@@ -1441,6 +1441,10 @@ fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, se
             if tries >= seq_len { continue; }
             let vi = v as i32;
             let mut new_defect = 0i64;
+            // Early termination: in cold phase, reject as soon as partial
+            // new_defect exceeds defect (acceptance probability ~0).
+            let early_threshold = if temp < 1.0 { defect } else { i64::MAX };
+            let mut completed = true;
             for s in 1..n {
                 let mut dc = 0i32;
                 if p + s < seq_len { let other = if p + s == q { -vi } else { seq[p + s] as i32 }; dc += (-vi) * other - vi * (seq[p + s] as i32); }
@@ -1450,8 +1454,13 @@ fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, se
                 delta_corr[s] = dc * weight;
                 let new_c = corr[s] as i64 + delta_corr[s] as i64;
                 new_defect += new_c * new_c;
+                if new_defect > early_threshold {
+                    completed = false;
+                    break;
+                }
             }
             stats.xy_nodes += 1;
+            if !completed { temp *= cooling; continue; }
             let delta = new_defect - defect;
             let accept = if delta <= 0 { true }
                 else if temp > 0.1 { (rng() % 10000) as f64 / 10000.0 < (-delta as f64 / temp).exp() }
