@@ -28,6 +28,35 @@ Ideas collected from Grok (credit: Grok for every item below).
 - **Symmetry Breaking** *(from Gemini)*: Force X to be symmetric (x_i = x_{n-1-i}) and Y to be skew-symmetric (y_i = -y_{n-1-i}). Modify backtrack_xy to assign pairs of bits simultaneously, reducing search space from 2^{2n} to ~2^n.
   - **Rejected (2026-03-30)**: Mathematically invalid for Turyn-type binary sequences. The known TT(6) solution X=[-1,-1,-1,-1,1,-1] is NOT palindromic; Y=[-1,-1,-1,1,-1,-1] is NOT skew-symmetric. Enforcing this would miss valid solutions. The symmetry result applies to continuous-valued sequences, not binary {±1}.
 
+## Why backtracking (Phase C) is never triggered on standard benchmarks
+
+On all standard benchmark profiles (n=14 θ=128, n=16 θ=256, n=22 θ=192), `pair_spec_ok=0` — the combined spectral pair filter rejects every Z/W pair, so `backtrack_xy` is never called (`xy_nodes=0`). Here's why:
+
+**The pipeline funnel (n=16 θ=256 example):**
+```
+z_generated = 4732  →  z_spec_ok = 1288   (individual: |Z(ω)|² ≤ 47 ∀ω)
+w_generated = 8008  →  w_spec_ok = 2871   (individual: |W(ω)|² ≤ 47 ∀ω)
+                           ↓ boundary bucketing + pairing
+                      pair_attempts = 692
+                           ↓ spectral_pair_ok: |Z(ω)|² + |W(ω)|² ≤ 47
+                      pair_spec_ok = 0      ← everything dies here
+                           ↓
+                      xy_nodes = 0
+```
+
+**Mathematical explanation:** Parseval's identity for Turyn sequences requires at every frequency ω:
+
+    |X(ω)|² + |Y(ω)|² + 2|Z(ω)|² + 2|W(ω)|² = 6n − 2
+
+Since |X|², |Y|² ≥ 0, the Z+W budget is `|Z(ω)|² + |W(ω)|² ≤ (6n−2)/2`. The individual filter allows each Z or W up to the full budget (47 for n=16), but the *pair* filter requires their **sum** ≤ 47 at every frequency simultaneously. A Z with power 30 at some ω can only pair with W having power ≤ 17 at that ω.
+
+Most generated Z/W candidates have high power (close to the bound) at overlapping frequencies. When paired, they exceed the budget. The individual bound is intentionally loose — tightening it would reject Z sequences that could pair with low-power W sequences.
+
+**Implications for optimization ideas:**
+- Any optimization targeting Phase C (backtracking) — including Gemini's incremental spectral pruning, symmetry breaking, and Douglas-Rachford — cannot improve benchmarks where Phase C is never entered.
+- The actual bottleneck is Phase B: DFS sequence generation + spectral filtering of individual Z/W candidates.
+- To trigger backtracking, either increase search limits dramatically or use smaller n where spectrally complementary Z/W pairs are more common.
+
 ## Re-check (2026-03-30, after user follow-up)
 
 I reran an apples-to-apples comparison of the code **before** the Grok idea bundle (`6eac0c5`) vs the bundle commit (`7b0894c`) using the same benchmark profile and more repeats:
