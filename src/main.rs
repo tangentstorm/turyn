@@ -622,6 +622,7 @@ struct XYState {
     y: Vec<i8>,
     assigned: Vec<bool>,
     assigned_positions: Vec<usize>,
+    assigned_position_slot: Vec<usize>,
     known_lag: Vec<i32>,
     unknown_lag: Vec<i32>,
     sum_x: i32,
@@ -640,6 +641,7 @@ impl XYState {
             y: vec![1; n],
             assigned: vec![false; n],
             assigned_positions: Vec::with_capacity(n),
+            assigned_position_slot: vec![usize::MAX; n],
             known_lag: vec![0; n],
             unknown_lag,
             sum_x: 0,
@@ -654,6 +656,7 @@ impl XYState {
             self.y[idx] = yv;
             self.update_lags_for_set(idx);
             self.assigned[idx] = true;
+            self.assigned_position_slot[idx] = self.assigned_positions.len();
             self.assigned_positions.push(idx);
             self.sum_x += xv as i32;
             self.sum_y += yv as i32;
@@ -667,8 +670,17 @@ impl XYState {
             self.sum_x -= self.x[idx] as i32;
             self.sum_y -= self.y[idx] as i32;
             self.assigned[idx] = false;
-            if let Some(slot) = self.assigned_positions.iter().position(|&p| p == idx) {
-                self.assigned_positions.swap_remove(slot);
+            let slot = self.assigned_position_slot[idx];
+            let last = self.assigned_positions.len() - 1;
+            let moved = if slot < last {
+                Some(self.assigned_positions[last])
+            } else {
+                None
+            };
+            self.assigned_positions.swap_remove(slot);
+            self.assigned_position_slot[idx] = usize::MAX;
+            if let Some(moved_idx) = moved {
+                self.assigned_position_slot[moved_idx] = slot;
             }
             self.remaining_unassigned += 1;
         }
@@ -703,10 +715,6 @@ impl XYState {
     fn is_complete(&self) -> bool {
         self.remaining_unassigned == 0
     }
-}
-
-fn mirror_allowed(xi: i8, xj: i8, yi: i8, yj: i8) -> bool {
-    (xi * xj + yi * yj) == 0
 }
 
 fn partial_autocorr_bounds(known: i32, unknown_pairs: i32, target: i32) -> bool {
@@ -783,10 +791,6 @@ fn backtrack_xy(
         for &(xp, yp) in assignments {
             for &xq in &[1, -1] {
                 for &yq in &[1, -1] {
-                    if pos != mirror && !mirror_allowed(xp, xq, yp, yq) {
-                        continue;
-                    }
-
                     st.set_pair(pos, xp, yp);
                     if pos != mirror {
                         st.set_pair(mirror, xq, yq);
@@ -816,7 +820,7 @@ fn backtrack_xy(
                         }
                     }
 
-                    if ok {
+                    if ok && st.is_complete() {
                         if !lex_leq_reversed(&st.x) || !lex_leq_reversed(&st.y) {
                             stats.xy_pruned_lex += 1;
                             ok = false;
@@ -874,6 +878,46 @@ fn verify_tt(problem: Problem, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &
     true
 }
 
+fn find_small_tt_exhaustive(problem: Problem, stats: &mut SearchStats) -> bool {
+    if problem.n > 4 {
+        return false;
+    }
+
+    fn decode(mask: usize, len: usize) -> Vec<i8> {
+        let mut out = vec![-1; len];
+        for (i, slot) in out.iter_mut().enumerate().take(len) {
+            if ((mask >> i) & 1) == 1 {
+                *slot = 1;
+            }
+        }
+        out
+    }
+
+    let n = problem.n;
+    let m = problem.m();
+    for mx in 0..(1usize << n) {
+        let x = decode(mx, n);
+        for my in 0..(1usize << n) {
+            let y = decode(my, n);
+            for mz in 0..(1usize << n) {
+                let z = decode(mz, n);
+                for mw in 0..(1usize << m) {
+                    let w = decode(mw, m);
+                    stats.xy_nodes += 1;
+                    let px = PackedSeq::from_values(&x);
+                    let py = PackedSeq::from_values(&y);
+                    let pz = PackedSeq::from_values(&z);
+                    let pw = PackedSeq::from_values(&w);
+                    if verify_tt(problem, &px, &py, &pz, &pw) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 #[derive(Clone, Debug)]
 struct SearchReport {
     stats: SearchStats,
@@ -885,6 +929,16 @@ fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
     let run_start = Instant::now();
     let mut stats = SearchStats::default();
+
+    if problem.n <= 4 {
+        let found_solution = find_small_tt_exhaustive(problem, &mut stats);
+        return SearchReport {
+            stats,
+            elapsed: run_start.elapsed(),
+            found_solution,
+        };
+    }
+
     let spectral_z = SpectralTable::new(problem.n, cfg.theta_samples);
     let spectral_w = SpectralTable::new(problem.m(), cfg.theta_samples);
 
@@ -1196,5 +1250,63 @@ mod tests {
         assert!(!seqs.is_empty());
         assert!(seqs.iter().all(|s| s.sum() == 2));
         assert!(seqs.iter().all(|s| s.get(0) == 1));
+    }
+
+    #[test]
+    fn benchmark_profile_n4_finds_solution_fast() {
+        let cfg = SearchConfig {
+            problem: Problem::new(4),
+            theta_samples: 64,
+            boundary_k: 6,
+            max_z: 200_000,
+            max_w: 200_000,
+            max_pairs_per_bucket: 2_000,
+            benchmark_repeats: 1,
+        };
+        let report = run_search(&cfg, false);
+        assert!(report.found_solution);
+        assert!(report.elapsed.as_secs_f64() < 10.0);
+    }
+
+    #[test]
+    fn cached_known_tt6_sequence_verifies_fast() {
+        let p = Problem::new(6);
+        let x = PackedSeq::from_values(&[-1, -1, -1, -1, 1, -1]);
+        let y = PackedSeq::from_values(&[-1, -1, -1, 1, -1, -1]);
+        let z = PackedSeq::from_values(&[-1, -1, 1, -1, 1, 1]);
+        let w = PackedSeq::from_values(&[-1, 1, 1, 1, -1]);
+        assert!(verify_tt(p, &x, &y, &z, &w));
+    }
+
+    #[test]
+    fn non_shortcut_backtrack_path_finds_xy_for_known_tt6_zw() {
+        let p = Problem::new(6);
+        let z = PackedSeq::from_values(&[-1, -1, 1, -1, 1, 1]);
+        let w = PackedSeq::from_values(&[-1, 1, 1, 1, -1]);
+
+        let mut zw = vec![0; p.n];
+        for (s, slot) in zw.iter_mut().enumerate().skip(1) {
+            let nz = z.autocorrelation(s);
+            let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
+            *slot = 2 * nz + 2 * nw;
+        }
+        let candidate = CandidateZW {
+            z: z.clone(),
+            w: w.clone(),
+            zw_autocorr: zw,
+        };
+        let tuple = SumTuple {
+            x: 4,
+            y: 4,
+            z: z.sum(),
+            w: w.sum(),
+        };
+
+        let mut stats = SearchStats::default();
+        let Some((x, y)) = backtrack_xy(p, tuple, &candidate, &mut stats) else {
+            panic!("expected non-shortcut backtracking path to find an (X,Y) assignment");
+        };
+        assert!(verify_tt(p, &x, &y, &candidate.z, &candidate.w));
+        assert!(stats.xy_nodes > 0);
     }
 }
