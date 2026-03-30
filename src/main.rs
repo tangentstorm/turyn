@@ -269,88 +269,26 @@ enum BoundarySignature {
 #[derive(Clone, Debug)]
 struct SpectralTable {
     samples: usize,
-    fft_len: usize,
-    use_fft: bool,
     cos: Vec<Vec<f64>>,
     sin: Vec<Vec<f64>>,
 }
 
 impl SpectralTable {
     fn new(n: usize, samples: usize) -> Self {
-        let fft_len = if samples <= 1 { 1 } else { 2 * (samples - 1) };
-        let use_fft = fft_len.is_power_of_two();
-        let mut cos = Vec::new();
-        let mut sin = Vec::new();
-        if !use_fft {
-            cos = vec![vec![0.0; n]; samples];
-            sin = vec![vec![0.0; n]; samples];
-            for i in 0..samples {
-                let theta = (i as f64) * std::f64::consts::PI / ((samples - 1).max(1) as f64);
-                for j in 0..n {
-                    let x = (j as f64) * theta;
-                    cos[i][j] = x.cos();
-                    sin[i][j] = x.sin();
-                }
+        let mut cos = vec![vec![0.0; n]; samples];
+        let mut sin = vec![vec![0.0; n]; samples];
+        for i in 0..samples {
+            let theta = (i as f64) * std::f64::consts::PI / ((samples - 1).max(1) as f64);
+            for j in 0..n {
+                let x = (j as f64) * theta;
+                cos[i][j] = x.cos();
+                sin[i][j] = x.sin();
             }
         }
-        Self {
-            samples,
-            fft_len,
-            use_fft,
-            cos,
-            sin,
-        }
+        Self { samples, cos, sin }
     }
 }
 
-fn fft_in_place(re: &mut [f64], im: &mut [f64]) {
-    let n = re.len();
-    debug_assert!(n.is_power_of_two());
-    debug_assert_eq!(n, im.len());
-
-    let mut j = 0usize;
-    for i in 1..n {
-        let mut bit = n >> 1;
-        while (j & bit) != 0 {
-            j ^= bit;
-            bit >>= 1;
-        }
-        j ^= bit;
-        if i < j {
-            re.swap(i, j);
-            im.swap(i, j);
-        }
-    }
-
-    let mut len = 2usize;
-    while len <= n {
-        let half = len / 2;
-        let angle = -2.0 * std::f64::consts::PI / (len as f64);
-        let wlen_re = angle.cos();
-        let wlen_im = angle.sin();
-        let mut i = 0usize;
-        while i < n {
-            let mut w_re = 1.0f64;
-            let mut w_im = 0.0f64;
-            for j in 0..half {
-                let u_re = re[i + j];
-                let u_im = im[i + j];
-                let v_re = re[i + j + half] * w_re - im[i + j + half] * w_im;
-                let v_im = re[i + j + half] * w_im + im[i + j + half] * w_re;
-                re[i + j] = u_re + v_re;
-                im[i + j] = u_im + v_im;
-                re[i + j + half] = u_re - v_re;
-                im[i + j + half] = u_im - v_im;
-                let next_w_re = w_re * wlen_re - w_im * wlen_im;
-                let next_w_im = w_re * wlen_im + w_im * wlen_re;
-                w_re = next_w_re;
-                w_im = next_w_im;
-            }
-            i += len;
-        }
-        len <<= 1;
-    }
-}
 
 fn enumerate_sum_tuples(problem: Problem) -> Vec<SumTuple> {
     let mut out = Vec::new();
@@ -450,41 +388,22 @@ fn autocorrs_from_values(values: &[i8]) -> Vec<i32> {
 }
 
 fn spectrum_if_ok(values: &[i8], table: &SpectralTable, bound: f64) -> Option<Vec<f64>> {
-    if !table.use_fft {
-        let mut spectrum = Vec::with_capacity(table.samples);
-        for i in 0..table.cos.len() {
-            let cos_row = &table.cos[i];
-            let sin_row = &table.sin[i];
-            let mut re = 0.0f64;
-            let mut im = 0.0f64;
-            for j in 0..values.len() {
-                if values[j] == 1 {
-                    re += cos_row[j];
-                    im += sin_row[j];
-                } else {
-                    re -= cos_row[j];
-                    im -= sin_row[j];
-                }
-            }
-            let p = re * re + im * im;
-            if p > bound {
-                return None;
-            }
-            spectrum.push(p);
-        }
-        return Some(spectrum);
-    }
-
-    let mut re = vec![0.0f64; table.fft_len];
-    let mut im = vec![0.0f64; table.fft_len];
-    for (i, &v) in values.iter().enumerate() {
-        re[i] = v as f64;
-    }
-    fft_in_place(&mut re, &mut im);
-
     let mut spectrum = Vec::with_capacity(table.samples);
-    for i in 0..table.samples {
-        let p = re[i] * re[i] + im[i] * im[i];
+    for i in 0..table.cos.len() {
+        let cos_row = &table.cos[i];
+        let sin_row = &table.sin[i];
+        let mut re = 0.0f64;
+        let mut im = 0.0f64;
+        for j in 0..values.len() {
+            if values[j] == 1 {
+                re += cos_row[j];
+                im += sin_row[j];
+            } else {
+                re -= cos_row[j];
+                im -= sin_row[j];
+            }
+        }
+        let p = re * re + im * im;
         if p > bound {
             return None;
         }
@@ -545,18 +464,6 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
         if *emitted >= limit {
             return;
         }
-        let remaining = (len - i) as i32;
-        let forced_tail = if tail_one && i <= (len - 1) { 1 } else { 0 };
-        let free = remaining - forced_tail;
-        let min_possible = curr_sum + forced_tail - free;
-        let max_possible = curr_sum + forced_tail + free;
-        if target_sum < min_possible || target_sum > max_possible {
-            return;
-        }
-        if ((target_sum - curr_sum - forced_tail + free) & 1) != 0 {
-            return;
-        }
-
         if i == len {
             if curr_sum == target_sum {
                 *emitted += 1;
