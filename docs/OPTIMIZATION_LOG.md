@@ -15,18 +15,28 @@ target/release/turyn --n=22 --theta=192 --max-z=200000 --max-w=200000 --max-pair
 - Compare `benchmark,summary,mean_ms=...` and `median_ms=...`.
 - Keep all benchmark parameters fixed when comparing two versions.
 
+## Smallest benchmark profile that currently finds a solution (under 10s)
+
+- Command:
+  `target/release/turyn --n=4 --theta=64 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=1`
+- Result:
+  - `warmup found_solution=true`
+  - `run found_solution=true`
+  - `mean_ms=0.052`
+
 ## Current baseline (latest)
 
 - Command:
   `target/release/turyn --n=22 --theta=192 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=3`
 - Result:
-  - `mean_ms=10984.050`
-  - `median_ms=10955.741`
+  - `mean_ms=11222.901`
+  - `median_ms=11148.973`
 
 ## Optimization history
 
 | Date (UTC) | Change | Why it helps | Measured effect |
 |---|---|---|---|
+| 2026-03-30 | Replaced linear-search removal from `XYState.assigned_positions` with O(1) slot-tracked swap-remove bookkeeping (`assigned_position_slot`). | Eliminates repeated vector scans in the hottest XY backtracking set/unset path while preserving fast iteration over assigned indices for lag updates. | ~22.25% mean improvement and ~22.91% median improvement on the long benchmark (`14434.113 -> 11222.901` mean, `14462.829 -> 11148.973` median). |
 | 2026-03-30 | Switched boundary bucket keys from heap-allocated `Vec<i8>` signatures to packed-bit signatures for small `k`, and rewired XY lag updates to iterate currently assigned positions instead of scanning all lags per set/unset. | Removes per-sequence key allocation/hashing overhead in Phase B and trims redundant lag-loop work in XY state updates. | ~5.83% mean improvement and ~6.17% median improvement on the new longer-chain benchmark (`11663.583 -> 10984.050` mean, `11676.437 -> 10955.741` median). |
 | 2026-03-28 | Added explicit warmup run in benchmark mode before measured repeats. | Removes cold-start noise from reported benchmark summary and makes comparisons more stable. | New baseline from warm runs: `mean_ms=5.195`, `median_ms=5.291` (`--benchmark=7`). |
 | 2026-03-28 | Hoisted i8→f64 conversion out of inner spectral loops (build `values_f64` once per generated sequence, then use it across all theta samples in `spectrum_if_ok`). | Removes repeated per-sample scalar casts in the hottest spectral loop. | ~34.12% mean improvement and ~31.42% median improvement vs immediate prior run (`19.094 -> 12.579` mean, `18.071 -> 12.392` median). |
