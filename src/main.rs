@@ -250,6 +250,12 @@ struct SeqWithSpectrum {
     autocorr: Vec<i32>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+enum BoundarySignature {
+    Packed { bits: u64, len: u8 },
+    Raw(Vec<i8>),
+}
+
 #[derive(Clone, Debug)]
 struct SpectralTable {
     cos: Vec<Vec<f64>>,
@@ -319,12 +325,31 @@ fn grouped_splits(raw: &[SumTuple]) -> BTreeMap<(i32, i32), Vec<SumTuple>> {
     m
 }
 
-fn boundary_signature_from_values(values: &[i8], k: usize) -> Vec<i8> {
+fn boundary_signature_from_values(values: &[i8], k: usize) -> BoundarySignature {
     let k = k.min(values.len());
-    let mut sig = Vec::with_capacity(k * 2);
-    sig.extend_from_slice(&values[..k]);
-    sig.extend_from_slice(&values[values.len() - k..]);
-    sig
+    let len = k * 2;
+    if len <= 64 {
+        let mut bits = 0u64;
+        for i in 0..k {
+            if values[i] == 1 {
+                bits |= 1u64 << i;
+            }
+        }
+        for i in 0..k {
+            if values[values.len() - k + i] == 1 {
+                bits |= 1u64 << (k + i);
+            }
+        }
+        BoundarySignature::Packed {
+            bits,
+            len: len as u8,
+        }
+    } else {
+        let mut sig = Vec::with_capacity(len);
+        sig.extend_from_slice(&values[..k]);
+        sig.extend_from_slice(&values[values.len() - k..]);
+        BoundarySignature::Raw(sig)
+    }
 }
 
 fn autocorrs_from_values(values: &[i8]) -> Vec<i32> {
@@ -340,14 +365,21 @@ fn autocorrs_from_values(values: &[i8]) -> Vec<i32> {
     out
 }
 
-fn spectrum_if_ok(values_f64: &[f64], table: &SpectralTable, bound: f64) -> Option<Vec<f64>> {
+fn spectrum_if_ok(values: &[i8], table: &SpectralTable, bound: f64) -> Option<Vec<f64>> {
     let mut spectrum = Vec::with_capacity(table.cos.len());
     for i in 0..table.cos.len() {
+        let cos_row = &table.cos[i];
+        let sin_row = &table.sin[i];
         let mut re = 0.0f64;
         let mut im = 0.0f64;
-        for (j, &vf) in values_f64.iter().enumerate() {
-            re += vf * table.cos[i][j];
-            im += vf * table.sin[i][j];
+        for j in 0..values.len() {
+            if values[j] == 1 {
+                re += cos_row[j];
+                im += sin_row[j];
+            } else {
+                re -= cos_row[j];
+                im -= sin_row[j];
+            }
         }
         let p = re * re + im * im;
         if p > bound {
@@ -515,11 +547,10 @@ fn build_zw_candidates(
     spectral_w: &SpectralTable,
     stats: &mut SearchStats,
 ) -> Vec<CandidateZW> {
-    let mut z_buckets: HashMap<Vec<i8>, Vec<SeqWithSpectrum>> = HashMap::new();
+    let mut z_buckets: HashMap<BoundarySignature, Vec<SeqWithSpectrum>> = HashMap::new();
     generate_sequences_with_sum_visit(problem.n, tuple.z, true, true, cfg.max_z, |values| {
         stats.z_generated += 1;
-        let values_f64: Vec<f64> = values.iter().map(|&v| v as f64).collect();
-        if let Some(spectrum) = spectrum_if_ok(&values_f64, spectral_z, problem.spectral_bound()) {
+        if let Some(spectrum) = spectrum_if_ok(values, spectral_z, problem.spectral_bound()) {
             stats.z_spectral_ok += 1;
             z_buckets
                 .entry(boundary_signature_from_values(values, cfg.boundary_k))
@@ -532,11 +563,10 @@ fn build_zw_candidates(
         }
     });
 
-    let mut w_buckets: HashMap<Vec<i8>, Vec<SeqWithSpectrum>> = HashMap::new();
+    let mut w_buckets: HashMap<BoundarySignature, Vec<SeqWithSpectrum>> = HashMap::new();
     generate_sequences_with_sum_visit(problem.m(), tuple.w, true, false, cfg.max_w, |values| {
         stats.w_generated += 1;
-        let values_f64: Vec<f64> = values.iter().map(|&v| v as f64).collect();
-        if let Some(spectrum) = spectrum_if_ok(&values_f64, spectral_w, problem.spectral_bound()) {
+        if let Some(spectrum) = spectrum_if_ok(values, spectral_w, problem.spectral_bound()) {
             stats.w_spectral_ok += 1;
             w_buckets
                 .entry(boundary_signature_from_values(values, cfg.boundary_k))
@@ -588,10 +618,10 @@ fn build_zw_candidates(
 
 #[derive(Clone)]
 struct XYState {
-    n: usize,
     x: Vec<i8>,
     y: Vec<i8>,
     assigned: Vec<bool>,
+    assigned_positions: Vec<usize>,
     known_lag: Vec<i32>,
     unknown_lag: Vec<i32>,
     sum_x: i32,
@@ -606,10 +636,10 @@ impl XYState {
             *slot = (n - s) as i32;
         }
         Self {
-            n,
             x: vec![1; n],
             y: vec![1; n],
             assigned: vec![false; n],
+            assigned_positions: Vec::with_capacity(n),
             known_lag: vec![0; n],
             unknown_lag,
             sum_x: 0,
@@ -622,11 +652,12 @@ impl XYState {
         if !self.assigned[idx] {
             self.x[idx] = xv;
             self.y[idx] = yv;
+            self.update_lags_for_set(idx);
             self.assigned[idx] = true;
+            self.assigned_positions.push(idx);
             self.sum_x += xv as i32;
             self.sum_y += yv as i32;
             self.remaining_unassigned -= 1;
-            self.update_lags_for_set(idx);
         }
     }
 
@@ -636,54 +667,41 @@ impl XYState {
             self.sum_x -= self.x[idx] as i32;
             self.sum_y -= self.y[idx] as i32;
             self.assigned[idx] = false;
+            if let Some(slot) = self.assigned_positions.iter().position(|&p| p == idx) {
+                self.assigned_positions.swap_remove(slot);
+            }
             self.remaining_unassigned += 1;
         }
     }
 
     fn update_lags_for_set(&mut self, idx: usize) {
-        for s in 1..self.n {
-            if idx >= s {
-                let j = idx - s;
-                if self.assigned[j] {
-                    self.unknown_lag[s] -= 1;
-                    self.known_lag[s] += (self.x[j] as i32) * (self.x[idx] as i32)
-                        + (self.y[j] as i32) * (self.y[idx] as i32);
-                }
+        let xi = self.x[idx] as i32;
+        let yi = self.y[idx] as i32;
+        for &j in &self.assigned_positions {
+            let s = idx.abs_diff(j);
+            if s == 0 {
+                continue;
             }
-            if idx + s < self.n {
-                let j = idx + s;
-                if self.assigned[j] {
-                    self.unknown_lag[s] -= 1;
-                    self.known_lag[s] += (self.x[idx] as i32) * (self.x[j] as i32)
-                        + (self.y[idx] as i32) * (self.y[j] as i32);
-                }
-            }
+            self.unknown_lag[s] -= 1;
+            self.known_lag[s] += (self.x[j] as i32) * xi + (self.y[j] as i32) * yi;
         }
     }
 
     fn update_lags_for_unset(&mut self, idx: usize) {
-        for s in 1..self.n {
-            if idx >= s {
-                let j = idx - s;
-                if self.assigned[j] {
-                    self.unknown_lag[s] += 1;
-                    self.known_lag[s] -= (self.x[j] as i32) * (self.x[idx] as i32)
-                        + (self.y[j] as i32) * (self.y[idx] as i32);
-                }
+        let xi = self.x[idx] as i32;
+        let yi = self.y[idx] as i32;
+        for &j in &self.assigned_positions {
+            let s = idx.abs_diff(j);
+            if s == 0 {
+                continue;
             }
-            if idx + s < self.n {
-                let j = idx + s;
-                if self.assigned[j] {
-                    self.unknown_lag[s] += 1;
-                    self.known_lag[s] -= (self.x[idx] as i32) * (self.x[j] as i32)
-                        + (self.y[idx] as i32) * (self.y[j] as i32);
-                }
-            }
+            self.unknown_lag[s] += 1;
+            self.known_lag[s] -= (self.x[j] as i32) * xi + (self.y[j] as i32) * yi;
         }
     }
 
     fn is_complete(&self) -> bool {
-        self.assigned.iter().all(|&b| b)
+        self.remaining_unassigned == 0
     }
 }
 
