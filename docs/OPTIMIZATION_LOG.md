@@ -47,3 +47,6 @@ For each optimization PR/commit:
 3. Keep benchmark command unchanged unless intentionally creating a *new benchmark profile*.
 
 If a new benchmark profile is needed (e.g., TT(56) stress profile), add a separate section with explicit command and keep historical comparisons within the same profile.
+
+## Development workflow
+- See `docs/GIT_WORKFLOW.md` for the append-only commit/PR process used to preserve iterative optimization history.
