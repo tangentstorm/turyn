@@ -13,6 +13,20 @@ Ideas collected from Grok (credit: Grok for every item below).
 - **FFT for spectrum** *(from Grok)*: Replaced the manual trigonometric loop with an in-tree FFT path for power-of-two grids, with fallback to trig for others. Benchmark (`--n=16 --theta=256 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3`) regressed from mean `91.363ms` (baseline) to `101.115ms` (about 10.7% slower).
 - **Better Z/W generation** *(from Grok)*: Added tighter global DFS bounds + parity pruning in `generate_sequences_with_sum_visit`. On the same benchmark profile, mean regressed from `97.412ms` to `103.510ms`.
 
+## Ideas from Gemini (credit: Gemini for every item below)
+
+- **Incremental Spectral Pruning in XY backtracker** *(from Gemini)*: Track running DFT sums (re_x, im_x, re_y, im_y) in XYState. Pre-calculate a spectral budget per frequency for each (Z,W) pair: `budget_k = (4n-2) - 2|DFT_Z(ω_k)|² - 2|DFT_W(ω_k)|²`. On each set_pair, update complex sums using SpectralTable. Prune if `|DFT_X_partial|² + |DFT_Y_partial|² > budget_k + ε` at any frequency.
+  - **Tried (2026-03-30)**: Implemented full incremental DFT tracking in XYState with spectral budget pruning. Regression: n=14 10.93→12.15ms (+11%), n=16 37.63→43.26ms (+15%). The standard benchmarks have xy_nodes=0 (backtracking never entered), so pruning adds only overhead. Would only help when Phase C is the bottleneck.
+
+- **SIMD-Accelerated Autocorrelation** *(from Gemini)*: Replace manual 4x loop unrolling in autocorrelation hot loops with explicit SIMD (std::simd or `wide` crate). Store sequences as aligned i8 slices. Use 256-bit vector multiply-and-add to process 32 elements per cycle.
+  - **Tried (2026-03-30)**: Replaced branching in `spectrum_if_ok` with branchless multiply (`v as f64 * cos`) and pre-computed i32/f64 values. On heavy spectral benchmark (n=16, θ=49152, ~8s/run): baseline mean=7820ms, branchless mean=8244ms (**5.4% regression**). The branch predictor handles {±1} sequences well; conditional add/sub avoids multiply latency. Stable Rust lacks `std::simd`; the `wide` crate would add a dependency. Reverted.
+
+- **Douglas-Rachford (DR) Projection Heuristic** *(from Gemini)*: Before expensive backtrack_xy, run a few DR iterations to check if a valid (X,Y) pair is likely. Start with random X,Y in [-1,1]^n, project onto frequency constraints (rescale magnitudes so |X_k|²+|Y_k|²=budget_k via FFT/IFFT), project onto time-domain cube (clamp/signum). If no convergence after ~100 iterations, discard the (Z,W) pair.
+  - **Skipped (2026-03-30)**: Two blockers: (1) Requires FFT/IFFT for the frequency-domain projection, but this project has zero external dependencies and the in-tree FFT path was already tried and reverted (10.7% regression). (2) DR is a pre-filter for backtrack_xy, but in all current benchmark profiles `pair_spec_ok=0` — backtracking is never entered, so DR would never execute. Would only help at large n where many Z/W pairs pass spectral filtering AND backtracking is the bottleneck.
+
+- **Symmetry Breaking** *(from Gemini)*: Force X to be symmetric (x_i = x_{n-1-i}) and Y to be skew-symmetric (y_i = -y_{n-1-i}). Modify backtrack_xy to assign pairs of bits simultaneously, reducing search space from 2^{2n} to ~2^n.
+  - **Rejected (2026-03-30)**: Mathematically invalid for Turyn-type binary sequences. The known TT(6) solution X=[-1,-1,-1,-1,1,-1] is NOT palindromic; Y=[-1,-1,-1,1,-1,-1] is NOT skew-symmetric. Enforcing this would miss valid solutions. The symmetry result applies to continuous-valued sequences, not binary {±1}.
+
 ## Re-check (2026-03-30, after user follow-up)
 
 I reran an apples-to-apples comparison of the code **before** the Grok idea bundle (`6eac0c5`) vs the bundle commit (`7b0894c`) using the same benchmark profile and more repeats:
