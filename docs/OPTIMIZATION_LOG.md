@@ -32,6 +32,10 @@ target/release/turyn --n=22 --theta=192 --max-z=200000 --max-w=200000 --max-pair
   - `mean_ms=11222.901`
   - `median_ms=11148.973`
 
+## Profiling
+
+- See `docs/PROFILING.md` for the currently working profiling workflow in this container (gprof fallback), plus why `perf`/Cargo-based profiler installs are currently blocked by repository/network 403 errors.
+
 ## Optimization history
 
 | Date (UTC) | Change | Why it helps | Measured effect |
