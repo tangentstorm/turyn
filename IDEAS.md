@@ -23,3 +23,33 @@ I reran an apples-to-apples comparison of the code **before** the Grok idea bund
 
 **Net result:** this combined bundle is currently ~3.5% slower on mean and ~6.8% slower on median on this profile.
 
+## Follow-up audit (2026-03-30, Claude)
+
+Benchmarked each Grok change individually on a different machine to identify which help and which hurt. All measurements use 7 repeats.
+
+### Benchmark results (n=16, θ=256, max-z=50000):
+
+| Configuration | mean_ms | median_ms |
+|---|---|---|
+| Pre-Grok baseline | 77 | 72 |
+| Full Grok bundle | 80 | 79 |
+| Grok − FFT removal only | 77 | 78 |
+| Grok − FFT − DFS parity | 79 | 76 |
+
+### Benchmark results (n=14, θ=128, max-z=200000):
+
+| Configuration | mean_ms | median_ms |
+|---|---|---|
+| Pre-Grok baseline | 20 | 21 |
+| Full Grok bundle | 23 | 23 |
+| Grok − FFT removal only | 21 | 22 |
+| Grok − FFT − DFS parity | 20 | 21 |
+
+### Conclusions:
+
+- **FFT path**: Caused regression even when not active (θ=256 is not power-of-two). The `if !table.use_fft` branch and larger function body hurt instruction cache / branch prediction. **Disabled.**
+- **DFS parity pruning**: Marginal on these benchmarks. The existing per-branch sum pruning later in the DFS already catches most infeasible nodes. **Disabled.**
+- **XY dynamic variable ordering**: Kept. Good algorithmic improvement.
+- **Bucket capping (push_capped)**: Kept. Reduces memory pressure.
+- **Manual loop unrolling**: Kept for now (marginal ~3.7% on Grok's benchmark, neutral on ours).
+

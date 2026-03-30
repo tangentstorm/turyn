@@ -26,11 +26,20 @@ target/release/turyn --n=22 --theta=192 --max-z=200000 --max-w=200000 --max-pair
 
 ## Current baseline (latest)
 
-- Command:
-  `target/release/turyn --n=22 --theta=192 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=3`
-- Result:
-  - `mean_ms=11222.901`
-  - `median_ms=11148.973`
+- Exhaustive search (n=14, theta=128):
+  - Command: `target/release/turyn --n=14 --theta=128 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=7`
+  - Result: `mean_ms=21, median_ms=22`
+
+- Exhaustive search (n=16, theta=256):
+  - Command: `target/release/turyn --n=16 --theta=256 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=7`
+  - Result: `mean_ms=77, median_ms=78`
+
+- Stochastic search (`--stochastic`):
+  - TT(6): ~0.6ms, TT(8): ~0.8ms, TT(14): ~175ms
+  - TT(22): reaches defect ~64 but does not yet converge to 0
+
+- Previous n=22 exhaustive baseline (different machine):
+  `mean_ms=11222.901`, `median_ms=11148.973`
 
 
 
@@ -54,6 +63,8 @@ Note: the previous per-idea claims in `IDEAS.md` were not backed by a step-by-st
 
 | Date (UTC) | Change | Why it helps | Measured effect |
 |---|---|---|---|
+| 2026-03-30 | Added multi-threaded stochastic local search (`--stochastic`) using simulated annealing with O(n) incremental defect updates. | Enables finding Turyn sequences at sizes where exhaustive DFS is infeasible. Sum-preserving pair swaps, adaptive cooling, one SA worker per core. | TT(6): 0.6ms, TT(8): 0.8ms, TT(14): 175ms. |
+| 2026-03-30 | Disabled FFT spectral path and DFS parity pruning from Grok bundle (both regressions). Kept XY dynamic variable ordering and bucket capping. | FFT path caused regression even when inactive (branch overhead, icache). DFS parity pruning was redundant with existing per-branch sum checks. | n=14: Grok 23ms → 21ms, n=16: Grok 80ms → 77ms. Recovers pre-Grok baseline while keeping beneficial Grok changes. |
 | 2026-03-30 | Audited Grok optimization bundle as a single before/after comparison (`6eac0c5` -> `7b0894c`) on the IDEA profile. | Verifies whether the combined set of changes actually improved runtime under the documented benchmark command. | Regression on this profile: mean `44.160 -> 45.723` ms (~3.5% slower), median `39.546 -> 42.237` ms (~6.8% slower). |
 | 2026-03-30 | Replaced linear-search removal from `XYState.assigned_positions` with O(1) slot-tracked swap-remove bookkeeping (`assigned_position_slot`). | Eliminates repeated vector scans in the hottest XY backtracking set/unset path while preserving fast iteration over assigned indices for lag updates. | ~22.25% mean improvement and ~22.91% median improvement on the long benchmark (`14434.113 -> 11222.901` mean, `14462.829 -> 11148.973` median). |
 | 2026-03-30 | Switched boundary bucket keys from heap-allocated `Vec<i8>` signatures to packed-bit signatures for small `k`, and rewired XY lag updates to iterate currently assigned positions instead of scanning all lags per set/unset. | Removes per-sequence key allocation/hashing overhead in Phase B and trims redundant lag-loop work in XY state updates. | ~5.83% mean improvement and ~6.17% median improvement on the new longer-chain benchmark (`11663.583 -> 10984.050` mean, `11676.437 -> 10955.741` median). |
