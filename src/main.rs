@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use rustfft::{FftPlanner, num_complex::Complex};
+
 #[derive(Clone, Copy, Debug)]
 struct Problem {
     n: usize,
@@ -269,26 +271,30 @@ enum BoundarySignature {
     Raw(Vec<i8>),
 }
 
-#[derive(Clone, Debug)]
-struct SpectralTable {
-    samples: usize,
-    cos: Vec<Vec<f64>>,
-    sin: Vec<Vec<f64>>,
+#[derive(Clone)]
+struct SpectralFilter {
+    fft_size: usize,
+    fft: Arc<dyn rustfft::Fft<f64>>,
 }
 
-impl SpectralTable {
-    fn new(n: usize, samples: usize) -> Self {
-        let mut cos = vec![vec![0.0; n]; samples];
-        let mut sin = vec![vec![0.0; n]; samples];
-        for i in 0..samples {
-            let theta = (i as f64) * std::f64::consts::PI / ((samples - 1).max(1) as f64);
-            for j in 0..n {
-                let x = (j as f64) * theta;
-                cos[i][j] = x.cos();
-                sin[i][j] = x.sin();
-            }
-        }
-        Self { samples, cos, sin }
+impl fmt::Debug for SpectralFilter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SpectralFilter")
+            .field("fft_size", &self.fft_size)
+            .finish()
+    }
+}
+
+impl SpectralFilter {
+    fn new(seq_len: usize, theta_samples: usize) -> Self {
+        // FFT of size M yields M/2+1 unique frequency bins for real input.
+        // To match theta_samples frequency checks, need M >= 2*theta_samples.
+        // Use at least 4*n for minimum spectral resolution.
+        let min_size = (4 * seq_len).max(2 * theta_samples);
+        let fft_size = min_size.next_power_of_two().max(16);
+        let mut planner = FftPlanner::new();
+        let fft = planner.plan_fft_forward(fft_size);
+        Self { fft_size, fft }
     }
 }
 
@@ -390,23 +396,24 @@ fn autocorrs_from_values(values: &[i8]) -> Vec<i32> {
     out
 }
 
-fn spectrum_if_ok(values: &[i8], table: &SpectralTable, bound: f64) -> Option<Vec<f64>> {
-    let mut spectrum = Vec::with_capacity(table.samples);
-    for i in 0..table.cos.len() {
-        let cos_row = &table.cos[i];
-        let sin_row = &table.sin[i];
-        let mut re = 0.0f64;
-        let mut im = 0.0f64;
-        for j in 0..values.len() {
-            if values[j] == 1 {
-                re += cos_row[j];
-                im += sin_row[j];
-            } else {
-                re -= cos_row[j];
-                im -= sin_row[j];
-            }
-        }
-        let p = re * re + im * im;
+fn spectrum_if_ok(
+    values: &[i8],
+    filter: &SpectralFilter,
+    bound: f64,
+    fft_buf: &mut Vec<Complex<f64>>,
+) -> Option<Vec<f64>> {
+    let m = filter.fft_size;
+    fft_buf.clear();
+    for &v in values {
+        fft_buf.push(Complex::new(v as f64, 0.0));
+    }
+    fft_buf.resize(m, Complex::new(0.0, 0.0));
+    filter.fft.process(fft_buf);
+    // Only check [0, M/2] — real sequence has symmetric spectrum
+    let half = m / 2 + 1;
+    let mut spectrum = Vec::with_capacity(half);
+    for k in 0..half {
+        let p = fft_buf[k].norm_sqr();
         if p > bound {
             return None;
         }
@@ -568,8 +575,8 @@ fn build_zw_candidates(
     problem: Problem,
     tuple: SumTuple,
     cfg: &SearchConfig,
-    spectral_z: &SpectralTable,
-    spectral_w: &SpectralTable,
+    spectral_z: &SpectralFilter,
+    spectral_w: &SpectralFilter,
     stats: &mut SearchStats,
 ) -> Vec<CandidateZW> {
     fn push_capped(
@@ -585,9 +592,12 @@ fn build_zw_candidates(
     }
 
     let mut z_buckets: HashMap<BoundarySignature, Vec<SeqWithSpectrum>> = HashMap::new();
+    let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
     generate_sequences_with_sum_visit(problem.n, tuple.z, true, true, cfg.max_z, |values| {
         stats.z_generated += 1;
-        if let Some(spectrum) = spectrum_if_ok(values, spectral_z, problem.spectral_bound()) {
+        if let Some(spectrum) =
+            spectrum_if_ok(values, spectral_z, problem.spectral_bound(), &mut fft_buf)
+        {
             stats.z_spectral_ok += 1;
             push_capped(
                 &mut z_buckets,
@@ -603,9 +613,12 @@ fn build_zw_candidates(
     });
 
     let mut w_buckets: HashMap<BoundarySignature, Vec<SeqWithSpectrum>> = HashMap::new();
+    fft_buf.clear();
     generate_sequences_with_sum_visit(problem.m(), tuple.w, true, false, cfg.max_w, |values| {
         stats.w_generated += 1;
-        if let Some(spectrum) = spectrum_if_ok(values, spectral_w, problem.spectral_bound()) {
+        if let Some(spectrum) =
+            spectrum_if_ok(values, spectral_w, problem.spectral_bound(), &mut fft_buf)
+        {
             stats.w_spectral_ok += 1;
             push_capped(
                 &mut w_buckets,
@@ -1017,8 +1030,11 @@ fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         };
     }
 
-    let spectral_z = SpectralTable::new(problem.n, cfg.theta_samples);
-    let spectral_w = SpectralTable::new(problem.m(), cfg.theta_samples);
+    // Both z (length n) and w (length m=n-1) filters must use same FFT size
+    // so their spectrums align for spectral_pair_ok comparison.
+    let max_seq_len = problem.n;
+    let spectral_z = SpectralFilter::new(max_seq_len, cfg.theta_samples);
+    let spectral_w = SpectralFilter::new(max_seq_len, cfg.theta_samples);
 
     let phase_a_start = Instant::now();
     let raw = enumerate_sum_tuples(problem);
