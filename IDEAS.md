@@ -11,6 +11,7 @@ Ideas collected from Grok (credit: Grok for every item below).
 ## Tried (no meaningful impact yet)
 
 - **FFT for spectrum** *(from Grok)*: Replaced the manual trigonometric loop with an in-tree FFT path for power-of-two grids, with fallback to trig for others. Benchmark (`--n=16 --theta=256 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3`) regressed from mean `91.363ms` (baseline) to `101.115ms` (about 10.7% slower).
+  - **Revisited (2026-03-30)**: Replaced manual DFT with `rustfft` crate (proper dependency). FFT size = max(4n, 2*theta_samples) rounded to power of 2, with reusable buffer. Result: n=14 θ=128 mean 11.09→5.70ms (**-48.6%**), n=16 θ=256 mean 38.25→20.20ms (**-47.2%**). Previous in-tree FFT regressed due to branch overhead; proper `rustfft` avoids this entirely. **Implemented.**
 - **Better Z/W generation** *(from Grok)*: Added tighter global DFS bounds + parity pruning in `generate_sequences_with_sum_visit`. On the same benchmark profile, mean regressed from `97.412ms` to `103.510ms`.
 
 ## Ideas from Gemini (credit: Gemini for every item below)

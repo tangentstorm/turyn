@@ -28,11 +28,11 @@ target/release/turyn --n=22 --theta=192 --max-z=200000 --max-w=200000 --max-pair
 
 - Exhaustive search (n=14, theta=128):
   - Command: `target/release/turyn --n=14 --theta=128 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=7`
-  - Result: `mean_ms=21, median_ms=22`
+  - Result: `mean_ms=5.70, median_ms=5.69`
 
 - Exhaustive search (n=16, theta=256):
   - Command: `target/release/turyn --n=16 --theta=256 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=7`
-  - Result: `mean_ms=77, median_ms=78`
+  - Result: `mean_ms=20.20, median_ms=20.17`
 
 - Stochastic search (`--stochastic`):
   - TT(6): ~0.6ms, TT(8): ~0.8ms, TT(14): ~175ms
@@ -63,6 +63,7 @@ Note: the previous per-idea claims in `IDEAS.md` were not backed by a step-by-st
 
 | Date (UTC) | Change | Why it helps | Measured effect |
 |---|---|---|---|
+| 2026-03-30 | Replaced manual O(θ×n) DFT in `spectrum_if_ok` with `rustfft` crate FFT using zero-padded sequences. FFT size = max(4n, 2θ) rounded to power of 2, with reusable buffer. | FFT computes full power spectrum in O(M log M) vs manual DFT's O(θ×n). For θ=256, n=16: FFT(512) does ~4.6K ops vs manual 4096 multiply-accumulates, with better SIMD utilization from optimized FFT library. | ~47-49% improvement: n=14 θ=128 mean `11.09 → 5.70` ms (**-48.6%**), n=16 θ=256 mean `38.25 → 20.20` ms (**-47.2%**). |
 | 2026-03-30 | Added multi-threaded stochastic local search (`--stochastic`) using simulated annealing with O(n) incremental defect updates. | Enables finding Turyn sequences at sizes where exhaustive DFS is infeasible. Sum-preserving pair swaps, adaptive cooling, one SA worker per core. | TT(6): 0.6ms, TT(8): 0.8ms, TT(14): 175ms. |
 | 2026-03-30 | Disabled FFT spectral path and DFS parity pruning from Grok bundle (both regressions). Kept XY dynamic variable ordering and bucket capping. | FFT path caused regression even when inactive (branch overhead, icache). DFS parity pruning was redundant with existing per-branch sum checks. | n=14: Grok 23ms → 21ms, n=16: Grok 80ms → 77ms. Recovers pre-Grok baseline while keeping beneficial Grok changes. |
 | 2026-03-30 | Audited Grok optimization bundle as a single before/after comparison (`6eac0c5` -> `7b0894c`) on the IDEA profile. | Verifies whether the combined set of changes actually improved runtime under the documented benchmark command. | Regression on this profile: mean `44.160 -> 45.723` ms (~3.5% slower), median `39.546 -> 42.237` ms (~6.8% slower). |
