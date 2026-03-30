@@ -1446,12 +1446,13 @@ fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, se
             let early_threshold = if temp < 1.0 { defect } else { i64::MAX };
             let mut completed = true;
             for s in 1..n {
-                let mut dc = 0i32;
-                if p + s < seq_len { let other = if p + s == q { -vi } else { seq[p + s] as i32 }; dc += (-vi) * other - vi * (seq[p + s] as i32); }
-                if p >= s { let other = if p - s == q { -vi } else { seq[p - s] as i32 }; dc += other * (-vi) - (seq[p - s] as i32) * vi; }
-                if q + s < seq_len && q + s != p { let other = seq[q + s] as i32; dc += (-vi) * other - vi * other; }
-                if q >= s && q - s != p { let other = seq[q - s] as i32; dc += other * (-vi) - other * vi; }
-                delta_corr[s] = dc * weight;
+                // Swapping two same-value positions: delta = -2*v * (sum of non-overlapping neighbors)
+                let mut nb = 0i32;
+                if p + s < seq_len && p + s != q { nb += seq[p + s] as i32; }
+                if p >= s && p - s != q { nb += seq[p - s] as i32; }
+                if q + s < seq_len && q + s != p { nb += seq[q + s] as i32; }
+                if q >= s && q - s != p { nb += seq[q - s] as i32; }
+                delta_corr[s] = -2 * vi * nb * weight;
                 let new_c = corr[s] as i64 + delta_corr[s] as i64;
                 new_defect += new_c * new_c;
                 if new_defect > early_threshold {
