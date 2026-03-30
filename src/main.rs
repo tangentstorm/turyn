@@ -1423,22 +1423,34 @@ fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, se
         let mut temp = (defect as f64).sqrt().max(50.0);
         let cooling = (0.1f64 / temp).powf(1.0 / max_flips as f64).max(0.99);
         let mut delta_corr = vec![0i32; n];
+        // Pre-build value-grouped index lists for O(1) partner finding.
+        // pos_idx[seq][0] = indices with value +1, pos_idx[seq][1] = indices with value -1
+        // Only include mutable indices (skip index 0 for all, skip n-1 for z).
+        let mut pos_idx: [Vec<Vec<usize>>; 4] = [vec![vec![], vec![]], vec![vec![], vec![]], vec![vec![], vec![]], vec![vec![], vec![]]];
+        let seqs_ref: [&[i8]; 4] = [&x, &y, &z, &w];
+        let seq_lens = [n, n, n, m];
+        for si in 0..4 {
+            let upper = if si == 2 { n - 1 } else { seq_lens[si] };
+            for i in 1..upper {
+                let vi = if seqs_ref[si][i] == 1 { 0 } else { 1 };
+                pos_idx[si][vi].push(i);
+            }
+        }
         for flip in 0..max_flips {
             if flip % 1000 == 0 && found.load(AtomicOrdering::Relaxed) { break; }
             let seq_idx = (rng() as usize) % 4;
             let seq_len = if seq_idx < 3 { n } else { m };
             let weight: i32 = if seq_idx < 2 { 1 } else { 2 };
             let seq: &mut [i8] = match seq_idx { 0 => &mut x, 1 => &mut y, 2 => &mut z, _ => &mut w };
-            let p = 1 + ((rng() as usize) % (seq_len - 1));
-            if seq_idx == 2 && p >= n - 1 { continue; }
+            let vi_group = if rng() & 1 == 0 { 0usize } else { 1 };
+            let group = &pos_idx[seq_idx][vi_group];
+            if group.len() < 2 { continue; }
+            let pi = (rng() as usize) % group.len();
+            let mut qi = (rng() as usize) % (group.len() - 1);
+            if qi >= pi { qi += 1; }
+            let p = group[pi];
+            let q = group[qi];
             let v = seq[p];
-            let mut q = 1 + ((rng() as usize) % (seq_len - 1));
-            let mut tries = 0;
-            while (seq[q] != v || q == p || (seq_idx == 2 && q >= n - 1)) && tries < seq_len {
-                q = 1 + ((rng() as usize) % (seq_len - 1));
-                tries += 1;
-            }
-            if tries >= seq_len { continue; }
             let vi = v as i32;
             let mut new_defect = 0i64;
             // Early termination: in cold phase, reject as soon as partial
@@ -1468,6 +1480,12 @@ fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, se
                 else { false };
             if accept {
                 seq[p] = -v; seq[q] = -v;
+                // Update pos_idx: move p and q from current group to opposite
+                let old_group = vi_group;
+                let new_group = 1 - old_group;
+                pos_idx[seq_idx][old_group].retain(|&i| i != p && i != q);
+                pos_idx[seq_idx][new_group].push(p);
+                pos_idx[seq_idx][new_group].push(q);
                 for s in 1..n { corr[s] += delta_corr[s]; }
                 defect = new_defect;
                 if defect == 0 {
