@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -197,6 +198,7 @@ struct SearchConfig {
     max_w: usize,
     max_pairs_per_bucket: usize,
     benchmark_repeats: usize,
+    stochastic: bool,
 }
 
 impl Default for SearchConfig {
@@ -209,6 +211,7 @@ impl Default for SearchConfig {
             max_w: 10_000,
             max_pairs_per_bucket: 5_000,
             benchmark_repeats: 0,
+            stochastic: false,
         }
     }
 }
@@ -1247,6 +1250,170 @@ fn run_benchmark(cfg: &SearchConfig) {
     );
 }
 
+fn compute_corr(problem: Problem, x: &[i8], y: &[i8], z: &[i8], w: &[i8]) -> Vec<i32> {
+    let n = problem.n;
+    let m = problem.m();
+    let mut corr = vec![0i32; n];
+    for s in 1..n {
+        let mut c = 0i32;
+        for i in 0..(n - s) {
+            c += (x[i] as i32) * (x[i + s] as i32)
+                + (y[i] as i32) * (y[i + s] as i32)
+                + 2 * (z[i] as i32) * (z[i + s] as i32);
+        }
+        if s < m {
+            for i in 0..(m - s) {
+                c += 2 * (w[i] as i32) * (w[i + s] as i32);
+            }
+        }
+        corr[s] = c;
+    }
+    corr
+}
+
+fn defect_from_corr(corr: &[i32]) -> i64 {
+    corr.iter().skip(1).map(|&c| (c as i64) * (c as i64)).sum()
+}
+
+fn stochastic_search(problem: Problem, verbose: bool) -> SearchReport {
+    let run_start = Instant::now();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get()).unwrap_or(1).max(1);
+    if verbose {
+        println!("TT({}): stochastic search with {} threads", problem.n, workers);
+    }
+    let found = Arc::new(AtomicBool::new(false));
+    let norm = Arc::new(normalized_tuples(&enumerate_sum_tuples(problem)));
+    let mut handles = Vec::new();
+    for tid in 0..workers {
+        let found = Arc::clone(&found);
+        let norm = Arc::clone(&norm);
+        handles.push(std::thread::spawn(move || {
+            stochastic_worker(problem, &norm, &found, tid as u64, verbose && tid == 0)
+        }));
+    }
+    let mut best = SearchReport { stats: SearchStats::default(), elapsed: run_start.elapsed(), found_solution: false };
+    for h in handles {
+        if let Ok(r) = h.join() {
+            best.stats.merge_from(&r.stats);
+            if r.found_solution { best.found_solution = true; }
+        }
+    }
+    best.elapsed = run_start.elapsed();
+    best
+}
+
+fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, seed: u64, verbose: bool) -> SearchReport {
+    let run_start = Instant::now();
+    let mut stats = SearchStats::default();
+    let n = problem.n;
+    let m = problem.m();
+    let mut rng_state: u64 = 0xdeadbeef12345678u64
+        ^ seed.wrapping_mul(0x9e3779b97f4a7c15)
+        ^ (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_nanos() as u64);
+    let mut rng = || -> u64 { rng_state ^= rng_state << 13; rng_state ^= rng_state >> 7; rng_state ^= rng_state << 17; rng_state };
+    let rand_seq = |len: usize, rng: &mut dyn FnMut() -> u64| -> Vec<i8> {
+        (0..len).map(|_| if rng() & 1 == 0 { 1 } else { -1 }).collect()
+    };
+    let fix_sum = |seq: &mut [i8], target: i32, rng: &mut dyn FnMut() -> u64, start: usize| {
+        let len = seq.len();
+        loop {
+            let current: i32 = seq.iter().map(|&v| v as i32).sum();
+            if current == target { break; }
+            let idx = start + ((rng() as usize) % (len - start));
+            if current < target && seq[idx] == -1 { seq[idx] = 1; }
+            else if current > target && seq[idx] == 1 { seq[idx] = -1; }
+        }
+    };
+    let max_restarts = 10_000_000;
+    let max_flips = n * n * 50;
+    for restart in 0..max_restarts {
+        if found.load(AtomicOrdering::Relaxed) { break; }
+        let tuple = &norm[(rng() as usize) % norm.len()];
+        let mut x = rand_seq(n, &mut rng);
+        let mut y = rand_seq(n, &mut rng);
+        let mut z = rand_seq(n, &mut rng);
+        let mut w = rand_seq(m, &mut rng);
+        x[0] = 1; y[0] = 1; z[0] = 1; z[n-1] = 1; w[0] = 1;
+        fix_sum(&mut x, tuple.x, &mut rng, 1);
+        fix_sum(&mut y, tuple.y, &mut rng, 1);
+        fix_sum(&mut z[..n-1], tuple.z - 1, &mut rng, 1);
+        fix_sum(&mut w, tuple.w, &mut rng, 1);
+        let mut corr = compute_corr(problem, &x, &y, &z, &w);
+        let mut defect = defect_from_corr(&corr);
+        stats.xy_nodes += 1;
+        if defect == 0 {
+            found.store(true, AtomicOrdering::Relaxed);
+            if verbose { println!("Solution found!"); }
+            let ok = verify_tt(problem, &PackedSeq::from_values(&x), &PackedSeq::from_values(&y),
+                               &PackedSeq::from_values(&z), &PackedSeq::from_values(&w));
+            return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: ok };
+        }
+        let mut temp = (defect as f64).sqrt().max(50.0);
+        let cooling = (0.1f64 / temp).powf(1.0 / max_flips as f64).max(0.99);
+        let mut delta_corr = vec![0i32; n];
+        for flip in 0..max_flips {
+            if flip % 1000 == 0 && found.load(AtomicOrdering::Relaxed) { break; }
+            let seq_idx = (rng() as usize) % 4;
+            let seq_len = if seq_idx < 3 { n } else { m };
+            let weight: i32 = if seq_idx < 2 { 1 } else { 2 };
+            let seq: &mut [i8] = match seq_idx { 0 => &mut x, 1 => &mut y, 2 => &mut z, _ => &mut w };
+            let p = 1 + ((rng() as usize) % (seq_len - 1));
+            if seq_idx == 2 && p >= n - 1 { continue; }
+            let v = seq[p];
+            let mut q = 1 + ((rng() as usize) % (seq_len - 1));
+            let mut tries = 0;
+            while (seq[q] != v || q == p || (seq_idx == 2 && q >= n - 1)) && tries < seq_len {
+                q = 1 + ((rng() as usize) % (seq_len - 1));
+                tries += 1;
+            }
+            if tries >= seq_len { continue; }
+            let vi = v as i32;
+            let mut new_defect = 0i64;
+            for s in 1..n {
+                let mut dc = 0i32;
+                if p + s < seq_len { let other = if p + s == q { -vi } else { seq[p + s] as i32 }; dc += (-vi) * other - vi * (seq[p + s] as i32); }
+                if p >= s { let other = if p - s == q { -vi } else { seq[p - s] as i32 }; dc += other * (-vi) - (seq[p - s] as i32) * vi; }
+                if q + s < seq_len && q + s != p { let other = seq[q + s] as i32; dc += (-vi) * other - vi * other; }
+                if q >= s && q - s != p { let other = seq[q - s] as i32; dc += other * (-vi) - other * vi; }
+                delta_corr[s] = dc * weight;
+                let new_c = corr[s] as i64 + delta_corr[s] as i64;
+                new_defect += new_c * new_c;
+            }
+            stats.xy_nodes += 1;
+            let delta = new_defect - defect;
+            let accept = if delta <= 0 { true }
+                else if temp > 0.1 { (rng() % 10000) as f64 / 10000.0 < (-delta as f64 / temp).exp() }
+                else { false };
+            if accept {
+                seq[p] = -v; seq[q] = -v;
+                for s in 1..n { corr[s] += delta_corr[s]; }
+                defect = new_defect;
+                if defect == 0 {
+                    let _ = seq;
+                    found.store(true, AtomicOrdering::Relaxed);
+                    if verbose {
+                        println!("Solution found at restart {} flip {}!", restart, flip);
+                        println!("X={}", x.iter().map(|&v| if v == 1 { '+' } else { '-' }).collect::<String>());
+                        println!("Y={}", y.iter().map(|&v| if v == 1 { '+' } else { '-' }).collect::<String>());
+                        println!("Z={}", z.iter().map(|&v| if v == 1 { '+' } else { '-' }).collect::<String>());
+                        println!("W={}", w.iter().map(|&v| if v == 1 { '+' } else { '-' }).collect::<String>());
+                    }
+                    let ok = verify_tt(problem, &PackedSeq::from_values(&x), &PackedSeq::from_values(&y),
+                                       &PackedSeq::from_values(&z), &PackedSeq::from_values(&w));
+                    return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: ok };
+                }
+            }
+            temp *= cooling;
+        }
+        if verbose && restart % 5000 == 0 && restart > 0 {
+            println!("Restart {}: defect={}, elapsed={:.1?}", restart, defect, run_start.elapsed());
+        }
+    }
+    SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false }
+}
+
 fn parse_args() -> SearchConfig {
     let mut cfg = SearchConfig::default();
     for arg in env::args().skip(1) {
@@ -1266,6 +1433,8 @@ fn parse_args() -> SearchConfig {
             cfg.benchmark_repeats = v.parse().unwrap_or(1);
         } else if arg == "--benchmark" {
             cfg.benchmark_repeats = 5;
+        } else if arg == "--stochastic" {
+            cfg.stochastic = true;
         }
     }
     cfg
@@ -1275,6 +1444,9 @@ fn main() {
     let cfg = parse_args();
     if cfg.benchmark_repeats > 0 {
         run_benchmark(&cfg);
+    } else if cfg.stochastic {
+        let report = stochastic_search(cfg.problem, true);
+        println!("Stochastic search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     } else {
         run_search(&cfg, true);
     }
@@ -1337,6 +1509,7 @@ mod tests {
             max_w: 200_000,
             max_pairs_per_bucket: 2_000,
             benchmark_repeats: 1,
+            stochastic: false,
         };
         let report = run_search(&cfg, false);
         assert!(report.found_solution);
@@ -1383,5 +1556,13 @@ mod tests {
         };
         assert!(verify_tt(p, &x, &y, &candidate.z, &candidate.w));
         assert!(stats.xy_nodes > 0);
+    }
+
+    #[test]
+    fn stochastic_search_finds_tt8() {
+        let p = Problem::new(8);
+        let report = stochastic_search(p, false);
+        assert!(report.found_solution);
+        assert!(report.elapsed.as_secs_f64() < 30.0);
     }
 }
