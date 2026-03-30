@@ -201,6 +201,7 @@ struct SearchConfig {
     max_pairs_per_bucket: usize,
     benchmark_repeats: usize,
     stochastic: bool,
+    stochastic_seconds: u64,
 }
 
 impl Default for SearchConfig {
@@ -214,6 +215,7 @@ impl Default for SearchConfig {
             max_pairs_per_bucket: 5_000,
             benchmark_repeats: 0,
             stochastic: false,
+            stochastic_seconds: 0,
         }
     }
 }
@@ -1221,6 +1223,14 @@ fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 }
 
 fn run_benchmark(cfg: &SearchConfig) {
+    if cfg.stochastic {
+        run_stochastic_benchmark(cfg);
+    } else {
+        run_exhaustive_benchmark(cfg);
+    }
+}
+
+fn run_exhaustive_benchmark(cfg: &SearchConfig) {
     let repeats = cfg.benchmark_repeats.max(1);
     let warmup = run_search(cfg, false);
     println!(
@@ -1266,6 +1276,43 @@ fn run_benchmark(cfg: &SearchConfig) {
     );
 }
 
+fn run_stochastic_benchmark(cfg: &SearchConfig) {
+    let secs = if cfg.stochastic_seconds > 0 { cfg.stochastic_seconds } else { 10 };
+    let repeats = cfg.benchmark_repeats.max(1);
+    // Warmup
+    let warmup = stochastic_search(cfg.problem, false, secs);
+    let warmup_rate = warmup.stats.xy_nodes as f64 / warmup.elapsed.as_secs_f64();
+    println!(
+        "benchmark,warmup,elapsed_s={:.3},flips={},flips_per_sec={:.0},found_solution={}",
+        warmup.elapsed.as_secs_f64(),
+        warmup.stats.xy_nodes,
+        warmup_rate,
+        warmup.found_solution
+    );
+    println!("benchmark,run,elapsed_s,flips,flips_per_sec,found_solution");
+    let mut rates = Vec::with_capacity(repeats);
+    for run in 1..=repeats {
+        let report = stochastic_search(cfg.problem, false, secs);
+        let rate = report.stats.xy_nodes as f64 / report.elapsed.as_secs_f64();
+        rates.push(rate);
+        println!(
+            "benchmark,{},{:.3},{},{:.0},{}",
+            run,
+            report.elapsed.as_secs_f64(),
+            report.stats.xy_nodes,
+            rate,
+            report.found_solution
+        );
+    }
+    rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let median = rates[rates.len() / 2];
+    let mean = rates.iter().sum::<f64>() / rates.len() as f64;
+    println!(
+        "benchmark,summary,mean_flips_per_sec={:.0},median_flips_per_sec={:.0},repeats={}",
+        mean, median, repeats
+    );
+}
+
 fn compute_corr(problem: Problem, x: &[i8], y: &[i8], z: &[i8], w: &[i8]) -> Vec<i32> {
     let n = problem.n;
     let m = problem.m();
@@ -1291,21 +1338,27 @@ fn defect_from_corr(corr: &[i32]) -> i64 {
     corr.iter().skip(1).map(|&c| (c as i64) * (c as i64)).sum()
 }
 
-fn stochastic_search(problem: Problem, verbose: bool) -> SearchReport {
+fn stochastic_search(problem: Problem, verbose: bool, time_limit_secs: u64) -> SearchReport {
     let run_start = Instant::now();
     let workers = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(1).max(1);
     if verbose {
         println!("TT({}): stochastic search with {} threads", problem.n, workers);
     }
+    let time_limit = if time_limit_secs > 0 {
+        Some(std::time::Duration::from_secs(time_limit_secs))
+    } else {
+        None
+    };
     let found = Arc::new(AtomicBool::new(false));
     let norm = Arc::new(normalized_tuples(&enumerate_sum_tuples(problem)));
+    let deadline = time_limit.map(|d| Instant::now() + d);
     let mut handles = Vec::new();
     for tid in 0..workers {
         let found = Arc::clone(&found);
         let norm = Arc::clone(&norm);
         handles.push(std::thread::spawn(move || {
-            stochastic_worker(problem, &norm, &found, tid as u64, verbose && tid == 0)
+            stochastic_worker(problem, &norm, &found, tid as u64, verbose && tid == 0, deadline)
         }));
     }
     let mut best = SearchReport { stats: SearchStats::default(), elapsed: run_start.elapsed(), found_solution: false };
@@ -1319,7 +1372,7 @@ fn stochastic_search(problem: Problem, verbose: bool) -> SearchReport {
     best
 }
 
-fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, seed: u64, verbose: bool) -> SearchReport {
+fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, seed: u64, verbose: bool, deadline: Option<Instant>) -> SearchReport {
     let run_start = Instant::now();
     let mut stats = SearchStats::default();
     let n = problem.n;
@@ -1346,6 +1399,7 @@ fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, se
     let max_flips = n * n * 50;
     for restart in 0..max_restarts {
         if found.load(AtomicOrdering::Relaxed) { break; }
+        if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
         let tuple = &norm[(rng() as usize) % norm.len()];
         let mut x = rand_seq(n, &mut rng);
         let mut y = rand_seq(n, &mut rng);
@@ -1451,6 +1505,9 @@ fn parse_args() -> SearchConfig {
             cfg.benchmark_repeats = 5;
         } else if arg == "--stochastic" {
             cfg.stochastic = true;
+        } else if let Some(v) = arg.strip_prefix("--stochastic-secs=") {
+            cfg.stochastic_seconds = v.parse().unwrap_or(10);
+            cfg.stochastic = true;
         }
     }
     cfg
@@ -1461,7 +1518,7 @@ fn main() {
     if cfg.benchmark_repeats > 0 {
         run_benchmark(&cfg);
     } else if cfg.stochastic {
-        let report = stochastic_search(cfg.problem, true);
+        let report = stochastic_search(cfg.problem, true, cfg.stochastic_seconds);
         println!("Stochastic search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     } else {
         run_search(&cfg, true);
@@ -1526,6 +1583,7 @@ mod tests {
             max_pairs_per_bucket: 2_000,
             benchmark_repeats: 1,
             stochastic: false,
+            stochastic_seconds: 0,
         };
         let report = run_search(&cfg, false);
         assert!(report.found_solution);
@@ -1577,7 +1635,7 @@ mod tests {
     #[test]
     fn stochastic_search_finds_tt8() {
         let p = Problem::new(8);
-        let report = stochastic_search(p, false);
+        let report = stochastic_search(p, false, 0);
         assert!(report.found_solution);
         assert!(report.elapsed.as_secs_f64() < 30.0);
     }

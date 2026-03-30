@@ -4,42 +4,61 @@ This file tracks performance-oriented changes and their measured impact.
 
 ## Benchmark protocol (use this for apples-to-apples comparison)
 
-- Build once in release mode.
-- Run exactly:
+Build once in release mode. Run both benchmarks. Each should take ~6–10s per run, long enough to avoid system noise.
+
+### Primary: Exhaustive search (Phase B throughput)
 
 ```bash
 cargo build --release
-target/release/turyn --n=22 --theta=192 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=3
+target/release/turyn --n=16 --theta=20000 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3
 ```
 
 - Compare `benchmark,summary,mean_ms=...` and `median_ms=...`.
+- Exercises Phase B: DFS sequence generation + FFT spectral filtering.
+- Phase C (XY backtracking) is never entered at this n/θ — `xy_nodes=0`.
+- Each run takes ~6s. Deterministic (same work units each run).
+- Does not find a solution (spectral pair filter rejects all Z/W pairs at n=16).
+
+### Secondary: Stochastic search (SA throughput)
+
+```bash
+target/release/turyn --n=16 --stochastic-secs=10 --benchmark=3
+```
+
+- Compare `benchmark,summary,mean_flips_per_sec=...` and `median_flips_per_sec=...`.
+- Exercises the simulated annealing inner loop: pair swap + O(n) incremental defect update.
+- Each run is time-limited to 10s. Measures **flips/sec** (SA move evaluations per second).
+- May or may not find a solution within the time window (TT(16) SA typically solves in 1–9s).
+- When a solution is found, the run stops early but flips/sec is still valid.
+- Stretch goal: once stochastic improvements push TT(18) into range, switch to `--n=18`.
+
+### Rules
+
 - Keep all benchmark parameters fixed when comparing two versions.
-
-## Smallest benchmark profile that currently finds a solution (under 10s)
-
-- Command:
-  `target/release/turyn --n=4 --theta=64 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=1`
-- Result:
-  - `warmup found_solution=true`
-  - `run found_solution=true`
-  - `mean_ms=0.052`
+- Run both benchmarks for each optimization; an idea may help one and hurt the other.
+- Benchmark runs should target 6–60s each. Under 6s is too noisy; over 60s wastes iteration time.
 
 ## Current baseline (latest)
 
+- Exhaustive search (n=16, theta=20000):
+  - Command: `target/release/turyn --n=16 --theta=20000 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3`
+  - Result: `mean_ms=6092, median_ms=6160`
+
+- Stochastic search (n=16, 10s time limit):
+  - Command: `target/release/turyn --n=16 --stochastic-secs=10 --benchmark=3`
+  - Result: `mean_flips_per_sec=29_362_982, median_flips_per_sec=29_462_228`
+
+### Legacy baselines (for reference)
+
 - Exhaustive search (n=14, theta=128):
-  - Command: `target/release/turyn --n=14 --theta=128 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=7`
-  - Result: `mean_ms=5.70, median_ms=5.69`
-
+  - `mean_ms=5.70, median_ms=5.69`
 - Exhaustive search (n=16, theta=256):
-  - Command: `target/release/turyn --n=16 --theta=256 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=7`
-  - Result: `mean_ms=20.20, median_ms=20.17`
-
-- Stochastic search (`--stochastic`):
-  - TT(6): ~0.6ms, TT(8): ~0.8ms, TT(14): ~175ms
-  - TT(22): reaches defect ~64 but does not yet converge to 0
-
+  - `mean_ms=20.20, median_ms=20.17`
 - Previous n=22 exhaustive baseline (different machine):
   `mean_ms=11222.901`, `median_ms=11148.973`
+- Stochastic search (time-to-solution, no time limit):
+  - TT(6): ~0.6ms, TT(8): ~0.8ms, TT(14): ~4.5s, TT(16): ~1.5–8.5s
+  - TT(18): converges in ~580s (slow), TT(22): does not converge
 
 
 
