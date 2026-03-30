@@ -9,7 +9,7 @@ This file tracks performance-oriented changes and their measured impact.
 
 ```bash
 cargo build --release
-target/release/turyn --n=14 --theta=64 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=5
+target/release/turyn --n=22 --theta=192 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=3
 ```
 
 - Compare `benchmark,summary,mean_ms=...` and `median_ms=...`.
@@ -18,15 +18,16 @@ target/release/turyn --n=14 --theta=64 --max-z=200000 --max-w=200000 --max-pairs
 ## Current baseline (latest)
 
 - Command:
-  `target/release/turyn --n=14 --theta=64 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=7`
+  `target/release/turyn --n=22 --theta=192 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=3`
 - Result:
-  - `mean_ms=5.195`
-  - `median_ms=5.291`
+  - `mean_ms=10984.050`
+  - `median_ms=10955.741`
 
 ## Optimization history
 
 | Date (UTC) | Change | Why it helps | Measured effect |
 |---|---|---|---|
+| 2026-03-30 | Switched boundary bucket keys from heap-allocated `Vec<i8>` signatures to packed-bit signatures for small `k`, and rewired XY lag updates to iterate currently assigned positions instead of scanning all lags per set/unset. | Removes per-sequence key allocation/hashing overhead in Phase B and trims redundant lag-loop work in XY state updates. | ~5.83% mean improvement and ~6.17% median improvement on the new longer-chain benchmark (`11663.583 -> 10984.050` mean, `11676.437 -> 10955.741` median). |
 | 2026-03-28 | Added explicit warmup run in benchmark mode before measured repeats. | Removes cold-start noise from reported benchmark summary and makes comparisons more stable. | New baseline from warm runs: `mean_ms=5.195`, `median_ms=5.291` (`--benchmark=7`). |
 | 2026-03-28 | Hoisted i8→f64 conversion out of inner spectral loops (build `values_f64` once per generated sequence, then use it across all theta samples in `spectrum_if_ok`). | Removes repeated per-sample scalar casts in the hottest spectral loop. | ~34.12% mean improvement and ~31.42% median improvement vs immediate prior run (`19.094 -> 12.579` mean, `18.071 -> 12.392` median). |
 | 2026-03-28 | Streamed sequence generation via callback (`generate_sequences_with_sum_visit`) and processed raw `&[i8]` values directly in Phase B (`spectrum_if_ok`, `autocorrs_from_values`, boundary signature). Only materialize `PackedSeq` for retained candidates. | Removed repeated pack/unpack and temporary object churn in candidate generation. | ~31.44% mean improvement and ~28.03% median improvement vs prior baseline (`8.984 -> 6.159` mean, `8.394 -> 6.041` median). |
