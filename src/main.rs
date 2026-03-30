@@ -1654,7 +1654,7 @@ impl SatEncoder {
         }
 
         // Base case: s[0][1] ↔ lits[0]
-        if k >= 1 {
+        if s[0][1] != 0 {
             solver.add_clause([-lits[0], s[0][1]]);
             solver.add_clause([lits[0], -s[0][1]]);
         }
@@ -1755,84 +1755,60 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
         let w_overlap = if k < m { m - k } else { 0 };
         let target = 2 * (n - k) + w_overlap; // agree_xy + 2*agree_zw = target
 
-        let mut xy_agree_lits = Vec::new();
+        let mut xy_lits = Vec::new();
         for i in 0..(n - k) {
-            xy_agree_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
+            xy_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
         }
         for i in 0..(n - k) {
-            xy_agree_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
+            xy_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
         }
 
-        let mut zw_agree_lits = Vec::new();
+        let mut zw_lits = Vec::new();
         for i in 0..(n - k) {
-            zw_agree_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
+            zw_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
         }
         for i in 0..w_overlap {
-            zw_agree_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
+            zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
         }
 
-        let max_xy = xy_agree_lits.len();
-        let max_zw = zw_agree_lits.len();
-
-        // Build counter variables for XY and ZW agree counts.
-        // xy_eq[c] = aux var meaning "exactly c of xy_agree_lits are true"
-        // zw_eq[c] = aux var meaning "exactly c of zw_agree_lits are true"
-        // We'll use a simpler approach: for each valid (c_xy, c_zw) pair,
-        // encode the conjunction (xy_count=c_xy ∧ zw_count=c_zw) and OR them.
-        //
-        // However, that's complex. Instead, use at-most-k and at-least-k to
-        // constrain: for each valid c_zw, IF zw_count == c_zw THEN xy_count == target - 2*c_zw.
-        //
-        // Simplest correct approach: enumerate valid c_zw values and for each one
-        // create a branch. Use selector variables.
-
-        let mut valid_splits: Vec<(usize, usize)> = Vec::new();
-        for c_zw in 0..=max_zw {
-            let needed_xy = target as isize - 2 * c_zw as isize;
-            if needed_xy >= 0 && (needed_xy as usize) <= max_xy {
-                valid_splits.push((needed_xy as usize, c_zw));
-            }
-        }
-
-        if valid_splits.is_empty() {
-            solver.add_clause([]); // force UNSAT — no valid split
-            continue;
-        }
-
-        // Encode weighted constraint: agree_xy + 2*agree_zw = target.
-        // Build at-least counters for XY and ZW. For each valid (c_xy, c_zw)
-        // pair, create a selector. At least one selector must be true,
-        // and each implies the exact cardinality of both groups.
-        let xy_ctr = enc.build_counter(&mut solver, &xy_agree_lits);
-        let zw_ctr = enc.build_counter(&mut solver, &zw_agree_lits);
+        // Weighted constraint: count(xy true) + 2*count(zw true) = target.
+        // Enumerate valid (c_xy, c_zw) splits. For each, create a selector
+        // that implies exact cardinality on both groups. OR all selectors.
+        let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
+        let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
 
         let mut selectors = Vec::new();
-        for &(c_xy, c_zw) in &valid_splits {
+        for c_zw in 0..=zw_lits.len() {
+            let rem = target as isize - 2 * c_zw as isize;
+            if rem < 0 || rem as usize > xy_lits.len() { continue; }
+            let c_xy = rem as usize;
+
             let sel = enc.fresh();
 
-            // sel → (xy count == c_xy): at-least c_xy AND at-most c_xy
+            // sel → (xy count >= c_xy)
             if c_xy > 0 {
                 if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
                     solver.add_clause([-sel, xy_ctr[c_xy]]);
                 } else {
-                    // c_xy > 0 but counter doesn't go that high — impossible split
-                    solver.add_clause([-sel]);
-                    continue; // don't add to selectors
+                    solver.add_clause([-sel]); // impossible
+                    continue;
                 }
             }
+            // sel → (xy count <= c_xy), i.e., ¬(xy >= c_xy+1)
             if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
                 solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
             }
 
-            // sel → (zw count == c_zw): at-least c_zw AND at-most c_zw
+            // sel → (zw count >= c_zw)
             if c_zw > 0 {
                 if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
                     solver.add_clause([-sel, zw_ctr[c_zw]]);
                 } else {
-                    solver.add_clause([-sel]);
+                    solver.add_clause([-sel]); // impossible
                     continue;
                 }
             }
+            // sel → (zw count <= c_zw)
             if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
                 solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
             }
@@ -1840,7 +1816,6 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
             selectors.push(sel);
         }
 
-        // At least one selector must be true
         if selectors.is_empty() {
             solver.add_clause([]); // UNSAT
         } else {
@@ -2154,7 +2129,168 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // WIP: same weighted cardinality bug affects multi-split lags at n=4
+    #[ignore] // WIP: selector-based weighted cardinality encoding
+    fn sat_autocorr_only_n4() {
+        // Test: just autocorrelation constraints (no sums, no symmetry breaking)
+        let n = 4usize;
+        let m = 3usize;
+        let mut enc = SatEncoder::new(n);
+        let mut solver: cadical::Solver = Default::default();
+
+        for k in 1..n {
+            let w_overlap = if k < m { m - k } else { 0 };
+            let target = 2 * (n - k) + w_overlap;
+
+            let mut xy_lits = Vec::new();
+            for i in 0..(n - k) {
+                xy_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
+            }
+            for i in 0..(n - k) {
+                xy_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
+            }
+            let mut zw_lits = Vec::new();
+            for i in 0..(n - k) {
+                zw_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
+            }
+            for i in 0..w_overlap {
+                zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
+            }
+
+            let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
+            let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
+
+            let mut selectors = Vec::new();
+            for c_zw in 0..=zw_lits.len() {
+                let rem = target as isize - 2 * c_zw as isize;
+                if rem < 0 || rem as usize > xy_lits.len() { continue; }
+                let c_xy = rem as usize;
+                let sel = enc.fresh();
+                if c_xy > 0 {
+                    if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
+                        solver.add_clause([-sel, xy_ctr[c_xy]]);
+                    } else { solver.add_clause([-sel]); continue; }
+                }
+                if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
+                    solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
+                }
+                if c_zw > 0 {
+                    if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
+                        solver.add_clause([-sel, zw_ctr[c_zw]]);
+                    } else { solver.add_clause([-sel]); continue; }
+                }
+                if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
+                    solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
+                }
+                selectors.push(sel);
+            }
+            assert!(!selectors.is_empty(), "lag {} has no valid splits", k);
+            solver.add_clause(selectors.iter().copied());
+        }
+
+        let result = solver.solve();
+        assert_eq!(result, Some(true), "autocorr-only n=4 should be SAT");
+    }
+
+    #[test]
+    fn sat_counter_with_xnor_hardcoded() {
+        // Minimal test: hardcode X=[1,1,1,1], check XY agree at lag 3 = exactly 2
+        let mut enc = SatEncoder { n: 4, m: 3, next_var: 9 }; // vars 1-4=X, 5-8=Y
+        let mut solver: cadical::Solver = Default::default();
+        // X = [T,T,T,T], Y = [T,F,T,T]
+        for v in 1..=4 { solver.add_clause([v]); } // all X = true
+        solver.add_clause([5]); // Y[0]=T
+        solver.add_clause([-6]); // Y[1]=F
+        solver.add_clause([7]); // Y[2]=T
+        solver.add_clause([8]); // Y[3]=T
+
+        // XY agree at lag 3: (X0,X3)=(T,T)=agree, (Y0,Y3)=(T,T)=agree
+        let ag1 = enc.encode_xnor(&mut solver, 1, 4); // X0 XNOR X3
+        let ag2 = enc.encode_xnor(&mut solver, 5, 8); // Y0 XNOR Y3
+        let lits = vec![ag1, ag2];
+        let ctr = enc.build_counter(&mut solver, &lits);
+        // Enforce exactly 2 via counter
+        assert!(ctr.len() >= 3 && ctr[2] != 0);
+        solver.add_clause([ctr[2]]); // at least 2
+        // ctr[3] doesn't exist (len=3), so at-most-2 is automatic
+
+        let result = solver.solve();
+        assert_eq!(result, Some(true), "hardcoded XY agrees at lag 3 should give exactly 2");
+    }
+
+    #[test]
+    #[ignore] // WIP: selector-based weighted cardinality encoding
+    fn sat_autocorr_hardcoded_tt4() {
+        // Hardcode the known TT(4) solution and check if the encoding is consistent
+        // X=[1,1,1,1], Y=[1,-1,1,1], Z=[1,1,-1,-1], W=[1,-1,1]
+        let n = 4usize;
+        let m = 3usize;
+        let mut enc = SatEncoder::new(n);
+        let mut solver: cadical::Solver = Default::default();
+
+        // Hardcode solution
+        let x = [1i8, 1, 1, 1];
+        let y = [1i8, -1, 1, 1];
+        let z = [1i8, 1, -1, -1];
+        let w = [1i8, -1, 1];
+        for i in 0..n { solver.add_clause([if x[i] == 1 { enc.x_var(i) } else { -enc.x_var(i) }]); }
+        for i in 0..n { solver.add_clause([if y[i] == 1 { enc.y_var(i) } else { -enc.y_var(i) }]); }
+        for i in 0..n { solver.add_clause([if z[i] == 1 { enc.z_var(i) } else { -enc.z_var(i) }]); }
+        for i in 0..m { solver.add_clause([if w[i] == 1 { enc.w_var(i) } else { -enc.w_var(i) }]); }
+
+        // Add autocorrelation constraints (same as sat_autocorr_only_n4)
+        for k in 1..n {
+            let w_overlap = if k < m { m - k } else { 0 };
+            let target = 2 * (n - k) + w_overlap;
+            let mut xy_lits = Vec::new();
+            for i in 0..(n - k) {
+                xy_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
+            }
+            for i in 0..(n - k) {
+                xy_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
+            }
+            let mut zw_lits = Vec::new();
+            for i in 0..(n - k) {
+                zw_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
+            }
+            for i in 0..w_overlap {
+                zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
+            }
+            let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
+            let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
+            let mut selectors = Vec::new();
+            for c_zw in 0..=zw_lits.len() {
+                let rem = target as isize - 2 * c_zw as isize;
+                if rem < 0 || rem as usize > xy_lits.len() { continue; }
+                let c_xy = rem as usize;
+                let sel = enc.fresh();
+                if c_xy > 0 {
+                    if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
+                        solver.add_clause([-sel, xy_ctr[c_xy]]);
+                    } else { solver.add_clause([-sel]); continue; }
+                }
+                if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
+                    solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
+                }
+                if c_zw > 0 {
+                    if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
+                        solver.add_clause([-sel, zw_ctr[c_zw]]);
+                    } else { solver.add_clause([-sel]); continue; }
+                }
+                if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
+                    solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
+                }
+                selectors.push(sel);
+            }
+            assert!(!selectors.is_empty(), "lag {} no valid splits (target={})", k, target);
+            solver.add_clause(selectors.iter().copied());
+        }
+
+        let result = solver.solve();
+        assert_eq!(result, Some(true), "hardcoded TT(4) solution should be consistent with encoding");
+    }
+
+    #[test]
+    #[ignore] // WIP: weighted cardinality bug
     fn sat_finds_tt4() {
         let p = Problem::new(4);
         let report = run_sat_search(p, false);
