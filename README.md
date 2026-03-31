@@ -6,23 +6,40 @@ The long-term goal is TT(56), which yields a **Hadamard matrix of order 668**.
 
 ## Current results
 
-| n | Best time | Method | Hadamard |
-|---|---|---|---|
-| 4 | <1ms | full SAT | 44 |
-| 6 | <1ms | full SAT | 68 |
-| 8 | 1.4ms | full SAT | 92 |
-| 10 | 106ms | full SAT | 116 |
-| 12 | 792ms | full SAT | 140 |
-| 14 | 310ms | full SAT | 164 |
-| 16 | 3.9s | full SAT | 188 |
-| 18 | 3.7s | full SAT | 212 |
-| 20 | 49s | full SAT | 236 |
-| 22 | 39s | hybrid | 260 |
-| 24 | 3.1s | hybrid | 284 |
+| n | Hadamard | full SAT | hybrid | z-sat | stochastic | best |
+|---|---|---|---|---|---|---|
+| 4 | 44 | 0.7ms | **0.3ms** | 0.5ms | — | hybrid |
+| 6 | 68 | 5.8ms | **0.5ms** | 3.4ms | — | hybrid |
+| 8 | 92 | 3.1ms | **1.1ms** | 1.9ms | 2.1ms | hybrid |
+| 10 | 116 | 23ms | **1.7ms** | 11ms | 9.7ms | hybrid |
+| 12 | 140 | 61ms | **11ms** | 81ms | 101ms | hybrid |
+| 14 | 164 | 462ms | **35ms** | 851ms | 676ms | hybrid |
+| 16 | 188 | 4.0s | 185ms | 25s | **157ms** | stochastic |
+| 18 | 212 | **3.8s** | 3.0s | timeout | timeout | hybrid |
+| 20 | 236 | 52s | **1.3s** | timeout | timeout | hybrid |
+| 22 | 260 | timeout | **40s** | timeout | — | hybrid |
+| 24 | 284 | timeout | **4.2s** | timeout | — | hybrid |
 
-All solved with **radical**, a pure Rust CDCL SAT solver included as a subcrate. No external C/C++ dependencies.
+All solved with **radical**, a pure Rust CDCL SAT solver included as a subcrate. No external C/C++ dependencies. Timeout = 2 minutes wall-clock. Stochastic is nondeterministic; times vary between runs.
 
 Known solutions exist in the literature for all even n up to 44 (London-Kotsireas 2025). The current bottleneck for n >= 26 is SAT solver performance at scale.
+
+### Benchmarking rules
+
+When regenerating this table:
+
+1. Build once with `cargo build --release`.
+2. Run each strategy for each even n from 4 to the largest n where at least one strategy succeeds.
+3. Timeout is **2 minutes** wall-clock per run. Record "timeout" for any run exceeding this.
+4. Record "—" for strategies known to not apply (e.g., stochastic at very small n where it doesn't converge).
+5. Bold the winning time in each row. Record the winning strategy name in the "best" column.
+6. Commands per strategy:
+   - **full SAT**: `target/release/turyn --n=N --sat`
+   - **hybrid**: `target/release/turyn --n=N --sat-xy --theta=128 --max-z=200000 --max-w=200000 --max-pairs=5000 --k=0`
+   - **z-sat**: `target/release/turyn --n=N --z-sat --theta=128 --max-z=50000`
+   - **stochastic**: `target/release/turyn --n=N --stochastic`
+7. Times are single-run wall-clock (not benchmark-mode averages). For noisy results, take the median of 3 runs.
+8. Continue increasing n past the main table until all strategies timeout, to find the frontier.
 
 ## Quick start
 
