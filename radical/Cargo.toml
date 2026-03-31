@@ -1,0 +1,5 @@
+[package]
+name = "radical"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust CDCL SAT solver inspired by CaDiCaL"
