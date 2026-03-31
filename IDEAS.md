@@ -255,3 +255,19 @@ For each lag s with agree target T, the parity constraint `sum(x_i XOR x_{i+s}) 
 
 **Implemented.** Benchmark n=22: **~15.4s (neutral)**. At n=22, the parity equations involve many variables each, so GJ produces few 2-variable rows after elimination. May help more at larger n with denser equation systems.
 
+### 5. Rephasing / target phases *(from Claude)*
+
+Periodically reset phase saving to the best-known assignment (lowest number of unsatisfied constraints) or random polarities. CaDiCaL alternates between "focused" mode (use phase saving) and "stable" mode (use target phases from best-seen assignment). This helps escape local minima where phase saving keeps returning to the same region. Low implementation effort: track best assignment seen so far, periodically overwrite `phase[]`.
+
+### 6. Clause compaction / GC *(from Claude)*
+
+radical marks deleted clauses with `deleted: true` but never reclaims memory from `clause_lits`. Over many solver invocations (168 tuples at n=22, each cloning the template), the clause database fragments. Compaction rewrites `clause_lits` to remove dead entries and remaps all clause indices. Expected to improve cache locality in BCP.
+
+### 7. Subsumption / self-subsumption *(from Claude)*
+
+After adding learnt clauses, check if any existing clause is subsumed (all its literals appear in a shorter clause). Remove subsumed clauses and strengthen clauses where one literal can be removed. CaDiCaL does this during inprocessing. Medium implementation effort.
+
+### 8. BVE preprocessing *(from Claude)*
+
+With quad PB generating explanation clauses on the fly, temporary auxiliary variables may accumulate. BVE resolves away variables that appear in few clauses by producing resolvents. For the current encoding (44 primary vars + generated explanation clauses), BVE could eliminate intermediate variables from explanation clauses, tightening the clause database.
+
