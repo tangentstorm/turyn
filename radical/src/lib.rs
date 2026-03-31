@@ -466,9 +466,12 @@ impl Solver {
         let mut p: Lit = 0; // current resolvent literal
 
         loop {
-            // Resolve with the reason clause
-            let clause_lits = self.clause_lits(reason_ci).to_vec();
-            for &lit in &clause_lits {
+            // Resolve with the reason clause (use raw indices to avoid borrow + copy)
+            let m = self.clause_meta[reason_ci as usize];
+            let cstart = m.start as usize;
+            let clen = m.len as usize;
+            for ki in 0..clen {
+                let lit = self.clause_lits[cstart + ki];
                 if lit == p { continue; } // skip the resolvent
                 let v = var_of(lit);
                 if seen[v] { continue; }
