@@ -1054,6 +1054,34 @@ struct SatXYTemplate {
 ///
 /// Returns: vec of (var_a, var_b, equal: bool) pairs — if equal is true,
 /// var_a = var_b; otherwise var_a = ¬var_b. Variables are 1-based.
+/// GF(2) row: a bitset of variable indices + a constant (0 or 1).
+/// Represents the equation: XOR of variables in the set = constant.
+#[derive(Clone)]
+struct Gf2Row {
+    vars: Vec<bool>, // vars[i] = true if variable i participates
+    constant: bool,  // right-hand side
+}
+
+impl Gf2Row {
+    fn new(num_vars: usize) -> Self {
+        Self { vars: vec![false; num_vars], constant: false }
+    }
+    fn xor_with(&mut self, other: &Gf2Row) {
+        for i in 0..self.vars.len() {
+            self.vars[i] ^= other.vars[i];
+        }
+        self.constant ^= other.constant;
+    }
+    /// Find the first set variable (pivot column), or None if all zero.
+    fn pivot(&self) -> Option<usize> {
+        self.vars.iter().position(|&v| v)
+    }
+    /// Count set variables.
+    fn popcount(&self) -> usize {
+        self.vars.iter().filter(|&&v| v).count()
+    }
+}
+
 fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Vec<(i32, i32, bool)> {
     let num_vars = 2 * n;
     // Union-find with negation tracking (XOR-union-find)
@@ -1132,14 +1160,107 @@ fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Vec<(i32, i32, 
         }
     }
 
-    // Extract non-trivial equalities (vars that share a root with another var)
+    // GF(2) Gauss-Jordan elimination on parity constraints from ALL lags.
+    // For each lag s with target T:
+    //   parity(agree_count) = T mod 2
+    //   agree(x_i, x_{i+s}) = x_i XNOR x_{i+s} = 1 ⊕ x_i ⊕ x_{i+s}
+    //   sum of agrees mod 2 = T mod 2
+    //   k + sum(x_i ⊕ x_{i+s}) mod 2 = T mod 2   (where k = # pairs)
+    //   sum(x_i ⊕ x_{i+s}) mod 2 = (T + k) mod 2
+    //
+    // sum(x_i ⊕ x_{i+s}) = sum(x_i) + sum(x_{i+s}) mod 2 (for distinct i)
+    // Each variable x_v appears in the XOR sum once per occurrence in a pair.
+    // Variable x_v appears as first element of pair (v, v+s) if v < n-s,
+    // and as second element of pair (v-s, v) if v >= s.
+    // So the total parity of a variable in the XOR sum depends on
+    // how many times it appears in pairs, which determines its coefficient mod 2.
+    {
+        let mut rows: Vec<Gf2Row> = Vec::new();
+        for s in 1..n {
+            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
+            if target_raw < 0 || target_raw % 2 != 0 { continue; }
+            let target = (target_raw / 2) as usize;
+            let k = 2 * (n - s); // total pairs (X + Y)
+
+            // Build GF(2) equation: for each pair (i, i+s), x_i and x_{i+s} each
+            // appear once. XOR of all these = (T + k) mod 2.
+            let mut row = Gf2Row::new(num_vars);
+            // X pairs
+            for i in 0..(n - s) {
+                row.vars[i] ^= true;       // x_i
+                row.vars[i + s] ^= true;   // x_{i+s}
+            }
+            // Y pairs
+            for i in 0..(n - s) {
+                row.vars[n + i] ^= true;       // y_i
+                row.vars[n + i + s] ^= true;   // y_{i+s}
+            }
+            row.constant = ((target + k) % 2) == 1;
+            // Skip trivial rows (all zeros)
+            if row.popcount() > 0 {
+                rows.push(row);
+            }
+        }
+
+        // Gauss-Jordan elimination
+        let mut pivot_row: Vec<Option<usize>> = vec![None; num_vars];
+        for r in 0..rows.len() {
+            // Reduce row r against existing pivots
+            loop {
+                let Some(col) = rows[r].pivot() else { break };
+                if let Some(pr) = pivot_row[col] {
+                    let pr_row = rows[pr].clone();
+                    rows[r].xor_with(&pr_row);
+                } else {
+                    // This column has no pivot yet — use row r as pivot
+                    pivot_row[col] = Some(r);
+                    // Reduce all other rows
+                    let pivot = rows[r].clone();
+                    for r2 in 0..rows.len() {
+                        if r2 != r && rows[r2].vars[col] {
+                            rows[r2].xor_with(&pivot);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Extract equalities from reduced rows:
+        // A row with exactly 1 variable: that variable = constant
+        // A row with exactly 2 variables: they are equal (or negated)
+        for row in &rows {
+            let set_vars: Vec<usize> = row.vars.iter().enumerate()
+                .filter(|&(_, &v)| v).map(|(i, _)| i).collect();
+            match set_vars.len() {
+                1 => {
+                    // Forced variable: x = constant
+                    let v = set_vars[0];
+                    // Union with a "truth" anchor: if constant=1, x is true (equivalent to x[0] which is forced true)
+                    // Since x[0] is forced true by symmetry breaking, we can't directly use
+                    // union-find for forced values. Instead, add as a clause later.
+                    // For now, skip single-variable rows.
+                }
+                2 => {
+                    // Two variables: x_a ⊕ x_b = c
+                    let a = set_vars[0];
+                    let b = set_vars[1];
+                    // c=0 → a=b, c=1 → a=¬b
+                    union(&mut parent, &mut rank, &mut neg, a, b, row.constant);
+                }
+                _ => {} // more than 2 variables: can't directly use in union-find
+            }
+        }
+    }
+
+    // Extract non-trivial equalities
     let mut equalities = Vec::new();
     for v in 0..num_vars {
         let (root, is_neg) = find(&mut parent, &mut neg, v);
         if root != v {
-            let a = (v as i32) + 1;     // 1-based
-            let b = (root as i32) + 1;  // 1-based
-            equalities.push((a, b, !is_neg)); // equal if not negated
+            let a = (v as i32) + 1;
+            let b = (root as i32) + 1;
+            equalities.push((a, b, !is_neg));
         }
     }
 
