@@ -233,3 +233,45 @@ The Phase C SAT solver (radical) is the bottleneck at n=22, consuming ~96% of co
 
 See README.md for the full CaDiCaL vs radical feature comparison matrix.
 
+## Next optimization candidates (credit: Claude)
+
+### 1. Quadratic PB constraints (eliminate XNOR aux vars entirely)
+
+Eliminate all 462 XNOR auxiliary variables by extending radical with quadratic PB constraints: `sum(a_i * b_i) = target`. The agree count `agree(x_i, x_{i+s}) = x_i*x_{i+s} + ¬x_i*¬x_{i+s}` is expressed as product terms directly on primary X/Y variables.
+
+**Implemented.** Propagation generates minimal explanation clauses on-the-fly for CDCL conflict analysis. Problem shrinks from ~506 vars / ~1850 clauses to 44 vars / 2 clauses + PB + quad PB constraints. Benchmark n=22: **~15.3s (neutral)**. The on-the-fly clause generation overhead roughly equals the saved XNOR clause cost. Two rounds of optimization (minimal explanation clauses, removing per-propagation allocations) did not change the picture.
+
+### 2. BVE preprocessing (bounded variable elimination)
+
+CaDiCaL's main advantage is BVE — resolving away variables that appear in few clauses before search begins. With the quadratic PB approach, there are very few clauses left (just symmetry breaking), so BVE has little to work with. **Skipped** — the quad PB approach made this less relevant.
+
+### 3. Tier-based clause retention
+
+CaDiCaL uses 3 tiers: glue ≤ 2 (never delete), glue ≤ 6 (delete 25%), rest (delete 50%). **Tried** with multiple configurations. Benchmark n=22: **~15.8s (+3% regression)**. The original flat glue ≤ 3 threshold was already well-tuned for these instance sizes. **Reverted.**
+
+### 4. Expand GJ to partial agree targets (parity constraints)
+
+For each lag s with agree target T, the parity constraint `sum(x_i XOR x_{i+s}) mod 2 = (T+k) mod 2` gives a GF(2) equation over primary variables — valid for ALL lags, not just extreme ones. Full GJ elimination on this system discovers additional variable equivalences.
+
+**Implemented.** Benchmark n=22: **~15.4s (neutral)**. At n=22, the parity equations involve many variables each, so GJ produces few 2-variable rows after elimination. May help more at larger n with denser equation systems.
+
+### 5. Rephasing / target phases *(from Claude)*
+
+Periodically reset phase saving to the best-known assignment or random polarities. **Tried** with multiple configurations: every 500/1000/2000 conflicts, every 4th/8th restart, alternating best/random. Benchmark n=22: **neutral to +2% regression** across all configs. Two optimization passes (frequency tuning, save-at-restart-only). Phase saving alone is sufficient for these structured short-solve instances. **Reverted.**
+
+### 6. Clause compaction / GC *(from Claude)*
+
+Compact `clause_lits` after `reduce_db` by removing deleted entries and remapping indices. **Tried**: full compaction with remap of watches, trail reasons, and variable reasons. Benchmark n=22: **neutral (~15.2s)**. With the quad PB encoding, the template has almost no clauses to fragment. The clone+short-solve pattern means clause databases are fresh each invocation. **Reverted.**
+
+### 7. Subsumption / self-subsumption *(from Claude)*
+
+Check learnt clauses for subsumption. **Skipped**: same reasoning as compaction. The clone+short-solve pattern means clause databases are small and fresh. The O(n_clauses * clause_len) subsumption check cost would exceed any BCP savings.
+
+### 8. BVE preprocessing *(from Claude)*
+
+Resolve away variables appearing in few clauses. **Skipped**: with quad PB, there are only 44 primary variables and 2 permanent clauses. Explanation clauses are generated during search and discarded with the solver. No preprocessing opportunity.
+
+### Why remaining CaDiCaL features don't help
+
+All four features (rephasing, compaction, subsumption, BVE) address problems in **long-running solves with large clause databases**. Our usage pattern is fundamentally different: **clone template → add per-candidate PB constraints → short solve → discard**. Each solve starts fresh with a small clause database. The remaining ~25% gap to CaDiCaL is likely from CaDiCaL's optimized C++ implementation (tighter inner loops, SIMD, cache-aligned data structures) rather than missing algorithmic features.
+

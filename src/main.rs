@@ -1037,27 +1037,252 @@ fn backtrack_xy(
 #[cfg(not(feature = "cadical"))]
 struct SatXYTemplate {
     solver: radical::Solver,
-    agree_per_lag: Vec<Vec<i32>>,  // agree_per_lag[s] = XNOR agree lits for lag s
+    lag_pairs: Vec<LagPairs>,
     n: usize,
 }
 
 #[cfg(feature = "cadical")]
 struct SatXYTemplate {
     solver: cadical::Solver,
-    agree_per_lag: Vec<Vec<i32>>,
+    lag_pairs: Vec<LagPairs>,
     n: usize,
 }
 
-/// Build SAT XY template with PB constraints for sum constraints,
-/// and XNOR agree variables for autocorrelation (but no totalizers).
-/// Returns the agree_lits per lag (used to add PB constraints per candidate).
+/// Per-candidate GJ elimination: given specific agree targets for each lag,
+/// determine which primary variable pairs must be equal/opposite, and
+/// propagate these equalities to reduce the problem.
+///
+/// Returns: vec of (var_a, var_b, equal: bool) pairs — if equal is true,
+/// var_a = var_b; otherwise var_a = ¬var_b. Variables are 1-based.
+/// GF(2) row: a bitset of variable indices + a constant (0 or 1).
+/// Represents the equation: XOR of variables in the set = constant.
+#[derive(Clone)]
+struct Gf2Row {
+    vars: Vec<bool>, // vars[i] = true if variable i participates
+    constant: bool,  // right-hand side
+}
+
+impl Gf2Row {
+    fn new(num_vars: usize) -> Self {
+        Self { vars: vec![false; num_vars], constant: false }
+    }
+    fn xor_with(&mut self, other: &Gf2Row) {
+        for i in 0..self.vars.len() {
+            self.vars[i] ^= other.vars[i];
+        }
+        self.constant ^= other.constant;
+    }
+    /// Find the first set variable (pivot column), or None if all zero.
+    fn pivot(&self) -> Option<usize> {
+        self.vars.iter().position(|&v| v)
+    }
+    /// Count set variables.
+    fn popcount(&self) -> usize {
+        self.vars.iter().filter(|&&v| v).count()
+    }
+}
+
+fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Vec<(i32, i32, bool)> {
+    let num_vars = 2 * n;
+    // Union-find with negation tracking (XOR-union-find)
+    let mut parent: Vec<usize> = (0..num_vars).collect();
+    let mut rank: Vec<u8> = vec![0; num_vars];
+    let mut neg: Vec<bool> = vec![false; num_vars]; // true if node is negated relative to parent
+
+    fn find(parent: &mut [usize], neg: &mut [bool], mut x: usize) -> (usize, bool) {
+        let mut path = Vec::new();
+        let mut n = false;
+        while parent[x] != x {
+            path.push(x);
+            n ^= neg[x];
+            x = parent[x];
+        }
+        let root = x;
+        let mut n2 = false;
+        for &p in path.iter().rev() {
+            n2 ^= neg[p];
+            parent[p] = root;
+            neg[p] = n2;
+        }
+        (root, n)
+    }
+
+    // Returns false if a contradiction is detected
+    fn union(parent: &mut [usize], rank: &mut [u8], neg: &mut [bool],
+             a: usize, b: usize, a_neg_b: bool) -> bool {
+        let (ra, na) = find(parent, neg, a);
+        let (rb, nb) = find(parent, neg, b);
+        if ra == rb {
+            // Check consistency: na ^ nb should equal a_neg_b
+            return (na ^ nb) == a_neg_b;
+        }
+        let rel = na ^ nb ^ a_neg_b;
+        if rank[ra] < rank[rb] {
+            parent[ra] = rb;
+            neg[ra] = rel;
+        } else if rank[ra] > rank[rb] {
+            parent[rb] = ra;
+            neg[rb] = rel;
+        } else {
+            parent[rb] = ra;
+            neg[rb] = rel;
+            rank[ra] += 1;
+        }
+        true
+    }
+
+    // Process lags where ALL or NO pairs agree.
+    // Also process lags where X and Y halves have separate extreme targets.
+    for s in 1..n {
+        let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
+        if target_raw < 0 || target_raw % 2 != 0 { continue; }
+        let target = (target_raw / 2) as usize;
+        let x_pairs = n - s;
+        let y_pairs = n - s;
+        let max_pairs = x_pairs + y_pairs;
+
+        if target == max_pairs {
+            // ALL pairs agree
+            for i in 0..x_pairs {
+                union(&mut parent, &mut rank, &mut neg, i, i + s, false);
+            }
+            for i in 0..y_pairs {
+                union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, false);
+            }
+        } else if target == 0 {
+            // NO pairs agree
+            for i in 0..x_pairs {
+                union(&mut parent, &mut rank, &mut neg, i, i + s, true);
+            }
+            for i in 0..y_pairs {
+                union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, true);
+            }
+        }
+    }
+
+    // GF(2) Gauss-Jordan elimination on parity constraints from ALL lags.
+    // For each lag s with target T:
+    //   parity(agree_count) = T mod 2
+    //   agree(x_i, x_{i+s}) = x_i XNOR x_{i+s} = 1 ⊕ x_i ⊕ x_{i+s}
+    //   sum of agrees mod 2 = T mod 2
+    //   k + sum(x_i ⊕ x_{i+s}) mod 2 = T mod 2   (where k = # pairs)
+    //   sum(x_i ⊕ x_{i+s}) mod 2 = (T + k) mod 2
+    //
+    // sum(x_i ⊕ x_{i+s}) = sum(x_i) + sum(x_{i+s}) mod 2 (for distinct i)
+    // Each variable x_v appears in the XOR sum once per occurrence in a pair.
+    // Variable x_v appears as first element of pair (v, v+s) if v < n-s,
+    // and as second element of pair (v-s, v) if v >= s.
+    // So the total parity of a variable in the XOR sum depends on
+    // how many times it appears in pairs, which determines its coefficient mod 2.
+    {
+        let mut rows: Vec<Gf2Row> = Vec::new();
+        for s in 1..n {
+            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
+            if target_raw < 0 || target_raw % 2 != 0 { continue; }
+            let target = (target_raw / 2) as usize;
+            let k = 2 * (n - s); // total pairs (X + Y)
+
+            // Build GF(2) equation: for each pair (i, i+s), x_i and x_{i+s} each
+            // appear once. XOR of all these = (T + k) mod 2.
+            let mut row = Gf2Row::new(num_vars);
+            // X pairs
+            for i in 0..(n - s) {
+                row.vars[i] ^= true;       // x_i
+                row.vars[i + s] ^= true;   // x_{i+s}
+            }
+            // Y pairs
+            for i in 0..(n - s) {
+                row.vars[n + i] ^= true;       // y_i
+                row.vars[n + i + s] ^= true;   // y_{i+s}
+            }
+            row.constant = ((target + k) % 2) == 1;
+            // Skip trivial rows (all zeros)
+            if row.popcount() > 0 {
+                rows.push(row);
+            }
+        }
+
+        // Gauss-Jordan elimination
+        let mut pivot_row: Vec<Option<usize>> = vec![None; num_vars];
+        for r in 0..rows.len() {
+            // Reduce row r against existing pivots
+            loop {
+                let Some(col) = rows[r].pivot() else { break };
+                if let Some(pr) = pivot_row[col] {
+                    let pr_row = rows[pr].clone();
+                    rows[r].xor_with(&pr_row);
+                } else {
+                    // This column has no pivot yet — use row r as pivot
+                    pivot_row[col] = Some(r);
+                    // Reduce all other rows
+                    let pivot = rows[r].clone();
+                    for r2 in 0..rows.len() {
+                        if r2 != r && rows[r2].vars[col] {
+                            rows[r2].xor_with(&pivot);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Extract equalities from reduced rows:
+        // A row with exactly 1 variable: that variable = constant
+        // A row with exactly 2 variables: they are equal (or negated)
+        for row in &rows {
+            let set_vars: Vec<usize> = row.vars.iter().enumerate()
+                .filter(|&(_, &v)| v).map(|(i, _)| i).collect();
+            match set_vars.len() {
+                1 => {
+                    // Forced variable: x = constant
+                    let v = set_vars[0];
+                    // Union with a "truth" anchor: if constant=1, x is true (equivalent to x[0] which is forced true)
+                    // Since x[0] is forced true by symmetry breaking, we can't directly use
+                    // union-find for forced values. Instead, add as a clause later.
+                    // For now, skip single-variable rows.
+                }
+                2 => {
+                    // Two variables: x_a ⊕ x_b = c
+                    let a = set_vars[0];
+                    let b = set_vars[1];
+                    // c=0 → a=b, c=1 → a=¬b
+                    union(&mut parent, &mut rank, &mut neg, a, b, row.constant);
+                }
+                _ => {} // more than 2 variables: can't directly use in union-find
+            }
+        }
+    }
+
+    // Extract non-trivial equalities
+    let mut equalities = Vec::new();
+    for v in 0..num_vars {
+        let (root, is_neg) = find(&mut parent, &mut neg, v);
+        if root != v {
+            let a = (v as i32) + 1;
+            let b = (root as i32) + 1;
+            equalities.push((a, b, !is_neg));
+        }
+    }
+
+    equalities
+}
+
+/// Pair data for quadratic PB constraints per lag: (lits_a, lits_b) for each lag.
+/// agree(x_i, x_{i+s}) = x_i*x_{i+s} + ¬x_i*¬x_{i+s}, so each lag has
+/// 4*(n-s) product terms (both-true + both-false for X pairs and Y pairs).
+struct LagPairs {
+    lits_a: Vec<i32>,
+    lits_b: Vec<i32>,
+}
+
+/// Build SAT XY template with PB constraints for sum constraints
+/// and quadratic PB agree pairs per lag. No XNOR auxiliary variables.
 fn build_sat_xy_clauses(
     problem: Problem,
     tuple: SumTuple,
     solver: &mut impl SatSolver,
-) -> Option<(Vec<Vec<i32>>, usize)> {
+) -> Option<(Vec<LagPairs>, usize)> {
     let n = problem.n;
-    let mut enc = SatEncoder { n: 2 * n, m: 0, next_var: (2 * n + 1) as i32 };
 
     let x_var = |i: usize| -> i32 { (i + 1) as i32 };
     let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
@@ -1066,7 +1291,7 @@ fn build_sat_xy_clauses(
     solver.add_clause([x_var(0)]); // x[0] = +1
     solver.add_clause([y_var(0)]); // y[0] = +1
 
-    // Sum constraints via PB: exactly x_pos of X are true, exactly y_pos of Y are true
+    // Sum constraints via PB
     if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0 {
         return None;
     }
@@ -1078,27 +1303,42 @@ fn build_sat_xy_clauses(
     solver.add_pb_eq(&x_lits, &ones, x_pos as u32);
     solver.add_pb_eq(&y_lits, &ones, y_pos as u32);
 
-    // Build XNOR agree variables per lag (no totalizers — targets set per candidate)
-    let mut agree_per_lag = Vec::with_capacity(n);
-    agree_per_lag.push(Vec::new()); // lag 0 unused
+    // Build agree pair lists per lag (no aux variables!)
+    // agree(a, b) = a*b + ¬a*¬b = (both true) + (both false)
+    let mut lag_pairs = Vec::with_capacity(n);
+    lag_pairs.push(LagPairs { lits_a: Vec::new(), lits_b: Vec::new() }); // lag 0 unused
     for s in 1..n {
-        let mut agree_lits = Vec::with_capacity(2 * (n - s));
+        let mut lits_a = Vec::with_capacity(4 * (n - s));
+        let mut lits_b = Vec::with_capacity(4 * (n - s));
+
+        // X pairs: agree(x_i, x_{i+s})
         for i in 0..(n - s) {
-            agree_lits.push(enc.encode_xnor(solver, x_var(i), x_var(i + s)));
+            // Both-true term: x_i * x_{i+s}
+            lits_a.push(x_var(i));
+            lits_b.push(x_var(i + s));
+            // Both-false term: ¬x_i * ¬x_{i+s}
+            lits_a.push(-x_var(i));
+            lits_b.push(-x_var(i + s));
         }
+        // Y pairs: agree(y_i, y_{i+s})
         for i in 0..(n - s) {
-            agree_lits.push(enc.encode_xnor(solver, y_var(i), y_var(i + s)));
+            lits_a.push(y_var(i));
+            lits_b.push(y_var(i + s));
+            lits_a.push(-y_var(i));
+            lits_b.push(-y_var(i + s));
         }
-        agree_per_lag.push(agree_lits);
+
+        lag_pairs.push(LagPairs { lits_a, lits_b });
     }
 
-    Some((agree_per_lag, n))
+    Some((lag_pairs, n))
 }
 
 /// Trait abstracting over radical::Solver and cadical::Solver.
 trait SatSolver {
     fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I);
     fn add_pb_eq(&mut self, lits: &[i32], coeffs: &[u32], target: u32);
+    fn add_quad_pb_eq(&mut self, lits_a: &[i32], lits_b: &[i32], coeffs: &[u32], target: u32);
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool>;
     fn value(&self, var: i32) -> Option<bool>;
     fn reset(&mut self);
@@ -1110,6 +1350,9 @@ impl SatSolver for radical::Solver {
     }
     fn add_pb_eq(&mut self, lits: &[i32], coeffs: &[u32], target: u32) {
         self.add_pb_eq(lits, coeffs, target);
+    }
+    fn add_quad_pb_eq(&mut self, lits_a: &[i32], lits_b: &[i32], coeffs: &[u32], target: u32) {
+        self.add_quad_pb_eq(lits_a, lits_b, coeffs, target);
     }
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool> {
         self.solve_with_assumptions(assumptions)
@@ -1128,9 +1371,10 @@ impl SatSolver for cadical::Solver {
         self.add_clause(lits);
     }
     fn add_pb_eq(&mut self, _lits: &[i32], _coeffs: &[u32], _target: u32) {
-        // CaDiCaL doesn't support PB natively; fall back to totalizer encoding
-        // This path won't be used since CaDiCaL uses the clause-based encoding
         unimplemented!("CaDiCaL backend uses clause-based encoding, not PB");
+    }
+    fn add_quad_pb_eq(&mut self, _a: &[i32], _b: &[i32], _c: &[u32], _t: u32) {
+        unimplemented!("CaDiCaL backend uses clause-based encoding, not quad PB");
     }
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool> {
         self.solve_with(assumptions.iter().copied())
@@ -1150,8 +1394,8 @@ impl SatXYTemplate {
         #[cfg(feature = "cadical")]
         let mut solver: cadical::Solver = Default::default();
 
-        let (agree_per_lag, n) = build_sat_xy_clauses(problem, tuple, &mut solver)?;
-        Some(Self { solver, agree_per_lag, n })
+        let (lag_pairs, n) = build_sat_xy_clauses(problem, tuple, &mut solver)?;
+        Some(Self { solver, lag_pairs, n })
     }
 
     /// Quick feasibility check: are the cardinality targets in range?
@@ -1176,12 +1420,26 @@ impl SatXYTemplate {
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
 
         let mut solver = self.solver.clone();
+
+        // GJ-derived equalities from extreme-target lags
+        let equalities = gj_candidate_equalities(n, candidate);
+        for &(a, b, equal) in &equalities {
+            if equal {
+                solver.add_clause([-a, b]);
+                solver.add_clause([a, -b]);
+            } else {
+                solver.add_clause([-a, -b]);
+                solver.add_clause([a, b]);
+            }
+        }
+
+        // Add quadratic PB constraints for each lag's agree target
         for s in 1..n {
             let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
             let target = (target_raw / 2) as usize;
-            let agree_lits = &self.agree_per_lag[s];
-            let ones: Vec<u32> = vec![1; agree_lits.len()];
-            solver.add_pb_eq(agree_lits, &ones, target as u32);
+            let lp = &self.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
         }
 
         match solver.solve() {
@@ -2775,13 +3033,13 @@ mod tests {
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (36 + i + 1) as i32 };
         let mut solver = template.solver.clone();
-        // Add per-pair PB cardinality constraints
+        // Add per-lag quadratic PB constraints
         for s in 1..36 {
             let target_raw = 2 * (36 - s) as i32 - candidate.zw_autocorr[s];
             let target = (target_raw / 2) as usize;
-            let agree_lits = &template.agree_per_lag[s];
-            let ones: Vec<u32> = vec![1; agree_lits.len()];
-            solver.add_pb_eq(agree_lits, &ones, target as u32);
+            let lp = &template.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
         }
         // Hardcode known X/Y
         for i in 0..36 {
