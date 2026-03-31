@@ -1048,8 +1048,106 @@ struct SatXYTemplate {
     n: usize,
 }
 
+/// Per-candidate GJ elimination: given specific agree targets for each lag,
+/// determine which primary variable pairs must be equal/opposite, and
+/// propagate these equalities to reduce the problem.
+///
+/// Returns: vec of (var_a, var_b, equal: bool) pairs — if equal is true,
+/// var_a = var_b; otherwise var_a = ¬var_b. Variables are 1-based.
+fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Vec<(i32, i32, bool)> {
+    let num_vars = 2 * n;
+    // Union-find with negation tracking (XOR-union-find)
+    let mut parent: Vec<usize> = (0..num_vars).collect();
+    let mut rank: Vec<u8> = vec![0; num_vars];
+    let mut neg: Vec<bool> = vec![false; num_vars]; // true if node is negated relative to parent
+
+    fn find(parent: &mut [usize], neg: &mut [bool], mut x: usize) -> (usize, bool) {
+        let mut path = Vec::new();
+        let mut n = false;
+        while parent[x] != x {
+            path.push(x);
+            n ^= neg[x];
+            x = parent[x];
+        }
+        let root = x;
+        let mut n2 = false;
+        for &p in path.iter().rev() {
+            n2 ^= neg[p];
+            parent[p] = root;
+            neg[p] = n2;
+        }
+        (root, n)
+    }
+
+    // Returns false if a contradiction is detected
+    fn union(parent: &mut [usize], rank: &mut [u8], neg: &mut [bool],
+             a: usize, b: usize, a_neg_b: bool) -> bool {
+        let (ra, na) = find(parent, neg, a);
+        let (rb, nb) = find(parent, neg, b);
+        if ra == rb {
+            // Check consistency: na ^ nb should equal a_neg_b
+            return (na ^ nb) == a_neg_b;
+        }
+        let rel = na ^ nb ^ a_neg_b;
+        if rank[ra] < rank[rb] {
+            parent[ra] = rb;
+            neg[ra] = rel;
+        } else if rank[ra] > rank[rb] {
+            parent[rb] = ra;
+            neg[rb] = rel;
+        } else {
+            parent[rb] = ra;
+            neg[rb] = rel;
+            rank[ra] += 1;
+        }
+        true
+    }
+
+    // Process lags where ALL or NO pairs agree.
+    // Also process lags where X and Y halves have separate extreme targets.
+    for s in 1..n {
+        let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
+        if target_raw < 0 || target_raw % 2 != 0 { continue; }
+        let target = (target_raw / 2) as usize;
+        let x_pairs = n - s;
+        let y_pairs = n - s;
+        let max_pairs = x_pairs + y_pairs;
+
+        if target == max_pairs {
+            // ALL pairs agree
+            for i in 0..x_pairs {
+                union(&mut parent, &mut rank, &mut neg, i, i + s, false);
+            }
+            for i in 0..y_pairs {
+                union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, false);
+            }
+        } else if target == 0 {
+            // NO pairs agree
+            for i in 0..x_pairs {
+                union(&mut parent, &mut rank, &mut neg, i, i + s, true);
+            }
+            for i in 0..y_pairs {
+                union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, true);
+            }
+        }
+    }
+
+    // Extract non-trivial equalities (vars that share a root with another var)
+    let mut equalities = Vec::new();
+    for v in 0..num_vars {
+        let (root, is_neg) = find(&mut parent, &mut neg, v);
+        if root != v {
+            let a = (v as i32) + 1;     // 1-based
+            let b = (root as i32) + 1;  // 1-based
+            equalities.push((a, b, !is_neg)); // equal if not negated
+        }
+    }
+
+    equalities
+}
+
 /// Build SAT XY template with PB constraints for sum constraints,
-/// and XNOR agree variables for autocorrelation (but no totalizers).
+/// XNOR agree variables for autocorrelation, and GJ-derived equalities.
 /// Returns the agree_lits per lag (used to add PB constraints per candidate).
 fn build_sat_xy_clauses(
     problem: Problem,
@@ -1078,7 +1176,7 @@ fn build_sat_xy_clauses(
     solver.add_pb_eq(&x_lits, &ones, x_pos as u32);
     solver.add_pb_eq(&y_lits, &ones, y_pos as u32);
 
-    // Build XNOR agree variables per lag (no totalizers — targets set per candidate)
+    // Build XNOR agree variables per lag
     let mut agree_per_lag = Vec::with_capacity(n);
     agree_per_lag.push(Vec::new()); // lag 0 unused
     for s in 1..n {
@@ -1176,6 +1274,22 @@ impl SatXYTemplate {
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
 
         let mut solver = self.solver.clone();
+
+        // GJ-derived equalities: for lags where ALL or NO pairs agree,
+        // we can assert hard equality/negation constraints on primary vars.
+        let equalities = gj_candidate_equalities(n, candidate);
+        for &(a, b, equal) in &equalities {
+            if equal {
+                // a = b: encode as (a → b) ∧ (b → a) = (¬a ∨ b) ∧ (a ∨ ¬b)
+                solver.add_clause([-a, b]);
+                solver.add_clause([a, -b]);
+            } else {
+                // a = ¬b: encode as (a → ¬b) ∧ (¬b → a) = (¬a ∨ ¬b) ∧ (a ∨ b)
+                solver.add_clause([-a, -b]);
+                solver.add_clause([a, b]);
+            }
+        }
+
         for s in 1..n {
             let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
             let target = (target_raw / 2) as usize;
