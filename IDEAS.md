@@ -100,6 +100,44 @@ Most generated Z/W candidates have high power (close to the bound) at overlappin
 
 - **Legendre/QR seeding for stochastic search** *(from Grok, "algebraic starters")*: On 50% of SA restarts, seed Z/W with Legendre-symbol sequences (quadratic residues mod nearest prime) with random circular shift and negation, instead of fully random. These have good autocorrelation properties. Stochastic benchmark: flips/sec `29.36M → 27.21M` (**7.3% regression**). The fix_sum step to adjust Legendre sequences to target sums adds per-restart overhead that outweighs any benefit from better starting autocorrelation. Time-to-solution occasionally faster (194ms vs 1.4s best) but median similar. **Reverted.**
 
+## Ideas from London thesis (credit: Stephen London, PhD thesis "Constructing New Turyn Type Sequences, T-Sequences and Hadamard Matrices", UIC 2013)
+
+London holds the record for longest known Turyn type sequences (TT(40)). His thesis describes an optimized version of Kharaghani's algorithm with several key optimizations (§3.3–3.4, §5.1):
+
+1. **Integer spectral storage** *(London §3.4, item 1)*: Store ⌊f_Z(θ)/2⌋ and ⌊f_W(θ)/2⌋ as 1–2 byte integers instead of 8-byte f64. Saves 4–8× memory per spectrum and speeds up pair comparisons. London's pair filter checks `⌊f_Z(θ_k)/2⌋ + ⌊f_W(θ_k)/2⌋ ≤ M` using integer arithmetic.
+
+2. **Precomputed cosine lookup arrays** *(London §3.4, item 2)*: Precompute at most 10,000 distinct cosine values in arrays. Our FFT-based approach already handles this differently, but for non-FFT paths this could help.
+
+3. **Difference arrays for cycling variables** *(London §3.4, item 3)*: Store the difference between k-th and (k+1)-st spectral value when iterating. Enables O(1) incremental spectral updates during DFS rather than recomputing from scratch.
+
+4. **Pair-based tuple searching** *(London §3.4, item 4)*: Enter a (σ_Z, σ_W) pair rather than individual sum tuples, allowing multiple quadruples to be checked in a single run. Our code currently iterates individual sum tuples; grouping by pair could reduce redundant Z/W generation.
+
+5. **Distance arrays for DFS pruning** *(London §3.4, item 5)*: Create (σ_Z, σ_W)-indexed arrays of distances to the nearest feasible solution. Allows early pruning in DFS when partial sums are too far from any feasible target.
+
+6. **Optimal theta ≈ 100** *(London §3.4, item 6)*: London found 100 equally spaced θ values approximately minimizes total running time (balancing spectral resolution vs computation cost). Our default is 256.
+
+7. **Outside-in X,Y construction with Turyn's theorem** *(London §3.3, Step 6)*: Build X,Y from position 6 inward toward the middle. At each step k, try all 8 possibilities for (x_k, y_k, x_{ℓ+1-k}), then use σ_X = σ_Y = 0 (Turyn's theorem) to derive y_{ℓ+1-k}. Reduces branching factor from 16 to 8 per step.
+
+8. **Prefix/suffix pre-enumeration** *(London §3.3, Step 1)*: Pre-enumerate all valid first/last 6 elements of X, Y, Z (1,911,620 possibilities). These are filtered by normalization, sum constraints, and spectral feasibility. For each (Z,W) pair, look up matching boundary prefixes/suffixes for X,Y instead of generating from scratch.
+
+9. **Spectral budget restriction** *(London §5.1)*: For longer sequences where full enumeration is infeasible, restrict ⌊f_Z(θ_k)/2⌋ + ⌊f_W(θ_k)/2⌋ ≤ M for some M < spectral_bound. Table V shows M values needed: e.g., M=66 finds first TT(32), M=84 finds first TT(40). A `--max-spectral` CLI parameter would enable this.
+
+10. **4-profile equivalence checking** *(London §3.4, item 7, §2.7)*: Check Hadamard matrix equivalence via 4-profiles (count 4-row inner products). ~10 minutes per matrix. Not directly relevant to search speed but useful for verifying uniqueness of results.
+
+### Implemented from London thesis
+
+- **Spectral budget restriction (`--max-spectral`)** *(London §5.1)*: Added `--max-spectral=M` CLI parameter. Restricts spectral pair filter to `|Z(ω)|² + |W(ω)|² ≤ M` at every frequency. Individual filtering still uses full spectral_bound. Trades completeness for dramatically reduced search space at larger n. London used M=66 for first TT(32), M=84 for first TT(40). No regression on existing benchmarks (pair filter already rejects everything at n=16). **Implemented.**
+
+- **Early sum feasibility pruning in XY backtracker** *(London §3.3, Step 6)*: Restructured backtrack_xy to set pos first, then pre-check sum feasibility for the mirror position BEFORE the expensive set_pair(mirror) call. Also checks x and y sum bounds independently for xq and yq. Additionally fixed a latent bug where the backtracker would corrupt state when the mirror position was already assigned. Phase C benchmark (n=16, θ=100): xy_nodes `901,772 → 10,368` (**87× reduction**), runtime `1903ms → 17.5ms` (**-99.1%**). Primary exhaustive benchmark (θ=20000): neutral (Phase C not triggered). **Implemented.**
+
+### Tried from London thesis (no improvement on current benchmarks)
+
+- **Integer spectral storage** *(London §3.4, item 1)*: Tried storing ⌈power/2⌉ as i16 (1-2 bytes) instead of f64 (8 bytes) for spectrum values. Individual filtering still uses f64; integer storage only for pair comparisons. Exhaustive (θ=20000): `5957 → 6209ms` (**+4.2% regression**). Light (θ=256): `20.9 → 26.5ms` (**+27% regression**). The `(p/2.0).ceil() as i16` conversion in the hot FFT post-processing loop adds overhead without benefit since pair_spec_ok=0 at these benchmark sizes. Memory savings would only matter with millions of stored spectra at larger n. **Reverted.**
+
+- **Pair-based tuple searching** *(London §3.4, item 4)*: Checked whether normalized tuples share (|z|, |w|) sums, which would allow reusing Z/W candidates across tuples. For n=16: all 4 tuples have unique (|z|, |w|) pairs. For n=22: all 10 tuples have unique (|z|, |w|) pairs. No savings possible at current benchmark sizes. **Not implemented.**
+
+- **Optimal theta ≈ 100** *(London §3.4, item 6)*: Tested theta values 50–20000 on both exhaustive and solution-finding benchmarks. Results are configuration-dependent: theta=100 is fastest for Phase B (FFT cost scales with theta) but lets more Z/W pairs through, triggering expensive Phase C at n=16 (1622ms). theta=200+ rejects all pairs at n=16, giving 22ms. London's theta=100 is optimal for his non-FFT spectral computation; for our FFT-based approach, theta=200–256 is the sweet spot for n=16. **Configuration finding, not code change.**
+
 ## Re-check (2026-03-30, after user follow-up)
 
 I reran an apples-to-apples comparison of the code **before** the Grok idea bundle (`6eac0c5`) vs the bundle commit (`7b0894c`) using the same benchmark profile and more repeats:
