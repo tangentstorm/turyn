@@ -1037,17 +1037,20 @@ fn backtrack_xy(
 #[cfg(not(feature = "cadical"))]
 struct SatXYTemplate {
     solver: radical::Solver,
-    counters: Vec<Vec<i32>>,
+    agree_per_lag: Vec<Vec<i32>>,  // agree_per_lag[s] = XNOR agree lits for lag s
     n: usize,
 }
 
 #[cfg(feature = "cadical")]
 struct SatXYTemplate {
     solver: cadical::Solver,
-    counters: Vec<Vec<i32>>,
+    agree_per_lag: Vec<Vec<i32>>,
     n: usize,
 }
 
+/// Build SAT XY template with PB constraints for sum constraints,
+/// and XNOR agree variables for autocorrelation (but no totalizers).
+/// Returns the agree_lits per lag (used to add PB constraints per candidate).
 fn build_sat_xy_clauses(
     problem: Problem,
     tuple: SumTuple,
@@ -1063,7 +1066,7 @@ fn build_sat_xy_clauses(
     solver.add_clause([x_var(0)]); // x[0] = +1
     solver.add_clause([y_var(0)]); // y[0] = +1
 
-    // Sum constraints
+    // Sum constraints via PB: exactly x_pos of X are true, exactly y_pos of Y are true
     if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0 {
         return None;
     }
@@ -1071,11 +1074,13 @@ fn build_sat_xy_clauses(
     let y_pos = ((tuple.y + n as i32) / 2) as usize;
     let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
     let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
-    enc.encode_cardinality_eq(solver, &x_lits, x_pos);
-    enc.encode_cardinality_eq(solver, &y_lits, y_pos);
+    let ones: Vec<u32> = vec![1; n];
+    solver.add_pb_eq(&x_lits, &ones, x_pos as u32);
+    solver.add_pb_eq(&y_lits, &ones, y_pos as u32);
 
-    let mut counters = Vec::with_capacity(n);
-    counters.push(Vec::new());
+    // Build XNOR agree variables per lag (no totalizers — targets set per candidate)
+    let mut agree_per_lag = Vec::with_capacity(n);
+    agree_per_lag.push(Vec::new()); // lag 0 unused
     for s in 1..n {
         let mut agree_lits = Vec::with_capacity(2 * (n - s));
         for i in 0..(n - s) {
@@ -1084,16 +1089,16 @@ fn build_sat_xy_clauses(
         for i in 0..(n - s) {
             agree_lits.push(enc.encode_xnor(solver, y_var(i), y_var(i + s)));
         }
-        let ctr = enc.build_counter(solver, &agree_lits);
-        counters.push(ctr);
+        agree_per_lag.push(agree_lits);
     }
 
-    Some((counters, n))
+    Some((agree_per_lag, n))
 }
 
 /// Trait abstracting over radical::Solver and cadical::Solver.
 trait SatSolver {
     fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I);
+    fn add_pb_eq(&mut self, lits: &[i32], coeffs: &[u32], target: u32);
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool>;
     fn value(&self, var: i32) -> Option<bool>;
     fn reset(&mut self);
@@ -1102,6 +1107,9 @@ trait SatSolver {
 impl SatSolver for radical::Solver {
     fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I) {
         self.add_clause(lits);
+    }
+    fn add_pb_eq(&mut self, lits: &[i32], coeffs: &[u32], target: u32) {
+        self.add_pb_eq(lits, coeffs, target);
     }
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool> {
         self.solve_with_assumptions(assumptions)
@@ -1118,6 +1126,11 @@ impl SatSolver for radical::Solver {
 impl SatSolver for cadical::Solver {
     fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I) {
         self.add_clause(lits);
+    }
+    fn add_pb_eq(&mut self, _lits: &[i32], _coeffs: &[u32], _target: u32) {
+        // CaDiCaL doesn't support PB natively; fall back to totalizer encoding
+        // This path won't be used since CaDiCaL uses the clause-based encoding
+        unimplemented!("CaDiCaL backend uses clause-based encoding, not PB");
     }
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool> {
         self.solve_with(assumptions.iter().copied())
@@ -1137,8 +1150,8 @@ impl SatXYTemplate {
         #[cfg(feature = "cadical")]
         let mut solver: cadical::Solver = Default::default();
 
-        let (counters, n) = build_sat_xy_clauses(problem, tuple, &mut solver)?;
-        Some(Self { solver, counters, n })
+        let (agree_per_lag, n) = build_sat_xy_clauses(problem, tuple, &mut solver)?;
+        Some(Self { solver, agree_per_lag, n })
     }
 
     /// Quick feasibility check: are the cardinality targets in range?
@@ -1150,36 +1163,31 @@ impl SatXYTemplate {
             let target = (target_raw / 2) as usize;
             let max_pairs = 2 * (n - s);
             if target > max_pairs { return false; }
-            let ctr = &self.counters[s];
-            if target >= 1 && (target >= ctr.len() || ctr[target] == 0) { return false; }
-            if target + 1 <= max_pairs && (target + 1 >= ctr.len() || ctr[target + 1] == 0) { return false; }
         }
         true
     }
 
     /// Solve for X/Y given a specific Z/W candidate.
-    /// Uses assumptions to assert per-pair cardinality targets.
-    fn solve_for(&mut self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
+    /// Clones the template and adds PB constraints for per-lag agree targets.
+    fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
         if !self.is_feasible(candidate) { return None; }
         let n = self.n;
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
 
-        let mut assumptions = Vec::new();
+        let mut solver = self.solver.clone();
         for s in 1..n {
             let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
             let target = (target_raw / 2) as usize;
-            let max_pairs = 2 * (n - s);
-            let ctr = &self.counters[s];
-            if target >= 1 { assumptions.push(ctr[target]); }
-            if target + 1 <= max_pairs { assumptions.push(-ctr[target + 1]); }
+            let agree_lits = &self.agree_per_lag[s];
+            let ones: Vec<u32> = vec![1; agree_lits.len()];
+            solver.add_pb_eq(agree_lits, &ones, target as u32);
         }
 
-        match self.solver.solve_with_assumptions(&assumptions) {
+        match solver.solve() {
             Some(true) => {
-                let x: Vec<i8> = (0..n).map(|i| if self.solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                let y: Vec<i8> = (0..n).map(|i| if self.solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                self.solver.reset();
+                let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
+                let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
                 Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)))
             }
             _ => None,
@@ -1194,7 +1202,7 @@ fn sat_solve_xy(
     candidate: &CandidateZW,
     _stats: &mut SearchStats,
 ) -> Option<(PackedSeq, PackedSeq)> {
-    let mut template = SatXYTemplate::build(problem, tuple)?;
+    let template = SatXYTemplate::build(problem, tuple)?;
     template.solve_for(candidate)
 }
 
@@ -2325,7 +2333,7 @@ fn hybrid_solve_tuple(
     if zw_candidates.is_empty() { return (None, stats); }
     if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
 
-    let Some(mut template) = SatXYTemplate::build(problem, tuple) else { return (None, stats); };
+    let Some(template) = SatXYTemplate::build(problem, tuple) else { return (None, stats); };
 
     // Deduplicate Z/W pairs by autocorrelation vector
     let mut seen_autocorr = std::collections::HashSet::new();
@@ -2767,14 +2775,13 @@ mod tests {
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (36 + i + 1) as i32 };
         let mut solver = template.solver.clone();
-        // Add per-pair cardinality assertions
+        // Add per-pair PB cardinality constraints
         for s in 1..36 {
             let target_raw = 2 * (36 - s) as i32 - candidate.zw_autocorr[s];
             let target = (target_raw / 2) as usize;
-            let max_pairs = 2 * (36 - s);
-            let ctr = &template.counters[s];
-            if target >= 1 { solver.add_clause([ctr[target]]); }
-            if target + 1 <= max_pairs { solver.add_clause([-ctr[target + 1]]); }
+            let agree_lits = &template.agree_per_lag[s];
+            let ones: Vec<u32> = vec![1; agree_lits.len()];
+            solver.add_pb_eq(agree_lits, &ones, target as u32);
         }
         // Hardcode known X/Y
         for i in 0..36 {

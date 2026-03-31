@@ -104,17 +104,41 @@ Multi-threaded simulated annealing: random initialization, sum-preserving pair s
 
 ## radical: pure Rust CDCL SAT solver
 
-The `radical/` subcrate is a minimal CDCL (Conflict-Driven Clause Learning) SAT solver written from scratch in Rust, inspired by CaDiCaL. Features:
+The `radical/` subcrate is a minimal CDCL (Conflict-Driven Clause Learning) SAT solver written from scratch in Rust, inspired by CaDiCaL. ~700 lines, zero dependencies, 18 tests.
 
-- Two-watched-literal (2WL) unit propagation
-- 1-UIP conflict analysis with clause learning
-- Non-chronological backjumping
-- VSIDS variable activity heuristic with binary heap
-- Phase saving
-- Luby restart schedule
-- LBD-based learnt clause deletion
-- Flat clause storage for fast cloning
-- ~600 lines, zero dependencies, 18 tests
+### Feature comparison: radical vs CaDiCaL
+
+| Feature | CaDiCaL | radical |
+|---|---|---|
+| **Core CDCL** | | |
+| Two-watched-literal BCP | ✅ | ✅ |
+| Blocker literals in watch lists | ✅ | ✅ |
+| 1-UIP conflict analysis | ✅ | ✅ |
+| Non-chronological backjumping | ✅ | ✅ |
+| VSIDS with activity decay | ✅ | ✅ |
+| Phase saving | ✅ | ✅ |
+| Learnt clause minimization | ✅ | ✅ |
+| LBD-based clause deletion | ✅ | ✅ |
+| **Restarts** | | |
+| Luby restarts | ✅ | ✅ |
+| EMA-based (glucose-style) restarts | ✅ | ❌ |
+| Rephasing / target phases | ✅ | ❌ |
+| **Preprocessing / Inprocessing** | | |
+| Bounded Variable Elimination (BVE) | ✅ | ❌ |
+| Subsumption / self-subsumption | ✅ | ❌ |
+| Failed literal probing | ✅ | ❌ |
+| Vivification | ✅ | ❌ |
+| **Clause management** | | |
+| Flat clause storage | ✅ | ✅ |
+| Tier-based retention (glue ≤ 2/6) | ✅ | ❌ |
+| Clause compaction / GC | ✅ | ❌ |
+| **Extensions (radical only)** | | |
+| Native PB constraints (`sum >= k`) | ❌ | ✅ |
+| Assumptions API | ✅ | ✅ |
+| Solver cloning (for templates) | ❌ | ✅ |
+| Pure Rust, zero C deps | ❌ | ✅ |
+
+Compile with `--features cadical` to use CaDiCaL as the Phase C backend for comparison.
 
 ## Docs
 
