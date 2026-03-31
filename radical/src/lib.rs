@@ -652,16 +652,12 @@ impl Solver {
         self.var_inc /= self.var_decay;
     }
 
-    /// Reduce the learnt clause database: keep clauses with LBD ≤ 3
-    /// and half of the rest (lowest activity / highest LBD).
     /// Remove low-quality learnt clauses to keep the database manageable.
-    /// Keeps "glue" clauses (LBD ≤ 3) and clauses currently used as reasons.
     fn reduce_db(&mut self) {
-        // Only reduce when we have many learnt clauses
-        let num_original: usize = self.clause_meta.iter()
-            .filter(|m| !m.learnt && !m.deleted).count();
         let num_learnt: usize = self.clause_meta.iter()
             .filter(|m| m.learnt && !m.deleted).count();
+        let num_original: usize = self.clause_meta.iter()
+            .filter(|m| !m.learnt && !m.deleted).count();
         if num_learnt < num_original { return; }
 
         // Collect which clauses are currently reasons
@@ -672,9 +668,8 @@ impl Solver {
             }
         }
 
-        // Delete learnt clauses with LBD > 3 that aren't reasons.
-        // Keep ~50% of eligible clauses (delete the worse half by LBD).
-        let mut eligible: Vec<(u32, u8)> = Vec::new(); // (ci, lbd)
+        // Keep glue clauses (LBD ≤ 3) always. Delete worst half of the rest.
+        let mut eligible: Vec<(u32, u8)> = Vec::new();
         for ci in 0..self.clause_meta.len() {
             let m = &self.clause_meta[ci];
             if m.learnt && !m.deleted && m.lbd > 3 && !is_reason[ci] {
@@ -686,7 +681,6 @@ impl Solver {
         // Sort by LBD descending — delete worst half
         eligible.sort_by(|a, b| b.1.cmp(&a.1));
         let to_delete = eligible.len() / 2;
-
         for &(ci, _) in &eligible[..to_delete] {
             self.clause_meta[ci as usize].deleted = true;
         }
