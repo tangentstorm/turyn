@@ -63,12 +63,14 @@ struct TrailEntry {
 }
 
 /// CDCL SAT Solver.
+#[derive(Clone)]
 pub struct Solver {
     // Variable state
     num_vars: usize,
     assigns: Vec<LBool>,    // indexed by var (0-based)
     level: Vec<u32>,         // decision level of each var
     reason: Vec<Reason>,     // reason for assignment
+    phase: Vec<bool>,        // phase saving: last polarity of each var
 
     // Trail
     trail: Vec<TrailEntry>,
@@ -78,10 +80,12 @@ pub struct Solver {
     clauses: Vec<Clause>,
     watches: Vec<Vec<usize>>, // watches[lit_index] = list of clause indices
 
-    // VSIDS activity
+    // VSIDS activity with binary heap
     activity: Vec<f64>,
     var_inc: f64,
     var_decay: f64,
+    heap: Vec<usize>,        // max-heap of variable indices, ordered by activity
+    heap_pos: Vec<usize>,    // heap_pos[v] = position of var v in heap (usize::MAX if not in heap)
 
     // Propagation queue
     prop_head: usize, // next trail entry to propagate
@@ -108,6 +112,7 @@ impl Solver {
             assigns: Vec::new(),
             level: Vec::new(),
             reason: Vec::new(),
+            phase: Vec::new(),
             trail: Vec::new(),
             trail_lim: Vec::new(),
             clauses: Vec::new(),
@@ -115,6 +120,8 @@ impl Solver {
             activity: Vec::new(),
             var_inc: 1.0,
             var_decay: 0.95,
+            heap: Vec::new(),
+            heap_pos: Vec::new(),
             prop_head: 0,
             conflicts: 0,
             restart_limit: 100,
@@ -126,13 +133,17 @@ impl Solver {
     /// Ensure variable `v` (1-based) exists.
     fn ensure_var(&mut self, v: usize) {
         while self.num_vars < v {
+            let idx = self.num_vars;
             self.num_vars += 1;
             self.assigns.push(LBool::Undef);
             self.level.push(0);
             self.reason.push(Reason::Decision);
+            self.phase.push(true); // default: branch positive
             self.activity.push(0.0);
             self.watches.push(Vec::new()); // positive literal
             self.watches.push(Vec::new()); // negative literal
+            self.heap_pos.push(self.heap.len());
+            self.heap.push(idx);
         }
     }
 
@@ -180,16 +191,64 @@ impl Solver {
 
     /// Solve the formula. Returns Some(true) if SAT, Some(false) if UNSAT.
     pub fn solve(&mut self) -> Option<bool> {
+        self.solve_with_assumptions(&[])
+    }
+
+    /// Solve under temporary assumptions. Assumptions are unit literals that
+    /// are asserted at decision level 1. After solving, the solver backtracks
+    /// to level 0, so assumptions don't persist but learnt clauses do.
+    pub fn solve_with_assumptions(&mut self, assumptions: &[Lit]) -> Option<bool> {
         if !self.ok { return Some(false); }
 
+        let assumption_level: u32 = if assumptions.is_empty() { 0 } else { 1 };
+
+        // Assert assumptions at decision level 1
+        if !assumptions.is_empty() {
+            self.new_decision_level();
+            for &lit in assumptions {
+                self.ensure_var(lit.unsigned_abs() as usize);
+                match self.lit_value(lit) {
+                    LBool::True => {} // already satisfied
+                    LBool::False => {
+                        self.backtrack(0);
+                        return Some(false); // contradicts existing assignment
+                    }
+                    LBool::Undef => {
+                        self.enqueue(lit, Reason::Decision);
+                    }
+                }
+            }
+            // Propagate assumptions
+            if let Some(_conflict) = self.propagate() {
+                self.backtrack(0);
+                return Some(false);
+            }
+        }
+
+        let result = self.solve_inner(assumption_level);
+
+        // Only backtrack if UNSAT — keep model for value() queries if SAT.
+        if result != Some(true) {
+            self.backtrack(0);
+        }
+        result
+    }
+
+    /// Reset the solver to level 0 (undo all decisions, keep learnt clauses).
+    pub fn reset(&mut self) {
+        self.backtrack(0);
+    }
+
+    fn solve_inner(&mut self, base_level: u32) -> Option<bool> {
         loop {
             if let Some(conflict_ci) = self.propagate() {
                 // Conflict
                 self.conflicts += 1;
-                if self.decision_level() == 0 {
-                    return Some(false); // top-level conflict → UNSAT
+                if self.decision_level() <= base_level {
+                    return Some(false); // conflict at/below assumption level → UNSAT
                 }
                 let (learnt_clause, bt_level) = self.analyze(conflict_ci);
+                let bt_level = bt_level.max(base_level);
                 self.backtrack(bt_level);
                 self.add_learnt_clause(learnt_clause);
                 self.decay_activities();
@@ -198,7 +257,7 @@ impl Solver {
                 if self.conflicts >= self.restart_limit {
                     self.restart_limit += 100 * luby(self.luby_index);
                     self.luby_index += 1;
-                    self.backtrack(0);
+                    self.backtrack(base_level);
                     // Periodic clause cleanup
                     if self.conflicts % 5000 == 0 {
                         self.reduce_db();
@@ -411,7 +470,11 @@ impl Solver {
         while self.trail.len() > self.trail_lim[level as usize] {
             let entry = self.trail.pop().unwrap();
             let v = var_of(entry.lit);
+            // Phase saving: remember the polarity
+            self.phase[v] = entry.lit > 0;
             self.assigns[v] = LBool::Undef;
+            // Re-insert into decision heap
+            self.heap_insert(v);
         }
         self.trail_lim.truncate(level as usize);
         self.prop_head = self.trail.len();
@@ -449,29 +512,96 @@ impl Solver {
         levels.len() as u32
     }
 
-    /// VSIDS: pick the unassigned variable with highest activity.
-    fn pick_branching_var(&self) -> Lit {
-        let mut best_var = 0;
-        let mut best_act = -1.0f64;
+    /// VSIDS: pick the unassigned variable with highest activity (O(log n) via heap).
+    fn pick_branching_var(&mut self) -> Lit {
+        // Pop variables from the heap until we find one that's unassigned
+        while let Some(&top) = self.heap.first() {
+            if self.assigns[top] == LBool::Undef {
+                // Use phase saving: branch with last known polarity
+                let v = (top as i32) + 1;
+                return if self.phase[top] { v } else { -v };
+            }
+            self.heap_pop();
+        }
+        // Fallback: linear scan (should never happen if heap is maintained)
         for v in 0..self.num_vars {
-            if self.assigns[v] == LBool::Undef && self.activity[v] > best_act {
-                best_act = self.activity[v];
-                best_var = v;
+            if self.assigns[v] == LBool::Undef {
+                let lit = (v as i32) + 1;
+                return if self.phase[v] { lit } else { -lit };
             }
         }
-        // Branch positive (arbitrary; could use phase saving)
-        (best_var as i32) + 1
+        unreachable!("no unassigned variable")
     }
 
     fn bump_activity(&mut self, v: usize) {
         self.activity[v] += self.var_inc;
         if self.activity[v] > 1e100 {
-            // Rescale all activities
             for a in &mut self.activity {
                 *a *= 1e-100;
             }
             self.var_inc *= 1e-100;
         }
+        // Update heap position (sift up)
+        if self.heap_pos[v] < self.heap.len() {
+            self.heap_sift_up(self.heap_pos[v]);
+        }
+    }
+
+    // ── Heap operations (max-heap by activity) ──
+
+    fn heap_parent(i: usize) -> usize { (i.wrapping_sub(1)) / 2 }
+    fn heap_left(i: usize) -> usize { 2 * i + 1 }
+    fn heap_right(i: usize) -> usize { 2 * i + 2 }
+
+    fn heap_sift_up(&mut self, mut i: usize) {
+        let v = self.heap[i];
+        while i > 0 {
+            let p = Self::heap_parent(i);
+            if self.activity[self.heap[p]] >= self.activity[v] { break; }
+            self.heap[i] = self.heap[p];
+            self.heap_pos[self.heap[p]] = i;
+            i = p;
+        }
+        self.heap[i] = v;
+        self.heap_pos[v] = i;
+    }
+
+    fn heap_sift_down(&mut self, mut i: usize) {
+        let v = self.heap[i];
+        let n = self.heap.len();
+        loop {
+            let l = Self::heap_left(i);
+            if l >= n { break; }
+            let r = Self::heap_right(i);
+            let best = if r < n && self.activity[self.heap[r]] > self.activity[self.heap[l]] { r } else { l };
+            if self.activity[self.heap[best]] <= self.activity[v] { break; }
+            self.heap[i] = self.heap[best];
+            self.heap_pos[self.heap[best]] = i;
+            i = best;
+        }
+        self.heap[i] = v;
+        self.heap_pos[v] = i;
+    }
+
+    fn heap_pop(&mut self) -> usize {
+        let top = self.heap[0];
+        let last = self.heap.len() - 1;
+        self.heap[0] = self.heap[last];
+        self.heap_pos[self.heap[0]] = 0;
+        self.heap_pos[top] = usize::MAX;
+        self.heap.pop();
+        if !self.heap.is_empty() {
+            self.heap_sift_down(0);
+        }
+        top
+    }
+
+    fn heap_insert(&mut self, v: usize) {
+        if self.heap_pos[v] < self.heap.len() { return; } // already in heap
+        let pos = self.heap.len();
+        self.heap.push(v);
+        self.heap_pos[v] = pos;
+        self.heap_sift_up(pos);
     }
 
     fn decay_activities(&mut self) {
