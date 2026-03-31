@@ -22,6 +22,10 @@ The long-term goal is TT(56), which yields a **Hadamard matrix of order 668**.
 
 All solved with **radical**, a pure Rust CDCL SAT solver included as a subcrate. No external C/C++ dependencies. Timeout = 2 minutes wall-clock. Stochastic is nondeterministic; times vary between runs.
 
+**Test machine:** 4-core Intel Xeon @ 2.10 GHz, 16 GB RAM, Linux x86_64. Note that the full SAT, hybrid, and z-sat strategies are currently **single-threaded** — only the DFS exhaustive and stochastic modes parallelize across cores. There is substantial room for improvement by parallelizing the SAT-based strategies (e.g., solving different sum-tuples or Z/W candidates concurrently).
+
+For comparison, London (2013) enumerated all 3,523 TT(24) sequences in ~1 hour and all 3,753 TT(26) in ~9 hours on a 6-core Intel i7 3930K @ 3.2 GHz, using a highly optimized custom C++ backtracker. Our hybrid solver finds a single TT(24) in 4.2s (single-threaded, on a slower CPU) but cannot yet enumerate all solutions or reach n=26 within 2 minutes.
+
 Known solutions exist in the literature for all even n up to 44 (London-Kotsireas 2025). The current bottleneck for n >= 26 is SAT solver performance at scale.
 
 ### Benchmarking rules
