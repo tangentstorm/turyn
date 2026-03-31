@@ -941,4 +941,59 @@ mod tests {
         let result = s.solve();
         assert!(result == Some(true) || result == Some(false));
     }
+
+    #[test]
+    fn assumptions_basic() {
+        let mut s = Solver::new();
+        s.add_clause([1, 2]);       // x1 OR x2
+        s.add_clause([-1, -2]);     // at most one true
+
+        // x1=true → x2=false
+        assert_eq!(s.solve_with_assumptions(&[1]), Some(true));
+        assert_eq!(s.value(1), Some(true));
+        assert_eq!(s.value(2), Some(false));
+        s.reset();
+
+        // x2=true → x1=false
+        assert_eq!(s.solve_with_assumptions(&[2]), Some(true));
+        assert_eq!(s.value(2), Some(true));
+        assert_eq!(s.value(1), Some(false));
+        s.reset();
+
+        // Both false: UNSAT
+        assert_eq!(s.solve_with_assumptions(&[-1, -2]), Some(false));
+
+        // After UNSAT, different assumptions should still work
+        assert_eq!(s.solve_with_assumptions(&[1]), Some(true));
+    }
+
+    #[test]
+    fn assumptions_repeated_sat() {
+        // Simulate the hybrid pattern: same structural clauses,
+        // different cardinality targets via assumptions
+        let mut s = Solver::new();
+        // 4 variables, structural clause: at least one true
+        s.add_clause([1, 2, 3, 4]);
+        // at most 2 true
+        s.add_clause([-1, -2, -3]);
+        s.add_clause([-1, -2, -4]);
+        s.add_clause([-1, -3, -4]);
+        s.add_clause([-2, -3, -4]);
+
+        // Multiple rounds with different assumptions
+        for round in 0..10 {
+            let assume_var = (round % 4) as i32 + 1;
+            let result = s.solve_with_assumptions(&[assume_var]);
+            assert_eq!(result, Some(true), "round {} with assumption {} should be SAT", round, assume_var);
+            s.reset();
+        }
+
+        // Assumption that makes it UNSAT: all four true
+        assert_eq!(s.solve_with_assumptions(&[1, 2, 3]), Some(false));
+
+        // Should still work after UNSAT
+        assert_eq!(s.solve_with_assumptions(&[1]), Some(true));
+        s.reset();
+        assert_eq!(s.solve_with_assumptions(&[4]), Some(true));
+    }
 }
