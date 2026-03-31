@@ -223,4 +223,50 @@ The Phase C SAT solver (radical) is the bottleneck at n=22, consuming ~96% of co
 | + Blocker literal optimization | 15.5s | -27.2% |
 | + Learnt clause minimization | **14.7s** | **-31.0%** |
 | CaDiCaL backend (for reference) | 11.8s | -44.6% |
+| + Native PB constraints (replace totalizers) | ~14.7s | neutral (fewer vars/clauses, same speed) |
+
+### Tried: Native XNOR propagation (CryptoMiniSat-style)
+
+- **Native XNOR constraints** *(from Claude)*: Replaced the 4-clause XNOR encoding (`aux ↔ (a ↔ b)`) with a native `XnorConstraint` struct that propagates directly. When 2 of the 3 variables are assigned, the third is forced. Watched via per-variable index (static, no updates needed). Benchmark n=22: `12.9s → 17.5s` (**+35% regression**). The 2WL clause encoding with blocker literals is more efficient because the blocker short-circuits most checks without accessing clause memory. The native XNOR adds a second propagation pass on a separate data structure for every enqueued literal. **Reverted.**
+
+- **CryptoMiniSat-style Gauss-Jordan elimination** *(idea)*: The XNOR constraints form a system of XOR equations (`aux ⊕ a ⊕ b = 0`). GJ elimination could discover implied variable equalities and reduce the constraint count. However, the XNOR aux variables appear in PB cardinality constraints (agree counts), not directly in clauses, so eliminating them requires rewriting PBs — a non-trivial transformation. The agree count `sum(x_i XNOR x_{i+s})` is quadratic in the original variables, so direct elimination without aux vars isn't possible in the PB framework. **Not implemented.**
+
+## CaDiCaL vs radical feature comparison
+
+| Feature | CaDiCaL | radical |
+|---|---|---|
+| **Core CDCL** | | |
+| Two-watched-literal BCP | ✅ | ✅ |
+| Blocker literals in watch lists | ✅ | ✅ |
+| 1-UIP conflict analysis | ✅ | ✅ |
+| Non-chronological backjumping | ✅ | ✅ |
+| VSIDS with activity decay | ✅ | ✅ |
+| Phase saving | ✅ | ✅ |
+| Learnt clause minimization | ✅ | ✅ |
+| LBD-based clause deletion | ✅ | ✅ |
+| **Restarts** | | |
+| Luby restarts | ✅ | ✅ |
+| EMA-based (glucose-style) restarts | ✅ | ❌ (tested, +75% regression) |
+| Rephasing / target phases | ✅ | ❌ |
+| Stabilization mode | ✅ | ❌ |
+| **Preprocessing / Inprocessing** | | |
+| Bounded Variable Elimination (BVE) | ✅ | ❌ |
+| Subsumption / self-subsumption | ✅ | ❌ |
+| Failed literal probing | ✅ | ❌ (tested, neutral) |
+| Vivification | ✅ | ❌ |
+| Equivalent literal substitution | ✅ | ❌ |
+| **Clause management** | | |
+| Flat clause storage | ✅ | ✅ |
+| Tier-based retention (glue ≤ 2/6) | ✅ | ❌ (glue ≤ 3 only) |
+| Binary clause special-casing | ✅ | ❌ |
+| Clause compaction / GC | ✅ | ❌ (soft delete only) |
+| **Incremental solving** | | |
+| Assumptions API | ✅ | ✅ |
+| Incremental clause addition | ✅ | ✅ |
+| **Extensions (radical only)** | | |
+| Native PB constraints (`sum >= k`) | ❌ | ✅ |
+| Solver cloning (for templates) | ❌ (C++ object) | ✅ (flat storage) |
+| Pure Rust, zero C deps | ❌ | ✅ |
+
+**Key gap**: CaDiCaL's ~20% speed advantage over radical (11.8s vs 14.7s at n=22) is likely from BVE preprocessing eliminating auxiliary variables introduced by the totalizer/XNOR encoding. With native PB constraints, radical has fewer auxiliary variables to eliminate, potentially narrowing this gap at larger n.
 
