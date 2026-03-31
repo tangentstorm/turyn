@@ -237,19 +237,21 @@ See README.md for the full CaDiCaL vs radical feature comparison matrix.
 
 ### 1. Quadratic PB constraints (eliminate XNOR aux vars entirely)
 
-Currently, each agree pair `(x_i, x_{i+s})` requires an XNOR auxiliary variable (462 aux vars, 1848 clauses at n=22). The agree count `sum(x_i XNOR x_{i+s}) = target` is quadratic in the primary variables. By extending radical with **quadratic PB constraints** that natively propagate `sum(a_i * b_i)` terms, we can eliminate ALL XNOR auxiliary variables and their clauses. The problem shrinks from ~506 vars / ~1850 clauses + ~40 PBs to **44 vars / 2 clauses + ~23 quadratic PBs**. This is a fundamentally different scale.
+Eliminate all 462 XNOR auxiliary variables by extending radical with quadratic PB constraints: `sum(a_i * b_i) = target`. The agree count `agree(x_i, x_{i+s}) = x_i*x_{i+s} + ¬x_i*¬x_{i+s}` is expressed as product terms directly on primary X/Y variables.
 
-Propagation for `a * b` terms: if either is false → 0; both true → 1; one true + one undef → check slack to propagate the undef one; both undef → contributes max 1 to slack.
+**Implemented.** Propagation generates minimal explanation clauses on-the-fly for CDCL conflict analysis. Problem shrinks from ~506 vars / ~1850 clauses to 44 vars / 2 clauses + PB + quad PB constraints. Benchmark n=22: **~15.3s (neutral)**. The on-the-fly clause generation overhead roughly equals the saved XNOR clause cost. Two rounds of optimization (minimal explanation clauses, removing per-propagation allocations) did not change the picture.
 
 ### 2. BVE preprocessing (bounded variable elimination)
 
-CaDiCaL's main advantage is BVE — resolving away variables that appear in few clauses before search begins. With the quadratic PB approach, there are very few clauses left (just symmetry breaking). But if we keep the current XNOR-clause encoding, BVE could resolve the aux variables since each appears in exactly one positive and a few negative occurrences. Expected to close most of the remaining gap to CaDiCaL.
+CaDiCaL's main advantage is BVE — resolving away variables that appear in few clauses before search begins. With the quadratic PB approach, there are very few clauses left (just symmetry breaking), so BVE has little to work with. **Skipped** — the quad PB approach made this less relevant.
 
 ### 3. Tier-based clause retention
 
-CaDiCaL uses 3 tiers for learnt clauses: glue ≤ 2 (never delete), glue ≤ 6 (keep longer), rest (delete aggressively). radical currently uses a flat threshold of glue ≤ 3. Adopting tiered retention could improve clause quality. Low implementation effort.
+CaDiCaL uses 3 tiers: glue ≤ 2 (never delete), glue ≤ 6 (delete 25%), rest (delete 50%). **Tried** with multiple configurations. Benchmark n=22: **~15.8s (+3% regression)**. The original flat glue ≤ 3 threshold was already well-tuned for these instance sizes. **Reverted.**
 
-### 4. Expand GJ to partial agree targets
+### 4. Expand GJ to partial agree targets (parity constraints)
 
-Currently GJ only exploits lags where target=0 or target=max (extreme cases). For intermediate targets like target=1, we know "at most one pair agrees," which constrains the search. We could extract **parity constraints** or **at-most-k implications** from these intermediate targets. For example, target=1 means the XOR of all agree pairs has a specific parity, giving a GF(2) equation over the agree variables.
+For each lag s with agree target T, the parity constraint `sum(x_i XOR x_{i+s}) mod 2 = (T+k) mod 2` gives a GF(2) equation over primary variables — valid for ALL lags, not just extreme ones. Full GJ elimination on this system discovers additional variable equivalences.
+
+**Implemented.** Benchmark n=22: **~15.4s (neutral)**. At n=22, the parity equations involve many variables each, so GJ produces few 2-variable rows after elimination. May help more at larger n with denser equation systems.
 
