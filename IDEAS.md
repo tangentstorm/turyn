@@ -233,3 +233,23 @@ The Phase C SAT solver (radical) is the bottleneck at n=22, consuming ~96% of co
 
 See README.md for the full CaDiCaL vs radical feature comparison matrix.
 
+## Next optimization candidates (credit: Claude)
+
+### 1. Quadratic PB constraints (eliminate XNOR aux vars entirely)
+
+Currently, each agree pair `(x_i, x_{i+s})` requires an XNOR auxiliary variable (462 aux vars, 1848 clauses at n=22). The agree count `sum(x_i XNOR x_{i+s}) = target` is quadratic in the primary variables. By extending radical with **quadratic PB constraints** that natively propagate `sum(a_i * b_i)` terms, we can eliminate ALL XNOR auxiliary variables and their clauses. The problem shrinks from ~506 vars / ~1850 clauses + ~40 PBs to **44 vars / 2 clauses + ~23 quadratic PBs**. This is a fundamentally different scale.
+
+Propagation for `a * b` terms: if either is false → 0; both true → 1; one true + one undef → check slack to propagate the undef one; both undef → contributes max 1 to slack.
+
+### 2. BVE preprocessing (bounded variable elimination)
+
+CaDiCaL's main advantage is BVE — resolving away variables that appear in few clauses before search begins. With the quadratic PB approach, there are very few clauses left (just symmetry breaking). But if we keep the current XNOR-clause encoding, BVE could resolve the aux variables since each appears in exactly one positive and a few negative occurrences. Expected to close most of the remaining gap to CaDiCaL.
+
+### 3. Tier-based clause retention
+
+CaDiCaL uses 3 tiers for learnt clauses: glue ≤ 2 (never delete), glue ≤ 6 (keep longer), rest (delete aggressively). radical currently uses a flat threshold of glue ≤ 3. Adopting tiered retention could improve clause quality. Low implementation effort.
+
+### 4. Expand GJ to partial agree targets
+
+Currently GJ only exploits lags where target=0 or target=max (extreme cases). For intermediate targets like target=1, we know "at most one pair agrees," which constrains the search. We could extract **parity constraints** or **at-most-k implications** from these intermediate targets. For example, target=1 means the XOR of all agree pairs has a specific parity, giving a GF(2) equation over the agree variables.
+
