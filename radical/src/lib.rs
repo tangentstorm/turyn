@@ -39,19 +39,21 @@ enum LBool {
     Undef,
 }
 
-/// A clause in the database.
-#[derive(Clone, Debug)]
-struct Clause {
-    lits: Vec<Lit>,
+/// Clause metadata (literals stored in flat `clause_lits` array).
+#[derive(Clone, Copy, Debug)]
+struct ClauseMeta {
+    start: u32,  // index into clause_lits
+    len: u16,
     learnt: bool,
-    lbd: u32, // Literal Block Distance (for learnt clause quality)
+    lbd: u8,
+    deleted: bool,
 }
 
 /// Reason a variable was assigned (for conflict analysis).
 #[derive(Clone, Copy, Debug)]
 enum Reason {
     Decision,
-    Clause(usize), // index into clause database
+    Clause(u32), // index into clause database
 }
 
 /// Trail entry: records an assignment.
@@ -76,9 +78,10 @@ pub struct Solver {
     trail: Vec<TrailEntry>,
     trail_lim: Vec<usize>,  // trail index at start of each decision level
 
-    // Clause database
-    clauses: Vec<Clause>,
-    watches: Vec<Vec<usize>>, // watches[lit_index] = list of clause indices
+    // Clause database (flat storage for cheap cloning)
+    clause_meta: Vec<ClauseMeta>,
+    clause_lits: Vec<Lit>,         // flat array of all clause literals
+    watches: Vec<Vec<u32>>,        // watches[lit_index] = list of clause indices (u32)
 
     // VSIDS activity with binary heap
     activity: Vec<f64>,
@@ -99,6 +102,22 @@ pub struct Solver {
     ok: bool, // false if top-level conflict detected
 }
 
+impl Solver {
+    /// Get the literals of clause `ci`.
+    #[inline]
+    fn clause_lits(&self, ci: u32) -> &[Lit] {
+        let m = &self.clause_meta[ci as usize];
+        &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)]
+    }
+
+    /// Get a mutable reference to the literals of clause `ci`.
+    #[inline]
+    fn clause_lits_mut(&mut self, ci: u32) -> &mut [Lit] {
+        let m = &self.clause_meta[ci as usize];
+        &mut self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)]
+    }
+}
+
 impl Default for Solver {
     fn default() -> Self {
         Self::new()
@@ -115,7 +134,8 @@ impl Solver {
             phase: Vec::new(),
             trail: Vec::new(),
             trail_lim: Vec::new(),
-            clauses: Vec::new(),
+            clause_meta: Vec::new(),
+            clause_lits: Vec::new(),
             watches: Vec::new(),
             activity: Vec::new(),
             var_inc: 1.0,
@@ -169,8 +189,10 @@ impl Solver {
                     LBool::False => { self.ok = false; } // contradiction
                     LBool::Undef => {
                         // Store as a clause so we have a reason index
-                        let ci = self.clauses.len();
-                        self.clauses.push(Clause { lits, learnt: false, lbd: 0 });
+                        let ci = self.clause_meta.len() as u32;
+                        let start = self.clause_lits.len() as u32;
+                        self.clause_lits.extend_from_slice(&lits);
+                        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
                         self.enqueue(lit, Reason::Clause(ci));
                         // Propagate immediately
                         if self.propagate().is_some() {
@@ -180,11 +202,13 @@ impl Solver {
                 }
             }
             _ => {
-                let ci = self.clauses.len();
+                let ci = self.clause_meta.len() as u32;
+                let start = self.clause_lits.len() as u32;
                 // Set up 2WL: watch the first two literals
                 self.watches[lit_index(negate(lits[0]))].push(ci);
                 self.watches[lit_index(negate(lits[1]))].push(ci);
-                self.clauses.push(Clause { lits, learnt: false, lbd: 0 });
+                self.clause_lits.extend_from_slice(&lits);
+                self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
             }
         }
     }
@@ -239,6 +263,15 @@ impl Solver {
         self.backtrack(0);
     }
 
+    /// Number of variables.
+    pub fn num_vars(&self) -> usize { self.num_vars }
+    /// Number of active (non-deleted) clauses.
+    pub fn num_clauses(&self) -> usize {
+        self.clause_meta.iter().filter(|m| !m.deleted).count()
+    }
+    /// Number of conflicts so far.
+    pub fn num_conflicts(&self) -> u64 { self.conflicts }
+
     fn solve_inner(&mut self, base_level: u32) -> Option<bool> {
         loop {
             if let Some(conflict_ci) = self.propagate() {
@@ -248,6 +281,14 @@ impl Solver {
                     return Some(false); // conflict at/below assumption level → UNSAT
                 }
                 let (learnt_clause, bt_level) = self.analyze(conflict_ci);
+                // Verify: every literal in the learnt clause should be false
+                // at the current decision level (before backtrack).
+                #[cfg(debug_assertions)]
+                for &lit in &learnt_clause {
+                    debug_assert!(self.lit_value(lit) == LBool::False,
+                        "learnt clause lit {} should be false but is {:?} (level={})",
+                        lit, self.lit_value(lit), self.level[var_of(lit)]);
+                }
                 let bt_level = bt_level.max(base_level);
                 self.backtrack(bt_level);
                 self.add_learnt_clause(learnt_clause);
@@ -258,10 +299,7 @@ impl Solver {
                     self.restart_limit += 100 * luby(self.luby_index);
                     self.luby_index += 1;
                     self.backtrack(base_level);
-                    // Periodic clause cleanup
-                    if self.conflicts % 5000 == 0 {
-                        self.reduce_db();
-                    }
+                    self.reduce_db();
                 }
             } else {
                 // No conflict
@@ -297,18 +335,19 @@ impl Solver {
         self.trail_lim.push(self.trail.len());
     }
 
+    #[inline(always)]
     fn lit_value(&self, lit: Lit) -> LBool {
         let v = var_of(lit);
-        match self.assigns[v] {
-            LBool::Undef => LBool::Undef,
-            LBool::True => if lit > 0 { LBool::True } else { LBool::False },
-            LBool::False => if lit > 0 { LBool::False } else { LBool::True },
-        }
+        let a = self.assigns[v];
+        if a == LBool::Undef { return LBool::Undef; }
+        // True XOR negative = flip if literal is negative
+        if (a == LBool::True) == (lit > 0) { LBool::True } else { LBool::False }
     }
 
     fn enqueue(&mut self, lit: Lit, reason: Reason) {
         let v = var_of(lit);
-        debug_assert!(self.assigns[v] == LBool::Undef);
+        debug_assert!(self.assigns[v] == LBool::Undef,
+            "enqueue lit={} but var {} already assigned {:?}", lit, v, self.assigns[v]);
         self.assigns[v] = if lit > 0 { LBool::True } else { LBool::False };
         self.level[v] = self.decision_level();
         self.reason[v] = reason;
@@ -317,7 +356,7 @@ impl Solver {
 
     /// BCP: propagate all enqueued assignments using 2WL.
     /// Returns the clause index of the first conflict, or None.
-    fn propagate(&mut self) -> Option<usize> {
+    fn propagate(&mut self) -> Option<u32> {
         while self.prop_head < self.trail.len() {
             let lit = self.trail[self.prop_head].lit;
             self.prop_head += 1;
@@ -330,31 +369,34 @@ impl Solver {
         None
     }
 
-    fn propagate_lit(&mut self, lit: Lit) -> Option<usize> {
-        // lit just became true. Clauses watching ¬lit (which just became false)
-        // are stored at watches[lit_index(negate(¬lit))] = watches[lit_index(lit)].
+    fn propagate_lit(&mut self, lit: Lit) -> Option<u32> {
         let false_lit = negate(lit);
         let watch_idx = lit_index(lit);
 
-        // Take the watch list to avoid borrow issues
         let mut watch_list = std::mem::take(&mut self.watches[watch_idx]);
         let mut i = 0;
-        let mut j = 0; // compaction index
+        let mut j = 0;
         let mut conflict = None;
 
         while i < watch_list.len() {
             let ci = watch_list[i];
+            if self.clause_meta[ci as usize].deleted {
+                // Skip deleted clauses — don't keep in watch list
+                i += 1;
+                continue;
+            }
+            let m = self.clause_meta[ci as usize];
+            let cstart = m.start as usize;
+            let clen = m.len as usize;
 
-            // Ensure false_lit is at position [1] in the clause.
-            // The 2WL convention: positions 0 and 1 are the two watched literals.
-            if self.clauses[ci].lits[0] == false_lit {
-                self.clauses[ci].lits.swap(0, 1);
+            // Ensure false_lit is at position [1]
+            if self.clause_lits[cstart] == false_lit {
+                self.clause_lits.swap(cstart, cstart + 1);
             }
 
-            let other = self.clauses[ci].lits[0]; // the other watched lit
+            let other = self.clause_lits[cstart]; // lits[0]
 
-            // If the other watched literal is already true, clause is satisfied.
-            // Keep watching.
+            // If the other watched literal is already true, skip
             if self.lit_value(other) == LBool::True {
                 watch_list[j] = ci;
                 j += 1;
@@ -362,35 +404,29 @@ impl Solver {
                 continue;
             }
 
-            // Look for a new literal to watch (from positions 2..len)
+            // Look for a new literal to watch
             let mut found_new = false;
-            let clause_len = self.clauses[ci].lits.len();
-            for k in 2..clause_len {
-                let replacement = self.clauses[ci].lits[k];
-                if self.lit_value(replacement) != LBool::False {
-                    // Swap replacement into position [1]
-                    self.clauses[ci].lits[1] = replacement;
-                    self.clauses[ci].lits[k] = false_lit;
-                    // Add this clause to the watch list of ¬replacement
-                    self.watches[lit_index(negate(replacement))].push(ci);
+            for k in 2..clen {
+                let repl = self.clause_lits[cstart + k];
+                if self.lit_value(repl) != LBool::False {
+                    self.clause_lits[cstart + 1] = repl;
+                    self.clause_lits[cstart + k] = false_lit;
+                    self.watches[lit_index(negate(repl))].push(ci);
                     found_new = true;
                     break;
                 }
             }
             if found_new {
-                // Don't keep ci in this watch list (it's now watched by replacement)
                 i += 1;
                 continue;
             }
 
-            // No new watcher found. Keep watching and check unit/conflict.
+            // No new watcher found
             watch_list[j] = ci;
             j += 1;
 
             if self.lit_value(other) == LBool::False {
-                // Conflict!
                 conflict = Some(ci);
-                // Copy remaining watches
                 while i + 1 < watch_list.len() {
                     i += 1;
                     watch_list[j] = watch_list[i];
@@ -398,7 +434,6 @@ impl Solver {
                 }
                 break;
             } else {
-                // Unit propagation
                 self.enqueue(other, Reason::Clause(ci));
             }
             i += 1;
@@ -410,7 +445,7 @@ impl Solver {
     }
 
     /// 1-UIP conflict analysis. Returns (learnt clause, backtrack level).
-    fn analyze(&mut self, conflict_ci: usize) -> (Vec<Lit>, u32) {
+    fn analyze(&mut self, conflict_ci: u32) -> (Vec<Lit>, u32) {
         let mut seen = vec![false; self.num_vars];
         let mut counter = 0; // # of unresolved literals at current decision level
         let mut learnt = Vec::new();
@@ -423,7 +458,7 @@ impl Solver {
 
         loop {
             // Resolve with the reason clause
-            let clause_lits = self.clauses[reason_ci].lits.clone();
+            let clause_lits = self.clause_lits(reason_ci).to_vec();
             for &lit in &clause_lits {
                 if lit == p { continue; } // skip the resolvent
                 let v = var_of(lit);
@@ -434,7 +469,7 @@ impl Solver {
                 if self.level[v] == self.decision_level() {
                     counter += 1; // will be resolved later
                 } else if self.level[v] > 0 {
-                    learnt.push(negate(lit));
+                    learnt.push(lit); // lit is false — part of the learnt clause
                     bt_level = bt_level.max(self.level[v]);
                 }
                 // Level-0 literals are always true, skip them
@@ -480,6 +515,9 @@ impl Solver {
         self.prop_head = self.trail.len();
     }
 
+    /// Minimize a learnt clause by removing redundant literals.
+    /// A literal is redundant if it's at level 0 (always false) or
+    /// if its reason clause is subsumed by the learnt clause.
     /// Add a learnt clause and enqueue the asserting literal.
     fn add_learnt_clause(&mut self, lits: Vec<Lit>) {
         if lits.len() == 1 {
@@ -488,28 +526,34 @@ impl Solver {
             return;
         }
 
-        let ci = self.clauses.len();
+        let ci = self.clause_meta.len() as u32;
         let lbd = self.compute_lbd(&lits);
+        let start = self.clause_lits.len() as u32;
+        let asserting_lit = lits[0];
 
         // Watch the first two literals
         self.watches[lit_index(negate(lits[0]))].push(ci);
         self.watches[lit_index(negate(lits[1]))].push(ci);
-        self.clauses.push(Clause { lits, learnt: true, lbd });
+        self.clause_lits.extend_from_slice(&lits);
+        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8, deleted: false });
 
         // The asserting literal (lits[0]) should be propagated
-        self.enqueue(self.clauses[ci].lits[0], Reason::Clause(ci));
+        self.enqueue(asserting_lit, Reason::Clause(ci));
     }
 
     /// Compute LBD (Literal Block Distance) of a clause.
     fn compute_lbd(&self, lits: &[Lit]) -> u32 {
-        let mut levels = Vec::new();
+        // Use a small bitset for levels (decision levels rarely exceed a few hundred)
+        let mut seen_levels = vec![false; self.decision_level() as usize + 1];
+        let mut count = 0u32;
         for &lit in lits {
-            let lv = self.level[var_of(lit)];
-            if !levels.contains(&lv) {
-                levels.push(lv);
+            let lv = self.level[var_of(lit)] as usize;
+            if lv < seen_levels.len() && !seen_levels[lv] {
+                seen_levels[lv] = true;
+                count += 1;
             }
         }
-        levels.len() as u32
+        count
     }
 
     /// VSIDS: pick the unassigned variable with highest activity (O(log n) via heap).
@@ -608,14 +652,43 @@ impl Solver {
         self.var_inc /= self.var_decay;
     }
 
-    /// Reduce the learnt clause database: keep clauses with LBD ≤ 3
-    /// and half of the rest (lowest activity / highest LBD).
+    /// Remove low-quality learnt clauses to keep the database manageable.
     fn reduce_db(&mut self) {
-        // Simple strategy: remove learnt clauses with LBD > 6
-        // that aren't currently a reason for any assignment.
-        // For now, just keep everything (full cleanup is complex
-        // because clause indices are used in reasons and watch lists).
-        // TODO: implement proper clause garbage collection with index remapping.
+        let num_learnt: usize = self.clause_meta.iter()
+            .filter(|m| m.learnt && !m.deleted).count();
+        let num_original: usize = self.clause_meta.iter()
+            .filter(|m| !m.learnt && !m.deleted).count();
+        if num_learnt < num_original { return; }
+
+        // Collect which clauses are currently reasons
+        let mut is_reason = vec![false; self.clause_meta.len()];
+        for entry in &self.trail {
+            if let Reason::Clause(ci) = entry.reason {
+                is_reason[ci as usize] = true;
+            }
+        }
+
+        // Keep glue clauses (LBD ≤ 3) always. Delete worst half of the rest.
+        let mut eligible: Vec<(u32, u8)> = Vec::new();
+        for ci in 0..self.clause_meta.len() {
+            let m = &self.clause_meta[ci];
+            if m.learnt && !m.deleted && m.lbd > 3 && !is_reason[ci] {
+                eligible.push((ci as u32, m.lbd));
+            }
+        }
+        if eligible.len() < 100 { return; }
+
+        // Sort by LBD descending — delete worst half
+        eligible.sort_by(|a, b| b.1.cmp(&a.1));
+        let to_delete = eligible.len() / 2;
+        for &(ci, _) in &eligible[..to_delete] {
+            self.clause_meta[ci as usize].deleted = true;
+        }
+
+        // Clean watch lists
+        for wl in &mut self.watches {
+            wl.retain(|&ci| !self.clause_meta[ci as usize].deleted);
+        }
     }
 }
 
@@ -914,5 +987,60 @@ mod tests {
         // Should complete (SAT or UNSAT) without panicking
         let result = s.solve();
         assert!(result == Some(true) || result == Some(false));
+    }
+
+    #[test]
+    fn assumptions_basic() {
+        let mut s = Solver::new();
+        s.add_clause([1, 2]);       // x1 OR x2
+        s.add_clause([-1, -2]);     // at most one true
+
+        // x1=true → x2=false
+        assert_eq!(s.solve_with_assumptions(&[1]), Some(true));
+        assert_eq!(s.value(1), Some(true));
+        assert_eq!(s.value(2), Some(false));
+        s.reset();
+
+        // x2=true → x1=false
+        assert_eq!(s.solve_with_assumptions(&[2]), Some(true));
+        assert_eq!(s.value(2), Some(true));
+        assert_eq!(s.value(1), Some(false));
+        s.reset();
+
+        // Both false: UNSAT
+        assert_eq!(s.solve_with_assumptions(&[-1, -2]), Some(false));
+
+        // After UNSAT, different assumptions should still work
+        assert_eq!(s.solve_with_assumptions(&[1]), Some(true));
+    }
+
+    #[test]
+    fn assumptions_repeated_sat() {
+        // Simulate the hybrid pattern: same structural clauses,
+        // different cardinality targets via assumptions
+        let mut s = Solver::new();
+        // 4 variables, structural clause: at least one true
+        s.add_clause([1, 2, 3, 4]);
+        // at most 2 true
+        s.add_clause([-1, -2, -3]);
+        s.add_clause([-1, -2, -4]);
+        s.add_clause([-1, -3, -4]);
+        s.add_clause([-2, -3, -4]);
+
+        // Multiple rounds with different assumptions
+        for round in 0..10 {
+            let assume_var = (round % 4) as i32 + 1;
+            let result = s.solve_with_assumptions(&[assume_var]);
+            assert_eq!(result, Some(true), "round {} with assumption {} should be SAT", round, assume_var);
+            s.reset();
+        }
+
+        // Assumption that makes it UNSAT: all four true
+        assert_eq!(s.solve_with_assumptions(&[1, 2, 3]), Some(false));
+
+        // Should still work after UNSAT
+        assert_eq!(s.solve_with_assumptions(&[1]), Some(true));
+        s.reset();
+        assert_eq!(s.solve_with_assumptions(&[4]), Some(true));
     }
 }
