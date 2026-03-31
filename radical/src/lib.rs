@@ -452,7 +452,8 @@ impl Solver {
         conflict
     }
 
-    /// 1-UIP conflict analysis. Returns (learnt clause, backtrack level).
+    /// 1-UIP conflict analysis with learnt clause minimization.
+    /// Returns (learnt clause, backtrack level).
     fn analyze(&mut self, conflict_ci: u32) -> (Vec<Lit>, u32) {
         let mut seen = vec![false; self.num_vars];
         let mut counter = 0; // # of unresolved literals at current decision level
@@ -494,6 +495,13 @@ impl Solver {
                     if counter == 0 {
                         // Found the 1-UIP
                         learnt.insert(0, negate(p)); // asserting literal at front
+                        // Minimize: remove redundant literals
+                        self.minimize_learnt(&mut learnt, &seen);
+                        // Recompute backtrack level after minimization
+                        bt_level = 0;
+                        for &lit in &learnt[1..] {
+                            bt_level = bt_level.max(self.level[var_of(lit)]);
+                        }
                         return (learnt, bt_level);
                     }
                     match entry.reason {
@@ -504,6 +512,60 @@ impl Solver {
                 }
             }
         }
+    }
+
+    /// Recursive clause minimization (MiniSat-style).
+    fn minimize_learnt(&self, learnt: &mut Vec<Lit>, seen: &[bool]) {
+        let mut levels_in_learnt = vec![false; self.decision_level() as usize + 1];
+        for &lit in learnt.iter() {
+            let lv = self.level[var_of(lit)] as usize;
+            if lv < levels_in_learnt.len() {
+                levels_in_learnt[lv] = true;
+            }
+        }
+
+        let mut j = 1; // keep learnt[0] (the asserting literal)
+        for i in 1..learnt.len() {
+            let lit = learnt[i];
+            let v = var_of(lit);
+            if let Reason::Clause(_) = self.reason[v] {
+                if self.lit_removable(v, seen, &levels_in_learnt) {
+                    continue;
+                }
+            }
+            learnt[j] = lit;
+            j += 1;
+        }
+        learnt.truncate(j);
+    }
+
+    /// Check if a literal's antecedent chain is covered by the learnt clause.
+    fn lit_removable(&self, v: usize, seen: &[bool], levels_in_learnt: &[bool]) -> bool {
+        let mut stack: Vec<usize> = vec![v];
+        let mut visited = vec![false; self.num_vars];
+        visited[v] = true;
+
+        while let Some(cur) = stack.pop() {
+            let ci = match self.reason[cur] {
+                Reason::Clause(ci) => ci,
+                Reason::Decision => return false,
+            };
+            let clause = self.clause_lits(ci);
+            for &lit in clause {
+                let u = var_of(lit);
+                if u == cur || visited[u] { continue; }
+                visited[u] = true;
+                if self.level[u] == 0 { continue; }
+                if seen[u] { continue; }
+                let lv = self.level[u] as usize;
+                if lv >= levels_in_learnt.len() || !levels_in_learnt[lv] { return false; }
+                match self.reason[u] {
+                    Reason::Decision => return false,
+                    Reason::Clause(_) => { stack.push(u); }
+                }
+            }
+        }
+        true
     }
 
     /// Backtrack to the given decision level.
