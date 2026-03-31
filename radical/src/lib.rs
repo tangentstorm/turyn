@@ -81,7 +81,7 @@ pub struct Solver {
     // Clause database (flat storage for cheap cloning)
     clause_meta: Vec<ClauseMeta>,
     clause_lits: Vec<Lit>,         // flat array of all clause literals
-    watches: Vec<Vec<u32>>,        // watches[lit_index] = list of clause indices (u32)
+    watches: Vec<Vec<(u32, Lit)>>,  // watches[lit_index] = (clause_index, blocker_literal)
 
     // VSIDS activity with binary heap
     activity: Vec<f64>,
@@ -204,9 +204,9 @@ impl Solver {
             _ => {
                 let ci = self.clause_meta.len() as u32;
                 let start = self.clause_lits.len() as u32;
-                // Set up 2WL: watch the first two literals
-                self.watches[lit_index(negate(lits[0]))].push(ci);
-                self.watches[lit_index(negate(lits[1]))].push(ci);
+                // Set up 2WL: watch the first two literals (blocker = the other watched lit)
+                self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
+                self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
                 self.clause_lits.extend_from_slice(&lits);
                 self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
             }
@@ -379,12 +379,20 @@ impl Solver {
         let mut conflict = None;
 
         while i < watch_list.len() {
-            let ci = watch_list[i];
+            let (ci, blocker) = watch_list[i];
             if self.clause_meta[ci as usize].deleted {
-                // Skip deleted clauses — don't keep in watch list
                 i += 1;
                 continue;
             }
+
+            // Blocker check: if the blocker literal is true, clause is satisfied
+            if self.lit_value(blocker) == LBool::True {
+                watch_list[j] = watch_list[i];
+                j += 1;
+                i += 1;
+                continue;
+            }
+
             let m = self.clause_meta[ci as usize];
             let cstart = m.start as usize;
             let clen = m.len as usize;
@@ -396,9 +404,9 @@ impl Solver {
 
             let other = self.clause_lits[cstart]; // lits[0]
 
-            // If the other watched literal is already true, skip
+            // If the other watched literal is already true, update blocker and skip
             if self.lit_value(other) == LBool::True {
-                watch_list[j] = ci;
+                watch_list[j] = (ci, other); // update blocker
                 j += 1;
                 i += 1;
                 continue;
@@ -411,7 +419,7 @@ impl Solver {
                 if self.lit_value(repl) != LBool::False {
                     self.clause_lits[cstart + 1] = repl;
                     self.clause_lits[cstart + k] = false_lit;
-                    self.watches[lit_index(negate(repl))].push(ci);
+                    self.watches[lit_index(negate(repl))].push((ci, other));
                     found_new = true;
                     break;
                 }
@@ -422,7 +430,7 @@ impl Solver {
             }
 
             // No new watcher found
-            watch_list[j] = ci;
+            watch_list[j] = (ci, other);
             j += 1;
 
             if self.lit_value(other) == LBool::False {
@@ -444,7 +452,8 @@ impl Solver {
         conflict
     }
 
-    /// 1-UIP conflict analysis. Returns (learnt clause, backtrack level).
+    /// 1-UIP conflict analysis with learnt clause minimization.
+    /// Returns (learnt clause, backtrack level).
     fn analyze(&mut self, conflict_ci: u32) -> (Vec<Lit>, u32) {
         let mut seen = vec![false; self.num_vars];
         let mut counter = 0; // # of unresolved literals at current decision level
@@ -486,6 +495,13 @@ impl Solver {
                     if counter == 0 {
                         // Found the 1-UIP
                         learnt.insert(0, negate(p)); // asserting literal at front
+                        // Minimize: remove redundant literals
+                        self.minimize_learnt(&mut learnt, &seen);
+                        // Recompute backtrack level after minimization
+                        bt_level = 0;
+                        for &lit in &learnt[1..] {
+                            bt_level = bt_level.max(self.level[var_of(lit)]);
+                        }
                         return (learnt, bt_level);
                     }
                     match entry.reason {
@@ -496,6 +512,60 @@ impl Solver {
                 }
             }
         }
+    }
+
+    /// Recursive clause minimization (MiniSat-style).
+    fn minimize_learnt(&self, learnt: &mut Vec<Lit>, seen: &[bool]) {
+        let mut levels_in_learnt = vec![false; self.decision_level() as usize + 1];
+        for &lit in learnt.iter() {
+            let lv = self.level[var_of(lit)] as usize;
+            if lv < levels_in_learnt.len() {
+                levels_in_learnt[lv] = true;
+            }
+        }
+
+        let mut j = 1; // keep learnt[0] (the asserting literal)
+        for i in 1..learnt.len() {
+            let lit = learnt[i];
+            let v = var_of(lit);
+            if let Reason::Clause(_) = self.reason[v] {
+                if self.lit_removable(v, seen, &levels_in_learnt) {
+                    continue;
+                }
+            }
+            learnt[j] = lit;
+            j += 1;
+        }
+        learnt.truncate(j);
+    }
+
+    /// Check if a literal's antecedent chain is covered by the learnt clause.
+    fn lit_removable(&self, v: usize, seen: &[bool], levels_in_learnt: &[bool]) -> bool {
+        let mut stack: Vec<usize> = vec![v];
+        let mut visited = vec![false; self.num_vars];
+        visited[v] = true;
+
+        while let Some(cur) = stack.pop() {
+            let ci = match self.reason[cur] {
+                Reason::Clause(ci) => ci,
+                Reason::Decision => return false,
+            };
+            let clause = self.clause_lits(ci);
+            for &lit in clause {
+                let u = var_of(lit);
+                if u == cur || visited[u] { continue; }
+                visited[u] = true;
+                if self.level[u] == 0 { continue; }
+                if seen[u] { continue; }
+                let lv = self.level[u] as usize;
+                if lv >= levels_in_learnt.len() || !levels_in_learnt[lv] { return false; }
+                match self.reason[u] {
+                    Reason::Decision => return false,
+                    Reason::Clause(_) => { stack.push(u); }
+                }
+            }
+        }
+        true
     }
 
     /// Backtrack to the given decision level.
@@ -531,9 +601,9 @@ impl Solver {
         let start = self.clause_lits.len() as u32;
         let asserting_lit = lits[0];
 
-        // Watch the first two literals
-        self.watches[lit_index(negate(lits[0]))].push(ci);
-        self.watches[lit_index(negate(lits[1]))].push(ci);
+        // Watch the first two literals (blocker = the other watched lit)
+        self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
+        self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
         self.clause_lits.extend_from_slice(&lits);
         self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8, deleted: false });
 
@@ -687,7 +757,7 @@ impl Solver {
 
         // Clean watch lists
         for wl in &mut self.watches {
-            wl.retain(|&ci| !self.clause_meta[ci as usize].deleted);
+            wl.retain(|&(ci, _)| !self.clause_meta[ci as usize].deleted);
         }
     }
 }

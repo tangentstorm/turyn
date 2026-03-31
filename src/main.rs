@@ -267,6 +267,8 @@ struct SearchStats {
     xy_pruned_sum: usize,
     xy_pruned_autocorr: usize,
     xy_pruned_lex: usize,
+    phase_b_nanos: u64,
+    phase_c_nanos: u64,
 }
 
 impl SearchStats {
@@ -285,6 +287,8 @@ impl SearchStats {
         self.xy_pruned_sum += other.xy_pruned_sum;
         self.xy_pruned_autocorr += other.xy_pruned_autocorr;
         self.xy_pruned_lex += other.xy_pruned_lex;
+        self.phase_b_nanos += other.phase_b_nanos;
+        self.phase_c_nanos += other.phase_c_nanos;
     }
 }
 
@@ -1030,51 +1034,110 @@ fn backtrack_xy(
 /// Pre-built SAT template for X/Y solving. Contains the structural clauses
 /// (XNOR, totalizer trees, sum constraints) that are shared across all Z/W pairs
 /// for a given tuple. Clone and add per-pair cardinality assertions to solve.
+#[cfg(not(feature = "cadical"))]
 struct SatXYTemplate {
     solver: radical::Solver,
-    counters: Vec<Vec<i32>>, // counters[lag] = totalizer "at-least" vars for agree count
+    counters: Vec<Vec<i32>>,
     n: usize,
+}
+
+#[cfg(feature = "cadical")]
+struct SatXYTemplate {
+    solver: cadical::Solver,
+    counters: Vec<Vec<i32>>,
+    n: usize,
+}
+
+fn build_sat_xy_clauses(
+    problem: Problem,
+    tuple: SumTuple,
+    solver: &mut impl SatSolver,
+) -> Option<(Vec<Vec<i32>>, usize)> {
+    let n = problem.n;
+    let mut enc = SatEncoder { n: 2 * n, m: 0, next_var: (2 * n + 1) as i32 };
+
+    let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+    let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+    // Symmetry breaking
+    solver.add_clause([x_var(0)]); // x[0] = +1
+    solver.add_clause([y_var(0)]); // y[0] = +1
+
+    // Sum constraints
+    if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0 {
+        return None;
+    }
+    let x_pos = ((tuple.x + n as i32) / 2) as usize;
+    let y_pos = ((tuple.y + n as i32) / 2) as usize;
+    let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+    let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+    enc.encode_cardinality_eq(solver, &x_lits, x_pos);
+    enc.encode_cardinality_eq(solver, &y_lits, y_pos);
+
+    let mut counters = Vec::with_capacity(n);
+    counters.push(Vec::new());
+    for s in 1..n {
+        let mut agree_lits = Vec::with_capacity(2 * (n - s));
+        for i in 0..(n - s) {
+            agree_lits.push(enc.encode_xnor(solver, x_var(i), x_var(i + s)));
+        }
+        for i in 0..(n - s) {
+            agree_lits.push(enc.encode_xnor(solver, y_var(i), y_var(i + s)));
+        }
+        let ctr = enc.build_counter(solver, &agree_lits);
+        counters.push(ctr);
+    }
+
+    Some((counters, n))
+}
+
+/// Trait abstracting over radical::Solver and cadical::Solver.
+trait SatSolver {
+    fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I);
+    fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool>;
+    fn value(&self, var: i32) -> Option<bool>;
+    fn reset(&mut self);
+}
+
+impl SatSolver for radical::Solver {
+    fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I) {
+        self.add_clause(lits);
+    }
+    fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool> {
+        self.solve_with_assumptions(assumptions)
+    }
+    fn value(&self, var: i32) -> Option<bool> {
+        self.value(var)
+    }
+    fn reset(&mut self) {
+        self.reset();
+    }
+}
+
+#[cfg(feature = "cadical")]
+impl SatSolver for cadical::Solver {
+    fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I) {
+        self.add_clause(lits);
+    }
+    fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool> {
+        self.solve_with(assumptions.iter().copied())
+    }
+    fn value(&self, var: i32) -> Option<bool> {
+        self.value(var)
+    }
+    fn reset(&mut self) {
+        // CaDiCaL auto-resets after solve
+    }
 }
 
 impl SatXYTemplate {
     fn build(problem: Problem, tuple: SumTuple) -> Option<Self> {
-        let n = problem.n;
-        let mut enc = SatEncoder { n: 2 * n, m: 0, next_var: (2 * n + 1) as i32 };
+        #[cfg(not(feature = "cadical"))]
         let mut solver: radical::Solver = Default::default();
+        #[cfg(feature = "cadical")]
+        let mut solver: cadical::Solver = Default::default();
 
-        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
-        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
-
-        // Symmetry breaking
-        solver.add_clause([x_var(0)]); // x[0] = +1
-        solver.add_clause([y_var(0)]); // y[0] = +1
-
-        // Sum constraints
-        if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0 {
-            return None;
-        }
-        let x_pos = ((tuple.x + n as i32) / 2) as usize;
-        let y_pos = ((tuple.y + n as i32) / 2) as usize;
-        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
-        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
-        enc.encode_cardinality_eq(&mut solver, &x_lits, x_pos);
-        enc.encode_cardinality_eq(&mut solver, &y_lits, y_pos);
-
-        // Build XNOR + totalizer for each lag (structural — no target assertions yet)
-        let mut counters = Vec::with_capacity(n);
-        counters.push(Vec::new()); // lag 0 unused
-        for s in 1..n {
-            let mut agree_lits = Vec::with_capacity(2 * (n - s));
-            for i in 0..(n - s) {
-                agree_lits.push(enc.encode_xnor(&mut solver, x_var(i), x_var(i + s)));
-            }
-            for i in 0..(n - s) {
-                agree_lits.push(enc.encode_xnor(&mut solver, y_var(i), y_var(i + s)));
-            }
-            let ctr = enc.build_counter(&mut solver, &agree_lits);
-            counters.push(ctr);
-        }
-
+        let (counters, n) = build_sat_xy_clauses(problem, tuple, &mut solver)?;
         Some(Self { solver, counters, n })
     }
 
@@ -1095,27 +1158,28 @@ impl SatXYTemplate {
     }
 
     /// Solve for X/Y given a specific Z/W candidate.
-    /// Clones the template solver and adds per-pair cardinality assertions.
-    fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
+    /// Uses assumptions to assert per-pair cardinality targets.
+    fn solve_for(&mut self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
         if !self.is_feasible(candidate) { return None; }
         let n = self.n;
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
 
-        let mut solver = self.solver.clone();
+        let mut assumptions = Vec::new();
         for s in 1..n {
             let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
             let target = (target_raw / 2) as usize;
             let max_pairs = 2 * (n - s);
             let ctr = &self.counters[s];
-            if target >= 1 { solver.add_clause([ctr[target]]); }
-            if target + 1 <= max_pairs { solver.add_clause([-ctr[target + 1]]); }
+            if target >= 1 { assumptions.push(ctr[target]); }
+            if target + 1 <= max_pairs { assumptions.push(-ctr[target + 1]); }
         }
 
-        match solver.solve() {
+        match self.solver.solve_with_assumptions(&assumptions) {
             Some(true) => {
-                let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
+                let x: Vec<i8> = (0..n).map(|i| if self.solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
+                let y: Vec<i8> = (0..n).map(|i| if self.solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
+                self.solver.reset();
                 Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)))
             }
             _ => None,
@@ -1922,7 +1986,7 @@ impl SatEncoder {
 
     /// Encode XNOR: aux ↔ (a ↔ b). Returns the auxiliary variable.
     /// aux=true means a and b have the same sign (+1,+1 or -1,-1).
-    fn encode_xnor(&mut self, solver: &mut radical::Solver, a: i32, b: i32) -> i32 {
+    fn encode_xnor(&mut self, solver: &mut impl SatSolver, a: i32, b: i32) -> i32 {
         let aux = self.fresh();
         // aux → (a ↔ b):  aux → (a → b) ∧ (b → a)
         //   ¬aux ∨ ¬a ∨ b, ¬aux ∨ a ∨ ¬b
@@ -1942,7 +2006,7 @@ impl SatEncoder {
     /// that is true iff at least c of `lits` are true. r[0] is unused.
     fn build_counter(
         &mut self,
-        solver: &mut radical::Solver,
+        solver: &mut impl SatSolver,
         lits: &[i32],
     ) -> Vec<i32> {
         let n = lits.len();
@@ -2023,7 +2087,7 @@ impl SatEncoder {
     /// Encode exactly `target` of `lits` must be true, using the totalizer.
     fn encode_cardinality_eq(
         &mut self,
-        solver: &mut radical::Solver,
+        solver: &mut impl SatSolver,
         lits: &[i32],
         target: usize,
     ) {
@@ -2253,13 +2317,15 @@ fn hybrid_solve_tuple(
     let phase_b_start = Instant::now();
     let zw_candidates =
         build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats);
+    let phase_b_elapsed = phase_b_start.elapsed();
+    stats.phase_b_nanos += phase_b_elapsed.as_nanos() as u64;
     if verbose && !zw_candidates.is_empty() {
-        println!("Tuple {}: {} Z/W pairs (Phase B: {:.3?})", tuple, zw_candidates.len(), phase_b_start.elapsed());
+        println!("Tuple {}: {} Z/W pairs (Phase B: {:.3?})", tuple, zw_candidates.len(), phase_b_elapsed);
     }
     if zw_candidates.is_empty() { return (None, stats); }
     if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
 
-    let Some(template) = SatXYTemplate::build(problem, tuple) else { return (None, stats); };
+    let Some(mut template) = SatXYTemplate::build(problem, tuple) else { return (None, stats); };
 
     // Deduplicate Z/W pairs by autocorrelation vector
     let mut seen_autocorr = std::collections::HashSet::new();
@@ -2275,6 +2341,7 @@ fn hybrid_solve_tuple(
         if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
         let sat_start = Instant::now();
         if let Some((x, y)) = template.solve_for(cand) {
+            stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
             let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
             if verbose {
                 print_solution(&format!("TT({}) hybrid (pair {}, {:.3?}, verified={})", problem.n, idx, sat_start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
@@ -2283,8 +2350,11 @@ fn hybrid_solve_tuple(
                 found.store(true, AtomicOrdering::Relaxed);
                 return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
             }
-        } else if verbose {
-            println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
+        } else {
+            stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
+            if verbose {
+                println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
+            }
         }
     }
     (None, stats)
@@ -2294,6 +2364,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
     let run_start = Instant::now();
 
+    let phase_a_start = Instant::now();
     let raw = enumerate_sum_tuples(problem);
     let mut seen = std::collections::HashSet::new();
     let tuples: Vec<SumTuple> = raw.into_iter()
@@ -2305,6 +2376,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             && (t.w + problem.m() as i32) % 2 == 0
         })
         .collect();
+    let phase_a_elapsed = phase_a_start.elapsed();
 
     let workers = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(1).max(1);
@@ -2380,9 +2452,20 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         }
     }
 
-    if verbose && !found_solution {
-        println!("Hybrid search: no solution found. Stats: z_gen={}, w_gen={}, pairs={}, elapsed={:.3?}",
-            stats.z_generated, stats.w_generated, stats.candidate_pair_spectral_ok, run_start.elapsed());
+    if verbose {
+        let total = run_start.elapsed();
+        let phase_a = phase_a_elapsed;
+        let phase_b = std::time::Duration::from_nanos(stats.phase_b_nanos);
+        let phase_c = std::time::Duration::from_nanos(stats.phase_c_nanos);
+        println!("\n--- Phase timing (wall-clock, summed across {} threads) ---", workers);
+        println!("  Phase A (tuple enum):       {:>10.3?}", phase_a);
+        println!("  Phase B (Z/W gen+spectral): {:>10.3?}  (thread-sum)", phase_b);
+        println!("  Phase C (SAT X/Y):          {:>10.3?}  (thread-sum)", phase_c);
+        println!("  Total wall-clock:           {:>10.3?}", total);
+        if !found_solution {
+            println!("Hybrid search: no solution found. Stats: z_gen={}, w_gen={}, pairs={}",
+                stats.z_generated, stats.w_generated, stats.candidate_pair_spectral_ok);
+        }
     }
     SearchReport { stats, elapsed: run_start.elapsed(), found_solution }
 }
