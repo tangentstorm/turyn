@@ -153,6 +153,21 @@ impl PackedSeq {
             .map(|i| if self.get(i) == 1 { '+' } else { '-' })
             .collect()
     }
+
+    fn as_blocks(&self) -> String {
+        (0..self.len)
+            .map(|i| if self.get(i) == 1 { '\u{2593}' } else { '\u{2591}' })
+            .collect()
+    }
+}
+
+fn print_solution(label: &str, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &PackedSeq) {
+    println!("\n{}", label);
+    println!("  X [{:>3}] {}", x.sum(), x.as_blocks());
+    println!("  Y [{:>3}] {}", y.sum(), y.as_blocks());
+    println!("  Z [{:>3}] {}", z.sum(), z.as_blocks());
+    println!("  W [{:>3}] {}", w.sum(), w.as_blocks());
+    println!();
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -1268,11 +1283,7 @@ fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             let phase_c_start = Instant::now();
             if let Some((x, y)) = backtrack_xy(problem, tuple, cand, &mut stats) {
                 if verbose {
-                    println!("Found candidate solution in bucket {}", idx);
-                    println!("X={} (sum={})", x.as_string(), x.sum());
-                    println!("Y={} (sum={})", y.as_string(), y.sum());
-                    println!("Z={} (sum={})", cand.z.as_string(), cand.z.sum());
-                    println!("W={} (sum={})", cand.w.as_string(), cand.w.sum());
+                    print_solution(&format!("Solution (bucket {})", idx), &x, &y, &cand.z, &cand.w);
                 }
                 let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
                 if verbose {
@@ -1602,15 +1613,14 @@ fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, se
                 if defect == 0 {
                     let _ = seq;
                     found.store(true, AtomicOrdering::Relaxed);
+                    let px = PackedSeq::from_values(&x);
+                    let py = PackedSeq::from_values(&y);
+                    let pz = PackedSeq::from_values(&z);
+                    let pw = PackedSeq::from_values(&w);
                     if verbose {
-                        println!("Solution found at restart {} flip {}!", restart, flip);
-                        println!("X={}", x.iter().map(|&v| if v == 1 { '+' } else { '-' }).collect::<String>());
-                        println!("Y={}", y.iter().map(|&v| if v == 1 { '+' } else { '-' }).collect::<String>());
-                        println!("Z={}", z.iter().map(|&v| if v == 1 { '+' } else { '-' }).collect::<String>());
-                        println!("W={}", w.iter().map(|&v| if v == 1 { '+' } else { '-' }).collect::<String>());
+                        print_solution(&format!("TT({}) found (restart {} flip {})", problem.n, restart, flip), &px, &py, &pz, &pw);
                     }
-                    let ok = verify_tt(problem, &PackedSeq::from_values(&x), &PackedSeq::from_values(&y),
-                                       &PackedSeq::from_values(&z), &PackedSeq::from_values(&w));
+                    let ok = verify_tt(problem, &px, &py, &pz, &pw);
                     return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: ok };
                 }
             }
@@ -1947,10 +1957,7 @@ fn run_sat_search(problem: Problem, verbose: bool) -> SearchReport {
             let ok = verify_tt(problem, &px, &py, &pz, &pw);
             if verbose {
                 println!("SAT found solution for tuple {} in {:.3?} (verified={})", tuple, tuple_start.elapsed(), ok);
-                println!("X={}", px.as_string());
-                println!("Y={}", py.as_string());
-                println!("Z={}", pz.as_string());
-                println!("W={}", pw.as_string());
+                print_solution(&format!("TT({}) SAT (tuple {}, {:.3?})", problem.n, tuple, tuple_start.elapsed()), &px, &py, &pz, &pw);
             }
             if ok {
                 return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
@@ -2016,11 +2023,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             if let Some((x, y)) = template.solve_for(cand) {
                 let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
                 if verbose {
-                    println!("SAT X/Y solved pair {} in {:.3?} (verified={})", idx, sat_start.elapsed(), ok);
-                    println!("X={}", x.as_string());
-                    println!("Y={}", y.as_string());
-                    println!("Z={}", cand.z.as_string());
-                    println!("W={}", cand.w.as_string());
+                    print_solution(&format!("TT({}) hybrid (pair {}, {:.3?}, verified={})", problem.n, idx, sat_start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
                 }
                 if ok {
                     return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
