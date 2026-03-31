@@ -2000,7 +2000,18 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         // then clone and solve for each Z/W pair.
         let Some(template) = SatXYTemplate::build(problem, *tuple) else { continue; };
 
-        for (idx, cand) in zw_candidates.iter().enumerate() {
+        // Deduplicate Z/W pairs by their autocorrelation vector —
+        // pairs with the same zw_autocorr are equivalent for X/Y solving.
+        let mut seen_autocorr = std::collections::HashSet::new();
+        let unique_candidates: Vec<&CandidateZW> = zw_candidates.iter()
+            .filter(|c| seen_autocorr.insert(c.zw_autocorr.clone()))
+            .collect();
+        if verbose && unique_candidates.len() < zw_candidates.len() {
+            println!("  Dedup: {} unique autocorr vectors from {} pairs",
+                unique_candidates.len(), zw_candidates.len());
+        }
+
+        for (idx, cand) in unique_candidates.iter().enumerate() {
             let sat_start = Instant::now();
             if let Some((x, y)) = template.solve_for(cand) {
                 let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
