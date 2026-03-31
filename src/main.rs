@@ -2335,25 +2335,26 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false };
     }
 
-    // Parallel: distribute tuples across threads
+    // Parallel: work-stealing via AtomicUsize. Each thread grabs the next
+    // unprocessed tuple, avoiding load imbalance from pre-chunking.
     let tuples = Arc::new(tuples);
     let cfg = Arc::new(cfg.clone());
+    let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut handles = Vec::new();
 
-    let chunk_size = tuples.len().div_ceil(workers).max(1);
-    for chunk_idx in 0..workers {
-        let start = chunk_idx * chunk_size;
-        if start >= tuples.len() { break; }
-        let end = ((chunk_idx + 1) * chunk_size).min(tuples.len());
+    for _tid in 0..workers {
         let tuples = Arc::clone(&tuples);
         let cfg = Arc::clone(&cfg);
         let found = Arc::clone(&found);
+        let next_idx = Arc::clone(&next_idx);
 
         handles.push(std::thread::spawn(move || {
             let mut local_stats = SearchStats::default();
             let mut solution = None;
-            for idx in start..end {
+            loop {
                 if found.load(AtomicOrdering::Relaxed) { break; }
+                let idx = next_idx.fetch_add(1, AtomicOrdering::Relaxed);
+                if idx >= tuples.len() { break; }
                 let (result, tstats) = hybrid_solve_tuple(problem, tuples[idx], &cfg, &found, false);
                 local_stats.merge_from(&tstats);
                 if result.is_some() {
