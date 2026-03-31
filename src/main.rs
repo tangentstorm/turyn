@@ -219,6 +219,7 @@ struct SearchConfig {
     stochastic_seconds: u64,
     sat: bool,
     sat_xy: bool,
+    z_sat: bool,
 }
 
 impl Default for SearchConfig {
@@ -235,6 +236,7 @@ impl Default for SearchConfig {
             stochastic_seconds: 0,
             sat: false,
             sat_xy: false,
+            z_sat: false,
         }
     }
 }
@@ -1142,6 +1144,180 @@ struct SearchReport {
     stats: SearchStats,
     elapsed: std::time::Duration,
     found_solution: bool,
+}
+
+/// SAT-based X/Y/W solver: given fixed Z (from DFS), encode X/Y/W + autocorrelation
+/// constraints and solve. This avoids the spectral pairing bottleneck of Phase B.
+///
+/// Variables: X[0..n), Y[0..n), W[0..m) as SAT vars; Z values hardcoded as constants.
+fn sat_solve_xyw(
+    problem: Problem,
+    tuple: SumTuple,
+    z_values: &[i8],
+    verbose: bool,
+) -> Option<(PackedSeq, PackedSeq, PackedSeq)> {
+    let n = problem.n;
+    let m = problem.m();
+    // Variables: X=1..n, Y=n+1..2n, W=2n+1..2n+m
+    let total_vars = 2 * n + m;
+    let mut enc = SatEncoder { n: total_vars, m: 0, next_var: (total_vars + 1) as i32 };
+    let mut solver: radical::Solver = Default::default();
+
+    let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+    let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+    let w_var = |i: usize| -> i32 { (2 * n + i + 1) as i32 };
+
+    // Symmetry breaking
+    solver.add_clause([x_var(0)]); // x[0] = +1
+
+    // Sum constraints
+    if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0
+        || (tuple.w + m as i32) % 2 != 0 { return None; }
+    let x_pos = ((tuple.x + n as i32) / 2) as usize;
+    let y_pos = ((tuple.y + n as i32) / 2) as usize;
+    let w_pos = ((tuple.w + m as i32) / 2) as usize;
+    let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+    let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+    let w_lits: Vec<i32> = (0..m).map(|i| w_var(i)).collect();
+    enc.encode_cardinality_eq(&mut solver, &x_lits, x_pos);
+    enc.encode_cardinality_eq(&mut solver, &y_lits, y_pos);
+    enc.encode_cardinality_eq(&mut solver, &w_lits, w_pos);
+
+    // Precompute Z autocorrelations (constants)
+    let z_autocorr: Vec<i32> = (0..n).map(|s| {
+        if s == 0 { 0 } else {
+            (0..(n - s)).map(|i| (z_values[i] as i32) * (z_values[i + s] as i32)).sum()
+        }
+    }).collect();
+
+    // Autocorrelation constraints: N_X(k) + N_Y(k) + 2*N_Z(k) + 2*N_W(k) = 0
+    // Z is fixed, so 2*N_Z(k) is a constant.
+    // N_X(k) + N_Y(k) + 2*N_W(k) = -2*N_Z(k)
+    // agree_X(k) + agree_Y(k) + 2*agree_W(k) = (2*(n-k) + w_overlap) + N_Z(k)
+    //   where w_overlap = max(0, m-k)
+    // Wait, let me derive carefully:
+    // N_X + N_Y + 2*N_W = -2*N_Z
+    // N_X = 2*agX - (n-k), N_Y = 2*agY - (n-k), N_W = 2*agW - w_overlap
+    // 2*agX + 2*agY + 4*agW - 2*(n-k) - 2*w_overlap = -2*N_Z
+    // agX + agY + 2*agW = (2*(n-k) + 2*w_overlap - 2*N_Z) / 2 = (n-k) + w_overlap - N_Z
+    for k in 1..n {
+        let w_overlap = if k < m { m - k } else { 0 };
+        let target_i = (n - k) as i32 + w_overlap as i32 - z_autocorr[k];
+        if target_i < 0 || target_i as usize > 2 * (n - k) + 2 * w_overlap {
+            return None; // infeasible
+        }
+        let target = target_i as usize;
+
+        // XY agrees (weight 1)
+        let mut xy_lits = Vec::new();
+        for i in 0..(n - k) {
+            xy_lits.push(enc.encode_xnor(&mut solver, x_var(i), x_var(i + k)));
+        }
+        for i in 0..(n - k) {
+            xy_lits.push(enc.encode_xnor(&mut solver, y_var(i), y_var(i + k)));
+        }
+
+        // W agrees (weight 2) — use selector approach
+        let mut w_agree_lits = Vec::new();
+        for i in 0..w_overlap {
+            w_agree_lits.push(enc.encode_xnor(&mut solver, w_var(i), w_var(i + k)));
+        }
+
+        let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
+        let w_ctr = enc.build_counter(&mut solver, &w_agree_lits);
+
+        let mut selectors = Vec::new();
+        for c_w in 0..=w_agree_lits.len() {
+            let rem = target as isize - 2 * c_w as isize;
+            if rem < 0 || rem as usize > xy_lits.len() { continue; }
+            let c_xy = rem as usize;
+            let sel = enc.fresh();
+            if c_xy > 0 {
+                if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 { solver.add_clause([-sel, xy_ctr[c_xy]]); }
+                else { solver.add_clause([-sel]); continue; }
+            }
+            if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 { solver.add_clause([-sel, -xy_ctr[c_xy + 1]]); }
+            if c_w > 0 {
+                if c_w < w_ctr.len() && w_ctr[c_w] != 0 { solver.add_clause([-sel, w_ctr[c_w]]); }
+                else { solver.add_clause([-sel]); continue; }
+            }
+            if c_w + 1 < w_ctr.len() && w_ctr[c_w + 1] != 0 { solver.add_clause([-sel, -w_ctr[c_w + 1]]); }
+            selectors.push(sel);
+        }
+        if selectors.is_empty() { return None; }
+        solver.add_clause(selectors.iter().copied());
+    }
+
+    if verbose {
+        eprintln!("  SAT X/Y/W: {} vars, z_sum={}", enc.next_var - 1, tuple.z);
+    }
+
+    match solver.solve() {
+        Some(true) => {
+            let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
+            let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
+            let w: Vec<i8> = (0..m).map(|i| if solver.value(w_var(i)) == Some(true) { 1 } else { -1 }).collect();
+            Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y), PackedSeq::from_values(&w)))
+        }
+        _ => None,
+    }
+}
+
+/// Hybrid Z-DFS + SAT X/Y/W search. Generates Z candidates via DFS with
+/// spectral filtering, then uses SAT to find X/Y/W for each Z.
+fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
+    let problem = cfg.problem;
+    let run_start = Instant::now();
+    let stats = SearchStats::default();
+
+    let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
+
+    let raw = enumerate_sum_tuples(problem);
+    let mut seen = std::collections::HashSet::new();
+    let tuples: Vec<SumTuple> = raw.into_iter().filter(|t| seen.insert((t.x, t.y, t.z, t.w))).collect();
+    if verbose {
+        println!("TT({}): Z-DFS + SAT X/Y/W search, {} tuples", problem.n, tuples.len());
+    }
+
+    for tuple in &tuples {
+        if (tuple.x + problem.n as i32) % 2 != 0 { continue; }
+        if (tuple.y + problem.n as i32) % 2 != 0 { continue; }
+        if (tuple.z + problem.n as i32) % 2 != 0 { continue; }
+        if (tuple.w + problem.m() as i32) % 2 != 0 { continue; }
+
+        let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
+        let mut z_count = 0usize;
+        let mut found = false;
+        generate_sequences_with_sum_visit(problem.n, tuple.z, true, true, cfg.max_z, |z_values| {
+            if found { return; }
+            z_count += 1;
+            // Spectral filter on Z alone
+            if spectrum_if_ok(z_values, &spectral_z, problem.spectral_bound(), &mut fft_buf).is_none() {
+                return;
+            }
+            // Try SAT for X/Y/W given this Z
+            if let Some((x, y, w)) = sat_solve_xyw(problem, *tuple, z_values, verbose) {
+                let pz = PackedSeq::from_values(z_values);
+                let ok = verify_tt(problem, &x, &y, &pz, &w);
+                if verbose {
+                    print_solution(
+                        &format!("TT({}) Z-SAT (tuple {}, z #{}, {:.3?}, verified={})",
+                            problem.n, tuple, z_count, run_start.elapsed(), ok),
+                        &x, &y, &pz, &w);
+                }
+                if ok { found = true; }
+            }
+        });
+        if found {
+            return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
+        }
+        if verbose && z_count > 0 {
+            println!("Tuple {}: {} Z candidates tried, {:.3?}", tuple, z_count, run_start.elapsed());
+        }
+    }
+
+    if verbose { println!("No solution found, elapsed={:.3?}", run_start.elapsed()); }
+    SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false }
 }
 
 fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
@@ -2072,6 +2248,8 @@ fn parse_args() -> SearchConfig {
             cfg.sat = true;
         } else if arg == "--sat-xy" {
             cfg.sat_xy = true;
+        } else if arg == "--z-sat" {
+            cfg.z_sat = true;
         }
     }
     cfg
@@ -2081,6 +2259,9 @@ fn main() {
     let cfg = parse_args();
     if cfg.benchmark_repeats > 0 {
         run_benchmark(&cfg);
+    } else if cfg.z_sat {
+        let report = run_z_sat_search(&cfg, true);
+        println!("Z-SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     } else if cfg.sat_xy {
         let report = run_hybrid_search(&cfg, true);
         println!("Hybrid search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
@@ -2156,6 +2337,7 @@ mod tests {
             stochastic_seconds: 0,
             sat: false,
             sat_xy: false,
+            z_sat: false,
         };
         let report = run_search(&cfg, false);
         assert!(report.found_solution);
