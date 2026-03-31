@@ -49,11 +49,22 @@ struct ClauseMeta {
     deleted: bool,
 }
 
+/// A pseudo-boolean constraint: sum(coeffs[i] * lits[i]) >= bound.
+/// Also stores the "slack" = sum of coeffs for true/undef literals - bound.
+/// When slack < coeffs[i] for some undef literal, that literal must be true.
+#[derive(Clone, Debug)]
+struct PbConstraint {
+    lits: Vec<Lit>,
+    coeffs: Vec<u32>,
+    bound: u32,
+}
+
 /// Reason a variable was assigned (for conflict analysis).
 #[derive(Clone, Copy, Debug)]
 enum Reason {
     Decision,
     Clause(u32), // index into clause database
+    Pb(u32),     // index into pb_constraints
 }
 
 /// Trail entry: records an assignment.
@@ -89,6 +100,10 @@ pub struct Solver {
     var_decay: f64,
     heap: Vec<usize>,        // max-heap of variable indices, ordered by activity
     heap_pos: Vec<usize>,    // heap_pos[v] = position of var v in heap (usize::MAX if not in heap)
+
+    // Pseudo-boolean constraints
+    pb_constraints: Vec<PbConstraint>,
+    pb_watches: Vec<Vec<u32>>,  // pb_watches[lit_index] = list of PB constraint indices
 
     // Propagation queue
     prop_head: usize, // next trail entry to propagate
@@ -137,6 +152,8 @@ impl Solver {
             clause_meta: Vec::new(),
             clause_lits: Vec::new(),
             watches: Vec::new(),
+            pb_constraints: Vec::new(),
+            pb_watches: Vec::new(),
             activity: Vec::new(),
             var_inc: 1.0,
             var_decay: 0.95,
@@ -160,8 +177,10 @@ impl Solver {
             self.reason.push(Reason::Decision);
             self.phase.push(true); // default: branch positive
             self.activity.push(0.0);
-            self.watches.push(Vec::new()); // positive literal
-            self.watches.push(Vec::new()); // negative literal
+            self.watches.push(Vec::new()); // positive literal watch
+            self.watches.push(Vec::new()); // negative literal watch
+            self.pb_watches.push(Vec::new()); // positive literal PB
+            self.pb_watches.push(Vec::new()); // negative literal PB
             self.heap_pos.push(self.heap.len());
             self.heap.push(idx);
         }
@@ -210,6 +229,50 @@ impl Solver {
                 self.clause_lits.extend_from_slice(&lits);
                 self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
             }
+        }
+    }
+
+    /// Add a pseudo-boolean "at least" constraint: sum(coeffs[i] * lits[i]) >= bound.
+    /// All coefficients must be positive. Literals use DIMACS convention.
+    pub fn add_pb_atleast(&mut self, lits: &[i32], coeffs: &[u32], bound: u32) {
+        if !self.ok { return; }
+        assert_eq!(lits.len(), coeffs.len());
+
+        // Ensure all variables exist
+        for &lit in lits {
+            assert!(lit != 0);
+            self.ensure_var(lit.unsigned_abs() as usize);
+        }
+
+        let pbi = self.pb_constraints.len() as u32;
+
+        // Watch all literals (we need to know when any becomes false)
+        for &lit in lits {
+            self.pb_watches[lit_index(negate(lit))].push(pbi);
+        }
+
+        self.pb_constraints.push(PbConstraint {
+            lits: lits.to_vec(),
+            coeffs: coeffs.to_vec(),
+            bound,
+        });
+
+        // Initial propagation: check if any literals are already forced
+        if self.propagate_pb(pbi).is_some() {
+            self.ok = false;
+        }
+    }
+
+    /// Add a pseudo-boolean equality: sum(coeffs[i] * lits[i]) = target.
+    /// Encoded as two PB constraints: >= target AND sum(coeffs[i] * ¬lits[i]) >= sum(coeffs) - target.
+    pub fn add_pb_eq(&mut self, lits: &[i32], coeffs: &[u32], target: u32) {
+        let total: u32 = coeffs.iter().sum();
+        // At least target
+        self.add_pb_atleast(lits, coeffs, target);
+        // At most target: negate all literals, bound = total - target
+        if total >= target {
+            let neg_lits: Vec<i32> = lits.iter().map(|&l| -l).collect();
+            self.add_pb_atleast(&neg_lits, coeffs, total - target);
         }
     }
 
@@ -274,13 +337,13 @@ impl Solver {
 
     fn solve_inner(&mut self, base_level: u32) -> Option<bool> {
         loop {
-            if let Some(conflict_ci) = self.propagate() {
+            if let Some(conflict_reason) = self.propagate() {
                 // Conflict
                 self.conflicts += 1;
                 if self.decision_level() <= base_level {
                     return Some(false); // conflict at/below assumption level → UNSAT
                 }
-                let (learnt_clause, bt_level) = self.analyze(conflict_ci);
+                let (learnt_clause, bt_level) = self.analyze(conflict_reason);
                 // Verify: every literal in the learnt clause should be false
                 // at the current decision level (before backtrack).
                 #[cfg(debug_assertions)]
@@ -354,16 +417,25 @@ impl Solver {
         self.trail.push(TrailEntry { lit, level: self.decision_level(), reason });
     }
 
-    /// BCP: propagate all enqueued assignments using 2WL.
-    /// Returns the clause index of the first conflict, or None.
-    fn propagate(&mut self) -> Option<u32> {
+    /// BCP + PB propagation. Returns conflict reason or None.
+    fn propagate(&mut self) -> Option<Reason> {
         while self.prop_head < self.trail.len() {
             let lit = self.trail[self.prop_head].lit;
             self.prop_head += 1;
-            // `lit` is now true. Propagate through watches of `¬lit`.
-            // (clauses watching ¬lit need a new watcher or become unit/conflict)
-            if let Some(conflict) = self.propagate_lit(lit) {
-                return Some(conflict);
+            // Clause BCP
+            if let Some(conflict_ci) = self.propagate_lit(lit) {
+                return Some(Reason::Clause(conflict_ci));
+            }
+            // PB propagation: lit is true, so ¬lit is false.
+            // Check PB constraints watching ¬lit.
+            if !self.pb_constraints.is_empty() {
+                let watch_idx = lit_index(lit); // watches on ¬lit
+                let pb_list: Vec<u32> = self.pb_watches[watch_idx].clone();
+                for &pbi in &pb_list {
+                    if let Some(conflict_reason) = self.propagate_pb(pbi) {
+                        return Some(conflict_reason);
+                    }
+                }
             }
         }
         None
@@ -452,39 +524,103 @@ impl Solver {
         conflict
     }
 
+    /// Propagate a PB constraint. Returns conflict reason if violated, None otherwise.
+    /// Computes slack = sum of coeffs for true/undef literals - bound.
+    /// If slack < 0 → conflict. If slack < coeff[i] for undef lit i → propagate lit i.
+    fn propagate_pb(&mut self, pbi: u32) -> Option<Reason> {
+        let pb = &self.pb_constraints[pbi as usize];
+        let n = pb.lits.len();
+
+        // Compute slack: sum coefficients for non-false literals, subtract bound
+        let mut slack: i64 = -(pb.bound as i64);
+        for i in 0..n {
+            if self.lit_value(pb.lits[i]) != LBool::False {
+                slack += pb.coeffs[i] as i64;
+            }
+        }
+
+        if slack < 0 {
+            return Some(Reason::Pb(pbi)); // conflict
+        }
+
+        // Propagate: any undef literal whose coefficient > slack must be true
+        for i in 0..n {
+            let lit = self.pb_constraints[pbi as usize].lits[i];
+            let coeff = self.pb_constraints[pbi as usize].coeffs[i];
+            if self.lit_value(lit) == LBool::Undef && (coeff as i64) > slack {
+                self.enqueue(lit, Reason::Pb(pbi));
+            }
+        }
+        None
+    }
+
+    /// Generate a clause explanation for a PB-based reason.
+    /// The clause is: the propagated literal OR the negation of all false literals
+    /// whose removal would violate the bound.
+    fn pb_reason_clause(&self, pbi: u32, propagated: Lit) -> Vec<Lit> {
+        let pb = &self.pb_constraints[pbi as usize];
+        let mut clause = vec![propagated];
+        for i in 0..pb.lits.len() {
+            let lit = pb.lits[i];
+            if lit != propagated && self.lit_value(lit) == LBool::False {
+                clause.push(negate(lit)); // negate: the false literal explains the propagation
+            }
+        }
+        clause
+    }
+
     /// 1-UIP conflict analysis with learnt clause minimization.
     /// Returns (learnt clause, backtrack level).
-    fn analyze(&mut self, conflict_ci: u32) -> (Vec<Lit>, u32) {
+    fn analyze(&mut self, conflict_reason: Reason) -> (Vec<Lit>, u32) {
         let mut seen = vec![false; self.num_vars];
-        let mut counter = 0; // # of unresolved literals at current decision level
+        let mut counter = 0;
         let mut learnt = Vec::new();
         let mut bt_level: u32 = 0;
-        let mut reason_ci = conflict_ci;
-
-        // Walk the implication graph backwards from the conflict
+        let mut current_reason = conflict_reason;
         let mut trail_idx = self.trail.len();
-        let mut p: Lit = 0; // current resolvent literal
+        let mut p: Lit = 0;
 
         loop {
-            // Resolve with the reason clause (use raw indices to avoid borrow + copy)
-            let m = self.clause_meta[reason_ci as usize];
-            let cstart = m.start as usize;
-            let clen = m.len as usize;
-            for ki in 0..clen {
-                let lit = self.clause_lits[cstart + ki];
-                if lit == p { continue; } // skip the resolvent
+            // Get the literals of the reason (clause or PB explanation)
+            let reason_lits: Vec<Lit> = match current_reason {
+                Reason::Clause(ci) => {
+                    let m = self.clause_meta[ci as usize];
+                    let cstart = m.start as usize;
+                    let clen = m.len as usize;
+                    self.clause_lits[cstart..cstart + clen].to_vec()
+                }
+                Reason::Pb(pbi) => {
+                    // For PB conflict/propagation: generate clause from all false lits
+                    let pb = &self.pb_constraints[pbi as usize];
+                    let mut lits = Vec::new();
+                    for i in 0..pb.lits.len() {
+                        let lit = pb.lits[i];
+                        if lit == negate(p) { continue; } // skip the propagated lit's negation
+                        if self.lit_value(lit) == LBool::False {
+                            lits.push(lit); // false literal, part of the reason
+                        }
+                    }
+                    if p != 0 {
+                        lits.push(p); // the propagated literal itself
+                    }
+                    lits
+                }
+                Reason::Decision => { unreachable!(); }
+            };
+
+            for &lit in &reason_lits {
+                if lit == p { continue; }
                 let v = var_of(lit);
                 if seen[v] { continue; }
                 seen[v] = true;
                 self.bump_activity(v);
 
                 if self.level[v] == self.decision_level() {
-                    counter += 1; // will be resolved later
+                    counter += 1;
                 } else if self.level[v] > 0 {
-                    learnt.push(lit); // lit is false — part of the learnt clause
+                    learnt.push(lit);
                     bt_level = bt_level.max(self.level[v]);
                 }
-                // Level-0 literals are always true, skip them
             }
 
             // Find next literal on trail at current decision level that was seen
@@ -496,21 +632,15 @@ impl Solver {
                     p = entry.lit;
                     counter -= 1;
                     if counter == 0 {
-                        // Found the 1-UIP
-                        learnt.insert(0, negate(p)); // asserting literal at front
-                        // Minimize: remove redundant literals
+                        learnt.insert(0, negate(p));
                         self.minimize_learnt(&mut learnt, &seen);
-                        // Recompute backtrack level after minimization
                         bt_level = 0;
                         for &lit in &learnt[1..] {
                             bt_level = bt_level.max(self.level[var_of(lit)]);
                         }
                         return (learnt, bt_level);
                     }
-                    match entry.reason {
-                        Reason::Clause(ci) => { reason_ci = ci; }
-                        Reason::Decision => { unreachable!("decision should be the UIP"); }
-                    }
+                    current_reason = entry.reason;
                     break;
                 }
             }
@@ -531,10 +661,13 @@ impl Solver {
         for i in 1..learnt.len() {
             let lit = learnt[i];
             let v = var_of(lit);
-            if let Reason::Clause(_) = self.reason[v] {
-                if self.lit_removable(v, seen, &levels_in_learnt) {
-                    continue;
+            match self.reason[v] {
+                Reason::Clause(_) | Reason::Pb(_) => {
+                    if self.lit_removable(v, seen, &levels_in_learnt) {
+                        continue;
+                    }
                 }
+                Reason::Decision => {}
             }
             learnt[j] = lit;
             j += 1;
@@ -549,12 +682,18 @@ impl Solver {
         visited[v] = true;
 
         while let Some(cur) = stack.pop() {
-            let ci = match self.reason[cur] {
-                Reason::Clause(ci) => ci,
+            // Get reason literals (clause or PB explanation)
+            let reason_lits: Vec<Lit> = match self.reason[cur] {
+                Reason::Clause(ci) => self.clause_lits(ci).to_vec(),
+                Reason::Pb(pbi) => {
+                    let pb = &self.pb_constraints[pbi as usize];
+                    pb.lits.iter().copied()
+                        .filter(|&l| var_of(l) != cur && self.lit_value(l) == LBool::False)
+                        .collect()
+                }
                 Reason::Decision => return false,
             };
-            let clause = self.clause_lits(ci);
-            for &lit in clause {
+            for &lit in &reason_lits {
                 let u = var_of(lit);
                 if u == cur || visited[u] { continue; }
                 visited[u] = true;
@@ -564,7 +703,7 @@ impl Solver {
                 if lv >= levels_in_learnt.len() || !levels_in_learnt[lv] { return false; }
                 match self.reason[u] {
                     Reason::Decision => return false,
-                    Reason::Clause(_) => { stack.push(u); }
+                    Reason::Clause(_) | Reason::Pb(_) => { stack.push(u); }
                 }
             }
         }
