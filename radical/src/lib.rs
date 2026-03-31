@@ -39,19 +39,20 @@ enum LBool {
     Undef,
 }
 
-/// A clause in the database.
-#[derive(Clone, Debug)]
-struct Clause {
-    lits: Vec<Lit>,
+/// Clause metadata (literals stored in flat `clause_lits` array).
+#[derive(Clone, Copy, Debug)]
+struct ClauseMeta {
+    start: u32,  // index into clause_lits
+    len: u16,
     learnt: bool,
-    lbd: u32, // Literal Block Distance (for learnt clause quality)
+    lbd: u8,
 }
 
 /// Reason a variable was assigned (for conflict analysis).
 #[derive(Clone, Copy, Debug)]
 enum Reason {
     Decision,
-    Clause(usize), // index into clause database
+    Clause(u32), // index into clause database
 }
 
 /// Trail entry: records an assignment.
@@ -76,9 +77,10 @@ pub struct Solver {
     trail: Vec<TrailEntry>,
     trail_lim: Vec<usize>,  // trail index at start of each decision level
 
-    // Clause database
-    clauses: Vec<Clause>,
-    watches: Vec<Vec<usize>>, // watches[lit_index] = list of clause indices
+    // Clause database (flat storage for cheap cloning)
+    clause_meta: Vec<ClauseMeta>,
+    clause_lits: Vec<Lit>,         // flat array of all clause literals
+    watches: Vec<Vec<u32>>,        // watches[lit_index] = list of clause indices (u32)
 
     // VSIDS activity with binary heap
     activity: Vec<f64>,
@@ -99,6 +101,22 @@ pub struct Solver {
     ok: bool, // false if top-level conflict detected
 }
 
+impl Solver {
+    /// Get the literals of clause `ci`.
+    #[inline]
+    fn clause_lits(&self, ci: u32) -> &[Lit] {
+        let m = &self.clause_meta[ci as usize];
+        &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)]
+    }
+
+    /// Get a mutable reference to the literals of clause `ci`.
+    #[inline]
+    fn clause_lits_mut(&mut self, ci: u32) -> &mut [Lit] {
+        let m = &self.clause_meta[ci as usize];
+        &mut self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)]
+    }
+}
+
 impl Default for Solver {
     fn default() -> Self {
         Self::new()
@@ -115,7 +133,8 @@ impl Solver {
             phase: Vec::new(),
             trail: Vec::new(),
             trail_lim: Vec::new(),
-            clauses: Vec::new(),
+            clause_meta: Vec::new(),
+            clause_lits: Vec::new(),
             watches: Vec::new(),
             activity: Vec::new(),
             var_inc: 1.0,
@@ -169,8 +188,10 @@ impl Solver {
                     LBool::False => { self.ok = false; } // contradiction
                     LBool::Undef => {
                         // Store as a clause so we have a reason index
-                        let ci = self.clauses.len();
-                        self.clauses.push(Clause { lits, learnt: false, lbd: 0 });
+                        let ci = self.clause_meta.len() as u32;
+                        let start = self.clause_lits.len() as u32;
+                        self.clause_lits.extend_from_slice(&lits);
+                        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0 });
                         self.enqueue(lit, Reason::Clause(ci));
                         // Propagate immediately
                         if self.propagate().is_some() {
@@ -180,11 +201,13 @@ impl Solver {
                 }
             }
             _ => {
-                let ci = self.clauses.len();
+                let ci = self.clause_meta.len() as u32;
+                let start = self.clause_lits.len() as u32;
                 // Set up 2WL: watch the first two literals
                 self.watches[lit_index(negate(lits[0]))].push(ci);
                 self.watches[lit_index(negate(lits[1]))].push(ci);
-                self.clauses.push(Clause { lits, learnt: false, lbd: 0 });
+                self.clause_lits.extend_from_slice(&lits);
+                self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0 });
             }
         }
     }
@@ -317,7 +340,7 @@ impl Solver {
 
     /// BCP: propagate all enqueued assignments using 2WL.
     /// Returns the clause index of the first conflict, or None.
-    fn propagate(&mut self) -> Option<usize> {
+    fn propagate(&mut self) -> Option<u32> {
         while self.prop_head < self.trail.len() {
             let lit = self.trail[self.prop_head].lit;
             self.prop_head += 1;
@@ -330,7 +353,7 @@ impl Solver {
         None
     }
 
-    fn propagate_lit(&mut self, lit: Lit) -> Option<usize> {
+    fn propagate_lit(&mut self, lit: Lit) -> Option<u32> {
         // lit just became true. Clauses watching ¬lit (which just became false)
         // are stored at watches[lit_index(negate(¬lit))] = watches[lit_index(lit)].
         let false_lit = negate(lit);
@@ -347,11 +370,11 @@ impl Solver {
 
             // Ensure false_lit is at position [1] in the clause.
             // The 2WL convention: positions 0 and 1 are the two watched literals.
-            if self.clauses[ci].lits[0] == false_lit {
-                self.clauses[ci].lits.swap(0, 1);
+            if self.clause_lits(ci)[0] == false_lit {
+                self.clause_lits_mut(ci).swap(0, 1);
             }
 
-            let other = self.clauses[ci].lits[0]; // the other watched lit
+            let other = self.clause_lits(ci)[0]; // the other watched lit
 
             // If the other watched literal is already true, clause is satisfied.
             // Keep watching.
@@ -364,13 +387,13 @@ impl Solver {
 
             // Look for a new literal to watch (from positions 2..len)
             let mut found_new = false;
-            let clause_len = self.clauses[ci].lits.len();
+            let clause_len = self.clause_lits(ci).len();
             for k in 2..clause_len {
-                let replacement = self.clauses[ci].lits[k];
+                let replacement = self.clause_lits(ci)[k];
                 if self.lit_value(replacement) != LBool::False {
                     // Swap replacement into position [1]
-                    self.clauses[ci].lits[1] = replacement;
-                    self.clauses[ci].lits[k] = false_lit;
+                    self.clause_lits_mut(ci)[1] = replacement;
+                    self.clause_lits_mut(ci)[k] = false_lit;
                     // Add this clause to the watch list of ¬replacement
                     self.watches[lit_index(negate(replacement))].push(ci);
                     found_new = true;
@@ -410,7 +433,7 @@ impl Solver {
     }
 
     /// 1-UIP conflict analysis. Returns (learnt clause, backtrack level).
-    fn analyze(&mut self, conflict_ci: usize) -> (Vec<Lit>, u32) {
+    fn analyze(&mut self, conflict_ci: u32) -> (Vec<Lit>, u32) {
         let mut seen = vec![false; self.num_vars];
         let mut counter = 0; // # of unresolved literals at current decision level
         let mut learnt = Vec::new();
@@ -423,7 +446,7 @@ impl Solver {
 
         loop {
             // Resolve with the reason clause
-            let clause_lits = self.clauses[reason_ci].lits.clone();
+            let clause_lits = self.clause_lits(reason_ci).to_vec();
             for &lit in &clause_lits {
                 if lit == p { continue; } // skip the resolvent
                 let v = var_of(lit);
@@ -488,16 +511,19 @@ impl Solver {
             return;
         }
 
-        let ci = self.clauses.len();
+        let ci = self.clause_meta.len() as u32;
         let lbd = self.compute_lbd(&lits);
+        let start = self.clause_lits.len() as u32;
+        let asserting_lit = lits[0];
 
         // Watch the first two literals
         self.watches[lit_index(negate(lits[0]))].push(ci);
         self.watches[lit_index(negate(lits[1]))].push(ci);
-        self.clauses.push(Clause { lits, learnt: true, lbd });
+        self.clause_lits.extend_from_slice(&lits);
+        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8 });
 
         // The asserting literal (lits[0]) should be propagated
-        self.enqueue(self.clauses[ci].lits[0], Reason::Clause(ci));
+        self.enqueue(asserting_lit, Reason::Clause(ci));
     }
 
     /// Compute LBD (Literal Block Distance) of a clause.
