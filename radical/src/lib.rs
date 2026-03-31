@@ -46,6 +46,7 @@ struct ClauseMeta {
     len: u16,
     learnt: bool,
     lbd: u8,
+    deleted: bool,
 }
 
 /// Reason a variable was assigned (for conflict analysis).
@@ -191,7 +192,7 @@ impl Solver {
                         let ci = self.clause_meta.len() as u32;
                         let start = self.clause_lits.len() as u32;
                         self.clause_lits.extend_from_slice(&lits);
-                        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0 });
+                        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
                         self.enqueue(lit, Reason::Clause(ci));
                         // Propagate immediately
                         if self.propagate().is_some() {
@@ -207,7 +208,7 @@ impl Solver {
                 self.watches[lit_index(negate(lits[0]))].push(ci);
                 self.watches[lit_index(negate(lits[1]))].push(ci);
                 self.clause_lits.extend_from_slice(&lits);
-                self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0 });
+                self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
             }
         }
     }
@@ -264,8 +265,10 @@ impl Solver {
 
     /// Number of variables.
     pub fn num_vars(&self) -> usize { self.num_vars }
-    /// Number of clauses.
-    pub fn num_clauses(&self) -> usize { self.clause_meta.len() }
+    /// Number of active (non-deleted) clauses.
+    pub fn num_clauses(&self) -> usize {
+        self.clause_meta.iter().filter(|m| !m.deleted).count()
+    }
     /// Number of conflicts so far.
     pub fn num_conflicts(&self) -> u64 { self.conflicts }
 
@@ -296,10 +299,7 @@ impl Solver {
                     self.restart_limit += 100 * luby(self.luby_index);
                     self.luby_index += 1;
                     self.backtrack(base_level);
-                    // Periodic clause cleanup
-                    if self.conflicts % 5000 == 0 {
-                        self.reduce_db();
-                    }
+                    self.reduce_db();
                 }
             } else {
                 // No conflict
@@ -380,6 +380,11 @@ impl Solver {
 
         while i < watch_list.len() {
             let ci = watch_list[i];
+            if self.clause_meta[ci as usize].deleted {
+                // Skip deleted clauses — don't keep in watch list
+                i += 1;
+                continue;
+            }
             let m = self.clause_meta[ci as usize];
             let cstart = m.start as usize;
             let clen = m.len as usize;
@@ -527,7 +532,7 @@ impl Solver {
         self.watches[lit_index(negate(lits[0]))].push(ci);
         self.watches[lit_index(negate(lits[1]))].push(ci);
         self.clause_lits.extend_from_slice(&lits);
-        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8 });
+        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8, deleted: false });
 
         // The asserting literal (lits[0]) should be propagated
         self.enqueue(asserting_lit, Reason::Clause(ci));
@@ -535,14 +540,17 @@ impl Solver {
 
     /// Compute LBD (Literal Block Distance) of a clause.
     fn compute_lbd(&self, lits: &[Lit]) -> u32 {
-        let mut levels = Vec::new();
+        // Use a small bitset for levels (decision levels rarely exceed a few hundred)
+        let mut seen_levels = vec![false; self.decision_level() as usize + 1];
+        let mut count = 0u32;
         for &lit in lits {
-            let lv = self.level[var_of(lit)];
-            if !levels.contains(&lv) {
-                levels.push(lv);
+            let lv = self.level[var_of(lit)] as usize;
+            if lv < seen_levels.len() && !seen_levels[lv] {
+                seen_levels[lv] = true;
+                count += 1;
             }
         }
-        levels.len() as u32
+        count
     }
 
     /// VSIDS: pick the unassigned variable with highest activity (O(log n) via heap).
@@ -643,12 +651,47 @@ impl Solver {
 
     /// Reduce the learnt clause database: keep clauses with LBD ≤ 3
     /// and half of the rest (lowest activity / highest LBD).
+    /// Remove low-quality learnt clauses to keep the database manageable.
+    /// Keeps "glue" clauses (LBD ≤ 3) and clauses currently used as reasons.
     fn reduce_db(&mut self) {
-        // Simple strategy: remove learnt clauses with LBD > 6
-        // that aren't currently a reason for any assignment.
-        // For now, just keep everything (full cleanup is complex
-        // because clause indices are used in reasons and watch lists).
-        // TODO: implement proper clause garbage collection with index remapping.
+        // Only reduce when we have many learnt clauses
+        let num_original: usize = self.clause_meta.iter()
+            .filter(|m| !m.learnt && !m.deleted).count();
+        let num_learnt: usize = self.clause_meta.iter()
+            .filter(|m| m.learnt && !m.deleted).count();
+        if num_learnt < num_original { return; }
+
+        // Collect which clauses are currently reasons
+        let mut is_reason = vec![false; self.clause_meta.len()];
+        for entry in &self.trail {
+            if let Reason::Clause(ci) = entry.reason {
+                is_reason[ci as usize] = true;
+            }
+        }
+
+        // Delete learnt clauses with LBD > 3 that aren't reasons.
+        // Keep ~50% of eligible clauses (delete the worse half by LBD).
+        let mut eligible: Vec<(u32, u8)> = Vec::new(); // (ci, lbd)
+        for ci in 0..self.clause_meta.len() {
+            let m = &self.clause_meta[ci];
+            if m.learnt && !m.deleted && m.lbd > 3 && !is_reason[ci] {
+                eligible.push((ci as u32, m.lbd));
+            }
+        }
+        if eligible.len() < 100 { return; }
+
+        // Sort by LBD descending — delete worst half
+        eligible.sort_by(|a, b| b.1.cmp(&a.1));
+        let to_delete = eligible.len() / 2;
+
+        for &(ci, _) in &eligible[..to_delete] {
+            self.clause_meta[ci as usize].deleted = true;
+        }
+
+        // Clean watch lists
+        for wl in &mut self.watches {
+            wl.retain(|&ci| !self.clause_meta[ci as usize].deleted);
+        }
     }
 }
 

@@ -1910,6 +1910,9 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
     let solve_start = Instant::now();
     let result = solver.solve();
     let solve_elapsed = solve_start.elapsed();
+    if verbose {
+        println!("  solve: {:.3?}, conflicts={}, clauses={}", solve_elapsed, solver.num_conflicts(), solver.num_clauses());
+    }
     match result {
         Some(true) => {
             let x: Vec<i8> = (0..n).map(|i| if solver.value(enc.x_var(i)) == Some(true) { 1 } else { -1 }).collect();
