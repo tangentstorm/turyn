@@ -83,6 +83,10 @@ pub struct Solver {
     clause_lits: Vec<Lit>,         // flat array of all clause literals
     watches: Vec<Vec<u32>>,        // watches[lit_index] = list of clause indices (u32)
 
+    // Binary implication graph: bin_imps[lit_index(L)] = list of (implied_lit, clause_idx).
+    // When L is true, all implied literals must be true.
+    bin_imps: Vec<Vec<(Lit, u32)>>,
+
     // VSIDS activity with binary heap
     activity: Vec<f64>,
     var_inc: f64,
@@ -137,6 +141,7 @@ impl Solver {
             clause_meta: Vec::new(),
             clause_lits: Vec::new(),
             watches: Vec::new(),
+            bin_imps: Vec::new(),
             activity: Vec::new(),
             var_inc: 1.0,
             var_decay: 0.95,
@@ -162,6 +167,8 @@ impl Solver {
             self.activity.push(0.0);
             self.watches.push(Vec::new()); // positive literal
             self.watches.push(Vec::new()); // negative literal
+            self.bin_imps.push(Vec::new()); // positive literal
+            self.bin_imps.push(Vec::new()); // negative literal
             self.heap_pos.push(self.heap.len());
             self.heap.push(idx);
         }
@@ -199,6 +206,29 @@ impl Solver {
                             self.ok = false;
                         }
                     }
+                }
+            }
+            2 => {
+                // Binary clause: store in implication graph for fast BCP.
+                // ¬a → b and ¬b → a
+                // Also store in clause DB for conflict analysis reasons.
+                let ci = self.clause_meta.len() as u32;
+                let start = self.clause_lits.len() as u32;
+                self.bin_imps[lit_index(negate(lits[0]))].push((lits[1], ci));
+                self.bin_imps[lit_index(negate(lits[1]))].push((lits[0], ci));
+                self.clause_lits.extend_from_slice(&lits);
+                self.clause_meta.push(ClauseMeta { start, len: 2, learnt: false, lbd: 0, deleted: false });
+                // Check for immediate unit propagation
+                let v0 = self.lit_value(lits[0]);
+                let v1 = self.lit_value(lits[1]);
+                if v0 == LBool::False && v1 == LBool::Undef {
+                    self.enqueue(lits[1], Reason::Clause(ci));
+                    if self.propagate().is_some() { self.ok = false; }
+                } else if v1 == LBool::False && v0 == LBool::Undef {
+                    self.enqueue(lits[0], Reason::Clause(ci));
+                    if self.propagate().is_some() { self.ok = false; }
+                } else if v0 == LBool::False && v1 == LBool::False {
+                    self.ok = false;
                 }
             }
             _ => {
@@ -354,14 +384,32 @@ impl Solver {
         self.trail.push(TrailEntry { lit, level: self.decision_level(), reason });
     }
 
-    /// BCP: propagate all enqueued assignments using 2WL.
-    /// Returns the clause index of the first conflict, or None.
+    /// BCP: propagate all enqueued assignments.
+    /// Binary implications first (fast), then 2WL for longer clauses.
     fn propagate(&mut self) -> Option<u32> {
         while self.prop_head < self.trail.len() {
             let lit = self.trail[self.prop_head].lit;
             self.prop_head += 1;
-            // `lit` is now true. Propagate through watches of `¬lit`.
-            // (clauses watching ¬lit need a new watcher or become unit/conflict)
+
+            // Binary implications: lit is true → all bin_imps[lit_index(lit)] must be true
+            let imp_idx = lit_index(lit);
+            // Iterate without borrowing self mutably
+            let mut bi = 0;
+            while bi < self.bin_imps[imp_idx].len() {
+                let (implied, bin_ci) = self.bin_imps[imp_idx][bi];
+                match self.lit_value(implied) {
+                    LBool::True => {}
+                    LBool::Undef => {
+                        self.enqueue(implied, Reason::Clause(bin_ci));
+                    }
+                    LBool::False => {
+                        return Some(bin_ci); // conflict in binary clause
+                    }
+                }
+                bi += 1;
+            }
+
+            // Longer clauses: 2WL propagation
             if let Some(conflict) = self.propagate_lit(lit) {
                 return Some(conflict);
             }
@@ -531,11 +579,18 @@ impl Solver {
         let start = self.clause_lits.len() as u32;
         let asserting_lit = lits[0];
 
-        // Watch the first two literals
-        self.watches[lit_index(negate(lits[0]))].push(ci);
-        self.watches[lit_index(negate(lits[1]))].push(ci);
         self.clause_lits.extend_from_slice(&lits);
         self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8, deleted: false });
+
+        if lits.len() == 2 {
+            // Binary learnt clause: add to implication graph
+            self.bin_imps[lit_index(negate(lits[0]))].push((lits[1], ci));
+            self.bin_imps[lit_index(negate(lits[1]))].push((lits[0], ci));
+        } else {
+            // Watch the first two literals
+            self.watches[lit_index(negate(lits[0]))].push(ci);
+            self.watches[lit_index(negate(lits[1]))].push(ci);
+        }
 
         // The asserting literal (lits[0]) should be propagated
         self.enqueue(asserting_lit, Reason::Clause(ci));
