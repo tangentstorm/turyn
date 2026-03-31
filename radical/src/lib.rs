@@ -278,6 +278,14 @@ impl Solver {
                     return Some(false); // conflict at/below assumption level → UNSAT
                 }
                 let (learnt_clause, bt_level) = self.analyze(conflict_ci);
+                // Verify: every literal in the learnt clause should be false
+                // at the current decision level (before backtrack).
+                #[cfg(debug_assertions)]
+                for &lit in &learnt_clause {
+                    debug_assert!(self.lit_value(lit) == LBool::False,
+                        "learnt clause lit {} should be false but is {:?} (level={})",
+                        lit, self.lit_value(lit), self.level[var_of(lit)]);
+                }
                 let bt_level = bt_level.max(base_level);
                 self.backtrack(bt_level);
                 self.add_learnt_clause(learnt_clause);
@@ -338,7 +346,8 @@ impl Solver {
 
     fn enqueue(&mut self, lit: Lit, reason: Reason) {
         let v = var_of(lit);
-        debug_assert!(self.assigns[v] == LBool::Undef);
+        debug_assert!(self.assigns[v] == LBool::Undef,
+            "enqueue lit={} but var {} already assigned {:?}", lit, v, self.assigns[v]);
         self.assigns[v] = if lit > 0 { LBool::True } else { LBool::False };
         self.level[v] = self.decision_level();
         self.reason[v] = reason;
@@ -455,7 +464,7 @@ impl Solver {
                 if self.level[v] == self.decision_level() {
                     counter += 1; // will be resolved later
                 } else if self.level[v] > 0 {
-                    learnt.push(negate(lit));
+                    learnt.push(lit); // lit is false — part of the learnt clause
                     bt_level = bt_level.max(self.level[v]);
                 }
                 // Level-0 literals are always true, skip them

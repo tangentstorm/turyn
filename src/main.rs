@@ -2513,13 +2513,13 @@ mod tests {
 
     #[test]
     fn sat_tt14_hardcoded_solution_bisect_lags() {
-        // Known TT(14) solution (after negating X and Y so x[0]=y[0]=+1):
+        // Known TT(14) solution (found via simulated annealing, x[0]=+1):
         let n = 14usize;
         let m = n - 1; // 13
-        let x_vals: Vec<i8> = vec![1,1,1,1,1,-1,1,1,1,1,1,-1,1,1];       // sum=8
-        let y_vals: Vec<i8> = vec![1,1,1,-1,-1,1,1,-1,1,1,1,1,-1,1];     // sum=4
-        let z_vals: Vec<i8> = vec![1,1,1,1,-1,-1,-1,1,-1,-1,-1,1,-1,1];  // sum=0
-        let w_vals: Vec<i8> = vec![1,1,-1,-1,-1,1,-1,1,1,-1,1,-1,-1];    // sum=-1
+        let x_vals: Vec<i8> = vec![1,-1,1,-1,-1,-1,1,1,1,-1,-1,1,1,1];   // sum=2
+        let y_vals: Vec<i8> = vec![1,1,1,-1,1,-1,-1,1,-1,-1,1,-1,1,1];   // sum=2
+        let z_vals: Vec<i8> = vec![-1,-1,-1,1,-1,-1,1,1,-1,-1,-1,-1,-1,1]; // sum=-6
+        let w_vals: Vec<i8> = vec![1,1,1,-1,1,1,-1,1,-1,1,-1,-1,-1];     // sum=1
 
         let px = PackedSeq::from_values(&x_vals);
         let py = PackedSeq::from_values(&y_vals);
@@ -2824,5 +2824,66 @@ mod tests {
         assert!(first_buggy_lag.is_none(),
             "Encoding is buggy starting at lag {}. See stderr for details.",
             first_buggy_lag.unwrap_or(0));
+    }
+
+    #[test]
+    fn sat_n14_free_search_manual_encoding() {
+        // Build the EXACT same encoding as sat_search for tuple (2,2,-6,1)
+        // but without using sat_search — replicate its code path here.
+        // Then try free search (no hardcoded solution).
+        let n = 14usize;
+        let m = 13usize;
+        let tuple = SumTuple { x: 2, y: 2, z: -6, w: 1 };
+        let mut enc = SatEncoder::new(n);
+        let mut solver: radical::Solver = Default::default();
+
+        solver.add_clause([enc.x_var(0)]); // x[0]=+1
+
+        let x_pos = ((tuple.x + n as i32) / 2) as usize; // 8
+        let y_pos = ((tuple.y + n as i32) / 2) as usize; // 8
+        let z_pos = ((tuple.z + n as i32) / 2) as usize; // 4
+        let w_pos = ((tuple.w + m as i32) / 2) as usize; // 7
+
+        let x_lits: Vec<i32> = (0..n).map(|i| enc.x_var(i)).collect();
+        let y_lits: Vec<i32> = (0..n).map(|i| enc.y_var(i)).collect();
+        let z_lits: Vec<i32> = (0..n).map(|i| enc.z_var(i)).collect();
+        let w_lits: Vec<i32> = (0..m).map(|i| enc.w_var(i)).collect();
+
+        enc.encode_cardinality_eq(&mut solver, &x_lits, x_pos);
+        enc.encode_cardinality_eq(&mut solver, &y_lits, y_pos);
+        enc.encode_cardinality_eq(&mut solver, &z_lits, z_pos);
+        enc.encode_cardinality_eq(&mut solver, &w_lits, w_pos);
+
+        for k in 1..n {
+            let w_overlap = if k < m { m - k } else { 0 };
+            let target = 2 * (n - k) + w_overlap;
+            let mut xy_lits_k = Vec::new();
+            for i in 0..(n - k) { xy_lits_k.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k))); }
+            for i in 0..(n - k) { xy_lits_k.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k))); }
+            let mut zw_lits_k = Vec::new();
+            for i in 0..(n - k) { zw_lits_k.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k))); }
+            for i in 0..w_overlap { zw_lits_k.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k))); }
+            let xy_ctr = enc.build_counter(&mut solver, &xy_lits_k);
+            let zw_ctr = enc.build_counter(&mut solver, &zw_lits_k);
+            let mut selectors = Vec::new();
+            for c_zw in 0..=zw_lits_k.len() {
+                let rem = target as isize - 2 * c_zw as isize;
+                if rem < 0 || rem as usize > xy_lits_k.len() { continue; }
+                let c_xy = rem as usize;
+                let sel = enc.fresh();
+                if c_xy > 0 { if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 { solver.add_clause([-sel, xy_ctr[c_xy]]); } else { solver.add_clause([-sel]); continue; } }
+                if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 { solver.add_clause([-sel, -xy_ctr[c_xy + 1]]); }
+                if c_zw > 0 { if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 { solver.add_clause([-sel, zw_ctr[c_zw]]); } else { solver.add_clause([-sel]); continue; } }
+                if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 { solver.add_clause([-sel, -zw_ctr[c_zw + 1]]); }
+                selectors.push(sel);
+            }
+            if selectors.is_empty() { solver.add_clause(std::iter::empty::<i32>()); }
+            else { solver.add_clause(selectors.iter().copied()); }
+        }
+
+        eprintln!("Manual encoding: {} vars, {} clauses", solver.num_vars(), solver.num_clauses());
+        let result = solver.solve();
+        eprintln!("Result: {:?}, conflicts: {}", result, solver.num_conflicts());
+        assert_eq!(result, Some(true), "TT(14) manual encoding should be SAT for tuple (2,2,-6,1)");
     }
 }
