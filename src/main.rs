@@ -267,6 +267,8 @@ struct SearchStats {
     xy_pruned_sum: usize,
     xy_pruned_autocorr: usize,
     xy_pruned_lex: usize,
+    phase_b_nanos: u64,
+    phase_c_nanos: u64,
 }
 
 impl SearchStats {
@@ -285,6 +287,8 @@ impl SearchStats {
         self.xy_pruned_sum += other.xy_pruned_sum;
         self.xy_pruned_autocorr += other.xy_pruned_autocorr;
         self.xy_pruned_lex += other.xy_pruned_lex;
+        self.phase_b_nanos += other.phase_b_nanos;
+        self.phase_c_nanos += other.phase_c_nanos;
     }
 }
 
@@ -2253,8 +2257,10 @@ fn hybrid_solve_tuple(
     let phase_b_start = Instant::now();
     let zw_candidates =
         build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats);
+    let phase_b_elapsed = phase_b_start.elapsed();
+    stats.phase_b_nanos += phase_b_elapsed.as_nanos() as u64;
     if verbose && !zw_candidates.is_empty() {
-        println!("Tuple {}: {} Z/W pairs (Phase B: {:.3?})", tuple, zw_candidates.len(), phase_b_start.elapsed());
+        println!("Tuple {}: {} Z/W pairs (Phase B: {:.3?})", tuple, zw_candidates.len(), phase_b_elapsed);
     }
     if zw_candidates.is_empty() { return (None, stats); }
     if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
@@ -2275,6 +2281,7 @@ fn hybrid_solve_tuple(
         if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
         let sat_start = Instant::now();
         if let Some((x, y)) = template.solve_for(cand) {
+            stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
             let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
             if verbose {
                 print_solution(&format!("TT({}) hybrid (pair {}, {:.3?}, verified={})", problem.n, idx, sat_start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
@@ -2283,8 +2290,11 @@ fn hybrid_solve_tuple(
                 found.store(true, AtomicOrdering::Relaxed);
                 return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
             }
-        } else if verbose {
-            println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
+        } else {
+            stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
+            if verbose {
+                println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
+            }
         }
     }
     (None, stats)
@@ -2294,6 +2304,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
     let run_start = Instant::now();
 
+    let phase_a_start = Instant::now();
     let raw = enumerate_sum_tuples(problem);
     let mut seen = std::collections::HashSet::new();
     let tuples: Vec<SumTuple> = raw.into_iter()
@@ -2305,6 +2316,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             && (t.w + problem.m() as i32) % 2 == 0
         })
         .collect();
+    let phase_a_elapsed = phase_a_start.elapsed();
 
     let workers = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(1).max(1);
@@ -2380,9 +2392,20 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         }
     }
 
-    if verbose && !found_solution {
-        println!("Hybrid search: no solution found. Stats: z_gen={}, w_gen={}, pairs={}, elapsed={:.3?}",
-            stats.z_generated, stats.w_generated, stats.candidate_pair_spectral_ok, run_start.elapsed());
+    if verbose {
+        let total = run_start.elapsed();
+        let phase_a = phase_a_elapsed;
+        let phase_b = std::time::Duration::from_nanos(stats.phase_b_nanos);
+        let phase_c = std::time::Duration::from_nanos(stats.phase_c_nanos);
+        println!("\n--- Phase timing (wall-clock, summed across {} threads) ---", workers);
+        println!("  Phase A (tuple enum):       {:>10.3?}", phase_a);
+        println!("  Phase B (Z/W gen+spectral): {:>10.3?}  (thread-sum)", phase_b);
+        println!("  Phase C (SAT X/Y):          {:>10.3?}  (thread-sum)", phase_c);
+        println!("  Total wall-clock:           {:>10.3?}", total);
+        if !found_solution {
+            println!("Hybrid search: no solution found. Stats: z_gen={}, w_gen={}, pairs={}",
+                stats.z_generated, stats.w_generated, stats.candidate_pair_spectral_ok);
+        }
     }
     SearchReport { stats, elapsed: run_start.elapsed(), found_solution }
 }
