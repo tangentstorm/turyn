@@ -1555,9 +1555,12 @@ impl SatEncoder {
         aux
     }
 
-    /// Build sequential counter and return the "at-least" indicator variables.
-    /// Returns vec s where s[c] (for c in 1..=lits.len()) is a SAT variable
-    /// that is true iff at least c of `lits` are true. s[0] is unused.
+    /// Totalizer encoding (Bailleux & Boufkhad 2003): build a binary tree
+    /// that counts how many of `lits` are true, using O(n log n) auxiliary
+    /// variables instead of O(n²) for a sequential counter.
+    ///
+    /// Returns vec r where r[c] (for c in 1..=lits.len()) is a SAT variable
+    /// that is true iff at least c of `lits` are true. r[0] is unused.
     fn build_counter(
         &mut self,
         solver: &mut cadical::Solver,
@@ -1565,69 +1568,80 @@ impl SatEncoder {
     ) -> Vec<i32> {
         let n = lits.len();
         if n == 0 {
-            return vec![0]; // s[0] only, unused
+            return vec![0];
+        }
+        if n == 1 {
+            // Single literal: at-least-1 ↔ lit
+            let v = self.fresh();
+            solver.add_clause([-lits[0], v]);
+            solver.add_clause([lits[0], -v]);
+            return vec![0, v];
         }
 
-        // Sequential counter: s[i][j] = "at least j of lits[0..=i] are true"
-        let mut s = vec![vec![0i32; n + 1]; n]; // s[i][j], j from 0 to n
-        for i in 0..n {
-            for j in 1..=(i + 1) {
-                s[i][j] = self.fresh();
-            }
-        }
+        // Split into halves and recurse
+        let mid = n / 2;
+        let left = self.build_counter(solver, &lits[..mid]);
+        let right = self.build_counter(solver, &lits[mid..]);
+        let left_max = mid;    // left can count 0..=mid
+        let right_max = n - mid; // right can count 0..=n-mid
 
-        // Base: s[0][1] ↔ lits[0]
-        solver.add_clause([-lits[0], s[0][1]]);
-        solver.add_clause([lits[0], -s[0][1]]);
-
-        // Inductive
-        for i in 1..n {
-            for j in 1..=(i + 1) {
-                if s[i][j] == 0 { continue; }
-                let prev_j = if j <= i { s[i - 1][j] } else { 0 };
-                let prev_j1 = if j >= 2 { s[i - 1][j - 1] } else { 0 };
-
-                // s[i][j] → s[i-1][j] ∨ lits[i]
-                if prev_j != 0 {
-                    solver.add_clause([-s[i][j], prev_j, lits[i]]);
-                } else {
-                    solver.add_clause([-s[i][j], lits[i]]);
-                }
-                // s[i][j] → s[i-1][j] ∨ s[i-1][j-1]
-                // When j=1, s[i-1][0] = "at least 0" is always true, so skip.
-                if j > 1 {
-                    if prev_j != 0 && prev_j1 != 0 {
-                        solver.add_clause([-s[i][j], prev_j, prev_j1]);
-                    } else if prev_j != 0 {
-                        solver.add_clause([-s[i][j], prev_j]);
-                    } else if prev_j1 != 0 {
-                        solver.add_clause([-s[i][j], prev_j1]);
-                    }
-                }
-                // s[i-1][j] → s[i][j]
-                if prev_j != 0 {
-                    solver.add_clause([-prev_j, s[i][j]]);
-                }
-                // lits[i] ∧ s[i-1][j-1] → s[i][j]
-                if prev_j1 != 0 {
-                    solver.add_clause([-lits[i], -prev_j1, s[i][j]]);
-                } else if j == 1 {
-                    solver.add_clause([-lits[i], s[i][j]]);
-                }
-            }
-        }
-
-        // Return the last row: s[n-1][c] for c = 0..=n
-        // s[c] means "at least c of all lits are true"
-        let mut result = vec![0i32; n + 1]; // result[0] unused
+        // Merge: create output variables for counts 1..=n
+        let mut out = vec![0i32; n + 1];
         for c in 1..=n {
-            result[c] = s[n - 1][c];
+            out[c] = self.fresh();
         }
-        result
+
+        // Merge clauses: out[c] ↔ ∃(a+b=c) left[a] ∧ right[b]
+        // Encoded as:
+        //   Forward: left[a] ∧ right[b] → out[a+b]  (for all valid a,b)
+        //   Backward: out[c] → left[a] ∨ right[c-a]  (for all valid a given c)
+        //
+        // Using "at-least" semantics (monotone):
+        //   left[a] ∧ right[b] → out[a+b]   (forward, ensures out counts enough)
+        //   out[c] → left[a] ∨ right[c-a]    (backward, ensures out doesn't overcount)
+
+        for a in 0..=left_max {
+            for b in 0..=right_max {
+                let c = a + b;
+                if c == 0 || c > n { continue; }
+                // Forward: left[a] ∧ right[b] → out[c]
+                // i.e., ¬left[a] ∨ ¬right[b] ∨ out[c]
+                let l = if a == 0 { 0 } else { left[a] };   // 0 means "always true"
+                let r = if b == 0 { 0 } else { right[b] };
+                match (l, r) {
+                    (0, 0) => { solver.add_clause([out[c]]); } // both always true
+                    (0, _) => { solver.add_clause([-r, out[c]]); }
+                    (_, 0) => { solver.add_clause([-l, out[c]]); }
+                    (_, _) => { solver.add_clause([-l, -r, out[c]]); }
+                }
+            }
+        }
+
+        // Backward: out[c] → ∨_{a=max(0,c-right_max)..min(c,left_max)} (left[a] ∨ right[c-a])
+        // Simplified: out[c] → left[a] ∨ right[c-a] for each valid split a
+        // Actually the standard totalizer backward clause is:
+        //   ¬left[a+1] ∧ ¬right[b+1] → ¬out[a+b+1]
+        // i.e., out[a+b+1] → left[a+1] ∨ right[b+1]
+        for a in 0..=left_max {
+            for b in 0..=right_max {
+                let c = a + b + 1;
+                if c > n { continue; }
+                let l_next = if a + 1 <= left_max { left[a + 1] } else { 0 };
+                let r_next = if b + 1 <= right_max { right[b + 1] } else { 0 };
+                // out[c] → l_next ∨ r_next
+                match (l_next, r_next) {
+                    (0, 0) => { solver.add_clause([-out[c]]); } // impossible count
+                    (0, _) => { solver.add_clause([-out[c], r_next]); }
+                    (_, 0) => { solver.add_clause([-out[c], l_next]); }
+                    (_, _) => { solver.add_clause([-out[c], l_next, r_next]); }
+                }
+            }
+        }
+
+        out
     }
 
-    /// Totalizer encoding: exactly `target` of `lits` must be true.
-    /// Uses sequential counter (Sinz 2005).
+    /// Encode exactly `target` of `lits` must be true, using the totalizer.
     fn encode_cardinality_eq(
         &mut self,
         solver: &mut cadical::Solver,
@@ -1639,82 +1653,20 @@ impl SatEncoder {
             assert!(target == 0);
             return;
         }
-        // At-most-k using sequential counter
-        // s[i][j] = "at least j of lits[0..=i] are true"
-        // Then enforce exactly target: s[n-1][target] ∧ ¬s[n-1][target+1]
-        let k = target;
-        if k > n { // impossible
-            solver.add_clause([0]); // empty clause = unsat
+        if target > n {
+            solver.add_clause([]); // impossible
             return;
         }
-
-        // Sequential counter variables: s[i][j] for i in 0..n, j in 1..=k+1
-        // (j=0 is always true, j>k+1 is always false)
-        let mut s = vec![vec![0i32; k + 2]; n]; // s[i][j], j from 0 to k+1
-        for i in 0..n {
-            for j in 1..=(k + 1).min(i + 1) {
-                s[i][j] = self.fresh();
-            }
+        let ctr = self.build_counter(solver, lits);
+        // Enforce at-least target
+        if target >= 1 {
+            assert!(ctr[target] != 0);
+            solver.add_clause([ctr[target]]);
         }
-
-        // Base case: s[0][1] ↔ lits[0]
-        if s[0][1] != 0 {
-            solver.add_clause([-lits[0], s[0][1]]);
-            solver.add_clause([lits[0], -s[0][1]]);
-        }
-        // s[0][j] = false for j >= 2
-        for j in 2..=k + 1 {
-            if s[0][j] != 0 {
-                solver.add_clause([-s[0][j]]);
-            }
-        }
-
-        // Inductive: s[i][j] ↔ s[i-1][j] ∨ (lits[i] ∧ s[i-1][j-1])
-        for i in 1..n {
-            for j in 1..=(k + 1).min(i + 1) {
-                if s[i][j] == 0 { continue; }
-                let prev_j = if j <= i { s[i - 1][j] } else { 0 };
-                let prev_j1 = if j >= 2 && s[i - 1][j - 1] != 0 { s[i - 1][j - 1] } else { 0 };
-
-                // s[i][j] → s[i-1][j] ∨ lits[i]
-                if prev_j != 0 {
-                    solver.add_clause([-s[i][j], prev_j, lits[i]]);
-                } else {
-                    solver.add_clause([-s[i][j], lits[i]]);
-                }
-                // s[i][j] → s[i-1][j] ∨ s[i-1][j-1]
-                // When j=1, s[i-1][0] = "at least 0" is always true, so skip.
-                if j > 1 {
-                    if prev_j != 0 && prev_j1 != 0 {
-                        solver.add_clause([-s[i][j], prev_j, prev_j1]);
-                    } else if prev_j != 0 {
-                        solver.add_clause([-s[i][j], prev_j]);
-                    } else if prev_j1 != 0 {
-                        solver.add_clause([-s[i][j], prev_j1]);
-                    }
-                }
-                // s[i-1][j] → s[i][j]
-                if prev_j != 0 {
-                    solver.add_clause([-prev_j, s[i][j]]);
-                }
-                // lits[i] ∧ s[i-1][j-1] → s[i][j]
-                if prev_j1 != 0 {
-                    solver.add_clause([-lits[i], -prev_j1, s[i][j]]);
-                } else if j == 1 {
-                    solver.add_clause([-lits[i], s[i][j]]);
-                }
-            }
-        }
-
-        // Enforce exactly k: s[n-1][k] must be true (at least k)
-        if k >= 1 && s[n - 1][k] != 0 {
-            solver.add_clause([s[n - 1][k]]);
-        }
-        // s[n-1][k+1] must be false (at most k)
-        if k + 1 <= n && s[n - 1][k + 1] != 0 {
-            solver.add_clause([-s[n - 1][k + 1]]);
-        } else if k + 1 <= n {
-            // s[n-1][k+1] was never created (always 0), meaning it's false already — OK
+        // Enforce at-most target (i.e., NOT at-least target+1)
+        if target + 1 <= n {
+            assert!(ctr[target + 1] != 0);
+            solver.add_clause([-ctr[target + 1]]);
         }
     }
 }
