@@ -1001,31 +1001,38 @@ impl SatXYTemplate {
         Some(Self { solver, counters, n })
     }
 
+    /// Quick feasibility check: are the cardinality targets in range?
+    fn is_feasible(&self, candidate: &CandidateZW) -> bool {
+        let n = self.n;
+        for s in 1..n {
+            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
+            if target_raw < 0 || target_raw % 2 != 0 { return false; }
+            let target = (target_raw / 2) as usize;
+            let max_pairs = 2 * (n - s);
+            if target > max_pairs { return false; }
+            let ctr = &self.counters[s];
+            if target >= 1 && (target >= ctr.len() || ctr[target] == 0) { return false; }
+            if target + 1 <= max_pairs && (target + 1 >= ctr.len() || ctr[target + 1] == 0) { return false; }
+        }
+        true
+    }
+
     /// Solve for X/Y given a specific Z/W candidate.
     /// Clones the template solver and adds per-pair cardinality assertions.
     fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
+        if !self.is_feasible(candidate) { return None; }
         let n = self.n;
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
 
         let mut solver = self.solver.clone();
-
         for s in 1..n {
             let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-            if target_raw < 0 || target_raw % 2 != 0 { return None; }
             let target = (target_raw / 2) as usize;
             let max_pairs = 2 * (n - s);
-            if target > max_pairs { return None; }
-
             let ctr = &self.counters[s];
-            if target >= 1 {
-                if target >= ctr.len() || ctr[target] == 0 { return None; }
-                solver.add_clause([ctr[target]]);
-            }
-            if target + 1 <= max_pairs {
-                if target + 1 >= ctr.len() || ctr[target + 1] == 0 { return None; }
-                solver.add_clause([-ctr[target + 1]]);
-            }
+            if target >= 1 { solver.add_clause([ctr[target]]); }
+            if target + 1 <= max_pairs { solver.add_clause([-ctr[target + 1]]); }
         }
 
         match solver.solve() {
