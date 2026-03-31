@@ -1099,27 +1099,28 @@ impl SatXYTemplate {
     }
 
     /// Solve for X/Y given a specific Z/W candidate.
-    /// Clones the template solver and adds per-pair cardinality assertions.
-    fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
+    /// Uses assumptions to assert per-pair cardinality targets, avoiding clone.
+    fn solve_for(&mut self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
         if !self.is_feasible(candidate) { return None; }
         let n = self.n;
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
 
-        let mut solver = self.solver.clone();
+        let mut assumptions = Vec::new();
         for s in 1..n {
             let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
             let target = (target_raw / 2) as usize;
             let max_pairs = 2 * (n - s);
             let ctr = &self.counters[s];
-            if target >= 1 { solver.add_clause([ctr[target]]); }
-            if target + 1 <= max_pairs { solver.add_clause([-ctr[target + 1]]); }
+            if target >= 1 { assumptions.push(ctr[target]); }
+            if target + 1 <= max_pairs { assumptions.push(-ctr[target + 1]); }
         }
 
-        match solver.solve() {
+        match self.solver.solve_with_assumptions(&assumptions) {
             Some(true) => {
-                let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
+                let x: Vec<i8> = (0..n).map(|i| if self.solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
+                let y: Vec<i8> = (0..n).map(|i| if self.solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
+                self.solver.reset();
                 Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)))
             }
             _ => None,
@@ -2265,7 +2266,7 @@ fn hybrid_solve_tuple(
     if zw_candidates.is_empty() { return (None, stats); }
     if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
 
-    let Some(template) = SatXYTemplate::build(problem, tuple) else { return (None, stats); };
+    let Some(mut template) = SatXYTemplate::build(problem, tuple) else { return (None, stats); };
 
     // Deduplicate Z/W pairs by autocorrelation vector
     let mut seen_autocorr = std::collections::HashSet::new();
