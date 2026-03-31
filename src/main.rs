@@ -1720,6 +1720,7 @@ impl SatEncoder {
 }
 
 fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>)> {
+    let encode_start = Instant::now();
     let n = problem.n;
     let m = problem.m();
     let mut enc = SatEncoder::new(n);
@@ -1830,11 +1831,14 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
         }
     }
 
+    let encode_elapsed = encode_start.elapsed();
     if verbose {
-        println!("SAT encoding: n={}, tuple={}, {} vars, solving...", n, tuple, enc.next_var - 1);
+        println!("SAT encoding: n={}, tuple={}, {} vars, encoded in {:.3?}, solving...", n, tuple, enc.next_var - 1, encode_elapsed);
     }
 
+    let solve_start = Instant::now();
     let result = solver.solve();
+    let solve_elapsed = solve_start.elapsed();
     match result {
         Some(true) => {
             let x: Vec<i8> = (0..n).map(|i| if solver.value(enc.x_var(i)) == Some(true) { 1 } else { -1 }).collect();
@@ -1844,11 +1848,11 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
             Some((x, y, z, w))
         }
         Some(false) => {
-            if verbose { println!("UNSAT for tuple {}", tuple); }
+            if verbose { println!("UNSAT for tuple {} in {:.3?}", tuple, solve_elapsed); }
             None
         }
         None => {
-            if verbose { println!("UNKNOWN for tuple {}", tuple); }
+            if verbose { println!("UNKNOWN for tuple {} in {:.3?}", tuple, solve_elapsed); }
             None
         }
     }
