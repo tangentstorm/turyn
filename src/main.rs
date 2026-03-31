@@ -1037,14 +1037,14 @@ fn backtrack_xy(
 #[cfg(not(feature = "cadical"))]
 struct SatXYTemplate {
     solver: radical::Solver,
-    agree_per_lag: Vec<Vec<i32>>,  // agree_per_lag[s] = XNOR agree lits for lag s
+    lag_pairs: Vec<LagPairs>,
     n: usize,
 }
 
 #[cfg(feature = "cadical")]
 struct SatXYTemplate {
     solver: cadical::Solver,
-    agree_per_lag: Vec<Vec<i32>>,
+    lag_pairs: Vec<LagPairs>,
     n: usize,
 }
 
@@ -1146,16 +1146,22 @@ fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Vec<(i32, i32, 
     equalities
 }
 
-/// Build SAT XY template with PB constraints for sum constraints,
-/// XNOR agree variables for autocorrelation, and GJ-derived equalities.
-/// Returns the agree_lits per lag (used to add PB constraints per candidate).
+/// Pair data for quadratic PB constraints per lag: (lits_a, lits_b) for each lag.
+/// agree(x_i, x_{i+s}) = x_i*x_{i+s} + ¬x_i*¬x_{i+s}, so each lag has
+/// 4*(n-s) product terms (both-true + both-false for X pairs and Y pairs).
+struct LagPairs {
+    lits_a: Vec<i32>,
+    lits_b: Vec<i32>,
+}
+
+/// Build SAT XY template with PB constraints for sum constraints
+/// and quadratic PB agree pairs per lag. No XNOR auxiliary variables.
 fn build_sat_xy_clauses(
     problem: Problem,
     tuple: SumTuple,
     solver: &mut impl SatSolver,
-) -> Option<(Vec<Vec<i32>>, usize)> {
+) -> Option<(Vec<LagPairs>, usize)> {
     let n = problem.n;
-    let mut enc = SatEncoder { n: 2 * n, m: 0, next_var: (2 * n + 1) as i32 };
 
     let x_var = |i: usize| -> i32 { (i + 1) as i32 };
     let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
@@ -1164,7 +1170,7 @@ fn build_sat_xy_clauses(
     solver.add_clause([x_var(0)]); // x[0] = +1
     solver.add_clause([y_var(0)]); // y[0] = +1
 
-    // Sum constraints via PB: exactly x_pos of X are true, exactly y_pos of Y are true
+    // Sum constraints via PB
     if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0 {
         return None;
     }
@@ -1176,27 +1182,42 @@ fn build_sat_xy_clauses(
     solver.add_pb_eq(&x_lits, &ones, x_pos as u32);
     solver.add_pb_eq(&y_lits, &ones, y_pos as u32);
 
-    // Build XNOR agree variables per lag
-    let mut agree_per_lag = Vec::with_capacity(n);
-    agree_per_lag.push(Vec::new()); // lag 0 unused
+    // Build agree pair lists per lag (no aux variables!)
+    // agree(a, b) = a*b + ¬a*¬b = (both true) + (both false)
+    let mut lag_pairs = Vec::with_capacity(n);
+    lag_pairs.push(LagPairs { lits_a: Vec::new(), lits_b: Vec::new() }); // lag 0 unused
     for s in 1..n {
-        let mut agree_lits = Vec::with_capacity(2 * (n - s));
+        let mut lits_a = Vec::with_capacity(4 * (n - s));
+        let mut lits_b = Vec::with_capacity(4 * (n - s));
+
+        // X pairs: agree(x_i, x_{i+s})
         for i in 0..(n - s) {
-            agree_lits.push(enc.encode_xnor(solver, x_var(i), x_var(i + s)));
+            // Both-true term: x_i * x_{i+s}
+            lits_a.push(x_var(i));
+            lits_b.push(x_var(i + s));
+            // Both-false term: ¬x_i * ¬x_{i+s}
+            lits_a.push(-x_var(i));
+            lits_b.push(-x_var(i + s));
         }
+        // Y pairs: agree(y_i, y_{i+s})
         for i in 0..(n - s) {
-            agree_lits.push(enc.encode_xnor(solver, y_var(i), y_var(i + s)));
+            lits_a.push(y_var(i));
+            lits_b.push(y_var(i + s));
+            lits_a.push(-y_var(i));
+            lits_b.push(-y_var(i + s));
         }
-        agree_per_lag.push(agree_lits);
+
+        lag_pairs.push(LagPairs { lits_a, lits_b });
     }
 
-    Some((agree_per_lag, n))
+    Some((lag_pairs, n))
 }
 
 /// Trait abstracting over radical::Solver and cadical::Solver.
 trait SatSolver {
     fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I);
     fn add_pb_eq(&mut self, lits: &[i32], coeffs: &[u32], target: u32);
+    fn add_quad_pb_eq(&mut self, lits_a: &[i32], lits_b: &[i32], coeffs: &[u32], target: u32);
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool>;
     fn value(&self, var: i32) -> Option<bool>;
     fn reset(&mut self);
@@ -1208,6 +1229,9 @@ impl SatSolver for radical::Solver {
     }
     fn add_pb_eq(&mut self, lits: &[i32], coeffs: &[u32], target: u32) {
         self.add_pb_eq(lits, coeffs, target);
+    }
+    fn add_quad_pb_eq(&mut self, lits_a: &[i32], lits_b: &[i32], coeffs: &[u32], target: u32) {
+        self.add_quad_pb_eq(lits_a, lits_b, coeffs, target);
     }
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool> {
         self.solve_with_assumptions(assumptions)
@@ -1226,9 +1250,10 @@ impl SatSolver for cadical::Solver {
         self.add_clause(lits);
     }
     fn add_pb_eq(&mut self, _lits: &[i32], _coeffs: &[u32], _target: u32) {
-        // CaDiCaL doesn't support PB natively; fall back to totalizer encoding
-        // This path won't be used since CaDiCaL uses the clause-based encoding
         unimplemented!("CaDiCaL backend uses clause-based encoding, not PB");
+    }
+    fn add_quad_pb_eq(&mut self, _a: &[i32], _b: &[i32], _c: &[u32], _t: u32) {
+        unimplemented!("CaDiCaL backend uses clause-based encoding, not quad PB");
     }
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool> {
         self.solve_with(assumptions.iter().copied())
@@ -1248,8 +1273,8 @@ impl SatXYTemplate {
         #[cfg(feature = "cadical")]
         let mut solver: cadical::Solver = Default::default();
 
-        let (agree_per_lag, n) = build_sat_xy_clauses(problem, tuple, &mut solver)?;
-        Some(Self { solver, agree_per_lag, n })
+        let (lag_pairs, n) = build_sat_xy_clauses(problem, tuple, &mut solver)?;
+        Some(Self { solver, lag_pairs, n })
     }
 
     /// Quick feasibility check: are the cardinality targets in range?
@@ -1275,27 +1300,25 @@ impl SatXYTemplate {
 
         let mut solver = self.solver.clone();
 
-        // GJ-derived equalities: for lags where ALL or NO pairs agree,
-        // we can assert hard equality/negation constraints on primary vars.
+        // GJ-derived equalities from extreme-target lags
         let equalities = gj_candidate_equalities(n, candidate);
         for &(a, b, equal) in &equalities {
             if equal {
-                // a = b: encode as (a → b) ∧ (b → a) = (¬a ∨ b) ∧ (a ∨ ¬b)
                 solver.add_clause([-a, b]);
                 solver.add_clause([a, -b]);
             } else {
-                // a = ¬b: encode as (a → ¬b) ∧ (¬b → a) = (¬a ∨ ¬b) ∧ (a ∨ b)
                 solver.add_clause([-a, -b]);
                 solver.add_clause([a, b]);
             }
         }
 
+        // Add quadratic PB constraints for each lag's agree target
         for s in 1..n {
             let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
             let target = (target_raw / 2) as usize;
-            let agree_lits = &self.agree_per_lag[s];
-            let ones: Vec<u32> = vec![1; agree_lits.len()];
-            solver.add_pb_eq(agree_lits, &ones, target as u32);
+            let lp = &self.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
         }
 
         match solver.solve() {
@@ -2889,13 +2912,13 @@ mod tests {
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (36 + i + 1) as i32 };
         let mut solver = template.solver.clone();
-        // Add per-pair PB cardinality constraints
+        // Add per-lag quadratic PB constraints
         for s in 1..36 {
             let target_raw = 2 * (36 - s) as i32 - candidate.zw_autocorr[s];
             let target = (target_raw / 2) as usize;
-            let agree_lits = &template.agree_per_lag[s];
-            let ones: Vec<u32> = vec![1; agree_lits.len()];
-            solver.add_pb_eq(agree_lits, &ones, target as u32);
+            let lp = &template.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
         }
         // Hardcode known X/Y
         for i in 0..36 {
