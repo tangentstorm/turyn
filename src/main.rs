@@ -966,7 +966,7 @@ fn sat_solve_xy(
 ) -> Option<(PackedSeq, PackedSeq)> {
     let n = problem.n;
     let mut enc = SatEncoder { n: 2 * n, m: 0, next_var: (2 * n + 1) as i32 };
-    let mut solver: cadical::Solver = Default::default();
+    let mut solver: radical::Solver = Default::default();
 
     let x_var = |i: usize| -> i32 { (i + 1) as i32 };
     let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
@@ -1619,7 +1619,7 @@ impl SatEncoder {
 
     /// Encode XNOR: aux ↔ (a ↔ b). Returns the auxiliary variable.
     /// aux=true means a and b have the same sign (+1,+1 or -1,-1).
-    fn encode_xnor(&mut self, solver: &mut cadical::Solver, a: i32, b: i32) -> i32 {
+    fn encode_xnor(&mut self, solver: &mut radical::Solver, a: i32, b: i32) -> i32 {
         let aux = self.fresh();
         // aux → (a ↔ b):  aux → (a → b) ∧ (b → a)
         //   ¬aux ∨ ¬a ∨ b, ¬aux ∨ a ∨ ¬b
@@ -1639,7 +1639,7 @@ impl SatEncoder {
     /// that is true iff at least c of `lits` are true. r[0] is unused.
     fn build_counter(
         &mut self,
-        solver: &mut cadical::Solver,
+        solver: &mut radical::Solver,
         lits: &[i32],
     ) -> Vec<i32> {
         let n = lits.len();
@@ -1720,7 +1720,7 @@ impl SatEncoder {
     /// Encode exactly `target` of `lits` must be true, using the totalizer.
     fn encode_cardinality_eq(
         &mut self,
-        solver: &mut cadical::Solver,
+        solver: &mut radical::Solver,
         lits: &[i32],
         target: usize,
     ) {
@@ -1752,7 +1752,7 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
     let n = problem.n;
     let m = problem.m();
     let mut enc = SatEncoder::new(n);
-    let mut solver: cadical::Solver = Default::default();
+    let mut solver: radical::Solver = Default::default();
 
     // Minimal symmetry breaking: only fix x[0]=+1.
     // Full TT symmetry group includes negation of each sequence independently,
@@ -2161,7 +2161,7 @@ mod tests {
     fn cardinality_encoding_exactly_2_of_4() {
         // Test: exactly 2 of 4 variables must be true
         let mut enc = SatEncoder { n: 0, m: 0, next_var: 5 };
-        let mut solver: cadical::Solver = Default::default();
+        let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3, 4];
         enc.encode_cardinality_eq(&mut solver, &lits, 2);
         // Should be SAT (many solutions: e.g. 1=T,2=T,3=F,4=F)
@@ -2174,7 +2174,7 @@ mod tests {
     #[test]
     fn cardinality_encoding_exactly_0_of_3() {
         let mut enc = SatEncoder { n: 0, m: 0, next_var: 4 };
-        let mut solver: cadical::Solver = Default::default();
+        let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3];
         enc.encode_cardinality_eq(&mut solver, &lits, 0);
         assert_eq!(solver.solve(), Some(true));
@@ -2186,7 +2186,7 @@ mod tests {
     #[test]
     fn cardinality_encoding_exactly_3_of_3() {
         let mut enc = SatEncoder { n: 0, m: 0, next_var: 4 };
-        let mut solver: cadical::Solver = Default::default();
+        let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3];
         enc.encode_cardinality_eq(&mut solver, &lits, 3);
         assert_eq!(solver.solve(), Some(true));
@@ -2198,7 +2198,7 @@ mod tests {
     #[test]
     fn xnor_encoding_correct() {
         let mut enc = SatEncoder { n: 0, m: 0, next_var: 3 };
-        let mut solver: cadical::Solver = Default::default();
+        let mut solver: radical::Solver = Default::default();
         // a=1, b=2, test all 4 combos
         let aux = enc.encode_xnor(&mut solver, 1, 2);
         // Force a=T, b=T → aux should be T (agree)
@@ -2211,7 +2211,7 @@ mod tests {
     #[test]
     fn build_counter_exactly_2_of_3() {
         let mut enc = SatEncoder { n: 0, m: 0, next_var: 4 };
-        let mut solver: cadical::Solver = Default::default();
+        let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3];
         let ctr = enc.build_counter(&mut solver, &lits);
         // Enforce exactly 2: at-least 2 AND at-most 2 (i.e., NOT at-least 3)
@@ -2238,7 +2238,7 @@ mod tests {
         let n = 4usize;
         let m = 3usize;
         let mut enc = SatEncoder::new(n);
-        let mut solver: cadical::Solver = Default::default();
+        let mut solver: radical::Solver = Default::default();
 
         for k in 1..n {
             let w_overlap = if k < m { m - k } else { 0 };
@@ -2298,7 +2298,7 @@ mod tests {
     fn sat_counter_with_xnor_hardcoded() {
         // Minimal test: hardcode X=[1,1,1,1], check XY agree at lag 3 = exactly 2
         let mut enc = SatEncoder { n: 4, m: 3, next_var: 9 }; // vars 1-4=X, 5-8=Y
-        let mut solver: cadical::Solver = Default::default();
+        let mut solver: radical::Solver = Default::default();
         // X = [T,T,T,T], Y = [T,F,T,T]
         for v in 1..=4 { solver.add_clause([v]); } // all X = true
         solver.add_clause([5]); // Y[0]=T
@@ -2327,7 +2327,7 @@ mod tests {
         let n = 4usize;
         let m = 3usize;
         let mut enc = SatEncoder::new(n);
-        let mut solver: cadical::Solver = Default::default();
+        let mut solver: radical::Solver = Default::default();
 
         // Hardcode solution
         let x = [1i8, 1, 1, 1];

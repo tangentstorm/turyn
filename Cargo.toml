@@ -8,5 +8,4 @@ edition = "2024"
 
 [dependencies]
 rustfft = "6"
-cadical = "0.1"
 radical = { path = "radical" }
