@@ -4,42 +4,61 @@ This file tracks performance-oriented changes and their measured impact.
 
 ## Benchmark protocol (use this for apples-to-apples comparison)
 
-- Build once in release mode.
-- Run exactly:
+Build once in release mode. Run both benchmarks. Each should take ~6–10s per run, long enough to avoid system noise.
+
+### Primary: Exhaustive search (Phase B throughput)
 
 ```bash
 cargo build --release
-target/release/turyn --n=22 --theta=192 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=3
+target/release/turyn --n=16 --theta=20000 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3
 ```
 
 - Compare `benchmark,summary,mean_ms=...` and `median_ms=...`.
+- Exercises Phase B: DFS sequence generation + FFT spectral filtering.
+- Phase C (XY backtracking) is never entered at this n/θ — `xy_nodes=0`.
+- Each run takes ~6s. Deterministic (same work units each run).
+- Does not find a solution (spectral pair filter rejects all Z/W pairs at n=16).
+
+### Secondary: Stochastic search (SA throughput)
+
+```bash
+target/release/turyn --n=16 --stochastic-secs=10 --benchmark=3
+```
+
+- Compare `benchmark,summary,mean_flips_per_sec=...` and `median_flips_per_sec=...`.
+- Exercises the simulated annealing inner loop: pair swap + O(n) incremental defect update.
+- Each run is time-limited to 10s. Measures **flips/sec** (SA move evaluations per second).
+- May or may not find a solution within the time window (TT(16) SA typically solves in 1–9s).
+- When a solution is found, the run stops early but flips/sec is still valid.
+- Stretch goal: once stochastic improvements push TT(18) into range, switch to `--n=18`.
+
+### Rules
+
 - Keep all benchmark parameters fixed when comparing two versions.
-
-## Smallest benchmark profile that currently finds a solution (under 10s)
-
-- Command:
-  `target/release/turyn --n=4 --theta=64 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=1`
-- Result:
-  - `warmup found_solution=true`
-  - `run found_solution=true`
-  - `mean_ms=0.052`
+- Run both benchmarks for each optimization; an idea may help one and hurt the other.
+- Benchmark runs should target 6–60s each. Under 6s is too noisy; over 60s wastes iteration time.
 
 ## Current baseline (latest)
 
+- Exhaustive search (n=16, theta=20000):
+  - Command: `target/release/turyn --n=16 --theta=20000 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3`
+  - Result: `mean_ms=6092, median_ms=6160`
+
+- Stochastic search (n=16, 10s time limit):
+  - Command: `target/release/turyn --n=16 --stochastic-secs=10 --benchmark=3`
+  - Result: `mean_flips_per_sec=41_650_115, median_flips_per_sec=41_608_236`
+
+### Legacy baselines (for reference)
+
 - Exhaustive search (n=14, theta=128):
-  - Command: `target/release/turyn --n=14 --theta=128 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=7`
-  - Result: `mean_ms=5.70, median_ms=5.69`
-
+  - `mean_ms=5.70, median_ms=5.69`
 - Exhaustive search (n=16, theta=256):
-  - Command: `target/release/turyn --n=16 --theta=256 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=7`
-  - Result: `mean_ms=20.20, median_ms=20.17`
-
-- Stochastic search (`--stochastic`):
-  - TT(6): ~0.6ms, TT(8): ~0.8ms, TT(14): ~175ms
-  - TT(22): reaches defect ~64 but does not yet converge to 0
-
+  - `mean_ms=20.20, median_ms=20.17`
 - Previous n=22 exhaustive baseline (different machine):
   `mean_ms=11222.901`, `median_ms=11148.973`
+- Stochastic search (time-to-solution, no time limit):
+  - TT(6): ~0.6ms, TT(8): ~0.8ms, TT(14): ~4.5s, TT(16): ~1.5–8.5s
+  - TT(18): converges in ~580s (slow), TT(22): does not converge
 
 
 
@@ -63,6 +82,10 @@ Note: the previous per-idea claims in `IDEAS.md` were not backed by a step-by-st
 
 | Date (UTC) | Change | Why it helps | Measured effect |
 |---|---|---|---|
+| 2026-03-30 | Pre-build per-sequence value-grouped index lists for O(1) SA partner selection. Eliminates random-probe loop (up to seq_len retries per flip). | Partner finding was the main per-flip overhead beyond delta computation: random probing hit wrong-value or same-position indices frequently, wasting iterations. Grouped lists give O(1) valid partner every time. | Stochastic: `34.13M → 41.65M flips/sec` (**+22.0%**). Exhaustive: neutral. |
+| 2026-03-30 | Simplified SA delta-corr from multiple multiply-accumulate pairs to single `-2*vi*nb*weight` formula per lag. | Same-value swaps have a clean delta: `-2v * (sum of non-overlapping neighbors)`. Fewer multiplies, cleaner branches, better codegen. | Stochastic: `32.03M → 34.13M flips/sec` (**+6.6%**). Exhaustive: neutral. |
+| 2026-03-31 | CaDiCaL SAT solver integration (`--sat` mode). Encodes TT constraints as CNF with XNOR agree variables, sequential counters for sums, selector-based weighted cardinality for autocorrelation. | SAT/CDCL solvers use conflict-driven clause learning and restarts, which can prune the search space far more effectively than custom DFS for highly constrained combinatorial problems. | TT(4): <1ms, TT(8): 1.6ms, TT(10): 91ms, TT(12): 552ms, TT(14): 554ms, TT(16): 4.6s, **TT(18): 89s** (vs SA 580s, **6.5x faster**). |
+| 2026-03-30 | SA early termination: in cold phase (temp < 1.0), stop delta-defect computation when partial sum exceeds current defect. | Most SA moves in the cold phase are bad; early termination skips remaining lag computations for clearly-rejected moves, saving O(n) work per rejected flip. | Stochastic: `29.36M → 32.03M flips/sec` (**+9.1%**). Exhaustive: neutral. |
 | 2026-03-30 | Replaced manual O(θ×n) DFT in `spectrum_if_ok` with `rustfft` crate FFT using zero-padded sequences. FFT size = max(4n, 2θ) rounded to power of 2, with reusable buffer. | FFT computes full power spectrum in O(M log M) vs manual DFT's O(θ×n). For θ=256, n=16: FFT(512) does ~4.6K ops vs manual 4096 multiply-accumulates, with better SIMD utilization from optimized FFT library. | ~47-49% improvement: n=14 θ=128 mean `11.09 → 5.70` ms (**-48.6%**), n=16 θ=256 mean `38.25 → 20.20` ms (**-47.2%**). |
 | 2026-03-30 | Added multi-threaded stochastic local search (`--stochastic`) using simulated annealing with O(n) incremental defect updates. | Enables finding Turyn sequences at sizes where exhaustive DFS is infeasible. Sum-preserving pair swaps, adaptive cooling, one SA worker per core. | TT(6): 0.6ms, TT(8): 0.8ms, TT(14): 175ms. |
 | 2026-03-30 | Disabled FFT spectral path and DFS parity pruning from Grok bundle (both regressions). Kept XY dynamic variable ordering and bucket capping. | FFT path caused regression even when inactive (branch overhead, icache). DFS parity pruning was redundant with existing per-branch sum checks. | n=14: Grok 23ms → 21ms, n=16: Grok 80ms → 77ms. Recovers pre-Grok baseline while keeping beneficial Grok changes. |

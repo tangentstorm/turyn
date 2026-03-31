@@ -201,6 +201,9 @@ struct SearchConfig {
     max_pairs_per_bucket: usize,
     benchmark_repeats: usize,
     stochastic: bool,
+    stochastic_seconds: u64,
+    sat: bool,
+    sat_xy: bool,
 }
 
 impl Default for SearchConfig {
@@ -214,6 +217,9 @@ impl Default for SearchConfig {
             max_pairs_per_bucket: 5_000,
             benchmark_repeats: 0,
             stochastic: false,
+            stochastic_seconds: 0,
+            sat: false,
+            sat_xy: false,
         }
     }
 }
@@ -944,6 +950,80 @@ fn backtrack_xy(
     }
 }
 
+/// SAT-based X/Y solver: given fixed Z/W (with precomputed autocorrelations),
+/// encode just the X/Y constraints and solve with CaDiCaL.
+///
+/// Variables: X[0..n) → vars 1..=n, Y[0..n) → vars n+1..=2n.
+/// Constraints:
+///   - x[0]=+1 (symmetry breaking)
+///   - sum(X) = tuple.x, sum(Y) = tuple.y  (cardinality)
+///   - For each lag s: N_X(s) + N_Y(s) = -zw_autocorr[s]  (autocorrelation)
+fn sat_solve_xy(
+    problem: Problem,
+    tuple: SumTuple,
+    candidate: &CandidateZW,
+    _stats: &mut SearchStats,
+) -> Option<(PackedSeq, PackedSeq)> {
+    let n = problem.n;
+    let mut enc = SatEncoder { n: 2 * n, m: 0, next_var: (2 * n + 1) as i32 };
+    let mut solver: cadical::Solver = Default::default();
+
+    let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+    let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+    // Symmetry breaking
+    solver.add_clause([x_var(0)]); // x[0] = +1
+    solver.add_clause([y_var(0)]); // y[0] = +1
+
+    // Sum constraints
+    let x_pos = ((tuple.x + n as i32) / 2) as usize;
+    let y_pos = ((tuple.y + n as i32) / 2) as usize;
+    if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0 {
+        return None; // parity mismatch
+    }
+    let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+    let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+    enc.encode_cardinality_eq(&mut solver, &x_lits, x_pos);
+    enc.encode_cardinality_eq(&mut solver, &y_lits, y_pos);
+
+    // Autocorrelation: for each lag s, N_X(s) + N_Y(s) = -zw_autocorr[s]
+    // N_X(s) = 2*agree_X(s) - (n-s), N_Y(s) = 2*agree_Y(s) - (n-s)
+    // So: 2*(agree_X + agree_Y) - 2*(n-s) = -zw_autocorr[s]
+    //     agree_X + agree_Y = (2*(n-s) - zw_autocorr[s]) / 2 = (n-s) - zw_autocorr[s]/2
+    for s in 1..n {
+        let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
+        if target_raw < 0 || target_raw % 2 != 0 {
+            return None; // infeasible
+        }
+        let target_agree = (target_raw / 2) as usize;
+        let max_pairs = 2 * (n - s);
+        if target_agree > max_pairs {
+            return None;
+        }
+
+        // Build agree literals: XNOR for each (i, i+s) pair in X and Y
+        let mut agree_lits = Vec::with_capacity(max_pairs);
+        for i in 0..(n - s) {
+            agree_lits.push(enc.encode_xnor(&mut solver, x_var(i), x_var(i + s)));
+        }
+        for i in 0..(n - s) {
+            agree_lits.push(enc.encode_xnor(&mut solver, y_var(i), y_var(i + s)));
+        }
+
+        // Simple cardinality: exactly target_agree of agree_lits are true
+        enc.encode_cardinality_eq(&mut solver, &agree_lits, target_agree);
+    }
+
+    match solver.solve() {
+        Some(true) => {
+            let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
+            let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
+            Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)))
+        }
+        _ => None,
+    }
+}
+
 fn verify_tt(problem: Problem, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &PackedSeq) -> bool {
     if x.len() != problem.n
         || y.len() != problem.n
@@ -1221,6 +1301,14 @@ fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 }
 
 fn run_benchmark(cfg: &SearchConfig) {
+    if cfg.stochastic {
+        run_stochastic_benchmark(cfg);
+    } else {
+        run_exhaustive_benchmark(cfg);
+    }
+}
+
+fn run_exhaustive_benchmark(cfg: &SearchConfig) {
     let repeats = cfg.benchmark_repeats.max(1);
     let warmup = run_search(cfg, false);
     println!(
@@ -1266,6 +1354,43 @@ fn run_benchmark(cfg: &SearchConfig) {
     );
 }
 
+fn run_stochastic_benchmark(cfg: &SearchConfig) {
+    let secs = if cfg.stochastic_seconds > 0 { cfg.stochastic_seconds } else { 10 };
+    let repeats = cfg.benchmark_repeats.max(1);
+    // Warmup
+    let warmup = stochastic_search(cfg.problem, false, secs);
+    let warmup_rate = warmup.stats.xy_nodes as f64 / warmup.elapsed.as_secs_f64();
+    println!(
+        "benchmark,warmup,elapsed_s={:.3},flips={},flips_per_sec={:.0},found_solution={}",
+        warmup.elapsed.as_secs_f64(),
+        warmup.stats.xy_nodes,
+        warmup_rate,
+        warmup.found_solution
+    );
+    println!("benchmark,run,elapsed_s,flips,flips_per_sec,found_solution");
+    let mut rates = Vec::with_capacity(repeats);
+    for run in 1..=repeats {
+        let report = stochastic_search(cfg.problem, false, secs);
+        let rate = report.stats.xy_nodes as f64 / report.elapsed.as_secs_f64();
+        rates.push(rate);
+        println!(
+            "benchmark,{},{:.3},{},{:.0},{}",
+            run,
+            report.elapsed.as_secs_f64(),
+            report.stats.xy_nodes,
+            rate,
+            report.found_solution
+        );
+    }
+    rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let median = rates[rates.len() / 2];
+    let mean = rates.iter().sum::<f64>() / rates.len() as f64;
+    println!(
+        "benchmark,summary,mean_flips_per_sec={:.0},median_flips_per_sec={:.0},repeats={}",
+        mean, median, repeats
+    );
+}
+
 fn compute_corr(problem: Problem, x: &[i8], y: &[i8], z: &[i8], w: &[i8]) -> Vec<i32> {
     let n = problem.n;
     let m = problem.m();
@@ -1291,21 +1416,27 @@ fn defect_from_corr(corr: &[i32]) -> i64 {
     corr.iter().skip(1).map(|&c| (c as i64) * (c as i64)).sum()
 }
 
-fn stochastic_search(problem: Problem, verbose: bool) -> SearchReport {
+fn stochastic_search(problem: Problem, verbose: bool, time_limit_secs: u64) -> SearchReport {
     let run_start = Instant::now();
     let workers = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(1).max(1);
     if verbose {
         println!("TT({}): stochastic search with {} threads", problem.n, workers);
     }
+    let time_limit = if time_limit_secs > 0 {
+        Some(std::time::Duration::from_secs(time_limit_secs))
+    } else {
+        None
+    };
     let found = Arc::new(AtomicBool::new(false));
     let norm = Arc::new(normalized_tuples(&enumerate_sum_tuples(problem)));
+    let deadline = time_limit.map(|d| Instant::now() + d);
     let mut handles = Vec::new();
     for tid in 0..workers {
         let found = Arc::clone(&found);
         let norm = Arc::clone(&norm);
         handles.push(std::thread::spawn(move || {
-            stochastic_worker(problem, &norm, &found, tid as u64, verbose && tid == 0)
+            stochastic_worker(problem, &norm, &found, tid as u64, verbose && tid == 0, deadline)
         }));
     }
     let mut best = SearchReport { stats: SearchStats::default(), elapsed: run_start.elapsed(), found_solution: false };
@@ -1319,7 +1450,7 @@ fn stochastic_search(problem: Problem, verbose: bool) -> SearchReport {
     best
 }
 
-fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, seed: u64, verbose: bool) -> SearchReport {
+fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, seed: u64, verbose: bool, deadline: Option<Instant>) -> SearchReport {
     let run_start = Instant::now();
     let mut stats = SearchStats::default();
     let n = problem.n;
@@ -1346,6 +1477,7 @@ fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, se
     let max_flips = n * n * 50;
     for restart in 0..max_restarts {
         if found.load(AtomicOrdering::Relaxed) { break; }
+        if let Some(dl) = deadline { if Instant::now() >= dl { break; } }
         let tuple = &norm[(rng() as usize) % norm.len()];
         let mut x = rand_seq(n, &mut rng);
         let mut y = rand_seq(n, &mut rng);
@@ -1369,41 +1501,69 @@ fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, se
         let mut temp = (defect as f64).sqrt().max(50.0);
         let cooling = (0.1f64 / temp).powf(1.0 / max_flips as f64).max(0.99);
         let mut delta_corr = vec![0i32; n];
+        // Pre-build value-grouped index lists for O(1) partner finding.
+        // pos_idx[seq][0] = indices with value +1, pos_idx[seq][1] = indices with value -1
+        // Only include mutable indices (skip index 0 for all, skip n-1 for z).
+        let mut pos_idx: [Vec<Vec<usize>>; 4] = [vec![vec![], vec![]], vec![vec![], vec![]], vec![vec![], vec![]], vec![vec![], vec![]]];
+        let seqs_ref: [&[i8]; 4] = [&x, &y, &z, &w];
+        let seq_lens = [n, n, n, m];
+        for si in 0..4 {
+            let upper = if si == 2 { n - 1 } else { seq_lens[si] };
+            for i in 1..upper {
+                let vi = if seqs_ref[si][i] == 1 { 0 } else { 1 };
+                pos_idx[si][vi].push(i);
+            }
+        }
         for flip in 0..max_flips {
             if flip % 1000 == 0 && found.load(AtomicOrdering::Relaxed) { break; }
             let seq_idx = (rng() as usize) % 4;
             let seq_len = if seq_idx < 3 { n } else { m };
             let weight: i32 = if seq_idx < 2 { 1 } else { 2 };
             let seq: &mut [i8] = match seq_idx { 0 => &mut x, 1 => &mut y, 2 => &mut z, _ => &mut w };
-            let p = 1 + ((rng() as usize) % (seq_len - 1));
-            if seq_idx == 2 && p >= n - 1 { continue; }
+            let vi_group = if rng() & 1 == 0 { 0usize } else { 1 };
+            let group = &pos_idx[seq_idx][vi_group];
+            if group.len() < 2 { continue; }
+            let pi = (rng() as usize) % group.len();
+            let mut qi = (rng() as usize) % (group.len() - 1);
+            if qi >= pi { qi += 1; }
+            let p = group[pi];
+            let q = group[qi];
             let v = seq[p];
-            let mut q = 1 + ((rng() as usize) % (seq_len - 1));
-            let mut tries = 0;
-            while (seq[q] != v || q == p || (seq_idx == 2 && q >= n - 1)) && tries < seq_len {
-                q = 1 + ((rng() as usize) % (seq_len - 1));
-                tries += 1;
-            }
-            if tries >= seq_len { continue; }
             let vi = v as i32;
             let mut new_defect = 0i64;
+            // Early termination: in cold phase, reject as soon as partial
+            // new_defect exceeds defect (acceptance probability ~0).
+            let early_threshold = if temp < 1.0 { defect } else { i64::MAX };
+            let mut completed = true;
             for s in 1..n {
-                let mut dc = 0i32;
-                if p + s < seq_len { let other = if p + s == q { -vi } else { seq[p + s] as i32 }; dc += (-vi) * other - vi * (seq[p + s] as i32); }
-                if p >= s { let other = if p - s == q { -vi } else { seq[p - s] as i32 }; dc += other * (-vi) - (seq[p - s] as i32) * vi; }
-                if q + s < seq_len && q + s != p { let other = seq[q + s] as i32; dc += (-vi) * other - vi * other; }
-                if q >= s && q - s != p { let other = seq[q - s] as i32; dc += other * (-vi) - other * vi; }
-                delta_corr[s] = dc * weight;
+                // Swapping two same-value positions: delta = -2*v * (sum of non-overlapping neighbors)
+                let mut nb = 0i32;
+                if p + s < seq_len && p + s != q { nb += seq[p + s] as i32; }
+                if p >= s && p - s != q { nb += seq[p - s] as i32; }
+                if q + s < seq_len && q + s != p { nb += seq[q + s] as i32; }
+                if q >= s && q - s != p { nb += seq[q - s] as i32; }
+                delta_corr[s] = -2 * vi * nb * weight;
                 let new_c = corr[s] as i64 + delta_corr[s] as i64;
                 new_defect += new_c * new_c;
+                if new_defect > early_threshold {
+                    completed = false;
+                    break;
+                }
             }
             stats.xy_nodes += 1;
+            if !completed { temp *= cooling; continue; }
             let delta = new_defect - defect;
             let accept = if delta <= 0 { true }
                 else if temp > 0.1 { (rng() % 10000) as f64 / 10000.0 < (-delta as f64 / temp).exp() }
                 else { false };
             if accept {
                 seq[p] = -v; seq[q] = -v;
+                // Update pos_idx: move p and q from current group to opposite
+                let old_group = vi_group;
+                let new_group = 1 - old_group;
+                pos_idx[seq_idx][old_group].retain(|&i| i != p && i != q);
+                pos_idx[seq_idx][new_group].push(p);
+                pos_idx[seq_idx][new_group].push(q);
                 for s in 1..n { corr[s] += delta_corr[s]; }
                 defect = new_defect;
                 if defect == 0 {
@@ -1430,6 +1590,405 @@ fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, se
     SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false }
 }
 
+// ── SAT-based search using CaDiCaL ──────────────────────────────────────────
+
+/// Variable layout for SAT encoding:
+///   X[0..n)   → vars 1..=n
+///   Y[0..n)   → vars n+1..=2n
+///   Z[0..n)   → vars 2n+1..=3n
+///   W[0..m)   → vars 3n+1..=3n+m
+/// Additional auxiliary variables start at 3n+m+1.
+#[allow(dead_code)]
+struct SatEncoder {
+    n: usize,
+    m: usize,
+    next_var: i32,
+}
+
+impl SatEncoder {
+    fn new(n: usize) -> Self {
+        let m = n - 1;
+        Self { n, m, next_var: (3 * n + m + 1) as i32 }
+    }
+
+    fn x_var(&self, i: usize) -> i32 { (i + 1) as i32 }
+    fn y_var(&self, i: usize) -> i32 { (self.n + i + 1) as i32 }
+    fn z_var(&self, i: usize) -> i32 { (2 * self.n + i + 1) as i32 }
+    fn w_var(&self, i: usize) -> i32 { (3 * self.n + i + 1) as i32 }
+    fn fresh(&mut self) -> i32 { let v = self.next_var; self.next_var += 1; v }
+
+    /// Encode XNOR: aux ↔ (a ↔ b). Returns the auxiliary variable.
+    /// aux=true means a and b have the same sign (+1,+1 or -1,-1).
+    fn encode_xnor(&mut self, solver: &mut cadical::Solver, a: i32, b: i32) -> i32 {
+        let aux = self.fresh();
+        // aux → (a ↔ b):  aux → (a → b) ∧ (b → a)
+        //   ¬aux ∨ ¬a ∨ b, ¬aux ∨ a ∨ ¬b
+        // (a ↔ b) → aux:  (¬a ∨ ¬b ∨ aux) ∧ (a ∨ b ∨ aux)
+        solver.add_clause([-aux, -a, b]);
+        solver.add_clause([-aux, a, -b]);
+        solver.add_clause([a, b, aux]);
+        solver.add_clause([-a, -b, aux]);
+        aux
+    }
+
+    /// Totalizer encoding (Bailleux & Boufkhad 2003): build a binary tree
+    /// that counts how many of `lits` are true, using O(n log n) auxiliary
+    /// variables instead of O(n²) for a sequential counter.
+    ///
+    /// Returns vec r where r[c] (for c in 1..=lits.len()) is a SAT variable
+    /// that is true iff at least c of `lits` are true. r[0] is unused.
+    fn build_counter(
+        &mut self,
+        solver: &mut cadical::Solver,
+        lits: &[i32],
+    ) -> Vec<i32> {
+        let n = lits.len();
+        if n == 0 {
+            return vec![0];
+        }
+        if n == 1 {
+            // Single literal: at-least-1 ↔ lit
+            let v = self.fresh();
+            solver.add_clause([-lits[0], v]);
+            solver.add_clause([lits[0], -v]);
+            return vec![0, v];
+        }
+
+        // Split into halves and recurse
+        let mid = n / 2;
+        let left = self.build_counter(solver, &lits[..mid]);
+        let right = self.build_counter(solver, &lits[mid..]);
+        let left_max = mid;    // left can count 0..=mid
+        let right_max = n - mid; // right can count 0..=n-mid
+
+        // Merge: create output variables for counts 1..=n
+        let mut out = vec![0i32; n + 1];
+        for c in 1..=n {
+            out[c] = self.fresh();
+        }
+
+        // Merge clauses: out[c] ↔ ∃(a+b=c) left[a] ∧ right[b]
+        // Encoded as:
+        //   Forward: left[a] ∧ right[b] → out[a+b]  (for all valid a,b)
+        //   Backward: out[c] → left[a] ∨ right[c-a]  (for all valid a given c)
+        //
+        // Using "at-least" semantics (monotone):
+        //   left[a] ∧ right[b] → out[a+b]   (forward, ensures out counts enough)
+        //   out[c] → left[a] ∨ right[c-a]    (backward, ensures out doesn't overcount)
+
+        for a in 0..=left_max {
+            for b in 0..=right_max {
+                let c = a + b;
+                if c == 0 || c > n { continue; }
+                // Forward: left[a] ∧ right[b] → out[c]
+                // i.e., ¬left[a] ∨ ¬right[b] ∨ out[c]
+                let l = if a == 0 { 0 } else { left[a] };   // 0 means "always true"
+                let r = if b == 0 { 0 } else { right[b] };
+                match (l, r) {
+                    (0, 0) => { solver.add_clause([out[c]]); } // both always true
+                    (0, _) => { solver.add_clause([-r, out[c]]); }
+                    (_, 0) => { solver.add_clause([-l, out[c]]); }
+                    (_, _) => { solver.add_clause([-l, -r, out[c]]); }
+                }
+            }
+        }
+
+        // Backward: out[c] → ∨_{a=max(0,c-right_max)..min(c,left_max)} (left[a] ∨ right[c-a])
+        // Simplified: out[c] → left[a] ∨ right[c-a] for each valid split a
+        // Actually the standard totalizer backward clause is:
+        //   ¬left[a+1] ∧ ¬right[b+1] → ¬out[a+b+1]
+        // i.e., out[a+b+1] → left[a+1] ∨ right[b+1]
+        for a in 0..=left_max {
+            for b in 0..=right_max {
+                let c = a + b + 1;
+                if c > n { continue; }
+                let l_next = if a + 1 <= left_max { left[a + 1] } else { 0 };
+                let r_next = if b + 1 <= right_max { right[b + 1] } else { 0 };
+                // out[c] → l_next ∨ r_next
+                match (l_next, r_next) {
+                    (0, 0) => { solver.add_clause([-out[c]]); } // impossible count
+                    (0, _) => { solver.add_clause([-out[c], r_next]); }
+                    (_, 0) => { solver.add_clause([-out[c], l_next]); }
+                    (_, _) => { solver.add_clause([-out[c], l_next, r_next]); }
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Encode exactly `target` of `lits` must be true, using the totalizer.
+    fn encode_cardinality_eq(
+        &mut self,
+        solver: &mut cadical::Solver,
+        lits: &[i32],
+        target: usize,
+    ) {
+        let n = lits.len();
+        if n == 0 {
+            assert!(target == 0);
+            return;
+        }
+        if target > n {
+            solver.add_clause([]); // impossible
+            return;
+        }
+        let ctr = self.build_counter(solver, lits);
+        // Enforce at-least target
+        if target >= 1 {
+            assert!(ctr[target] != 0);
+            solver.add_clause([ctr[target]]);
+        }
+        // Enforce at-most target (i.e., NOT at-least target+1)
+        if target + 1 <= n {
+            assert!(ctr[target + 1] != 0);
+            solver.add_clause([-ctr[target + 1]]);
+        }
+    }
+}
+
+fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>)> {
+    let encode_start = Instant::now();
+    let n = problem.n;
+    let m = problem.m();
+    let mut enc = SatEncoder::new(n);
+    let mut solver: cadical::Solver = Default::default();
+
+    // Minimal symmetry breaking: only fix x[0]=+1.
+    // Full TT symmetry group includes negation of each sequence independently,
+    // so fixing x[0]=+1 is always valid. Other constraints like z[0]=z[n-1]=+1
+    // are too restrictive for some n (e.g., TT(6)).
+    solver.add_clause([enc.x_var(0)]);  // x[0] = +1
+
+    // Sum constraints: encode that exactly (sum+len)/2 variables are true (=+1)
+    // sum = (# +1) - (# -1) = 2*(# +1) - len, so (# +1) = (sum + len) / 2
+    let x_pos = ((tuple.x + n as i32) / 2) as usize;
+    let y_pos = ((tuple.y + n as i32) / 2) as usize;
+    let z_pos = ((tuple.z + n as i32) / 2) as usize;
+    let w_pos = ((tuple.w + m as i32) / 2) as usize;
+
+    let x_lits: Vec<i32> = (0..n).map(|i| enc.x_var(i)).collect();
+    let y_lits: Vec<i32> = (0..n).map(|i| enc.y_var(i)).collect();
+    let z_lits: Vec<i32> = (0..n).map(|i| enc.z_var(i)).collect();
+    let w_lits: Vec<i32> = (0..m).map(|i| enc.w_var(i)).collect();
+
+    enc.encode_cardinality_eq(&mut solver, &x_lits, x_pos);
+    enc.encode_cardinality_eq(&mut solver, &y_lits, y_pos);
+    enc.encode_cardinality_eq(&mut solver, &z_lits, z_pos);
+    enc.encode_cardinality_eq(&mut solver, &w_lits, w_pos);
+
+    // Autocorrelation constraints:
+    // For each lag k: N_X(k) + N_Y(k) + 2*N_Z(k) + 2*N_W(k) = 0
+    // N_S(k) = 2*(# agree pairs) - (len_S - k)
+    //
+    // Let agree_xy = # X agree pairs + # Y agree pairs (weight 1 each)
+    //     agree_zw = # Z agree pairs + # W agree pairs (weight 1 each)
+    // Then constraint = (agree_xy) + 2*(agree_zw) = 2*(n-k) + w_overlap
+    //
+    // We use two separate counters and enumerate valid (c_xy, c_zw) splits.
+
+    for k in 1..n {
+        let w_overlap = if k < m { m - k } else { 0 };
+        let target = 2 * (n - k) + w_overlap; // agree_xy + 2*agree_zw = target
+
+        let mut xy_lits = Vec::new();
+        for i in 0..(n - k) {
+            xy_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
+        }
+        for i in 0..(n - k) {
+            xy_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
+        }
+
+        let mut zw_lits = Vec::new();
+        for i in 0..(n - k) {
+            zw_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
+        }
+        for i in 0..w_overlap {
+            zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
+        }
+
+        // Weighted constraint: count(xy true) + 2*count(zw true) = target.
+        // Enumerate valid (c_xy, c_zw) splits. For each, create a selector
+        // that implies exact cardinality on both groups. OR all selectors.
+        let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
+        let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
+
+        let mut selectors = Vec::new();
+        for c_zw in 0..=zw_lits.len() {
+            let rem = target as isize - 2 * c_zw as isize;
+            if rem < 0 || rem as usize > xy_lits.len() { continue; }
+            let c_xy = rem as usize;
+
+            let sel = enc.fresh();
+
+            // sel → (xy count >= c_xy)
+            if c_xy > 0 {
+                if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
+                    solver.add_clause([-sel, xy_ctr[c_xy]]);
+                } else {
+                    solver.add_clause([-sel]); // impossible
+                    continue;
+                }
+            }
+            // sel → (xy count <= c_xy), i.e., ¬(xy >= c_xy+1)
+            if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
+                solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
+            }
+
+            // sel → (zw count >= c_zw)
+            if c_zw > 0 {
+                if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
+                    solver.add_clause([-sel, zw_ctr[c_zw]]);
+                } else {
+                    solver.add_clause([-sel]); // impossible
+                    continue;
+                }
+            }
+            // sel → (zw count <= c_zw)
+            if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
+                solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
+            }
+
+            selectors.push(sel);
+        }
+
+        if selectors.is_empty() {
+            solver.add_clause([]); // UNSAT
+        } else {
+            solver.add_clause(selectors.iter().copied());
+        }
+    }
+
+    let encode_elapsed = encode_start.elapsed();
+    if verbose {
+        println!("SAT encoding: n={}, tuple={}, {} vars, encoded in {:.3?}, solving...", n, tuple, enc.next_var - 1, encode_elapsed);
+    }
+
+    let solve_start = Instant::now();
+    let result = solver.solve();
+    let solve_elapsed = solve_start.elapsed();
+    match result {
+        Some(true) => {
+            let x: Vec<i8> = (0..n).map(|i| if solver.value(enc.x_var(i)) == Some(true) { 1 } else { -1 }).collect();
+            let y: Vec<i8> = (0..n).map(|i| if solver.value(enc.y_var(i)) == Some(true) { 1 } else { -1 }).collect();
+            let z: Vec<i8> = (0..n).map(|i| if solver.value(enc.z_var(i)) == Some(true) { 1 } else { -1 }).collect();
+            let w: Vec<i8> = (0..m).map(|i| if solver.value(enc.w_var(i)) == Some(true) { 1 } else { -1 }).collect();
+            Some((x, y, z, w))
+        }
+        Some(false) => {
+            if verbose { println!("UNSAT for tuple {} in {:.3?}", tuple, solve_elapsed); }
+            None
+        }
+        None => {
+            if verbose { println!("UNKNOWN for tuple {} in {:.3?}", tuple, solve_elapsed); }
+            None
+        }
+    }
+}
+
+fn run_sat_search(problem: Problem, verbose: bool) -> SearchReport {
+    let run_start = Instant::now();
+    let stats = SearchStats::default();
+    let raw = enumerate_sum_tuples(problem);
+    // Use raw tuples (not normalized) because SAT symmetry breaking
+    // (x[0]=1, z[0]=z[n-1]=1, etc.) is only compatible with specific sign combos.
+    // Deduplicate by the actual (x,y,z,w) sums.
+    let mut seen = std::collections::HashSet::new();
+    let tuples: Vec<SumTuple> = raw.into_iter().filter(|t| seen.insert((t.x, t.y, t.z, t.w))).collect();
+    if verbose {
+        println!("TT({}): SAT search over {} distinct sum-tuples", problem.n, tuples.len());
+    }
+    for tuple in &tuples {
+        // Skip tuples where sum parities don't work
+        if (tuple.x + problem.n as i32) % 2 != 0 { continue; }
+        if (tuple.y + problem.n as i32) % 2 != 0 { continue; }
+        if (tuple.z + problem.n as i32) % 2 != 0 { continue; }
+        if (tuple.w + problem.m() as i32) % 2 != 0 { continue; }
+
+        let tuple_start = Instant::now();
+        if let Some((x, y, z, w)) = sat_search(problem, *tuple, verbose) {
+            let px = PackedSeq::from_values(&x);
+            let py = PackedSeq::from_values(&y);
+            let pz = PackedSeq::from_values(&z);
+            let pw = PackedSeq::from_values(&w);
+            let ok = verify_tt(problem, &px, &py, &pz, &pw);
+            if verbose {
+                println!("SAT found solution for tuple {} in {:.3?} (verified={})", tuple, tuple_start.elapsed(), ok);
+                println!("X={}", px.as_string());
+                println!("Y={}", py.as_string());
+                println!("Z={}", pz.as_string());
+                println!("W={}", pw.as_string());
+            }
+            if ok {
+                return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
+            }
+        } else if verbose {
+            println!("Tuple {} exhausted in {:.3?}", tuple, tuple_start.elapsed());
+        }
+    }
+    SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false }
+}
+
+/// Hybrid search: Phase A+B (sum tuples, Z/W generation, spectral filtering)
+/// followed by SAT-based X/Y solving for each candidate (Z,W) pair.
+fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
+    let problem = cfg.problem;
+    let run_start = Instant::now();
+    let mut stats = SearchStats::default();
+
+    let max_seq_len = problem.n;
+    let spectral_z = SpectralFilter::new(max_seq_len, cfg.theta_samples);
+    let spectral_w = SpectralFilter::new(max_seq_len, cfg.theta_samples);
+
+    let raw = enumerate_sum_tuples(problem);
+    // Use raw tuples — normalized tuples might not cover the sign combos
+    // compatible with SAT symmetry breaking (x[0]=y[0]=+1).
+    let mut seen = std::collections::HashSet::new();
+    let tuples: Vec<SumTuple> = raw.into_iter().filter(|t| seen.insert((t.x, t.y, t.z, t.w))).collect();
+    if verbose {
+        println!("TT({}): hybrid search (Phase B → SAT X/Y), {} distinct tuples", problem.n, tuples.len());
+    }
+
+    for tuple in &tuples {
+        // Skip tuples with bad parity (can't have integer # of +1s)
+        if (tuple.x + problem.n as i32) % 2 != 0 { continue; }
+        if (tuple.y + problem.n as i32) % 2 != 0 { continue; }
+        if (tuple.z + problem.n as i32) % 2 != 0 { continue; }
+        if (tuple.w + problem.m() as i32) % 2 != 0 { continue; }
+        let phase_b_start = Instant::now();
+        let zw_candidates =
+            build_zw_candidates(problem, *tuple, cfg, &spectral_z, &spectral_w, &mut stats);
+        if verbose && !zw_candidates.is_empty() {
+            println!("Tuple {}: {} Z/W pairs (Phase B: {:.3?})", tuple, zw_candidates.len(), phase_b_start.elapsed());
+        }
+
+        for (idx, cand) in zw_candidates.iter().enumerate() {
+            let sat_start = Instant::now();
+            if let Some((x, y)) = sat_solve_xy(problem, *tuple, cand, &mut stats) {
+                let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
+                if verbose {
+                    println!("SAT X/Y solved pair {} in {:.3?} (verified={})", idx, sat_start.elapsed(), ok);
+                    println!("X={}", x.as_string());
+                    println!("Y={}", y.as_string());
+                    println!("Z={}", cand.z.as_string());
+                    println!("W={}", cand.w.as_string());
+                }
+                if ok {
+                    return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
+                }
+            } else if verbose {
+                println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
+            }
+        }
+    }
+
+    if verbose {
+        println!("Hybrid search: no solution found. Stats: z_gen={}, w_gen={}, pairs={}, elapsed={:.3?}",
+            stats.z_generated, stats.w_generated, stats.candidate_pair_spectral_ok, run_start.elapsed());
+    }
+    SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false }
+}
+
 fn parse_args() -> SearchConfig {
     let mut cfg = SearchConfig::default();
     for arg in env::args().skip(1) {
@@ -1451,6 +2010,13 @@ fn parse_args() -> SearchConfig {
             cfg.benchmark_repeats = 5;
         } else if arg == "--stochastic" {
             cfg.stochastic = true;
+        } else if let Some(v) = arg.strip_prefix("--stochastic-secs=") {
+            cfg.stochastic_seconds = v.parse().unwrap_or(10);
+            cfg.stochastic = true;
+        } else if arg == "--sat" {
+            cfg.sat = true;
+        } else if arg == "--sat-xy" {
+            cfg.sat_xy = true;
         }
     }
     cfg
@@ -1460,8 +2026,14 @@ fn main() {
     let cfg = parse_args();
     if cfg.benchmark_repeats > 0 {
         run_benchmark(&cfg);
+    } else if cfg.sat_xy {
+        let report = run_hybrid_search(&cfg, true);
+        println!("Hybrid search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
+    } else if cfg.sat {
+        let report = run_sat_search(cfg.problem, true);
+        println!("SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     } else if cfg.stochastic {
-        let report = stochastic_search(cfg.problem, true);
+        let report = stochastic_search(cfg.problem, true, cfg.stochastic_seconds);
         println!("Stochastic search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     } else {
         run_search(&cfg, true);
@@ -1526,6 +2098,9 @@ mod tests {
             max_pairs_per_bucket: 2_000,
             benchmark_repeats: 1,
             stochastic: false,
+            stochastic_seconds: 0,
+            sat: false,
+            sat_xy: false,
         };
         let report = run_search(&cfg, false);
         assert!(report.found_solution);
@@ -1577,8 +2152,249 @@ mod tests {
     #[test]
     fn stochastic_search_finds_tt8() {
         let p = Problem::new(8);
-        let report = stochastic_search(p, false);
+        let report = stochastic_search(p, false, 0);
         assert!(report.found_solution);
         assert!(report.elapsed.as_secs_f64() < 30.0);
+    }
+
+    #[test]
+    fn cardinality_encoding_exactly_2_of_4() {
+        // Test: exactly 2 of 4 variables must be true
+        let mut enc = SatEncoder { n: 0, m: 0, next_var: 5 };
+        let mut solver: cadical::Solver = Default::default();
+        let lits = vec![1, 2, 3, 4];
+        enc.encode_cardinality_eq(&mut solver, &lits, 2);
+        // Should be SAT (many solutions: e.g. 1=T,2=T,3=F,4=F)
+        assert_eq!(solver.solve(), Some(true));
+        let vals: Vec<bool> = (1..=4).map(|v| solver.value(v) == Some(true)).collect();
+        let count: usize = vals.iter().filter(|&&v| v).count();
+        assert_eq!(count, 2, "Expected exactly 2 true, got {:?}", vals);
+    }
+
+    #[test]
+    fn cardinality_encoding_exactly_0_of_3() {
+        let mut enc = SatEncoder { n: 0, m: 0, next_var: 4 };
+        let mut solver: cadical::Solver = Default::default();
+        let lits = vec![1, 2, 3];
+        enc.encode_cardinality_eq(&mut solver, &lits, 0);
+        assert_eq!(solver.solve(), Some(true));
+        for v in 1..=3 {
+            assert_eq!(solver.value(v), Some(false), "var {} should be false", v);
+        }
+    }
+
+    #[test]
+    fn cardinality_encoding_exactly_3_of_3() {
+        let mut enc = SatEncoder { n: 0, m: 0, next_var: 4 };
+        let mut solver: cadical::Solver = Default::default();
+        let lits = vec![1, 2, 3];
+        enc.encode_cardinality_eq(&mut solver, &lits, 3);
+        assert_eq!(solver.solve(), Some(true));
+        for v in 1..=3 {
+            assert_eq!(solver.value(v), Some(true), "var {} should be true", v);
+        }
+    }
+
+    #[test]
+    fn xnor_encoding_correct() {
+        let mut enc = SatEncoder { n: 0, m: 0, next_var: 3 };
+        let mut solver: cadical::Solver = Default::default();
+        // a=1, b=2, test all 4 combos
+        let aux = enc.encode_xnor(&mut solver, 1, 2);
+        // Force a=T, b=T → aux should be T (agree)
+        solver.add_clause([1]);
+        solver.add_clause([2]);
+        assert_eq!(solver.solve(), Some(true));
+        assert_eq!(solver.value(aux), Some(true));
+    }
+
+    #[test]
+    fn build_counter_exactly_2_of_3() {
+        let mut enc = SatEncoder { n: 0, m: 0, next_var: 4 };
+        let mut solver: cadical::Solver = Default::default();
+        let lits = vec![1, 2, 3];
+        let ctr = enc.build_counter(&mut solver, &lits);
+        // Enforce exactly 2: at-least 2 AND at-most 2 (i.e., NOT at-least 3)
+        assert!(ctr.len() >= 3, "counter should have at-least-2 var");
+        solver.add_clause([ctr[2]]); // at least 2
+        if ctr.len() > 3 && ctr[3] != 0 {
+            solver.add_clause([-ctr[3]]); // at most 2
+        }
+        assert_eq!(solver.solve(), Some(true));
+        let count: usize = (1..=3).filter(|&v| solver.value(v) == Some(true)).count();
+        assert_eq!(count, 2, "expected exactly 2 true");
+    }
+
+    #[test]
+    fn sat_finds_tt6() {
+        let p = Problem::new(6);
+        let report = run_sat_search(p, true);
+        assert!(report.found_solution, "SAT should find TT(6)");
+    }
+
+    #[test]
+    fn sat_autocorr_only_n4() {
+        // Test: just autocorrelation constraints (no sums, no symmetry breaking)
+        let n = 4usize;
+        let m = 3usize;
+        let mut enc = SatEncoder::new(n);
+        let mut solver: cadical::Solver = Default::default();
+
+        for k in 1..n {
+            let w_overlap = if k < m { m - k } else { 0 };
+            let target = 2 * (n - k) + w_overlap;
+
+            let mut xy_lits = Vec::new();
+            for i in 0..(n - k) {
+                xy_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
+            }
+            for i in 0..(n - k) {
+                xy_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
+            }
+            let mut zw_lits = Vec::new();
+            for i in 0..(n - k) {
+                zw_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
+            }
+            for i in 0..w_overlap {
+                zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
+            }
+
+            let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
+            let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
+
+            let mut selectors = Vec::new();
+            for c_zw in 0..=zw_lits.len() {
+                let rem = target as isize - 2 * c_zw as isize;
+                if rem < 0 || rem as usize > xy_lits.len() { continue; }
+                let c_xy = rem as usize;
+                let sel = enc.fresh();
+                if c_xy > 0 {
+                    if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
+                        solver.add_clause([-sel, xy_ctr[c_xy]]);
+                    } else { solver.add_clause([-sel]); continue; }
+                }
+                if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
+                    solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
+                }
+                if c_zw > 0 {
+                    if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
+                        solver.add_clause([-sel, zw_ctr[c_zw]]);
+                    } else { solver.add_clause([-sel]); continue; }
+                }
+                if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
+                    solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
+                }
+                selectors.push(sel);
+            }
+            assert!(!selectors.is_empty(), "lag {} has no valid splits", k);
+            solver.add_clause(selectors.iter().copied());
+        }
+
+        let result = solver.solve();
+        assert_eq!(result, Some(true), "autocorr-only n=4 should be SAT");
+    }
+
+    #[test]
+    fn sat_counter_with_xnor_hardcoded() {
+        // Minimal test: hardcode X=[1,1,1,1], check XY agree at lag 3 = exactly 2
+        let mut enc = SatEncoder { n: 4, m: 3, next_var: 9 }; // vars 1-4=X, 5-8=Y
+        let mut solver: cadical::Solver = Default::default();
+        // X = [T,T,T,T], Y = [T,F,T,T]
+        for v in 1..=4 { solver.add_clause([v]); } // all X = true
+        solver.add_clause([5]); // Y[0]=T
+        solver.add_clause([-6]); // Y[1]=F
+        solver.add_clause([7]); // Y[2]=T
+        solver.add_clause([8]); // Y[3]=T
+
+        // XY agree at lag 3: (X0,X3)=(T,T)=agree, (Y0,Y3)=(T,T)=agree
+        let ag1 = enc.encode_xnor(&mut solver, 1, 4); // X0 XNOR X3
+        let ag2 = enc.encode_xnor(&mut solver, 5, 8); // Y0 XNOR Y3
+        let lits = vec![ag1, ag2];
+        let ctr = enc.build_counter(&mut solver, &lits);
+        // Enforce exactly 2 via counter
+        assert!(ctr.len() >= 3 && ctr[2] != 0);
+        solver.add_clause([ctr[2]]); // at least 2
+        // ctr[3] doesn't exist (len=3), so at-most-2 is automatic
+
+        let result = solver.solve();
+        assert_eq!(result, Some(true), "hardcoded XY agrees at lag 3 should give exactly 2");
+    }
+
+    #[test]
+    fn sat_autocorr_hardcoded_tt4() {
+        // Hardcode the known TT(4) solution and check if the encoding is consistent
+        // X=[1,1,1,1], Y=[1,-1,1,1], Z=[1,1,-1,-1], W=[1,-1,1]
+        let n = 4usize;
+        let m = 3usize;
+        let mut enc = SatEncoder::new(n);
+        let mut solver: cadical::Solver = Default::default();
+
+        // Hardcode solution
+        let x = [1i8, 1, 1, 1];
+        let y = [1i8, -1, 1, 1];
+        let z = [1i8, 1, -1, -1];
+        let w = [1i8, -1, 1];
+        for i in 0..n { solver.add_clause([if x[i] == 1 { enc.x_var(i) } else { -enc.x_var(i) }]); }
+        for i in 0..n { solver.add_clause([if y[i] == 1 { enc.y_var(i) } else { -enc.y_var(i) }]); }
+        for i in 0..n { solver.add_clause([if z[i] == 1 { enc.z_var(i) } else { -enc.z_var(i) }]); }
+        for i in 0..m { solver.add_clause([if w[i] == 1 { enc.w_var(i) } else { -enc.w_var(i) }]); }
+
+        // Add autocorrelation constraints (same as sat_autocorr_only_n4)
+        for k in 1..n {
+            let w_overlap = if k < m { m - k } else { 0 };
+            let target = 2 * (n - k) + w_overlap;
+            let mut xy_lits = Vec::new();
+            for i in 0..(n - k) {
+                xy_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
+            }
+            for i in 0..(n - k) {
+                xy_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
+            }
+            let mut zw_lits = Vec::new();
+            for i in 0..(n - k) {
+                zw_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
+            }
+            for i in 0..w_overlap {
+                zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
+            }
+            let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
+            let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
+            let mut selectors = Vec::new();
+            for c_zw in 0..=zw_lits.len() {
+                let rem = target as isize - 2 * c_zw as isize;
+                if rem < 0 || rem as usize > xy_lits.len() { continue; }
+                let c_xy = rem as usize;
+                let sel = enc.fresh();
+                if c_xy > 0 {
+                    if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
+                        solver.add_clause([-sel, xy_ctr[c_xy]]);
+                    } else { solver.add_clause([-sel]); continue; }
+                }
+                if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
+                    solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
+                }
+                if c_zw > 0 {
+                    if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
+                        solver.add_clause([-sel, zw_ctr[c_zw]]);
+                    } else { solver.add_clause([-sel]); continue; }
+                }
+                if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
+                    solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
+                }
+                selectors.push(sel);
+            }
+            assert!(!selectors.is_empty(), "lag {} no valid splits (target={})", k, target);
+            solver.add_clause(selectors.iter().copied());
+        }
+
+        let result = solver.solve();
+        assert_eq!(result, Some(true), "hardcoded TT(4) solution should be consistent with encoding");
+    }
+
+    #[test]
+    fn sat_finds_tt4() {
+        let p = Problem::new(4);
+        let report = run_sat_search(p, false);
+        assert!(report.found_solution, "SAT should find TT(4)");
     }
 }

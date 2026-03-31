@@ -57,6 +57,49 @@ Most generated Z/W candidates have high power (close to the bound) at overlappin
 - The actual bottleneck is Phase B: DFS sequence generation + spectral filtering of individual Z/W candidates.
 - To trigger backtracking, either increase search limits dramatically or use smaller n where spectrally complementary Z/W pairs are more common.
 
+## Ideas from Grok: SAT/CP hybrids and cross-field approaches (credit: Grok)
+
+### SAT / CP hybrids (Bright–Kotsireas–Ganesh style)
+- **SAT encoding of TT constraints**: Encode the four sequences as Boolean vars (±1 as true/false). The autocorrelation conditions `N_A(k) + N_B(k) + 2*N_C(k) + 2*N_D(k) = 0` become cardinality constraints on agreeing/disagreeing pairs at each lag (linearizable with auxiliaries). Hard-code canonical form as symmetry-breaking clauses. Use existing sum-tuple enumeration to split into cases (fix sums first), then SAT-solve within each. Modern CDCL solvers (CaDiCaL, Kissat) with learned clauses often beat custom backtrack.
+- **Incremental SAT + custom backtracker**: Solve prefixes with SAT, then switch to Rust incremental autocorr engine for verification or mid-search.
+- **CP/MILP alternative**: OR-Tools or Gecode with table constraints or MDDs for autocorrelation sums; PuLP/Gurobi for integer program (quadratic nature needs linearization).
+- **Practical first step**: Prototype SAT export — dump partial instances (with canonical breaking) to DIMACS/PB format and test Kissat/CaDiCaL on n=38–40.
+
+### Geometric / matrix-completion (Kline 2019 style)
+- **Suffix completion via relaxation**: Generate partial (A,B,C,D) up to position m << n using current backtracker or random/spectral-guided. Treat missing suffix as unknowns. Remaining autocorrelation equations form quadratic constraints on suffix. Solve real relaxation (ignore ±1), round to nearest ±1, project back via iterative refinement or gradient descent on merit factor.
+- **Partial → repair loop**: Backtrack a bit → geometric repair attempt → if promising, continue exact search or verify. Inconsistencies show early; good partials complete dramatically.
+- **Upper-level completion**: Once have candidate TT quadruple, build partial Goethals–Seidel array and apply Kline-style completion/repair directly on the big matrix.
+
+### Composition / multiplicative
+- **Base sequence lifting**: TT(n) produce base sequences of lengths (2n-1, 2n-1, n, n). Base sequences have recursive/product constructions (Cooper–Wallis, etc.). Hunt for ways to lift/combine known TT-derived bases into larger ones, reverse-engineer TT quadruple.
+- **Algebraic starters**: Seed C and D (shorter ones) with quadratic residues, Legendre symbols, or characters over finite fields/rings, then solve for A/B. Energy equation `A(1)^2 + B(1)^2 + 2*C(1)^2 + 2*D(1)^2 = 6n-2` suggests factorizations in cyclotomic/quaternion settings.
+- **Block-Kronecker inflation**: Take two smaller TT(a), TT(b), try interleave or tensor partial correlations, then repair with geometric method.
+
+### Cross-field analogies
+- **Radar/comms (merit factor)**: TT are perfect aperiodic complementary quadruples. SA, PSO, or genetic algorithms (used on Golay pairs) can generate high-merit partials to seed exact searcher.
+- **Coding theory**: Equivalent to certain constant-weight codes or difference sets. Column generation or branch-and-price techniques apply.
+- **QUBO / quantum annealing**: QUBO formulations exist for smaller Turyn/Williamson (Suksmono 2022); hybrid classical-quantum for subproblems.
+- **SDP relaxations**: Frequency-domain view (power spectra summing) relaxes to semidefinite programs; dual gives bounds or good continuous approximations to round + repair.
+- **ML-guided search**: Train policy network (AlphaZero-style) on small-n solutions for variable ordering or promising partials. NeuroSAT-like for learning clause importance.
+
+### Implemented from Grok SAT/CP ideas
+
+- **CaDiCaL SAT solver integration** *(from Grok, "SAT/CP hybrids")*: Added `--sat` mode using the `cadical` crate (CaDiCaL v1.9.5 with Rust bindings). Encodes TT(n) as a SAT instance with: Boolean variables for ±1 sequence positions, XNOR auxiliary variables for agree/disagree at each lag, sequential counter (Sinz 2005) for exact cardinality on sums, and selector-based weighted cardinality for the autocorrelation constraints (separate XY/ZW counters with enumerated valid splits). Iterates over all distinct sum-tuples with x[0]=+1 symmetry breaking. Results: TT(4)–TT(18) all found. TT(18) in 89s vs SA's 580s (**6.5x faster**). **Implemented.**
+
+### Tried from Grok SAT/CP ideas
+
+- **Z-aware per-frequency W spectral tightening** *(from Grok, "tighter spectral bounds")*: After generating all Z candidates, compute min Z power at each frequency across retained Z. Use `spectral_bound - min_z_power[k]` as tighter per-frequency bound when filtering W. At θ=256 (n=16): reduced w_spec_ok from 2871 to 2668 (**7.1% fewer W candidates**). But at the primary benchmark (θ=20000): w_spec_ok=2662 in both cases — zero additional rejections. The high spectral resolution at large θ already provides tight individual bounds. Exhaustive benchmark: `6092ms → 6325ms` (**3.8% regression** from per-frequency bound overhead). **Reverted.**
+
+- **Greedy repair near solution** *(from Grok, "geometric repair / Kline 2019")*: When SA defect drops below 4*n, switch to exhaustive steepest-descent: try all O(n²) same-value pair swaps across all 4 sequences, take the best improving one, repeat until stuck. At n=16: flips/sec `32.03M → 30.06M` (**6.1% regression**) because each greedy evaluation is O(n³) total. All runs found solutions (benefit in convergence), but at n=18 defect still stuck at ~40-56 (greedy can't escape local minima deeper than pair swaps). The quadratic constraint structure means nearby solutions aren't reachable by pair swaps alone. **Reverted.**
+
+- **Simplified delta-corr computation** *(from Grok, "merit factor optimization")*: Refactored SA inner loop delta computation from multiple multiply-accumulate pairs to a single `-2*vi*nb*weight` formula. Since seq[p]=seq[q]=v (same-value swap), the delta at each lag reduces to `-2v * (sum of 4 non-overlapping neighbors)`. Fewer multiplies and cleaner branch structure. Stochastic benchmark: `32.03M → 34.13M flips/sec` (**+6.6%**). Exhaustive: neutral. **Implemented.**
+
+- **Pre-grouped value indices for O(1) SA partner selection** *(from Grok, "efficient search data structures")*: Pre-build per-sequence lists of indices with value +1 and -1. Partner selection becomes O(1) random index from the matching group, eliminating the random-probe loop (up to seq_len retries). Updates on accept: O(n/2) retain + push. Stochastic benchmark: `34.13M → 41.65M flips/sec` (**+22.0%**). Exhaustive: neutral. **Implemented.**
+
+- **Lag-targeted SA move selection** *(from Grok, "radar/comms merit factor")*: On 25% of SA flips, find the worst lag s* (max |corr[s]|), then pick positions p, q at distance s* for the swap. This ensures swaps directly affect the highest-defect lag. Stochastic benchmark: `32.03M → 29.52M flips/sec` (**7.8% regression**). The O(n) worst-lag scan on 25% of flips plus extra branch overhead and same-value fallback costs more than any convergence benefit. SA's existing random exploration with temperature scheduling already handles lag targeting implicitly through the accept/reject criterion. **Reverted.**
+
+- **Legendre/QR seeding for stochastic search** *(from Grok, "algebraic starters")*: On 50% of SA restarts, seed Z/W with Legendre-symbol sequences (quadratic residues mod nearest prime) with random circular shift and negation, instead of fully random. These have good autocorrelation properties. Stochastic benchmark: flips/sec `29.36M → 27.21M` (**7.3% regression**). The fix_sum step to adjust Legendre sequences to target sums adds per-restart overhead that outweighs any benefit from better starting autocorrelation. Time-to-solution occasionally faster (194ms vs 1.4s best) but median similar. **Reverted.**
+
 ## Re-check (2026-03-30, after user follow-up)
 
 I reran an apples-to-apples comparison of the code **before** the Grok idea bundle (`6eac0c5`) vs the bundle commit (`7b0894c`) using the same benchmark profile and more repeats:
