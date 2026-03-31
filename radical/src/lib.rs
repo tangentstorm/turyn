@@ -395,11 +395,30 @@ impl Solver {
             }
 
             let other = self.clause_lits[cstart]; // lits[0]
+            let other_val = self.lit_value(other);
 
             // If the other watched literal is already true, skip
-            if self.lit_value(other) == LBool::True {
+            if other_val == LBool::True {
                 watch_list[j] = ci;
                 j += 1;
+                i += 1;
+                continue;
+            }
+
+            // Binary clause fast path: no alternate watcher exists.
+            if clen == 2 {
+                watch_list[j] = ci;
+                j += 1;
+                if other_val == LBool::False {
+                    conflict = Some(ci);
+                    while i + 1 < watch_list.len() {
+                        i += 1;
+                        watch_list[j] = watch_list[i];
+                        j += 1;
+                    }
+                    break;
+                }
+                self.enqueue(other, Reason::Clause(ci));
                 i += 1;
                 continue;
             }
@@ -425,7 +444,7 @@ impl Solver {
             watch_list[j] = ci;
             j += 1;
 
-            if self.lit_value(other) == LBool::False {
+            if other_val == LBool::False {
                 conflict = Some(ci);
                 while i + 1 < watch_list.len() {
                     i += 1;

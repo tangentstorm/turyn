@@ -26,7 +26,46 @@ This generates `gmon.out` in the working directory.
 gprof ./target/release/turyn gmon.out | less
 ```
 
-In this environment, that profile currently shows `turyn::spectrum_if_ok` as the dominant hotspot for the sample workload.
+## Latest profile snapshot (2026-03-31)
+
+Using the commands above on the latest `main`/HEAD in this container, benchmark mode reported:
+
+- `mean_ms=267.109`
+- `median_ms=265.155`
+
+`gprof` flat profile top self-time entries:
+
+- `radical::Solver::propagate` — **54.43%**
+- `turyn::build_zw_candidates` — **28.24%**
+- `radical::Solver::solve_inner` — **5.61%**
+- `radical::Solver::enqueue` — **2.75%**
+- `radical::Solver::backtrack` — **2.75%**
+- `rustfft::Fft::process` — **2.65%**
+- `turyn::spectrum_if_ok` — **1.33%**
+
+Interpretation: SAT propagation is now the dominant bottleneck for this workload, while spectral filtering is no longer the top hotspot.
+
+## Suggested optimization hotspots (next experiments)
+
+1. **BCP/watch-list micro-optimization in `radical::Solver::propagate`**
+   - Reduce pointer chasing and bounds checks in watched-literal scans.
+   - Try tighter memory layout for watch entries and clause headers to improve cache locality.
+   - Measure branch-miss impact by comparing variants that reduce unpredictable conditionals in inner loops.
+
+2. **Clause database pressure management**
+   - Tune restart + deletion trigger thresholds to keep propagation fast under heavy learned-clause growth.
+   - Experiment with stricter retention for high-LBD clauses only when they remain active in recent conflicts.
+
+3. **Hybrid pipeline load reduction before SAT calls (`build_zw_candidates`)**
+   - Add cheaper early filters before expensive candidate materialization when possible.
+   - Increase deduplication/canonicalization opportunities for equivalent Z/W autocorrelation signatures.
+
+4. **Allocator pressure checks in SAT path**
+   - Audit per-solve clone/allocation paths to ensure no avoidable short-lived allocations remain.
+   - Reuse buffers/vectors in hot loops where ownership allows.
+
+5. **FFT path is secondary now**
+   - `rustfft::Fft::process` is still visible; minor wins are possible (buffer reuse/alignment), but expected ROI is lower than SAT propagation work.
 
 ---
 

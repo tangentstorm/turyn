@@ -86,6 +86,27 @@ Note: the previous per-idea claims in `IDEAS.md` were not backed by a step-by-st
 
 - See `docs/PROFILING.md` for the currently working profiling workflow in this container (gprof fallback), plus why `perf`/Cargo-based profiler installs are currently blocked by repository/network 403 errors.
 
+
+## Latest hotspot profile (2026-03-31)
+
+Profiled current HEAD with gprof using:
+
+- `RUSTFLAGS='-C link-arg=-pg' cargo build --release`
+- `./target/release/turyn --n=16 --theta=192 --max-z=200000 --max-w=200000 --max-pairs=2000 --benchmark=20`
+- `gprof ./target/release/turyn gmon.out`
+
+Top hotspots by self time:
+
+- `radical::Solver::propagate` (54.43%)
+- `turyn::build_zw_candidates` (28.24%)
+- `radical::Solver::solve_inner` (5.61%)
+- `radical::Solver::enqueue` (2.75%)
+- `radical::Solver::backtrack` (2.75%)
+- `rustfft::Fft::process` (2.65%)
+- `turyn::spectrum_if_ok` (1.33%)
+
+Takeaway: SAT BCP (`propagate`) is currently the dominant optimization target.
+
 ## Optimization history
 
 | Date (UTC) | Change | Why it helps | Measured effect |
