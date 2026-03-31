@@ -1034,51 +1034,110 @@ fn backtrack_xy(
 /// Pre-built SAT template for X/Y solving. Contains the structural clauses
 /// (XNOR, totalizer trees, sum constraints) that are shared across all Z/W pairs
 /// for a given tuple. Clone and add per-pair cardinality assertions to solve.
+#[cfg(not(feature = "cadical"))]
 struct SatXYTemplate {
     solver: radical::Solver,
-    counters: Vec<Vec<i32>>, // counters[lag] = totalizer "at-least" vars for agree count
+    counters: Vec<Vec<i32>>,
     n: usize,
+}
+
+#[cfg(feature = "cadical")]
+struct SatXYTemplate {
+    solver: cadical::Solver,
+    counters: Vec<Vec<i32>>,
+    n: usize,
+}
+
+fn build_sat_xy_clauses(
+    problem: Problem,
+    tuple: SumTuple,
+    solver: &mut impl SatSolver,
+) -> Option<(Vec<Vec<i32>>, usize)> {
+    let n = problem.n;
+    let mut enc = SatEncoder { n: 2 * n, m: 0, next_var: (2 * n + 1) as i32 };
+
+    let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+    let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+    // Symmetry breaking
+    solver.add_clause([x_var(0)]); // x[0] = +1
+    solver.add_clause([y_var(0)]); // y[0] = +1
+
+    // Sum constraints
+    if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0 {
+        return None;
+    }
+    let x_pos = ((tuple.x + n as i32) / 2) as usize;
+    let y_pos = ((tuple.y + n as i32) / 2) as usize;
+    let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+    let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+    enc.encode_cardinality_eq(solver, &x_lits, x_pos);
+    enc.encode_cardinality_eq(solver, &y_lits, y_pos);
+
+    let mut counters = Vec::with_capacity(n);
+    counters.push(Vec::new());
+    for s in 1..n {
+        let mut agree_lits = Vec::with_capacity(2 * (n - s));
+        for i in 0..(n - s) {
+            agree_lits.push(enc.encode_xnor(solver, x_var(i), x_var(i + s)));
+        }
+        for i in 0..(n - s) {
+            agree_lits.push(enc.encode_xnor(solver, y_var(i), y_var(i + s)));
+        }
+        let ctr = enc.build_counter(solver, &agree_lits);
+        counters.push(ctr);
+    }
+
+    Some((counters, n))
+}
+
+/// Trait abstracting over radical::Solver and cadical::Solver.
+trait SatSolver {
+    fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I);
+    fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool>;
+    fn value(&self, var: i32) -> Option<bool>;
+    fn reset(&mut self);
+}
+
+impl SatSolver for radical::Solver {
+    fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I) {
+        self.add_clause(lits);
+    }
+    fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool> {
+        self.solve_with_assumptions(assumptions)
+    }
+    fn value(&self, var: i32) -> Option<bool> {
+        self.value(var)
+    }
+    fn reset(&mut self) {
+        self.reset();
+    }
+}
+
+#[cfg(feature = "cadical")]
+impl SatSolver for cadical::Solver {
+    fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I) {
+        self.add_clause(lits);
+    }
+    fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool> {
+        self.solve_with(assumptions.iter().copied())
+    }
+    fn value(&self, var: i32) -> Option<bool> {
+        self.value(var)
+    }
+    fn reset(&mut self) {
+        // CaDiCaL auto-resets after solve
+    }
 }
 
 impl SatXYTemplate {
     fn build(problem: Problem, tuple: SumTuple) -> Option<Self> {
-        let n = problem.n;
-        let mut enc = SatEncoder { n: 2 * n, m: 0, next_var: (2 * n + 1) as i32 };
+        #[cfg(not(feature = "cadical"))]
         let mut solver: radical::Solver = Default::default();
+        #[cfg(feature = "cadical")]
+        let mut solver: cadical::Solver = Default::default();
 
-        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
-        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
-
-        // Symmetry breaking
-        solver.add_clause([x_var(0)]); // x[0] = +1
-        solver.add_clause([y_var(0)]); // y[0] = +1
-
-        // Sum constraints
-        if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0 {
-            return None;
-        }
-        let x_pos = ((tuple.x + n as i32) / 2) as usize;
-        let y_pos = ((tuple.y + n as i32) / 2) as usize;
-        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
-        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
-        enc.encode_cardinality_eq(&mut solver, &x_lits, x_pos);
-        enc.encode_cardinality_eq(&mut solver, &y_lits, y_pos);
-
-        // Build XNOR + totalizer for each lag (structural — no target assertions yet)
-        let mut counters = Vec::with_capacity(n);
-        counters.push(Vec::new()); // lag 0 unused
-        for s in 1..n {
-            let mut agree_lits = Vec::with_capacity(2 * (n - s));
-            for i in 0..(n - s) {
-                agree_lits.push(enc.encode_xnor(&mut solver, x_var(i), x_var(i + s)));
-            }
-            for i in 0..(n - s) {
-                agree_lits.push(enc.encode_xnor(&mut solver, y_var(i), y_var(i + s)));
-            }
-            let ctr = enc.build_counter(&mut solver, &agree_lits);
-            counters.push(ctr);
-        }
-
+        let (counters, n) = build_sat_xy_clauses(problem, tuple, &mut solver)?;
         Some(Self { solver, counters, n })
     }
 
@@ -1099,7 +1158,7 @@ impl SatXYTemplate {
     }
 
     /// Solve for X/Y given a specific Z/W candidate.
-    /// Uses assumptions to assert per-pair cardinality targets, avoiding clone.
+    /// Uses assumptions to assert per-pair cardinality targets.
     fn solve_for(&mut self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
         if !self.is_feasible(candidate) { return None; }
         let n = self.n;
@@ -1927,7 +1986,7 @@ impl SatEncoder {
 
     /// Encode XNOR: aux ↔ (a ↔ b). Returns the auxiliary variable.
     /// aux=true means a and b have the same sign (+1,+1 or -1,-1).
-    fn encode_xnor(&mut self, solver: &mut radical::Solver, a: i32, b: i32) -> i32 {
+    fn encode_xnor(&mut self, solver: &mut impl SatSolver, a: i32, b: i32) -> i32 {
         let aux = self.fresh();
         // aux → (a ↔ b):  aux → (a → b) ∧ (b → a)
         //   ¬aux ∨ ¬a ∨ b, ¬aux ∨ a ∨ ¬b
@@ -1947,7 +2006,7 @@ impl SatEncoder {
     /// that is true iff at least c of `lits` are true. r[0] is unused.
     fn build_counter(
         &mut self,
-        solver: &mut radical::Solver,
+        solver: &mut impl SatSolver,
         lits: &[i32],
     ) -> Vec<i32> {
         let n = lits.len();
@@ -2028,7 +2087,7 @@ impl SatEncoder {
     /// Encode exactly `target` of `lits` must be true, using the totalizer.
     fn encode_cardinality_eq(
         &mut self,
-        solver: &mut radical::Solver,
+        solver: &mut impl SatSolver,
         lits: &[i32],
         target: usize,
     ) {

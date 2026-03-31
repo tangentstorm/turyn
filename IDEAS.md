@@ -178,3 +178,15 @@ Benchmarked each Grok change individually on a different machine to identify whi
 - **Bucket capping (push_capped)**: Kept. Reduces memory pressure.
 - **Manual loop unrolling**: Kept for now (marginal ~3.7% on Grok's benchmark, neutral on ours).
 
+## Ideas from Claude: radical SAT solver improvements (credit: Claude)
+
+The Phase C SAT solver (radical) is the bottleneck at n=22, consuming ~96% of compute. CaDiCaL has several techniques that radical lacks. Prioritized by expected impact:
+
+1. **Learnt clause minimization** *(from Claude)*: After 1-UIP conflict analysis, recursively remove redundant literals from the learnt clause. A literal is redundant if its reason clause is entirely subsumed by other literals already in the learnt clause (or at decision level 0). CaDiCaL's `minimize` pass typically shrinks learnt clauses 20-30%, improving propagation efficiency and reducing clause database bloat.
+
+2. **EMA-based restarts** *(from Claude)*: Replace the fixed Luby restart schedule with glucose-style EMA (exponential moving average) tracking of recent vs. global LBD quality. Restart when recent LBD average exceeds global average by a margin. More adaptive than Luby — restarts aggressively when the solver is exploring unproductive regions, and holds steady when making progress.
+
+3. **Failed literal probing** *(from Claude)*: At the start of solving (or periodically), probe each unassigned literal: assume it true, propagate, and if a conflict arises, the literal must be false. Also detects equivalent/implied literals. Particularly effective on structured/combinatorial instances with many binary implications, like the cardinality encodings used here.
+
+4. **On-the-fly self-subsumption** *(from Claude)*: During conflict analysis, when resolving with a reason clause, check if the resolvent subsumes the reason clause. If so, strengthen the reason clause by removing the resolved literal. This is essentially free (check during existing analysis loop) and produces stronger propagation in future conflicts.
+
