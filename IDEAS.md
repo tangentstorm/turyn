@@ -100,6 +100,30 @@ Most generated Z/W candidates have high power (close to the bound) at overlappin
 
 - **Legendre/QR seeding for stochastic search** *(from Grok, "algebraic starters")*: On 50% of SA restarts, seed Z/W with Legendre-symbol sequences (quadratic residues mod nearest prime) with random circular shift and negation, instead of fully random. These have good autocorrelation properties. Stochastic benchmark: flips/sec `29.36M → 27.21M` (**7.3% regression**). The fix_sum step to adjust Legendre sequences to target sums adds per-restart overhead that outweighs any benefit from better starting autocorrelation. Time-to-solution occasionally faster (194ms vs 1.4s best) but median similar. **Reverted.**
 
+## Ideas from London thesis (credit: Stephen London, PhD thesis "Constructing New Turyn Type Sequences, T-Sequences and Hadamard Matrices", UIC 2013)
+
+London holds the record for longest known Turyn type sequences (TT(40)). His thesis describes an optimized version of Kharaghani's algorithm with several key optimizations (§3.3–3.4, §5.1):
+
+1. **Integer spectral storage** *(London §3.4, item 1)*: Store ⌊f_Z(θ)/2⌋ and ⌊f_W(θ)/2⌋ as 1–2 byte integers instead of 8-byte f64. Saves 4–8× memory per spectrum and speeds up pair comparisons. London's pair filter checks `⌊f_Z(θ_k)/2⌋ + ⌊f_W(θ_k)/2⌋ ≤ M` using integer arithmetic.
+
+2. **Precomputed cosine lookup arrays** *(London §3.4, item 2)*: Precompute at most 10,000 distinct cosine values in arrays. Our FFT-based approach already handles this differently, but for non-FFT paths this could help.
+
+3. **Difference arrays for cycling variables** *(London §3.4, item 3)*: Store the difference between k-th and (k+1)-st spectral value when iterating. Enables O(1) incremental spectral updates during DFS rather than recomputing from scratch.
+
+4. **Pair-based tuple searching** *(London §3.4, item 4)*: Enter a (σ_Z, σ_W) pair rather than individual sum tuples, allowing multiple quadruples to be checked in a single run. Our code currently iterates individual sum tuples; grouping by pair could reduce redundant Z/W generation.
+
+5. **Distance arrays for DFS pruning** *(London §3.4, item 5)*: Create (σ_Z, σ_W)-indexed arrays of distances to the nearest feasible solution. Allows early pruning in DFS when partial sums are too far from any feasible target.
+
+6. **Optimal theta ≈ 100** *(London §3.4, item 6)*: London found 100 equally spaced θ values approximately minimizes total running time (balancing spectral resolution vs computation cost). Our default is 256.
+
+7. **Outside-in X,Y construction with Turyn's theorem** *(London §3.3, Step 6)*: Build X,Y from position 6 inward toward the middle. At each step k, try all 8 possibilities for (x_k, y_k, x_{ℓ+1-k}), then use σ_X = σ_Y = 0 (Turyn's theorem) to derive y_{ℓ+1-k}. Reduces branching factor from 16 to 8 per step.
+
+8. **Prefix/suffix pre-enumeration** *(London §3.3, Step 1)*: Pre-enumerate all valid first/last 6 elements of X, Y, Z (1,911,620 possibilities). These are filtered by normalization, sum constraints, and spectral feasibility. For each (Z,W) pair, look up matching boundary prefixes/suffixes for X,Y instead of generating from scratch.
+
+9. **Spectral budget restriction** *(London §5.1)*: For longer sequences where full enumeration is infeasible, restrict ⌊f_Z(θ_k)/2⌋ + ⌊f_W(θ_k)/2⌋ ≤ M for some M < spectral_bound. Table V shows M values needed: e.g., M=66 finds first TT(32), M=84 finds first TT(40). A `--max-spectral` CLI parameter would enable this.
+
+10. **4-profile equivalence checking** *(London §3.4, item 7, §2.7)*: Check Hadamard matrix equivalence via 4-profiles (count 4-row inner products). ~10 minutes per matrix. Not directly relevant to search speed but useful for verifying uniqueness of results.
+
 ## Re-check (2026-03-30, after user follow-up)
 
 I reran an apples-to-apples comparison of the code **before** the Grok idea bundle (`6eac0c5`) vs the bundle commit (`7b0894c`) using the same benchmark profile and more repeats:
