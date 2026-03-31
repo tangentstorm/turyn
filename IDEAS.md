@@ -190,3 +190,37 @@ The Phase C SAT solver (radical) is the bottleneck at n=22, consuming ~96% of co
 
 4. **On-the-fly self-subsumption** *(from Claude)*: During conflict analysis, when resolving with a reason clause, check if the resolvent subsumes the reason clause. If so, strengthen the reason clause by removing the resolved literal. This is essentially free (check during existing analysis loop) and produces stronger propagation in future conflicts.
 
+5. **Blocker literal in watch lists** *(from Claude)*: Store a "blocker" literal (the other watched literal) alongside each clause index in watch lists. Before accessing clause memory during BCP, check if the blocker is already true — if so, skip entirely. Avoids cache-miss-heavy clause access for satisfied clauses.
+
+6. **Assumptions-based incremental solving** *(from Claude)*: Instead of cloning the solver template for each Z/W pair, use `solve_with_assumptions()` to pass per-pair cardinality targets as temporary assumptions. Avoids clone overhead and lets learnt clauses persist across candidates.
+
+7. **CaDiCaL backend via feature flag** *(from Claude)*: Optional `--features cadical` compile-time flag that swaps radical for CaDiCaL (v1.9.5). Useful as a performance reference and for larger instances where CaDiCaL's preprocessing (BVE, subsumption, probing) pays off.
+
+### Implemented from Claude SAT ideas
+
+- **Assumptions-based incremental solving** *(from Claude, idea 6)*: Switched `SatXYTemplate::solve_for()` from cloning the solver to using `solve_with_assumptions()`. Learnt clauses now persist across Z/W pairs for the same tuple. Benchmark n=22: `21.3s → 19.7s` (**-7.5%**). **Implemented.**
+
+- **Blocker literal in watch lists** *(from Claude, idea 5)*: Changed watch lists from `Vec<u32>` to `Vec<(u32, Lit)>`, storing the other watched literal as a blocker. The blocker check in `propagate_lit` skips satisfied clauses before accessing clause memory. Benchmark n=22: `19.7s → 15.5s` (**-21.3%**). **Implemented.**
+
+- **Learnt clause minimization** *(from Claude, idea 1)*: Added recursive minimization (MiniSat-style) after 1-UIP analysis. Removes literals whose reason chains are entirely covered by the learnt clause. Initially regressed +5% on the original baseline, but after the blocker literal optimization made propagation cheaper, the balance shifted. Benchmark n=22: `15.5s → 14.7s` (**-5.1%**). **Implemented.**
+
+- **CaDiCaL backend** *(from Claude, idea 7)*: Added `SatSolver` trait abstracting over radical and CaDiCaL. Compile with `--features cadical` to use CaDiCaL. Benchmark n=22: CaDiCaL `11.8s` vs radical `14.7s`. CaDiCaL is ~20% faster, likely due to BVE preprocessing. **Implemented.**
+
+### Tried from Claude SAT ideas (rejected)
+
+- **EMA-based restarts** *(from Claude, idea 2)*: Replaced Luby restarts with glucose-style EMA tracking (fast α=1/32, slow α=1/4096, margin=1.25, blocking by trail size). First attempt on original baseline: `21.1s → 21.6s` (+2.3% regression). Second attempt after blocker+minimization: `14.7s → 25.8s` (**+75% regression**). The EMA strategy restarts too aggressively for these instances, undoing productive search. Luby's geometric backoff is a better fit. **Reverted.**
+
+- **Failed literal probing** *(from Claude, idea 3)*: Probed up to 500 most-active unassigned variables before each solve. Negligible impact: `21.1s → 21.2s` (+0.6%, within noise). The cardinality-encoded instances don't have cheap implications to discover via unit propagation alone. May help at larger n with more complex implication graphs. **Reverted.**
+
+- **On-the-fly self-subsumption** *(from Claude, idea 4)*: During conflict analysis, checked if all non-resolvent literals of the reason clause were already `seen`, and if so, strengthened the reason clause by removing the resolved literal. Caused correctness issues (4 test failures on first attempt, 1 on second) due to watch list invariant corruption when strengthening clauses mid-analysis. CaDiCaL handles this via lazy/deferred strengthening. **Reverted.**
+
+### Combined results summary (n=22 hybrid search)
+
+| Configuration | Mean time | Delta vs baseline |
+|---|---|---|
+| Original (clone-based radical, Luby) | 21.3s | — |
+| + Assumptions-based solving | 19.7s | -7.5% |
+| + Blocker literal optimization | 15.5s | -27.2% |
+| + Learnt clause minimization | **14.7s** | **-31.0%** |
+| CaDiCaL backend (for reference) | 11.8s | -44.6% |
+
