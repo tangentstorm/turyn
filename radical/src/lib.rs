@@ -515,6 +515,9 @@ impl Solver {
         self.prop_head = self.trail.len();
     }
 
+    /// Minimize a learnt clause by removing redundant literals.
+    /// A literal is redundant if it's at level 0 (always false) or
+    /// if its reason clause is subsumed by the learnt clause.
     /// Add a learnt clause and enqueue the asserting literal.
     fn add_learnt_clause(&mut self, lits: Vec<Lit>) {
         if lits.len() == 1 {
