@@ -2510,4 +2510,319 @@ mod tests {
         let report = run_sat_search(p, false);
         assert!(report.found_solution, "SAT should find TT(4)");
     }
+
+    #[test]
+    fn sat_tt14_hardcoded_solution_bisect_lags() {
+        // Known TT(14) solution (after negating X and Y so x[0]=y[0]=+1):
+        let n = 14usize;
+        let m = n - 1; // 13
+        let x_vals: Vec<i8> = vec![1,1,1,1,1,-1,1,1,1,1,1,-1,1,1];       // sum=8
+        let y_vals: Vec<i8> = vec![1,1,1,-1,-1,1,1,-1,1,1,1,1,-1,1];     // sum=4
+        let z_vals: Vec<i8> = vec![1,1,1,1,-1,-1,-1,1,-1,-1,-1,1,-1,1];  // sum=0
+        let w_vals: Vec<i8> = vec![1,1,-1,-1,-1,1,-1,1,1,-1,1,-1,-1];    // sum=-1
+
+        let px = PackedSeq::from_values(&x_vals);
+        let py = PackedSeq::from_values(&y_vals);
+        let pz = PackedSeq::from_values(&z_vals);
+        let pw = PackedSeq::from_values(&w_vals);
+
+        // First verify the solution is actually valid
+        let sx = px.sum();
+        let sy = py.sum();
+        let sz = pz.sum();
+        let sw = pw.sum();
+        eprintln!("Sums: x={}, y={}, z={}, w={}", sx, sy, sz, sw);
+        eprintln!("Energy: x^2+y^2+2z^2+2w^2 = {}",
+            sx*sx + sy*sy + 2*sz*sz + 2*sw*sw);
+        eprintln!("Target energy: {}", 6 * n as i32 - 2);
+        assert!(verify_tt(Problem::new(n), &px, &py, &pz, &pw),
+            "Known TT(14) solution should verify");
+
+        let tuple = SumTuple { x: sx, y: sy, z: sz, w: sw };
+
+        // Step 1: Build the FULL encoding (matching sat_search exactly) plus
+        // hardcode the known solution. Check if SAT.
+        {
+            let mut enc = SatEncoder::new(n);
+            let mut solver: radical::Solver = Default::default();
+
+            // Symmetry breaking: x[0]=+1
+            solver.add_clause([enc.x_var(0)]);
+
+            // Sum constraints
+            let x_pos = ((tuple.x + n as i32) / 2) as usize;
+            let y_pos = ((tuple.y + n as i32) / 2) as usize;
+            let z_pos = ((tuple.z + n as i32) / 2) as usize;
+            let w_pos = ((tuple.w + m as i32) / 2) as usize;
+
+            let x_lits: Vec<i32> = (0..n).map(|i| enc.x_var(i)).collect();
+            let y_lits: Vec<i32> = (0..n).map(|i| enc.y_var(i)).collect();
+            let z_lits: Vec<i32> = (0..n).map(|i| enc.z_var(i)).collect();
+            let w_lits: Vec<i32> = (0..m).map(|i| enc.w_var(i)).collect();
+
+            enc.encode_cardinality_eq(&mut solver, &x_lits, x_pos);
+            enc.encode_cardinality_eq(&mut solver, &y_lits, y_pos);
+            enc.encode_cardinality_eq(&mut solver, &z_lits, z_pos);
+            enc.encode_cardinality_eq(&mut solver, &w_lits, w_pos);
+
+            // Autocorrelation constraints (same as sat_search)
+            for k in 1..n {
+                let w_overlap = if k < m { m - k } else { 0 };
+                let target = 2 * (n - k) + w_overlap;
+
+                let mut xy_lits = Vec::new();
+                for i in 0..(n - k) {
+                    xy_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
+                }
+                for i in 0..(n - k) {
+                    xy_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
+                }
+
+                let mut zw_lits = Vec::new();
+                for i in 0..(n - k) {
+                    zw_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
+                }
+                for i in 0..w_overlap {
+                    zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
+                }
+
+                let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
+                let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
+
+                let mut selectors = Vec::new();
+                for c_zw in 0..=zw_lits.len() {
+                    let rem = target as isize - 2 * c_zw as isize;
+                    if rem < 0 || rem as usize > xy_lits.len() { continue; }
+                    let c_xy = rem as usize;
+
+                    let sel = enc.fresh();
+
+                    if c_xy > 0 {
+                        if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
+                            solver.add_clause([-sel, xy_ctr[c_xy]]);
+                        } else {
+                            solver.add_clause([-sel]);
+                            continue;
+                        }
+                    }
+                    if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
+                        solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
+                    }
+
+                    if c_zw > 0 {
+                        if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
+                            solver.add_clause([-sel, zw_ctr[c_zw]]);
+                        } else {
+                            solver.add_clause([-sel]);
+                            continue;
+                        }
+                    }
+                    if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
+                        solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
+                    }
+
+                    selectors.push(sel);
+                }
+
+                if selectors.is_empty() {
+                    solver.add_clause([]);
+                } else {
+                    solver.add_clause(selectors.iter().copied());
+                }
+            }
+
+            // Hardcode the known solution as unit clauses
+            for i in 0..n {
+                solver.add_clause([if x_vals[i] == 1 { enc.x_var(i) } else { -enc.x_var(i) }]);
+                solver.add_clause([if y_vals[i] == 1 { enc.y_var(i) } else { -enc.y_var(i) }]);
+                solver.add_clause([if z_vals[i] == 1 { enc.z_var(i) } else { -enc.z_var(i) }]);
+            }
+            for i in 0..m {
+                solver.add_clause([if w_vals[i] == 1 { enc.w_var(i) } else { -enc.w_var(i) }]);
+            }
+
+            let result = solver.solve();
+            if result != Some(true) {
+                eprintln!("FULL encoding with hardcoded TT(14) is UNSAT! Bisecting by lag...");
+            } else {
+                eprintln!("FULL encoding with hardcoded TT(14) is SAT (no bug?)");
+                // Even if it passes, continue bisecting to be thorough
+            }
+        }
+
+        // Step 2: Bisect by adding autocorrelation constraints ONE LAG AT A TIME
+        // to find which lag's encoding is buggy.
+        let mut first_buggy_lag: Option<usize> = None;
+        for max_lag in 1..n {
+            let mut enc = SatEncoder::new(n);
+            let mut solver: radical::Solver = Default::default();
+
+            // Symmetry breaking
+            solver.add_clause([enc.x_var(0)]);
+
+            // Sum constraints
+            let x_pos = ((tuple.x + n as i32) / 2) as usize;
+            let y_pos = ((tuple.y + n as i32) / 2) as usize;
+            let z_pos = ((tuple.z + n as i32) / 2) as usize;
+            let w_pos = ((tuple.w + m as i32) / 2) as usize;
+
+            let x_lits: Vec<i32> = (0..n).map(|i| enc.x_var(i)).collect();
+            let y_lits: Vec<i32> = (0..n).map(|i| enc.y_var(i)).collect();
+            let z_lits: Vec<i32> = (0..n).map(|i| enc.z_var(i)).collect();
+            let w_lits: Vec<i32> = (0..m).map(|i| enc.w_var(i)).collect();
+
+            enc.encode_cardinality_eq(&mut solver, &x_lits, x_pos);
+            enc.encode_cardinality_eq(&mut solver, &y_lits, y_pos);
+            enc.encode_cardinality_eq(&mut solver, &z_lits, z_pos);
+            enc.encode_cardinality_eq(&mut solver, &w_lits, w_pos);
+
+            // Add autocorrelation constraints ONLY up to lag max_lag
+            for k in 1..=max_lag {
+                let w_overlap = if k < m { m - k } else { 0 };
+                let target = 2 * (n - k) + w_overlap;
+
+                let mut xy_lits_k = Vec::new();
+                for i in 0..(n - k) {
+                    xy_lits_k.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
+                }
+                for i in 0..(n - k) {
+                    xy_lits_k.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
+                }
+
+                let mut zw_lits_k = Vec::new();
+                for i in 0..(n - k) {
+                    zw_lits_k.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
+                }
+                for i in 0..w_overlap {
+                    zw_lits_k.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
+                }
+
+                let xy_ctr = enc.build_counter(&mut solver, &xy_lits_k);
+                let zw_ctr = enc.build_counter(&mut solver, &zw_lits_k);
+
+                let mut selectors = Vec::new();
+                for c_zw in 0..=zw_lits_k.len() {
+                    let rem = target as isize - 2 * c_zw as isize;
+                    if rem < 0 || rem as usize > xy_lits_k.len() { continue; }
+                    let c_xy = rem as usize;
+
+                    let sel = enc.fresh();
+
+                    if c_xy > 0 {
+                        if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
+                            solver.add_clause([-sel, xy_ctr[c_xy]]);
+                        } else {
+                            solver.add_clause([-sel]);
+                            continue;
+                        }
+                    }
+                    if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
+                        solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
+                    }
+
+                    if c_zw > 0 {
+                        if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
+                            solver.add_clause([-sel, zw_ctr[c_zw]]);
+                        } else {
+                            solver.add_clause([-sel]);
+                            continue;
+                        }
+                    }
+                    if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
+                        solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
+                    }
+
+                    selectors.push(sel);
+                }
+
+                if selectors.is_empty() {
+                    solver.add_clause([]);
+                } else {
+                    solver.add_clause(selectors.iter().copied());
+                }
+            }
+
+            // Hardcode the known solution
+            for i in 0..n {
+                solver.add_clause([if x_vals[i] == 1 { enc.x_var(i) } else { -enc.x_var(i) }]);
+                solver.add_clause([if y_vals[i] == 1 { enc.y_var(i) } else { -enc.y_var(i) }]);
+                solver.add_clause([if z_vals[i] == 1 { enc.z_var(i) } else { -enc.z_var(i) }]);
+            }
+            for i in 0..m {
+                solver.add_clause([if w_vals[i] == 1 { enc.w_var(i) } else { -enc.w_var(i) }]);
+            }
+
+            let result = solver.solve();
+            let sat = result == Some(true);
+
+            // Compute expected values for this lag for diagnostic output
+            if !sat {
+                let k = max_lag;
+                let w_overlap = if k < m { m - k } else { 0 };
+                let target = 2 * (n - k) + w_overlap;
+
+                // Count actual agree pairs from the known solution
+                let mut xy_agree = 0usize;
+                for i in 0..(n - k) {
+                    if x_vals[i] == x_vals[i + k] { xy_agree += 1; }
+                }
+                for i in 0..(n - k) {
+                    if y_vals[i] == y_vals[i + k] { xy_agree += 1; }
+                }
+                let mut zw_agree = 0usize;
+                for i in 0..(n - k) {
+                    if z_vals[i] == z_vals[i + k] { zw_agree += 1; }
+                }
+                for i in 0..w_overlap {
+                    if w_vals[i] == w_vals[i + k] { zw_agree += 1; }
+                }
+
+                let actual_combined = xy_agree + 2 * zw_agree;
+
+                eprintln!("LAG {} makes it UNSAT!", k);
+                eprintln!("  target (from formula) = 2*(n-k) + w_overlap = 2*{} + {} = {}",
+                    n - k, w_overlap, target);
+                eprintln!("  actual xy_agree={}, zw_agree={}, xy_agree + 2*zw_agree = {}",
+                    xy_agree, zw_agree, actual_combined);
+                eprintln!("  target == actual? {}", target == actual_combined);
+
+                // Also verify autocorrelation directly
+                let nx = px.autocorrelation(k);
+                let ny = py.autocorrelation(k);
+                let nz = pz.autocorrelation(k);
+                let nw = if k < m { pw.autocorrelation(k) } else { 0 };
+                eprintln!("  N_X({})={}, N_Y({})={}, N_Z({})={}, N_W({})={}",
+                    k, nx, k, ny, k, nz, k, nw);
+                eprintln!("  N_X+N_Y+2*N_Z+2*N_W = {}",
+                    nx + ny + 2*nz + 2*nw);
+
+                // Check which selector splits are available
+                let xy_total = 2 * (n - k);
+                let zw_total = (n - k) + w_overlap;
+                eprintln!("  xy_lits.len()={}, zw_lits.len()={}", xy_total, zw_total);
+                eprintln!("  Valid (c_xy, c_zw) splits for target={}:", target);
+                for c_zw in 0..=zw_total {
+                    let rem = target as isize - 2 * c_zw as isize;
+                    if rem < 0 || rem as usize > xy_total { continue; }
+                    let c_xy = rem as usize;
+                    let matches_actual = c_xy == xy_agree && c_zw == zw_agree;
+                    eprintln!("    c_xy={}, c_zw={} {}",
+                        c_xy, c_zw,
+                        if matches_actual { "<-- ACTUAL" } else { "" });
+                }
+
+                if first_buggy_lag.is_none() {
+                    first_buggy_lag = Some(k);
+                }
+                // Don't break - show all buggy lags
+            } else {
+                eprintln!("Lags 1..={}: SAT (ok)", max_lag);
+            }
+        }
+
+        // The test should fail if any lag is buggy
+        assert!(first_buggy_lag.is_none(),
+            "Encoding is buggy starting at lag {}. See stderr for details.",
+            first_buggy_lag.unwrap_or(0));
+    }
 }
