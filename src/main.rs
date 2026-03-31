@@ -1522,6 +1522,7 @@ fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, se
 ///   Z[0..n)   → vars 2n+1..=3n
 ///   W[0..m)   → vars 3n+1..=3n+m
 /// Additional auxiliary variables start at 3n+m+1.
+#[allow(dead_code)]
 struct SatEncoder {
     n: usize,
     m: usize,
@@ -1593,12 +1594,15 @@ impl SatEncoder {
                     solver.add_clause([-s[i][j], lits[i]]);
                 }
                 // s[i][j] → s[i-1][j] ∨ s[i-1][j-1]
-                if prev_j != 0 && prev_j1 != 0 {
-                    solver.add_clause([-s[i][j], prev_j, prev_j1]);
-                } else if prev_j != 0 {
-                    solver.add_clause([-s[i][j], prev_j]);
-                } else if prev_j1 != 0 {
-                    solver.add_clause([-s[i][j], prev_j1]);
+                // When j=1, s[i-1][0] = "at least 0" is always true, so skip.
+                if j > 1 {
+                    if prev_j != 0 && prev_j1 != 0 {
+                        solver.add_clause([-s[i][j], prev_j, prev_j1]);
+                    } else if prev_j != 0 {
+                        solver.add_clause([-s[i][j], prev_j]);
+                    } else if prev_j1 != 0 {
+                        solver.add_clause([-s[i][j], prev_j1]);
+                    }
                 }
                 // s[i-1][j] → s[i][j]
                 if prev_j != 0 {
@@ -1679,12 +1683,15 @@ impl SatEncoder {
                     solver.add_clause([-s[i][j], lits[i]]);
                 }
                 // s[i][j] → s[i-1][j] ∨ s[i-1][j-1]
-                if prev_j != 0 && prev_j1 != 0 {
-                    solver.add_clause([-s[i][j], prev_j, prev_j1]);
-                } else if prev_j != 0 {
-                    solver.add_clause([-s[i][j], prev_j]);
-                } else if prev_j1 != 0 {
-                    solver.add_clause([-s[i][j], prev_j1]);
+                // When j=1, s[i-1][0] = "at least 0" is always true, so skip.
+                if j > 1 {
+                    if prev_j != 0 && prev_j1 != 0 {
+                        solver.add_clause([-s[i][j], prev_j, prev_j1]);
+                    } else if prev_j != 0 {
+                        solver.add_clause([-s[i][j], prev_j]);
+                    } else if prev_j1 != 0 {
+                        solver.add_clause([-s[i][j], prev_j1]);
+                    }
                 }
                 // s[i-1][j] → s[i][j]
                 if prev_j != 0 {
@@ -1849,7 +1856,7 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
 
 fn run_sat_search(problem: Problem, verbose: bool) -> SearchReport {
     let run_start = Instant::now();
-    let mut stats = SearchStats::default();
+    let stats = SearchStats::default();
     let raw = enumerate_sum_tuples(problem);
     // Use raw tuples (not normalized) because SAT symmetry breaking
     // (x[0]=1, z[0]=z[n-1]=1, etc.) is only compatible with specific sign combos.
@@ -2121,7 +2128,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // WIP: weighted cardinality encoding bug — selector approach breaks multi-split lags
     fn sat_finds_tt6() {
         let p = Problem::new(6);
         let report = run_sat_search(p, true);
@@ -2129,7 +2135,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // WIP: selector-based weighted cardinality encoding
     fn sat_autocorr_only_n4() {
         // Test: just autocorrelation constraints (no sums, no symmetry breaking)
         let n = 4usize;
@@ -2218,7 +2223,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // WIP: selector-based weighted cardinality encoding
     fn sat_autocorr_hardcoded_tt4() {
         // Hardcode the known TT(4) solution and check if the encoding is consistent
         // X=[1,1,1,1], Y=[1,-1,1,1], Z=[1,1,-1,-1], W=[1,-1,1]
@@ -2290,7 +2294,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // WIP: weighted cardinality bug
     fn sat_finds_tt4() {
         let p = Problem::new(4);
         let report = run_sat_search(p, false);

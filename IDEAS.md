@@ -82,6 +82,10 @@ Most generated Z/W candidates have high power (close to the bound) at overlappin
 - **SDP relaxations**: Frequency-domain view (power spectra summing) relaxes to semidefinite programs; dual gives bounds or good continuous approximations to round + repair.
 - **ML-guided search**: Train policy network (AlphaZero-style) on small-n solutions for variable ordering or promising partials. NeuroSAT-like for learning clause importance.
 
+### Implemented from Grok SAT/CP ideas
+
+- **CaDiCaL SAT solver integration** *(from Grok, "SAT/CP hybrids")*: Added `--sat` mode using the `cadical` crate (CaDiCaL v1.9.5 with Rust bindings). Encodes TT(n) as a SAT instance with: Boolean variables for ±1 sequence positions, XNOR auxiliary variables for agree/disagree at each lag, sequential counter (Sinz 2005) for exact cardinality on sums, and selector-based weighted cardinality for the autocorrelation constraints (separate XY/ZW counters with enumerated valid splits). Iterates over all distinct sum-tuples with x[0]=+1 symmetry breaking. Results: TT(4)–TT(18) all found. TT(18) in 89s vs SA's 580s (**6.5x faster**). **Implemented.**
+
 ### Tried from Grok SAT/CP ideas
 
 - **Z-aware per-frequency W spectral tightening** *(from Grok, "tighter spectral bounds")*: After generating all Z candidates, compute min Z power at each frequency across retained Z. Use `spectral_bound - min_z_power[k]` as tighter per-frequency bound when filtering W. At θ=256 (n=16): reduced w_spec_ok from 2871 to 2668 (**7.1% fewer W candidates**). But at the primary benchmark (θ=20000): w_spec_ok=2662 in both cases — zero additional rejections. The high spectral resolution at large θ already provides tight individual bounds. Exhaustive benchmark: `6092ms → 6325ms` (**3.8% regression** from per-frequency bound overhead). **Reverted.**
