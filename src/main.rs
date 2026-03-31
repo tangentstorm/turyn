@@ -220,6 +220,10 @@ struct SearchConfig {
     sat: bool,
     sat_xy: bool,
     z_sat: bool,
+    /// London §5.1: restrict spectral pair sum to ≤ max_spectral.
+    /// If None, uses the default spectral_bound (= (6n-2)/2).
+    /// Setting this lower than spectral_bound trades completeness for speed.
+    max_spectral: Option<f64>,
 }
 
 impl Default for SearchConfig {
@@ -237,6 +241,7 @@ impl Default for SearchConfig {
             sat: false,
             sat_xy: false,
             z_sat: false,
+            max_spectral: None,
         }
     }
 }
@@ -614,12 +619,19 @@ fn build_zw_candidates(
         }
     }
 
+    // London §5.1: use tighter spectral bound if --max-spectral is set.
+    // Individual sequences are filtered against the tighter bound, and pairs
+    // are filtered against the same tighter bound. This trades completeness
+    // for dramatically reduced search space at larger n.
+    let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
+    let individual_bound = problem.spectral_bound();
+
     let mut z_buckets: HashMap<BoundarySignature, Vec<SeqWithSpectrum>> = HashMap::new();
     let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
     generate_sequences_with_sum_visit(problem.n, tuple.z, true, true, cfg.max_z, |values| {
         stats.z_generated += 1;
         if let Some(spectrum) =
-            spectrum_if_ok(values, spectral_z, problem.spectral_bound(), &mut fft_buf)
+            spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf)
         {
             stats.z_spectral_ok += 1;
             push_capped(
@@ -640,7 +652,7 @@ fn build_zw_candidates(
     generate_sequences_with_sum_visit(problem.m(), tuple.w, true, false, cfg.max_w, |values| {
         stats.w_generated += 1;
         if let Some(spectrum) =
-            spectrum_if_ok(values, spectral_w, problem.spectral_bound(), &mut fft_buf)
+            spectrum_if_ok(values, spectral_w, individual_bound, &mut fft_buf)
         {
             stats.w_spectral_ok += 1;
             push_capped(
@@ -666,7 +678,7 @@ fn build_zw_candidates(
         for z in zs {
             for w in ws {
                 stats.candidate_pair_attempts += 1;
-                if spectral_pair_ok(&z.spectrum, &w.spectrum, problem.spectral_bound()) {
+                if spectral_pair_ok(&z.spectrum, &w.spectrum, pair_bound) {
                     stats.candidate_pair_spectral_ok += 1;
                     let mut zw = vec![0; problem.n];
                     for (s, slot) in zw.iter_mut().enumerate().skip(1) {
@@ -903,26 +915,73 @@ fn backtrack_xy(
         let assignments: &[(i8, i8)] = &[(-1, 1), (1, -1), (1, 1), (-1, -1)];
 
         for &(xp, yp) in assignments {
-            for &xq in &[1, -1] {
-                for &yq in &[1, -1] {
-                    st.set_pair(pos, xp, yp);
-                    if pos != mirror {
-                        st.set_pair(mirror, xq, yq);
-                    }
+            st.set_pair(pos, xp, yp);
 
-                    let rem = st.remaining_unassigned as i32;
-                    if (tuple.x < st.sum_x - rem)
-                        || (tuple.x > st.sum_x + rem)
-                        || (tuple.y < st.sum_y - rem)
-                        || (tuple.y > st.sum_y + rem)
+            // London §3.3: check sum feasibility after setting pos, before mirror.
+            // Early prune avoids expensive set_pair(mirror) lag updates.
+            let rem_after_pos = st.remaining_unassigned as i32;
+            if tuple.x < st.sum_x - rem_after_pos
+                || tuple.x > st.sum_x + rem_after_pos
+                || tuple.y < st.sum_y - rem_after_pos
+                || tuple.y > st.sum_y + rem_after_pos
+            {
+                stats.xy_pruned_sum += 1;
+                st.unset_pair(pos);
+                continue;
+            }
+
+            let mirror_already_assigned = st.assigned[mirror];
+
+            if pos == mirror || mirror_already_assigned {
+                // Self-mirror or mirror already assigned: only pos is new
+                let mut ok = true;
+                for s in 1..problem.n {
+                    let target = -cand.zw_autocorr[s];
+                    if !partial_autocorr_bounds(st.known_lag[s], st.unknown_lag[s], target) {
+                        stats.xy_pruned_autocorr += 1;
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok && st.is_complete() {
+                    if !lex_leq_reversed(&st.x) || !lex_leq_reversed(&st.y) {
+                        stats.xy_pruned_lex += 1;
+                        ok = false;
+                    }
+                    if ok && !lex_leq(&st.x, &st.y) {
+                        stats.xy_pruned_lex += 1;
+                        ok = false;
+                    }
+                }
+                if ok && recurse(problem, tuple, cand, st, stats) {
+                    return true;
+                }
+                st.unset_pair(pos);
+                continue;
+            }
+
+            for &xq in &[1, -1] {
+                // London §3.3: pre-check x sum feasibility for mirror before set_pair
+                let sum_x_after = st.sum_x + xq as i32;
+                let rem_after_both = rem_after_pos - 1;
+                if tuple.x < sum_x_after - rem_after_both
+                    || tuple.x > sum_x_after + rem_after_both
+                {
+                    stats.xy_pruned_sum += 1;
+                    continue;
+                }
+
+                for &yq in &[1, -1] {
+                    // Pre-check y sum feasibility before expensive set_pair(mirror)
+                    let sum_y_after = st.sum_y + yq as i32;
+                    if tuple.y < sum_y_after - rem_after_both
+                        || tuple.y > sum_y_after + rem_after_both
                     {
                         stats.xy_pruned_sum += 1;
-                        if pos != mirror {
-                            st.unset_pair(mirror);
-                        }
-                        st.unset_pair(pos);
                         continue;
                     }
+
+                    st.set_pair(mirror, xq, yq);
 
                     let mut ok = true;
                     for s in 1..problem.n {
@@ -949,12 +1008,11 @@ fn backtrack_xy(
                         return true;
                     }
 
-                    if pos != mirror {
-                        st.unset_pair(mirror);
-                    }
-                    st.unset_pair(pos);
+                    st.unset_pair(mirror);
                 }
             }
+
+            st.unset_pair(pos);
         }
 
         false
@@ -2250,6 +2308,8 @@ fn parse_args() -> SearchConfig {
             cfg.sat_xy = true;
         } else if arg == "--z-sat" {
             cfg.z_sat = true;
+        } else if let Some(v) = arg.strip_prefix("--max-spectral=") {
+            cfg.max_spectral = Some(v.parse().unwrap_or(0.0));
         }
     }
     cfg
@@ -2338,6 +2398,7 @@ mod tests {
             sat: false,
             sat_xy: false,
             z_sat: false,
+            max_spectral: None,
         };
         let report = run_search(&cfg, false);
         assert!(report.found_solution);

@@ -42,7 +42,15 @@ target/release/turyn --n=16 --stochastic-secs=10 --benchmark=3
 
 - Exhaustive search (n=16, theta=20000):
   - Command: `target/release/turyn --n=16 --theta=20000 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3`
-  - Result: `mean_ms=6092, median_ms=6160`
+  - Result: `mean_ms=5976, median_ms=5950`
+
+- Phase C search (n=16, theta=100):
+  - Command: `target/release/turyn --n=16 --theta=100 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=5`
+  - Result: `mean_ms=17.5, median_ms=17.7` (was ~1903ms before London early-prune optimization)
+
+- Hybrid search (n=14):
+  - Command: `target/release/turyn --n=14 --sat-xy --theta=128 --max-z=200000 --max-w=200000 --max-pairs=5000 --k=0 --benchmark=3`
+  - Result: `mean_ms=3190, median_ms=3192`
 
 - Stochastic search (n=16, 10s time limit):
   - Command: `target/release/turyn --n=16 --stochastic-secs=10 --benchmark=3`
@@ -84,6 +92,8 @@ Note: the previous per-idea claims in `IDEAS.md` were not backed by a step-by-st
 |---|---|---|---|
 | 2026-03-30 | Pre-build per-sequence value-grouped index lists for O(1) SA partner selection. Eliminates random-probe loop (up to seq_len retries per flip). | Partner finding was the main per-flip overhead beyond delta computation: random probing hit wrong-value or same-position indices frequently, wasting iterations. Grouped lists give O(1) valid partner every time. | Stochastic: `34.13M → 41.65M flips/sec` (**+22.0%**). Exhaustive: neutral. |
 | 2026-03-30 | Simplified SA delta-corr from multiple multiply-accumulate pairs to single `-2*vi*nb*weight` formula per lag. | Same-value swaps have a clean delta: `-2v * (sum of non-overlapping neighbors)`. Fewer multiplies, cleaner branches, better codegen. | Stochastic: `32.03M → 34.13M flips/sec` (**+6.6%**). Exhaustive: neutral. |
+| 2026-03-31 | Early sum feasibility pruning in XY backtracker (London §3.3): set pos first, pre-check mirror sum bounds before expensive set_pair(mirror). Also fix latent bug with mirror-already-assigned state corruption. | Avoids O(n) lag updates in set_pair/unset_pair for ~90% of mirror combinations that fail sum feasibility. The bug fix prevents redundant tree exploration from state corruption when mirror of picked position was already assigned. | Phase C (n=16 θ=100): xy_nodes `901,772 → 10,368` (**87× fewer**), `1903ms → 17.5ms` (**-99.1%**). Exhaustive (θ=20000): neutral. Hybrid (n=14): neutral. |
+| 2026-03-31 | Add `--max-spectral=M` CLI parameter (London §5.1): restrict spectral pair filter to `|Z(ω)|² + |W(ω)|² ≤ M` instead of default `(6n-2)/2`. | Trades search completeness for speed at larger n. London used this to find TT(34)–TT(40) where full enumeration is infeasible. | Feature addition, no performance change on existing benchmarks (pair filter already rejects all at n=16). |
 | 2026-03-31 | Implement learnt clause deletion in radical. Keep glue clauses (LBD ≤ 3) and delete worst 50% of eligible learnt clauses when count exceeds original clause count. Trigger on every restart. | Without deletion, clause count grows unboundedly (137K at n=16), quadratically slowing BCP. CaDiCaL-style aggressive cleanup keeps the database lean while preserving high-quality learnt clauses. | Full SAT n=16: `17.5s → 3.9s` (**-78%**). n=18: `164s → 3.7s` (**-98%**). n=20: **52s** (previously >5min). |
 | 2026-03-31 | Fix critical soundness bug in radical conflict analysis: `learnt.push(negate(lit))` should be `learnt.push(lit)`. Lits from conflict/reason clauses are already false — negating them produces true lits in the learnt clause, corrupting all subsequent CDCL learning. | Bug caused false UNSAT at n>=14 (2.5K+ vars). All learnt clauses contained wrong-polarity literals, leading to invalid derivations. | Full SAT n=14: UNSAT→**SAT in 310ms**. n=16: **22s**. n=18: **164s**. |
 | 2026-03-31 | Optimize radical BCP inner loop: direct `clause_lits[]` indexing instead of `clause_lits(ci)` helper (avoids re-fetching ClauseMeta per access), `#[inline(always)]` on `lit_value`. | Reduces indirection in the hottest loop — `propagate_lit` is called for every assignment and iterates over watch lists with multiple clause literal accesses per clause. | Hybrid n=14: `3.8s → 3.4s` (**-10%**). |
