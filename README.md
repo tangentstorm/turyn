@@ -8,23 +8,25 @@ The long-term goal is TT(56), which yields a **Hadamard matrix of order 668**.
 
 | n | Hadamard | full SAT | hybrid | z-sat | stochastic | best |
 |---|---|---|---|---|---|---|
-| 4 | 44 | 0.7ms | **0.3ms** | 0.5ms | — | hybrid |
-| 6 | 68 | 5.8ms | **0.5ms** | 3.4ms | — | hybrid |
-| 8 | 92 | 3.1ms | **1.1ms** | 1.9ms | 2.1ms | hybrid |
-| 10 | 116 | 23ms | **1.7ms** | 11ms | 9.7ms | hybrid |
-| 12 | 140 | 61ms | **11ms** | 81ms | 101ms | hybrid |
-| 14 | 164 | 462ms | **35ms** | 851ms | 676ms | hybrid |
-| 16 | 188 | 4.0s | 185ms | 25s | **157ms** | stochastic |
-| 18 | 212 | **3.8s** | 3.0s | timeout | timeout | hybrid |
-| 20 | 236 | 52s | **1.3s** | timeout | timeout | hybrid |
-| 22 | 260 | timeout | **40s** | timeout | — | hybrid |
-| 24 | 284 | timeout | **4.2s** | timeout | — | hybrid |
+| 4 | 44 | 0.7ms | **0.6ms** | 0.5ms | — | hybrid |
+| 6 | 68 | 5.8ms | **0.8ms** | 3.4ms | — | hybrid |
+| 8 | 92 | 3.1ms | **1.7ms** | 1.9ms | 2.1ms | hybrid |
+| 10 | 116 | 23ms | **1.6ms** | 11ms | 9.7ms | hybrid |
+| 12 | 140 | 61ms | **8ms** | 81ms | 101ms | hybrid |
+| 14 | 164 | 462ms | **40ms** | 851ms | 676ms | hybrid |
+| 16 | 188 | 3.9s | **203ms** | 25s | 157ms | hybrid |
+| 18 | 212 | 3.8s | **3.1s** | timeout | timeout | hybrid |
+| 20 | 236 | 51s | **1.4s** | timeout | timeout | hybrid |
+| 22 | 260 | timeout | **32s** | timeout | — | hybrid |
+| 24 | 284 | timeout | **4.7s** | timeout | — | hybrid |
+
+Hybrid is now the default mode and runs in parallel across all available cores. Just run `target/release/turyn --n=N` to search.
 
 All solved with **radical**, a pure Rust CDCL SAT solver included as a subcrate. No external C/C++ dependencies. Timeout = 2 minutes wall-clock. Stochastic is nondeterministic; times vary between runs.
 
-**Test machine:** 4-core Intel Xeon @ 2.10 GHz, 16 GB RAM, Linux x86_64. Note that the full SAT, hybrid, and z-sat strategies are currently **single-threaded** — only the DFS exhaustive and stochastic modes parallelize across cores. There is substantial room for improvement by parallelizing the SAT-based strategies (e.g., solving different sum-tuples or Z/W candidates concurrently).
+**Test machine:** 4-core Intel Xeon @ 2.10 GHz, 16 GB RAM, Linux x86_64. Hybrid search parallelizes Phase B + SAT solving across cores (one thread per sum-tuple). Full SAT and z-sat are currently single-threaded.
 
-For comparison, London (2013) enumerated all 3,523 TT(24) sequences in ~1 hour and all 3,753 TT(26) in ~9 hours on a 6-core Intel i7 3930K @ 3.2 GHz, using a highly optimized custom C++ backtracker. Our hybrid solver finds a single TT(24) in 4.2s (single-threaded, on a slower CPU) but cannot yet enumerate all solutions or reach n=26 within 2 minutes.
+For comparison, London (2013) enumerated all 3,523 TT(24) sequences in ~1 hour and all 3,753 TT(26) in ~9 hours on a 6-core Intel i7 3930K @ 3.2 GHz, using a highly optimized custom C++ backtracker. Our hybrid solver finds a single TT(24) in 4.7s on a slower 4-core machine but cannot yet enumerate all solutions or reach n=26 within 2 minutes.
 
 Known solutions exist in the literature for all even n up to 44 (London-Kotsireas 2025). The current bottleneck for n >= 26 is SAT solver performance at scale.
 
@@ -38,8 +40,8 @@ When regenerating this table:
 4. Record "—" for strategies known to not apply (e.g., stochastic at very small n where it doesn't converge).
 5. Bold the winning time in each row. Record the winning strategy name in the "best" column.
 6. Commands per strategy:
+   - **hybrid** (default): `target/release/turyn --n=N`
    - **full SAT**: `target/release/turyn --n=N --sat`
-   - **hybrid**: `target/release/turyn --n=N --sat-xy --theta=128 --max-z=200000 --max-w=200000 --max-pairs=5000 --k=0`
    - **z-sat**: `target/release/turyn --n=N --z-sat --theta=128 --max-z=50000`
    - **stochastic**: `target/release/turyn --n=N --stochastic`
 7. Times are single-run wall-clock (not benchmark-mode averages). For noisy results, take the median of 3 runs.
@@ -50,11 +52,11 @@ When regenerating this table:
 ```bash
 cargo build --release
 
-# Full SAT search (best for n <= 20)
-target/release/turyn --n=14 --sat
+# Default: hybrid search (best overall, parallelized across cores)
+target/release/turyn --n=24
 
-# Hybrid: Phase B generates Z/W, SAT solves X/Y (best for n=22-24)
-target/release/turyn --n=24 --sat-xy --theta=128 --max-z=200000 --max-w=200000 --max-pairs=5000 --k=0
+# Full SAT search (competitive for n <= 18)
+target/release/turyn --n=14 --sat
 
 # Z-SAT: DFS generates Z, SAT solves X/Y/W (bypasses spectral pairing)
 target/release/turyn --n=14 --z-sat --theta=128 --max-z=50000
@@ -63,10 +65,10 @@ target/release/turyn --n=14 --z-sat --theta=128 --max-z=50000
 target/release/turyn --n=16 --stochastic
 
 # Exhaustive DFS search (original method, small n only)
-target/release/turyn --n=8 --theta=64 --max-z=200000 --max-w=200000 --max-pairs=2000
+target/release/turyn --n=8 --dfs --theta=64 --max-z=200000 --max-w=200000 --max-pairs=2000
 
-# Benchmark mode (exhaustive or stochastic throughput)
-target/release/turyn --n=16 --theta=20000 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3
+# Benchmark mode
+target/release/turyn --n=14 --benchmark=3
 target/release/turyn --n=16 --stochastic-secs=10 --benchmark=3
 ```
 

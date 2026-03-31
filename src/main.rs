@@ -220,6 +220,7 @@ struct SearchConfig {
     sat: bool,
     sat_xy: bool,
     z_sat: bool,
+    dfs: bool,
     /// London §5.1: restrict spectral pair sum to ≤ max_spectral.
     /// If None, uses the default spectral_bound (= (6n-2)/2).
     /// Setting this lower than spectral_bound trades completeness for speed.
@@ -230,10 +231,10 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             problem: Problem::new(56),
-            theta_samples: 256,
-            boundary_k: 6,
-            max_z: 10_000,
-            max_w: 10_000,
+            theta_samples: 128,
+            boundary_k: 0,
+            max_z: 200_000,
+            max_w: 200_000,
             max_pairs_per_bucket: 5_000,
             benchmark_repeats: 0,
             stochastic: false,
@@ -241,6 +242,7 @@ impl Default for SearchConfig {
             sat: false,
             sat_xy: false,
             z_sat: false,
+            dfs: false,
             max_spectral: None,
         }
     }
@@ -1581,9 +1583,33 @@ fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 fn run_benchmark(cfg: &SearchConfig) {
     if cfg.stochastic {
         run_stochastic_benchmark(cfg);
-    } else {
+    } else if cfg.dfs {
         run_exhaustive_benchmark(cfg);
+    } else {
+        run_hybrid_benchmark(cfg);
     }
+}
+
+fn run_hybrid_benchmark(cfg: &SearchConfig) {
+    let repeats = cfg.benchmark_repeats.max(1);
+    let warmup = run_hybrid_search(cfg, false);
+    println!(
+        "benchmark,warmup,elapsed_ms={:.3},found_solution={}",
+        warmup.elapsed.as_secs_f64() * 1000.0,
+        warmup.found_solution
+    );
+    println!("benchmark,run,elapsed_ms,found_solution");
+    let mut elapsed_ms = Vec::with_capacity(repeats);
+    for run in 1..=repeats {
+        let report = run_hybrid_search(cfg, false);
+        let ms = report.elapsed.as_secs_f64() * 1000.0;
+        elapsed_ms.push(ms);
+        println!("benchmark,{},{:.3},{}", run, ms, report.found_solution);
+    }
+    elapsed_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    let median = elapsed_ms[elapsed_ms.len() / 2];
+    let mean = elapsed_ms.iter().sum::<f64>() / elapsed_ms.len() as f64;
+    println!("benchmark,summary,mean_ms={:.3},median_ms={:.3},repeats={}", mean, median, repeats);
 }
 
 fn run_exhaustive_benchmark(cfg: &SearchConfig) {
@@ -2208,74 +2234,156 @@ fn run_sat_search(problem: Problem, verbose: bool) -> SearchReport {
 
 /// Hybrid search: Phase A+B (sum tuples, Z/W generation, spectral filtering)
 /// followed by SAT-based X/Y solving for each candidate (Z,W) pair.
-fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
-    let problem = cfg.problem;
-    let run_start = Instant::now();
+/// Process a single sum-tuple: Phase B (Z/W generation) + Phase C (SAT X/Y solving).
+/// Returns Some((x, y, z, w, stats)) if a solution is found.
+fn hybrid_solve_tuple(
+    problem: Problem,
+    tuple: SumTuple,
+    cfg: &SearchConfig,
+    found: &AtomicBool,
+    verbose: bool,
+) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SearchStats) {
     let mut stats = SearchStats::default();
+    if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
 
     let max_seq_len = problem.n;
     let spectral_z = SpectralFilter::new(max_seq_len, cfg.theta_samples);
     let spectral_w = SpectralFilter::new(max_seq_len, cfg.theta_samples);
 
-    let raw = enumerate_sum_tuples(problem);
-    // Use raw tuples — normalized tuples might not cover the sign combos
-    // compatible with SAT symmetry breaking (x[0]=y[0]=+1).
-    let mut seen = std::collections::HashSet::new();
-    let tuples: Vec<SumTuple> = raw.into_iter().filter(|t| seen.insert((t.x, t.y, t.z, t.w))).collect();
-    if verbose {
-        println!("TT({}): hybrid search (Phase B → SAT X/Y), {} distinct tuples", problem.n, tuples.len());
+    let phase_b_start = Instant::now();
+    let zw_candidates =
+        build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats);
+    if verbose && !zw_candidates.is_empty() {
+        println!("Tuple {}: {} Z/W pairs (Phase B: {:.3?})", tuple, zw_candidates.len(), phase_b_start.elapsed());
+    }
+    if zw_candidates.is_empty() { return (None, stats); }
+    if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
+
+    let Some(template) = SatXYTemplate::build(problem, tuple) else { return (None, stats); };
+
+    // Deduplicate Z/W pairs by autocorrelation vector
+    let mut seen_autocorr = std::collections::HashSet::new();
+    let unique_candidates: Vec<&CandidateZW> = zw_candidates.iter()
+        .filter(|c| seen_autocorr.insert(c.zw_autocorr.clone()))
+        .collect();
+    if verbose && unique_candidates.len() < zw_candidates.len() {
+        println!("  Dedup: {} unique autocorr vectors from {} pairs",
+            unique_candidates.len(), zw_candidates.len());
     }
 
-    for tuple in &tuples {
-        // Skip tuples with bad parity (can't have integer # of +1s)
-        if (tuple.x + problem.n as i32) % 2 != 0 { continue; }
-        if (tuple.y + problem.n as i32) % 2 != 0 { continue; }
-        if (tuple.z + problem.n as i32) % 2 != 0 { continue; }
-        if (tuple.w + problem.m() as i32) % 2 != 0 { continue; }
-        let phase_b_start = Instant::now();
-        let zw_candidates =
-            build_zw_candidates(problem, *tuple, cfg, &spectral_z, &spectral_w, &mut stats);
-        if verbose && !zw_candidates.is_empty() {
-            println!("Tuple {}: {} Z/W pairs (Phase B: {:.3?})", tuple, zw_candidates.len(), phase_b_start.elapsed());
+    for (idx, cand) in unique_candidates.iter().enumerate() {
+        if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
+        let sat_start = Instant::now();
+        if let Some((x, y)) = template.solve_for(cand) {
+            let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
+            if verbose {
+                print_solution(&format!("TT({}) hybrid (pair {}, {:.3?}, verified={})", problem.n, idx, sat_start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
+            }
+            if ok {
+                found.store(true, AtomicOrdering::Relaxed);
+                return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
+            }
+        } else if verbose {
+            println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
         }
-        if zw_candidates.is_empty() { continue; }
+    }
+    (None, stats)
+}
 
-        // Build SAT template once per tuple (XNOR + totalizer structure),
-        // then clone and solve for each Z/W pair.
-        let Some(template) = SatXYTemplate::build(problem, *tuple) else { continue; };
+fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
+    let problem = cfg.problem;
+    let run_start = Instant::now();
 
-        // Deduplicate Z/W pairs by their autocorrelation vector —
-        // pairs with the same zw_autocorr are equivalent for X/Y solving.
-        let mut seen_autocorr = std::collections::HashSet::new();
-        let unique_candidates: Vec<&CandidateZW> = zw_candidates.iter()
-            .filter(|c| seen_autocorr.insert(c.zw_autocorr.clone()))
-            .collect();
-        if verbose && unique_candidates.len() < zw_candidates.len() {
-            println!("  Dedup: {} unique autocorr vectors from {} pairs",
-                unique_candidates.len(), zw_candidates.len());
-        }
+    let raw = enumerate_sum_tuples(problem);
+    let mut seen = std::collections::HashSet::new();
+    let tuples: Vec<SumTuple> = raw.into_iter()
+        .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+        .filter(|t| {
+            (t.x + problem.n as i32) % 2 == 0
+            && (t.y + problem.n as i32) % 2 == 0
+            && (t.z + problem.n as i32) % 2 == 0
+            && (t.w + problem.m() as i32) % 2 == 0
+        })
+        .collect();
 
-        for (idx, cand) in unique_candidates.iter().enumerate() {
-            let sat_start = Instant::now();
-            if let Some((x, y)) = template.solve_for(cand) {
-                let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get()).unwrap_or(1).max(1);
+    if verbose {
+        println!("TT({}): hybrid search (Phase B → SAT X/Y), {} tuples, {} threads",
+            problem.n, tuples.len(), workers);
+    }
+
+    let found = Arc::new(AtomicBool::new(false));
+
+    // For single-thread or very few tuples, run sequentially
+    if workers <= 1 || tuples.len() <= 1 {
+        let mut stats = SearchStats::default();
+        for tuple in &tuples {
+            let (result, local_stats) = hybrid_solve_tuple(problem, *tuple, cfg, &found, verbose);
+            stats.merge_from(&local_stats);
+            if let Some((x, y, z, w)) = result {
                 if verbose {
-                    print_solution(&format!("TT({}) hybrid (pair {}, {:.3?}, verified={})", problem.n, idx, sat_start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
+                    print_solution(&format!("TT({}) SOLUTION", problem.n), &x, &y, &z, &w);
                 }
-                if ok {
-                    return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
+                return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
+            }
+        }
+        if verbose {
+            println!("Hybrid search: no solution found. Stats: z_gen={}, w_gen={}, pairs={}, elapsed={:.3?}",
+                stats.z_generated, stats.w_generated, stats.candidate_pair_spectral_ok, run_start.elapsed());
+        }
+        return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false };
+    }
+
+    // Parallel: distribute tuples across threads
+    let tuples = Arc::new(tuples);
+    let cfg = Arc::new(cfg.clone());
+    let mut handles = Vec::new();
+
+    let chunk_size = tuples.len().div_ceil(workers).max(1);
+    for chunk_idx in 0..workers {
+        let start = chunk_idx * chunk_size;
+        if start >= tuples.len() { break; }
+        let end = ((chunk_idx + 1) * chunk_size).min(tuples.len());
+        let tuples = Arc::clone(&tuples);
+        let cfg = Arc::clone(&cfg);
+        let found = Arc::clone(&found);
+
+        handles.push(std::thread::spawn(move || {
+            let mut local_stats = SearchStats::default();
+            let mut solution = None;
+            for idx in start..end {
+                if found.load(AtomicOrdering::Relaxed) { break; }
+                let (result, tstats) = hybrid_solve_tuple(problem, tuples[idx], &cfg, &found, false);
+                local_stats.merge_from(&tstats);
+                if result.is_some() {
+                    solution = result;
+                    break;
                 }
-            } else if verbose {
-                println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
+            }
+            (solution, local_stats)
+        }));
+    }
+
+    let mut stats = SearchStats::default();
+    let mut found_solution = false;
+    for h in handles {
+        if let Ok((result, local_stats)) = h.join() {
+            stats.merge_from(&local_stats);
+            if let Some((x, y, z, w)) = result {
+                if verbose {
+                    print_solution(&format!("TT({}) SOLUTION", problem.n), &x, &y, &z, &w);
+                }
+                found_solution = true;
             }
         }
     }
 
-    if verbose {
+    if verbose && !found_solution {
         println!("Hybrid search: no solution found. Stats: z_gen={}, w_gen={}, pairs={}, elapsed={:.3?}",
             stats.z_generated, stats.w_generated, stats.candidate_pair_spectral_ok, run_start.elapsed());
     }
-    SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false }
+    SearchReport { stats, elapsed: run_start.elapsed(), found_solution }
 }
 
 fn parse_args() -> SearchConfig {
@@ -2305,7 +2413,10 @@ fn parse_args() -> SearchConfig {
         } else if arg == "--sat" {
             cfg.sat = true;
         } else if arg == "--sat-xy" {
+            // Legacy alias — hybrid is now the default
             cfg.sat_xy = true;
+        } else if arg == "--dfs" {
+            cfg.dfs = true;
         } else if arg == "--z-sat" {
             cfg.z_sat = true;
         } else if let Some(v) = arg.strip_prefix("--max-spectral=") {
@@ -2322,17 +2433,18 @@ fn main() {
     } else if cfg.z_sat {
         let report = run_z_sat_search(&cfg, true);
         println!("Z-SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
-    } else if cfg.sat_xy {
-        let report = run_hybrid_search(&cfg, true);
-        println!("Hybrid search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     } else if cfg.sat {
         let report = run_sat_search(cfg.problem, true);
         println!("SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     } else if cfg.stochastic {
         let report = stochastic_search(cfg.problem, true, cfg.stochastic_seconds);
         println!("Stochastic search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
-    } else {
+    } else if cfg.dfs {
         run_search(&cfg, true);
+    } else {
+        // Default: hybrid search (Phase B → SAT X/Y). Use --sat, --stochastic, or --dfs to override.
+        let report = run_hybrid_search(&cfg, true);
+        println!("Hybrid search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     }
 }
 
@@ -2398,6 +2510,7 @@ mod tests {
             sat: false,
             sat_xy: false,
             z_sat: false,
+            dfs: false,
             max_spectral: None,
         };
         let report = run_search(&cfg, false);
