@@ -33,10 +33,11 @@ fn negate(lit: Lit) -> Lit {
 
 /// Assignment value for a variable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum LBool {
-    True,
-    False,
-    Undef,
+    Undef = 0,
+    True = 1,
+    False = 2,
 }
 
 /// Clause metadata (literals stored in flat `clause_lits` array).
@@ -775,22 +776,29 @@ impl Solver {
         let qc = &self.quad_pb_constraints[qi as usize];
         let aa = self.assigns[qc.vars_a[ti]];
         let ab = self.assigns[qc.vars_b[ti]];
-        // a_false: assigned to the opposite of what makes the literal true
-        let a_false = aa != LBool::Undef && aa != qc.true_val_a[ti];
-        let b_false = ab != LBool::Undef && ab != qc.true_val_b[ti];
-        let c = qc.coeffs[ti] as i32;
 
-        // State: 0=DEAD (either false), 2=TRUE (both assigned, neither false), 1=MAYBE
-        let new_state = if a_false | b_false { 0u8 }
-            else if aa != LBool::Undef && ab != LBool::Undef { 2u8 }
-            else { 1u8 };
+        // Fast path: if either variable is Undef, state is MAYBE (1)
+        // unless the other is assigned-false (then DEAD). But if both
+        // are Undef, definitely MAYBE — skip the full evaluation.
+        let new_state = if aa == LBool::Undef {
+            if ab == LBool::Undef { 1u8 }
+            else if ab != qc.true_val_b[ti] { 0u8 } // b is false → DEAD
+            else { 1u8 } // b is true but a is undef → MAYBE
+        } else if ab == LBool::Undef {
+            if aa != qc.true_val_a[ti] { 0u8 } // a is false → DEAD
+            else { 1u8 } // a is true but b is undef → MAYBE
+        } else {
+            // Both assigned
+            let a_false = aa != qc.true_val_a[ti];
+            let b_false = ab != qc.true_val_b[ti];
+            if a_false | b_false { 0u8 } else { 2u8 }
+        };
 
         let qc = &mut self.quad_pb_constraints[qi as usize];
         let old_state = qc.term_state[ti];
         if old_state == new_state { return; }
 
-        // Adjust counters: subtract old contribution, add new
-        // Using direct arithmetic instead of match to reduce branches
+        let c = qc.coeffs[ti] as i32;
         if old_state == 1 { qc.sum_maybe -= c; }
         else if old_state == 2 { qc.sum_true -= c; }
         if new_state == 1 { qc.sum_maybe += c; }
@@ -1062,9 +1070,9 @@ impl Solver {
             self.phase[v] = entry.lit > 0;
             self.assigns[v] = LBool::Undef;
             if v < self.quad_pb_reasons.len() { self.quad_pb_reasons[v] = None; }
-            // Incrementally update quad PB term states after unassigning
-            // (skipped when backtracking to level 0 and caller will reset state)
-            if !(self.skip_backtrack_quad_pb && level == 0) {
+            // Incrementally update quad PB term states after unassigning.
+            // Skip for level 0 when caller manages state externally (table path).
+            if !(level == 0 && self.skip_backtrack_quad_pb) {
                 for idx in 0..self.quad_pb_var_terms[v].len() {
                     let (qi, ti) = self.quad_pb_var_terms[v][idx];
                     self.update_quad_pb_term(qi, ti as usize);
@@ -1074,6 +1082,17 @@ impl Solver {
         }
         self.trail_lim.truncate(level as usize);
         self.prop_head = self.trail.len();
+
+        // For backtrack to level 0 with external state management:
+        // batch-reset all quad PB constraints (all vars Undef → all terms MAYBE).
+        if level == 0 && self.skip_backtrack_quad_pb && !self.quad_pb_constraints.is_empty() {
+            for qc in &mut self.quad_pb_constraints {
+                let total: i32 = qc.coeffs.iter().map(|&c| c as i32).sum();
+                qc.sum_true = 0;
+                qc.sum_maybe = total;
+                for s in qc.term_state.iter_mut() { *s = 1; } // all MAYBE
+            }
+        }
     }
 
     /// Minimize a learnt clause by removing redundant literals.
