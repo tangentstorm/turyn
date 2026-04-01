@@ -253,7 +253,10 @@ struct SearchConfig {
     /// Run only Phase A (print tuples) or Phase B (print Z/W pairs).
     phase_only: Option<String>,
     /// Path to XY boundary table file for table-based Phase C.
+    /// Defaults to "./xy-table.bin".
     xy_table_path: Option<String>,
+    /// Run without XY boundary table (slower).
+    no_table: bool,
     /// Dump DIMACS CNF to this path instead of solving.
     dump_dimacs: Option<String>,
 }
@@ -281,6 +284,7 @@ impl Default for SearchConfig {
             test_tuple: None,
             phase_only: None,
             xy_table_path: None,
+            no_table: false,
             dump_dimacs: None,
         }
     }
@@ -3136,28 +3140,26 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
     let phase_a_elapsed = phase_a_start.elapsed();
 
-    // Load XY boundary table if specified
-    let xy_table: Option<Arc<XYBoundaryTable>> = cfg.xy_table_path.as_ref().and_then(|path| {
-        match XYBoundaryTable::load(path, problem.n) {
+    // Load XY boundary table (default: ./xy-table.bin)
+    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table.bin".to_string());
+    let xy_table: Option<Arc<XYBoundaryTable>> = if cfg.no_table {
+        None
+    } else {
+        match XYBoundaryTable::load(&table_path, problem.n) {
             Some(t) => {
-                if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {} groups)", path, t.n, t.k, t.groups.len()); }
+                if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {} groups)", table_path, t.n, t.k, t.groups.len()); }
                 Some(Arc::new(t))
             }
             None => {
-                eprintln!("Error: failed to load XY boundary table from '{}'", path);
-                eprintln!("Generate it with: target/release/gen_table {} 6 {}", problem.n, path);
-                None
+                eprintln!("Error: XY boundary table not found at '{}'", table_path);
+                eprintln!("Generate it once (reusable for any n):");
+                eprintln!("  cargo build --release --bin gen_table");
+                eprintln!("  target/release/gen_table {} 6 {}", problem.n, table_path);
+                eprintln!("Or run with --no-table to skip (slower).");
+                std::process::exit(1);
             }
         }
-    });
-
-    // Hint for n >= 26 without table
-    if problem.n >= 26 && xy_table.is_none() && cfg.xy_table_path.is_none() {
-        eprintln!("Hint: for faster search, pre-generate an XY boundary table (reusable for any n):");
-        eprintln!("  cargo build --release --bin gen_table");
-        eprintln!("  target/release/gen_table {} 6 xy_table.bin", problem.n);
-        eprintln!("  target/release/turyn --n={} --xy-table=xy_table.bin", problem.n);
-    }
+    };
 
     let workers = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(1).max(1);
@@ -3620,6 +3622,8 @@ fn parse_args() -> SearchConfig {
             }
         } else if let Some(v) = arg.strip_prefix("--xy-table=") {
             cfg.xy_table_path = Some(v.to_string());
+        } else if arg == "--no-table" {
+            cfg.no_table = true;
         } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
             cfg.dump_dimacs = Some(v.to_string());
         }
@@ -3844,6 +3848,8 @@ mod tests {
             test_tuple: None,
             phase_only: None,
             xy_table_path: None,
+            no_table: true,
+            dump_dimacs: None,
         };
         let report = run_search(&cfg, false);
         assert!(report.found_solution);
