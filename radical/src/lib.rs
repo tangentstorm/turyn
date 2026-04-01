@@ -146,6 +146,9 @@ pub struct Solver {
     restart_limit: u64,
     luby_index: u32,
 
+    // Limits
+    conflict_limit: u64,  // 0 = no limit
+
     // State
     ok: bool, // false if top-level conflict detected
 }
@@ -199,6 +202,7 @@ impl Solver {
             conflicts: 0,
             restart_limit: 100,
             luby_index: 0,
+            conflict_limit: 0,
             ok: true,
         }
     }
@@ -417,12 +421,19 @@ impl Solver {
     }
     /// Number of conflicts so far.
     pub fn num_conflicts(&self) -> u64 { self.conflicts }
+    /// Set a conflict limit. Solve returns None if limit is reached.
+    /// Set to 0 to disable.
+    pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
 
     fn solve_inner(&mut self, base_level: u32) -> Option<bool> {
         loop {
             if let Some(conflict_reason) = self.propagate() {
                 // Conflict
                 self.conflicts += 1;
+                // Check conflict limit
+                if self.conflict_limit > 0 && self.conflicts >= self.conflict_limit {
+                    return None; // indeterminate — limit reached
+                }
                 if self.decision_level() <= base_level {
                     return Some(false); // conflict at/below assumption level → UNSAT
                 }
