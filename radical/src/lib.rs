@@ -443,6 +443,38 @@ impl Solver {
     /// Set to 0 to disable.
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
 
+    /// Reset a quad PB constraint's incremental state from precomputed values.
+    /// Used for fast boundary config switching without backtracking.
+    pub fn reset_quad_pb_state(&mut self, qi: usize, term_state: &[u8], sum_true: i32, sum_maybe: i32) {
+        let qc = &mut self.quad_pb_constraints[qi];
+        qc.term_state[..term_state.len()].copy_from_slice(term_state);
+        qc.sum_true = sum_true;
+        qc.sum_maybe = sum_maybe;
+    }
+
+    /// Get the number of quad PB constraints.
+    pub fn num_quad_pb(&self) -> usize { self.quad_pb_constraints.len() }
+
+    /// Get the number of terms in a quad PB constraint.
+    pub fn quad_pb_num_terms(&self, qi: usize) -> usize { self.quad_pb_constraints[qi].num_terms as usize }
+
+    /// Get quad PB term info for precomputation.
+    pub fn quad_pb_term_info(&self, qi: usize, ti: usize) -> (usize, usize, bool, bool) {
+        let qc = &self.quad_pb_constraints[qi];
+        (qc.vars_a[ti], qc.vars_b[ti], qc.neg_a[ti], qc.neg_b[ti])
+    }
+
+    /// Full reset to base state: unassign all variables, clear trail, reset conflicts.
+    /// Keeps all constraints and learnt clauses intact.
+    pub fn reset_to_base(&mut self) {
+        // Backtrack to level 0
+        self.backtrack(0);
+        // Reset conflict counter and restart state
+        self.conflicts = 0;
+        self.restart_limit = 100;
+        self.luby_index = 0;
+    }
+
     /// Pre-allocate internal buffers for expected search size.
     /// Call before cloning as a template to ensure clones have capacity.
     pub fn reserve_for_search(&mut self, expected_clauses: usize) {

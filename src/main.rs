@@ -2786,9 +2786,9 @@ impl XYBoundaryTable {
         }
     }
 
-    /// One clone per Z/W pair. Boundary configs tried via assumptions (no extra cloning).
-    /// The solver's own BCP handles the term simplification when boundary vars are fixed.
-    /// Learnt clauses persist across configs, making later solves faster.
+    /// Direct state injection: one clone per Z/W pair. For each boundary config,
+    /// precompute which quad PB terms are TRUE/DEAD/MAYBE and inject directly
+    /// into the solver's incremental state. No backtracking, no assumption propagation.
     fn solve_xy_with_sat(
         &self, problem: Problem, tuple: SumTuple,
         candidate: &CandidateZW, template: &SatXYTemplate,
@@ -2816,8 +2816,23 @@ impl XYBoundaryTable {
             solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
         }
 
-        // Autocorrelation filter setup (non-exact lags)
+        // Precompute per quad PB constraint: which terms have BOTH vars in boundary
         let is_bnd = |pos: usize| -> bool { pos < k || pos >= n - k };
+        let num_qpb = solver.num_quad_pb();
+        struct TermBndInfo { var_a: usize, var_b: usize, neg_a: bool, neg_b: bool, both_bnd: bool }
+        let mut qpb_term_info: Vec<Vec<TermBndInfo>> = Vec::with_capacity(num_qpb);
+        for qi in 0..num_qpb {
+            let nt = solver.quad_pb_num_terms(qi);
+            let mut infos = Vec::with_capacity(nt);
+            for ti in 0..nt {
+                let (va, vb, na, nb) = solver.quad_pb_term_info(qi, ti);
+                let pa = va % n; let pb = vb % n;
+                infos.push(TermBndInfo { var_a: va, var_b: vb, neg_a: na, neg_b: nb, both_bnd: is_bnd(pa) && is_bnd(pb) });
+            }
+            qpb_term_info.push(infos);
+        }
+
+        // Autocorrelation filter setup
         struct LagFilter { s: usize, pairs: Vec<(usize, usize)>, max_unknown: i32 }
         let mut lag_filters: Vec<LagFilter> = Vec::new();
         for s in 1..n {
@@ -2830,6 +2845,10 @@ impl XYBoundaryTable {
         lag_filters.sort_by_key(|f| f.max_unknown);
         let targets: Vec<i32> = (0..n).map(|s| if s == 0 { 0 } else { -candidate.zw_autocorr[s] }).collect();
         let required_sig: Vec<i16> = self.exact_lags.iter().map(|&s| targets[s] as i16).collect();
+
+        // Pre-allocate buffers for term state injection
+        let max_terms = qpb_term_info.iter().map(|v| v.len()).max().unwrap_or(0);
+        let mut term_state_buf = vec![0u8; max_terms];
 
         let max_bnd_sum = (2 * k) as i16;
         for x_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
@@ -2849,7 +2868,7 @@ impl XYBoundaryTable {
                         yv[i] = if (y_bits >> i) & 1 == 1 { 1 } else { -1 };
                         yv[n-k+i] = if (y_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
                     }
-                    // GJ equality filter
+                    // GJ filter
                     let mut ok = true;
                     for &(a, b, equal) in &equalities {
                         let va = (a as usize)-1; let vb = (b as usize)-1;
@@ -2861,7 +2880,7 @@ impl XYBoundaryTable {
                         else { if a_val != -b_val { ok = false; break; } }
                     }
                     if !ok { continue; }
-                    // Autocorrelation filter on bounded lags
+                    // Autocorrelation filter
                     for lf in &lag_filters {
                         let mut kn = 0i32;
                         for &(i, j) in &lf.pairs { kn += xv[i] as i32 * xv[j] as i32 + yv[i] as i32 * yv[j] as i32; }
@@ -2869,7 +2888,44 @@ impl XYBoundaryTable {
                     }
                     if !ok { continue; }
 
-                    // Build assumptions: fix boundary variables
+                    // Build boundary value lookup: assigns[var] for boundary vars
+                    // var 0..n-1 = X positions, n..2n-1 = Y positions
+                    let mut bnd_vals = [0i8; 128]; // assigns for boundary vars
+                    for i in 0..k { bnd_vals[i] = xv[i]; bnd_vals[n-k+i] = xv[n-k+i]; }
+                    for i in 0..k { bnd_vals[n+i] = yv[i]; bnd_vals[n+n-k+i] = yv[n-k+i]; }
+
+                    // Precompute term states for all quad PB constraints and inject
+                    let mut infeasible = false;
+                    for qi in 0..num_qpb {
+                        let infos = &qpb_term_info[qi];
+                        let mut st = 0i32; let mut sm = 0i32;
+                        for (ti, info) in infos.iter().enumerate() {
+                            if info.both_bnd {
+                                // Both boundary: evaluate the term
+                                let a_val = bnd_vals[info.var_a];
+                                let b_val = bnd_vals[info.var_b];
+                                let a_true = (a_val == 1 && !info.neg_a) || (a_val == -1 && info.neg_a);
+                                let b_true = (b_val == 1 && !info.neg_b) || (b_val == -1 && info.neg_b);
+                                if a_true && b_true {
+                                    term_state_buf[ti] = 2; st += 1; // TRUE
+                                } else {
+                                    let a_false = (a_val == 1 && info.neg_a) || (a_val == -1 && !info.neg_a);
+                                    let b_false = (b_val == 1 && info.neg_b) || (b_val == -1 && !info.neg_b);
+                                    if a_false || b_false {
+                                        term_state_buf[ti] = 0; // DEAD
+                                    } else {
+                                        term_state_buf[ti] = 1; sm += 1; // MAYBE (shouldn't happen if both_bnd)
+                                    }
+                                }
+                            } else {
+                                // At least one free variable: MAYBE
+                                term_state_buf[ti] = 1; sm += 1;
+                            }
+                        }
+                        solver.reset_quad_pb_state(qi, &term_state_buf[..infos.len()], st, sm);
+                    }
+
+                    // Build assumptions for boundary variables
                     let mut assumptions = Vec::with_capacity(4 * k);
                     for i in 0..k {
                         assumptions.push(if xv[i] == 1 { x_var(i) } else { -x_var(i) });
@@ -2881,14 +2937,13 @@ impl XYBoundaryTable {
                         assumptions.push(if yv[p] == 1 { y_var(p) } else { -y_var(p) });
                     }
 
-                    // Solve with assumptions — no clone, learnt clauses persist!
                     match solver.solve_with_assumptions(&assumptions) {
                         Some(true) => {
                             let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
                             let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
                             return Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)));
                         }
-                        _ => {} // UNSAT — learnt clauses help future configs
+                        _ => {}
                     }
                 }
             }
