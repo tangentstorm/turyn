@@ -2677,7 +2677,7 @@ fn hybrid_solve_tuple(
 
     // Two-pass SAT strategy: first pass with conflict limit for quick rejects,
     // second pass without limit for remaining candidates.
-    let conflict_limit = if problem.n >= 24 { 50000 } else { 0 };
+    let conflict_limit = if problem.n >= 26 { 50000 } else { 0 };
     let mut deferred: Vec<usize> = Vec::new();
 
     // Pass 1: try all candidates with conflict limit
@@ -2751,13 +2751,15 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let cfg = cfg.clone();
     let cfg = cfg;
 
-    // Heuristic tuple ordering: balance "likely to contain solution" with
-    // "cheap to search". Known TT solutions have x≈y, so |x-y| is key.
-    // But also need small |z|+|w| for cheap Phase B.
-    // Score = |x-y| * 2 + |z| + |w|  (penalize x≠y heavily, prefer small z/w)
-    // Heuristic tuple ordering: try small |z|+|w| first (cheap Phase B),
-    // break ties by small |x-y| (solutions often have x≈y).
-    tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
+    // Heuristic tuple ordering depends on problem size.
+    // For smaller n: cheap Phase B first (small |z|+|w|), since Phase B dominates.
+    // For larger n: solution-likely first (small |x-y|), since Phase C dominates
+    // and we want to reach the solution tuple early.
+    if problem.n >= 26 {
+        tuples.sort_by_key(|t| ((t.x - t.y).abs(), t.z.abs() + t.w.abs(), t.x.abs() + t.y.abs()));
+    } else {
+        tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
+    }
     let phase_a_elapsed = phase_a_start.elapsed();
 
     let workers = std::thread::available_parallelism()
