@@ -155,6 +155,7 @@ impl PackedSeq {
             .collect()
     }
 
+    #[allow(dead_code)]
     fn as_blocks(&self) -> String {
         (0..self.len)
             .map(|i| if self.get(i) == 1 { '\u{2593}' } else { '\u{2591}' })
@@ -162,12 +163,26 @@ impl PackedSeq {
     }
 }
 
+/// Format a sequence as a colorized +/- string for terminal display.
+/// '+' gets black text on light gray background, '-' gets white text on dark gray.
+/// Copies as plain +/- from most terminals.
+fn colored_pm(seq: &PackedSeq) -> String {
+    let mut out = String::new();
+    for i in 0..seq.len() {
+        if seq.get(i) == 1 {
+            out.push_str("\x1b[30;47m+\x1b[0m");
+        } else {
+            out.push_str("\x1b[37;100m-\x1b[0m");
+        }
+    }
+    out
+}
+
 fn print_solution(label: &str, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &PackedSeq) {
     println!("\n{}", label);
-    println!("  X [{:>3}] {}", x.sum(), x.as_blocks());
-    println!("  Y [{:>3}] {}", y.sum(), y.as_blocks());
-    println!("  Z [{:>3}] {}", z.sum(), z.as_blocks());
-    println!("  W [{:>3}] {}", w.sum(), w.as_blocks());
+    for (name, seq) in [("X", x), ("Y", y), ("Z", z), ("W", w)] {
+        println!("{} =: '{}'  NB. {}", name, colored_pm(seq), seq.sum());
+    }
     println!();
 }
 
