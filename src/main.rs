@@ -2633,7 +2633,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let phase_a_start = Instant::now();
     let raw = enumerate_sum_tuples(problem);
     let mut seen = std::collections::HashSet::new();
-    let tuples: Vec<SumTuple> = raw.into_iter()
+    let mut tuples: Vec<SumTuple> = raw.into_iter()
         .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
         .filter(|t| {
             (t.x + problem.n as i32) % 2 == 0
@@ -2642,6 +2642,11 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             && (t.w + problem.m() as i32) % 2 == 0
         })
         .collect();
+    // Heuristic tuple ordering: balance "likely to contain solution" with
+    // "cheap to search". Known TT solutions have x≈y, so |x-y| is key.
+    // But also need small |z|+|w| for cheap Phase B.
+    // Score = |x-y| * 2 + |z| + |w|  (penalize x≠y heavily, prefer small z/w)
+    tuples.sort_by_key(|t| ((t.x - t.y).abs() * 2 + t.z.abs() + t.w.abs(), t.x.abs() + t.y.abs()));
     let phase_a_elapsed = phase_a_start.elapsed();
 
     let workers = std::thread::available_parallelism()
