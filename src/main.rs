@@ -2675,18 +2675,11 @@ fn hybrid_solve_tuple(
             unique_candidates.len(), zw_candidates.len());
     }
 
-    // Two-pass SAT strategy: first pass with conflict limit for quick rejects,
-    // second pass without limit for remaining candidates.
-    let conflict_limit = if problem.n >= 26 { 50000 } else { 0 };
-    let mut deferred: Vec<usize> = Vec::new();
-
-    // Pass 1: try all candidates with conflict limit
     for (idx, cand) in unique_candidates.iter().enumerate() {
         if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
         let sat_start = Instant::now();
-        let (result, was_limited) = template.solve_for_limited(cand, conflict_limit);
-        stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
-        if let Some((x, y)) = result {
+        if let Some((x, y)) = template.solve_for(cand) {
+            stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
             let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
             if verbose {
                 print_solution(&format!("TT({}) hybrid (pair {}, {:.3?}, verified={})", problem.n, idx, sat_start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
@@ -2695,32 +2688,10 @@ fn hybrid_solve_tuple(
                 found.store(true, AtomicOrdering::Relaxed);
                 return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
             }
-        } else if was_limited {
-            deferred.push(idx);
-        } else if verbose {
-            println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
-        }
-    }
-
-    // Pass 2: retry deferred candidates without limit
-    for &idx in &deferred {
-        if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
-        let cand = unique_candidates[idx];
-        let sat_start = Instant::now();
-        if let Some((x, y)) = template.solve_for(cand) {
-            stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
-            let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
-            if verbose {
-                print_solution(&format!("TT({}) hybrid (pair {}/deferred, {:.3?}, verified={})", problem.n, idx, sat_start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
-            }
-            if ok {
-                found.store(true, AtomicOrdering::Relaxed);
-                return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
-            }
         } else {
             stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
             if verbose {
-                println!("SAT X/Y: UNSAT for pair {}/deferred in {:.3?}", idx, sat_start.elapsed());
+                println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
             }
         }
     }
