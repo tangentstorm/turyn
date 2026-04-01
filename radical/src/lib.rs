@@ -177,6 +177,7 @@ impl Solver {
 
     /// Get a mutable reference to the literals of clause `ci`.
     #[inline]
+    #[allow(dead_code)]
     fn clause_lits_mut(&mut self, ci: u32) -> &mut [Lit] {
         let m = &self.clause_meta[ci as usize];
         &mut self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)]
@@ -444,6 +445,23 @@ impl Solver {
     }
     /// Number of conflicts so far.
     pub fn num_conflicts(&self) -> u64 { self.conflicts }
+
+    /// Write all clauses in DIMACS CNF format to the given writer.
+    /// Note: PB and quad-PB constraints are not included (DIMACS only supports CNF).
+    pub fn dump_dimacs(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        let num_clauses = self.clause_meta.iter().filter(|m| !m.deleted).count();
+        writeln!(w, "p cnf {} {}", self.num_vars, num_clauses)?;
+        for m in &self.clause_meta {
+            if m.deleted { continue; }
+            let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
+            for &lit in lits {
+                write!(w, "{} ", lit)?;
+            }
+            writeln!(w, "0")?;
+        }
+        Ok(())
+    }
+
     /// Set a conflict limit. Solve returns None if limit is reached.
     /// Set to 0 to disable.
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
@@ -754,6 +772,7 @@ impl Solver {
     /// Generate a clause explanation for a PB-based reason.
     /// The clause is: the propagated literal OR the negation of all false literals
     /// whose removal would violate the bound.
+    #[allow(dead_code)]
     fn pb_reason_clause(&self, pbi: u32, propagated: Lit) -> Vec<Lit> {
         let pb = &self.pb_constraints[pbi as usize];
         let mut clause = vec![propagated];
@@ -768,10 +787,9 @@ impl Solver {
 
     /// Propagate a quadratic PB constraint: sum(coeffs[i] * a_i * b_i) = target.
     /// Single-pass: computes slack and finds propagation in one scan.
-    #[inline(never)]
     /// Recompute a single term's state and update incremental counters.
     /// Returns the new state (0=DEAD, 1=MAYBE, 2=TRUE).
-    #[inline(always)]
+    #[inline(never)]
     fn update_quad_pb_term(&mut self, qi: u32, ti: usize) {
         let qc = &self.quad_pb_constraints[qi as usize];
         let aa = self.assigns[qc.vars_a[ti]];
@@ -1292,6 +1310,31 @@ fn luby(i: u32) -> u64 {
             idx -= size;
         }
     }
+}
+
+/// Parse a DIMACS CNF file and load it into a new solver.
+/// Returns the solver ready for `solve()`.
+pub fn parse_dimacs(input: &str) -> Solver {
+    let mut solver = Solver::new();
+    let mut clause: Vec<i32> = Vec::new();
+    for line in input.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('c') || line.starts_with('p') {
+            continue;
+        }
+        for tok in line.split_whitespace() {
+            let lit: i32 = tok.parse().expect("invalid literal in DIMACS");
+            if lit == 0 {
+                solver.add_clause(clause.drain(..));
+            } else {
+                clause.push(lit);
+            }
+        }
+    }
+    if !clause.is_empty() {
+        solver.add_clause(clause);
+    }
+    solver
 }
 
 #[cfg(test)]

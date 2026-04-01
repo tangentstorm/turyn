@@ -148,12 +148,14 @@ impl PackedSeq {
         sig
     }
 
+    #[allow(dead_code)]
     fn as_string(&self) -> String {
         (0..self.len)
             .map(|i| if self.get(i) == 1 { '+' } else { '-' })
             .collect()
     }
 
+    #[allow(dead_code)]
     fn as_blocks(&self) -> String {
         (0..self.len)
             .map(|i| if self.get(i) == 1 { '\u{2593}' } else { '\u{2591}' })
@@ -161,12 +163,26 @@ impl PackedSeq {
     }
 }
 
+/// Format a sequence as a colorized +/- string for terminal display.
+/// '+' gets black text on light gray background, '-' gets white text on dark gray.
+/// Copies as plain +/- from most terminals.
+fn colored_pm(seq: &PackedSeq) -> String {
+    let mut out = String::new();
+    for i in 0..seq.len() {
+        if seq.get(i) == 1 {
+            out.push_str("\x1b[30;47m+\x1b[0m");
+        } else {
+            out.push_str("\x1b[37;100m-\x1b[0m");
+        }
+    }
+    out
+}
+
 fn print_solution(label: &str, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &PackedSeq) {
     println!("\n{}", label);
-    println!("  X [{:>3}] {}", x.sum(), x.as_blocks());
-    println!("  Y [{:>3}] {}", y.sum(), y.as_blocks());
-    println!("  Z [{:>3}] {}", z.sum(), z.as_blocks());
-    println!("  W [{:>3}] {}", w.sum(), w.as_blocks());
+    for (name, seq) in [("X", x), ("Y", y), ("Z", z), ("W", w)] {
+        println!("{} =: '{}'  NB. {}", name, colored_pm(seq), seq.sum());
+    }
     println!();
 }
 
@@ -238,6 +254,8 @@ struct SearchConfig {
     phase_only: Option<String>,
     /// Path to XY boundary table file for table-based Phase C.
     xy_table_path: Option<String>,
+    /// Dump DIMACS CNF to this path instead of solving.
+    dump_dimacs: Option<String>,
 }
 
 impl Default for SearchConfig {
@@ -263,6 +281,7 @@ impl Default for SearchConfig {
             test_tuple: None,
             phase_only: None,
             xy_table_path: None,
+            dump_dimacs: None,
         }
     }
 }
@@ -427,6 +446,7 @@ fn boundary_signature_from_values(values: &[i8], k: usize) -> BoundarySignature 
     }
 }
 
+#[allow(dead_code)]
 fn autocorrs_from_values(values: &[i8]) -> Vec<i32> {
     let n = values.len();
     let mut out = vec![0; n];
@@ -1406,6 +1426,7 @@ fn build_sat_xy_clauses(
 }
 
 /// Trait abstracting over radical::Solver and cadical::Solver.
+#[allow(dead_code)]
 trait SatSolver {
     fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I);
     fn add_pb_eq(&mut self, lits: &[i32], coeffs: &[u32], target: u32);
@@ -1547,6 +1568,7 @@ impl SatXYTemplate {
 }
 
 /// SAT-based X/Y solver: given fixed Z/W, encode just X/Y constraints and solve.
+#[allow(dead_code)]
 fn sat_solve_xy(
     problem: Problem,
     tuple: SumTuple,
@@ -2474,8 +2496,9 @@ impl SatEncoder {
     }
 }
 
-fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>)> {
-    let encode_start = Instant::now();
+/// Build the full SAT encoding for a given problem and sum-tuple.
+/// Returns (encoder, solver) pair before solving.
+fn sat_encode(problem: Problem, tuple: SumTuple) -> (SatEncoder, radical::Solver) {
     let n = problem.n;
     let m = problem.m();
     let mut enc = SatEncoder::new(n);
@@ -2488,7 +2511,6 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
     solver.add_clause([enc.x_var(0)]);  // x[0] = +1
 
     // Sum constraints: encode that exactly (sum+len)/2 variables are true (=+1)
-    // sum = (# +1) - (# -1) = 2*(# +1) - len, so (# +1) = (sum + len) / 2
     let x_pos = ((tuple.x + n as i32) / 2) as usize;
     let y_pos = ((tuple.y + n as i32) / 2) as usize;
     let z_pos = ((tuple.z + n as i32) / 2) as usize;
@@ -2504,19 +2526,9 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
     enc.encode_cardinality_eq(&mut solver, &z_lits, z_pos);
     enc.encode_cardinality_eq(&mut solver, &w_lits, w_pos);
 
-    // Autocorrelation constraints:
-    // For each lag k: N_X(k) + N_Y(k) + 2*N_Z(k) + 2*N_W(k) = 0
-    // N_S(k) = 2*(# agree pairs) - (len_S - k)
-    //
-    // Let agree_xy = # X agree pairs + # Y agree pairs (weight 1 each)
-    //     agree_zw = # Z agree pairs + # W agree pairs (weight 1 each)
-    // Then constraint = (agree_xy) + 2*(agree_zw) = 2*(n-k) + w_overlap
-    //
-    // We use two separate counters and enumerate valid (c_xy, c_zw) splits.
-
     for k in 1..n {
         let w_overlap = if k < m { m - k } else { 0 };
-        let target = 2 * (n - k) + w_overlap; // agree_xy + 2*agree_zw = target
+        let target = 2 * (n - k) + w_overlap;
 
         let mut xy_lits = Vec::new();
         for i in 0..(n - k) {
@@ -2534,9 +2546,6 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
             zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
         }
 
-        // Weighted constraint: count(xy true) + 2*count(zw true) = target.
-        // Enumerate valid (c_xy, c_zw) splits. For each, create a selector
-        // that implies exact cardinality on both groups. OR all selectors.
         let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
         let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
 
@@ -2548,30 +2557,26 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
 
             let sel = enc.fresh();
 
-            // sel → (xy count >= c_xy)
             if c_xy > 0 {
                 if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
                     solver.add_clause([-sel, xy_ctr[c_xy]]);
                 } else {
-                    solver.add_clause([-sel]); // impossible
+                    solver.add_clause([-sel]);
                     continue;
                 }
             }
-            // sel → (xy count <= c_xy), i.e., ¬(xy >= c_xy+1)
             if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
                 solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
             }
 
-            // sel → (zw count >= c_zw)
             if c_zw > 0 {
                 if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
                     solver.add_clause([-sel, zw_ctr[c_zw]]);
                 } else {
-                    solver.add_clause([-sel]); // impossible
+                    solver.add_clause([-sel]);
                     continue;
                 }
             }
-            // sel → (zw count <= c_zw)
             if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
                 solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
             }
@@ -2580,11 +2585,20 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
         }
 
         if selectors.is_empty() {
-            solver.add_clause([]); // UNSAT
+            solver.add_clause([]);
         } else {
             solver.add_clause(selectors.iter().copied());
         }
     }
+
+    (enc, solver)
+}
+
+fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>)> {
+    let encode_start = Instant::now();
+    let n = problem.n;
+    let m = problem.m();
+    let (enc, mut solver) = sat_encode(problem, tuple);
 
     let encode_elapsed = encode_start.elapsed();
     if verbose {
@@ -2775,6 +2789,7 @@ impl XYBoundaryTable {
     }
 
     /// Expand boundary bits into full sequence values at boundary positions.
+    #[allow(dead_code)]
     fn expand_boundary(&self, bits: u32, seq: &mut [i8]) {
         let k = self.k;
         let n = self.n;
@@ -2899,7 +2914,7 @@ impl XYBoundaryTable {
                     for i in 0..k { bnd_vals[n+i] = yv[i]; bnd_vals[n+n-k+i] = yv[n-k+i]; }
 
                     // Precompute term states for all quad PB constraints and inject
-                    let mut infeasible = false;
+                    let _infeasible = false;
                     for qi in 0..num_qpb {
                         let infos = &qpb_term_info[qi];
                         let mut st = 0i32; let mut sm = 0i32;
@@ -3287,7 +3302,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let (result_tx, result_rx) = std::sync::mpsc::channel::<Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>>();
     // Per-worker channels: coordinator sends work, worker receives
     let mut worker_txs: Vec<std::sync::mpsc::SyncSender<Option<WorkItem>>> = Vec::new();
-    let mut worker_ready_tx_list: Vec<std::sync::mpsc::Sender<usize>> = Vec::new();
+    let _worker_ready_tx_list: Vec<std::sync::mpsc::Sender<usize>> = Vec::new();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<usize>(); // workers signal "I'm idle"
 
     // Spawn workers
@@ -3481,6 +3496,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         println!("\n--- Phase timing (wall-clock, {} threads) ---", workers);
         println!("  Phase A (tuple enum):       {:>10.3?}", phase_a_elapsed);
         println!("  Phase B (Z/W gen+spectral): {:>10.3?}  (thread-sum)", phase_b);
+        println!("  Phase C (SAT X/Y):          {:>10.3?}  (thread-sum)", phase_c);
         println!("  Pairs dispatched:           {:>10}", pairs_dispatched);
         println!("  Total wall-clock:           {:>10.3?}", total);
         if !found_solution {
@@ -3548,6 +3564,8 @@ fn parse_args() -> SearchConfig {
             }
         } else if let Some(v) = arg.strip_prefix("--xy-table=") {
             cfg.xy_table_path = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
+            cfg.dump_dimacs = Some(v.to_string());
         }
     }
     cfg
@@ -3653,6 +3671,31 @@ fn main() {
                     candidates.len(), start.elapsed());
             }
         }
+        return;
+    }
+    if let Some(ref path) = cfg.dump_dimacs {
+        let problem = cfg.problem;
+        let raw = enumerate_sum_tuples(problem);
+        let mut seen = std::collections::HashSet::new();
+        let mut tuples: Vec<SumTuple> = raw.into_iter()
+            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+            .filter(|t| {
+                (t.x + problem.n as i32) % 2 == 0
+                && (t.y + problem.n as i32) % 2 == 0
+                && (t.z + problem.n as i32) % 2 == 0
+                && (t.w + problem.m() as i32) % 2 == 0
+            })
+            .collect();
+        if let Some(ref t) = cfg.test_tuple {
+            tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
+        }
+        tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs()));
+        let tuple = tuples[0];
+        println!("Dumping DIMACS for TT({}) tuple {} to {}", problem.n, tuple, path);
+        let (_enc, solver) = sat_encode(problem, tuple);
+        let mut file = std::fs::File::create(path).expect("failed to create DIMACS file");
+        solver.dump_dimacs(&mut file).expect("failed to write DIMACS");
+        println!("Wrote {} vars, {} clauses", solver.num_vars(), solver.num_clauses());
         return;
     }
     if cfg.benchmark_repeats > 0 {
