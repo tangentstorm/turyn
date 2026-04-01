@@ -161,6 +161,9 @@ pub struct Solver {
 
     // State
     ok: bool, // false if top-level conflict detected
+    /// When true, skip quad PB incremental updates during backtrack.
+    /// Used when the caller will reset quad PB state externally.
+    pub skip_backtrack_quad_pb: bool,
 }
 
 impl Solver {
@@ -215,6 +218,7 @@ impl Solver {
             luby_index: 0,
             conflict_limit: 0,
             ok: true,
+            skip_backtrack_quad_pb: false,
         }
     }
 
@@ -1059,9 +1063,12 @@ impl Solver {
             self.assigns[v] = LBool::Undef;
             if v < self.quad_pb_reasons.len() { self.quad_pb_reasons[v] = None; }
             // Incrementally update quad PB term states after unassigning
-            for idx in 0..self.quad_pb_var_terms[v].len() {
-                let (qi, ti) = self.quad_pb_var_terms[v][idx];
-                self.update_quad_pb_term(qi, ti as usize);
+            // (skipped when backtracking to level 0 and caller will reset state)
+            if !(self.skip_backtrack_quad_pb && level == 0) {
+                for idx in 0..self.quad_pb_var_terms[v].len() {
+                    let (qi, ti) = self.quad_pb_var_terms[v][idx];
+                    self.update_quad_pb_term(qi, ti as usize);
+                }
             }
             self.heap_insert(v);
         }

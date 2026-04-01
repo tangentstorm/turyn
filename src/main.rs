@@ -2816,6 +2816,9 @@ impl XYBoundaryTable {
             solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
         }
 
+        // Skip quad PB incremental updates during backtrack — we reset state per config
+        solver.skip_backtrack_quad_pb = true;
+
         // Precompute per quad PB constraint: which terms have BOTH vars in boundary
         let is_bnd = |pos: usize| -> bool { pos < k || pos >= n - k };
         let num_qpb = solver.num_quad_pb();
