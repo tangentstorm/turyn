@@ -2675,8 +2675,36 @@ fn hybrid_solve_tuple(
             unique_candidates.len(), zw_candidates.len());
     }
 
+    // For large n, use conflict limit to quickly reject easy-UNSAT pairs,
+    // then retry deferred (UNKNOWN) pairs without limit.
+    let conflict_limit = if problem.n >= 26 { 50000u64 } else { 0 };
+    let mut deferred: Vec<usize> = Vec::new();
+
     for (idx, cand) in unique_candidates.iter().enumerate() {
         if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
+        let sat_start = Instant::now();
+        let (result, was_limited) = template.solve_for_limited(cand, conflict_limit);
+        stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
+        if let Some((x, y)) = result {
+            let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
+            if verbose {
+                print_solution(&format!("TT({}) hybrid (pair {}, {:.3?}, verified={})", problem.n, idx, sat_start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
+            }
+            if ok {
+                found.store(true, AtomicOrdering::Relaxed);
+                return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
+            }
+        } else if was_limited {
+            deferred.push(idx);
+        } else if verbose {
+            println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
+        }
+    }
+
+    // Pass 2: retry deferred candidates without limit
+    for &idx in &deferred {
+        if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
+        let cand = unique_candidates[idx];
         let sat_start = Instant::now();
         if let Some((x, y)) = template.solve_for(cand) {
             stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
