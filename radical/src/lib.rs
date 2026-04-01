@@ -445,6 +445,23 @@ impl Solver {
     }
     /// Number of conflicts so far.
     pub fn num_conflicts(&self) -> u64 { self.conflicts }
+
+    /// Write all clauses in DIMACS CNF format to the given writer.
+    /// Note: PB and quad-PB constraints are not included (DIMACS only supports CNF).
+    pub fn dump_dimacs(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        let num_clauses = self.clause_meta.iter().filter(|m| !m.deleted).count();
+        writeln!(w, "p cnf {} {}", self.num_vars, num_clauses)?;
+        for m in &self.clause_meta {
+            if m.deleted { continue; }
+            let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
+            for &lit in lits {
+                write!(w, "{} ", lit)?;
+            }
+            writeln!(w, "0")?;
+        }
+        Ok(())
+    }
+
     /// Set a conflict limit. Solve returns None if limit is reached.
     /// Set to 0 to disable.
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }

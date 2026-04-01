@@ -254,6 +254,8 @@ struct SearchConfig {
     phase_only: Option<String>,
     /// Path to XY boundary table file for table-based Phase C.
     xy_table_path: Option<String>,
+    /// Dump DIMACS CNF to this path instead of solving.
+    dump_dimacs: Option<String>,
 }
 
 impl Default for SearchConfig {
@@ -279,6 +281,7 @@ impl Default for SearchConfig {
             test_tuple: None,
             phase_only: None,
             xy_table_path: None,
+            dump_dimacs: None,
         }
     }
 }
@@ -2493,8 +2496,9 @@ impl SatEncoder {
     }
 }
 
-fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>)> {
-    let encode_start = Instant::now();
+/// Build the full SAT encoding for a given problem and sum-tuple.
+/// Returns (encoder, solver) pair before solving.
+fn sat_encode(problem: Problem, tuple: SumTuple) -> (SatEncoder, radical::Solver) {
     let n = problem.n;
     let m = problem.m();
     let mut enc = SatEncoder::new(n);
@@ -2507,7 +2511,6 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
     solver.add_clause([enc.x_var(0)]);  // x[0] = +1
 
     // Sum constraints: encode that exactly (sum+len)/2 variables are true (=+1)
-    // sum = (# +1) - (# -1) = 2*(# +1) - len, so (# +1) = (sum + len) / 2
     let x_pos = ((tuple.x + n as i32) / 2) as usize;
     let y_pos = ((tuple.y + n as i32) / 2) as usize;
     let z_pos = ((tuple.z + n as i32) / 2) as usize;
@@ -2523,19 +2526,9 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
     enc.encode_cardinality_eq(&mut solver, &z_lits, z_pos);
     enc.encode_cardinality_eq(&mut solver, &w_lits, w_pos);
 
-    // Autocorrelation constraints:
-    // For each lag k: N_X(k) + N_Y(k) + 2*N_Z(k) + 2*N_W(k) = 0
-    // N_S(k) = 2*(# agree pairs) - (len_S - k)
-    //
-    // Let agree_xy = # X agree pairs + # Y agree pairs (weight 1 each)
-    //     agree_zw = # Z agree pairs + # W agree pairs (weight 1 each)
-    // Then constraint = (agree_xy) + 2*(agree_zw) = 2*(n-k) + w_overlap
-    //
-    // We use two separate counters and enumerate valid (c_xy, c_zw) splits.
-
     for k in 1..n {
         let w_overlap = if k < m { m - k } else { 0 };
-        let target = 2 * (n - k) + w_overlap; // agree_xy + 2*agree_zw = target
+        let target = 2 * (n - k) + w_overlap;
 
         let mut xy_lits = Vec::new();
         for i in 0..(n - k) {
@@ -2553,9 +2546,6 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
             zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
         }
 
-        // Weighted constraint: count(xy true) + 2*count(zw true) = target.
-        // Enumerate valid (c_xy, c_zw) splits. For each, create a selector
-        // that implies exact cardinality on both groups. OR all selectors.
         let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
         let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
 
@@ -2567,30 +2557,26 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
 
             let sel = enc.fresh();
 
-            // sel → (xy count >= c_xy)
             if c_xy > 0 {
                 if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
                     solver.add_clause([-sel, xy_ctr[c_xy]]);
                 } else {
-                    solver.add_clause([-sel]); // impossible
+                    solver.add_clause([-sel]);
                     continue;
                 }
             }
-            // sel → (xy count <= c_xy), i.e., ¬(xy >= c_xy+1)
             if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
                 solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
             }
 
-            // sel → (zw count >= c_zw)
             if c_zw > 0 {
                 if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
                     solver.add_clause([-sel, zw_ctr[c_zw]]);
                 } else {
-                    solver.add_clause([-sel]); // impossible
+                    solver.add_clause([-sel]);
                     continue;
                 }
             }
-            // sel → (zw count <= c_zw)
             if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
                 solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
             }
@@ -2599,11 +2585,20 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
         }
 
         if selectors.is_empty() {
-            solver.add_clause([]); // UNSAT
+            solver.add_clause([]);
         } else {
             solver.add_clause(selectors.iter().copied());
         }
     }
+
+    (enc, solver)
+}
+
+fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>)> {
+    let encode_start = Instant::now();
+    let n = problem.n;
+    let m = problem.m();
+    let (enc, mut solver) = sat_encode(problem, tuple);
 
     let encode_elapsed = encode_start.elapsed();
     if verbose {
@@ -3569,6 +3564,8 @@ fn parse_args() -> SearchConfig {
             }
         } else if let Some(v) = arg.strip_prefix("--xy-table=") {
             cfg.xy_table_path = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
+            cfg.dump_dimacs = Some(v.to_string());
         }
     }
     cfg
@@ -3674,6 +3671,31 @@ fn main() {
                     candidates.len(), start.elapsed());
             }
         }
+        return;
+    }
+    if let Some(ref path) = cfg.dump_dimacs {
+        let problem = cfg.problem;
+        let raw = enumerate_sum_tuples(problem);
+        let mut seen = std::collections::HashSet::new();
+        let mut tuples: Vec<SumTuple> = raw.into_iter()
+            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+            .filter(|t| {
+                (t.x + problem.n as i32) % 2 == 0
+                && (t.y + problem.n as i32) % 2 == 0
+                && (t.z + problem.n as i32) % 2 == 0
+                && (t.w + problem.m() as i32) % 2 == 0
+            })
+            .collect();
+        if let Some(ref t) = cfg.test_tuple {
+            tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
+        }
+        tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs()));
+        let tuple = tuples[0];
+        println!("Dumping DIMACS for TT({}) tuple {} to {}", problem.n, tuple, path);
+        let (_enc, solver) = sat_encode(problem, tuple);
+        let mut file = std::fs::File::create(path).expect("failed to create DIMACS file");
+        solver.dump_dimacs(&mut file).expect("failed to write DIMACS");
+        println!("Wrote {} vars, {} clauses", solver.num_vars(), solver.num_clauses());
         return;
     }
     if cfg.benchmark_repeats > 0 {
