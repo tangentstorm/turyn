@@ -1289,7 +1289,13 @@ fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Option<Vec<(i32
                     if row.constant { return None; }
                 }
                 1 => {
-                    // Forced variable: skip for now
+                    // Forced variable: x_v = constant (in GF(2)).
+                    // constant=true → x_v has bit 1 → same as x[0] (forced +1) → equal
+                    // constant=false → x_v has bit 0 → opposite of x[0] → negated
+                    let v = set_vars[0];
+                    if !union(&mut parent, &mut rank, &mut neg, v, 0, !row.constant) {
+                        return None;
+                    }
                 }
                 2 => {
                     let a = set_vars[0];
