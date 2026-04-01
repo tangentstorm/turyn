@@ -535,8 +535,9 @@ impl Solver {
             // PB propagation: lit became true, so ¬lit is false.
             if !self.pb_constraints.is_empty() {
                 let watch_idx = lit_index(lit);
-                let pb_list: Vec<u32> = self.pb_watches[watch_idx].clone();
-                for &pbi in &pb_list {
+                // PB watches are static (never modified), iterate by index to avoid clone
+                for idx in 0..self.pb_watches[watch_idx].len() {
+                    let pbi = self.pb_watches[watch_idx][idx];
                     if let Some(conflict_reason) = self.propagate_pb(pbi) {
                         return Some(conflict_reason);
                     }

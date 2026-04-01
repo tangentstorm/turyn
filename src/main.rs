@@ -1392,6 +1392,7 @@ trait SatSolver {
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool>;
     fn value(&self, var: i32) -> Option<bool>;
     fn reset(&mut self);
+    fn set_conflict_limit(&mut self, limit: u64);
 }
 
 impl SatSolver for radical::Solver {
@@ -1412,6 +1413,9 @@ impl SatSolver for radical::Solver {
     }
     fn reset(&mut self) {
         self.reset();
+    }
+    fn set_conflict_limit(&mut self, limit: u64) {
+        self.set_conflict_limit(limit);
     }
 }
 
@@ -1434,6 +1438,9 @@ impl SatSolver for cadical::Solver {
     }
     fn reset(&mut self) {
         // CaDiCaL auto-resets after solve
+    }
+    fn set_conflict_limit(&mut self, _limit: u64) {
+        // CaDiCaL uses its own limit mechanism
     }
 }
 
@@ -1463,13 +1470,18 @@ impl SatXYTemplate {
 
     /// Solve for X/Y given a specific Z/W candidate.
     /// Clones the template and adds PB constraints for per-lag agree targets.
-    fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
-        if !self.is_feasible(candidate) { return None; }
+    /// Returns (result, was_limited): result is Some if SAT, None if UNSAT/UNKNOWN.
+    /// was_limited=true means we hit the conflict limit (UNKNOWN).
+    fn solve_for_limited(&self, candidate: &CandidateZW, conflict_limit: u64) -> (Option<(PackedSeq, PackedSeq)>, bool) {
+        if !self.is_feasible(candidate) { return (None, false); }
         let n = self.n;
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
 
         let mut solver = self.solver.clone();
+        if conflict_limit > 0 {
+            solver.set_conflict_limit(conflict_limit);
+        }
 
         // GJ-derived equalities from extreme-target lags
         let equalities = gj_candidate_equalities(n, candidate);
@@ -1496,10 +1508,15 @@ impl SatXYTemplate {
             Some(true) => {
                 let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
                 let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)))
+                (Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y))), false)
             }
-            _ => None,
+            Some(false) => (None, false),  // definite UNSAT
+            None => (None, true),  // hit conflict limit (UNKNOWN)
         }
+    }
+
+    fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
+        self.solve_for_limited(candidate, 0).0
     }
 }
 
@@ -2658,11 +2675,18 @@ fn hybrid_solve_tuple(
             unique_candidates.len(), zw_candidates.len());
     }
 
+    // Two-pass SAT strategy: first pass with conflict limit for quick rejects,
+    // second pass without limit for remaining candidates.
+    let conflict_limit = if problem.n >= 24 { 50000 } else { 0 };
+    let mut deferred: Vec<usize> = Vec::new();
+
+    // Pass 1: try all candidates with conflict limit
     for (idx, cand) in unique_candidates.iter().enumerate() {
         if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
         let sat_start = Instant::now();
-        if let Some((x, y)) = template.solve_for(cand) {
-            stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
+        let (result, was_limited) = template.solve_for_limited(cand, conflict_limit);
+        stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
+        if let Some((x, y)) = result {
             let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
             if verbose {
                 print_solution(&format!("TT({}) hybrid (pair {}, {:.3?}, verified={})", problem.n, idx, sat_start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
@@ -2671,10 +2695,32 @@ fn hybrid_solve_tuple(
                 found.store(true, AtomicOrdering::Relaxed);
                 return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
             }
+        } else if was_limited {
+            deferred.push(idx);
+        } else if verbose {
+            println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
+        }
+    }
+
+    // Pass 2: retry deferred candidates without limit
+    for &idx in &deferred {
+        if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
+        let cand = unique_candidates[idx];
+        let sat_start = Instant::now();
+        if let Some((x, y)) = template.solve_for(cand) {
+            stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
+            let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
+            if verbose {
+                print_solution(&format!("TT({}) hybrid (pair {}/deferred, {:.3?}, verified={})", problem.n, idx, sat_start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
+            }
+            if ok {
+                found.store(true, AtomicOrdering::Relaxed);
+                return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
+            }
         } else {
             stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
             if verbose {
-                println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
+                println!("SAT X/Y: UNSAT for pair {}/deferred in {:.3?}", idx, sat_start.elapsed());
             }
         }
     }
