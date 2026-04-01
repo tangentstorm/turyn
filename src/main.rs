@@ -3281,10 +3281,14 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
     use std::collections::BinaryHeap;
 
-    // Auto-widen spectral bound for n >= 28
+    // Auto-widen spectral pair bound for n >= 28.
+    // Individual Z/W are still filtered at the strict spectral_bound, so the
+    // theoretical max pair sum is 2 * spectral_bound.  Widening to that limit
+    // effectively disables the pair filter, but the priority queue dispatches
+    // tightest pairs first so SAT effort concentrates on the best candidates.
     let mut producer_cfg = cfg.clone();
     if producer_cfg.max_spectral.is_none() && problem.n >= 28 {
-        let widened = problem.spectral_bound() + 30.0;
+        let widened = problem.spectral_bound() * 2.0;
         if verbose {
             eprintln!("Auto-widening spectral bound to {:.0} for n={}", widened, problem.n);
         }
