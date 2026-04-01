@@ -225,6 +225,17 @@ struct SearchConfig {
     /// If None, uses the default spectral_bound (= (6n-2)/2).
     /// Setting this lower than spectral_bound trades completeness for speed.
     max_spectral: Option<f64>,
+    /// Test mode: verify a known solution or test SAT on known Z/W.
+    /// Format: 4 strings of +/- chars, e.g. "++--+-" for [1,1,-1,-1,1,-1].
+    verify_seqs: Option<[String; 4]>,
+    /// Test SAT X/Y with given Z/W (2 strings of +/- chars).
+    test_zw: Option<[String; 2]>,
+    /// Conflict limit per SAT solve (0 = unlimited).
+    conflict_limit: u64,
+    /// Test a specific sum-tuple (x,y,z,w) only.
+    test_tuple: Option<SumTuple>,
+    /// Run only Phase A (print tuples) or Phase B (print Z/W pairs).
+    phase_only: Option<String>,
 }
 
 impl Default for SearchConfig {
@@ -244,6 +255,11 @@ impl Default for SearchConfig {
             z_sat: false,
             dfs: false,
             max_spectral: None,
+            verify_seqs: None,
+            test_zw: None,
+            conflict_limit: 0,
+            test_tuple: None,
+            phase_only: None,
         }
     }
 }
@@ -2580,6 +2596,10 @@ fn hybrid_solve_tuple(
     let spectral_z = SpectralFilter::new(max_seq_len, cfg.theta_samples);
     let spectral_w = SpectralFilter::new(max_seq_len, cfg.theta_samples);
 
+    // Phase B: generate Z/W candidates and Phase C: SAT-test them in batches.
+    // Instead of generating ALL candidates then testing, we generate a batch of Z/W
+    // pairs, SAT-test them, then generate more. This interleaves Phase B and C so
+    // we don't spend minutes in Phase B before trying any SAT.
     let phase_b_start = Instant::now();
     let zw_candidates =
         build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats);
@@ -2642,6 +2662,21 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             && (t.w + problem.m() as i32) % 2 == 0
         })
         .collect();
+    // Filter to specific tuple if --tuple is set
+    if let Some(ref t) = cfg.test_tuple {
+        tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
+    }
+
+    // For large n, reduce per-tuple limits to get through more tuples.
+    // At n=26, 200K candidates per tuple means Phase B takes >10s each.
+    // With 50K, Phase B takes ~0.5s and we cover 10x more tuples.
+    let mut cfg = cfg.clone();
+    if problem.n >= 26 && cfg.max_z > 50_000 {
+        cfg.max_z = 50_000;
+        cfg.max_w = 50_000;
+    }
+    let cfg = cfg;
+
     // Heuristic tuple ordering: balance "likely to contain solution" with
     // "cheap to search". Known TT solutions have x≈y, so |x-y| is key.
     // But also need small |z|+|w| for cheap Phase B.
@@ -2662,7 +2697,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     if workers <= 1 || tuples.len() <= 1 {
         let mut stats = SearchStats::default();
         for tuple in &tuples {
-            let (result, local_stats) = hybrid_solve_tuple(problem, *tuple, cfg, &found, verbose);
+            let (result, local_stats) = hybrid_solve_tuple(problem, *tuple, &cfg, &found, verbose);
             stats.merge_from(&local_stats);
             if let Some((x, y, z, w)) = result {
                 if verbose {
@@ -2816,13 +2851,131 @@ fn parse_args() -> SearchConfig {
             cfg.z_sat = true;
         } else if let Some(v) = arg.strip_prefix("--max-spectral=") {
             cfg.max_spectral = Some(v.parse().unwrap_or(0.0));
+        } else if let Some(v) = arg.strip_prefix("--verify=") {
+            let parts: Vec<&str> = v.split(',').collect();
+            if parts.len() == 4 {
+                cfg.verify_seqs = Some([parts[0].to_string(), parts[1].to_string(),
+                                        parts[2].to_string(), parts[3].to_string()]);
+            }
+        } else if let Some(v) = arg.strip_prefix("--test-zw=") {
+            let parts: Vec<&str> = v.split(',').collect();
+            if parts.len() == 2 {
+                cfg.test_zw = Some([parts[0].to_string(), parts[1].to_string()]);
+            }
+        } else if let Some(v) = arg.strip_prefix("--conflict-limit=") {
+            cfg.conflict_limit = v.parse().unwrap_or(0);
+        } else if arg == "--phase-a" || arg == "--phase-b" {
+            cfg.phase_only = Some(arg[2..].to_string());
+        } else if let Some(v) = arg.strip_prefix("--tuple=") {
+            let parts: Vec<i32> = v.split(',').filter_map(|s| s.parse().ok()).collect();
+            if parts.len() == 4 {
+                cfg.test_tuple = Some(SumTuple { x: parts[0], y: parts[1], z: parts[2], w: parts[3] });
+            }
         }
     }
     cfg
 }
 
+/// Parse a +/- string into a PackedSeq. '+' = +1, '-' = -1.
+fn parse_seq(s: &str) -> PackedSeq {
+    let vals: Vec<i8> = s.chars().map(|c| if c == '+' { 1 } else { -1 }).collect();
+    PackedSeq::from_values(&vals)
+}
+
 fn main() {
     let cfg = parse_args();
+    if let Some(ref seqs) = cfg.verify_seqs {
+        let x = parse_seq(&seqs[0]);
+        let y = parse_seq(&seqs[1]);
+        let z = parse_seq(&seqs[2]);
+        let w = parse_seq(&seqs[3]);
+        let n = x.len();
+        let p = Problem::new(n);
+        print_solution(&format!("Verifying TT({})", n), &x, &y, &z, &w);
+        let ok = verify_tt(p, &x, &y, &z, &w);
+        println!("Verified: {}", ok);
+        if !ok { std::process::exit(1); }
+        return;
+    }
+    if let Some(ref zw) = cfg.test_zw {
+        let z = parse_seq(&zw[0]);
+        let w = parse_seq(&zw[1]);
+        let n = z.len();
+        let p = Problem::new(n);
+        let zs = z.sum();
+        let ws = w.sum();
+        // Compute ZW autocorrelation
+        let mut zw_autocorr = vec![0i32; n];
+        for s in 1..n {
+            let nz = z.autocorrelation(s);
+            let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
+            zw_autocorr[s] = 2 * nz + 2 * nw;
+        }
+        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr };
+        // Try all sum tuples that match this Z/W
+        let raw = enumerate_sum_tuples(p);
+        let mut seen = std::collections::HashSet::new();
+        let tuples: Vec<SumTuple> = raw.into_iter()
+            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+            .filter(|t| t.z == zs && t.w == ws)
+            .filter(|t| (t.x + n as i32) % 2 == 0 && (t.y + n as i32) % 2 == 0)
+            .collect();
+        println!("TT({}): testing Z(sum={}) W(sum={}) against {} tuples", n, zs, ws, tuples.len());
+        print_solution("  Z/W", &PackedSeq::from_values(&[0]), &PackedSeq::from_values(&[0]), &z, &w);
+        for tuple in &tuples {
+            let start = Instant::now();
+            let Some(template) = SatXYTemplate::build(p, *tuple) else { continue };
+            if let Some((x, y)) = template.solve_for(&candidate) {
+                let ok = verify_tt(p, &x, &y, &z, &w);
+                print_solution(&format!("FOUND for tuple {} ({:.3?}, verified={})", tuple, start.elapsed(), ok), &x, &y, &z, &w);
+                if ok { return; }
+            } else {
+                println!("  Tuple {}: UNSAT ({:.3?})", tuple, start.elapsed());
+            }
+        }
+        println!("No X/Y found for given Z/W");
+        return;
+    }
+    if let Some(ref phase) = cfg.phase_only {
+        let problem = cfg.problem;
+        let raw = enumerate_sum_tuples(problem);
+        let mut seen = std::collections::HashSet::new();
+        let mut tuples: Vec<SumTuple> = raw.into_iter()
+            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+            .filter(|t| {
+                (t.x + problem.n as i32) % 2 == 0
+                && (t.y + problem.n as i32) % 2 == 0
+                && (t.z + problem.n as i32) % 2 == 0
+                && (t.w + problem.m() as i32) % 2 == 0
+            })
+            .collect();
+        if let Some(ref t) = cfg.test_tuple {
+            tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
+        }
+        tuples.sort_by_key(|t| ((t.x - t.y).abs() * 2 + t.z.abs() + t.w.abs(), t.x.abs() + t.y.abs()));
+
+        if phase == "phase-a" {
+            println!("TT({}): {} tuples (x,y,z,w) satisfying x²+y²+2z²+2w²={}",
+                problem.n, tuples.len(), problem.target_energy());
+            for t in &tuples {
+                println!("  ({},{},{},{})", t.x, t.y, t.z, t.w);
+            }
+        } else if phase == "phase-b" {
+            let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
+            let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
+            for tuple in &tuples {
+                let mut stats = SearchStats::default();
+                let start = Instant::now();
+                let candidates = build_zw_candidates(problem, *tuple, &cfg, &spectral_z, &spectral_w, &mut stats);
+                println!("({},{},{},{}): z={}/{} w={}/{} pairs={} ({:.3?})",
+                    tuple.x, tuple.y, tuple.z, tuple.w,
+                    stats.z_spectral_ok, stats.z_generated,
+                    stats.w_spectral_ok, stats.w_generated,
+                    candidates.len(), start.elapsed());
+            }
+        }
+        return;
+    }
     if cfg.benchmark_repeats > 0 {
         run_benchmark(&cfg);
     } else if cfg.z_sat {
@@ -2907,6 +3060,11 @@ mod tests {
             z_sat: false,
             dfs: false,
             max_spectral: None,
+            verify_seqs: None,
+            test_zw: None,
+            conflict_limit: 0,
+            test_tuple: None,
+            phase_only: None,
         };
         let report = run_search(&cfg, false);
         assert!(report.found_solution);
