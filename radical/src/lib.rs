@@ -443,6 +443,14 @@ impl Solver {
     /// Set to 0 to disable.
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
 
+    /// Pre-allocate internal buffers for expected search size.
+    /// Call before cloning as a template to ensure clones have capacity.
+    pub fn reserve_for_search(&mut self, expected_clauses: usize) {
+        self.clause_lits.reserve(expected_clauses * 5);
+        self.clause_meta.reserve(expected_clauses);
+        self.trail.reserve(self.num_vars);
+    }
+
     fn solve_inner(&mut self, base_level: u32) -> Option<bool> {
         loop {
             if let Some(conflict_reason) = self.propagate() {

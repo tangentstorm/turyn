@@ -1470,6 +1470,9 @@ impl SatXYTemplate {
         let mut solver: cadical::Solver = Default::default();
 
         let (lag_pairs, n) = build_sat_xy_clauses(problem, tuple, &mut solver)?;
+        // Pre-allocate for expected search size (reduces realloc during solve)
+        #[cfg(not(feature = "cadical"))]
+        solver.reserve_for_search(200);
         Some(Self { solver, lag_pairs, n })
     }
 
