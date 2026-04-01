@@ -33,10 +33,11 @@ fn negate(lit: Lit) -> Lit {
 
 /// Assignment value for a variable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 enum LBool {
-    True,
-    False,
-    Undef,
+    Undef = 0,
+    True = 1,
+    False = 2,
 }
 
 /// Clause metadata (literals stored in flat `clause_lits` array).
