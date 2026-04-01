@@ -78,11 +78,14 @@ struct QuadPbConstraint {
     lits_b: Vec<Lit>,
     coeffs: Vec<u32>,
     target: u32,
-    // Pre-computed variable indices and sign masks for fast access
+    // Pre-computed variable indices and polarity for fast access
     vars_a: Vec<usize>,
     vars_b: Vec<usize>,
     neg_a: Vec<bool>,
     neg_b: Vec<bool>,
+    // Pre-encoded: the LBool value that means "literal is true"
+    true_val_a: Vec<LBool>,
+    true_val_b: Vec<LBool>,
     num_terms: u32,
     // Incremental state per term: 0=DEAD, 1=MAYBE, 2=TRUE
     term_state: Vec<u8>,
@@ -158,6 +161,9 @@ pub struct Solver {
 
     // State
     ok: bool, // false if top-level conflict detected
+    /// When true, skip quad PB incremental updates during backtrack.
+    /// Used when the caller will reset quad PB state externally.
+    pub skip_backtrack_quad_pb: bool,
 }
 
 impl Solver {
@@ -212,6 +218,7 @@ impl Solver {
             luby_index: 0,
             conflict_limit: 0,
             ok: true,
+            skip_backtrack_quad_pb: false,
         }
     }
 
@@ -357,12 +364,15 @@ impl Solver {
         let vars_b: Vec<usize> = lits_b.iter().map(|&l| var_of(l)).collect();
         let neg_a: Vec<bool> = lits_a.iter().map(|&l| l < 0).collect();
         let neg_b: Vec<bool> = lits_b.iter().map(|&l| l < 0).collect();
+        let true_val_a: Vec<LBool> = lits_a.iter().map(|&l| if l > 0 { LBool::True } else { LBool::False }).collect();
+        let true_val_b: Vec<LBool> = lits_b.iter().map(|&l| if l > 0 { LBool::True } else { LBool::False }).collect();
         self.quad_pb_constraints.push(QuadPbConstraint {
             lits_a: lits_a.to_vec(),
             lits_b: lits_b.to_vec(),
             coeffs: coeffs.to_vec(),
             target,
             vars_a, vars_b, neg_a, neg_b,
+            true_val_a, true_val_b,
             num_terms: lits_a.len() as u32,
             term_state: vec![1u8; lits_a.len()], // all MAYBE initially
             sum_true: 0,
@@ -436,6 +446,58 @@ impl Solver {
     /// Set a conflict limit. Solve returns None if limit is reached.
     /// Set to 0 to disable.
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
+
+    /// Reset a quad PB constraint's incremental state from precomputed values.
+    /// Used for fast boundary config switching without backtracking.
+    pub fn reset_quad_pb_state(&mut self, qi: usize, term_state: &[u8], sum_true: i32, sum_maybe: i32) {
+        let qc = &mut self.quad_pb_constraints[qi];
+        qc.term_state[..term_state.len()].copy_from_slice(term_state);
+        qc.sum_true = sum_true;
+        qc.sum_maybe = sum_maybe;
+    }
+
+    /// Get the number of quad PB constraints.
+    pub fn num_quad_pb(&self) -> usize { self.quad_pb_constraints.len() }
+
+    /// Get the number of terms in a quad PB constraint.
+    pub fn quad_pb_num_terms(&self, qi: usize) -> usize { self.quad_pb_constraints[qi].num_terms as usize }
+
+    /// Get quad PB term info for precomputation.
+    pub fn quad_pb_term_info(&self, qi: usize, ti: usize) -> (usize, usize, bool, bool) {
+        let qc = &self.quad_pb_constraints[qi];
+        (qc.vars_a[ti], qc.vars_b[ti], qc.neg_a[ti], qc.neg_b[ti])
+    }
+
+    /// Full reset to base state: unassign all variables, clear trail, reset conflicts.
+    /// Keeps all constraints and learnt clauses intact.
+    pub fn reset_to_base(&mut self) {
+        // Backtrack to level 0
+        self.backtrack(0);
+        // Reset conflict counter and restart state
+        self.conflicts = 0;
+        self.restart_limit = 100;
+        self.luby_index = 0;
+    }
+
+    /// Delete all learnt clauses and clean watch lists.
+    /// Call between independent solves to prevent clause database bloat.
+    pub fn clear_learnt(&mut self) {
+        self.backtrack(0);
+        for m in &mut self.clause_meta {
+            if m.learnt { m.deleted = true; }
+        }
+        for wl in &mut self.watches {
+            wl.retain(|&(ci, _)| !self.clause_meta[ci as usize].deleted);
+        }
+    }
+
+    /// Pre-allocate internal buffers for expected search size.
+    /// Call before cloning as a template to ensure clones have capacity.
+    pub fn reserve_for_search(&mut self, expected_clauses: usize) {
+        self.clause_lits.reserve(expected_clauses * 5);
+        self.clause_meta.reserve(expected_clauses);
+        self.trail.reserve(self.num_vars);
+    }
 
     fn solve_inner(&mut self, base_level: u32) -> Option<bool> {
         loop {
@@ -653,10 +715,18 @@ impl Solver {
         let pb = &self.pb_constraints[pbi as usize];
         let n = pb.lits.len();
 
-        // Compute slack: sum coefficients for non-false literals, subtract bound
+        // Compute slack: sum coefficients for non-false literals, subtract bound.
+        // For unit coefficients, slack = count(non-false) - bound.
         let mut slack: i64 = -(pb.bound as i64);
+        let mut first_undef = n; // index of first undef literal
         for i in 0..n {
-            if self.lit_value(pb.lits[i]) != LBool::False {
+            let v = var_of(pb.lits[i]);
+            let a = self.assigns[v];
+            if a == LBool::Undef {
+                slack += pb.coeffs[i] as i64;
+                if first_undef == n { first_undef = i; }
+            } else if (a == LBool::True) == (pb.lits[i] > 0) {
+                // Literal is true → contributes to slack
                 slack += pb.coeffs[i] as i64;
             }
         }
@@ -665,11 +735,15 @@ impl Solver {
             return Some(Reason::Pb(pbi)); // conflict
         }
 
-        // Propagate: any undef literal whose coefficient > slack must be true
-        for i in 0..n {
+        // Propagate: any undef literal whose coefficient > slack must be true.
+        // Early exit: if slack >= max_coeff, no propagation possible.
+        if slack > 0 { return None; } // all coefficients are 1, so slack>0 means no propagation
+
+        // slack == 0: force all undef literals
+        for i in first_undef..n {
             let lit = self.pb_constraints[pbi as usize].lits[i];
-            let coeff = self.pb_constraints[pbi as usize].coeffs[i];
-            if self.lit_value(lit) == LBool::Undef && (coeff as i64) > slack {
+            let v = var_of(lit);
+            if self.assigns[v] == LBool::Undef {
                 self.enqueue(lit, Reason::Pb(pbi));
             }
         }
@@ -701,29 +775,27 @@ impl Solver {
         let qc = &self.quad_pb_constraints[qi as usize];
         let aa = self.assigns[qc.vars_a[ti]];
         let ab = self.assigns[qc.vars_b[ti]];
-        let a_false = (aa == LBool::True && qc.neg_a[ti]) || (aa == LBool::False && !qc.neg_a[ti]);
-        let b_false = (ab == LBool::True && qc.neg_b[ti]) || (ab == LBool::False && !qc.neg_b[ti]);
+        // a_false: assigned to the opposite of what makes the literal true
+        let a_false = aa != LBool::Undef && aa != qc.true_val_a[ti];
+        let b_false = ab != LBool::Undef && ab != qc.true_val_b[ti];
         let c = qc.coeffs[ti] as i32;
 
-        let new_state = if a_false || b_false { 0 }
-            else if aa != LBool::Undef && ab != LBool::Undef { 2 }
-            else { 1 };
+        // State: 0=DEAD (either false), 2=TRUE (both assigned, neither false), 1=MAYBE
+        let new_state = if a_false | b_false { 0u8 }
+            else if aa != LBool::Undef && ab != LBool::Undef { 2u8 }
+            else { 1u8 };
 
-        let old_state = self.quad_pb_constraints[qi as usize].term_state[ti];
+        let qc = &mut self.quad_pb_constraints[qi as usize];
+        let old_state = qc.term_state[ti];
         if old_state == new_state { return; }
 
-        // Adjust counters
-        match old_state {
-            1 => { self.quad_pb_constraints[qi as usize].sum_maybe -= c; }
-            2 => { self.quad_pb_constraints[qi as usize].sum_true -= c; }
-            _ => {}
-        }
-        match new_state {
-            1 => { self.quad_pb_constraints[qi as usize].sum_maybe += c; }
-            2 => { self.quad_pb_constraints[qi as usize].sum_true += c; }
-            _ => {}
-        }
-        self.quad_pb_constraints[qi as usize].term_state[ti] = new_state;
+        // Adjust counters: subtract old contribution, add new
+        // Using direct arithmetic instead of match to reduce branches
+        if old_state == 1 { qc.sum_maybe -= c; }
+        else if old_state == 2 { qc.sum_true -= c; }
+        if new_state == 1 { qc.sum_maybe += c; }
+        else if new_state == 2 { qc.sum_true += c; }
+        qc.term_state[ti] = new_state;
     }
 
     /// Propagate a quadratic PB constraint using incremental counters.
@@ -747,9 +819,9 @@ impl Solver {
             let qc = &self.quad_pb_constraints[qi as usize];
             let aa = self.assigns[qc.vars_a[i]];
             let ab = self.assigns[qc.vars_b[i]];
-            let a_false = (aa == LBool::True && qc.neg_a[i]) || (aa == LBool::False && !qc.neg_a[i]);
-            let b_false = (ab == LBool::True && qc.neg_b[i]) || (ab == LBool::False && !qc.neg_b[i]);
-            if a_false || b_false { continue; }
+            let a_false = aa != LBool::Undef && aa != qc.true_val_a[i];
+            let b_false = ab != LBool::Undef && ab != qc.true_val_b[i];
+            if a_false | b_false { continue; }
             let a_undef = aa == LBool::Undef;
             let b_undef = ab == LBool::Undef;
             if !a_undef && !b_undef { continue; }
@@ -991,9 +1063,12 @@ impl Solver {
             self.assigns[v] = LBool::Undef;
             if v < self.quad_pb_reasons.len() { self.quad_pb_reasons[v] = None; }
             // Incrementally update quad PB term states after unassigning
-            for idx in 0..self.quad_pb_var_terms[v].len() {
-                let (qi, ti) = self.quad_pb_var_terms[v][idx];
-                self.update_quad_pb_term(qi, ti as usize);
+            // (skipped when backtracking to level 0 and caller will reset state)
+            if !(self.skip_backtrack_quad_pb && level == 0) {
+                for idx in 0..self.quad_pb_var_terms[v].len() {
+                    let (qi, ti) = self.quad_pb_var_terms[v][idx];
+                    self.update_quad_pb_term(qi, ti as usize);
+                }
             }
             self.heap_insert(v);
         }

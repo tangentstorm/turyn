@@ -236,6 +236,8 @@ struct SearchConfig {
     test_tuple: Option<SumTuple>,
     /// Run only Phase A (print tuples) or Phase B (print Z/W pairs).
     phase_only: Option<String>,
+    /// Path to XY boundary table file for table-based Phase C.
+    xy_table_path: Option<String>,
 }
 
 impl Default for SearchConfig {
@@ -260,6 +262,7 @@ impl Default for SearchConfig {
             conflict_limit: 0,
             test_tuple: None,
             phase_only: None,
+            xy_table_path: None,
         }
     }
 }
@@ -269,6 +272,7 @@ struct CandidateZW {
     z: PackedSeq,
     w: PackedSeq,
     zw_autocorr: Vec<i32>,
+    max_pair_power: f64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -474,13 +478,21 @@ fn spectrum_if_ok(
 
 fn spectral_pair_ok(z_spectrum: &[f64], w_spectrum: &[f64], bound: f64) -> bool {
     for i in 0..z_spectrum.len() {
-        let pz = z_spectrum[i];
-        let pw = w_spectrum[i];
-        if pz > bound || pw > bound || pz + pw > bound {
+        if z_spectrum[i] + w_spectrum[i] > bound {
             return false;
         }
     }
     true
+}
+
+/// Max combined spectral power across all frequencies.
+fn spectral_pair_max_power(z_spectrum: &[f64], w_spectrum: &[f64]) -> f64 {
+    let mut max_power = 0.0f64;
+    for i in 0..z_spectrum.len() {
+        let combined = z_spectrum[i] + w_spectrum[i];
+        if combined > max_power { max_power = combined; }
+    }
+    max_power
 }
 
 #[allow(dead_code)]
@@ -721,7 +733,9 @@ fn build_zw_candidates(
         for z in zs {
             for w in ws {
                 stats.candidate_pair_attempts += 1;
-                if spectral_pair_ok(&z.spectrum, &w.spectrum, pair_bound) {
+                if !spectral_pair_ok(&z.spectrum, &w.spectrum, pair_bound) { continue; }
+                let max_power = spectral_pair_max_power(&z.spectrum, &w.spectrum);
+                {
                     stats.candidate_pair_spectral_ok += 1;
                     // Compute autocorrelation lazily (only for surviving pairs)
                     let z_auto = z.autocorr.as_ref().map(|a| a.clone())
@@ -746,6 +760,7 @@ fn build_zw_candidates(
                         z: z.seq.clone(),
                         w: w.seq.clone(),
                         zw_autocorr: zw,
+                        max_pair_power: max_power,
                     });
                     taken += 1;
                     if taken >= cfg.max_pairs_per_bucket {
@@ -1458,6 +1473,9 @@ impl SatXYTemplate {
         let mut solver: cadical::Solver = Default::default();
 
         let (lag_pairs, n) = build_sat_xy_clauses(problem, tuple, &mut solver)?;
+        // Pre-allocate for expected search size (reduces realloc during solve)
+        #[cfg(not(feature = "cadical"))]
+        solver.reserve_for_search(200);
         Some(Self { solver, lag_pairs, n })
     }
 
@@ -2638,6 +2656,312 @@ fn run_sat_search(problem: Problem, verbose: bool) -> SearchReport {
     SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false }
 }
 
+// ==================== Prefix/suffix table for fast X/Y completion ====================
+
+/// Pre-computed table of valid X/Y boundary configurations.
+/// Grouped by (x_bnd_sum, y_bnd_sum, high_lag_signature) for fast lookup.
+/// The high_lag_signature captures autocorrelation at lags where all pairs are
+/// boundary-only (max_unknown=0), enabling exact-match filtering at load time.
+struct XYBoundaryTable {
+    n: usize,
+    k: usize,
+    /// Map from (x_bnd_sum, y_bnd_sum, high_lag_sig) → list of (x_bits, y_bits)
+    groups: HashMap<(i16, i16, Vec<i16>), Vec<(u32, u32)>>,
+    /// Which lags have max_unknown=0 (fully determined by boundary)
+    exact_lags: Vec<usize>,
+}
+
+impl XYBoundaryTable {
+    fn load(path: &str) -> Option<Self> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).ok()?;
+        if buf.len() < 20 { return None; }
+
+        // Parse header
+        if &buf[0..4] != b"XYTT" { return None; }
+        let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        if version != 2 { return None; }
+        let n = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
+        let k = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
+        let num_groups = u32::from_le_bytes(buf[16..20].try_into().ok()?) as usize;
+
+        // Parse group directory
+        let dir_entry_size = 2 + 2 + 8 + 4; // i16 + i16 + u64 + u32
+        let dir_start = 20;
+        let dir_end = dir_start + num_groups * dir_entry_size;
+        if buf.len() < dir_end { return None; }
+
+        struct DirEntry { x_sum: i16, y_sum: i16, offset: u64, count: u32 }
+        let mut dir = Vec::with_capacity(num_groups);
+        for i in 0..num_groups {
+            let base = dir_start + i * dir_entry_size;
+            let x_sum = i16::from_le_bytes(buf[base..base+2].try_into().ok()?);
+            let y_sum = i16::from_le_bytes(buf[base+2..base+4].try_into().ok()?);
+            let offset = u64::from_le_bytes(buf[base+4..base+12].try_into().ok()?);
+            let count = u32::from_le_bytes(buf[base+12..base+16].try_into().ok()?);
+            dir.push(DirEntry { x_sum, y_sum, offset, count });
+        }
+
+        // Parse entry data
+        let data_start = dir_end;
+        let entry_size = 8; // u32 + u32
+        let mut groups = HashMap::new();
+        for d in &dir {
+            let start = data_start + d.offset as usize * entry_size;
+            let end = start + d.count as usize * entry_size;
+            if buf.len() < end { return None; }
+            let mut entries = Vec::with_capacity(d.count as usize);
+            for j in 0..d.count as usize {
+                let base = start + j * entry_size;
+                let xb = u32::from_le_bytes(buf[base..base+4].try_into().ok()?);
+                let yb = u32::from_le_bytes(buf[base+4..base+8].try_into().ok()?);
+                entries.push((xb, yb));
+            }
+            groups.insert((d.x_sum, d.y_sum), entries);
+        }
+
+        // Find lags where all pairs are boundary-only (exact match for indexing)
+        let mut sig_lags = Vec::new();
+        let mut sig_lag_pairs: Vec<Vec<(usize, usize)>> = Vec::new();
+        for s in 1..n {
+            let mut pairs = Vec::new();
+            let mut has_non_boundary = false;
+            for i in 0..n - s {
+                let i_bnd = i < k || i >= n - k;
+                let j_bnd = (i + s) < k || (i + s) >= n - k;
+                if i_bnd && j_bnd {
+                    pairs.push((i, i + s));
+                } else {
+                    has_non_boundary = true;
+                }
+            }
+            if !pairs.is_empty() && !has_non_boundary {
+                sig_lags.push(s);
+                sig_lag_pairs.push(pairs);
+            }
+        }
+        let exact_lags = sig_lags.clone();
+
+        // Re-group by (x_sum, y_sum, high_lag_signature) using exact lags
+        let mut refined_groups: HashMap<(i16, i16, Vec<i16>), Vec<(u32, u32)>> = HashMap::new();
+        for ((x_sum, y_sum), entries) in &groups {
+            for &(xb, yb) in entries {
+                // Expand boundary to compute exact-lag autocorrelation
+                let mut x_vals = vec![0i8; n];
+                let mut y_vals = vec![0i8; n];
+                for i in 0..k {
+                    x_vals[i] = if (xb >> i) & 1 == 1 { 1 } else { -1 };
+                    x_vals[n - k + i] = if (xb >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                    y_vals[i] = if (yb >> i) & 1 == 1 { 1 } else { -1 };
+                    y_vals[n - k + i] = if (yb >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                }
+                let sig: Vec<i16> = sig_lag_pairs.iter().map(|pairs| {
+                    let mut acc = 0i32;
+                    for &(i, j) in pairs {
+                        acc += x_vals[i] as i32 * x_vals[j] as i32;
+                        acc += y_vals[i] as i32 * y_vals[j] as i32;
+                    }
+                    acc as i16
+                }).collect();
+                refined_groups.entry((*x_sum, *y_sum, sig))
+                    .or_default()
+                    .push((xb, yb));
+            }
+        }
+
+        Some(Self { n, k, groups: refined_groups, exact_lags })
+    }
+
+    /// Expand boundary bits into full sequence values at boundary positions.
+    fn expand_boundary(&self, bits: u32, seq: &mut [i8]) {
+        let k = self.k;
+        let n = self.n;
+        for i in 0..k {
+            seq[i] = if (bits >> i) & 1 == 1 { 1 } else { -1 };
+        }
+        for i in 0..k {
+            seq[n - k + i] = if (bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+        }
+    }
+
+    /// Direct state injection: one clone per Z/W pair. For each boundary config,
+    /// precompute which quad PB terms are TRUE/DEAD/MAYBE and inject directly
+    /// into the solver's incremental state. No backtracking, no assumption propagation.
+    fn solve_xy_with_sat(
+        &self, problem: Problem, tuple: SumTuple,
+        candidate: &CandidateZW, template: &SatXYTemplate,
+    ) -> Option<(PackedSeq, PackedSeq)> {
+        let n = problem.n;
+        let k = self.k;
+        let middle_len = n - 2 * k;
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+        if !template.is_feasible(candidate) { return None; }
+        let Some(equalities) = gj_candidate_equalities(n, candidate) else { return None; };
+
+        // Clone solver ONCE per Z/W pair, add GJ equalities and full quad PB constraints
+        let mut solver = template.solver.clone();
+        for &(a, b, equal) in &equalities {
+            if equal { solver.add_clause([-a, b]); solver.add_clause([a, -b]); }
+            else { solver.add_clause([-a, -b]); solver.add_clause([a, b]); }
+        }
+        for s in 1..n {
+            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
+            let target = (target_raw / 2) as usize;
+            let lp = &template.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+        }
+
+        // Skip quad PB incremental updates during backtrack — we reset state per config
+        solver.skip_backtrack_quad_pb = true;
+
+        // Precompute per quad PB constraint: which terms have BOTH vars in boundary
+        let is_bnd = |pos: usize| -> bool { pos < k || pos >= n - k };
+        let num_qpb = solver.num_quad_pb();
+        struct TermBndInfo { var_a: usize, var_b: usize, neg_a: bool, neg_b: bool, both_bnd: bool }
+        let mut qpb_term_info: Vec<Vec<TermBndInfo>> = Vec::with_capacity(num_qpb);
+        for qi in 0..num_qpb {
+            let nt = solver.quad_pb_num_terms(qi);
+            let mut infos = Vec::with_capacity(nt);
+            for ti in 0..nt {
+                let (va, vb, na, nb) = solver.quad_pb_term_info(qi, ti);
+                let pa = va % n; let pb = vb % n;
+                infos.push(TermBndInfo { var_a: va, var_b: vb, neg_a: na, neg_b: nb, both_bnd: is_bnd(pa) && is_bnd(pb) });
+            }
+            qpb_term_info.push(infos);
+        }
+
+        // Autocorrelation filter setup
+        struct LagFilter { s: usize, pairs: Vec<(usize, usize)>, max_unknown: i32 }
+        let mut lag_filters: Vec<LagFilter> = Vec::new();
+        for s in 1..n {
+            let mut pairs = Vec::new(); let mut unk = 0i32;
+            for i in 0..n-s {
+                if is_bnd(i) && is_bnd(i+s) { pairs.push((i, i+s)); } else { unk += 2; }
+            }
+            if !pairs.is_empty() && unk > 0 { lag_filters.push(LagFilter { s, pairs, max_unknown: unk }); }
+        }
+        lag_filters.sort_by_key(|f| f.max_unknown);
+        let targets: Vec<i32> = (0..n).map(|s| if s == 0 { 0 } else { -candidate.zw_autocorr[s] }).collect();
+        let required_sig: Vec<i16> = self.exact_lags.iter().map(|&s| targets[s] as i16).collect();
+
+        // Pre-allocate buffers for term state injection
+        let max_terms = qpb_term_info.iter().map(|v| v.len()).max().unwrap_or(0);
+        let mut term_state_buf = vec![0u8; max_terms];
+
+        let mut configs_tested = 0usize;
+        let max_bnd_sum = (2 * k) as i16;
+        for x_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
+            let x_mid = tuple.x - x_bnd_sum as i32;
+            if x_mid.abs() > middle_len as i32 || (x_mid + middle_len as i32) % 2 != 0 { continue; }
+            for y_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
+                let y_mid = tuple.y - y_bnd_sum as i32;
+                if y_mid.abs() > middle_len as i32 || (y_mid + middle_len as i32) % 2 != 0 { continue; }
+                let key = (x_bnd_sum, y_bnd_sum, required_sig.clone());
+                let Some(entries) = self.groups.get(&key) else { continue; };
+
+                for &(x_bits, y_bits) in entries {
+                    let mut xv = [0i8; 64]; let mut yv = [0i8; 64];
+                    for i in 0..k {
+                        xv[i] = if (x_bits >> i) & 1 == 1 { 1 } else { -1 };
+                        xv[n-k+i] = if (x_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
+                        yv[i] = if (y_bits >> i) & 1 == 1 { 1 } else { -1 };
+                        yv[n-k+i] = if (y_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
+                    }
+                    // GJ filter
+                    let mut ok = true;
+                    for &(a, b, equal) in &equalities {
+                        let va = (a as usize)-1; let vb = (b as usize)-1;
+                        let pa = va % n; let pb = vb % n;
+                        if !is_bnd(pa) || !is_bnd(pb) { continue; }
+                        let a_val = if va < n { xv[pa] } else { yv[pa] };
+                        let b_val = if vb < n { xv[pb] } else { yv[pb] };
+                        if equal { if a_val != b_val { ok = false; break; } }
+                        else { if a_val != -b_val { ok = false; break; } }
+                    }
+                    if !ok { continue; }
+                    // Autocorrelation filter
+                    for lf in &lag_filters {
+                        let mut kn = 0i32;
+                        for &(i, j) in &lf.pairs { kn += xv[i] as i32 * xv[j] as i32 + yv[i] as i32 * yv[j] as i32; }
+                        if (targets[lf.s] - kn).abs() > lf.max_unknown { ok = false; break; }
+                    }
+                    if !ok { continue; }
+
+                    // Build boundary value lookup: assigns[var] for boundary vars
+                    // var 0..n-1 = X positions, n..2n-1 = Y positions
+                    let mut bnd_vals = [0i8; 128]; // assigns for boundary vars
+                    for i in 0..k { bnd_vals[i] = xv[i]; bnd_vals[n-k+i] = xv[n-k+i]; }
+                    for i in 0..k { bnd_vals[n+i] = yv[i]; bnd_vals[n+n-k+i] = yv[n-k+i]; }
+
+                    // Precompute term states for all quad PB constraints and inject
+                    let mut infeasible = false;
+                    for qi in 0..num_qpb {
+                        let infos = &qpb_term_info[qi];
+                        let mut st = 0i32; let mut sm = 0i32;
+                        for (ti, info) in infos.iter().enumerate() {
+                            if info.both_bnd {
+                                // Both boundary: evaluate the term
+                                let a_val = bnd_vals[info.var_a];
+                                let b_val = bnd_vals[info.var_b];
+                                let a_true = (a_val == 1 && !info.neg_a) || (a_val == -1 && info.neg_a);
+                                let b_true = (b_val == 1 && !info.neg_b) || (b_val == -1 && info.neg_b);
+                                if a_true && b_true {
+                                    term_state_buf[ti] = 2; st += 1; // TRUE
+                                } else {
+                                    let a_false = (a_val == 1 && info.neg_a) || (a_val == -1 && !info.neg_a);
+                                    let b_false = (b_val == 1 && info.neg_b) || (b_val == -1 && !info.neg_b);
+                                    if a_false || b_false {
+                                        term_state_buf[ti] = 0; // DEAD
+                                    } else {
+                                        term_state_buf[ti] = 1; sm += 1; // MAYBE (shouldn't happen if both_bnd)
+                                    }
+                                }
+                            } else {
+                                // At least one free variable: MAYBE
+                                term_state_buf[ti] = 1; sm += 1;
+                            }
+                        }
+                        solver.reset_quad_pb_state(qi, &term_state_buf[..infos.len()], st, sm);
+                    }
+
+                    // Build assumptions for boundary variables
+                    let mut assumptions = Vec::with_capacity(4 * k);
+                    for i in 0..k {
+                        assumptions.push(if xv[i] == 1 { x_var(i) } else { -x_var(i) });
+                        assumptions.push(if yv[i] == 1 { y_var(i) } else { -y_var(i) });
+                    }
+                    for i in 0..k {
+                        let p = n-k+i;
+                        assumptions.push(if xv[p] == 1 { x_var(p) } else { -x_var(p) });
+                        assumptions.push(if yv[p] == 1 { y_var(p) } else { -y_var(p) });
+                    }
+
+                    match solver.solve_with_assumptions(&assumptions) {
+                        Some(true) => {
+                            let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
+                            let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
+                            return Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)));
+                        }
+                        _ => {
+                            // Periodically clear learnt clauses to prevent watch list bloat
+                            configs_tested += 1;
+                            if configs_tested % 1 == 0 {
+                                solver.clear_learnt();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
 /// Hybrid search: Phase A+B (sum tuples, Z/W generation, spectral filtering)
 /// followed by SAT-based X/Y solving for each candidate (Z,W) pair.
 /// Process a single sum-tuple: Phase B (Z/W generation) + Phase C (SAT X/Y solving).
@@ -2648,6 +2972,7 @@ fn hybrid_solve_tuple(
     cfg: &SearchConfig,
     found: &AtomicBool,
     verbose: bool,
+    xy_table: Option<&XYBoundaryTable>,
 ) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SearchStats) {
     let mut stats = SearchStats::default();
     if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
@@ -2671,8 +2996,6 @@ fn hybrid_solve_tuple(
     if zw_candidates.is_empty() { return (None, stats); }
     if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
 
-    let Some(template) = SatXYTemplate::build(problem, tuple) else { return (None, stats); };
-
     // Deduplicate Z/W pairs by autocorrelation vector
     let mut seen_autocorr = std::collections::HashSet::new();
     let unique_candidates: Vec<&CandidateZW> = zw_candidates.iter()
@@ -2681,6 +3004,31 @@ fn hybrid_solve_tuple(
     if verbose && unique_candidates.len() < zw_candidates.len() {
         println!("  Dedup: {} unique autocorr vectors from {} pairs",
             unique_candidates.len(), zw_candidates.len());
+    }
+
+    let Some(template) = SatXYTemplate::build(problem, tuple) else { return (None, stats); };
+
+    // Table-based Phase C: pre-seed SAT with boundary configurations
+    if let Some(table) = xy_table {
+        for (idx, cand) in unique_candidates.iter().enumerate() {
+            if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
+            let start = Instant::now();
+            if let Some((x, y)) = table.solve_xy_with_sat(problem, tuple, cand, &template) {
+                stats.phase_c_nanos += start.elapsed().as_nanos() as u64;
+                let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
+                if verbose {
+                    print_solution(&format!("TT({}) table+SAT (pair {}, {:.3?}, verified={})",
+                        problem.n, idx, start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
+                }
+                if ok {
+                    found.store(true, AtomicOrdering::Relaxed);
+                    return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
+                }
+            } else {
+                stats.phase_c_nanos += start.elapsed().as_nanos() as u64;
+            }
+        }
+        return (None, stats);
     }
 
     // For large n, use conflict limit to quickly reject easy-UNSAT pairs,
@@ -2769,11 +3117,25 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
     let phase_a_elapsed = phase_a_start.elapsed();
 
+    // Load XY boundary table or create direct-enumeration solver
+    let xy_table: Option<Arc<XYBoundaryTable>> = cfg.xy_table_path.as_ref().map(|path| {
+        if let Some(t) = XYBoundaryTable::load(path) {
+            if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={})", path, t.n, t.k); }
+            Arc::new(t)
+        } else {
+            // Create a stub table for direct outside-in construction
+            let k: usize = path.parse().unwrap_or(6);
+            if verbose { eprintln!("Using outside-in construction with k={}", k); }
+            Arc::new(XYBoundaryTable { n: problem.n, k, groups: HashMap::new(), exact_lags: Vec::new() })
+        }
+    });
+
     let workers = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(1).max(1);
     if verbose {
-        println!("TT({}): hybrid search (Phase B → SAT X/Y), {} tuples, {} threads",
-            problem.n, tuples.len(), workers);
+        let method = if xy_table.as_ref().map(|a| &**a).is_some() { "table" } else { "SAT X/Y" };
+        println!("TT({}): hybrid search (Phase B → {}), {} tuples, {} threads",
+            problem.n, method, tuples.len(), workers);
     }
 
     let found = Arc::new(AtomicBool::new(false));
@@ -2782,7 +3144,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     if workers <= 1 || tuples.len() <= 1 {
         let mut stats = SearchStats::default();
         for tuple in &tuples {
-            let (result, local_stats) = hybrid_solve_tuple(problem, *tuple, &cfg, &found, verbose);
+            let (result, local_stats) = hybrid_solve_tuple(problem, *tuple, &cfg, &found, verbose, xy_table.as_ref().map(|a| &**a));
             stats.merge_from(&local_stats);
             if let Some((x, y, z, w)) = result {
                 if verbose {
@@ -2802,6 +3164,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     // unprocessed tuple, avoiding load imbalance from pre-chunking.
     let tuples = Arc::new(tuples);
     let cfg = Arc::new(cfg.clone());
+    let xy_table = xy_table.map(Arc::new);
     let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let total_tuples = tuples.len();
     // Shared progress counters
@@ -2846,6 +3209,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let tuples_done = Arc::clone(&tuples_done);
         let pairs_tested = Arc::clone(&pairs_tested);
         let pairs_sat = Arc::clone(&pairs_sat);
+        let xy_table = xy_table.clone();
 
         handles.push(std::thread::spawn(move || {
             let mut local_stats = SearchStats::default();
@@ -2854,7 +3218,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 if found.load(AtomicOrdering::Relaxed) { break; }
                 let idx = next_idx.fetch_add(1, AtomicOrdering::Relaxed);
                 if idx >= tuples.len() { break; }
-                let (result, tstats) = hybrid_solve_tuple(problem, tuples[idx], &cfg, &found, false);
+                let (result, tstats) = hybrid_solve_tuple(problem, tuples[idx], &cfg, &found, false,
+                    xy_table.as_ref().map(|a| { let r: &XYBoundaryTable = a; r }));
                 pairs_tested.fetch_add(tstats.candidate_pair_spectral_ok, AtomicOrdering::Relaxed);
                 pairs_sat.fetch_add(tstats.xy_nodes, AtomicOrdering::Relaxed);
                 tuples_done.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2961,6 +3326,8 @@ fn parse_args() -> SearchConfig {
             if parts.len() == 4 {
                 cfg.test_tuple = Some(SumTuple { x: parts[0], y: parts[1], z: parts[2], w: parts[3] });
             }
+        } else if let Some(v) = arg.strip_prefix("--xy-table=") {
+            cfg.xy_table_path = Some(v.to_string());
         }
     }
     cfg
@@ -3001,7 +3368,7 @@ fn main() {
             let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
             zw_autocorr[s] = 2 * nz + 2 * nw;
         }
-        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr };
+        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr, max_pair_power: 0.0 };
         // Try all sum tuples that match this Z/W
         let raw = enumerate_sum_tuples(p);
         let mut seen = std::collections::HashSet::new();
@@ -3157,6 +3524,7 @@ mod tests {
             conflict_limit: 0,
             test_tuple: None,
             phase_only: None,
+            xy_table_path: None,
         };
         let report = run_search(&cfg, false);
         assert!(report.found_solution);
@@ -3189,6 +3557,7 @@ mod tests {
             z: z.clone(),
             w: w.clone(),
             zw_autocorr: zw,
+            max_pair_power: 0.0,
         };
         let tuple = SumTuple {
             x: 4,
@@ -3315,7 +3684,7 @@ mod tests {
             let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
             *slot = 2 * nz + 2 * nw;
         }
-        let candidate = CandidateZW { z, w, zw_autocorr: zw };
+        let candidate = CandidateZW { z, w, zw_autocorr: zw, max_pair_power: 0.0 };
         let tuple = SumTuple { x: 0, y: 6, z: 8, w: 5 };
         let mut stats = SearchStats::default();
         // Test 1: can the SAT solver find X/Y from scratch?
