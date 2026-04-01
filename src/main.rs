@@ -236,6 +236,8 @@ struct SearchConfig {
     test_tuple: Option<SumTuple>,
     /// Run only Phase A (print tuples) or Phase B (print Z/W pairs).
     phase_only: Option<String>,
+    /// Path to XY boundary table file for table-based Phase C.
+    xy_table_path: Option<String>,
 }
 
 impl Default for SearchConfig {
@@ -260,6 +262,7 @@ impl Default for SearchConfig {
             conflict_limit: 0,
             test_tuple: None,
             phase_only: None,
+            xy_table_path: None,
         }
     }
 }
@@ -2653,6 +2656,400 @@ fn run_sat_search(problem: Problem, verbose: bool) -> SearchReport {
     SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false }
 }
 
+// ==================== Prefix/suffix table for fast X/Y completion ====================
+
+/// Pre-computed table of valid X/Y boundary configurations.
+/// Grouped by (x_boundary_sum, y_boundary_sum) for fast lookup per tuple.
+struct XYBoundaryTable {
+    n: usize,
+    k: usize,
+    /// Map from (x_bnd_sum, y_bnd_sum) → list of (x_bits, y_bits)
+    groups: HashMap<(i16, i16), Vec<(u32, u32)>>,
+}
+
+impl XYBoundaryTable {
+    fn load(path: &str) -> Option<Self> {
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).ok()?;
+        if buf.len() < 20 { return None; }
+
+        // Parse header
+        if &buf[0..4] != b"XYTT" { return None; }
+        let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        if version != 2 { return None; }
+        let n = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
+        let k = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
+        let num_groups = u32::from_le_bytes(buf[16..20].try_into().ok()?) as usize;
+
+        // Parse group directory
+        let dir_entry_size = 2 + 2 + 8 + 4; // i16 + i16 + u64 + u32
+        let dir_start = 20;
+        let dir_end = dir_start + num_groups * dir_entry_size;
+        if buf.len() < dir_end { return None; }
+
+        struct DirEntry { x_sum: i16, y_sum: i16, offset: u64, count: u32 }
+        let mut dir = Vec::with_capacity(num_groups);
+        for i in 0..num_groups {
+            let base = dir_start + i * dir_entry_size;
+            let x_sum = i16::from_le_bytes(buf[base..base+2].try_into().ok()?);
+            let y_sum = i16::from_le_bytes(buf[base+2..base+4].try_into().ok()?);
+            let offset = u64::from_le_bytes(buf[base+4..base+12].try_into().ok()?);
+            let count = u32::from_le_bytes(buf[base+12..base+16].try_into().ok()?);
+            dir.push(DirEntry { x_sum, y_sum, offset, count });
+        }
+
+        // Parse entry data
+        let data_start = dir_end;
+        let entry_size = 8; // u32 + u32
+        let mut groups = HashMap::new();
+        for d in &dir {
+            let start = data_start + d.offset as usize * entry_size;
+            let end = start + d.count as usize * entry_size;
+            if buf.len() < end { return None; }
+            let mut entries = Vec::with_capacity(d.count as usize);
+            for j in 0..d.count as usize {
+                let base = start + j * entry_size;
+                let xb = u32::from_le_bytes(buf[base..base+4].try_into().ok()?);
+                let yb = u32::from_le_bytes(buf[base+4..base+8].try_into().ok()?);
+                entries.push((xb, yb));
+            }
+            groups.insert((d.x_sum, d.y_sum), entries);
+        }
+
+        Some(Self { n, k, groups })
+    }
+
+    /// Expand boundary bits into full sequence values at boundary positions.
+    fn expand_boundary(&self, bits: u32, seq: &mut [i8]) {
+        let k = self.k;
+        let n = self.n;
+        for i in 0..k {
+            seq[i] = if (bits >> i) & 1 == 1 { 1 } else { -1 };
+        }
+        for i in 0..k {
+            seq[n - k + i] = if (bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+        }
+    }
+
+    /// Try to find X/Y given a Z/W candidate using outside-in construction.
+    /// Enumerates boundary configurations with autocorrelation pruning, then
+    /// searches the middle with backtracking.
+    fn solve_xy(
+        &self,
+        problem: Problem,
+        tuple: SumTuple,
+        candidate: &CandidateZW,
+    ) -> Option<(PackedSeq, PackedSeq)> {
+        let n = problem.n;
+        let k = self.k;
+        let middle_len = n - 2 * k;
+
+        // Outside-in: assign boundary positions one at a time with pruning.
+        // Order: position 0 (fixed +1), then 1, n-1, 2, n-2, ... k-1, n-k
+        // At each step, try all 4 (x, y) assignments and prune by autocorrelation bounds.
+        let mut x = vec![0i8; n];
+        let mut y = vec![0i8; n];
+
+        // Build assignment order: prefix positions 0..k, suffix positions n-k..n
+        let mut positions: Vec<usize> = Vec::with_capacity(2 * k);
+        for i in 0..k {
+            positions.push(i);
+            if n - 1 - i >= k && n - 1 - i < n - k {
+                // skip — this is a middle position
+            } else if n - 1 - i != i {
+                positions.push(n - 1 - i);
+            }
+        }
+        // Deduplicate and sort
+        positions.sort();
+        positions.dedup();
+
+        fn boundary_dfs(
+            pos_idx: usize,
+            positions: &[usize],
+            x: &mut [i8],
+            y: &mut [i8],
+            x_sum: i32,
+            y_sum: i32,
+            tuple: SumTuple,
+            candidate: &CandidateZW,
+            n: usize,
+            k: usize,
+            middle_len: usize,
+        ) -> bool {
+            if pos_idx >= positions.len() {
+                // All boundary positions assigned. Check autocorrelation feasibility
+                // and search middle.
+                let x_mid_needed = tuple.x - x_sum;
+                let y_mid_needed = tuple.y - y_sum;
+                if x_mid_needed.abs() > middle_len as i32 { return false; }
+                if y_mid_needed.abs() > middle_len as i32 { return false; }
+                if (x_mid_needed + middle_len as i32) % 2 != 0 { return false; }
+                if (y_mid_needed + middle_len as i32) % 2 != 0 { return false; }
+
+                // Check autocorrelation bounds for boundary-only pairs
+                for s in 1..n {
+                    let target = -candidate.zw_autocorr[s];
+                    let mut known = 0i32;
+                    let mut max_unknown = 0i32;
+                    for i in 0..n - s {
+                        let i_bnd = i < k || i >= n - k;
+                        let j_bnd = (i + s) < k || (i + s) >= n - k;
+                        if i_bnd && j_bnd {
+                            known += x[i] as i32 * x[i + s] as i32;
+                            known += y[i] as i32 * y[i + s] as i32;
+                        } else {
+                            max_unknown += 2;
+                        }
+                    }
+                    if (target - known).abs() > max_unknown { return false; }
+                }
+
+                // Search middle positions
+                return middle_dfs(
+                    k, k, n - k, x, y, 0, 0,
+                    x_mid_needed, y_mid_needed,
+                    &candidate.zw_autocorr, n, k,
+                );
+            }
+
+            let pos = positions[pos_idx];
+
+            // x[0] is always +1
+            let x_choices: &[i8] = if pos == 0 { &[1] } else { &[1, -1] };
+
+            for &xv in x_choices {
+                for &yv in &[1i8, -1] {
+                    x[pos] = xv;
+                    y[pos] = yv;
+                    let new_x_sum = x_sum + xv as i32;
+                    let new_y_sum = y_sum + yv as i32;
+
+                    // Sum feasibility: remaining boundary + middle must reach target
+                    let remaining_bnd = (positions.len() - pos_idx - 1) as i32;
+                    let total_remaining = remaining_bnd + middle_len as i32;
+                    if (tuple.x - new_x_sum).abs() > total_remaining { continue; }
+                    if (tuple.y - new_y_sum).abs() > total_remaining { continue; }
+
+                    // Partial autocorrelation check at boundary lags
+                    let mut ok = true;
+                    for s in 1..n {
+                        let target = -candidate.zw_autocorr[s];
+                        let mut known = 0i32;
+                        let mut max_unknown = 0i32;
+                        for i in 0..n - s {
+                            let i_assigned = i < k && i <= pos || i >= n - k && i <= pos;
+                            let j = i + s;
+                            let j_assigned = j < k && j <= pos || j >= n - k && j <= pos;
+
+                            // More precise: check if positions[0..=pos_idx] contains i and j
+                            let i_done = positions[..=pos_idx].contains(&i);
+                            let j_done = positions[..=pos_idx].contains(&j);
+
+                            if i_done && j_done {
+                                known += x[i] as i32 * x[j] as i32;
+                                known += y[i] as i32 * y[j] as i32;
+                            } else {
+                                max_unknown += 2;
+                            }
+                        }
+                        if (target - known).abs() > max_unknown {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok { continue; }
+
+                    if boundary_dfs(
+                        pos_idx + 1, positions, x, y, new_x_sum, new_y_sum,
+                        tuple, candidate, n, k, middle_len,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        fn middle_dfs(
+            pos: usize,
+            mid_start: usize,
+            mid_end: usize,
+            x: &mut [i8],
+            y: &mut [i8],
+            x_sum: i32,
+            y_sum: i32,
+            x_target: i32,
+            y_target: i32,
+            zw_autocorr: &[i32],
+            n: usize,
+            k: usize,
+        ) -> bool {
+            if pos >= mid_end {
+                if x_sum != x_target || y_sum != y_target { return false; }
+                // Verify full autocorrelation
+                for s in 1..n {
+                    let mut acc = zw_autocorr[s];
+                    for i in 0..n - s {
+                        acc += x[i] as i32 * x[i + s] as i32;
+                        acc += y[i] as i32 * y[i + s] as i32;
+                    }
+                    if acc != 0 { return false; }
+                }
+                return true;
+            }
+
+            let remaining = (mid_end - pos - 1) as i32;
+            for &xv in &[1i8, -1] {
+                for &yv in &[1i8, -1] {
+                    let nx = x_sum + xv as i32;
+                    let ny = y_sum + yv as i32;
+                    if (x_target - nx).abs() > remaining { continue; }
+                    if (y_target - ny).abs() > remaining { continue; }
+
+                    x[pos] = xv;
+                    y[pos] = yv;
+
+                    // Partial autocorrelation pruning
+                    let mut ok = true;
+                    for s in 1..n {
+                        let mut known = zw_autocorr[s];
+                        let mut max_unknown = 0i32;
+                        for i in 0..n - s {
+                            let j = i + s;
+                            let i_done = i < k || (i >= mid_start && i <= pos) || i >= n - k;
+                            let j_done = j < k || (j >= mid_start && j <= pos) || j >= n - k;
+                            if i_done && j_done {
+                                known += x[i] as i32 * x[j] as i32 + y[i] as i32 * y[j] as i32;
+                            } else {
+                                max_unknown += 2;
+                            }
+                        }
+                        if known.abs() > max_unknown { ok = false; break; }
+                    }
+                    if !ok { continue; }
+
+                    if middle_dfs(pos + 1, mid_start, mid_end, x, y, nx, ny,
+                                   x_target, y_target, zw_autocorr, n, k) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        if boundary_dfs(0, &positions, &mut x, &mut y, 0, 0,
+                         tuple, candidate, n, k, middle_len) {
+            Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)))
+        } else {
+            None
+        }
+    }
+
+    /// Backtrack search for middle positions of X and Y.
+    fn search_middle(
+        &self,
+        x_template: &[i8],
+        y_template: &[i8],
+        mid_start: usize,
+        mid_end: usize,
+        x_mid_sum: i32,
+        y_mid_sum: i32,
+        zw_autocorr: &[i32],
+        n: usize,
+    ) -> Option<(Vec<i8>, Vec<i8>)> {
+        let mut x = x_template.to_vec();
+        let mut y = y_template.to_vec();
+        let mid_len = mid_end - mid_start;
+
+        fn dfs(
+            pos: usize,
+            mid_start: usize,
+            mid_end: usize,
+            x: &mut Vec<i8>,
+            y: &mut Vec<i8>,
+            x_sum: i32,
+            y_sum: i32,
+            x_target: i32,
+            y_target: i32,
+            zw_autocorr: &[i32],
+            n: usize,
+            k: usize,
+        ) -> bool {
+            if pos >= mid_end {
+                // All middle positions assigned. Verify full autocorrelation.
+                if x_sum != x_target || y_sum != y_target { return false; }
+                for s in 1..n {
+                    let mut acc = zw_autocorr[s];
+                    for i in 0..n - s {
+                        acc += x[i] as i32 * x[i + s] as i32;
+                        acc += y[i] as i32 * y[i + s] as i32;
+                    }
+                    if acc != 0 { return false; }
+                }
+                return true;
+            }
+
+            let remaining = (mid_end - pos - 1) as i32;
+
+            for &xv in &[1i8, -1] {
+                for &yv in &[1i8, -1] {
+                    let new_x_sum = x_sum + xv as i32;
+                    let new_y_sum = y_sum + yv as i32;
+
+                    // Sum feasibility
+                    if (x_target - new_x_sum).abs() > remaining { continue; }
+                    if (y_target - new_y_sum).abs() > remaining { continue; }
+
+                    x[pos] = xv;
+                    y[pos] = yv;
+
+                    // Partial autocorrelation check: for each lag s, check if
+                    // the contribution from newly assigned position is feasible
+                    let mut ok = true;
+                    for s in 1..n {
+                        // Compute known autocorrelation at this lag
+                        let mut known = zw_autocorr[s];
+                        let mut unknown_pairs = 0i32;
+                        for i in 0..n - s {
+                            let i_assigned = i < k || (i >= mid_start && i <= pos) || i >= n - k;
+                            let j_assigned = (i+s) < k || ((i+s) >= mid_start && (i+s) <= pos) || (i+s) >= n - k;
+                            if i_assigned && j_assigned {
+                                known += x[i] as i32 * x[i + s] as i32;
+                                known += y[i] as i32 * y[i + s] as i32;
+                            } else {
+                                unknown_pairs += 1;
+                            }
+                        }
+                        // Each unknown pair can contribute at most ±2
+                        if known.abs() > 2 * unknown_pairs {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok { continue; }
+
+                    if dfs(pos + 1, mid_start, mid_end, x, y, new_x_sum, new_y_sum,
+                           x_target, y_target, zw_autocorr, n, k) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+
+        // Initial middle sums are 0 (not yet assigned)
+        if dfs(mid_start, mid_start, mid_end, &mut x, &mut y, 0, 0,
+               x_mid_sum, y_mid_sum, zw_autocorr, n, self.k) {
+            Some((x, y))
+        } else {
+            None
+        }
+    }
+}
+
 /// Hybrid search: Phase A+B (sum tuples, Z/W generation, spectral filtering)
 /// followed by SAT-based X/Y solving for each candidate (Z,W) pair.
 /// Process a single sum-tuple: Phase B (Z/W generation) + Phase C (SAT X/Y solving).
@@ -2663,6 +3060,7 @@ fn hybrid_solve_tuple(
     cfg: &SearchConfig,
     found: &AtomicBool,
     verbose: bool,
+    xy_table: Option<&XYBoundaryTable>,
 ) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SearchStats) {
     let mut stats = SearchStats::default();
     if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
@@ -2686,8 +3084,6 @@ fn hybrid_solve_tuple(
     if zw_candidates.is_empty() { return (None, stats); }
     if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
 
-    let Some(template) = SatXYTemplate::build(problem, tuple) else { return (None, stats); };
-
     // Deduplicate Z/W pairs by autocorrelation vector
     let mut seen_autocorr = std::collections::HashSet::new();
     let unique_candidates: Vec<&CandidateZW> = zw_candidates.iter()
@@ -2697,6 +3093,32 @@ fn hybrid_solve_tuple(
         println!("  Dedup: {} unique autocorr vectors from {} pairs",
             unique_candidates.len(), zw_candidates.len());
     }
+
+    // Try table-based Phase C first (if table is available)
+    if let Some(table) = xy_table {
+        for (idx, cand) in unique_candidates.iter().enumerate() {
+            if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
+            let start = Instant::now();
+            if let Some((x, y)) = table.solve_xy(problem, tuple, cand) {
+                stats.phase_c_nanos += start.elapsed().as_nanos() as u64;
+                let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
+                if verbose {
+                    print_solution(&format!("TT({}) table (pair {}, {:.3?}, verified={})",
+                        problem.n, idx, start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
+                }
+                if ok {
+                    found.store(true, AtomicOrdering::Relaxed);
+                    return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
+                }
+            } else {
+                stats.phase_c_nanos += start.elapsed().as_nanos() as u64;
+            }
+        }
+        return (None, stats);
+    }
+
+    // SAT-based Phase C fallback
+    let Some(template) = SatXYTemplate::build(problem, tuple) else { return (None, stats); };
 
     // For large n, use conflict limit to quickly reject easy-UNSAT pairs,
     // then retry deferred (UNKNOWN) pairs without limit.
@@ -2784,11 +3206,25 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
     let phase_a_elapsed = phase_a_start.elapsed();
 
+    // Load XY boundary table or create direct-enumeration solver
+    let xy_table: Option<Arc<XYBoundaryTable>> = cfg.xy_table_path.as_ref().map(|path| {
+        if let Some(t) = XYBoundaryTable::load(path) {
+            if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={})", path, t.n, t.k); }
+            Arc::new(t)
+        } else {
+            // Create a stub table for direct outside-in construction
+            let k: usize = path.parse().unwrap_or(6);
+            if verbose { eprintln!("Using outside-in construction with k={}", k); }
+            Arc::new(XYBoundaryTable { n: problem.n, k, groups: HashMap::new() })
+        }
+    });
+
     let workers = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(1).max(1);
     if verbose {
-        println!("TT({}): hybrid search (Phase B → SAT X/Y), {} tuples, {} threads",
-            problem.n, tuples.len(), workers);
+        let method = if xy_table.as_ref().map(|a| &**a).is_some() { "table" } else { "SAT X/Y" };
+        println!("TT({}): hybrid search (Phase B → {}), {} tuples, {} threads",
+            problem.n, method, tuples.len(), workers);
     }
 
     let found = Arc::new(AtomicBool::new(false));
@@ -2797,7 +3233,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     if workers <= 1 || tuples.len() <= 1 {
         let mut stats = SearchStats::default();
         for tuple in &tuples {
-            let (result, local_stats) = hybrid_solve_tuple(problem, *tuple, &cfg, &found, verbose);
+            let (result, local_stats) = hybrid_solve_tuple(problem, *tuple, &cfg, &found, verbose, xy_table.as_ref().map(|a| &**a));
             stats.merge_from(&local_stats);
             if let Some((x, y, z, w)) = result {
                 if verbose {
@@ -2817,6 +3253,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     // unprocessed tuple, avoiding load imbalance from pre-chunking.
     let tuples = Arc::new(tuples);
     let cfg = Arc::new(cfg.clone());
+    let xy_table = xy_table.map(Arc::new);
     let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let total_tuples = tuples.len();
     // Shared progress counters
@@ -2861,6 +3298,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let tuples_done = Arc::clone(&tuples_done);
         let pairs_tested = Arc::clone(&pairs_tested);
         let pairs_sat = Arc::clone(&pairs_sat);
+        let xy_table = xy_table.clone();
 
         handles.push(std::thread::spawn(move || {
             let mut local_stats = SearchStats::default();
@@ -2869,7 +3307,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 if found.load(AtomicOrdering::Relaxed) { break; }
                 let idx = next_idx.fetch_add(1, AtomicOrdering::Relaxed);
                 if idx >= tuples.len() { break; }
-                let (result, tstats) = hybrid_solve_tuple(problem, tuples[idx], &cfg, &found, false);
+                let (result, tstats) = hybrid_solve_tuple(problem, tuples[idx], &cfg, &found, false,
+                    xy_table.as_ref().map(|a| { let r: &XYBoundaryTable = a; r }));
                 pairs_tested.fetch_add(tstats.candidate_pair_spectral_ok, AtomicOrdering::Relaxed);
                 pairs_sat.fetch_add(tstats.xy_nodes, AtomicOrdering::Relaxed);
                 tuples_done.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2976,6 +3415,8 @@ fn parse_args() -> SearchConfig {
             if parts.len() == 4 {
                 cfg.test_tuple = Some(SumTuple { x: parts[0], y: parts[1], z: parts[2], w: parts[3] });
             }
+        } else if let Some(v) = arg.strip_prefix("--xy-table=") {
+            cfg.xy_table_path = Some(v.to_string());
         }
     }
     cfg
@@ -3172,6 +3613,7 @@ mod tests {
             conflict_limit: 0,
             test_tuple: None,
             phase_only: None,
+            xy_table_path: None,
         };
         let report = run_search(&cfg, false);
         assert!(report.found_solution);
