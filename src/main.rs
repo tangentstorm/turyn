@@ -2686,7 +2686,7 @@ struct XYBoundaryTable {
 }
 
 impl XYBoundaryTable {
-    fn load(path: &str) -> Option<Self> {
+    fn load(path: &str, n: usize) -> Option<Self> {
         use std::io::Read;
         let mut f = std::fs::File::open(path).ok()?;
         let mut buf = Vec::new();
@@ -2697,8 +2697,12 @@ impl XYBoundaryTable {
         if &buf[0..4] != b"XYTT" { return None; }
         let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
         if version != 2 { return None; }
-        let n = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
+        let _table_n = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
         let k = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
+        if n < 2 * k {
+            eprintln!("Error: table k={} requires n >= {}, but n={}", k, 2 * k, n);
+            return None;
+        }
         let num_groups = u32::from_le_bytes(buf[16..20].try_into().ok()?) as usize;
 
         // Parse group directory
@@ -3134,7 +3138,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
     // Load XY boundary table if specified
     let xy_table: Option<Arc<XYBoundaryTable>> = cfg.xy_table_path.as_ref().and_then(|path| {
-        match XYBoundaryTable::load(path) {
+        match XYBoundaryTable::load(path, problem.n) {
             Some(t) => {
                 if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {} groups)", path, t.n, t.k, t.groups.len()); }
                 Some(Arc::new(t))
@@ -3149,7 +3153,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
     // Hint for n >= 26 without table
     if problem.n >= 26 && xy_table.is_none() && cfg.xy_table_path.is_none() {
-        eprintln!("Hint: for ~20% faster search at n={}, pre-generate an XY boundary table:", problem.n);
+        eprintln!("Hint: for faster search, pre-generate an XY boundary table (reusable for any n):");
         eprintln!("  cargo build --release --bin gen_table");
         eprintln!("  target/release/gen_table {} 6 xy_table.bin", problem.n);
         eprintln!("  target/release/turyn --n={} --xy-table=xy_table.bin", problem.n);
@@ -3310,9 +3314,10 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let _worker_ready_tx_list: Vec<std::sync::mpsc::Sender<usize>> = Vec::new();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<usize>(); // workers signal "I'm idle"
 
-    // Shared counters for progress reporting
+    // Shared counters for progress reporting and timing
     let tuples_produced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pairs_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let phase_c_nanos_shared = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Spawn workers
     let xy_table = xy_table.map(Arc::new);
@@ -3324,6 +3329,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let result_tx = result_tx.clone();
         let xy_table = xy_table.clone();
         let pairs_completed = Arc::clone(&pairs_completed);
+        let phase_c_nanos_shared = Arc::clone(&phase_c_nanos_shared);
 
         std::thread::spawn(move || {
             let mut template_cache: HashMap<(i32,i32,i32,i32), SatXYTemplate> = HashMap::new();
@@ -3336,6 +3342,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                     SatXYTemplate::build(problem, item.tuple).unwrap()
                 });
 
+                let c_start = Instant::now();
                 let mut solved = None;
                 if let Some(ref table) = xy_table {
                     let t: &XYBoundaryTable = table;
@@ -3351,6 +3358,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                         }
                     }
                 }
+                phase_c_nanos_shared.fetch_add(c_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
 
                 pairs_completed.fetch_add(1, AtomicOrdering::Relaxed);
 
@@ -3391,8 +3399,10 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 let idx = next.fetch_add(1, AtomicOrdering::Relaxed);
                 if idx >= tuples.len() { break; }
                 let tuple = tuples[idx];
+                let b_start = Instant::now();
                 let candidates = build_zw_candidates(
                     problem, tuple, &cfg, &spectral_z, &spectral_w, &mut stats, &found);
+                stats.phase_b_nanos += b_start.elapsed().as_nanos() as u64;
                 let mut seen = std::collections::HashSet::new();
                 for c in candidates {
                     if found.load(AtomicOrdering::Relaxed) { break; }
@@ -3516,15 +3526,20 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         }
     }
 
+    // Merge Phase C timing from workers
+    stats.phase_c_nanos = phase_c_nanos_shared.load(AtomicOrdering::Relaxed);
+
     if verbose {
         let total = run_start.elapsed();
         let phase_b = std::time::Duration::from_nanos(stats.phase_b_nanos);
         let phase_c = std::time::Duration::from_nanos(stats.phase_c_nanos);
+        let p_done = pairs_completed.load(AtomicOrdering::Relaxed);
         println!("\n--- Phase timing (wall-clock, {} threads) ---", workers);
         println!("  Phase A (tuple enum):       {:>10.3?}", phase_a_elapsed);
         println!("  Phase B (Z/W gen+spectral): {:>10.3?}  (thread-sum)", phase_b);
         println!("  Phase C (SAT X/Y):          {:>10.3?}  (thread-sum)", phase_c);
         println!("  Pairs dispatched:           {:>10}", pairs_dispatched);
+        println!("  Pairs completed:            {:>10}", p_done);
         println!("  Total wall-clock:           {:>10.3?}", total);
         if !found_solution {
             println!("Hybrid search: no solution found. Stats: z_gen={}, w_gen={}, pairs={}",
