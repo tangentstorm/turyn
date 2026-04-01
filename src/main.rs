@@ -232,6 +232,10 @@ struct SearchConfig {
     test_zw: Option<[String; 2]>,
     /// Conflict limit per SAT solve (0 = unlimited).
     conflict_limit: u64,
+    /// Test a specific sum-tuple (x,y,z,w) only.
+    test_tuple: Option<SumTuple>,
+    /// Run only Phase A (print tuples) or Phase B (print Z/W pairs).
+    phase_only: Option<String>,
 }
 
 impl Default for SearchConfig {
@@ -254,6 +258,8 @@ impl Default for SearchConfig {
             verify_seqs: None,
             test_zw: None,
             conflict_limit: 0,
+            test_tuple: None,
+            phase_only: None,
         }
     }
 }
@@ -2652,6 +2658,11 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             && (t.w + problem.m() as i32) % 2 == 0
         })
         .collect();
+    // Filter to specific tuple if --tuple is set
+    if let Some(ref t) = cfg.test_tuple {
+        tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
+    }
+
     // Heuristic tuple ordering: balance "likely to contain solution" with
     // "cheap to search". Known TT solutions have x≈y, so |x-y| is key.
     // But also need small |z|+|w| for cheap Phase B.
@@ -2839,6 +2850,13 @@ fn parse_args() -> SearchConfig {
             }
         } else if let Some(v) = arg.strip_prefix("--conflict-limit=") {
             cfg.conflict_limit = v.parse().unwrap_or(0);
+        } else if arg == "--phase-a" || arg == "--phase-b" {
+            cfg.phase_only = Some(arg[2..].to_string());
+        } else if let Some(v) = arg.strip_prefix("--tuple=") {
+            let parts: Vec<i32> = v.split(',').filter_map(|s| s.parse().ok()).collect();
+            if parts.len() == 4 {
+                cfg.test_tuple = Some(SumTuple { x: parts[0], y: parts[1], z: parts[2], w: parts[3] });
+            }
         }
     }
     cfg
@@ -2902,6 +2920,46 @@ fn main() {
             }
         }
         println!("No X/Y found for given Z/W");
+        return;
+    }
+    if let Some(ref phase) = cfg.phase_only {
+        let problem = cfg.problem;
+        let raw = enumerate_sum_tuples(problem);
+        let mut seen = std::collections::HashSet::new();
+        let mut tuples: Vec<SumTuple> = raw.into_iter()
+            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+            .filter(|t| {
+                (t.x + problem.n as i32) % 2 == 0
+                && (t.y + problem.n as i32) % 2 == 0
+                && (t.z + problem.n as i32) % 2 == 0
+                && (t.w + problem.m() as i32) % 2 == 0
+            })
+            .collect();
+        if let Some(ref t) = cfg.test_tuple {
+            tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
+        }
+        tuples.sort_by_key(|t| ((t.x - t.y).abs() * 2 + t.z.abs() + t.w.abs(), t.x.abs() + t.y.abs()));
+
+        if phase == "phase-a" {
+            println!("TT({}): {} tuples (x,y,z,w) satisfying x²+y²+2z²+2w²={}",
+                problem.n, tuples.len(), problem.target_energy());
+            for t in &tuples {
+                println!("  ({},{},{},{})", t.x, t.y, t.z, t.w);
+            }
+        } else if phase == "phase-b" {
+            let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
+            let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
+            for tuple in &tuples {
+                let mut stats = SearchStats::default();
+                let start = Instant::now();
+                let candidates = build_zw_candidates(problem, *tuple, &cfg, &spectral_z, &spectral_w, &mut stats);
+                println!("({},{},{},{}): z={}/{} w={}/{} pairs={} ({:.3?})",
+                    tuple.x, tuple.y, tuple.z, tuple.w,
+                    stats.z_spectral_ok, stats.z_generated,
+                    stats.w_spectral_ok, stats.w_generated,
+                    candidates.len(), start.elapsed());
+            }
+        }
         return;
     }
     if cfg.benchmark_repeats > 0 {
@@ -2991,6 +3049,8 @@ mod tests {
             verify_seqs: None,
             test_zw: None,
             conflict_limit: 0,
+            test_tuple: None,
+            phase_only: None,
         };
         let report = run_search(&cfg, false);
         assert!(report.found_solution);
