@@ -1312,6 +1312,31 @@ fn luby(i: u32) -> u64 {
     }
 }
 
+/// Parse a DIMACS CNF file and load it into a new solver.
+/// Returns the solver ready for `solve()`.
+pub fn parse_dimacs(input: &str) -> Solver {
+    let mut solver = Solver::new();
+    let mut clause: Vec<i32> = Vec::new();
+    for line in input.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('c') || line.starts_with('p') {
+            continue;
+        }
+        for tok in line.split_whitespace() {
+            let lit: i32 = tok.parse().expect("invalid literal in DIMACS");
+            if lit == 0 {
+                solver.add_clause(clause.drain(..));
+            } else {
+                clause.push(lit);
+            }
+        }
+    }
+    if !clause.is_empty() {
+        solver.add_clause(clause);
+    }
+    solver
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
