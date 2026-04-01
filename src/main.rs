@@ -3170,82 +3170,279 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false };
     }
 
-    // Parallel: work-stealing via AtomicUsize. Each thread grabs the next
-    // unprocessed tuple, avoiding load imbalance from pre-chunking.
-    let tuples = Arc::new(tuples);
-    let cfg = Arc::new(cfg.clone());
-    let xy_table = xy_table.map(Arc::new);
-    let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let total_tuples = tuples.len();
-    // Shared progress counters
-    let tuples_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let pairs_tested = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let pairs_sat = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut handles = Vec::new();
+    // For n >= 28 (spectral wall): use producer-consumer with priority queue.
+    // Phase B produces candidates sorted by max_pair_power; workers pop tightest first.
+    // For smaller n: use the faster per-tuple work-stealing path.
+    if problem.n < 28 && cfg.max_spectral.is_none() {
+        // Original per-tuple work-stealing path
+        let tuples = Arc::new(tuples);
+        let cfg = Arc::new(cfg.clone());
+        let xy_table = xy_table.map(Arc::new);
+        let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let total_tuples = tuples.len();
+        let tuples_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pairs_tested = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
 
-    // Progress reporter thread (prints every 10s if verbose)
-    let progress_handle = if verbose {
-        let found_c = Arc::clone(&found);
-        let tuples_done_c = Arc::clone(&tuples_done);
-        let pairs_tested_c = Arc::clone(&pairs_tested);
-        let pairs_sat_c = Arc::clone(&pairs_sat);
-        let start = run_start;
-        Some(std::thread::spawn(move || {
-            loop {
-                // Sleep in small increments so we notice early termination quickly
-                for _ in 0..100 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    if found_c.load(AtomicOrdering::Relaxed) { return; }
+        let progress_handle = if verbose {
+            let found_c = Arc::clone(&found);
+            let tuples_done_c = Arc::clone(&tuples_done);
+            let pairs_tested_c = Arc::clone(&pairs_tested);
+            let start = run_start;
+            Some(std::thread::spawn(move || {
+                loop {
+                    for _ in 0..100 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if found_c.load(AtomicOrdering::Relaxed) { return; }
+                        let done = tuples_done_c.load(AtomicOrdering::Relaxed);
+                        if done >= total_tuples { return; }
+                    }
                     let done = tuples_done_c.load(AtomicOrdering::Relaxed);
-                    if done >= total_tuples { return; }
+                    if done >= total_tuples { break; }
+                    let pairs = pairs_tested_c.load(AtomicOrdering::Relaxed);
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let pct = 100.0 * done as f64 / total_tuples as f64;
+                    eprintln!("[{:.0}s] {}/{} tuples ({:.0}%), {} Z/W pairs, {:.1} tuples/s",
+                        elapsed, done, total_tuples, pct, pairs, done as f64 / elapsed);
                 }
-                let done = tuples_done_c.load(AtomicOrdering::Relaxed);
-                if done >= total_tuples { break; }
-                let pairs = pairs_tested_c.load(AtomicOrdering::Relaxed);
-                let sat = pairs_sat_c.load(AtomicOrdering::Relaxed);
-                let elapsed = start.elapsed().as_secs_f64();
-                let pct = 100.0 * done as f64 / total_tuples as f64;
-                eprintln!("[{:.0}s] {}/{} tuples ({:.0}%), {} Z/W pairs, {:.1} tuples/s",
-                    elapsed, done, total_tuples, pct, pairs, done as f64 / elapsed);
-            }
-        }))
-    } else { None };
+            }))
+        } else { None };
 
-    for _tid in 0..workers {
-        let tuples = Arc::clone(&tuples);
-        let cfg = Arc::clone(&cfg);
+        for _tid in 0..workers {
+            let tuples = Arc::clone(&tuples);
+            let cfg = Arc::clone(&cfg);
+            let found = Arc::clone(&found);
+            let next_idx = Arc::clone(&next_idx);
+            let tuples_done = Arc::clone(&tuples_done);
+            let pairs_tested = Arc::clone(&pairs_tested);
+            let xy_table = xy_table.clone();
+
+            handles.push(std::thread::spawn(move || {
+                let mut local_stats = SearchStats::default();
+                let mut solution = None;
+                loop {
+                    if found.load(AtomicOrdering::Relaxed) { break; }
+                    let idx = next_idx.fetch_add(1, AtomicOrdering::Relaxed);
+                    if idx >= tuples.len() { break; }
+                    let (result, tstats) = hybrid_solve_tuple(problem, tuples[idx], &cfg, &found, false,
+                        xy_table.as_ref().map(|a| { let r: &XYBoundaryTable = a; r }));
+                    pairs_tested.fetch_add(tstats.candidate_pair_spectral_ok, AtomicOrdering::Relaxed);
+                    tuples_done.fetch_add(1, AtomicOrdering::Relaxed);
+                    local_stats.merge_from(&tstats);
+                    if result.is_some() { solution = result; break; }
+                }
+                (solution, local_stats)
+            }));
+        }
+
+        let mut stats = SearchStats::default();
+        let mut found_solution = false;
+        for h in handles {
+            if let Ok((result, local_stats)) = h.join() {
+                stats.merge_from(&local_stats);
+                if let Some((x, y, z, w)) = result {
+                    if verbose { print_solution(&format!("TT({}) SOLUTION", problem.n), &x, &y, &z, &w); }
+                    found_solution = true;
+                }
+            }
+        }
+        if let Some(ph) = progress_handle { let _ = ph.join(); }
+
+        if verbose {
+            let total = run_start.elapsed();
+            let phase_b = std::time::Duration::from_nanos(stats.phase_b_nanos);
+            let phase_c = std::time::Duration::from_nanos(stats.phase_c_nanos);
+            println!("\n--- Phase timing (wall-clock, summed across {} threads) ---", workers);
+            println!("  Phase A (tuple enum):       {:>10.3?}", phase_a_elapsed);
+            println!("  Phase B (Z/W gen+spectral): {:>10.3?}  (thread-sum)", phase_b);
+            println!("  Phase C (SAT X/Y):          {:>10.3?}  (thread-sum)", phase_c);
+            println!("  Total wall-clock:           {:>10.3?}", total);
+            if !found_solution {
+                println!("Hybrid search: no solution found. Stats: z_gen={}, w_gen={}, pairs={}",
+                    stats.z_generated, stats.w_generated, stats.candidate_pair_spectral_ok);
+            }
+        }
+        return SearchReport { stats, elapsed: run_start.elapsed(), found_solution };
+    }
+
+    // Priority queue path for n >= 28 (or explicit --max-spectral):
+    use std::sync::{Mutex, Condvar};
+    use std::collections::BinaryHeap;
+    use std::cmp::Reverse;
+
+    // Work item for the priority queue
+    struct WorkItem {
+        tuple: SumTuple,
+        candidate: CandidateZW,
+    }
+    impl PartialEq for WorkItem { fn eq(&self, other: &Self) -> bool { self.candidate.max_pair_power == other.candidate.max_pair_power } }
+    impl Eq for WorkItem {}
+    impl PartialOrd for WorkItem { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
+    impl Ord for WorkItem {
+        fn cmp(&self, other: &Self) -> Ordering {
+            // Reverse: lower max_pair_power = higher priority (min-heap via Reverse)
+            self.candidate.max_pair_power.partial_cmp(&other.candidate.max_pair_power)
+                .unwrap_or(Ordering::Equal)
+        }
+    }
+
+    let queue: Arc<Mutex<BinaryHeap<Reverse<WorkItem>>>> = Arc::new(Mutex::new(BinaryHeap::new()));
+    let queue_cv = Arc::new(Condvar::new());
+    let producer_done = Arc::new(AtomicBool::new(false));
+    let total_tuples = tuples.len();
+
+    // Auto-widen spectral bound for n >= 28 where default yields no pairs
+    let mut producer_cfg = cfg.clone();
+    if producer_cfg.max_spectral.is_none() && problem.n >= 28 {
+        let widened = problem.spectral_bound() + 30.0;
+        if verbose {
+            eprintln!("Auto-widening spectral bound to {:.0} for n={} (default {:.0} may yield no pairs)",
+                widened, problem.n, problem.spectral_bound());
+        }
+        producer_cfg.max_spectral = Some(widened);
+    }
+
+    // Producer thread: runs Phase B for all tuples, pushes candidates into priority queue
+    let producer_handle = {
         let found = Arc::clone(&found);
-        let next_idx = Arc::clone(&next_idx);
-        let tuples_done = Arc::clone(&tuples_done);
-        let pairs_tested = Arc::clone(&pairs_tested);
-        let pairs_sat = Arc::clone(&pairs_sat);
+        let queue = Arc::clone(&queue);
+        let queue_cv = Arc::clone(&queue_cv);
+        let producer_done = Arc::clone(&producer_done);
+        let cfg = producer_cfg;
+        std::thread::spawn(move || {
+            let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
+            let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
+            let mut stats = SearchStats::default();
+            for tuple in &tuples {
+                if found.load(AtomicOrdering::Relaxed) { break; }
+                let candidates = build_zw_candidates(problem, *tuple, &cfg, &spectral_z, &spectral_w, &mut stats, &found);
+                // Deduplicate by autocorrelation
+                let mut seen = std::collections::HashSet::new();
+                let unique: Vec<CandidateZW> = candidates.into_iter()
+                    .filter(|c| seen.insert(c.zw_autocorr.clone()))
+                    .collect();
+                if !unique.is_empty() {
+                    let mut q = queue.lock().unwrap();
+                    for c in unique {
+                        q.push(Reverse(WorkItem { tuple: *tuple, candidate: c }));
+                    }
+                    queue_cv.notify_all();
+                }
+            }
+            producer_done.store(true, AtomicOrdering::Relaxed);
+            queue_cv.notify_all(); // wake workers so they see producer is done
+            stats
+        })
+    };
+
+    // Worker threads: pop from priority queue and run Phase C
+    let xy_table = xy_table.map(Arc::new);
+    let cfg = Arc::new(cfg.clone());
+    let mut handles = Vec::new();
+    for _tid in 0..workers {
+        let found = Arc::clone(&found);
+        let queue = Arc::clone(&queue);
+        let queue_cv = Arc::clone(&queue_cv);
+        let producer_done = Arc::clone(&producer_done);
+        let cfg = Arc::clone(&cfg);
         let xy_table = xy_table.clone();
 
         handles.push(std::thread::spawn(move || {
             let mut local_stats = SearchStats::default();
             let mut solution = None;
+            // Cache SAT templates per tuple
+            let mut template_cache: HashMap<(i32,i32,i32,i32), SatXYTemplate> = HashMap::new();
+
             loop {
                 if found.load(AtomicOrdering::Relaxed) { break; }
-                let idx = next_idx.fetch_add(1, AtomicOrdering::Relaxed);
-                if idx >= tuples.len() { break; }
-                let (result, tstats) = hybrid_solve_tuple(problem, tuples[idx], &cfg, &found, false,
-                    xy_table.as_ref().map(|a| { let r: &XYBoundaryTable = a; r }));
-                pairs_tested.fetch_add(tstats.candidate_pair_spectral_ok, AtomicOrdering::Relaxed);
-                pairs_sat.fetch_add(tstats.xy_nodes, AtomicOrdering::Relaxed);
-                tuples_done.fetch_add(1, AtomicOrdering::Relaxed);
-                local_stats.merge_from(&tstats);
-                if result.is_some() {
-                    solution = result;
-                    break;
+
+                // Pop highest-priority (lowest spectral power) work item
+                let item = {
+                    let mut q = queue.lock().unwrap();
+                    loop {
+                        if let Some(Reverse(item)) = q.pop() {
+                            break Some(item);
+                        }
+                        if producer_done.load(AtomicOrdering::Relaxed) {
+                            break None;
+                        }
+                        // Wait for producer to push more items
+                        q = queue_cv.wait(q).unwrap();
+                    }
+                };
+
+                let Some(item) = item else { break; };
+
+                // Get or build SAT template for this tuple
+                let tuple_key = (item.tuple.x, item.tuple.y, item.tuple.z, item.tuple.w);
+                let template = template_cache.entry(tuple_key).or_insert_with(|| {
+                    SatXYTemplate::build(problem, item.tuple).unwrap()
+                });
+
+                // If we have a table, use table-based solve
+                if let Some(ref table) = xy_table {
+                    let table_ref: &XYBoundaryTable = table;
+                    if let Some((x, y)) = table_ref.solve_xy_with_sat(
+                        problem, item.tuple, &item.candidate, template,
+                    ) {
+                        let ok = verify_tt(problem, &x, &y, &item.candidate.z, &item.candidate.w);
+                        if ok {
+                            found.store(true, AtomicOrdering::Relaxed);
+                            queue_cv.notify_all();
+                            solution = Some((x, y, item.candidate.z.clone(), item.candidate.w.clone()));
+                            break;
+                        }
+                    }
+                } else {
+                    // Standard SAT solve
+                    if let Some((x, y)) = template.solve_for(&item.candidate) {
+                        let ok = verify_tt(problem, &x, &y, &item.candidate.z, &item.candidate.w);
+                        if ok {
+                            found.store(true, AtomicOrdering::Relaxed);
+                            queue_cv.notify_all();
+                            solution = Some((x, y, item.candidate.z.clone(), item.candidate.w.clone()));
+                            break;
+                        }
+                    }
                 }
             }
             (solution, local_stats)
         }));
     }
 
+    // Progress reporter
+    let progress_handle = if verbose {
+        let found_c = Arc::clone(&found);
+        let producer_done_c = Arc::clone(&producer_done);
+        let queue_c = Arc::clone(&queue);
+        let start = run_start;
+        Some(std::thread::spawn(move || {
+            loop {
+                for _ in 0..100 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if found_c.load(AtomicOrdering::Relaxed) { return; }
+                    if producer_done_c.load(AtomicOrdering::Relaxed) {
+                        let q = queue_c.lock().unwrap();
+                        if q.is_empty() { return; }
+                    }
+                }
+                let qlen = queue_c.lock().unwrap().len();
+                let elapsed = start.elapsed().as_secs_f64();
+                let done = producer_done_c.load(AtomicOrdering::Relaxed);
+                eprintln!("[{:.0}s] queue={}, producer_done={}", elapsed, qlen, done);
+            }
+        }))
+    } else { None };
+
     let mut stats = SearchStats::default();
     let mut found_solution = false;
-    // Signal progress reporter to stop
+
+    // Join producer first to collect Phase B stats
+    if let Ok(producer_stats) = producer_handle.join() {
+        stats.merge_from(&producer_stats);
+    }
+
+    // Join workers
     for h in handles {
         if let Ok((result, local_stats)) = h.join() {
             stats.merge_from(&local_stats);
