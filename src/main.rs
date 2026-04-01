@@ -3117,23 +3117,33 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
     let phase_a_elapsed = phase_a_start.elapsed();
 
-    // Load XY boundary table or create direct-enumeration solver
-    let xy_table: Option<Arc<XYBoundaryTable>> = cfg.xy_table_path.as_ref().map(|path| {
-        if let Some(t) = XYBoundaryTable::load(path) {
-            if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={})", path, t.n, t.k); }
-            Arc::new(t)
-        } else {
-            // Create a stub table for direct outside-in construction
-            let k: usize = path.parse().unwrap_or(6);
-            if verbose { eprintln!("Using outside-in construction with k={}", k); }
-            Arc::new(XYBoundaryTable { n: problem.n, k, groups: HashMap::new(), exact_lags: Vec::new() })
+    // Load XY boundary table if specified
+    let xy_table: Option<Arc<XYBoundaryTable>> = cfg.xy_table_path.as_ref().and_then(|path| {
+        match XYBoundaryTable::load(path) {
+            Some(t) => {
+                if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {} groups)", path, t.n, t.k, t.groups.len()); }
+                Some(Arc::new(t))
+            }
+            None => {
+                eprintln!("Error: failed to load XY boundary table from '{}'", path);
+                eprintln!("Generate it with: target/release/gen_table {} 6 {}", problem.n, path);
+                None
+            }
         }
     });
+
+    // Hint for n >= 26 without table
+    if problem.n >= 26 && xy_table.is_none() && cfg.xy_table_path.is_none() {
+        eprintln!("Hint: for ~20% faster search at n={}, pre-generate an XY boundary table:", problem.n);
+        eprintln!("  cargo build --release --bin gen_table");
+        eprintln!("  target/release/gen_table {} 6 xy_table.bin", problem.n);
+        eprintln!("  target/release/turyn --n={} --xy-table=xy_table.bin", problem.n);
+    }
 
     let workers = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(1).max(1);
     if verbose {
-        let method = if xy_table.as_ref().map(|a| &**a).is_some() { "table" } else { "SAT X/Y" };
+        let method = if xy_table.is_some() { "table+SAT" } else { "SAT X/Y" };
         println!("TT({}): hybrid search (Phase B → {}), {} tuples, {} threads",
             problem.n, method, tuples.len(), workers);
     }
