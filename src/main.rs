@@ -2681,7 +2681,9 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     // "cheap to search". Known TT solutions have x≈y, so |x-y| is key.
     // But also need small |z|+|w| for cheap Phase B.
     // Score = |x-y| * 2 + |z| + |w|  (penalize x≠y heavily, prefer small z/w)
-    tuples.sort_by_key(|t| ((t.x - t.y).abs() * 2 + t.z.abs() + t.w.abs(), t.x.abs() + t.y.abs()));
+    // Heuristic tuple ordering: try small |z|+|w| first (cheap Phase B),
+    // break ties by small |x-y| (solutions often have x≈y).
+    tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
     let phase_a_elapsed = phase_a_start.elapsed();
 
     let workers = std::thread::available_parallelism()
@@ -2952,7 +2954,9 @@ fn main() {
         if let Some(ref t) = cfg.test_tuple {
             tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
         }
-        tuples.sort_by_key(|t| ((t.x - t.y).abs() * 2 + t.z.abs() + t.w.abs(), t.x.abs() + t.y.abs()));
+        // Heuristic tuple ordering: try small |z|+|w| first (cheap Phase B),
+    // break ties by small |x-y| (solutions often have x≈y).
+    tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
 
         if phase == "phase-a" {
             println!("TT({}): {} tuples (x,y,z,w) satisfying x²+y²+2z²+2w²={}",
