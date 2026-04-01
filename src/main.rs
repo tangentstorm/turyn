@@ -494,11 +494,14 @@ fn generate_sequences_with_sum(
     let mut out = Vec::new();
     generate_sequences_with_sum_visit(len, target_sum, root_one, tail_one, limit, |values| {
         out.push(PackedSeq::from_values(values));
+        true
     });
     out
 }
 
-fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
+/// Generate ±1 sequences of given length and sum, calling `visit` for each.
+/// `visit` returns `true` to continue, `false` to stop early.
+fn generate_sequences_with_sum_visit<F: FnMut(&[i8]) -> bool>(
     len: usize,
     target_sum: i32,
     root_one: bool,
@@ -508,6 +511,7 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
 ) {
     let mut curr = vec![1i8; len];
     let mut emitted = 0usize;
+    let mut stopped = false;
 
     fn dfs(
         i: usize,
@@ -516,18 +520,21 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
         target_sum: i32,
         curr: &mut [i8],
         emitted: &mut usize,
+        stopped: &mut bool,
         limit: usize,
         root_one: bool,
         tail_one: bool,
-        visit: &mut impl FnMut(&[i8]),
+        visit: &mut impl FnMut(&[i8]) -> bool,
     ) {
-        if *emitted >= limit {
+        if *emitted >= limit || *stopped {
             return;
         }
         if i == len {
             if curr_sum == target_sum {
                 *emitted += 1;
-                visit(curr);
+                if !visit(curr) {
+                    *stopped = true;
+                }
             }
             return;
         }
@@ -541,6 +548,7 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
                 target_sum,
                 curr,
                 emitted,
+                stopped,
                 limit,
                 root_one,
                 tail_one,
@@ -558,6 +566,7 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
                 target_sum,
                 curr,
                 emitted,
+                stopped,
                 limit,
                 root_one,
                 tail_one,
@@ -581,12 +590,15 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
                 target_sum,
                 curr,
                 emitted,
+                stopped,
                 limit,
                 root_one,
                 tail_one,
                 visit,
             );
         }
+
+        if *stopped { return; }
 
         curr[i] = -1;
         let max_neg = curr_sum - 1 + forced_plus + free_remaining;
@@ -599,6 +611,7 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
                 target_sum,
                 curr,
                 emitted,
+                stopped,
                 limit,
                 root_one,
                 tail_one,
@@ -614,6 +627,7 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
         target_sum,
         &mut curr,
         &mut emitted,
+        &mut stopped,
         limit,
         root_one,
         tail_one,
@@ -628,6 +642,7 @@ fn build_zw_candidates(
     spectral_z: &SpectralFilter,
     spectral_w: &SpectralFilter,
     stats: &mut SearchStats,
+    found: &AtomicBool,
 ) -> Vec<CandidateZW> {
     fn push_capped(
         buckets: &mut HashMap<BoundarySignature, Vec<SeqWithSpectrum>>,
@@ -651,6 +666,7 @@ fn build_zw_candidates(
     let mut z_buckets: HashMap<BoundarySignature, Vec<SeqWithSpectrum>> = HashMap::new();
     let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
     generate_sequences_with_sum_visit(problem.n, tuple.z, true, true, cfg.max_z, |values| {
+        if found.load(AtomicOrdering::Relaxed) { return false; }
         stats.z_generated += 1;
         if let Some(spectrum) =
             spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf)
@@ -667,11 +683,15 @@ fn build_zw_candidates(
                 cfg.max_pairs_per_bucket.max(1),
             );
         }
+        true
     });
+
+    if found.load(AtomicOrdering::Relaxed) { return Vec::new(); }
 
     let mut w_buckets: HashMap<BoundarySignature, Vec<SeqWithSpectrum>> = HashMap::new();
     fft_buf.clear();
     generate_sequences_with_sum_visit(problem.m(), tuple.w, true, false, cfg.max_w, |values| {
+        if found.load(AtomicOrdering::Relaxed) { return false; }
         stats.w_generated += 1;
         if let Some(spectrum) =
             spectrum_if_ok(values, spectral_w, individual_bound, &mut fft_buf)
@@ -688,6 +708,7 @@ fn build_zw_candidates(
                 cfg.max_pairs_per_bucket.max(1),
             );
         }
+        true
     });
 
     let mut out = Vec::new();
@@ -1708,11 +1729,11 @@ fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let mut z_count = 0usize;
         let mut found = false;
         generate_sequences_with_sum_visit(problem.n, tuple.z, true, true, cfg.max_z, |z_values| {
-            if found { return; }
+            if found { return false; }
             z_count += 1;
             // Spectral filter on Z alone
             if spectrum_if_ok(z_values, &spectral_z, problem.spectral_bound(), &mut fft_buf).is_none() {
-                return;
+                return true;
             }
             // Try SAT for X/Y/W given this Z
             if let Some((x, y, w)) = sat_solve_xyw(problem, *tuple, z_values, verbose) {
@@ -1724,8 +1745,9 @@ fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                             problem.n, tuple, z_count, run_start.elapsed(), ok),
                         &x, &y, &pz, &w);
                 }
-                if ok { found = true; }
+                if ok { found = true; return false; }
             }
+            true
         });
         if found {
             return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
@@ -1786,7 +1808,7 @@ fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             let mut found_solution = false;
             for tuple in &norm {
                 let zw_candidates =
-                    build_zw_candidates(problem, *tuple, cfg, &spectral_z, &spectral_w, &mut stats);
+                    build_zw_candidates(problem, *tuple, cfg, &spectral_z, &spectral_w, &mut stats, &AtomicBool::new(false));
                 for cand in &zw_candidates {
                     if let Some((x, y)) = backtrack_xy(problem, *tuple, cand, &mut stats) {
                         found_solution = verify_tt(problem, &x, &y, &cand.z, &cand.w);
@@ -1830,7 +1852,7 @@ fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 for idx in start..end {
                     let tuple = tuples[idx];
                     let zw_candidates =
-                        build_zw_candidates(problem, tuple, &cfg, &sz, &sw, &mut local_stats);
+                        build_zw_candidates(problem, tuple, &cfg, &sz, &sw, &mut local_stats, &AtomicBool::new(false));
                     for cand in &zw_candidates {
                         if let Some((x, y)) = backtrack_xy(problem, tuple, cand, &mut local_stats) {
                             found_solution = verify_tt(problem, &x, &y, &cand.z, &cand.w);
@@ -1868,7 +1890,7 @@ fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             println!("Trying tuple family {tuple}");
         }
         let zw_candidates =
-            build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats);
+            build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats, &AtomicBool::new(false));
         if verbose {
             println!("  Phase B: {} candidate (Z,W) pairs", zw_candidates.len());
             println!("  Phase B elapsed: {:.3?}", phase_b_start.elapsed());
@@ -2615,7 +2637,7 @@ fn hybrid_solve_tuple(
     // we don't spend minutes in Phase B before trying any SAT.
     let phase_b_start = Instant::now();
     let zw_candidates =
-        build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats);
+        build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats, found);
     let phase_b_elapsed = phase_b_start.elapsed();
     stats.phase_b_nanos += phase_b_elapsed.as_nanos() as u64;
     if verbose && !zw_candidates.is_empty() {
@@ -2742,8 +2764,13 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let start = run_start;
         Some(std::thread::spawn(move || {
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                if found_c.load(AtomicOrdering::Relaxed) { break; }
+                // Sleep in small increments so we notice early termination quickly
+                for _ in 0..100 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if found_c.load(AtomicOrdering::Relaxed) { return; }
+                    let done = tuples_done_c.load(AtomicOrdering::Relaxed);
+                    if done >= total_tuples { return; }
+                }
                 let done = tuples_done_c.load(AtomicOrdering::Relaxed);
                 if done >= total_tuples { break; }
                 let pairs = pairs_tested_c.load(AtomicOrdering::Relaxed);
@@ -2976,7 +3003,7 @@ fn main() {
             for tuple in &tuples {
                 let mut stats = SearchStats::default();
                 let start = Instant::now();
-                let candidates = build_zw_candidates(problem, *tuple, &cfg, &spectral_z, &spectral_w, &mut stats);
+                let candidates = build_zw_candidates(problem, *tuple, &cfg, &spectral_z, &spectral_w, &mut stats, &AtomicBool::new(false));
                 println!("({},{},{},{}): z={}/{} w={}/{} pairs={} ({:.3?})",
                     tuple.x, tuple.y, tuple.z, tuple.w,
                     stats.z_spectral_ok, stats.z_generated,
