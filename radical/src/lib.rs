@@ -177,6 +177,7 @@ impl Solver {
 
     /// Get a mutable reference to the literals of clause `ci`.
     #[inline]
+    #[allow(dead_code)]
     fn clause_lits_mut(&mut self, ci: u32) -> &mut [Lit] {
         let m = &self.clause_meta[ci as usize];
         &mut self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)]
@@ -754,6 +755,7 @@ impl Solver {
     /// Generate a clause explanation for a PB-based reason.
     /// The clause is: the propagated literal OR the negation of all false literals
     /// whose removal would violate the bound.
+    #[allow(dead_code)]
     fn pb_reason_clause(&self, pbi: u32, propagated: Lit) -> Vec<Lit> {
         let pb = &self.pb_constraints[pbi as usize];
         let mut clause = vec![propagated];
@@ -768,10 +770,9 @@ impl Solver {
 
     /// Propagate a quadratic PB constraint: sum(coeffs[i] * a_i * b_i) = target.
     /// Single-pass: computes slack and finds propagation in one scan.
-    #[inline(never)]
     /// Recompute a single term's state and update incremental counters.
     /// Returns the new state (0=DEAD, 1=MAYBE, 2=TRUE).
-    #[inline(always)]
+    #[inline(never)]
     fn update_quad_pb_term(&mut self, qi: u32, ti: usize) {
         let qc = &self.quad_pb_constraints[qi as usize];
         let aa = self.assigns[qc.vars_a[ti]];

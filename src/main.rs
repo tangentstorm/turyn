@@ -148,6 +148,7 @@ impl PackedSeq {
         sig
     }
 
+    #[allow(dead_code)]
     fn as_string(&self) -> String {
         (0..self.len)
             .map(|i| if self.get(i) == 1 { '+' } else { '-' })
@@ -427,6 +428,7 @@ fn boundary_signature_from_values(values: &[i8], k: usize) -> BoundarySignature 
     }
 }
 
+#[allow(dead_code)]
 fn autocorrs_from_values(values: &[i8]) -> Vec<i32> {
     let n = values.len();
     let mut out = vec![0; n];
@@ -1406,6 +1408,7 @@ fn build_sat_xy_clauses(
 }
 
 /// Trait abstracting over radical::Solver and cadical::Solver.
+#[allow(dead_code)]
 trait SatSolver {
     fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I);
     fn add_pb_eq(&mut self, lits: &[i32], coeffs: &[u32], target: u32);
@@ -1547,6 +1550,7 @@ impl SatXYTemplate {
 }
 
 /// SAT-based X/Y solver: given fixed Z/W, encode just X/Y constraints and solve.
+#[allow(dead_code)]
 fn sat_solve_xy(
     problem: Problem,
     tuple: SumTuple,
@@ -2775,6 +2779,7 @@ impl XYBoundaryTable {
     }
 
     /// Expand boundary bits into full sequence values at boundary positions.
+    #[allow(dead_code)]
     fn expand_boundary(&self, bits: u32, seq: &mut [i8]) {
         let k = self.k;
         let n = self.n;
@@ -2899,7 +2904,7 @@ impl XYBoundaryTable {
                     for i in 0..k { bnd_vals[n+i] = yv[i]; bnd_vals[n+n-k+i] = yv[n-k+i]; }
 
                     // Precompute term states for all quad PB constraints and inject
-                    let mut infeasible = false;
+                    let _infeasible = false;
                     for qi in 0..num_qpb {
                         let infos = &qpb_term_info[qi];
                         let mut st = 0i32; let mut sm = 0i32;
@@ -3287,7 +3292,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let (result_tx, result_rx) = std::sync::mpsc::channel::<Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>>();
     // Per-worker channels: coordinator sends work, worker receives
     let mut worker_txs: Vec<std::sync::mpsc::SyncSender<Option<WorkItem>>> = Vec::new();
-    let mut worker_ready_tx_list: Vec<std::sync::mpsc::Sender<usize>> = Vec::new();
+    let _worker_ready_tx_list: Vec<std::sync::mpsc::Sender<usize>> = Vec::new();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<usize>(); // workers signal "I'm idle"
 
     // Spawn workers
@@ -3481,6 +3486,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         println!("\n--- Phase timing (wall-clock, {} threads) ---", workers);
         println!("  Phase A (tuple enum):       {:>10.3?}", phase_a_elapsed);
         println!("  Phase B (Z/W gen+spectral): {:>10.3?}  (thread-sum)", phase_b);
+        println!("  Phase C (SAT X/Y):          {:>10.3?}  (thread-sum)", phase_c);
         println!("  Pairs dispatched:           {:>10}", pairs_dispatched);
         println!("  Total wall-clock:           {:>10.3?}", total);
         if !found_solution {

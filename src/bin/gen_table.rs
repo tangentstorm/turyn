@@ -69,7 +69,7 @@ fn main() {
 
 /// Decode bit pattern and compute boundary sums.
 /// Returns (x_boundary_bits, y_boundary_bits, x_sum, y_sum)
-fn decode_and_sum(bits: u64, n: usize, k: usize) -> (u32, u32, i16, i16) {
+fn decode_and_sum(bits: u64, _n: usize, k: usize) -> (u32, u32, i16, i16) {
     let mut x_bits = 0u32;
     let mut y_bits = 0u32;
     let mut x_sum = 0i16;
