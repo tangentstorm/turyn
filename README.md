@@ -13,12 +13,12 @@ The long-term goal is TT(56), which yields a **Hadamard matrix of order 668**.
 | 8 | 92 | 3.1ms | **1.7ms** | 1.9ms | 2.1ms | hybrid |
 | 10 | 116 | 23ms | **1.6ms** | 11ms | 9.7ms | hybrid |
 | 12 | 140 | 61ms | **8ms** | 81ms | 101ms | hybrid |
-| 14 | 164 | 462ms | **40ms** | 851ms | 676ms | hybrid |
-| 16 | 188 | 3.9s | **203ms** | 25s | 157ms | hybrid |
-| 18 | 212 | 3.8s | **3.1s** | timeout | timeout | hybrid |
-| 20 | 236 | 51s | **1.4s** | timeout | timeout | hybrid |
-| 22 | 260 | timeout | **32s** | timeout | — | hybrid |
-| 24 | 284 | timeout | **4.7s** | timeout | — | hybrid |
+| 14 | 164 | 462ms | **9ms** | 851ms | 676ms | hybrid |
+| 16 | 188 | 3.9s | **80ms** | 25s | 157ms | hybrid |
+| 18 | 212 | 3.8s | **953ms** | timeout | timeout | hybrid |
+| 20 | 236 | 51s | **917ms** | timeout | timeout | hybrid |
+| 22 | 260 | timeout | **8.7s** | timeout | — | hybrid |
+| 24 | 284 | timeout | **2.5s** | timeout | — | hybrid |
 
 Hybrid is now the default mode and runs in parallel across all available cores. Just run `target/release/turyn --n=N` to search.
 
@@ -134,6 +134,7 @@ The `radical/` subcrate is a minimal CDCL (Conflict-Driven Clause Learning) SAT 
 | Clause compaction / GC | ✅ | ❌ |
 | **Extensions (radical only)** | | |
 | Native PB constraints (`sum >= k`) | ❌ | ✅ |
+| Quadratic PB (`sum(a*b) = k`) | ❌ | ✅ |
 | Assumptions API | ✅ | ✅ |
 | Solver cloning (for templates) | ❌ | ✅ |
 | Pure Rust, zero C deps | ❌ | ✅ |
