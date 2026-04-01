@@ -78,11 +78,14 @@ struct QuadPbConstraint {
     lits_b: Vec<Lit>,
     coeffs: Vec<u32>,
     target: u32,
-    // Pre-computed variable indices and sign masks for fast access
+    // Pre-computed variable indices and polarity for fast access
     vars_a: Vec<usize>,
     vars_b: Vec<usize>,
     neg_a: Vec<bool>,
     neg_b: Vec<bool>,
+    // Pre-encoded: the LBool value that means "literal is true"
+    true_val_a: Vec<LBool>,
+    true_val_b: Vec<LBool>,
     num_terms: u32,
     // Incremental state per term: 0=DEAD, 1=MAYBE, 2=TRUE
     term_state: Vec<u8>,
@@ -357,12 +360,15 @@ impl Solver {
         let vars_b: Vec<usize> = lits_b.iter().map(|&l| var_of(l)).collect();
         let neg_a: Vec<bool> = lits_a.iter().map(|&l| l < 0).collect();
         let neg_b: Vec<bool> = lits_b.iter().map(|&l| l < 0).collect();
+        let true_val_a: Vec<LBool> = lits_a.iter().map(|&l| if l > 0 { LBool::True } else { LBool::False }).collect();
+        let true_val_b: Vec<LBool> = lits_b.iter().map(|&l| if l > 0 { LBool::True } else { LBool::False }).collect();
         self.quad_pb_constraints.push(QuadPbConstraint {
             lits_a: lits_a.to_vec(),
             lits_b: lits_b.to_vec(),
             coeffs: coeffs.to_vec(),
             target,
             vars_a, vars_b, neg_a, neg_b,
+            true_val_a, true_val_b,
             num_terms: lits_a.len() as u32,
             term_state: vec![1u8; lits_a.len()], // all MAYBE initially
             sum_true: 0,
@@ -701,29 +707,27 @@ impl Solver {
         let qc = &self.quad_pb_constraints[qi as usize];
         let aa = self.assigns[qc.vars_a[ti]];
         let ab = self.assigns[qc.vars_b[ti]];
-        let a_false = (aa == LBool::True && qc.neg_a[ti]) || (aa == LBool::False && !qc.neg_a[ti]);
-        let b_false = (ab == LBool::True && qc.neg_b[ti]) || (ab == LBool::False && !qc.neg_b[ti]);
+        // a_false: assigned to the opposite of what makes the literal true
+        let a_false = aa != LBool::Undef && aa != qc.true_val_a[ti];
+        let b_false = ab != LBool::Undef && ab != qc.true_val_b[ti];
         let c = qc.coeffs[ti] as i32;
 
-        let new_state = if a_false || b_false { 0 }
-            else if aa != LBool::Undef && ab != LBool::Undef { 2 }
-            else { 1 };
+        // State: 0=DEAD (either false), 2=TRUE (both assigned, neither false), 1=MAYBE
+        let new_state = if a_false | b_false { 0u8 }
+            else if aa != LBool::Undef && ab != LBool::Undef { 2u8 }
+            else { 1u8 };
 
-        let old_state = self.quad_pb_constraints[qi as usize].term_state[ti];
+        let qc = &mut self.quad_pb_constraints[qi as usize];
+        let old_state = qc.term_state[ti];
         if old_state == new_state { return; }
 
-        // Adjust counters
-        match old_state {
-            1 => { self.quad_pb_constraints[qi as usize].sum_maybe -= c; }
-            2 => { self.quad_pb_constraints[qi as usize].sum_true -= c; }
-            _ => {}
-        }
-        match new_state {
-            1 => { self.quad_pb_constraints[qi as usize].sum_maybe += c; }
-            2 => { self.quad_pb_constraints[qi as usize].sum_true += c; }
-            _ => {}
-        }
-        self.quad_pb_constraints[qi as usize].term_state[ti] = new_state;
+        // Adjust counters: subtract old contribution, add new
+        // Using direct arithmetic instead of match to reduce branches
+        if old_state == 1 { qc.sum_maybe -= c; }
+        else if old_state == 2 { qc.sum_true -= c; }
+        if new_state == 1 { qc.sum_maybe += c; }
+        else if new_state == 2 { qc.sum_true += c; }
+        qc.term_state[ti] = new_state;
     }
 
     /// Propagate a quadratic PB constraint using incremental counters.
@@ -747,9 +751,9 @@ impl Solver {
             let qc = &self.quad_pb_constraints[qi as usize];
             let aa = self.assigns[qc.vars_a[i]];
             let ab = self.assigns[qc.vars_b[i]];
-            let a_false = (aa == LBool::True && qc.neg_a[i]) || (aa == LBool::False && !qc.neg_a[i]);
-            let b_false = (ab == LBool::True && qc.neg_b[i]) || (ab == LBool::False && !qc.neg_b[i]);
-            if a_false || b_false { continue; }
+            let a_false = aa != LBool::Undef && aa != qc.true_val_a[i];
+            let b_false = ab != LBool::Undef && ab != qc.true_val_b[i];
+            if a_false | b_false { continue; }
             let a_undef = aa == LBool::Undef;
             let b_undef = ab == LBool::Undef;
             if !a_undef && !b_undef { continue; }
