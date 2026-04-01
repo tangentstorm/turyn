@@ -253,7 +253,10 @@ struct SearchConfig {
     /// Run only Phase A (print tuples) or Phase B (print Z/W pairs).
     phase_only: Option<String>,
     /// Path to XY boundary table file for table-based Phase C.
+    /// Defaults to "./xy-table.bin".
     xy_table_path: Option<String>,
+    /// Run without XY boundary table (slower).
+    no_table: bool,
     /// Dump DIMACS CNF to this path instead of solving.
     dump_dimacs: Option<String>,
 }
@@ -281,6 +284,7 @@ impl Default for SearchConfig {
             test_tuple: None,
             phase_only: None,
             xy_table_path: None,
+            no_table: false,
             dump_dimacs: None,
         }
     }
@@ -2686,7 +2690,7 @@ struct XYBoundaryTable {
 }
 
 impl XYBoundaryTable {
-    fn load(path: &str) -> Option<Self> {
+    fn load(path: &str, n: usize) -> Option<Self> {
         use std::io::Read;
         let mut f = std::fs::File::open(path).ok()?;
         let mut buf = Vec::new();
@@ -2697,8 +2701,12 @@ impl XYBoundaryTable {
         if &buf[0..4] != b"XYTT" { return None; }
         let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
         if version != 2 { return None; }
-        let n = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
+        let _table_n = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
         let k = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
+        if n < 2 * k {
+            eprintln!("Error: table k={} requires n >= {}, but n={}", k, 2 * k, n);
+            return None;
+        }
         let num_groups = u32::from_le_bytes(buf[16..20].try_into().ok()?) as usize;
 
         // Parse group directory
@@ -3132,28 +3140,26 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
     let phase_a_elapsed = phase_a_start.elapsed();
 
-    // Load XY boundary table if specified
-    let xy_table: Option<Arc<XYBoundaryTable>> = cfg.xy_table_path.as_ref().and_then(|path| {
-        match XYBoundaryTable::load(path) {
+    // Load XY boundary table (default: ./xy-table.bin)
+    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table.bin".to_string());
+    let xy_table: Option<Arc<XYBoundaryTable>> = if cfg.no_table {
+        None
+    } else {
+        match XYBoundaryTable::load(&table_path, problem.n) {
             Some(t) => {
-                if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {} groups)", path, t.n, t.k, t.groups.len()); }
+                if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {} groups)", table_path, t.n, t.k, t.groups.len()); }
                 Some(Arc::new(t))
             }
             None => {
-                eprintln!("Error: failed to load XY boundary table from '{}'", path);
-                eprintln!("Generate it with: target/release/gen_table {} 6 {}", problem.n, path);
-                None
+                eprintln!("Error: XY boundary table not found at '{}'", table_path);
+                eprintln!("Generate it once (reusable for any n):");
+                eprintln!("  cargo build --release --bin gen_table");
+                eprintln!("  target/release/gen_table {} 6 {}", problem.n, table_path);
+                eprintln!("Or run with --no-table to skip (slower).");
+                std::process::exit(1);
             }
         }
-    });
-
-    // Hint for n >= 26 without table
-    if problem.n >= 26 && xy_table.is_none() && cfg.xy_table_path.is_none() {
-        eprintln!("Hint: for ~20% faster search at n={}, pre-generate an XY boundary table:", problem.n);
-        eprintln!("  cargo build --release --bin gen_table");
-        eprintln!("  target/release/gen_table {} 6 xy_table.bin", problem.n);
-        eprintln!("  target/release/turyn --n={} --xy-table=xy_table.bin", problem.n);
-    }
+    };
 
     let workers = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(1).max(1);
@@ -3185,8 +3191,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false };
     }
 
-    // For n < 28: use fast per-tuple work-stealing (no coordinator overhead)
-    if problem.n < 28 {
+    // For small n: use fast per-tuple work-stealing (no coordinator overhead)
+    if problem.n < 26 {
         let tuples = Arc::new(tuples);
         let cfg = Arc::new(cfg.clone());
         let xy_table = xy_table.map(Arc::new);
@@ -3212,8 +3218,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                     if done >= total_tuples { break; }
                     let pairs = pairs_tested_c.load(AtomicOrdering::Relaxed);
                     let elapsed = start.elapsed().as_secs_f64();
-                    eprintln!("[{:.0}s] {}/{} tuples ({:.0}%), {} pairs, {:.1} tuples/s",
-                        elapsed, done, total_tuples, 100.0*done as f64/total_tuples as f64, pairs, done as f64/elapsed);
+                    eprintln!("[{:.0}s] tuples {}/{}, done {}, {:.1} pairs/s",
+                        elapsed, done, total_tuples, pairs, pairs as f64/elapsed);
                 }
             }))
         } else { None };
@@ -3272,7 +3278,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         return SearchReport { stats, elapsed: run_start.elapsed(), found_solution };
     }
 
-    // For n >= 26: channel-based coordinator with priority queue.
+    // For n >= 26: channel-based coordinator with shared priority queue.
+    // All pairs from all tuples go into one queue, dispatched tightest-first.
     // - Producer thread: runs Phase B for all tuples, sends candidates to coordinator
     // - Coordinator (this thread): receives candidates, inserts into priority queue,
     //   dispatches to idle workers (tightest spectral first)
@@ -3281,10 +3288,14 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
     use std::collections::BinaryHeap;
 
-    // Auto-widen spectral bound for n >= 28
+    // Auto-widen spectral pair bound for n >= 28.
+    // Individual Z/W are still filtered at the strict spectral_bound, so the
+    // theoretical max pair sum is 2 * spectral_bound.  Widening to that limit
+    // effectively disables the pair filter, but the priority queue dispatches
+    // tightest pairs first so SAT effort concentrates on the best candidates.
     let mut producer_cfg = cfg.clone();
     if producer_cfg.max_spectral.is_none() && problem.n >= 28 {
-        let widened = problem.spectral_bound() + 30.0;
+        let widened = problem.spectral_bound() * 2.0;
         if verbose {
             eprintln!("Auto-widening spectral bound to {:.0} for n={}", widened, problem.n);
         }
@@ -3305,6 +3316,11 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let _worker_ready_tx_list: Vec<std::sync::mpsc::Sender<usize>> = Vec::new();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<usize>(); // workers signal "I'm idle"
 
+    // Shared counters for progress reporting and timing
+    let tuples_produced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pairs_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let phase_c_nanos_shared = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // Spawn workers
     let xy_table = xy_table.map(Arc::new);
     for tid in 0..workers {
@@ -3314,6 +3330,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let ready_tx = ready_tx.clone();
         let result_tx = result_tx.clone();
         let xy_table = xy_table.clone();
+        let pairs_completed = Arc::clone(&pairs_completed);
+        let phase_c_nanos_shared = Arc::clone(&phase_c_nanos_shared);
 
         std::thread::spawn(move || {
             let mut template_cache: HashMap<(i32,i32,i32,i32), SatXYTemplate> = HashMap::new();
@@ -3326,6 +3344,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                     SatXYTemplate::build(problem, item.tuple).unwrap()
                 });
 
+                let c_start = Instant::now();
                 let mut solved = None;
                 if let Some(ref table) = xy_table {
                     let t: &XYBoundaryTable = table;
@@ -3341,6 +3360,9 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                         }
                     }
                 }
+                phase_c_nanos_shared.fetch_add(c_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+
+                pairs_completed.fetch_add(1, AtomicOrdering::Relaxed);
 
                 if solved.is_some() {
                     found.store(true, AtomicOrdering::Relaxed);
@@ -3355,30 +3377,45 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     drop(ready_tx); // coordinator uses ready_rx only
     drop(result_tx); // only workers send results
 
-    // Producer threads: run Phase B in parallel, send (tuple, candidate) pairs
-    // Use half the cores for production, half reserved for workers
-    let num_producers = (workers / 2).max(1);
+    // Single producer thread with adaptive throttling.
+    // Pair generation is far cheaper than SAT solving, so one producer can
+    // easily keep the queue full.  When the queue is deep, the producer sleeps
+    // to yield its CPU core to SAT workers.  It wakes periodically to generate
+    // one tuple's worth of pairs, then goes back to sleep if still pressured.
     let tuples = Arc::new(tuples);
+    let total_tuples = tuples.len();
     let producer_cfg = Arc::new(producer_cfg);
     let next_tuple = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let queue_pressure = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let queue_pressure_producer = Arc::clone(&queue_pressure);
     let mut producer_handles = Vec::new();
-    for _ in 0..num_producers {
+    {
         let found = Arc::clone(&found);
         let tx = producer_tx.clone();
         let tuples = Arc::clone(&tuples);
         let cfg = Arc::clone(&producer_cfg);
         let next = Arc::clone(&next_tuple);
+        let tuples_produced = Arc::clone(&tuples_produced);
+        let pressure_threshold = workers * 100;
         producer_handles.push(std::thread::spawn(move || {
             let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
             let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
             let mut stats = SearchStats::default();
             loop {
                 if found.load(AtomicOrdering::Relaxed) { break; }
+                // Throttle: if queue is deep, sleep to yield CPU to SAT workers
+                while queue_pressure_producer.load(AtomicOrdering::Relaxed) > pressure_threshold {
+                    if found.load(AtomicOrdering::Relaxed) { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                if found.load(AtomicOrdering::Relaxed) { break; }
                 let idx = next.fetch_add(1, AtomicOrdering::Relaxed);
                 if idx >= tuples.len() { break; }
                 let tuple = tuples[idx];
+                let b_start = Instant::now();
                 let candidates = build_zw_candidates(
                     problem, tuple, &cfg, &spectral_z, &spectral_w, &mut stats, &found);
+                stats.phase_b_nanos += b_start.elapsed().as_nanos() as u64;
                 let mut seen = std::collections::HashSet::new();
                 for c in candidates {
                     if found.load(AtomicOrdering::Relaxed) { break; }
@@ -3386,6 +3423,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                         if tx.send((tuple, c)).is_err() { break; }
                     }
                 }
+                tuples_produced.fetch_add(1, AtomicOrdering::Relaxed);
             }
             stats
         }));
@@ -3412,6 +3450,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let mut found_solution = false;
     let mut stats = SearchStats::default();
     let mut pairs_dispatched = 0usize;
+    let mut last_progress = std::time::Instant::now();
 
     // Helper: dispatch from pq to an idle worker
     let dispatch = |pq: &mut BinaryHeap<PqItem>, idle: &mut Vec<usize>,
@@ -3464,12 +3503,26 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             }
         }
 
+        // Update queue pressure so producer can throttle
+        queue_pressure.store(pq.len(), AtomicOrdering::Relaxed);
+
         // Dispatch work
         dispatch(&mut pq, &mut idle_workers, &worker_txs, &mut pairs_dispatched);
 
         // Check if we're done (producer finished + queue empty + all workers idle)
         if producer_done && pq.is_empty() && idle_workers.len() == workers {
             break;
+        }
+
+        // Progress reporting every ~10s
+        if verbose && last_progress.elapsed().as_secs() >= 10 {
+            let elapsed = run_start.elapsed().as_secs_f64();
+            let t_done = tuples_produced.load(AtomicOrdering::Relaxed);
+            let p_done = pairs_completed.load(AtomicOrdering::Relaxed);
+            eprintln!("[{:.0}s] tuples {}/{}, queue {}, dispatched {}, done {}, {:.1} pairs/s",
+                elapsed, t_done, total_tuples, pq.len(), pairs_dispatched, p_done,
+                p_done as f64 / elapsed);
+            last_progress = std::time::Instant::now();
         }
 
         // Brief yield to avoid busy-spinning — use thread::yield instead of sleep
@@ -3489,15 +3542,20 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         }
     }
 
+    // Merge Phase C timing from workers
+    stats.phase_c_nanos = phase_c_nanos_shared.load(AtomicOrdering::Relaxed);
+
     if verbose {
         let total = run_start.elapsed();
         let phase_b = std::time::Duration::from_nanos(stats.phase_b_nanos);
         let phase_c = std::time::Duration::from_nanos(stats.phase_c_nanos);
+        let p_done = pairs_completed.load(AtomicOrdering::Relaxed);
         println!("\n--- Phase timing (wall-clock, {} threads) ---", workers);
         println!("  Phase A (tuple enum):       {:>10.3?}", phase_a_elapsed);
         println!("  Phase B (Z/W gen+spectral): {:>10.3?}  (thread-sum)", phase_b);
         println!("  Phase C (SAT X/Y):          {:>10.3?}  (thread-sum)", phase_c);
         println!("  Pairs dispatched:           {:>10}", pairs_dispatched);
+        println!("  Pairs completed:            {:>10}", p_done);
         println!("  Total wall-clock:           {:>10.3?}", total);
         if !found_solution {
             println!("Hybrid search: no solution found. Stats: z_gen={}, w_gen={}, pairs={}",
@@ -3564,6 +3622,8 @@ fn parse_args() -> SearchConfig {
             }
         } else if let Some(v) = arg.strip_prefix("--xy-table=") {
             cfg.xy_table_path = Some(v.to_string());
+        } else if arg == "--no-table" {
+            cfg.no_table = true;
         } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
             cfg.dump_dimacs = Some(v.to_string());
         }
@@ -3788,6 +3848,8 @@ mod tests {
             test_tuple: None,
             phase_only: None,
             xy_table_path: None,
+            no_table: true,
+            dump_dimacs: None,
         };
         let report = run_search(&cfg, false);
         assert!(report.found_solution);
