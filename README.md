@@ -53,7 +53,7 @@ When regenerating this table:
 cargo build --release
 
 # Default: hybrid search (best overall, parallelized across cores)
-target/release/turyn --n=24
+cargo run --release -- --n=24
 
 # Full SAT search (competitive for n <= 18)
 target/release/turyn --n=14 --sat
@@ -67,10 +67,70 @@ target/release/turyn --n=16 --stochastic
 # Exhaustive DFS search (original method, small n only)
 target/release/turyn --n=8 --dfs --theta=64 --max-z=200000 --max-w=200000 --max-pairs=2000
 
+# Dump DIMACS CNF for external solvers
+target/release/turyn --n=14 --dump-dimacs=tt14.cnf
+
+# Solve a DIMACS file with radical
+target/release/radical tt14.cnf
+
 # Benchmark mode
 target/release/turyn --n=14 --benchmark=3
-target/release/turyn --n=16 --stochastic-secs=10 --benchmark=3
 ```
+
+## Flags
+
+### Search mode (mutually exclusive)
+
+| Flag | Description |
+|---|---|
+| *(default)* | Hybrid search: Phase B + SAT X/Y, parallelized across cores |
+| `--sat` | Full SAT encoding of all four sequences |
+| `--z-sat` | DFS generates Z only, SAT solves X/Y/W jointly |
+| `--dfs` | Exhaustive DFS with spectral filtering (small n only) |
+| `--stochastic` | Multi-threaded simulated annealing |
+| `--sat-xy` | Legacy alias for hybrid (no-op, hybrid is now default) |
+
+### Problem parameters
+
+| Flag | Default | Description |
+|---|---|---|
+| `--n=N` | 56 | Problem size (search for TT(n)) |
+| `--theta=SAMPLES` | 128 | Number of frequency samples for spectral filtering |
+| `--k=K` | 0 | XY boundary table prefix/suffix size |
+| `--max-z=N` | 200000 | Max Z sequences to generate in Phase B |
+| `--max-w=N` | 200000 | Max W sequences to generate in Phase B |
+| `--max-pairs=N` | 5000 | Max Z/W pairs per signature bucket |
+| `--max-spectral=M` | *(auto)* | Tighter spectral bound (London §5.1, default = (6n-2)/2) |
+| `--conflict-limit=N` | 0 | Max SAT conflicts per solve (0 = unlimited) |
+
+### Stochastic options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--stochastic-secs=SECS` | 10 | Time limit for stochastic search (implies `--stochastic`) |
+
+### Benchmarking
+
+| Flag | Default | Description |
+|---|---|---|
+| `--benchmark[=REPS]` | 5 | Run REPS times, report mean/median timing |
+
+### Diagnostics and testing
+
+| Flag | Description |
+|---|---|
+| `--phase-a` | Print sum-tuples only (no search) |
+| `--phase-b` | Print Z/W pairs only (no Phase C) |
+| `--tuple=x,y,z,w` | Test a specific sum-tuple only |
+| `--verify=X,Y,Z,W` | Verify a known solution (comma-separated +/- strings) |
+| `--test-zw=Z,W` | Test SAT X/Y solving with known Z,W |
+| `--xy-table=PATH` | Load XY boundary table from binary file |
+
+### DIMACS export
+
+| Flag | Description |
+|---|---|
+| `--dump-dimacs=PATH` | Write the full SAT encoding as a DIMACS CNF file instead of solving |
 
 ## Search architecture
 
@@ -104,7 +164,14 @@ Multi-threaded simulated annealing: random initialization, sum-preserving pair s
 
 ## radical: pure Rust CDCL SAT solver
 
-The `radical/` subcrate is a minimal CDCL (Conflict-Driven Clause Learning) SAT solver written from scratch in Rust, inspired by CaDiCaL. ~700 lines, zero dependencies, 18 tests.
+The `radical/` subcrate is a minimal CDCL (Conflict-Driven Clause Learning) SAT solver written from scratch in Rust, inspired by CaDiCaL. ~1600 lines, zero dependencies, 18 tests.
+
+It ships as both a library (used by turyn) and a standalone binary that reads and solves DIMACS CNF files:
+
+```bash
+target/release/radical problem.cnf
+# Output: s SATISFIABLE / s UNSATISFIABLE (exit 10/20)
+```
 
 ### Feature comparison: radical vs CaDiCaL
 
