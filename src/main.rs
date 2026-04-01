@@ -225,6 +225,13 @@ struct SearchConfig {
     /// If None, uses the default spectral_bound (= (6n-2)/2).
     /// Setting this lower than spectral_bound trades completeness for speed.
     max_spectral: Option<f64>,
+    /// Test mode: verify a known solution or test SAT on known Z/W.
+    /// Format: 4 strings of +/- chars, e.g. "++--+-" for [1,1,-1,-1,1,-1].
+    verify_seqs: Option<[String; 4]>,
+    /// Test SAT X/Y with given Z/W (2 strings of +/- chars).
+    test_zw: Option<[String; 2]>,
+    /// Conflict limit per SAT solve (0 = unlimited).
+    conflict_limit: u64,
 }
 
 impl Default for SearchConfig {
@@ -244,6 +251,9 @@ impl Default for SearchConfig {
             z_sat: false,
             dfs: false,
             max_spectral: None,
+            verify_seqs: None,
+            test_zw: None,
+            conflict_limit: 0,
         }
     }
 }
@@ -2816,13 +2826,84 @@ fn parse_args() -> SearchConfig {
             cfg.z_sat = true;
         } else if let Some(v) = arg.strip_prefix("--max-spectral=") {
             cfg.max_spectral = Some(v.parse().unwrap_or(0.0));
+        } else if let Some(v) = arg.strip_prefix("--verify=") {
+            let parts: Vec<&str> = v.split(',').collect();
+            if parts.len() == 4 {
+                cfg.verify_seqs = Some([parts[0].to_string(), parts[1].to_string(),
+                                        parts[2].to_string(), parts[3].to_string()]);
+            }
+        } else if let Some(v) = arg.strip_prefix("--test-zw=") {
+            let parts: Vec<&str> = v.split(',').collect();
+            if parts.len() == 2 {
+                cfg.test_zw = Some([parts[0].to_string(), parts[1].to_string()]);
+            }
+        } else if let Some(v) = arg.strip_prefix("--conflict-limit=") {
+            cfg.conflict_limit = v.parse().unwrap_or(0);
         }
     }
     cfg
 }
 
+/// Parse a +/- string into a PackedSeq. '+' = +1, '-' = -1.
+fn parse_seq(s: &str) -> PackedSeq {
+    let vals: Vec<i8> = s.chars().map(|c| if c == '+' { 1 } else { -1 }).collect();
+    PackedSeq::from_values(&vals)
+}
+
 fn main() {
     let cfg = parse_args();
+    if let Some(ref seqs) = cfg.verify_seqs {
+        let x = parse_seq(&seqs[0]);
+        let y = parse_seq(&seqs[1]);
+        let z = parse_seq(&seqs[2]);
+        let w = parse_seq(&seqs[3]);
+        let n = x.len();
+        let p = Problem::new(n);
+        print_solution(&format!("Verifying TT({})", n), &x, &y, &z, &w);
+        let ok = verify_tt(p, &x, &y, &z, &w);
+        println!("Verified: {}", ok);
+        if !ok { std::process::exit(1); }
+        return;
+    }
+    if let Some(ref zw) = cfg.test_zw {
+        let z = parse_seq(&zw[0]);
+        let w = parse_seq(&zw[1]);
+        let n = z.len();
+        let p = Problem::new(n);
+        let zs = z.sum();
+        let ws = w.sum();
+        // Compute ZW autocorrelation
+        let mut zw_autocorr = vec![0i32; n];
+        for s in 1..n {
+            let nz = z.autocorrelation(s);
+            let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
+            zw_autocorr[s] = 2 * nz + 2 * nw;
+        }
+        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr };
+        // Try all sum tuples that match this Z/W
+        let raw = enumerate_sum_tuples(p);
+        let mut seen = std::collections::HashSet::new();
+        let tuples: Vec<SumTuple> = raw.into_iter()
+            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+            .filter(|t| t.z == zs && t.w == ws)
+            .filter(|t| (t.x + n as i32) % 2 == 0 && (t.y + n as i32) % 2 == 0)
+            .collect();
+        println!("TT({}): testing Z(sum={}) W(sum={}) against {} tuples", n, zs, ws, tuples.len());
+        print_solution("  Z/W", &PackedSeq::from_values(&[0]), &PackedSeq::from_values(&[0]), &z, &w);
+        for tuple in &tuples {
+            let start = Instant::now();
+            let Some(template) = SatXYTemplate::build(p, *tuple) else { continue };
+            if let Some((x, y)) = template.solve_for(&candidate) {
+                let ok = verify_tt(p, &x, &y, &z, &w);
+                print_solution(&format!("FOUND for tuple {} ({:.3?}, verified={})", tuple, start.elapsed(), ok), &x, &y, &z, &w);
+                if ok { return; }
+            } else {
+                println!("  Tuple {}: UNSAT ({:.3?})", tuple, start.elapsed());
+            }
+        }
+        println!("No X/Y found for given Z/W");
+        return;
+    }
     if cfg.benchmark_repeats > 0 {
         run_benchmark(&cfg);
     } else if cfg.z_sat {
@@ -2907,6 +2988,9 @@ mod tests {
             z_sat: false,
             dfs: false,
             max_spectral: None,
+            verify_seqs: None,
+            test_zw: None,
+            conflict_limit: 0,
         };
         let report = run_search(&cfg, false);
         assert!(report.found_solution);
