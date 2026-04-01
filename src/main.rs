@@ -2850,6 +2850,7 @@ impl XYBoundaryTable {
         let max_terms = qpb_term_info.iter().map(|v| v.len()).max().unwrap_or(0);
         let mut term_state_buf = vec![0u8; max_terms];
 
+        let mut configs_tested = 0usize;
         let max_bnd_sum = (2 * k) as i16;
         for x_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
             let x_mid = tuple.x - x_bnd_sum as i32;
@@ -2943,7 +2944,13 @@ impl XYBoundaryTable {
                             let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
                             return Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)));
                         }
-                        _ => {}
+                        _ => {
+                            // Periodically clear learnt clauses to prevent watch list bloat
+                            configs_tested += 1;
+                            if configs_tested % 1 == 0 {
+                                solver.clear_learnt();
+                            }
+                        }
                     }
                 }
             }

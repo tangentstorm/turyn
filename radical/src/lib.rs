@@ -475,6 +475,18 @@ impl Solver {
         self.luby_index = 0;
     }
 
+    /// Delete all learnt clauses and clean watch lists.
+    /// Call between independent solves to prevent clause database bloat.
+    pub fn clear_learnt(&mut self) {
+        self.backtrack(0);
+        for m in &mut self.clause_meta {
+            if m.learnt { m.deleted = true; }
+        }
+        for wl in &mut self.watches {
+            wl.retain(|&(ci, _)| !self.clause_meta[ci as usize].deleted);
+        }
+    }
+
     /// Pre-allocate internal buffers for expected search size.
     /// Call before cloning as a template to ensure clones have capacity.
     pub fn reserve_for_search(&mut self, expected_clauses: usize) {
