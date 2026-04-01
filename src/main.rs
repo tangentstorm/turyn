@@ -494,11 +494,14 @@ fn generate_sequences_with_sum(
     let mut out = Vec::new();
     generate_sequences_with_sum_visit(len, target_sum, root_one, tail_one, limit, |values| {
         out.push(PackedSeq::from_values(values));
+        true
     });
     out
 }
 
-fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
+/// Generate ±1 sequences of given length and sum, calling `visit` for each.
+/// `visit` returns `true` to continue, `false` to stop early.
+fn generate_sequences_with_sum_visit<F: FnMut(&[i8]) -> bool>(
     len: usize,
     target_sum: i32,
     root_one: bool,
@@ -508,6 +511,7 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
 ) {
     let mut curr = vec![1i8; len];
     let mut emitted = 0usize;
+    let mut stopped = false;
 
     fn dfs(
         i: usize,
@@ -516,18 +520,21 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
         target_sum: i32,
         curr: &mut [i8],
         emitted: &mut usize,
+        stopped: &mut bool,
         limit: usize,
         root_one: bool,
         tail_one: bool,
-        visit: &mut impl FnMut(&[i8]),
+        visit: &mut impl FnMut(&[i8]) -> bool,
     ) {
-        if *emitted >= limit {
+        if *emitted >= limit || *stopped {
             return;
         }
         if i == len {
             if curr_sum == target_sum {
                 *emitted += 1;
-                visit(curr);
+                if !visit(curr) {
+                    *stopped = true;
+                }
             }
             return;
         }
@@ -541,6 +548,7 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
                 target_sum,
                 curr,
                 emitted,
+                stopped,
                 limit,
                 root_one,
                 tail_one,
@@ -558,6 +566,7 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
                 target_sum,
                 curr,
                 emitted,
+                stopped,
                 limit,
                 root_one,
                 tail_one,
@@ -581,12 +590,15 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
                 target_sum,
                 curr,
                 emitted,
+                stopped,
                 limit,
                 root_one,
                 tail_one,
                 visit,
             );
         }
+
+        if *stopped { return; }
 
         curr[i] = -1;
         let max_neg = curr_sum - 1 + forced_plus + free_remaining;
@@ -599,6 +611,7 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
                 target_sum,
                 curr,
                 emitted,
+                stopped,
                 limit,
                 root_one,
                 tail_one,
@@ -614,6 +627,7 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8])>(
         target_sum,
         &mut curr,
         &mut emitted,
+        &mut stopped,
         limit,
         root_one,
         tail_one,
@@ -628,6 +642,7 @@ fn build_zw_candidates(
     spectral_z: &SpectralFilter,
     spectral_w: &SpectralFilter,
     stats: &mut SearchStats,
+    found: &AtomicBool,
 ) -> Vec<CandidateZW> {
     fn push_capped(
         buckets: &mut HashMap<BoundarySignature, Vec<SeqWithSpectrum>>,
@@ -651,6 +666,7 @@ fn build_zw_candidates(
     let mut z_buckets: HashMap<BoundarySignature, Vec<SeqWithSpectrum>> = HashMap::new();
     let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
     generate_sequences_with_sum_visit(problem.n, tuple.z, true, true, cfg.max_z, |values| {
+        if found.load(AtomicOrdering::Relaxed) { return false; }
         stats.z_generated += 1;
         if let Some(spectrum) =
             spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf)
@@ -667,11 +683,15 @@ fn build_zw_candidates(
                 cfg.max_pairs_per_bucket.max(1),
             );
         }
+        true
     });
+
+    if found.load(AtomicOrdering::Relaxed) { return Vec::new(); }
 
     let mut w_buckets: HashMap<BoundarySignature, Vec<SeqWithSpectrum>> = HashMap::new();
     fft_buf.clear();
     generate_sequences_with_sum_visit(problem.m(), tuple.w, true, false, cfg.max_w, |values| {
+        if found.load(AtomicOrdering::Relaxed) { return false; }
         stats.w_generated += 1;
         if let Some(spectrum) =
             spectrum_if_ok(values, spectral_w, individual_bound, &mut fft_buf)
@@ -688,6 +708,7 @@ fn build_zw_candidates(
                 cfg.max_pairs_per_bucket.max(1),
             );
         }
+        true
     });
 
     let mut out = Vec::new();
@@ -1111,7 +1132,8 @@ impl Gf2Row {
     }
 }
 
-fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Vec<(i32, i32, bool)> {
+/// Returns None if a contradiction is detected (UNSAT), otherwise equalities.
+fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Option<Vec<(i32, i32, bool)>> {
     let num_vars = 2 * n;
     // Union-find with negation tracking (XOR-union-find)
     let mut parent: Vec<usize> = (0..num_vars).collect();
@@ -1173,18 +1195,18 @@ fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Vec<(i32, i32, 
         if target == max_pairs {
             // ALL pairs agree
             for i in 0..x_pairs {
-                union(&mut parent, &mut rank, &mut neg, i, i + s, false);
+                if !union(&mut parent, &mut rank, &mut neg, i, i + s, false) { return None; }
             }
             for i in 0..y_pairs {
-                union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, false);
+                if !union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, false) { return None; }
             }
         } else if target == 0 {
             // NO pairs agree
             for i in 0..x_pairs {
-                union(&mut parent, &mut rank, &mut neg, i, i + s, true);
+                if !union(&mut parent, &mut rank, &mut neg, i, i + s, true) { return None; }
             }
             for i in 0..y_pairs {
-                union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, true);
+                if !union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, true) { return None; }
             }
         }
     }
@@ -1262,22 +1284,27 @@ fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Vec<(i32, i32, 
             let set_vars: Vec<usize> = row.vars.iter().enumerate()
                 .filter(|&(_, &v)| v).map(|(i, _)| i).collect();
             match set_vars.len() {
+                0 => {
+                    // All-zero row: if constant is 1, contradiction (UNSAT)
+                    if row.constant { return None; }
+                }
                 1 => {
-                    // Forced variable: x = constant
+                    // Forced variable: x_v = constant (in GF(2)).
+                    // constant=true → x_v has bit 1 → same as x[0] (forced +1) → equal
+                    // constant=false → x_v has bit 0 → opposite of x[0] → negated
                     let v = set_vars[0];
-                    // Union with a "truth" anchor: if constant=1, x is true (equivalent to x[0] which is forced true)
-                    // Since x[0] is forced true by symmetry breaking, we can't directly use
-                    // union-find for forced values. Instead, add as a clause later.
-                    // For now, skip single-variable rows.
+                    if !union(&mut parent, &mut rank, &mut neg, v, 0, !row.constant) {
+                        return None;
+                    }
                 }
                 2 => {
-                    // Two variables: x_a ⊕ x_b = c
                     let a = set_vars[0];
                     let b = set_vars[1];
-                    // c=0 → a=b, c=1 → a=¬b
-                    union(&mut parent, &mut rank, &mut neg, a, b, row.constant);
+                    if !union(&mut parent, &mut rank, &mut neg, a, b, row.constant) {
+                        return None;
+                    }
                 }
-                _ => {} // more than 2 variables: can't directly use in union-find
+                _ => {}
             }
         }
     }
@@ -1293,7 +1320,7 @@ fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Vec<(i32, i32, 
         }
     }
 
-    equalities
+    Some(equalities)
 }
 
 /// Pair data for quadratic PB constraints per lag: (lits_a, lits_b) for each lag.
@@ -1371,6 +1398,7 @@ trait SatSolver {
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool>;
     fn value(&self, var: i32) -> Option<bool>;
     fn reset(&mut self);
+    fn set_conflict_limit(&mut self, limit: u64);
 }
 
 impl SatSolver for radical::Solver {
@@ -1391,6 +1419,9 @@ impl SatSolver for radical::Solver {
     }
     fn reset(&mut self) {
         self.reset();
+    }
+    fn set_conflict_limit(&mut self, limit: u64) {
+        self.set_conflict_limit(limit);
     }
 }
 
@@ -1413,6 +1444,9 @@ impl SatSolver for cadical::Solver {
     }
     fn reset(&mut self) {
         // CaDiCaL auto-resets after solve
+    }
+    fn set_conflict_limit(&mut self, _limit: u64) {
+        // CaDiCaL uses its own limit mechanism
     }
 }
 
@@ -1442,16 +1476,23 @@ impl SatXYTemplate {
 
     /// Solve for X/Y given a specific Z/W candidate.
     /// Clones the template and adds PB constraints for per-lag agree targets.
-    fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
-        if !self.is_feasible(candidate) { return None; }
+    /// Returns (result, was_limited): result is Some if SAT, None if UNSAT/UNKNOWN.
+    /// was_limited=true means we hit the conflict limit (UNKNOWN).
+    fn solve_for_limited(&self, candidate: &CandidateZW, conflict_limit: u64) -> (Option<(PackedSeq, PackedSeq)>, bool) {
+        if !self.is_feasible(candidate) { return (None, false); }
         let n = self.n;
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
 
-        let mut solver = self.solver.clone();
+        // GJ-derived equalities from extreme-target lags (before clone — cheap)
+        let Some(equalities) = gj_candidate_equalities(n, candidate) else {
+            return (None, false); // GJ detected contradiction → UNSAT
+        };
 
-        // GJ-derived equalities from extreme-target lags
-        let equalities = gj_candidate_equalities(n, candidate);
+        let mut solver = self.solver.clone();
+        if conflict_limit > 0 {
+            solver.set_conflict_limit(conflict_limit);
+        }
         for &(a, b, equal) in &equalities {
             if equal {
                 solver.add_clause([-a, b]);
@@ -1475,10 +1516,15 @@ impl SatXYTemplate {
             Some(true) => {
                 let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
                 let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)))
+                (Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y))), false)
             }
-            _ => None,
+            Some(false) => (None, false),  // definite UNSAT
+            None => (None, true),  // hit conflict limit (UNKNOWN)
         }
+    }
+
+    fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
+        self.solve_for_limited(candidate, 0).0
     }
 }
 
@@ -1708,11 +1754,11 @@ fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let mut z_count = 0usize;
         let mut found = false;
         generate_sequences_with_sum_visit(problem.n, tuple.z, true, true, cfg.max_z, |z_values| {
-            if found { return; }
+            if found { return false; }
             z_count += 1;
             // Spectral filter on Z alone
             if spectrum_if_ok(z_values, &spectral_z, problem.spectral_bound(), &mut fft_buf).is_none() {
-                return;
+                return true;
             }
             // Try SAT for X/Y/W given this Z
             if let Some((x, y, w)) = sat_solve_xyw(problem, *tuple, z_values, verbose) {
@@ -1724,8 +1770,9 @@ fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                             problem.n, tuple, z_count, run_start.elapsed(), ok),
                         &x, &y, &pz, &w);
                 }
-                if ok { found = true; }
+                if ok { found = true; return false; }
             }
+            true
         });
         if found {
             return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
@@ -1786,7 +1833,7 @@ fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             let mut found_solution = false;
             for tuple in &norm {
                 let zw_candidates =
-                    build_zw_candidates(problem, *tuple, cfg, &spectral_z, &spectral_w, &mut stats);
+                    build_zw_candidates(problem, *tuple, cfg, &spectral_z, &spectral_w, &mut stats, &AtomicBool::new(false));
                 for cand in &zw_candidates {
                     if let Some((x, y)) = backtrack_xy(problem, *tuple, cand, &mut stats) {
                         found_solution = verify_tt(problem, &x, &y, &cand.z, &cand.w);
@@ -1830,7 +1877,7 @@ fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 for idx in start..end {
                     let tuple = tuples[idx];
                     let zw_candidates =
-                        build_zw_candidates(problem, tuple, &cfg, &sz, &sw, &mut local_stats);
+                        build_zw_candidates(problem, tuple, &cfg, &sz, &sw, &mut local_stats, &AtomicBool::new(false));
                     for cand in &zw_candidates {
                         if let Some((x, y)) = backtrack_xy(problem, tuple, cand, &mut local_stats) {
                             found_solution = verify_tt(problem, &x, &y, &cand.z, &cand.w);
@@ -1868,7 +1915,7 @@ fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             println!("Trying tuple family {tuple}");
         }
         let zw_candidates =
-            build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats);
+            build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats, &AtomicBool::new(false));
         if verbose {
             println!("  Phase B: {} candidate (Z,W) pairs", zw_candidates.len());
             println!("  Phase B elapsed: {:.3?}", phase_b_start.elapsed());
@@ -2615,7 +2662,7 @@ fn hybrid_solve_tuple(
     // we don't spend minutes in Phase B before trying any SAT.
     let phase_b_start = Instant::now();
     let zw_candidates =
-        build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats);
+        build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats, found);
     let phase_b_elapsed = phase_b_start.elapsed();
     stats.phase_b_nanos += phase_b_elapsed.as_nanos() as u64;
     if verbose && !zw_candidates.is_empty() {
@@ -2636,8 +2683,36 @@ fn hybrid_solve_tuple(
             unique_candidates.len(), zw_candidates.len());
     }
 
+    // For large n, use conflict limit to quickly reject easy-UNSAT pairs,
+    // then retry deferred (UNKNOWN) pairs without limit.
+    let conflict_limit = if problem.n >= 26 { 50000u64 } else { 0 };
+    let mut deferred: Vec<usize> = Vec::new();
+
     for (idx, cand) in unique_candidates.iter().enumerate() {
         if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
+        let sat_start = Instant::now();
+        let (result, was_limited) = template.solve_for_limited(cand, conflict_limit);
+        stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
+        if let Some((x, y)) = result {
+            let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
+            if verbose {
+                print_solution(&format!("TT({}) hybrid (pair {}, {:.3?}, verified={})", problem.n, idx, sat_start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
+            }
+            if ok {
+                found.store(true, AtomicOrdering::Relaxed);
+                return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
+            }
+        } else if was_limited {
+            deferred.push(idx);
+        } else if verbose {
+            println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
+        }
+    }
+
+    // Pass 2: retry deferred candidates without limit
+    for &idx in &deferred {
+        if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
+        let cand = unique_candidates[idx];
         let sat_start = Instant::now();
         if let Some((x, y)) = template.solve_for(cand) {
             stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
@@ -2683,13 +2758,15 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let cfg = cfg.clone();
     let cfg = cfg;
 
-    // Heuristic tuple ordering: balance "likely to contain solution" with
-    // "cheap to search". Known TT solutions have x≈y, so |x-y| is key.
-    // But also need small |z|+|w| for cheap Phase B.
-    // Score = |x-y| * 2 + |z| + |w|  (penalize x≠y heavily, prefer small z/w)
-    // Heuristic tuple ordering: try small |z|+|w| first (cheap Phase B),
-    // break ties by small |x-y| (solutions often have x≈y).
-    tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
+    // Heuristic tuple ordering depends on problem size.
+    // For smaller n: cheap Phase B first (small |z|+|w|), since Phase B dominates.
+    // For larger n: solution-likely first (small |x-y|), since Phase C dominates
+    // and we want to reach the solution tuple early.
+    if problem.n >= 26 {
+        tuples.sort_by_key(|t| ((t.x - t.y).abs(), t.z.abs() + t.w.abs(), t.x.abs() + t.y.abs()));
+    } else {
+        tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
+    }
     let phase_a_elapsed = phase_a_start.elapsed();
 
     let workers = std::thread::available_parallelism()
@@ -2742,8 +2819,13 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let start = run_start;
         Some(std::thread::spawn(move || {
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                if found_c.load(AtomicOrdering::Relaxed) { break; }
+                // Sleep in small increments so we notice early termination quickly
+                for _ in 0..100 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    if found_c.load(AtomicOrdering::Relaxed) { return; }
+                    let done = tuples_done_c.load(AtomicOrdering::Relaxed);
+                    if done >= total_tuples { return; }
+                }
                 let done = tuples_done_c.load(AtomicOrdering::Relaxed);
                 if done >= total_tuples { break; }
                 let pairs = pairs_tested_c.load(AtomicOrdering::Relaxed);
@@ -2976,7 +3058,7 @@ fn main() {
             for tuple in &tuples {
                 let mut stats = SearchStats::default();
                 let start = Instant::now();
-                let candidates = build_zw_candidates(problem, *tuple, &cfg, &spectral_z, &spectral_w, &mut stats);
+                let candidates = build_zw_candidates(problem, *tuple, &cfg, &spectral_z, &spectral_w, &mut stats, &AtomicBool::new(false));
                 println!("({},{},{},{}): z={}/{} w={}/{} pairs={} ({:.3?})",
                     tuple.x, tuple.y, tuple.z, tuple.w,
                     stats.z_spectral_ok, stats.z_generated,
