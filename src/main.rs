@@ -3189,8 +3189,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false };
     }
 
-    // For n < 26: use fast per-tuple work-stealing (no coordinator overhead)
-    if problem.n < 26 {
+    // For small n: use fast per-tuple work-stealing (no coordinator overhead)
+    if problem.n < 20 {
         let tuples = Arc::new(tuples);
         let cfg = Arc::new(cfg.clone());
         let xy_table = xy_table.map(Arc::new);
