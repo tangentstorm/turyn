@@ -275,3 +275,7 @@ Resolve away variables appearing in few clauses. **Skipped**: with quad PB, ther
 
 All four features (rephasing, compaction, subsumption, BVE) address problems in **long-running solves with large clause databases**. Our usage pattern is fundamentally different: **clone template → add per-candidate PB constraints → short solve → discard**. Each solve starts fresh with a small clause database. The remaining ~25% gap to CaDiCaL is likely from CaDiCaL's optimized C++ implementation (tighter inner loops, SIMD, cache-aligned data structures) rather than missing algorithmic features.
 
+
+### 9. Incremental slack tracking for quad PB *(from Claude)*
+
+Currently `propagate_quad_pb` recomputes `sum_true` and `sum_maybe` from scratch on every call by scanning all ~80 terms. With ~21 constraints checked per variable assignment, this is O(21 * 80) = ~1680 term evaluations per assignment. Incremental tracking would store `sum_true` and `sum_maybe` per constraint and update them delta-style when a variable changes (+/- one term's coefficient). This requires careful bookkeeping during backtrack (restore old values). Expected to reduce the per-assignment cost from O(terms) to O(1) amortized.
