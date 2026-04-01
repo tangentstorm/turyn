@@ -2786,177 +2786,151 @@ impl XYBoundaryTable {
         }
     }
 
-    /// Pre-seed SAT solver with boundary configurations from the table.
-    /// For each Z/W candidate, clone the solver ONCE (with quad PB constraints),
-    /// then try each compatible boundary config via assumptions (no additional cloning).
+    /// For each compatible boundary config, build a REDUCED SAT instance:
+    /// fix boundary as unit clauses, build quad PB with only free-variable
+    /// terms and adjusted targets. Halves terms (~650 vs 1300) and vars (~28 vs 52).
     fn solve_xy_with_sat(
-        &self,
-        problem: Problem,
-        tuple: SumTuple,
-        candidate: &CandidateZW,
-        template: &SatXYTemplate,
+        &self, problem: Problem, tuple: SumTuple,
+        candidate: &CandidateZW, template: &SatXYTemplate,
     ) -> Option<(PackedSeq, PackedSeq)> {
         let n = problem.n;
         let k = self.k;
         let middle_len = n - 2 * k;
-
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
 
         if !template.is_feasible(candidate) { return None; }
+        let Some(equalities) = gj_candidate_equalities(n, candidate) else { return None; };
 
-        // Check GJ feasibility
-        let Some(equalities) = gj_candidate_equalities(n, candidate) else {
-            return None;
-        };
-
-        // Clone solver ONCE, add GJ equalities and quad PB constraints
-        let mut solver = template.solver.clone();
-        for &(a, b, equal) in &equalities {
-            if equal {
-                solver.add_clause([-a, b]);
-                solver.add_clause([a, -b]);
-            } else {
-                solver.add_clause([-a, -b]);
-                solver.add_clause([a, b]);
-            }
-        }
+        // Precompute per-lag: which terms are boundary-only vs free
+        let is_bnd = |pos: usize| -> bool { pos < k || pos >= n - k };
+        struct LagSplit { target: usize, free_a: Vec<i32>, free_b: Vec<i32>, bnd_term_indices: Vec<usize> }
+        let mut lag_splits: Vec<Option<LagSplit>> = vec![None];
         for s in 1..n {
             let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
+            if target_raw < 0 || target_raw % 2 != 0 { return None; }
             let target = (target_raw / 2) as usize;
             let lp = &template.lag_pairs[s];
-            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
-            solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+            let mut free_a = Vec::new(); let mut free_b = Vec::new(); let mut bnd_idx = Vec::new();
+            for ti in 0..lp.lits_a.len() {
+                let va = (lp.lits_a[ti].unsigned_abs() - 1) as usize;
+                let vb = (lp.lits_b[ti].unsigned_abs() - 1) as usize;
+                if is_bnd(va % n) && is_bnd(vb % n) { bnd_idx.push(ti); }
+                else { free_a.push(lp.lits_a[ti]); free_b.push(lp.lits_b[ti]); }
+            }
+            lag_splits.push(Some(LagSplit { target, free_a, free_b, bnd_term_indices: bnd_idx }));
         }
 
-        // Precompute which lags have boundary-only pairs (for fast filtering)
-        // and sort them by max_unknown ascending (tightest filter first)
-        struct LagFilter {
-            s: usize,
-            pairs: Vec<(usize, usize)>, // (i, j=i+s) where both are boundary
-            max_unknown: i32,
-        }
+        // Autocorrelation filter setup (for non-exact lags)
+        struct LagFilter { s: usize, pairs: Vec<(usize, usize)>, max_unknown: i32 }
         let mut lag_filters: Vec<LagFilter> = Vec::new();
         for s in 1..n {
-            let mut pairs = Vec::new();
-            let mut unknown_count = 0i32;
-            for i in 0..n - s {
-                let i_bnd = i < k || i >= n - k;
-                let j_bnd = (i + s) < k || (i + s) >= n - k;
-                if i_bnd && j_bnd {
-                    pairs.push((i, i + s));
-                } else {
-                    unknown_count += 2; // X + Y each contribute 1 unknown
-                }
+            let mut pairs = Vec::new(); let mut unk = 0i32;
+            for i in 0..n-s {
+                if is_bnd(i) && is_bnd(i+s) { pairs.push((i, i+s)); } else { unk += 2; }
             }
-            if !pairs.is_empty() {
-                lag_filters.push(LagFilter { s, pairs, max_unknown: unknown_count });
-            }
+            if !pairs.is_empty() && unk > 0 { lag_filters.push(LagFilter { s, pairs, max_unknown: unk }); }
         }
-        // Only keep lags with max_unknown > 0 in the filter (exact-match lags are in the index)
-        lag_filters.retain(|f| f.max_unknown > 0);
-        // Sort by ascending max_unknown (tightest first)
         lag_filters.sort_by_key(|f| f.max_unknown);
-
-        // Precompute targets for each lag
         let targets: Vec<i32> = (0..n).map(|s| if s == 0 { 0 } else { -candidate.zw_autocorr[s] }).collect();
+        let required_sig: Vec<i16> = self.exact_lags.iter().map(|&s| targets[s] as i16).collect();
 
-        // For each Z/W pair, compute the required exact-lag autocorrelation
-        let required_sig: Vec<i16> = self.exact_lags.iter().map(|&s| {
-            (-candidate.zw_autocorr[s]) as i16
-        }).collect();
-
-        // Try each compatible boundary config via assumptions
         let mut configs_tested = 0usize;
         let mut configs_scanned = 0usize;
+        let max_bnd_sum = (2 * k) as i16;
 
-        // Iterate only over groups matching sum AND exact-lag signature
-        for x_bnd_sum in (-12i16..=12).step_by(2) {
+        for x_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
             let x_mid = tuple.x - x_bnd_sum as i32;
-            if x_mid.abs() > middle_len as i32 { continue; }
-            if (x_mid + middle_len as i32) % 2 != 0 { continue; }
-            for y_bnd_sum in (-12i16..=12).step_by(2) {
+            if x_mid.abs() > middle_len as i32 || (x_mid + middle_len as i32) % 2 != 0 { continue; }
+            for y_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
                 let y_mid = tuple.y - y_bnd_sum as i32;
-                if y_mid.abs() > middle_len as i32 { continue; }
-                if (y_mid + middle_len as i32) % 2 != 0 { continue; }
+                if y_mid.abs() > middle_len as i32 || (y_mid + middle_len as i32) % 2 != 0 { continue; }
 
                 let key = (x_bnd_sum, y_bnd_sum, required_sig.clone());
                 let Some(entries) = self.groups.get(&key) else { continue; };
 
-            for &(x_bits, y_bits) in entries {
-                configs_scanned += 1;
-                // Expand boundary values
-                let mut x_vals = [0i8; 64];
-                let mut y_vals = [0i8; 64];
-                for i in 0..k {
-                    x_vals[i] = if (x_bits >> i) & 1 == 1 { 1 } else { -1 };
-                    x_vals[n - k + i] = if (x_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                    y_vals[i] = if (y_bits >> i) & 1 == 1 { 1 } else { -1 };
-                    y_vals[n - k + i] = if (y_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                }
-
-                // GJ equality filter: check if boundary positions satisfy derived equalities
-                let mut feasible = true;
-                for &(a, b, equal) in &equalities {
-                    // a, b are 1-based positive: variable index = a-1 (0..2n)
-                    let va = (a as usize) - 1; // 0..2n
-                    let vb = (b as usize) - 1;
-                    // Position in sequence
-                    let pos_a = va % n;
-                    let pos_b = vb % n;
-                    let a_is_bnd = pos_a < k || pos_a >= n - k;
-                    let b_is_bnd = pos_b < k || pos_b >= n - k;
-                    if !a_is_bnd || !b_is_bnd { continue; }
-                    // Get boundary values
-                    let val_a = if va < n { x_vals[pos_a] } else { y_vals[pos_a] };
-                    let val_b = if vb < n { x_vals[pos_b] } else { y_vals[pos_b] };
-                    if equal {
-                        if val_a != val_b { feasible = false; break; }
-                    } else {
-                        if val_a != -val_b { feasible = false; break; }
+                for &(x_bits, y_bits) in entries {
+                    configs_scanned += 1;
+                    let mut xv = [0i8; 64]; let mut yv = [0i8; 64];
+                    for i in 0..k {
+                        xv[i] = if (x_bits >> i) & 1 == 1 { 1 } else { -1 };
+                        xv[n-k+i] = if (x_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
+                        yv[i] = if (y_bits >> i) & 1 == 1 { 1 } else { -1 };
+                        yv[n-k+i] = if (y_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
                     }
-                }
-                if !feasible { continue; }
-
-                // Partial autocorrelation filter on non-exact lags
-                for lf in &lag_filters {
-                    let mut known = 0i32;
-                    for &(i, j) in &lf.pairs {
-                        known += x_vals[i] as i32 * x_vals[j] as i32;
-                        known += y_vals[i] as i32 * y_vals[j] as i32;
+                    // GJ equality filter
+                    let mut ok = true;
+                    for &(a, b, equal) in &equalities {
+                        let va = (a as usize)-1; let vb = (b as usize)-1;
+                        let pa = va % n; let pb = vb % n;
+                        if !is_bnd(pa) || !is_bnd(pb) { continue; }
+                        let va_val = if va < n { xv[pa] } else { yv[pa] };
+                        let vb_val = if vb < n { xv[pb] } else { yv[pb] };
+                        if equal { if va_val != vb_val { ok = false; break; } }
+                        else { if va_val != -vb_val { ok = false; break; } }
                     }
-                    if (targets[lf.s] - known).abs() > lf.max_unknown {
-                        feasible = false;
-                        break;
+                    if !ok { continue; }
+                    // Autocorrelation filter on bounded lags
+                    for lf in &lag_filters {
+                        let mut kn = 0i32;
+                        for &(i, j) in &lf.pairs { kn += xv[i] as i32 * xv[j] as i32 + yv[i] as i32 * yv[j] as i32; }
+                        if (targets[lf.s] - kn).abs() > lf.max_unknown { ok = false; break; }
                     }
-                }
-                if !feasible { continue; }
+                    if !ok { continue; }
 
-                configs_tested += 1;
-                // Build assumptions: fix boundary variables
-                let mut assumptions = Vec::with_capacity(4 * k);
-                for i in 0..k {
-                    assumptions.push(if x_vals[i] == 1 { x_var(i) } else { -x_var(i) });
-                    assumptions.push(if y_vals[i] == 1 { y_var(i) } else { -y_var(i) });
-                }
-                for i in 0..k {
-                    let pos = n - k + i;
-                    assumptions.push(if x_vals[pos] == 1 { x_var(pos) } else { -x_var(pos) });
-                    assumptions.push(if y_vals[pos] == 1 { y_var(pos) } else { -y_var(pos) });
-                }
+                    configs_tested += 1;
 
-                // Solve with assumptions (no clone needed!)
-                match solver.solve_with_assumptions(&assumptions) {
-                    Some(true) => {
+                    // Build REDUCED solver with only free-variable terms
+                    let mut solver = template.solver.clone();
+                    // Fix boundary as unit clauses
+                    for i in 0..k {
+                        solver.add_clause([if xv[i]==1 { x_var(i) } else { -x_var(i) }]);
+                        solver.add_clause([if yv[i]==1 { y_var(i) } else { -y_var(i) }]);
+                    }
+                    for i in 0..k {
+                        let p = n-k+i;
+                        solver.add_clause([if xv[p]==1 { x_var(p) } else { -x_var(p) }]);
+                        solver.add_clause([if yv[p]==1 { y_var(p) } else { -y_var(p) }]);
+                    }
+                    for &(a, b, equal) in &equalities {
+                        if equal { solver.add_clause([-a, b]); solver.add_clause([a, -b]); }
+                        else { solver.add_clause([-a, -b]); solver.add_clause([a, b]); }
+                    }
+                    // Add REDUCED quad PB: free terms only, adjusted target
+                    let mut infeasible = false;
+                    for s in 1..n {
+                        let ls = lag_splits[s].as_ref().unwrap();
+                        if ls.free_a.is_empty() { continue; }
+                        // Compute known contribution from boundary terms
+                        let lp = &template.lag_pairs[s];
+                        let mut known = 0u32;
+                        for &ti in &ls.bnd_term_indices {
+                            let la = lp.lits_a[ti]; let lb = lp.lits_b[ti];
+                            let va = (la.unsigned_abs()-1) as usize;
+                            let vb = (lb.unsigned_abs()-1) as usize;
+                            let a_val = if va < n { xv[va%n] } else { yv[va%n] };
+                            let b_val = if vb < n { xv[vb%n] } else { yv[vb%n] };
+                            let a_true = (la > 0 && a_val == 1) || (la < 0 && a_val == -1);
+                            let b_true = (lb > 0 && b_val == 1) || (lb < 0 && b_val == -1);
+                            if a_true && b_true { known += 1; }
+                        }
+                        if (ls.target as u32) < known || ls.target as u32 - known > ls.free_a.len() as u32 {
+                            infeasible = true; break;
+                        }
+                        let reduced = ls.target as u32 - known;
+                        let ones: Vec<u32> = vec![1; ls.free_a.len()];
+                        solver.add_quad_pb_eq(&ls.free_a, &ls.free_b, &ones, reduced);
+                    }
+                    if infeasible { continue; }
+
+                    if let Some(true) = solver.solve() {
                         let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
                         let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
                         return Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)));
                     }
-                    _ => {} // UNSAT for this config, learnt clauses carry over to next!
                 }
             }
-            } // y_bnd_sum
-        } // x_bnd_sum
+        }
         eprintln!("[table] scanned={}, passed_filter={}", configs_scanned, configs_tested);
         None
     }
