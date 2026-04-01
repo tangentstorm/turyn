@@ -4,21 +4,21 @@ Searches for **Turyn-type sequences** TT(n) -- four {+1, -1} sequences (X, Y, Z,
 
 The long-term goal is TT(56), which yields a **Hadamard matrix of order 668**.
 
-## Current results
+## Current results (hybrid SAT solver)
 
-| n | Hadamard | full SAT | hybrid | z-sat | stochastic | best |
-|---|---|---|---|---|---|---|
-| 4 | 44 | 0.7ms | **0.6ms** | 0.5ms | — | hybrid |
-| 6 | 68 | 5.8ms | **0.8ms** | 3.4ms | — | hybrid |
-| 8 | 92 | 3.1ms | **1.7ms** | 1.9ms | 2.1ms | hybrid |
-| 10 | 116 | 23ms | **1.6ms** | 11ms | 9.7ms | hybrid |
-| 12 | 140 | 61ms | **8ms** | 81ms | 101ms | hybrid |
-| 14 | 164 | 462ms | **9ms** | 851ms | 676ms | hybrid |
-| 16 | 188 | 3.9s | **80ms** | 25s | 157ms | hybrid |
-| 18 | 212 | 3.8s | **953ms** | timeout | timeout | hybrid |
-| 20 | 236 | 51s | **917ms** | timeout | timeout | hybrid |
-| 22 | 260 | timeout | **8.7s** | timeout | — | hybrid |
-| 24 | 284 | timeout | **2.5s** | timeout | — | hybrid |
+| n | Hadamard | hybrid |
+|---|---|---|
+| 4 | 44 | 0.5ms |
+| 6 | 68 | 0.5ms |
+| 8 | 92 | 1.6ms |
+| 10 | 116 | 0.7ms |
+| 12 | 140 | 3.4ms |
+| 14 | 164 | 12ms |
+| 16 | 188 | 71ms |
+| 18 | 212 | 860ms |
+| 20 | 236 | 869ms |
+| 22 | 260 | 3.2s |
+| 24 | 284 | 1.8s |
 
 Hybrid is now the default mode and runs in parallel across all available cores. Just run `target/release/turyn --n=N` to search.
 
