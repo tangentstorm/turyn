@@ -312,7 +312,7 @@ impl SearchStats {
 struct SeqWithSpectrum {
     seq: PackedSeq,
     spectrum: Vec<f64>,
-    autocorr: Vec<i32>,
+    autocorr: Option<Vec<i32>>,  // lazily computed at pair time
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -661,7 +661,7 @@ fn build_zw_candidates(
                 boundary_signature_from_values(values, cfg.boundary_k),
                 SeqWithSpectrum {
                     spectrum,
-                    autocorr: autocorrs_from_values(values),
+                    autocorr: None,
                     seq: PackedSeq::from_values(values),
                 },
                 cfg.max_pairs_per_bucket.max(1),
@@ -682,7 +682,7 @@ fn build_zw_candidates(
                 boundary_signature_from_values(values, cfg.boundary_k),
                 SeqWithSpectrum {
                     spectrum,
-                    autocorr: autocorrs_from_values(values),
+                    autocorr: None,
                     seq: PackedSeq::from_values(values),
                 },
                 cfg.max_pairs_per_bucket.max(1),
@@ -702,10 +702,23 @@ fn build_zw_candidates(
                 stats.candidate_pair_attempts += 1;
                 if spectral_pair_ok(&z.spectrum, &w.spectrum, pair_bound) {
                     stats.candidate_pair_spectral_ok += 1;
+                    // Compute autocorrelation lazily (only for surviving pairs)
+                    let z_auto = z.autocorr.as_ref().map(|a| a.clone())
+                        .unwrap_or_else(|| {
+                            let mut a = vec![0i32; problem.n];
+                            for s in 1..problem.n { a[s] = z.seq.autocorrelation(s); }
+                            a
+                        });
+                    let w_auto = w.autocorr.as_ref().map(|a| a.clone())
+                        .unwrap_or_else(|| {
+                            let mut a = vec![0i32; problem.m()];
+                            for s in 1..problem.m() { a[s] = w.seq.autocorrelation(s); }
+                            a
+                        });
                     let mut zw = vec![0; problem.n];
                     for (s, slot) in zw.iter_mut().enumerate().skip(1) {
-                        let nz = z.autocorr[s];
-                        let nw = if s < problem.m() { w.autocorr[s] } else { 0 };
+                        let nz = z_auto[s];
+                        let nw = if s < problem.m() { w_auto[s] } else { 0 };
                         *slot = 2 * nz + 2 * nw;
                     }
                     out.push(CandidateZW {
