@@ -269,6 +269,7 @@ struct CandidateZW {
     z: PackedSeq,
     w: PackedSeq,
     zw_autocorr: Vec<i32>,
+    max_pair_power: f64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -474,13 +475,21 @@ fn spectrum_if_ok(
 
 fn spectral_pair_ok(z_spectrum: &[f64], w_spectrum: &[f64], bound: f64) -> bool {
     for i in 0..z_spectrum.len() {
-        let pz = z_spectrum[i];
-        let pw = w_spectrum[i];
-        if pz > bound || pw > bound || pz + pw > bound {
+        if z_spectrum[i] + w_spectrum[i] > bound {
             return false;
         }
     }
     true
+}
+
+/// Max combined spectral power across all frequencies.
+fn spectral_pair_max_power(z_spectrum: &[f64], w_spectrum: &[f64]) -> f64 {
+    let mut max_power = 0.0f64;
+    for i in 0..z_spectrum.len() {
+        let combined = z_spectrum[i] + w_spectrum[i];
+        if combined > max_power { max_power = combined; }
+    }
+    max_power
 }
 
 #[allow(dead_code)]
@@ -721,7 +730,9 @@ fn build_zw_candidates(
         for z in zs {
             for w in ws {
                 stats.candidate_pair_attempts += 1;
-                if spectral_pair_ok(&z.spectrum, &w.spectrum, pair_bound) {
+                if !spectral_pair_ok(&z.spectrum, &w.spectrum, pair_bound) { continue; }
+                let max_power = spectral_pair_max_power(&z.spectrum, &w.spectrum);
+                {
                     stats.candidate_pair_spectral_ok += 1;
                     // Compute autocorrelation lazily (only for surviving pairs)
                     let z_auto = z.autocorr.as_ref().map(|a| a.clone())
@@ -746,6 +757,7 @@ fn build_zw_candidates(
                         z: z.seq.clone(),
                         w: w.seq.clone(),
                         zw_autocorr: zw,
+                        max_pair_power: max_power,
                     });
                     taken += 1;
                     if taken >= cfg.max_pairs_per_bucket {
@@ -3001,7 +3013,7 @@ fn main() {
             let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
             zw_autocorr[s] = 2 * nz + 2 * nw;
         }
-        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr };
+        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr, max_pair_power: 0.0 };
         // Try all sum tuples that match this Z/W
         let raw = enumerate_sum_tuples(p);
         let mut seen = std::collections::HashSet::new();
@@ -3189,6 +3201,7 @@ mod tests {
             z: z.clone(),
             w: w.clone(),
             zw_autocorr: zw,
+            max_pair_power: 0.0,
         };
         let tuple = SumTuple {
             x: 4,
@@ -3315,7 +3328,7 @@ mod tests {
             let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
             *slot = 2 * nz + 2 * nw;
         }
-        let candidate = CandidateZW { z, w, zw_autocorr: zw };
+        let candidate = CandidateZW { z, w, zw_autocorr: zw, max_pair_power: 0.0 };
         let tuple = SumTuple { x: 0, y: 6, z: 8, w: 5 };
         let mut stats = SearchStats::default();
         // Test 1: can the SAT solver find X/Y from scratch?
