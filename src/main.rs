@@ -3185,8 +3185,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false };
     }
 
-    // For n < 28: use fast per-tuple work-stealing (no coordinator overhead)
-    if problem.n < 28 {
+    // For n < 26: use fast per-tuple work-stealing (no coordinator overhead)
+    if problem.n < 26 {
         let tuples = Arc::new(tuples);
         let cfg = Arc::new(cfg.clone());
         let xy_table = xy_table.map(Arc::new);
@@ -3212,8 +3212,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                     if done >= total_tuples { break; }
                     let pairs = pairs_tested_c.load(AtomicOrdering::Relaxed);
                     let elapsed = start.elapsed().as_secs_f64();
-                    eprintln!("[{:.0}s] {}/{} tuples ({:.0}%), {} pairs, {:.1} tuples/s",
-                        elapsed, done, total_tuples, 100.0*done as f64/total_tuples as f64, pairs, done as f64/elapsed);
+                    eprintln!("[{:.0}s] tuples {}/{}, done {}, {:.1} pairs/s",
+                        elapsed, done, total_tuples, pairs, pairs as f64/elapsed);
                 }
             }))
         } else { None };
@@ -3272,7 +3272,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         return SearchReport { stats, elapsed: run_start.elapsed(), found_solution };
     }
 
-    // For n >= 26: channel-based coordinator with priority queue.
+    // For n >= 26: channel-based coordinator with shared priority queue.
+    // All pairs from all tuples go into one queue, dispatched tightest-first.
     // - Producer thread: runs Phase B for all tuples, sends candidates to coordinator
     // - Coordinator (this thread): receives candidates, inserts into priority queue,
     //   dispatches to idle workers (tightest spectral first)
@@ -3309,6 +3310,10 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let _worker_ready_tx_list: Vec<std::sync::mpsc::Sender<usize>> = Vec::new();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<usize>(); // workers signal "I'm idle"
 
+    // Shared counters for progress reporting
+    let tuples_produced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pairs_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     // Spawn workers
     let xy_table = xy_table.map(Arc::new);
     for tid in 0..workers {
@@ -3318,6 +3323,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let ready_tx = ready_tx.clone();
         let result_tx = result_tx.clone();
         let xy_table = xy_table.clone();
+        let pairs_completed = Arc::clone(&pairs_completed);
 
         std::thread::spawn(move || {
             let mut template_cache: HashMap<(i32,i32,i32,i32), SatXYTemplate> = HashMap::new();
@@ -3346,6 +3352,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                     }
                 }
 
+                pairs_completed.fetch_add(1, AtomicOrdering::Relaxed);
+
                 if solved.is_some() {
                     found.store(true, AtomicOrdering::Relaxed);
                     let _ = result_tx.send(solved);
@@ -3363,6 +3371,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     // Use half the cores for production, half reserved for workers
     let num_producers = (workers / 2).max(1);
     let tuples = Arc::new(tuples);
+    let total_tuples = tuples.len();
     let producer_cfg = Arc::new(producer_cfg);
     let next_tuple = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut producer_handles = Vec::new();
@@ -3372,6 +3381,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let tuples = Arc::clone(&tuples);
         let cfg = Arc::clone(&producer_cfg);
         let next = Arc::clone(&next_tuple);
+        let tuples_produced = Arc::clone(&tuples_produced);
         producer_handles.push(std::thread::spawn(move || {
             let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
             let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
@@ -3390,6 +3400,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                         if tx.send((tuple, c)).is_err() { break; }
                     }
                 }
+                tuples_produced.fetch_add(1, AtomicOrdering::Relaxed);
             }
             stats
         }));
@@ -3416,6 +3427,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let mut found_solution = false;
     let mut stats = SearchStats::default();
     let mut pairs_dispatched = 0usize;
+    let mut last_progress = std::time::Instant::now();
 
     // Helper: dispatch from pq to an idle worker
     let dispatch = |pq: &mut BinaryHeap<PqItem>, idle: &mut Vec<usize>,
@@ -3474,6 +3486,17 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         // Check if we're done (producer finished + queue empty + all workers idle)
         if producer_done && pq.is_empty() && idle_workers.len() == workers {
             break;
+        }
+
+        // Progress reporting every ~10s
+        if verbose && last_progress.elapsed().as_secs() >= 10 {
+            let elapsed = run_start.elapsed().as_secs_f64();
+            let t_done = tuples_produced.load(AtomicOrdering::Relaxed);
+            let p_done = pairs_completed.load(AtomicOrdering::Relaxed);
+            eprintln!("[{:.0}s] tuples {}/{}, queue {}, dispatched {}, done {}, {:.1} pairs/s",
+                elapsed, t_done, total_tuples, pq.len(), pairs_dispatched, p_done,
+                p_done as f64 / elapsed);
+            last_progress = std::time::Instant::now();
         }
 
         // Brief yield to avoid busy-spinning — use thread::yield instead of sleep
