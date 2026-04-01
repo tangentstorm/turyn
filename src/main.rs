@@ -1132,7 +1132,8 @@ impl Gf2Row {
     }
 }
 
-fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Vec<(i32, i32, bool)> {
+/// Returns None if a contradiction is detected (UNSAT), otherwise equalities.
+fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Option<Vec<(i32, i32, bool)>> {
     let num_vars = 2 * n;
     // Union-find with negation tracking (XOR-union-find)
     let mut parent: Vec<usize> = (0..num_vars).collect();
@@ -1194,18 +1195,18 @@ fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Vec<(i32, i32, 
         if target == max_pairs {
             // ALL pairs agree
             for i in 0..x_pairs {
-                union(&mut parent, &mut rank, &mut neg, i, i + s, false);
+                if !union(&mut parent, &mut rank, &mut neg, i, i + s, false) { return None; }
             }
             for i in 0..y_pairs {
-                union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, false);
+                if !union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, false) { return None; }
             }
         } else if target == 0 {
             // NO pairs agree
             for i in 0..x_pairs {
-                union(&mut parent, &mut rank, &mut neg, i, i + s, true);
+                if !union(&mut parent, &mut rank, &mut neg, i, i + s, true) { return None; }
             }
             for i in 0..y_pairs {
-                union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, true);
+                if !union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, true) { return None; }
             }
         }
     }
@@ -1283,22 +1284,21 @@ fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Vec<(i32, i32, 
             let set_vars: Vec<usize> = row.vars.iter().enumerate()
                 .filter(|&(_, &v)| v).map(|(i, _)| i).collect();
             match set_vars.len() {
+                0 => {
+                    // All-zero row: if constant is 1, contradiction (UNSAT)
+                    if row.constant { return None; }
+                }
                 1 => {
-                    // Forced variable: x = constant
-                    let v = set_vars[0];
-                    // Union with a "truth" anchor: if constant=1, x is true (equivalent to x[0] which is forced true)
-                    // Since x[0] is forced true by symmetry breaking, we can't directly use
-                    // union-find for forced values. Instead, add as a clause later.
-                    // For now, skip single-variable rows.
+                    // Forced variable: skip for now
                 }
                 2 => {
-                    // Two variables: x_a ⊕ x_b = c
                     let a = set_vars[0];
                     let b = set_vars[1];
-                    // c=0 → a=b, c=1 → a=¬b
-                    union(&mut parent, &mut rank, &mut neg, a, b, row.constant);
+                    if !union(&mut parent, &mut rank, &mut neg, a, b, row.constant) {
+                        return None;
+                    }
                 }
-                _ => {} // more than 2 variables: can't directly use in union-find
+                _ => {}
             }
         }
     }
@@ -1314,7 +1314,7 @@ fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Vec<(i32, i32, 
         }
     }
 
-    equalities
+    Some(equalities)
 }
 
 /// Pair data for quadratic PB constraints per lag: (lits_a, lits_b) for each lag.
@@ -1478,13 +1478,15 @@ impl SatXYTemplate {
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
 
+        // GJ-derived equalities from extreme-target lags (before clone — cheap)
+        let Some(equalities) = gj_candidate_equalities(n, candidate) else {
+            return (None, false); // GJ detected contradiction → UNSAT
+        };
+
         let mut solver = self.solver.clone();
         if conflict_limit > 0 {
             solver.set_conflict_limit(conflict_limit);
         }
-
-        // GJ-derived equalities from extreme-target lags
-        let equalities = gj_candidate_equalities(n, candidate);
         for &(a, b, equal) in &equalities {
             if equal {
                 solver.add_clause([-a, b]);
