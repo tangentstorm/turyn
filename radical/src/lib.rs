@@ -83,7 +83,12 @@ struct QuadPbConstraint {
     vars_b: Vec<usize>,
     neg_a: Vec<bool>,
     neg_b: Vec<bool>,
-    num_terms: u32,  // cached lits_a.len()
+    num_terms: u32,
+    // Incremental state per term: 0=DEAD, 1=MAYBE, 2=TRUE
+    term_state: Vec<u8>,
+    sum_true: i32,
+    sum_maybe: i32,
+    dirty: bool,  // true if backtrack invalidated counters
 }
 
 /// Reason a variable was assigned (for conflict analysis).
@@ -355,6 +360,10 @@ impl Solver {
             target,
             vars_a, vars_b, neg_a, neg_b,
             num_terms: lits_a.len() as u32,
+            term_state: vec![1u8; lits_a.len()], // all MAYBE initially
+            sum_true: 0,
+            sum_maybe: coeffs.iter().sum::<u32>() as i32,
+            dirty: false,
         });
 
         // Initial propagation
@@ -530,9 +539,15 @@ impl Solver {
                     }
                 }
             }
-            // Quadratic PB propagation
+            // Quadratic PB: incremental update + propagation
             if !self.quad_pb_constraints.is_empty() {
                 let v = var_of(lit);
+                // Update term states for all terms involving this variable
+                for idx in 0..self.quad_pb_var_terms[v].len() {
+                    let (qi, ti) = self.quad_pb_var_terms[v][idx];
+                    self.update_quad_pb_term(qi, ti as usize);
+                }
+                // Propagate constraints watching this variable
                 for idx in 0..self.quad_pb_var_watches[v].len() {
                     let qi = self.quad_pb_var_watches[v][idx];
                     if let Some(conflict_reason) = self.propagate_quad_pb(qi) {
@@ -675,32 +690,68 @@ impl Solver {
     /// Propagate a quadratic PB constraint: sum(coeffs[i] * a_i * b_i) = target.
     /// Single-pass: computes slack and finds propagation in one scan.
     #[inline(never)]
-    /// Propagate a quadratic PB constraint using pre-computed variable indices.
+    /// Recompute a single term's state and update incremental counters.
+    /// Returns the new state (0=DEAD, 1=MAYBE, 2=TRUE).
+    #[inline(always)]
+    fn update_quad_pb_term(&mut self, qi: u32, ti: usize) {
+        let qc = &self.quad_pb_constraints[qi as usize];
+        let aa = self.assigns[qc.vars_a[ti]];
+        let ab = self.assigns[qc.vars_b[ti]];
+        let a_false = (aa == LBool::True && qc.neg_a[ti]) || (aa == LBool::False && !qc.neg_a[ti]);
+        let b_false = (ab == LBool::True && qc.neg_b[ti]) || (ab == LBool::False && !qc.neg_b[ti]);
+        let c = qc.coeffs[ti] as i32;
+
+        let new_state = if a_false || b_false { 0 }
+            else if aa != LBool::Undef && ab != LBool::Undef { 2 }
+            else { 1 };
+
+        let old_state = self.quad_pb_constraints[qi as usize].term_state[ti];
+        if old_state == new_state { return; }
+
+        // Adjust counters
+        match old_state {
+            1 => { self.quad_pb_constraints[qi as usize].sum_maybe -= c; }
+            2 => { self.quad_pb_constraints[qi as usize].sum_true -= c; }
+            _ => {}
+        }
+        match new_state {
+            1 => { self.quad_pb_constraints[qi as usize].sum_maybe += c; }
+            2 => { self.quad_pb_constraints[qi as usize].sum_true += c; }
+            _ => {}
+        }
+        self.quad_pb_constraints[qi as usize].term_state[ti] = new_state;
+    }
+
+    /// Propagate a quadratic PB constraint using incremental counters.
     #[inline(never)]
     fn propagate_quad_pb(&mut self, qi: u32) -> Option<Reason> {
-        let qc = &self.quad_pb_constraints[qi as usize];
-        let n = qc.lits_a.len();
-        let target = qc.target as i64;
-        let assigns = &self.assigns;
-
-        // Single pass with pre-computed var indices: no var_of() calls
-        let mut sum_true: i64 = 0;
-        let mut sum_maybe: i64 = 0;
-
-        for i in 0..n {
-            let aa = assigns[qc.vars_a[i]];
-            let ab = assigns[qc.vars_b[i]];
-            // a is false if: assigned True but lit is negative, or assigned False but lit is positive
-            let a_false = (aa == LBool::True && qc.neg_a[i]) || (aa == LBool::False && !qc.neg_a[i]);
-            let b_false = (ab == LBool::True && qc.neg_b[i]) || (ab == LBool::False && !qc.neg_b[i]);
-            if a_false || b_false { continue; }
-            let c = qc.coeffs[i] as i64;
-            if aa != LBool::Undef && ab != LBool::Undef {
-                sum_true += c;
-            } else {
-                sum_maybe += c;
+        // Recompute from scratch if dirty (after backtrack)
+        if self.quad_pb_constraints[qi as usize].dirty {
+            let n = self.quad_pb_constraints[qi as usize].num_terms as usize;
+            let mut st = 0i32;
+            let mut sm = 0i32;
+            for i in 0..n {
+                let qc = &self.quad_pb_constraints[qi as usize];
+                let aa = self.assigns[qc.vars_a[i]];
+                let ab = self.assigns[qc.vars_b[i]];
+                let a_false = (aa == LBool::True && qc.neg_a[i]) || (aa == LBool::False && !qc.neg_a[i]);
+                let b_false = (ab == LBool::True && qc.neg_b[i]) || (ab == LBool::False && !qc.neg_b[i]);
+                let c = self.quad_pb_constraints[qi as usize].coeffs[i] as i32;
+                let state = if a_false || b_false { 0u8 }
+                    else if aa != LBool::Undef && ab != LBool::Undef { st += c; 2u8 }
+                    else { sm += c; 1u8 };
+                self.quad_pb_constraints[qi as usize].term_state[i] = state;
             }
+            self.quad_pb_constraints[qi as usize].sum_true = st;
+            self.quad_pb_constraints[qi as usize].sum_maybe = sm;
+            self.quad_pb_constraints[qi as usize].dirty = false;
         }
+
+        let qc = &self.quad_pb_constraints[qi as usize];
+        let n = qc.num_terms as usize;
+        let target = qc.target as i64;
+        let sum_true = qc.sum_true as i64;
+        let sum_maybe = qc.sum_maybe as i64;
 
         if sum_true + sum_maybe < target || sum_true > target {
             return self.quad_pb_conflict(qi);
@@ -708,7 +759,6 @@ impl Solver {
 
         let slack_up = sum_true + sum_maybe - target;
         let slack_down = target - sum_true;
-        // Early exit: if all coefficients are 1 (common case) and both slacks > 0, no propagation
         if slack_up > 0 && slack_down > 0 { return None; }
 
         for i in 0..n {
@@ -989,14 +1039,16 @@ impl Solver {
         while self.trail.len() > self.trail_lim[level as usize] {
             let entry = self.trail.pop().unwrap();
             let v = var_of(entry.lit);
-            // Phase saving: remember the polarity
             self.phase[v] = entry.lit > 0;
             self.assigns[v] = LBool::Undef;
-            // Re-insert into decision heap
             self.heap_insert(v);
         }
         self.trail_lim.truncate(level as usize);
         self.prop_head = self.trail.len();
+        // Mark all quad PB constraints dirty (counters stale after backtrack)
+        for qc in &mut self.quad_pb_constraints {
+            qc.dirty = true;
+        }
     }
 
     /// Minimize a learnt clause by removing redundant literals.
