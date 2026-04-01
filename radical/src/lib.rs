@@ -79,10 +79,11 @@ struct QuadPbConstraint {
     coeffs: Vec<u32>,
     target: u32,
     // Pre-computed variable indices and sign masks for fast access
-    vars_a: Vec<usize>,   // var_of(lits_a[i])
-    vars_b: Vec<usize>,   // var_of(lits_b[i])
-    neg_a: Vec<bool>,     // true if lits_a[i] < 0 (negated)
-    neg_b: Vec<bool>,     // true if lits_b[i] < 0 (negated)
+    vars_a: Vec<usize>,
+    vars_b: Vec<usize>,
+    neg_a: Vec<bool>,
+    neg_b: Vec<bool>,
+    num_terms: u32,  // cached lits_a.len()
 }
 
 /// Reason a variable was assigned (for conflict analysis).
@@ -349,6 +350,7 @@ impl Solver {
             coeffs: coeffs.to_vec(),
             target,
             vars_a, vars_b, neg_a, neg_b,
+            num_terms: lits_a.len() as u32,
         });
 
         // Initial propagation
@@ -517,7 +519,7 @@ impl Solver {
                     }
                 }
             }
-            // Quadratic PB propagation: variable got assigned
+            // Quadratic PB propagation
             if !self.quad_pb_constraints.is_empty() {
                 let v = var_of(lit);
                 for idx in 0..self.quad_pb_var_watches[v].len() {
