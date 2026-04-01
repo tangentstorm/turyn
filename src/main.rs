@@ -2722,20 +2722,27 @@ impl XYBoundaryTable {
             groups.insert((d.x_sum, d.y_sum), entries);
         }
 
-        // Find lags where all pairs are boundary-only (max_unknown=0)
-        let mut exact_lags = Vec::new();
+        // Find lags where all pairs are boundary-only (exact match for indexing)
+        let mut sig_lags = Vec::new();
+        let mut sig_lag_pairs: Vec<Vec<(usize, usize)>> = Vec::new();
         for s in 1..n {
-            let mut all_boundary = true;
+            let mut pairs = Vec::new();
+            let mut has_non_boundary = false;
             for i in 0..n - s {
                 let i_bnd = i < k || i >= n - k;
                 let j_bnd = (i + s) < k || (i + s) >= n - k;
-                if !i_bnd || !j_bnd {
-                    all_boundary = false;
-                    break;
+                if i_bnd && j_bnd {
+                    pairs.push((i, i + s));
+                } else {
+                    has_non_boundary = true;
                 }
             }
-            if all_boundary { exact_lags.push(s); }
+            if !pairs.is_empty() && !has_non_boundary {
+                sig_lags.push(s);
+                sig_lag_pairs.push(pairs);
+            }
         }
+        let exact_lags = sig_lags.clone();
 
         // Re-group by (x_sum, y_sum, high_lag_signature) using exact lags
         let mut refined_groups: HashMap<(i16, i16, Vec<i16>), Vec<(u32, u32)>> = HashMap::new();
@@ -2750,11 +2757,11 @@ impl XYBoundaryTable {
                     y_vals[i] = if (yb >> i) & 1 == 1 { 1 } else { -1 };
                     y_vals[n - k + i] = if (yb >> (k + i)) & 1 == 1 { 1 } else { -1 };
                 }
-                let sig: Vec<i16> = exact_lags.iter().map(|&s| {
+                let sig: Vec<i16> = sig_lag_pairs.iter().map(|pairs| {
                     let mut acc = 0i32;
-                    for i in 0..n - s {
-                        acc += x_vals[i] as i32 * x_vals[i + s] as i32;
-                        acc += y_vals[i] as i32 * y_vals[i + s] as i32;
+                    for &(i, j) in pairs {
+                        acc += x_vals[i] as i32 * x_vals[j] as i32;
+                        acc += y_vals[i] as i32 * y_vals[j] as i32;
                     }
                     acc as i16
                 }).collect();
@@ -2846,7 +2853,9 @@ impl XYBoundaryTable {
                 lag_filters.push(LagFilter { s, pairs, max_unknown: unknown_count });
             }
         }
-        // Sort: check zero-unknown lags first (exact match required), then by ascending max_unknown
+        // Only keep lags with max_unknown > 0 in the filter (exact-match lags are in the index)
+        lag_filters.retain(|f| f.max_unknown > 0);
+        // Sort by ascending max_unknown (tightest first)
         lag_filters.sort_by_key(|f| f.max_unknown);
 
         // Precompute targets for each lag
@@ -2886,9 +2895,30 @@ impl XYBoundaryTable {
                     y_vals[n - k + i] = if (y_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
                 }
 
-                // Fast autocorrelation filter using precomputed lag pairs
-                // Check tightest lags first (zero-unknown lags require exact match)
+                // GJ equality filter: check if boundary positions satisfy derived equalities
                 let mut feasible = true;
+                for &(a, b, equal) in &equalities {
+                    // a, b are 1-based positive: variable index = a-1 (0..2n)
+                    let va = (a as usize) - 1; // 0..2n
+                    let vb = (b as usize) - 1;
+                    // Position in sequence
+                    let pos_a = va % n;
+                    let pos_b = vb % n;
+                    let a_is_bnd = pos_a < k || pos_a >= n - k;
+                    let b_is_bnd = pos_b < k || pos_b >= n - k;
+                    if !a_is_bnd || !b_is_bnd { continue; }
+                    // Get boundary values
+                    let val_a = if va < n { x_vals[pos_a] } else { y_vals[pos_a] };
+                    let val_b = if vb < n { x_vals[pos_b] } else { y_vals[pos_b] };
+                    if equal {
+                        if val_a != val_b { feasible = false; break; }
+                    } else {
+                        if val_a != -val_b { feasible = false; break; }
+                    }
+                }
+                if !feasible { continue; }
+
+                // Partial autocorrelation filter on non-exact lags
                 for lf in &lag_filters {
                     let mut known = 0i32;
                     for &(i, j) in &lf.pairs {
