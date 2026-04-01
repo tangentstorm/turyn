@@ -659,10 +659,18 @@ impl Solver {
         let pb = &self.pb_constraints[pbi as usize];
         let n = pb.lits.len();
 
-        // Compute slack: sum coefficients for non-false literals, subtract bound
+        // Compute slack: sum coefficients for non-false literals, subtract bound.
+        // For unit coefficients, slack = count(non-false) - bound.
         let mut slack: i64 = -(pb.bound as i64);
+        let mut first_undef = n; // index of first undef literal
         for i in 0..n {
-            if self.lit_value(pb.lits[i]) != LBool::False {
+            let v = var_of(pb.lits[i]);
+            let a = self.assigns[v];
+            if a == LBool::Undef {
+                slack += pb.coeffs[i] as i64;
+                if first_undef == n { first_undef = i; }
+            } else if (a == LBool::True) == (pb.lits[i] > 0) {
+                // Literal is true → contributes to slack
                 slack += pb.coeffs[i] as i64;
             }
         }
@@ -671,11 +679,15 @@ impl Solver {
             return Some(Reason::Pb(pbi)); // conflict
         }
 
-        // Propagate: any undef literal whose coefficient > slack must be true
-        for i in 0..n {
+        // Propagate: any undef literal whose coefficient > slack must be true.
+        // Early exit: if slack >= max_coeff, no propagation possible.
+        if slack > 0 { return None; } // all coefficients are 1, so slack>0 means no propagation
+
+        // slack == 0: force all undef literals
+        for i in first_undef..n {
             let lit = self.pb_constraints[pbi as usize].lits[i];
-            let coeff = self.pb_constraints[pbi as usize].coeffs[i];
-            if self.lit_value(lit) == LBool::Undef && (coeff as i64) > slack {
+            let v = var_of(lit);
+            if self.assigns[v] == LBool::Undef {
                 self.enqueue(lit, Reason::Pb(pbi));
             }
         }
