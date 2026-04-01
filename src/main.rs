@@ -2678,13 +2678,44 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let tuples = Arc::new(tuples);
     let cfg = Arc::new(cfg.clone());
     let next_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let total_tuples = tuples.len();
+    // Shared progress counters
+    let tuples_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pairs_tested = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let pairs_sat = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut handles = Vec::new();
+
+    // Progress reporter thread (prints every 10s if verbose)
+    let progress_handle = if verbose {
+        let found_c = Arc::clone(&found);
+        let tuples_done_c = Arc::clone(&tuples_done);
+        let pairs_tested_c = Arc::clone(&pairs_tested);
+        let pairs_sat_c = Arc::clone(&pairs_sat);
+        let start = run_start;
+        Some(std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                if found_c.load(AtomicOrdering::Relaxed) { break; }
+                let done = tuples_done_c.load(AtomicOrdering::Relaxed);
+                if done >= total_tuples { break; }
+                let pairs = pairs_tested_c.load(AtomicOrdering::Relaxed);
+                let sat = pairs_sat_c.load(AtomicOrdering::Relaxed);
+                let elapsed = start.elapsed().as_secs_f64();
+                let pct = 100.0 * done as f64 / total_tuples as f64;
+                eprintln!("[{:.0}s] {}/{} tuples ({:.0}%), {} Z/W pairs, {:.1} tuples/s",
+                    elapsed, done, total_tuples, pct, pairs, done as f64 / elapsed);
+            }
+        }))
+    } else { None };
 
     for _tid in 0..workers {
         let tuples = Arc::clone(&tuples);
         let cfg = Arc::clone(&cfg);
         let found = Arc::clone(&found);
         let next_idx = Arc::clone(&next_idx);
+        let tuples_done = Arc::clone(&tuples_done);
+        let pairs_tested = Arc::clone(&pairs_tested);
+        let pairs_sat = Arc::clone(&pairs_sat);
 
         handles.push(std::thread::spawn(move || {
             let mut local_stats = SearchStats::default();
@@ -2694,6 +2725,9 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 let idx = next_idx.fetch_add(1, AtomicOrdering::Relaxed);
                 if idx >= tuples.len() { break; }
                 let (result, tstats) = hybrid_solve_tuple(problem, tuples[idx], &cfg, &found, false);
+                pairs_tested.fetch_add(tstats.candidate_pair_spectral_ok, AtomicOrdering::Relaxed);
+                pairs_sat.fetch_add(tstats.xy_nodes, AtomicOrdering::Relaxed);
+                tuples_done.fetch_add(1, AtomicOrdering::Relaxed);
                 local_stats.merge_from(&tstats);
                 if result.is_some() {
                     solution = result;
@@ -2706,6 +2740,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
     let mut stats = SearchStats::default();
     let mut found_solution = false;
+    // Signal progress reporter to stop
     for h in handles {
         if let Ok((result, local_stats)) = h.join() {
             stats.merge_from(&local_stats);
@@ -2716,6 +2751,11 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 found_solution = true;
             }
         }
+    }
+
+    // Stop progress reporter
+    if let Some(ph) = progress_handle {
+        let _ = ph.join();
     }
 
     if verbose {
