@@ -1070,9 +1070,9 @@ impl Solver {
             self.phase[v] = entry.lit > 0;
             self.assigns[v] = LBool::Undef;
             if v < self.quad_pb_reasons.len() { self.quad_pb_reasons[v] = None; }
-            // Incrementally update quad PB term states after unassigning
-            // (skipped when backtracking to level 0 and caller will reset state)
-            if !(self.skip_backtrack_quad_pb && level == 0) {
+            // Incrementally update quad PB term states after unassigning.
+            // Skip for level 0 when caller manages state externally (table path).
+            if !(level == 0 && self.skip_backtrack_quad_pb) {
                 for idx in 0..self.quad_pb_var_terms[v].len() {
                     let (qi, ti) = self.quad_pb_var_terms[v][idx];
                     self.update_quad_pb_term(qi, ti as usize);
@@ -1082,6 +1082,17 @@ impl Solver {
         }
         self.trail_lim.truncate(level as usize);
         self.prop_head = self.trail.len();
+
+        // For backtrack to level 0 with external state management:
+        // batch-reset all quad PB constraints (all vars Undef → all terms MAYBE).
+        if level == 0 && self.skip_backtrack_quad_pb && !self.quad_pb_constraints.is_empty() {
+            for qc in &mut self.quad_pb_constraints {
+                let total: i32 = qc.coeffs.iter().map(|&c| c as i32).sum();
+                qc.sum_true = 0;
+                qc.sum_maybe = total;
+                for s in qc.term_state.iter_mut() { *s = 1; } // all MAYBE
+            }
+        }
     }
 
     /// Minimize a learnt clause by removing redundant literals.
