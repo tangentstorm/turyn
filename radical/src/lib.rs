@@ -644,24 +644,27 @@ impl Solver {
     }
 
     /// Propagate a quadratic PB constraint: sum(coeffs[i] * a_i * b_i) = target.
-    /// When propagation forces a literal, generates an explanatory clause and
-    /// adds it to the clause database, then enqueues with a Clause reason.
-    /// Returns conflict reason if violated, None otherwise.
+    /// Single-pass: computes slack and finds propagation in one scan.
+    #[inline(never)]
     fn propagate_quad_pb(&mut self, qi: u32) -> Option<Reason> {
         let qc = &self.quad_pb_constraints[qi as usize];
         let n = qc.lits_a.len();
         let target = qc.target as i64;
 
+        // Single pass: compute slack AND find first propagation candidate.
         let mut sum_true: i64 = 0;
         let mut sum_maybe: i64 = 0;
 
         for i in 0..n {
-            let va = self.lit_value(qc.lits_a[i]);
-            let vb = self.lit_value(qc.lits_b[i]);
+            let la = qc.lits_a[i];
+            let lb = qc.lits_b[i];
+            let aa = self.assigns[var_of(la)];
+            let ab = self.assigns[var_of(lb)];
+            let a_false = (aa == LBool::True && la < 0) || (aa == LBool::False && la > 0);
+            let b_false = (ab == LBool::True && lb < 0) || (ab == LBool::False && lb > 0);
+            if a_false || b_false { continue; }
             let c = qc.coeffs[i] as i64;
-            if va == LBool::False || vb == LBool::False {
-                // dead
-            } else if va == LBool::True && vb == LBool::True {
+            if aa != LBool::Undef && ab != LBool::Undef {
                 sum_true += c;
             } else {
                 sum_maybe += c;
@@ -669,27 +672,7 @@ impl Solver {
         }
 
         if sum_true + sum_maybe < target || sum_true > target {
-            // Conflict: build a clause from all assigned literals
-            let qc = &self.quad_pb_constraints[qi as usize];
-            let mut clause = Vec::new();
-            for i in 0..qc.lits_a.len() {
-                for &lit in &[qc.lits_a[i], qc.lits_b[i]] {
-                    let v = var_of(lit);
-                    if self.assigns[v] != LBool::Undef {
-                        let neg_lit = if self.lit_value(lit) == LBool::True { negate(lit) } else { lit };
-                        clause.push(neg_lit);
-                    }
-                }
-            }
-            clause.sort_by_key(|l| var_of(*l));
-            clause.dedup_by_key(|l| var_of(*l));
-            // Add as a clause and return conflict
-            let ci = self.clause_meta.len() as u32;
-            let start = self.clause_lits.len() as u32;
-            if clause.is_empty() { return Some(Reason::Decision); } // shouldn't happen
-            self.clause_lits.extend_from_slice(&clause);
-            self.clause_meta.push(ClauseMeta { start, len: clause.len() as u16, learnt: true, lbd: 0, deleted: false });
-            return Some(Reason::Clause(ci));
+            return self.quad_pb_conflict(qi);
         }
 
         let slack_up = sum_true + sum_maybe - target;
@@ -699,77 +682,87 @@ impl Solver {
             let la = self.quad_pb_constraints[qi as usize].lits_a[i];
             let lb = self.quad_pb_constraints[qi as usize].lits_b[i];
             let c = self.quad_pb_constraints[qi as usize].coeffs[i] as i64;
-            let va = self.lit_value(la);
-            let vb = self.lit_value(lb);
-
-            if va == LBool::False || vb == LBool::False { continue; }
-            if va == LBool::True && vb == LBool::True { continue; }
+            let aa = self.assigns[var_of(la)];
+            let ab = self.assigns[var_of(lb)];
+            let a_false = (aa == LBool::True && la < 0) || (aa == LBool::False && la > 0);
+            let b_false = (ab == LBool::True && lb < 0) || (ab == LBool::False && lb > 0);
+            if a_false || b_false { continue; }
+            let a_undef = aa == LBool::Undef;
+            let b_undef = ab == LBool::Undef;
+            if !a_undef && !b_undef { continue; } // both assigned true
 
             let propagated_lit;
             if c > slack_up {
-                // Term must be true
-                if va == LBool::True && vb == LBool::Undef {
-                    propagated_lit = lb;
-                } else if vb == LBool::True && va == LBool::Undef {
-                    propagated_lit = la;
-                } else if va == LBool::Undef && vb == LBool::Undef {
-                    propagated_lit = la; // force one; other forced on re-check
-                } else { continue; }
-            } else if c > slack_down {
-                // Term must be false
-                if va == LBool::True && vb == LBool::Undef {
-                    propagated_lit = negate(lb);
-                } else if vb == LBool::True && va == LBool::Undef {
-                    propagated_lit = negate(la);
-                } else { continue; }
+                propagated_lit = if !a_undef { lb } else { la };
+            } else if c > slack_down && (!a_undef || !b_undef) {
+                if !a_undef && b_undef { propagated_lit = negate(lb); }
+                else if !b_undef && a_undef { propagated_lit = negate(la); }
+                else { continue; }
             } else { continue; }
 
-            // Build a minimal explanation clause: propagated_lit ∨ ¬(reasons).
-            // Only include the false literal from each dead term (the one that
-            // killed it), and for the upper-bound case, the true lits from
-            // satisfied terms. Minimality improves BCP performance.
-            let qc = &self.quad_pb_constraints[qi as usize];
-            let mut clause = vec![propagated_lit];
-            let pv = var_of(propagated_lit);
-            for j in 0..qc.lits_a.len() {
-                let la_j = qc.lits_a[j];
-                let lb_j = qc.lits_b[j];
-                let va_j = self.lit_value(la_j);
-                let vb_j = self.lit_value(lb_j);
+            return self.quad_pb_explain_and_enqueue(qi, propagated_lit, slack_down, c);
+        }
+        None
+    }
 
-                if va_j == LBool::False || vb_j == LBool::False {
-                    // Dead term: include ONE false literal as reason
-                    let false_lit = if va_j == LBool::False { la_j } else { lb_j };
-                    let v = var_of(false_lit);
-                    if v != pv && self.level[v] > 0 {
-                        clause.push(false_lit);
-                    }
-                } else if va_j == LBool::True && vb_j == LBool::True {
-                    // Satisfied term: for upper-bound propagation, include true lits
-                    if c > slack_down {
-                        for &lit in &[la_j, lb_j] {
-                            let v = var_of(lit);
-                            if v != pv && self.level[v] > 0 {
-                                clause.push(negate(lit));
-                            }
-                        }
-                    }
+    fn quad_pb_conflict(&mut self, qi: u32) -> Option<Reason> {
+        let qc = &self.quad_pb_constraints[qi as usize];
+        let mut clause = Vec::new();
+        let mut seen = 0u64;
+        for i in 0..qc.lits_a.len() {
+            for &lit in &[qc.lits_a[i], qc.lits_b[i]] {
+                let v = var_of(lit);
+                let bit = 1u64 << (v & 63);
+                if v < 64 && seen & bit != 0 { continue; }
+                if self.assigns[v] != LBool::Undef {
+                    if v < 64 { seen |= bit; }
+                    clause.push(if self.lit_value(lit) == LBool::True { negate(lit) } else { lit });
                 }
             }
-
-            // Add as a clause and enqueue
-            let ci = self.clause_meta.len() as u32;
-            let start = self.clause_lits.len() as u32;
-            // Set up 2WL
-            if clause.len() >= 2 {
-                self.watches[lit_index(negate(clause[0]))].push((ci, clause[1]));
-                self.watches[lit_index(negate(clause[1]))].push((ci, clause[0]));
-            }
-            self.clause_lits.extend_from_slice(&clause);
-            self.clause_meta.push(ClauseMeta { start, len: clause.len() as u16, learnt: true, lbd: 0, deleted: false });
-            self.enqueue(propagated_lit, Reason::Clause(ci));
-            return None; // one propagation at a time
         }
+        if clause.is_empty() { return Some(Reason::Decision); }
+        let ci = self.clause_meta.len() as u32;
+        let start = self.clause_lits.len() as u32;
+        self.clause_lits.extend_from_slice(&clause);
+        self.clause_meta.push(ClauseMeta { start, len: clause.len() as u16, learnt: true, lbd: 0, deleted: false });
+        Some(Reason::Clause(ci))
+    }
+
+    fn quad_pb_explain_and_enqueue(&mut self, qi: u32, propagated_lit: Lit, slack_down: i64, coeff: i64) -> Option<Reason> {
+        let qc = &self.quad_pb_constraints[qi as usize];
+        let mut clause = vec![propagated_lit];
+        let pv = var_of(propagated_lit);
+        let is_upper = coeff > slack_down;
+
+        for j in 0..qc.lits_a.len() {
+            let la_j = qc.lits_a[j];
+            let lb_j = qc.lits_b[j];
+            let aa = self.assigns[var_of(la_j)];
+            let ab = self.assigns[var_of(lb_j)];
+            let a_false = (aa == LBool::True && la_j < 0) || (aa == LBool::False && la_j > 0);
+            let b_false = (ab == LBool::True && lb_j < 0) || (ab == LBool::False && lb_j > 0);
+
+            if a_false || b_false {
+                let false_lit = if a_false { la_j } else { lb_j };
+                let v = var_of(false_lit);
+                if v != pv && self.level[v] > 0 { clause.push(false_lit); }
+            } else if is_upper && aa != LBool::Undef && ab != LBool::Undef {
+                for &lit in &[la_j, lb_j] {
+                    let v = var_of(lit);
+                    if v != pv && self.level[v] > 0 { clause.push(negate(lit)); }
+                }
+            }
+        }
+
+        let ci = self.clause_meta.len() as u32;
+        let start = self.clause_lits.len() as u32;
+        if clause.len() >= 2 {
+            self.watches[lit_index(negate(clause[0]))].push((ci, clause[1]));
+            self.watches[lit_index(negate(clause[1]))].push((ci, clause[0]));
+        }
+        self.clause_lits.extend_from_slice(&clause);
+        self.clause_meta.push(ClauseMeta { start, len: clause.len() as u16, learnt: true, lbd: 0, deleted: false });
+        self.enqueue(propagated_lit, Reason::Clause(ci));
         None
     }
 
