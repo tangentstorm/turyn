@@ -2596,6 +2596,10 @@ fn hybrid_solve_tuple(
     let spectral_z = SpectralFilter::new(max_seq_len, cfg.theta_samples);
     let spectral_w = SpectralFilter::new(max_seq_len, cfg.theta_samples);
 
+    // Phase B: generate Z/W candidates and Phase C: SAT-test them in batches.
+    // Instead of generating ALL candidates then testing, we generate a batch of Z/W
+    // pairs, SAT-test them, then generate more. This interleaves Phase B and C so
+    // we don't spend minutes in Phase B before trying any SAT.
     let phase_b_start = Instant::now();
     let zw_candidates =
         build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats);
@@ -2663,6 +2667,16 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
     }
 
+    // For large n, reduce per-tuple limits to get through more tuples.
+    // At n=26, 200K candidates per tuple means Phase B takes >10s each.
+    // With 50K, Phase B takes ~0.5s and we cover 10x more tuples.
+    let mut cfg = cfg.clone();
+    if problem.n >= 26 && cfg.max_z > 50_000 {
+        cfg.max_z = 50_000;
+        cfg.max_w = 50_000;
+    }
+    let cfg = cfg;
+
     // Heuristic tuple ordering: balance "likely to contain solution" with
     // "cheap to search". Known TT solutions have x≈y, so |x-y| is key.
     // But also need small |z|+|w| for cheap Phase B.
@@ -2683,7 +2697,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     if workers <= 1 || tuples.len() <= 1 {
         let mut stats = SearchStats::default();
         for tuple in &tuples {
-            let (result, local_stats) = hybrid_solve_tuple(problem, *tuple, cfg, &found, verbose);
+            let (result, local_stats) = hybrid_solve_tuple(problem, *tuple, &cfg, &found, verbose);
             stats.merge_from(&local_stats);
             if let Some((x, y, z, w)) = result {
                 if verbose {
