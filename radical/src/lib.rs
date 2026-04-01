@@ -88,7 +88,6 @@ struct QuadPbConstraint {
     term_state: Vec<u8>,
     sum_true: i32,
     sum_maybe: i32,
-    dirty: bool,  // true if backtrack invalidated counters
 }
 
 /// Reason a variable was assigned (for conflict analysis).
@@ -368,7 +367,6 @@ impl Solver {
             term_state: vec![1u8; lits_a.len()], // all MAYBE initially
             sum_true: 0,
             sum_maybe: coeffs.iter().sum::<u32>() as i32,
-            dirty: false,
         });
 
         // Initial propagation
@@ -730,28 +728,6 @@ impl Solver {
     /// Propagate a quadratic PB constraint using incremental counters.
     #[inline(never)]
     fn propagate_quad_pb(&mut self, qi: u32) -> Option<Reason> {
-        // Recompute from scratch if dirty (after backtrack)
-        if self.quad_pb_constraints[qi as usize].dirty {
-            let n = self.quad_pb_constraints[qi as usize].num_terms as usize;
-            let mut st = 0i32;
-            let mut sm = 0i32;
-            for i in 0..n {
-                let qc = &self.quad_pb_constraints[qi as usize];
-                let aa = self.assigns[qc.vars_a[i]];
-                let ab = self.assigns[qc.vars_b[i]];
-                let a_false = (aa == LBool::True && qc.neg_a[i]) || (aa == LBool::False && !qc.neg_a[i]);
-                let b_false = (ab == LBool::True && qc.neg_b[i]) || (ab == LBool::False && !qc.neg_b[i]);
-                let c = self.quad_pb_constraints[qi as usize].coeffs[i] as i32;
-                let state = if a_false || b_false { 0u8 }
-                    else if aa != LBool::Undef && ab != LBool::Undef { st += c; 2u8 }
-                    else { sm += c; 1u8 };
-                self.quad_pb_constraints[qi as usize].term_state[i] = state;
-            }
-            self.quad_pb_constraints[qi as usize].sum_true = st;
-            self.quad_pb_constraints[qi as usize].sum_maybe = sm;
-            self.quad_pb_constraints[qi as usize].dirty = false;
-        }
-
         let qc = &self.quad_pb_constraints[qi as usize];
         let n = qc.num_terms as usize;
         let target = qc.target as i64;
@@ -1013,14 +989,15 @@ impl Solver {
             self.phase[v] = entry.lit > 0;
             self.assigns[v] = LBool::Undef;
             if v < self.quad_pb_reasons.len() { self.quad_pb_reasons[v] = None; }
+            // Incrementally update quad PB term states after unassigning
+            for idx in 0..self.quad_pb_var_terms[v].len() {
+                let (qi, ti) = self.quad_pb_var_terms[v][idx];
+                self.update_quad_pb_term(qi, ti as usize);
+            }
             self.heap_insert(v);
         }
         self.trail_lim.truncate(level as usize);
         self.prop_head = self.trail.len();
-        // Mark all quad PB constraints dirty (counters stale after backtrack)
-        for qc in &mut self.quad_pb_constraints {
-            qc.dirty = true;
-        }
     }
 
     /// Minimize a learnt clause by removing redundant literals.
