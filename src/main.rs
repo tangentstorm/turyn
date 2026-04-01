@@ -3190,7 +3190,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
 
     // For small n: use fast per-tuple work-stealing (no coordinator overhead)
-    if problem.n < 20 {
+    if problem.n < 26 {
         let tuples = Arc::new(tuples);
         let cfg = Arc::new(cfg.clone());
         let xy_table = xy_table.map(Arc::new);
@@ -3375,26 +3375,37 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     drop(ready_tx); // coordinator uses ready_rx only
     drop(result_tx); // only workers send results
 
-    // Producer threads: run Phase B in parallel, send (tuple, candidate) pairs
-    // Use half the cores for production, half reserved for workers
-    let num_producers = (workers / 2).max(1);
+    // Single producer thread with adaptive throttling.
+    // Pair generation is far cheaper than SAT solving, so one producer can
+    // easily keep the queue full.  When the queue is deep, the producer sleeps
+    // to yield its CPU core to SAT workers.  It wakes periodically to generate
+    // one tuple's worth of pairs, then goes back to sleep if still pressured.
     let tuples = Arc::new(tuples);
     let total_tuples = tuples.len();
     let producer_cfg = Arc::new(producer_cfg);
     let next_tuple = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let queue_pressure = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let queue_pressure_producer = Arc::clone(&queue_pressure);
     let mut producer_handles = Vec::new();
-    for _ in 0..num_producers {
+    {
         let found = Arc::clone(&found);
         let tx = producer_tx.clone();
         let tuples = Arc::clone(&tuples);
         let cfg = Arc::clone(&producer_cfg);
         let next = Arc::clone(&next_tuple);
         let tuples_produced = Arc::clone(&tuples_produced);
+        let pressure_threshold = workers * 100;
         producer_handles.push(std::thread::spawn(move || {
             let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
             let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
             let mut stats = SearchStats::default();
             loop {
+                if found.load(AtomicOrdering::Relaxed) { break; }
+                // Throttle: if queue is deep, sleep to yield CPU to SAT workers
+                while queue_pressure_producer.load(AtomicOrdering::Relaxed) > pressure_threshold {
+                    if found.load(AtomicOrdering::Relaxed) { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
                 if found.load(AtomicOrdering::Relaxed) { break; }
                 let idx = next.fetch_add(1, AtomicOrdering::Relaxed);
                 if idx >= tuples.len() { break; }
@@ -3489,6 +3500,9 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 Err(_) => break,
             }
         }
+
+        // Update queue pressure so producer can throttle
+        queue_pressure.store(pq.len(), AtomicOrdering::Relaxed);
 
         // Dispatch work
         dispatch(&mut pq, &mut idle_workers, &worker_txs, &mut pairs_dispatched);
