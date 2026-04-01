@@ -2667,14 +2667,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
     }
 
-    // For large n, reduce per-tuple limits to get through more tuples.
-    // At n=26, 200K candidates per tuple means Phase B takes >10s each.
-    // With 50K, Phase B takes ~0.5s and we cover 10x more tuples.
-    let mut cfg = cfg.clone();
-    if problem.n >= 26 && cfg.max_z > 50_000 {
-        cfg.max_z = 50_000;
-        cfg.max_w = 50_000;
-    }
+    let cfg = cfg.clone();
     let cfg = cfg;
 
     // Heuristic tuple ordering: balance "likely to contain solution" with
