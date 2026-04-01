@@ -3170,11 +3170,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false };
     }
 
-    // For n >= 28 (spectral wall): use producer-consumer with priority queue.
-    // Phase B produces candidates sorted by max_pair_power; workers pop tightest first.
-    // For smaller n: use the faster per-tuple work-stealing path.
-    if problem.n < 28 && cfg.max_spectral.is_none() {
-        // Original per-tuple work-stealing path
+    // For n < 28: use fast per-tuple work-stealing (no coordinator overhead)
+    if problem.n < 28 {
         let tuples = Arc::new(tuples);
         let cfg = Arc::new(cfg.clone());
         let xy_table = xy_table.map(Arc::new);
@@ -3194,16 +3191,14 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                     for _ in 0..100 {
                         std::thread::sleep(std::time::Duration::from_millis(100));
                         if found_c.load(AtomicOrdering::Relaxed) { return; }
-                        let done = tuples_done_c.load(AtomicOrdering::Relaxed);
-                        if done >= total_tuples { return; }
+                        if tuples_done_c.load(AtomicOrdering::Relaxed) >= total_tuples { return; }
                     }
                     let done = tuples_done_c.load(AtomicOrdering::Relaxed);
                     if done >= total_tuples { break; }
                     let pairs = pairs_tested_c.load(AtomicOrdering::Relaxed);
                     let elapsed = start.elapsed().as_secs_f64();
-                    let pct = 100.0 * done as f64 / total_tuples as f64;
-                    eprintln!("[{:.0}s] {}/{} tuples ({:.0}%), {} Z/W pairs, {:.1} tuples/s",
-                        elapsed, done, total_tuples, pct, pairs, done as f64 / elapsed);
+                    eprintln!("[{:.0}s] {}/{} tuples ({:.0}%), {} pairs, {:.1} tuples/s",
+                        elapsed, done, total_tuples, 100.0*done as f64/total_tuples as f64, pairs, done as f64/elapsed);
                 }
             }))
         } else { None };
@@ -3216,7 +3211,6 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             let tuples_done = Arc::clone(&tuples_done);
             let pairs_tested = Arc::clone(&pairs_tested);
             let xy_table = xy_table.clone();
-
             handles.push(std::thread::spawn(move || {
                 let mut local_stats = SearchStats::default();
                 let mut solution = None;
@@ -3234,7 +3228,6 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 (solution, local_stats)
             }));
         }
-
         let mut stats = SearchStats::default();
         let mut found_solution = false;
         for h in handles {
@@ -3247,12 +3240,11 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             }
         }
         if let Some(ph) = progress_handle { let _ = ph.join(); }
-
         if verbose {
             let total = run_start.elapsed();
             let phase_b = std::time::Duration::from_nanos(stats.phase_b_nanos);
             let phase_c = std::time::Duration::from_nanos(stats.phase_c_nanos);
-            println!("\n--- Phase timing (wall-clock, summed across {} threads) ---", workers);
+            println!("\n--- Phase timing (wall-clock, {} threads) ---", workers);
             println!("  Phase A (tuple enum):       {:>10.3?}", phase_a_elapsed);
             println!("  Phase B (Z/W gen+spectral): {:>10.3?}  (thread-sum)", phase_b);
             println!("  Phase C (SAT X/Y):          {:>10.3?}  (thread-sum)", phase_c);
@@ -3265,210 +3257,231 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         return SearchReport { stats, elapsed: run_start.elapsed(), found_solution };
     }
 
-    // Priority queue path for n >= 28 (or explicit --max-spectral):
-    use std::sync::{Mutex, Condvar};
+    // For n >= 26: channel-based coordinator with priority queue.
+    // - Producer thread: runs Phase B for all tuples, sends candidates to coordinator
+    // - Coordinator (this thread): receives candidates, inserts into priority queue,
+    //   dispatches to idle workers (tightest spectral first)
+    // - Worker threads: receive work items via channel, run Phase C, send results back
+    // No mutex contention — coordinator is the only one touching the priority queue.
+
     use std::collections::BinaryHeap;
-    use std::cmp::Reverse;
 
-    // Work item for the priority queue
-    struct WorkItem {
-        tuple: SumTuple,
-        candidate: CandidateZW,
-    }
-    impl PartialEq for WorkItem { fn eq(&self, other: &Self) -> bool { self.candidate.max_pair_power == other.candidate.max_pair_power } }
-    impl Eq for WorkItem {}
-    impl PartialOrd for WorkItem { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
-    impl Ord for WorkItem {
-        fn cmp(&self, other: &Self) -> Ordering {
-            // Reverse: lower max_pair_power = higher priority (min-heap via Reverse)
-            self.candidate.max_pair_power.partial_cmp(&other.candidate.max_pair_power)
-                .unwrap_or(Ordering::Equal)
-        }
-    }
-
-    let queue: Arc<Mutex<BinaryHeap<Reverse<WorkItem>>>> = Arc::new(Mutex::new(BinaryHeap::new()));
-    let queue_cv = Arc::new(Condvar::new());
-    let producer_done = Arc::new(AtomicBool::new(false));
-    let total_tuples = tuples.len();
-
-    // Auto-widen spectral bound for n >= 28 where default yields no pairs
+    // Auto-widen spectral bound for n >= 28
     let mut producer_cfg = cfg.clone();
     if producer_cfg.max_spectral.is_none() && problem.n >= 28 {
         let widened = problem.spectral_bound() + 30.0;
         if verbose {
-            eprintln!("Auto-widening spectral bound to {:.0} for n={} (default {:.0} may yield no pairs)",
-                widened, problem.n, problem.spectral_bound());
+            eprintln!("Auto-widening spectral bound to {:.0} for n={}", widened, problem.n);
         }
         producer_cfg.max_spectral = Some(widened);
     }
 
-    // Producer thread: runs Phase B for all tuples, pushes candidates into priority queue
-    let producer_handle = {
-        let found = Arc::clone(&found);
-        let queue = Arc::clone(&queue);
-        let queue_cv = Arc::clone(&queue_cv);
-        let producer_done = Arc::clone(&producer_done);
-        let cfg = producer_cfg;
-        std::thread::spawn(move || {
-            let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
-            let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
-            let mut stats = SearchStats::default();
-            for tuple in &tuples {
-                if found.load(AtomicOrdering::Relaxed) { break; }
-                let candidates = build_zw_candidates(problem, *tuple, &cfg, &spectral_z, &spectral_w, &mut stats, &found);
-                // Deduplicate by autocorrelation
-                let mut seen = std::collections::HashSet::new();
-                let unique: Vec<CandidateZW> = candidates.into_iter()
-                    .filter(|c| seen.insert(c.zw_autocorr.clone()))
-                    .collect();
-                if !unique.is_empty() {
-                    let mut q = queue.lock().unwrap();
-                    for c in unique {
-                        q.push(Reverse(WorkItem { tuple: *tuple, candidate: c }));
-                    }
-                    queue_cv.notify_all();
-                }
-            }
-            producer_done.store(true, AtomicOrdering::Relaxed);
-            queue_cv.notify_all(); // wake workers so they see producer is done
-            stats
-        })
-    };
+    // Work item sent from coordinator to workers
+    struct WorkItem {
+        tuple: SumTuple,
+        candidate: CandidateZW,
+    }
 
-    // Worker threads: pop from priority queue and run Phase C
+    // Channels
+    let (producer_tx, producer_rx) = std::sync::mpsc::channel::<(SumTuple, CandidateZW)>();
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>>();
+    // Per-worker channels: coordinator sends work, worker receives
+    let mut worker_txs: Vec<std::sync::mpsc::SyncSender<Option<WorkItem>>> = Vec::new();
+    let mut worker_ready_tx_list: Vec<std::sync::mpsc::Sender<usize>> = Vec::new();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<usize>(); // workers signal "I'm idle"
+
+    // Spawn workers
     let xy_table = xy_table.map(Arc::new);
-    let cfg = Arc::new(cfg.clone());
-    let mut handles = Vec::new();
-    for _tid in 0..workers {
+    for tid in 0..workers {
+        let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<Option<WorkItem>>(1);
+        worker_txs.push(work_tx);
         let found = Arc::clone(&found);
-        let queue = Arc::clone(&queue);
-        let queue_cv = Arc::clone(&queue_cv);
-        let producer_done = Arc::clone(&producer_done);
-        let cfg = Arc::clone(&cfg);
+        let ready_tx = ready_tx.clone();
+        let result_tx = result_tx.clone();
         let xy_table = xy_table.clone();
 
-        handles.push(std::thread::spawn(move || {
-            let mut local_stats = SearchStats::default();
-            let mut solution = None;
-            // Cache SAT templates per tuple
+        std::thread::spawn(move || {
             let mut template_cache: HashMap<(i32,i32,i32,i32), SatXYTemplate> = HashMap::new();
-
-            loop {
+            // Signal ready immediately
+            let _ = ready_tx.send(tid);
+            while let Ok(Some(item)) = work_rx.recv() {
                 if found.load(AtomicOrdering::Relaxed) { break; }
-
-                // Pop highest-priority (lowest spectral power) work item
-                let item = {
-                    let mut q = queue.lock().unwrap();
-                    loop {
-                        if let Some(Reverse(item)) = q.pop() {
-                            break Some(item);
-                        }
-                        if producer_done.load(AtomicOrdering::Relaxed) {
-                            break None;
-                        }
-                        // Wait for producer to push more items
-                        q = queue_cv.wait(q).unwrap();
-                    }
-                };
-
-                let Some(item) = item else { break; };
-
-                // Get or build SAT template for this tuple
                 let tuple_key = (item.tuple.x, item.tuple.y, item.tuple.z, item.tuple.w);
                 let template = template_cache.entry(tuple_key).or_insert_with(|| {
                     SatXYTemplate::build(problem, item.tuple).unwrap()
                 });
 
-                // If we have a table, use table-based solve
+                let mut solved = None;
                 if let Some(ref table) = xy_table {
-                    let table_ref: &XYBoundaryTable = table;
-                    if let Some((x, y)) = table_ref.solve_xy_with_sat(
-                        problem, item.tuple, &item.candidate, template,
-                    ) {
-                        let ok = verify_tt(problem, &x, &y, &item.candidate.z, &item.candidate.w);
-                        if ok {
-                            found.store(true, AtomicOrdering::Relaxed);
-                            queue_cv.notify_all();
-                            solution = Some((x, y, item.candidate.z.clone(), item.candidate.w.clone()));
-                            break;
+                    let t: &XYBoundaryTable = table;
+                    if let Some((x, y)) = t.solve_xy_with_sat(problem, item.tuple, &item.candidate, template) {
+                        if verify_tt(problem, &x, &y, &item.candidate.z, &item.candidate.w) {
+                            solved = Some((x, y, item.candidate.z.clone(), item.candidate.w.clone()));
                         }
                     }
                 } else {
-                    // Standard SAT solve
                     if let Some((x, y)) = template.solve_for(&item.candidate) {
-                        let ok = verify_tt(problem, &x, &y, &item.candidate.z, &item.candidate.w);
-                        if ok {
-                            found.store(true, AtomicOrdering::Relaxed);
-                            queue_cv.notify_all();
-                            solution = Some((x, y, item.candidate.z.clone(), item.candidate.w.clone()));
-                            break;
+                        if verify_tt(problem, &x, &y, &item.candidate.z, &item.candidate.w) {
+                            solved = Some((x, y, item.candidate.z.clone(), item.candidate.w.clone()));
                         }
                     }
                 }
-            }
-            (solution, local_stats)
-        }));
-    }
 
-    // Progress reporter
-    let progress_handle = if verbose {
-        let found_c = Arc::clone(&found);
-        let producer_done_c = Arc::clone(&producer_done);
-        let queue_c = Arc::clone(&queue);
-        let start = run_start;
-        Some(std::thread::spawn(move || {
+                if solved.is_some() {
+                    found.store(true, AtomicOrdering::Relaxed);
+                    let _ = result_tx.send(solved);
+                    break;
+                }
+                // Signal ready for more work
+                let _ = ready_tx.send(tid);
+            }
+        });
+    }
+    drop(ready_tx); // coordinator uses ready_rx only
+    drop(result_tx); // only workers send results
+
+    // Producer threads: run Phase B in parallel, send (tuple, candidate) pairs
+    // Use half the cores for production, half reserved for workers
+    let num_producers = (workers / 2).max(1);
+    let tuples = Arc::new(tuples);
+    let producer_cfg = Arc::new(producer_cfg);
+    let next_tuple = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut producer_handles = Vec::new();
+    for _ in 0..num_producers {
+        let found = Arc::clone(&found);
+        let tx = producer_tx.clone();
+        let tuples = Arc::clone(&tuples);
+        let cfg = Arc::clone(&producer_cfg);
+        let next = Arc::clone(&next_tuple);
+        producer_handles.push(std::thread::spawn(move || {
+            let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
+            let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
+            let mut stats = SearchStats::default();
             loop {
-                for _ in 0..100 {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    if found_c.load(AtomicOrdering::Relaxed) { return; }
-                    if producer_done_c.load(AtomicOrdering::Relaxed) {
-                        let q = queue_c.lock().unwrap();
-                        if q.is_empty() { return; }
+                if found.load(AtomicOrdering::Relaxed) { break; }
+                let idx = next.fetch_add(1, AtomicOrdering::Relaxed);
+                if idx >= tuples.len() { break; }
+                let tuple = tuples[idx];
+                let candidates = build_zw_candidates(
+                    problem, tuple, &cfg, &spectral_z, &spectral_w, &mut stats, &found);
+                let mut seen = std::collections::HashSet::new();
+                for c in candidates {
+                    if found.load(AtomicOrdering::Relaxed) { break; }
+                    if seen.insert(c.zw_autocorr.clone()) {
+                        if tx.send((tuple, c)).is_err() { break; }
                     }
                 }
-                let qlen = queue_c.lock().unwrap().len();
-                let elapsed = start.elapsed().as_secs_f64();
-                let done = producer_done_c.load(AtomicOrdering::Relaxed);
-                eprintln!("[{:.0}s] queue={}, producer_done={}", elapsed, qlen, done);
             }
-        }))
-    } else { None };
-
-    let mut stats = SearchStats::default();
-    let mut found_solution = false;
-
-    // Join producer first to collect Phase B stats
-    if let Ok(producer_stats) = producer_handle.join() {
-        stats.merge_from(&producer_stats);
+            stats
+        }));
     }
+    drop(producer_tx); // close channel when all producers finish
 
-    // Join workers
-    for h in handles {
-        if let Ok((result, local_stats)) = h.join() {
-            stats.merge_from(&local_stats);
-            if let Some((x, y, z, w)) = result {
-                if verbose {
-                    print_solution(&format!("TT({}) SOLUTION", problem.n), &x, &y, &z, &w);
-                }
-                found_solution = true;
-            }
+    // Coordinator: priority queue + dispatch loop
+    // Ord impl for priority queue (min-heap by max_pair_power)
+    struct PqItem { power: f64, tuple: SumTuple, candidate: CandidateZW }
+    impl PartialEq for PqItem { fn eq(&self, other: &Self) -> bool { self.power == other.power } }
+    impl Eq for PqItem {}
+    impl PartialOrd for PqItem {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+    }
+    impl Ord for PqItem {
+        fn cmp(&self, other: &Self) -> Ordering {
+            // Reverse ordering: lower power = higher priority
+            other.power.partial_cmp(&self.power).unwrap_or(Ordering::Equal)
         }
     }
 
-    // Stop progress reporter
-    if let Some(ph) = progress_handle {
-        let _ = ph.join();
+    let mut pq: BinaryHeap<PqItem> = BinaryHeap::new();
+    let mut idle_workers: Vec<usize> = Vec::new();
+    let mut found_solution = false;
+    let mut stats = SearchStats::default();
+    let mut pairs_dispatched = 0usize;
+
+    // Helper: dispatch from pq to an idle worker
+    let dispatch = |pq: &mut BinaryHeap<PqItem>, idle: &mut Vec<usize>,
+                    worker_txs: &[std::sync::mpsc::SyncSender<Option<WorkItem>>],
+                    dispatched: &mut usize| {
+        while let Some(tid) = idle.pop() {
+            if let Some(item) = pq.pop() {
+                *dispatched += 1;
+                let _ = worker_txs[tid].send(Some(WorkItem {
+                    tuple: item.tuple, candidate: item.candidate,
+                }));
+            } else {
+                idle.push(tid);
+                break;
+            }
+        }
+    };
+
+    let mut producer_done = false;
+    loop {
+        if found.load(AtomicOrdering::Relaxed) {
+            // Solution found — collect it
+            if let Ok(Some(sol)) = result_rx.try_recv() {
+                if verbose {
+                    print_solution(&format!("TT({}) SOLUTION", problem.n),
+                        &sol.0, &sol.1, &sol.2, &sol.3);
+                }
+                found_solution = true;
+            }
+            break;
+        }
+
+        // Receive candidates from producer (non-blocking)
+        loop {
+            match producer_rx.try_recv() {
+                Ok((tuple, candidate)) => {
+                    let power = candidate.max_pair_power;
+                    pq.push(PqItem { power, tuple, candidate });
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => { producer_done = true; break; }
+            }
+        }
+
+        // Receive "ready" signals from workers (non-blocking)
+        loop {
+            match ready_rx.try_recv() {
+                Ok(tid) => idle_workers.push(tid),
+                Err(_) => break,
+            }
+        }
+
+        // Dispatch work
+        dispatch(&mut pq, &mut idle_workers, &worker_txs, &mut pairs_dispatched);
+
+        // Check if we're done (producer finished + queue empty + all workers idle)
+        if producer_done && pq.is_empty() && idle_workers.len() == workers {
+            break;
+        }
+
+        // Brief yield to avoid busy-spinning — use thread::yield instead of sleep
+        // to minimize latency
+        std::thread::yield_now();
+    }
+
+    // Shutdown workers
+    for tx in &worker_txs {
+        let _ = tx.send(None);
+    }
+
+    // Collect producer stats
+    for h in producer_handles {
+        if let Ok(producer_stats) = h.join() {
+            stats.merge_from(&producer_stats);
+        }
     }
 
     if verbose {
         let total = run_start.elapsed();
-        let phase_a = phase_a_elapsed;
         let phase_b = std::time::Duration::from_nanos(stats.phase_b_nanos);
         let phase_c = std::time::Duration::from_nanos(stats.phase_c_nanos);
-        println!("\n--- Phase timing (wall-clock, summed across {} threads) ---", workers);
-        println!("  Phase A (tuple enum):       {:>10.3?}", phase_a);
+        println!("\n--- Phase timing (wall-clock, {} threads) ---", workers);
+        println!("  Phase A (tuple enum):       {:>10.3?}", phase_a_elapsed);
         println!("  Phase B (Z/W gen+spectral): {:>10.3?}  (thread-sum)", phase_b);
-        println!("  Phase C (SAT X/Y):          {:>10.3?}  (thread-sum)", phase_c);
+        println!("  Pairs dispatched:           {:>10}", pairs_dispatched);
         println!("  Total wall-clock:           {:>10.3?}", total);
         if !found_solution {
             println!("Hybrid search: no solution found. Stats: z_gen={}, w_gen={}, pairs={}",
