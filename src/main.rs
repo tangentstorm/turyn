@@ -2142,120 +2142,277 @@ fn run_sat_search(problem: Problem, verbose: bool) -> SearchReport {
 /// Grouped by (x_bnd_sum, y_bnd_sum, high_lag_signature) for fast lookup.
 /// The high_lag_signature captures autocorrelation at lags where all pairs are
 /// boundary-only (max_unknown=0), enabling exact-match filtering at load time.
+enum TableBacking {
+    Owned(Vec<u8>),
+    Mmap(memmap2::Mmap),
+}
+
+impl TableBacking {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            TableBacking::Owned(v) => v,
+            TableBacking::Mmap(m) => m,
+        }
+    }
+}
+
 struct XYBoundaryTable {
     n: usize,
     k: usize,
-    /// Map from (x_bnd_sum, y_bnd_sum, high_lag_sig) → list of (x_bits, y_bits)
-    groups: HashMap<(i16, i16, Vec<i16>), Vec<(u32, u32)>>,
+    dim: usize,
+    /// File data (mmap or owned Vec, kept alive for pointer validity)
+    _backing: TableBacking,
+    /// Pointer to the index section: dim² entries of (offset_u64, count_u32)
+    index: *const u8,
+    /// Pointer to the data section: packed (x_bits: u32, y_bits: u32) entries
+    data: *const u8,
     /// Which lags have max_unknown=0 (fully determined by boundary)
     exact_lags: Vec<usize>,
+    /// Sub-index: entries sorted by exact-lag sig within each bucket.
+    /// Maps packed (bucket_idx, sig_u64) → (offset, count) into sorted_entries.
+    sig_index: HashMap<(u32, u64), (u32, u32)>,
+    /// All entries re-ordered by (bucket, sig) for sub-indexed lookup.
+    sorted_entries: Vec<(u32, u32)>,
 }
+
+// Safety: the mmap data is immutable and the pointers are derived from it
+unsafe impl Send for XYBoundaryTable {}
+unsafe impl Sync for XYBoundaryTable {}
 
 impl XYBoundaryTable {
     fn load(path: &str, n: usize) -> Option<Self> {
-        use std::io::Read;
-        let mut f = std::fs::File::open(path).ok()?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf).ok()?;
-        if buf.len() < 20 { return None; }
+        let f = std::fs::File::open(path).ok()?;
+        let mmap = unsafe { memmap2::Mmap::map(&f).ok()? };
+        if mmap.len() < 20 { return None; }
 
         // Parse header
-        if &buf[0..4] != b"XYTT" { return None; }
-        let version = u32::from_le_bytes(buf[4..8].try_into().ok()?);
-        if version != 2 { return None; }
-        let _table_n = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
-        let k = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
+        if &mmap[0..4] != b"XYTT" { return None; }
+        let version = u32::from_le_bytes(mmap[4..8].try_into().ok()?);
+        let k;
+        let dim;
+
+        if version == 3 {
+            let _table_n = u32::from_le_bytes(mmap[8..12].try_into().ok()?) as usize;
+            k = u32::from_le_bytes(mmap[12..16].try_into().ok()?) as usize;
+            dim = u32::from_le_bytes(mmap[16..20].try_into().ok()?) as usize;
+            if dim != 2 * k + 1 { return None; }
+        } else if version == 2 {
+            // v2: old HashMap format — convert on-the-fly (needs full copy)
+            let buf = mmap[..].to_vec();
+            drop(mmap);
+            return Self::load_v2(&buf, n);
+        } else {
+            return None;
+        }
+
         if n < 2 * k {
             eprintln!("Error: table k={} requires n >= {}, but n={}", k, 2 * k, n);
             return None;
         }
-        let num_groups = u32::from_le_bytes(buf[16..20].try_into().ok()?) as usize;
 
-        // Parse group directory
-        let dir_entry_size = 2 + 2 + 8 + 4; // i16 + i16 + u64 + u32
+        let index_start = 20;
+        let index_size = dim * dim * 12;
+        let data_start = index_start + index_size;
+        if mmap.len() < data_start { return None; }
+
+        let index = mmap[index_start..].as_ptr();
+        let data = mmap[data_start..].as_ptr();
+
+        // Find exact lags
+        let mut exact_lags = Vec::new();
+        for s in 1..n {
+            let mut all_bnd = true;
+            let mut has_pairs = false;
+            for i in 0..n - s {
+                let i_bnd = i < k || i >= n - k;
+                let j_bnd = (i + s) < k || (i + s) >= n - k;
+                if i_bnd && j_bnd { has_pairs = true; }
+                else { all_bnd = false; }
+            }
+            if has_pairs && all_bnd { exact_lags.push(s); }
+        }
+
+        let mut table = Self { n, k, dim, _backing: TableBacking::Mmap(mmap), index, data, exact_lags,
+            sig_index: HashMap::new(), sorted_entries: Vec::new() };
+        table.build_sig_index();
+        Some(table)
+    }
+
+    /// Load v2 format (old HashMap-based) for backwards compatibility
+    fn load_v2(buf: &[u8], n: usize) -> Option<Self> {
+        let k = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
+        if n < 2 * k { return None; }
+        let num_groups = u32::from_le_bytes(buf[16..20].try_into().ok()?) as usize;
+        let dim = 2 * k + 1;
+
+        // Parse v2 directory
+        let dir_entry_size = 16; // i16 + i16 + u64 + u32
         let dir_start = 20;
         let dir_end = dir_start + num_groups * dir_entry_size;
         if buf.len() < dir_end { return None; }
 
+        // Build v3-style flat index from v2 groups
+        let sum_to_idx = |s: i16| -> usize { ((s + 2 * k as i16) / 2) as usize };
+
+        // First pass: read directory and accumulate counts
         struct DirEntry { x_sum: i16, y_sum: i16, offset: u64, count: u32 }
         let mut dir = Vec::with_capacity(num_groups);
+        let mut index_counts = vec![0u32; dim * dim];
         for i in 0..num_groups {
             let base = dir_start + i * dir_entry_size;
-            let x_sum = i16::from_le_bytes(buf[base..base+2].try_into().ok()?);
-            let y_sum = i16::from_le_bytes(buf[base+2..base+4].try_into().ok()?);
+            let xs = i16::from_le_bytes(buf[base..base+2].try_into().ok()?);
+            let ys = i16::from_le_bytes(buf[base+2..base+4].try_into().ok()?);
             let offset = u64::from_le_bytes(buf[base+4..base+12].try_into().ok()?);
             let count = u32::from_le_bytes(buf[base+12..base+16].try_into().ok()?);
-            dir.push(DirEntry { x_sum, y_sum, offset, count });
+            let bi = sum_to_idx(xs) * dim + sum_to_idx(ys);
+            index_counts[bi] += count;
+            dir.push(DirEntry { x_sum: xs, y_sum: ys, offset, count });
         }
 
-        // Parse entry data
-        let data_start = dir_end;
-        let entry_size = 8; // u32 + u32
-        let mut groups = HashMap::new();
+        // Build v3-compatible buffer: header + index + data (reusing v2 data)
+        let v2_data_start = dir_end;
+        let total_entries: u64 = index_counts.iter().map(|&c| c as u64).sum();
+        let index_size = dim * dim * 12;
+        let data_size = total_entries as usize * 8;
+        let mut v3_buf = vec![0u8; 20 + index_size + data_size];
+
+        // Header
+        v3_buf[0..4].copy_from_slice(b"XYTT");
+        v3_buf[4..8].copy_from_slice(&3u32.to_le_bytes());
+        v3_buf[8..12].copy_from_slice(&(n as u32).to_le_bytes());
+        v3_buf[12..16].copy_from_slice(&(k as u32).to_le_bytes());
+        v3_buf[16..20].copy_from_slice(&(dim as u32).to_le_bytes());
+
+        // Compute offsets from counts
+        let mut offsets = vec![0u64; dim * dim];
+        let mut cum = 0u64;
+        for i in 0..dim * dim {
+            offsets[i] = cum;
+            cum += index_counts[i] as u64;
+        }
+
+        // Write index
+        for i in 0..dim * dim {
+            let base = 20 + i * 12;
+            v3_buf[base..base+8].copy_from_slice(&offsets[i].to_le_bytes());
+            v3_buf[base+8..base+12].copy_from_slice(&index_counts[i].to_le_bytes());
+        }
+
+        // Copy data entries from v2 into v3 layout
+        let v3_data_start = 20 + index_size;
+        let mut write_pos = vec![0u64; dim * dim];
         for d in &dir {
-            let start = data_start + d.offset as usize * entry_size;
-            let end = start + d.count as usize * entry_size;
-            if buf.len() < end { return None; }
-            let mut entries = Vec::with_capacity(d.count as usize);
+            let bi = sum_to_idx(d.x_sum) * dim + sum_to_idx(d.y_sum);
+            let src_start = v2_data_start + d.offset as usize * 8;
             for j in 0..d.count as usize {
-                let base = start + j * entry_size;
-                let xb = u32::from_le_bytes(buf[base..base+4].try_into().ok()?);
-                let yb = u32::from_le_bytes(buf[base+4..base+8].try_into().ok()?);
-                entries.push((xb, yb));
+                let src = src_start + j * 8;
+                let dst_entry = offsets[bi] + write_pos[bi];
+                let dst = v3_data_start + dst_entry as usize * 8;
+                v3_buf[dst..dst+8].copy_from_slice(&buf[src..src+8]);
+                write_pos[bi] += 1;
             }
-            groups.insert((d.x_sum, d.y_sum), entries);
         }
 
-        // Find lags where all pairs are boundary-only (exact match for indexing)
-        let mut sig_lags = Vec::new();
-        let mut sig_lag_pairs: Vec<Vec<(usize, usize)>> = Vec::new();
+        // Find exact lags
+        let mut exact_lags = Vec::new();
         for s in 1..n {
-            let mut pairs = Vec::new();
-            let mut has_non_boundary = false;
+            let mut all_bnd = true; let mut has = false;
             for i in 0..n - s {
-                let i_bnd = i < k || i >= n - k;
-                let j_bnd = (i + s) < k || (i + s) >= n - k;
-                if i_bnd && j_bnd {
-                    pairs.push((i, i + s));
-                } else {
-                    has_non_boundary = true;
-                }
+                let ib = i < k || i >= n - k;
+                let jb = (i+s) < k || (i+s) >= n - k;
+                if ib && jb { has = true; } else { all_bnd = false; }
             }
-            if !pairs.is_empty() && !has_non_boundary {
-                sig_lags.push(s);
-                sig_lag_pairs.push(pairs);
-            }
+            if has && all_bnd { exact_lags.push(s); }
         }
-        let exact_lags = sig_lags.clone();
 
-        // Re-group by (x_sum, y_sum, high_lag_signature) using exact lags
-        let mut refined_groups: HashMap<(i16, i16, Vec<i16>), Vec<(u32, u32)>> = HashMap::new();
-        for ((x_sum, y_sum), entries) in &groups {
+        let index = v3_buf[20..].as_ptr();
+        let data = v3_buf[v3_data_start..].as_ptr();
+        let mut table = Self { n, k, dim, _backing: TableBacking::Owned(v3_buf), index, data, exact_lags,
+            sig_index: HashMap::new(), sorted_entries: Vec::new() };
+        table.build_sig_index();
+        Some(table)
+    }
+
+    /// Build the sig sub-index: group entries within each bucket by exact-lag signature.
+    fn build_sig_index(&mut self) {
+        let n = self.n;
+        let k = self.k;
+        let pos_to_bit = |pos: usize| -> u32 {
+            if pos < k { pos as u32 } else { (k + pos - (n - k)) as u32 }
+        };
+
+        // Precompute exact-lag pair positions
+        let mut exact_pairs: Vec<Vec<(usize, usize)>> = Vec::new();
+        for &s in &self.exact_lags {
+            let mut pairs = Vec::new();
+            for i in 0..n - s {
+                let ib = i < k || i >= n - k;
+                let jb = (i + s) < k || (i + s) >= n - k;
+                if ib && jb { pairs.push((i, i + s)); }
+            }
+            exact_pairs.push(pairs);
+        }
+
+        // Compute signature for an entry
+        let compute_sig = |xb: u32, yb: u32| -> u64 {
+            let mut packed = 0u64;
+            for (li, pairs) in exact_pairs.iter().enumerate() {
+                let mut disagree = 0u32;
+                for &(i, j) in pairs {
+                    let bi = pos_to_bit(i);
+                    let bj = pos_to_bit(j);
+                    disagree += ((xb >> bi) ^ (xb >> bj)) & 1;
+                    disagree += ((yb >> bi) ^ (yb >> bj)) & 1;
+                }
+                let num_bnd = 2 * pairs.len() as i32;
+                let kn = num_bnd - 2 * disagree as i32;
+                let shifted = (kn + 64) as u64;
+                packed |= (shifted & 0x7F) << (li * 7);
+            }
+            packed
+        };
+
+        // Iterate all buckets, group entries by sig
+        let mut sig_groups: HashMap<(u32, u64), Vec<(u32, u32)>> = HashMap::new();
+        for bi in 0..(self.dim * self.dim) {
+            let entries = unsafe {
+                let idx_ptr = self.index.add(bi * 12);
+                let offset = u64::from_le_bytes(*(idx_ptr as *const [u8; 8])) as usize;
+                let count = u32::from_le_bytes(*(idx_ptr.add(8) as *const [u8; 4])) as usize;
+                if count == 0 { continue; }
+                let entry_ptr = self.data.add(offset * 8) as *const (u32, u32);
+                std::slice::from_raw_parts(entry_ptr, count)
+            };
             for &(xb, yb) in entries {
-                // Expand boundary to compute exact-lag autocorrelation
-                let mut x_vals = vec![0i8; n];
-                let mut y_vals = vec![0i8; n];
-                for i in 0..k {
-                    x_vals[i] = if (xb >> i) & 1 == 1 { 1 } else { -1 };
-                    x_vals[n - k + i] = if (xb >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                    y_vals[i] = if (yb >> i) & 1 == 1 { 1 } else { -1 };
-                    y_vals[n - k + i] = if (yb >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                }
-                let sig: Vec<i16> = sig_lag_pairs.iter().map(|pairs| {
-                    let mut acc = 0i32;
-                    for &(i, j) in pairs {
-                        acc += x_vals[i] as i32 * x_vals[j] as i32;
-                        acc += y_vals[i] as i32 * y_vals[j] as i32;
-                    }
-                    acc as i16
-                }).collect();
-                refined_groups.entry((*x_sum, *y_sum, sig))
-                    .or_default()
-                    .push((xb, yb));
+                let sig = compute_sig(xb, yb);
+                sig_groups.entry((bi as u32, sig)).or_default().push((xb, yb));
             }
         }
 
-        Some(Self { n, k, groups: refined_groups, exact_lags })
+        // Flatten into sorted_entries and build sig_index
+        let mut sorted = Vec::with_capacity(sig_groups.values().map(|v| v.len()).sum());
+        let mut sig_idx = HashMap::with_capacity(sig_groups.len());
+        for ((bi, sig), entries) in &sig_groups {
+            let start = sorted.len() as u32;
+            sorted.extend_from_slice(entries);
+            sig_idx.insert((*bi, *sig), (start, entries.len() as u32));
+        }
+        self.sig_index = sig_idx;
+        self.sorted_entries = sorted;
+    }
+
+    /// Get entries for a given (x_bnd_sum, y_bnd_sum) and exact-lag signature.
+    #[inline]
+    fn get_sig_bucket(&self, x_sum: i16, y_sum: i16, sig: u64) -> &[(u32, u32)] {
+        let xi = ((x_sum + 2 * self.k as i16) / 2) as usize;
+        let yi = ((y_sum + 2 * self.k as i16) / 2) as usize;
+        if xi >= self.dim || yi >= self.dim { return &[]; }
+        let bi = (xi * self.dim + yi) as u32;
+        if let Some(&(start, count)) = self.sig_index.get(&(bi, sig)) {
+            &self.sorted_entries[start as usize..(start + count) as usize]
+        } else {
+            &[]
+        }
     }
 
     /// Expand boundary bits into full sequence values at boundary positions.
@@ -2338,7 +2495,15 @@ impl XYBoundaryTable {
         }
         lag_filters.sort_by_key(|f| f.max_unknown);
         let targets: Vec<i32> = (0..n).map(|s| if s == 0 { 0 } else { -candidate.zw_autocorr[s] }).collect();
-        let required_sig: Vec<i16> = self.exact_lags.iter().map(|&s| targets[s] as i16).collect();
+        // Pack exact-lag targets into a sig u64 for sub-index lookup
+        let required_sig = {
+            let mut packed = 0u64;
+            for (li, &s) in self.exact_lags.iter().enumerate() {
+                let shifted = (targets[s] + 64) as u64;
+                packed |= (shifted & 0x7F) << (li * 7);
+            }
+            packed
+        };
 
         // Precompute GJ bit-checks: work directly on packed bits, no expansion needed
         struct GjBitCheck { a_is_x: bool, b_is_x: bool, a_bit: u32, b_bit: u32, need_xor: u32 }
@@ -2367,12 +2532,12 @@ impl XYBoundaryTable {
             for y_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
                 let y_mid = tuple.y - y_bnd_sum as i32;
                 if y_mid.abs() > middle_len as i32 || (y_mid + middle_len as i32) % 2 != 0 { continue; }
-                let key = (x_bnd_sum, y_bnd_sum, required_sig.clone());
-                let Some(entries) = self.groups.get(&key) else { continue; };
+                let entries = self.get_sig_bucket(x_bnd_sum, y_bnd_sum, required_sig);
+                if entries.is_empty() { continue; }
 
                 for &(x_bits, y_bits) in entries {
-                    // GJ filter: operate directly on packed bits (no expansion)
                     let mut ok = true;
+                    // GJ filter
                     for gc in &gj_checks {
                         let bit_a = if gc.a_is_x { (x_bits >> gc.a_bit) & 1 } else { (y_bits >> gc.a_bit) & 1 };
                         let bit_b = if gc.b_is_x { (x_bits >> gc.b_bit) & 1 } else { (y_bits >> gc.b_bit) & 1 };
@@ -2634,7 +2799,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     } else {
         match XYBoundaryTable::load(&table_path, problem.n) {
             Some(t) => {
-                if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {} groups)", table_path, t.n, t.k, t.groups.len()); }
+                if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {}×{} index)", table_path, t.n, t.k, t.dim, t.dim); }
                 Some(Arc::new(t))
             }
             None => {
