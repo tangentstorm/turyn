@@ -806,7 +806,7 @@ impl Solver {
     /// Single-pass: computes slack and finds propagation in one scan.
     /// Recompute a single term's state and update incremental counters.
     /// Returns the new state (0=DEAD, 1=MAYBE, 2=TRUE).
-    #[inline(never)]
+    #[inline(always)]
     fn update_quad_pb_term(&mut self, qi: u32, ti: usize) {
         let t = &self.quad_pb_constraints[qi as usize].terms[ti];
         let aa = self.assigns[t.var_a()];
@@ -837,7 +837,7 @@ impl Solver {
 
     /// Propagate a quadratic PB constraint using incremental counters.
     /// Single-pass: finds propagation and builds explanation in one fused scan.
-    #[inline(never)]
+    #[inline]
     fn propagate_quad_pb(&mut self, qi: u32) -> Option<Reason> {
         let qc = &self.quad_pb_constraints[qi as usize];
         let n = qc.num_terms as usize;
