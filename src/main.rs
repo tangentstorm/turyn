@@ -3190,9 +3190,11 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
     let phase_a_elapsed = phase_a_start.elapsed();
 
-    // Load XY boundary table (default: ./xy-table.bin)
+    // Load XY boundary table (default: ./xy-table.bin).
+    // Skip table for n < 12: the search space is tiny and boundary signature
+    // matching with k=6 covers the entire sequence, over-restricting Z/W pairing.
     let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table.bin".to_string());
-    let xy_table: Option<Arc<XYBoundaryTable>> = if cfg.no_table {
+    let xy_table: Option<Arc<XYBoundaryTable>> = if cfg.no_table || problem.n < 12 {
         None
     } else {
         match XYBoundaryTable::load(&table_path, problem.n) {
@@ -3210,6 +3212,15 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             }
         }
     };
+
+    // When no table is loaded, boundary signature matching is pointless —
+    // it only restricts Z/W pairing without benefit. Set boundary_k=0 so
+    // all sequences land in the same bucket (full Cartesian pairing).
+    let mut cfg = cfg.clone();
+    if xy_table.is_none() {
+        cfg.boundary_k = 0;
+    }
+    let cfg = cfg; // re-bind as immutable
 
     let workers = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(1).max(1);
@@ -3430,8 +3441,10 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let mut producer_done = false;
     loop {
         if found.load(AtomicOrdering::Relaxed) {
-            // Solution found — collect it
-            if let Ok(Some(sol)) = result_rx.try_recv() {
+            // Solution found — blocking recv to ensure we collect the result.
+            // The worker sets found=true then sends the result, so it's guaranteed
+            // to arrive (use recv() not try_recv() to avoid the race).
+            if let Ok(Some(sol)) = result_rx.recv() {
                 if verbose {
                     print_solution(&format!("TT({}) SOLUTION", problem.n),
                         &sol.0, &sol.1, &sol.2, &sol.3);
@@ -4540,5 +4553,54 @@ mod tests {
         let result = solver.solve();
         eprintln!("Result: {:?}, conflicts: {}", result, solver.num_conflicts());
         assert_eq!(result, Some(true), "TT(14) manual encoding should be SAT for tuple (2,2,-6,1)");
+    }
+
+    #[test]
+    fn sat_solves_tt2() {
+        // TT(2): Z=[+1,+1], W=[+1], tuple=(0,0,2,1)
+        // Expected: X=[+1,-1], Y=[+1,-1]
+        let p = Problem::new(2);
+        let tuple = SumTuple { x: 0, y: 0, z: 2, w: 1 };
+        let z = PackedSeq::from_values(&[1, 1]);
+        let w = PackedSeq::from_values(&[1]);
+        let mut zw = vec![0i32; p.n];
+        for s in 1..p.n {
+            let nz = z.autocorrelation(s);
+            let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
+            zw[s] = 2 * nz + 2 * nw;
+        }
+        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr: zw, max_pair_power: 0.0 };
+        let template = SatXYTemplate::build(p, tuple);
+        assert!(template.is_some(), "Template should build for n=2");
+        let result = template.unwrap().solve_for(&candidate);
+        assert!(result.is_some(), "SAT should find X,Y for TT(2)");
+        let (x, y) = result.unwrap();
+        assert!(verify_tt(p, &x, &y, &z, &w), "Solution should verify");
+    }
+
+    #[test]
+    fn sat_solves_tt6_known_zw() {
+        // Known TT(6) solution: Z=[-1,-1,1,-1,1,1], W=[-1,1,1,1,-1]
+        // Negated to match root_one: Z=[1,1,-1,1,-1,-1], W=[1,-1,-1,-1,1]
+        let p = Problem::new(6);
+        let z = PackedSeq::from_values(&[1, 1, -1, 1, -1, -1]);
+        let w = PackedSeq::from_values(&[1, -1, -1, -1, 1]);
+        let z_sum: i32 = [1, 1, -1, 1, -1, -1].iter().sum();
+        let w_sum: i32 = [1, -1, -1, -1, 1].iter().sum();
+        let tuple = SumTuple { x: 0, y: 0, z: z_sum, w: w_sum };
+        // Check tuple is valid
+        assert_eq!(tuple.x*tuple.x + tuple.y*tuple.y + 2*tuple.z*tuple.z + 2*tuple.w*tuple.w,
+                   p.target_energy(), "Tuple should satisfy energy equation");
+        let mut zw = vec![0i32; p.n];
+        for s in 1..p.n {
+            let nz = z.autocorrelation(s);
+            let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
+            zw[s] = 2 * nz + 2 * nw;
+        }
+        let candidate = CandidateZW { z, w, zw_autocorr: zw, max_pair_power: 0.0 };
+        let template = SatXYTemplate::build(p, tuple);
+        assert!(template.is_some(), "Template should build for n=6 tuple {:?}", tuple);
+        let result = template.unwrap().solve_for(&candidate);
+        assert!(result.is_some(), "SAT should find X,Y for known TT(6) Z,W pair");
     }
 }
