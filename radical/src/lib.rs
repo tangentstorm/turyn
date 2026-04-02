@@ -157,7 +157,7 @@ pub struct Solver {
     // Quadratic PB constraints
     quad_pb_constraints: Vec<QuadPbConstraint>,
     quad_pb_var_watches: Vec<Vec<u32>>,       // quad_pb_var_watches[var] = list of constraint indices
-    quad_pb_var_terms: Vec<Vec<(u32, u16)>>,
+    quad_pb_var_terms: Vec<Vec<(u32, u16, bool)>>,  // (constraint_idx, term_idx, is_var_a)
     // Stored explanations: captured at propagation time, used during analysis.
     // Indexed by variable. Cleared on backtrack.
     quad_pb_reasons: Vec<Option<Vec<Lit>>>,
@@ -371,13 +371,12 @@ impl Solver {
         // Watch by variable + build term index
         let mut watched = std::collections::HashSet::new();
         for i in 0..lits_a.len() {
-            for &lit in &[lits_a[i], lits_b[i]] {
-                let v = var_of(lit);
-                if watched.insert(v) {
-                    self.quad_pb_var_watches[v].push(qi);
-                }
-                self.quad_pb_var_terms[v].push((qi, i as u16));
-            }
+            let va = var_of(lits_a[i]);
+            let vb = var_of(lits_b[i]);
+            if watched.insert(va) { self.quad_pb_var_watches[va].push(qi); }
+            if watched.insert(vb) { self.quad_pb_var_watches[vb].push(qi); }
+            self.quad_pb_var_terms[va].push((qi, i as u16, true));   // is_var_a = true
+            self.quad_pb_var_terms[vb].push((qi, i as u16, false));  // is_var_a = false
         }
 
         let terms: Vec<QuadPbTerm> = (0..lits_a.len()).map(|i| {
@@ -644,10 +643,11 @@ impl Solver {
             // Quadratic PB: incremental update + propagation
             if !self.quad_pb_constraints.is_empty() {
                 let v = var_of(lit);
+                let known_val = self.assigns[v]; // just assigned, hot in cache
                 // Update term states for all terms involving this variable
                 for idx in 0..self.quad_pb_var_terms[v].len() {
-                    let (qi, ti) = self.quad_pb_var_terms[v][idx];
-                    self.update_quad_pb_term(qi, ti as usize);
+                    let (qi, ti, is_a) = self.quad_pb_var_terms[v][idx];
+                    self.update_quad_pb_term_hint(qi, ti as usize, known_val, is_a);
                 }
                 // Propagate constraints watching this variable
                 for idx in 0..self.quad_pb_var_watches[v].len() {
@@ -802,15 +802,18 @@ impl Solver {
         clause
     }
 
-    /// Propagate a quadratic PB constraint: sum(coeffs[i] * a_i * b_i) = target.
-    /// Single-pass: computes slack and finds propagation in one scan.
-    /// Recompute a single term's state and update incremental counters.
-    /// Returns the new state (0=DEAD, 1=MAYBE, 2=TRUE).
+    /// Update a single quad PB term's state with a hint: the caller knows the
+    /// value of one variable (is_a=true → var_a's value, is_a=false → var_b's value).
+    /// This avoids one random assigns[] lookup per call (the 40% hotspot).
     #[inline(always)]
-    fn update_quad_pb_term(&mut self, qi: u32, ti: usize) {
+    fn update_quad_pb_term_hint(&mut self, qi: u32, ti: usize, known_val: LBool, is_a: bool) {
         let t = &self.quad_pb_constraints[qi as usize].terms[ti];
-        let aa = self.assigns[t.var_a()];
-        let ab = self.assigns[t.var_b()];
+        // Only look up the *other* variable's assignment
+        let (aa, ab) = if is_a {
+            (known_val, self.assigns[t.var_b()])
+        } else {
+            (self.assigns[t.var_a()], known_val)
+        };
 
         let new_state = if aa == LBool::Undef {
             if ab == LBool::Undef { 1u8 }
@@ -1114,8 +1117,8 @@ impl Solver {
             // Skip for level 0 when caller manages state externally (table path).
             if !(level == 0 && self.skip_backtrack_quad_pb) {
                 for idx in 0..self.quad_pb_var_terms[v].len() {
-                    let (qi, ti) = self.quad_pb_var_terms[v][idx];
-                    self.update_quad_pb_term(qi, ti as usize);
+                    let (qi, ti, is_a) = self.quad_pb_var_terms[v][idx];
+                    self.update_quad_pb_term_hint(qi, ti as usize, LBool::Undef, is_a);
                 }
             }
             self.heap_insert(v);
