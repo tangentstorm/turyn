@@ -75,19 +75,51 @@ struct PbConstraint {
 /// lits are undef or one is true → force a false assignment to prevent exceeding.
 /// Per-term data for a quadratic PB constraint, packed into a single struct
 /// for cache-friendly access and cheap cloning (one Vec instead of ten).
+/// State lookup table for quad PB terms. Indexed by:
+///   aa * 12 + ab * 4 + tv_offset
+/// where aa/ab are LBool as u8 (Undef=0, True=1, False=2) and
+/// tv_offset encodes the true_val pair (0-3).
+/// Returns: 0=DEAD, 1=MAYBE, 2=TRUE.
+static QPB_STATE_TABLE: [u8; 36] = [
+    // aa=Undef(0), ab=Undef(0): always MAYBE
+    1, 1, 1, 1,
+    // aa=Undef(0), ab=True(1): MAYBE if mb, DEAD if !mb
+    //   tv=(T,T)→mb=1→M, tv=(T,F)→mb=0→D, tv=(F,T)→mb=1→M, tv=(F,F)→mb=0→D
+    1, 0, 1, 0,
+    // aa=Undef(0), ab=False(2): MAYBE if mb, DEAD if !mb
+    //   tv=(T,T)→mb=0→D, tv=(T,F)→mb=1→M, tv=(F,T)→mb=0→D, tv=(F,F)→mb=1→M
+    0, 1, 0, 1,
+    // aa=True(1), ab=Undef(0): MAYBE if ma, DEAD if !ma
+    //   tv=(T,*)→ma=1→M, tv=(F,*)→ma=0→D
+    1, 1, 0, 0,
+    // aa=True(1), ab=True(1): TRUE if ma&&mb, else DEAD
+    2, 0, 0, 0,
+    // aa=True(1), ab=False(2)
+    0, 2, 0, 0,
+    // aa=False(2), ab=Undef(0)
+    0, 0, 1, 1,
+    // aa=False(2), ab=True(1)
+    0, 0, 2, 0,
+    // aa=False(2), ab=False(2)
+    0, 0, 0, 2,
+];
+
 #[derive(Clone, Copy, Debug)]
 struct QuadPbTerm {
     lit_a: Lit,
     lit_b: Lit,
-    coeff: u32,
+    coeff: u16,
+    var_a: u16,     // cached var_of(lit_a) as u16
+    var_b: u16,     // cached var_of(lit_b) as u16
     state: u8,      // 0=DEAD, 1=MAYBE, 2=TRUE
+    tv_offset: u8,  // precomputed: (if lit_a < 0 { 2 } else { 0 }) + (if lit_b < 0 { 1 } else { 0 })
 }
 
 impl QuadPbTerm {
     #[inline(always)]
-    fn var_a(&self) -> usize { var_of(self.lit_a) }
+    fn var_a(&self) -> usize { self.var_a as usize }
     #[inline(always)]
-    fn var_b(&self) -> usize { var_of(self.lit_b) }
+    fn var_b(&self) -> usize { self.var_b as usize }
     #[inline(always)]
     fn true_val_a(&self) -> LBool { if self.lit_a > 0 { LBool::True } else { LBool::False } }
     #[inline(always)]
@@ -96,6 +128,11 @@ impl QuadPbTerm {
     fn neg_a(&self) -> bool { self.lit_a < 0 }
     #[inline(always)]
     fn neg_b(&self) -> bool { self.lit_b < 0 }
+    /// Compute state from two LBool assignments using branchless table lookup.
+    #[inline(always)]
+    fn compute_state(&self, aa: LBool, ab: LBool) -> u8 {
+        QPB_STATE_TABLE[(aa as u8 as usize) * 12 + (ab as u8 as usize) * 4 + self.tv_offset as usize]
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -383,8 +420,11 @@ impl Solver {
             QuadPbTerm {
                 lit_a: lits_a[i],
                 lit_b: lits_b[i],
-                coeff: coeffs[i],
+                coeff: coeffs[i] as u16,
+                var_a: var_of(lits_a[i]) as u16,
+                var_b: var_of(lits_b[i]) as u16,
                 state: 1, // MAYBE
+                tv_offset: (if lits_a[i] < 0 { 2u8 } else { 0 }) + (if lits_b[i] < 0 { 1 } else { 0 }),
             }
         }).collect();
         self.quad_pb_constraints.push(QuadPbConstraint {
@@ -815,16 +855,7 @@ impl Solver {
             (self.assigns[t.var_a()], known_val)
         };
 
-        let new_state = if aa == LBool::Undef {
-            if ab == LBool::Undef { 1u8 }
-            else if ab != t.true_val_b() { 0u8 }
-            else { 1u8 }
-        } else if ab == LBool::Undef {
-            if aa != t.true_val_a() { 0u8 }
-            else { 1u8 }
-        } else {
-            if (aa != t.true_val_a()) | (ab != t.true_val_b()) { 0u8 } else { 2u8 }
-        };
+        let new_state = t.compute_state(aa, ab);
 
         let qc = &mut self.quad_pb_constraints[qi as usize];
         let old_state = qc.terms[ti].state;
