@@ -2320,19 +2320,40 @@ impl XYBoundaryTable {
             qpb_term_info.push(infos);
         }
 
-        // Autocorrelation filter setup
-        struct LagFilter { s: usize, pairs: Vec<(usize, usize)>, max_unknown: i32 }
+        // Autocorrelation filter setup with precomputed bit positions
+        let pos_to_bit = |pos: usize| -> u32 {
+            if pos < k { pos as u32 } else { (k + pos - (n - k)) as u32 }
+        };
+        struct LagFilter { s: usize, pairs: Vec<(usize, usize)>, max_unknown: i32, num_bnd_pairs: i32 }
         let mut lag_filters: Vec<LagFilter> = Vec::new();
         for s in 1..n {
             let mut pairs = Vec::new(); let mut unk = 0i32;
             for i in 0..n-s {
                 if is_bnd(i) && is_bnd(i+s) { pairs.push((i, i+s)); } else { unk += 2; }
             }
-            if !pairs.is_empty() && unk > 0 { lag_filters.push(LagFilter { s, pairs, max_unknown: unk }); }
+            if !pairs.is_empty() && unk > 0 {
+                let num_bnd = 2 * pairs.len() as i32;
+                lag_filters.push(LagFilter { s, pairs, max_unknown: unk, num_bnd_pairs: num_bnd });
+            }
         }
         lag_filters.sort_by_key(|f| f.max_unknown);
         let targets: Vec<i32> = (0..n).map(|s| if s == 0 { 0 } else { -candidate.zw_autocorr[s] }).collect();
         let required_sig: Vec<i16> = self.exact_lags.iter().map(|&s| targets[s] as i16).collect();
+
+        // Precompute GJ bit-checks: work directly on packed bits, no expansion needed
+        struct GjBitCheck { a_is_x: bool, b_is_x: bool, a_bit: u32, b_bit: u32, need_xor: u32 }
+        let mut gj_checks: Vec<GjBitCheck> = Vec::new();
+        for &(a, b, equal) in &equalities {
+            let va = (a.unsigned_abs() as usize) - 1;
+            let vb = (b.unsigned_abs() as usize) - 1;
+            let pa = va % n; let pb = vb % n;
+            if !is_bnd(pa) || !is_bnd(pb) { continue; }
+            gj_checks.push(GjBitCheck {
+                a_is_x: va < n, b_is_x: vb < n,
+                a_bit: pos_to_bit(pa), b_bit: pos_to_bit(pb),
+                need_xor: (a < 0) as u32 ^ (b < 0) as u32 ^ (!equal) as u32,
+            });
+        }
 
         // Pre-allocate buffers for term state injection
         let max_terms = qpb_term_info.iter().map(|v| v.len()).max().unwrap_or(0);
@@ -2350,6 +2371,29 @@ impl XYBoundaryTable {
                 let Some(entries) = self.groups.get(&key) else { continue; };
 
                 for &(x_bits, y_bits) in entries {
+                    // GJ filter: operate directly on packed bits (no expansion)
+                    let mut ok = true;
+                    for gc in &gj_checks {
+                        let bit_a = if gc.a_is_x { (x_bits >> gc.a_bit) & 1 } else { (y_bits >> gc.a_bit) & 1 };
+                        let bit_b = if gc.b_is_x { (x_bits >> gc.b_bit) & 1 } else { (y_bits >> gc.b_bit) & 1 };
+                        if (bit_a ^ bit_b) != gc.need_xor { ok = false; break; }
+                    }
+                    if !ok { continue; }
+                    // Autocorrelation filter: bit extraction + XOR per pair
+                    for lf in &lag_filters {
+                        let mut disagree = 0u32;
+                        for &(i, j) in &lf.pairs {
+                            let bi = pos_to_bit(i);
+                            let bj = pos_to_bit(j);
+                            disagree += ((x_bits >> bi) ^ (x_bits >> bj)) & 1;
+                            disagree += ((y_bits >> bi) ^ (y_bits >> bj)) & 1;
+                        }
+                        let kn = lf.num_bnd_pairs - 2 * disagree as i32;
+                        if (targets[lf.s] - kn).abs() > lf.max_unknown { ok = false; break; }
+                    }
+                    if !ok { continue; }
+
+                    // Expand bits only for entries passing all filters
                     let mut xv = [0i8; 64]; let mut yv = [0i8; 64];
                     for i in 0..k {
                         xv[i] = if (x_bits >> i) & 1 == 1 { 1 } else { -1 };
@@ -2357,29 +2401,8 @@ impl XYBoundaryTable {
                         yv[i] = if (y_bits >> i) & 1 == 1 { 1 } else { -1 };
                         yv[n-k+i] = if (y_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
                     }
-                    // GJ filter
-                    let mut ok = true;
-                    for &(a, b, equal) in &equalities {
-                        let va = (a as usize)-1; let vb = (b as usize)-1;
-                        let pa = va % n; let pb = vb % n;
-                        if !is_bnd(pa) || !is_bnd(pb) { continue; }
-                        let a_val = if va < n { xv[pa] } else { yv[pa] };
-                        let b_val = if vb < n { xv[pb] } else { yv[pb] };
-                        if equal { if a_val != b_val { ok = false; break; } }
-                        else { if a_val != -b_val { ok = false; break; } }
-                    }
-                    if !ok { continue; }
-                    // Autocorrelation filter
-                    for lf in &lag_filters {
-                        let mut kn = 0i32;
-                        for &(i, j) in &lf.pairs { kn += xv[i] as i32 * xv[j] as i32 + yv[i] as i32 * yv[j] as i32; }
-                        if (targets[lf.s] - kn).abs() > lf.max_unknown { ok = false; break; }
-                    }
-                    if !ok { continue; }
-
-                    // Build boundary value lookup: assigns[var] for boundary vars
-                    // var 0..n-1 = X positions, n..2n-1 = Y positions
-                    let mut bnd_vals = [0i8; 128]; // assigns for boundary vars
+                    // Build boundary value lookup
+                    let mut bnd_vals = [0i8; 128];
                     for i in 0..k { bnd_vals[i] = xv[i]; bnd_vals[n-k+i] = xv[n-k+i]; }
                     for i in 0..k { bnd_vals[n+i] = yv[i]; bnd_vals[n+n-k+i] = yv[n-k+i]; }
 
