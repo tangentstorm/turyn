@@ -73,23 +73,27 @@ struct PbConstraint {
 /// lit is true and the other undef → force the undef lit true.
 /// When lower_slack < coeff[i] for a potentially-true term where both
 /// lits are undef or one is true → force a false assignment to prevent exceeding.
+/// Per-term data for a quadratic PB constraint, packed into a single struct
+/// for cache-friendly access and cheap cloning (one Vec instead of ten).
+#[derive(Clone, Copy, Debug)]
+struct QuadPbTerm {
+    lit_a: Lit,
+    lit_b: Lit,
+    var_a: u32,     // variable index (was usize, but u32 is sufficient and saves space)
+    var_b: u32,
+    coeff: u32,
+    true_val_a: LBool,  // the LBool value that means "literal a is true"
+    true_val_b: LBool,
+    neg_a: bool,
+    neg_b: bool,
+    state: u8,      // 0=DEAD, 1=MAYBE, 2=TRUE
+}
+
 #[derive(Clone, Debug)]
 struct QuadPbConstraint {
-    lits_a: Vec<Lit>,
-    lits_b: Vec<Lit>,
-    coeffs: Vec<u32>,
+    terms: Vec<QuadPbTerm>,  // single Vec instead of 10 separate ones
     target: u32,
-    // Pre-computed variable indices and polarity for fast access
-    vars_a: Vec<usize>,
-    vars_b: Vec<usize>,
-    neg_a: Vec<bool>,
-    neg_b: Vec<bool>,
-    // Pre-encoded: the LBool value that means "literal is true"
-    true_val_a: Vec<LBool>,
-    true_val_b: Vec<LBool>,
     num_terms: u32,
-    // Incremental state per term: 0=DEAD, 1=MAYBE, 2=TRUE
-    term_state: Vec<u8>,
     sum_true: i32,
     sum_maybe: i32,
 }
@@ -362,23 +366,26 @@ impl Solver {
             }
         }
 
-        let vars_a: Vec<usize> = lits_a.iter().map(|&l| var_of(l)).collect();
-        let vars_b: Vec<usize> = lits_b.iter().map(|&l| var_of(l)).collect();
-        let neg_a: Vec<bool> = lits_a.iter().map(|&l| l < 0).collect();
-        let neg_b: Vec<bool> = lits_b.iter().map(|&l| l < 0).collect();
-        let true_val_a: Vec<LBool> = lits_a.iter().map(|&l| if l > 0 { LBool::True } else { LBool::False }).collect();
-        let true_val_b: Vec<LBool> = lits_b.iter().map(|&l| if l > 0 { LBool::True } else { LBool::False }).collect();
+        let terms: Vec<QuadPbTerm> = (0..lits_a.len()).map(|i| {
+            QuadPbTerm {
+                lit_a: lits_a[i],
+                lit_b: lits_b[i],
+                var_a: var_of(lits_a[i]) as u32,
+                var_b: var_of(lits_b[i]) as u32,
+                coeff: coeffs[i],
+                true_val_a: if lits_a[i] > 0 { LBool::True } else { LBool::False },
+                true_val_b: if lits_b[i] > 0 { LBool::True } else { LBool::False },
+                neg_a: lits_a[i] < 0,
+                neg_b: lits_b[i] < 0,
+                state: 1, // MAYBE
+            }
+        }).collect();
         self.quad_pb_constraints.push(QuadPbConstraint {
-            lits_a: lits_a.to_vec(),
-            lits_b: lits_b.to_vec(),
-            coeffs: coeffs.to_vec(),
             target,
-            vars_a, vars_b, neg_a, neg_b,
-            true_val_a, true_val_b,
-            num_terms: lits_a.len() as u32,
-            term_state: vec![1u8; lits_a.len()], // all MAYBE initially
+            num_terms: terms.len() as u32,
             sum_true: 0,
             sum_maybe: coeffs.iter().sum::<u32>() as i32,
+            terms,
         });
 
         // Initial propagation
@@ -470,7 +477,9 @@ impl Solver {
     /// Used for fast boundary config switching without backtracking.
     pub fn reset_quad_pb_state(&mut self, qi: usize, term_state: &[u8], sum_true: i32, sum_maybe: i32) {
         let qc = &mut self.quad_pb_constraints[qi];
-        qc.term_state[..term_state.len()].copy_from_slice(term_state);
+        for (i, &s) in term_state.iter().enumerate() {
+            qc.terms[i].state = s;
+        }
         qc.sum_true = sum_true;
         qc.sum_maybe = sum_maybe;
     }
@@ -483,8 +492,8 @@ impl Solver {
 
     /// Get quad PB term info for precomputation.
     pub fn quad_pb_term_info(&self, qi: usize, ti: usize) -> (usize, usize, bool, bool) {
-        let qc = &self.quad_pb_constraints[qi];
-        (qc.vars_a[ti], qc.vars_b[ti], qc.neg_a[ti], qc.neg_b[ti])
+        let t = &self.quad_pb_constraints[qi].terms[ti];
+        (t.var_a as usize, t.var_b as usize, t.neg_a, t.neg_b)
     }
 
     /// Full reset to base state: unassign all variables, clear trail, reset conflicts.
@@ -791,37 +800,31 @@ impl Solver {
     /// Returns the new state (0=DEAD, 1=MAYBE, 2=TRUE).
     #[inline(never)]
     fn update_quad_pb_term(&mut self, qi: u32, ti: usize) {
-        let qc = &self.quad_pb_constraints[qi as usize];
-        let aa = self.assigns[qc.vars_a[ti]];
-        let ab = self.assigns[qc.vars_b[ti]];
+        let t = &self.quad_pb_constraints[qi as usize].terms[ti];
+        let aa = self.assigns[t.var_a as usize];
+        let ab = self.assigns[t.var_b as usize];
 
-        // Fast path: if either variable is Undef, state is MAYBE (1)
-        // unless the other is assigned-false (then DEAD). But if both
-        // are Undef, definitely MAYBE — skip the full evaluation.
         let new_state = if aa == LBool::Undef {
             if ab == LBool::Undef { 1u8 }
-            else if ab != qc.true_val_b[ti] { 0u8 } // b is false → DEAD
-            else { 1u8 } // b is true but a is undef → MAYBE
+            else if ab != t.true_val_b { 0u8 }
+            else { 1u8 }
         } else if ab == LBool::Undef {
-            if aa != qc.true_val_a[ti] { 0u8 } // a is false → DEAD
-            else { 1u8 } // a is true but b is undef → MAYBE
+            if aa != t.true_val_a { 0u8 }
+            else { 1u8 }
         } else {
-            // Both assigned
-            let a_false = aa != qc.true_val_a[ti];
-            let b_false = ab != qc.true_val_b[ti];
-            if a_false | b_false { 0u8 } else { 2u8 }
+            if (aa != t.true_val_a) | (ab != t.true_val_b) { 0u8 } else { 2u8 }
         };
 
         let qc = &mut self.quad_pb_constraints[qi as usize];
-        let old_state = qc.term_state[ti];
+        let old_state = qc.terms[ti].state;
         if old_state == new_state { return; }
 
-        let c = qc.coeffs[ti] as i32;
+        let c = qc.terms[ti].coeff as i32;
         if old_state == 1 { qc.sum_maybe -= c; }
         else if old_state == 2 { qc.sum_true -= c; }
         if new_state == 1 { qc.sum_maybe += c; }
         else if new_state == 2 { qc.sum_true += c; }
-        qc.term_state[ti] = new_state;
+        qc.terms[ti].state = new_state;
     }
 
     /// Propagate a quadratic PB constraint using incremental counters.
@@ -842,19 +845,19 @@ impl Solver {
         if slack_up > 0 && slack_down > 0 { return None; }
 
         for i in 0..n {
-            let qc = &self.quad_pb_constraints[qi as usize];
-            let aa = self.assigns[qc.vars_a[i]];
-            let ab = self.assigns[qc.vars_b[i]];
-            let a_false = aa != LBool::Undef && aa != qc.true_val_a[i];
-            let b_false = ab != LBool::Undef && ab != qc.true_val_b[i];
+            let t = &self.quad_pb_constraints[qi as usize].terms[i];
+            let aa = self.assigns[t.var_a as usize];
+            let ab = self.assigns[t.var_b as usize];
+            let a_false = aa != LBool::Undef && aa != t.true_val_a;
+            let b_false = ab != LBool::Undef && ab != t.true_val_b;
             if a_false | b_false { continue; }
             let a_undef = aa == LBool::Undef;
             let b_undef = ab == LBool::Undef;
             if !a_undef && !b_undef { continue; }
 
-            let c = qc.coeffs[i] as i64;
-            let la = qc.lits_a[i];
-            let lb = qc.lits_b[i];
+            let c = t.coeff as i64;
+            let la = t.lit_a;
+            let lb = t.lit_b;
             let propagated_lit;
             if c > slack_up {
                 propagated_lit = if !a_undef { lb } else { la };
@@ -864,32 +867,28 @@ impl Solver {
                 else { continue; }
             } else { continue; }
 
-            // Compute explanation NOW (state is correct) and store it.
-            // Include all false literals that explain why this propagation happened.
             let pv = var_of(propagated_lit);
             let is_upper = c > slack_down;
             let mut explanation = Vec::new();
             {
-                let qc = &self.quad_pb_constraints[qi as usize];
+                let terms = &self.quad_pb_constraints[qi as usize].terms;
                 let mut seen_v = vec![false; self.num_vars];
-                for j in 0..qc.lits_a.len() {
-                    let la_j = qc.lits_a[j];
-                    let lb_j = qc.lits_b[j];
-                    let va = qc.vars_a[j];
-                    let vb = qc.vars_b[j];
+                for t in terms {
+                    let va = t.var_a as usize;
+                    let vb = t.var_b as usize;
                     let aa = self.assigns[va];
                     let ab = self.assigns[vb];
-                    let a_false = (aa == LBool::True && qc.neg_a[j]) || (aa == LBool::False && !qc.neg_a[j]);
-                    let b_false = (ab == LBool::True && qc.neg_b[j]) || (ab == LBool::False && !qc.neg_b[j]);
+                    let a_false = (aa == LBool::True && t.neg_a) || (aa == LBool::False && !t.neg_a);
+                    let b_false = (ab == LBool::True && t.neg_b) || (ab == LBool::False && !t.neg_b);
 
                     if a_false || b_false {
-                        let (lit, v) = if a_false { (la_j, va) } else { (lb_j, vb) };
+                        let (lit, v) = if a_false { (t.lit_a, va) } else { (t.lit_b, vb) };
                         if v != pv && !seen_v[v] && self.level[v] > 0 {
                             seen_v[v] = true;
                             explanation.push(lit);
                         }
                     } else if is_upper && aa != LBool::Undef && ab != LBool::Undef {
-                        for &(lit, v) in &[(la_j, va), (lb_j, vb)] {
+                        for &(lit, v) in &[(t.lit_a, va), (t.lit_b, vb)] {
                             if v != pv && !seen_v[v] && self.level[v] > 0 {
                                 seen_v[v] = true;
                                 explanation.push(negate(lit));
@@ -950,11 +949,11 @@ impl Solver {
                         lits
                     } else {
                         // Conflict: compute from current state (haven't backtracked yet)
-                        let qc = &self.quad_pb_constraints[qi as usize];
+                        let terms = &self.quad_pb_constraints[qi as usize].terms;
                         let mut lits = Vec::new();
                         let mut seen_v = vec![false; self.num_vars];
-                        for i in 0..qc.lits_a.len() {
-                            for &(lit, v) in &[(qc.lits_a[i], qc.vars_a[i]), (qc.lits_b[i], qc.vars_b[i])] {
+                        for t in terms {
+                            for &(lit, v) in &[(t.lit_a, t.var_a as usize), (t.lit_b, t.var_b as usize)] {
                                 if !seen_v[v] && self.assigns[v] != LBool::Undef && self.level[v] > 0 {
                                     seen_v[v] = true;
                                     lits.push(if self.lit_value(lit) == LBool::False { lit } else { negate(lit) });
@@ -1105,10 +1104,10 @@ impl Solver {
         // batch-reset all quad PB constraints (all vars Undef → all terms MAYBE).
         if level == 0 && self.skip_backtrack_quad_pb && !self.quad_pb_constraints.is_empty() {
             for qc in &mut self.quad_pb_constraints {
-                let total: i32 = qc.coeffs.iter().map(|&c| c as i32).sum();
+                let total: i32 = qc.terms.iter().map(|t| t.coeff as i32).sum();
                 qc.sum_true = 0;
                 qc.sum_maybe = total;
-                for s in qc.term_state.iter_mut() { *s = 1; } // all MAYBE
+                for t in qc.terms.iter_mut() { t.state = 1; } // all MAYBE
             }
         }
     }
