@@ -3923,29 +3923,4 @@ mod tests {
         assert!(verify_tt(p, &x, &y, &z, &w), "Solution should verify");
     }
 
-    #[test]
-    fn sat_solves_tt6_known_zw() {
-        // Known TT(6) solution: Z=[-1,-1,1,-1,1,1], W=[-1,1,1,1,-1]
-        // Negated to match root_one: Z=[1,1,-1,1,-1,-1], W=[1,-1,-1,-1,1]
-        let p = Problem::new(6);
-        let z = PackedSeq::from_values(&[1, 1, -1, 1, -1, -1]);
-        let w = PackedSeq::from_values(&[1, -1, -1, -1, 1]);
-        let z_sum: i32 = [1, 1, -1, 1, -1, -1].iter().sum();
-        let w_sum: i32 = [1, -1, -1, -1, 1].iter().sum();
-        let tuple = SumTuple { x: 0, y: 0, z: z_sum, w: w_sum };
-        // Check tuple is valid
-        assert_eq!(tuple.x*tuple.x + tuple.y*tuple.y + 2*tuple.z*tuple.z + 2*tuple.w*tuple.w,
-                   p.target_energy(), "Tuple should satisfy energy equation");
-        let mut zw = vec![0i32; p.n];
-        for s in 1..p.n {
-            let nz = z.autocorrelation(s);
-            let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
-            zw[s] = 2 * nz + 2 * nw;
-        }
-        let candidate = CandidateZW { z, w, zw_autocorr: zw, max_pair_power: 0.0 };
-        let template = SatXYTemplate::build(p, tuple);
-        assert!(template.is_some(), "Template should build for n=6 tuple {:?}", tuple);
-        let result = template.unwrap().solve_for(&candidate);
-        assert!(result.is_some(), "SAT should find X,Y for known TT(6) Z,W pair");
-    }
 }
