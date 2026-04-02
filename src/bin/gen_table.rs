@@ -95,28 +95,57 @@ fn main() {
         xy_groups.entry(sig).or_default().push((xb, yb));
     }
 
-    // Assign signature IDs and build flat data
+    // Assign signature IDs and build flat data, sorted by (x_sum, y_sum) within each sig.
+    // Also build a per-sig sub-index: for each (x_sum_idx, y_sum_idx) within the sig,
+    // store the (offset_within_sig, count) so runtime can jump to matching entries.
     let num_sigs = xy_groups.len();
-    eprintln!("  {} distinct signatures", num_sigs);
+    let sum_dim = 2 * k + 1; // distinct sum values per axis
+    let sub_idx_per_sig = sum_dim * sum_dim; // (x_sum_idx, y_sum_idx) buckets
+    eprintln!("  {} distinct signatures, {} sum sub-buckets per sig", num_sigs, sub_idx_per_sig);
 
     let mut sig_to_id: HashMap<Vec<i16>, u32> = HashMap::new();
     let mut sig_offsets: Vec<u32> = Vec::with_capacity(num_sigs);
     let mut sig_counts: Vec<u32> = Vec::with_capacity(num_sigs);
     let mut xy_data: Vec<(u32, u32)> = Vec::new();
+    // Per-sig sub-index: flattened [num_sigs * sub_idx_per_sig] of (offset_within_sig: u32, count: u16)
+    // Packed as u64: offset in low 32, count in high 16, to save space.
+    // Actually just use (u32, u32) for simplicity.
+    let mut sub_index: Vec<(u32, u32)> = Vec::with_capacity(num_sigs * sub_idx_per_sig);
 
-    // Sort signatures for deterministic output
+    let sum_to_idx = |sum: i32| -> usize { ((sum + 2 * k as i32) / 2) as usize };
+
     let mut sorted_sigs: Vec<Vec<i16>> = xy_groups.keys().cloned().collect();
     sorted_sigs.sort();
     for sig in &sorted_sigs {
         let entries = &xy_groups[sig];
         let id = sig_to_id.len() as u32;
         sig_to_id.insert(sig.clone(), id);
-        sig_offsets.push(xy_data.len() as u32);
+        let sig_start = xy_data.len() as u32;
+        sig_offsets.push(sig_start);
         sig_counts.push(entries.len() as u32);
-        xy_data.extend_from_slice(entries);
+
+        // Group entries by (x_sum, y_sum)
+        let mut sum_buckets: Vec<Vec<(u32, u32)>> = vec![Vec::new(); sub_idx_per_sig];
+        for &(xb, yb) in entries {
+            let xs = (2 * xb.count_ones() as i32) - (2 * k) as i32;
+            let ys = (2 * yb.count_ones() as i32) - (2 * k) as i32;
+            let bi = sum_to_idx(xs) * sum_dim + sum_to_idx(ys);
+            sum_buckets[bi].push((xb, yb));
+        }
+
+        // Write entries sorted by sum bucket, build sub-index
+        let mut within_offset = 0u32;
+        for bi in 0..sub_idx_per_sig {
+            let count = sum_buckets[bi].len() as u32;
+            sub_index.push((within_offset, count));
+            xy_data.extend_from_slice(&sum_buckets[bi]);
+            within_offset += count;
+        }
     }
     let total_xy = xy_data.len();
+    let sub_index_size = sub_index.len() * 8;
     eprintln!("  Total unique X/Y entries: {} ({:.1} MB)", total_xy, total_xy as f64 * 8.0 / 1_048_576.0);
+    eprintln!("  Sub-index: {} entries ({:.1} MB)", sub_index.len(), sub_index_size as f64 / 1_048_576.0);
 
     // Phase 2: Map each Z/W config to a signature ID
     eprintln!("Phase 2: mapping Z/W configs to signatures...");
@@ -159,26 +188,24 @@ fn main() {
     eprintln!("  Non-empty Z/W slots: {}/{}", nonempty, total_zw_index);
 
     // Write file
-    let header_size = 24usize;
+    let header_size = 28usize; // added sum_dim field
     let zw_index_size = total_zw_index * 4;
     let sig_dir_size = num_sigs * 8;
+    let sub_idx_size = sub_index.len() * 8;
     let xy_data_size = total_xy * 8;
-    let total_size = header_size + zw_index_size + sig_dir_size + xy_data_size;
-    eprintln!("Writing: {:.1} MB total (index={:.1}MB, sigs={:.1}KB, data={:.1}MB)",
-        total_size as f64 / 1_048_576.0,
-        zw_index_size as f64 / 1_048_576.0,
-        sig_dir_size as f64 / 1024.0,
-        xy_data_size as f64 / 1_048_576.0);
+    let total_size = header_size + zw_index_size + sig_dir_size + sub_idx_size + xy_data_size;
+    eprintln!("Writing: {:.1} MB total", total_size as f64 / 1_048_576.0);
 
     let mut f = std::fs::File::create(outfile).expect("Failed to create file");
 
     // Header
     f.write_all(b"XYTT").unwrap();
-    f.write_all(&4u32.to_le_bytes()).unwrap(); // version 4
+    f.write_all(&4u32.to_le_bytes()).unwrap();
     f.write_all(&(n as u32).to_le_bytes()).unwrap();
     f.write_all(&(k as u32).to_le_bytes()).unwrap();
     f.write_all(&(total_zw_index as u32).to_le_bytes()).unwrap();
     f.write_all(&(num_sigs as u32).to_le_bytes()).unwrap();
+    f.write_all(&(sum_dim as u32).to_le_bytes()).unwrap();
 
     // ZW index: sig_id per slot
     for &id in &zw_index {
@@ -189,6 +216,12 @@ fn main() {
     for i in 0..num_sigs {
         f.write_all(&sig_offsets[i].to_le_bytes()).unwrap();
         f.write_all(&sig_counts[i].to_le_bytes()).unwrap();
+    }
+
+    // Sub-index: (offset_within_sig, count) per (sig, x_sum_idx, y_sum_idx)
+    for &(off, cnt) in &sub_index {
+        f.write_all(&off.to_le_bytes()).unwrap();
+        f.write_all(&cnt.to_le_bytes()).unwrap();
     }
 
     // XY data
