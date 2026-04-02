@@ -2159,10 +2159,11 @@ impl TableBacking {
 struct XYBoundaryTable {
     n: usize,
     k: usize,
-    x_dim: usize,        // 2^(2k) — number of index entries
+    zw_dim: usize,        // z_dim * w_dim — total index entries
+    w_dim: usize,         // 2^(2k) — W bits dimension
     _backing: TableBacking,
-    index: *const u8,     // x_dim entries of (offset_u64, count_u32)
-    data: *const u8,      // packed y_bits (u32), 4 bytes each
+    index: *const u8,     // zw_dim entries of (offset_u64, count_u32)
+    data: *const u8,      // packed (x_bits: u32, y_bits: u32) pairs, 8 bytes each
 }
 
 // Safety: the mmap data is immutable and the pointers are derived from it
@@ -2181,32 +2182,33 @@ impl XYBoundaryTable {
 
         let _table_n = u32::from_le_bytes(mmap[8..12].try_into().ok()?) as usize;
         let k = u32::from_le_bytes(mmap[12..16].try_into().ok()?) as usize;
-        let x_dim = u32::from_le_bytes(mmap[16..20].try_into().ok()?) as usize;
+        let zw_dim = u32::from_le_bytes(mmap[16..20].try_into().ok()?) as usize;
+        let w_dim = 1usize << (2 * k);
 
         if n < 2 * k { return None; }
 
         let index_start = 20;
-        let index_size = x_dim * 12;
+        let index_size = zw_dim * 12;
         let data_start = index_start + index_size;
         if mmap.len() < data_start { return None; }
 
         let index = mmap[index_start..].as_ptr();
         let data = mmap[data_start..].as_ptr();
 
-        Some(Self { n, k, x_dim, _backing: TableBacking::Mmap(mmap), index, data })
+        Some(Self { n, k, zw_dim, w_dim, _backing: TableBacking::Mmap(mmap), index, data })
     }
 
-    /// Get y_bits entries for a given x_bits value. Direct array index, O(1).
+    /// Get (x_bits, y_bits) pairs for a given Z/W boundary. Direct array index, O(1).
     #[inline]
-    fn get_y_entries(&self, x_bits: u32) -> &[u32] {
-        let xi = x_bits as usize;
-        if xi >= self.x_dim { return &[]; }
+    fn get_xy_entries(&self, z_bits: u32, w_bits: u32) -> &[(u32, u32)] {
+        let idx = z_bits as usize * self.w_dim + w_bits as usize;
+        if idx >= self.zw_dim { return &[]; }
         unsafe {
-            let idx_ptr = self.index.add(xi * 12);
+            let idx_ptr = self.index.add(idx * 12);
             let offset = u64::from_le_bytes(*(idx_ptr as *const [u8; 8])) as usize;
             let count = u32::from_le_bytes(*(idx_ptr.add(8) as *const [u8; 4])) as usize;
             if count == 0 { return &[]; }
-            let data_ptr = self.data.add(offset * 4) as *const u32;
+            let data_ptr = self.data.add(offset * 8) as *const (u32, u32);
             std::slice::from_raw_parts(data_ptr, count)
         }
     }
@@ -2232,6 +2234,7 @@ impl XYBoundaryTable {
         candidate: &CandidateZW, template: &SatXYTemplate,
     ) -> Option<(PackedSeq, PackedSeq)> {
         let n = problem.n;
+        let m = n - 1; // W length
         let k = self.k;
         let middle_len = n - 2 * k;
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
@@ -2273,110 +2276,50 @@ impl XYBoundaryTable {
             qpb_term_info.push(infos);
         }
 
-        // Autocorrelation filter setup with precomputed bit positions
-        let pos_to_bit = |pos: usize| -> u32 {
-            if pos < k { pos as u32 } else { (k + pos - (n - k)) as u32 }
-        };
-        struct LagFilter { s: usize, pairs: Vec<(usize, usize)>, max_unknown: i32, num_bnd_pairs: i32 }
-        let mut lag_filters: Vec<LagFilter> = Vec::new();
-        for s in 1..n {
-            let mut pairs = Vec::new(); let mut unk = 0i32;
-            for i in 0..n-s {
-                if is_bnd(i) && is_bnd(i+s) { pairs.push((i, i+s)); } else { unk += 2; }
-            }
-            if !pairs.is_empty() && unk > 0 {
-                let num_bnd = 2 * pairs.len() as i32;
-                lag_filters.push(LagFilter { s, pairs, max_unknown: unk, num_bnd_pairs: num_bnd });
-            }
-        }
-        lag_filters.sort_by_key(|f| f.max_unknown);
-        let targets: Vec<i32> = (0..n).map(|s| if s == 0 { 0 } else { -candidate.zw_autocorr[s] }).collect();
-
-        // Precompute GJ bit-checks for X-only and Y-only and cross constraints
-        struct GjBitCheck { a_is_x: bool, b_is_x: bool, a_bit: u32, b_bit: u32, need_xor: u32 }
-        let mut gj_x_only: Vec<GjBitCheck> = Vec::new(); // both vars in X
-        let mut gj_cross: Vec<GjBitCheck> = Vec::new();  // cross X/Y
-        for &(a, b, equal) in &equalities {
-            let va = (a.unsigned_abs() as usize) - 1;
-            let vb = (b.unsigned_abs() as usize) - 1;
-            let pa = va % n; let pb = vb % n;
-            if !is_bnd(pa) || !is_bnd(pb) { continue; }
-            let gc = GjBitCheck {
-                a_is_x: va < n, b_is_x: vb < n,
-                a_bit: pos_to_bit(pa), b_bit: pos_to_bit(pb),
-                need_xor: (a < 0) as u32 ^ (b < 0) as u32 ^ (!equal) as u32,
-            };
-            if gc.a_is_x && gc.b_is_x { gj_x_only.push(gc); }
-            else { gj_cross.push(gc); }
+        // Extract Z/W boundary bits from the candidate
+        let mut z_bits = 0u32;
+        let mut w_bits = 0u32;
+        for i in 0..k {
+            if candidate.z.get(i) == 1 { z_bits |= 1 << i; }
+            if candidate.z.get(n - k + i) == 1 { z_bits |= 1 << (k + i); }
+            if candidate.w.get(i) == 1 { w_bits |= 1 << i; }
+            if candidate.w.get(m - k + i) == 1 { w_bits |= 1 << (k + i); }
         }
 
-        // Precompute x-only autocorrelation filters (lags where ALL boundary pairs are x-x)
-        // and combined x+y filters
-        struct XLagFilter { s: usize, pairs: Vec<(u32, u32)>, max_unknown: i32, num_bnd_pairs: i32 }
-        let mut x_lag_filters: Vec<XLagFilter> = Vec::new();
-        for lf in &lag_filters {
-            let bit_pairs: Vec<(u32, u32)> = lf.pairs.iter()
-                .map(|&(i, j)| (pos_to_bit(i), pos_to_bit(j))).collect();
-            x_lag_filters.push(XLagFilter {
-                s: lf.s, pairs: bit_pairs, max_unknown: lf.max_unknown, num_bnd_pairs: lf.num_bnd_pairs,
-            });
-        }
-
-        // Required x boundary sum
-        let x_sum_required = tuple.x as i16;
-        let y_sum_required = tuple.y as i16;
+        // Look up all compatible (x, y) boundary configs — O(1) index lookup
+        let xy_entries = self.get_xy_entries(z_bits, w_bits);
+        if xy_entries.is_empty() { return None; }
 
         // Pre-allocate buffers for term state injection
         let max_terms = qpb_term_info.iter().map(|v| v.len()).max().unwrap_or(0);
         let mut term_state_buf = vec![0u8; max_terms];
 
         let mut configs_tested = 0usize;
-        // Iterate all x_bits values. x[0]=+1 is fixed, so only odd values (bit 0 = 1).
-        for x_bits in (1u32..self.x_dim as u32).step_by(2) {
-            // X boundary sum check
-            let x_bnd_sum = (2 * x_bits.count_ones() as i16) - (2 * k) as i16;
-            let x_mid = x_sum_required - x_bnd_sum;
-            if x_mid.abs() > middle_len as i32 as i16 || (x_mid + middle_len as i16) % 2 != 0 { continue; }
+        for &(x_bits, y_bits) in xy_entries {
+            // Sum feasibility check (middle portion must have valid sum)
+            let x_bnd_sum = (2 * x_bits.count_ones() as i32) - (2 * k) as i32;
+            let y_bnd_sum = (2 * y_bits.count_ones() as i32) - (2 * k) as i32;
+            let x_mid = tuple.x - x_bnd_sum;
+            let y_mid = tuple.y - y_bnd_sum;
+            if x_mid.abs() > middle_len as i32 || (x_mid + middle_len as i32) % 2 != 0 { continue; }
+            if y_mid.abs() > middle_len as i32 || (y_mid + middle_len as i32) % 2 != 0 { continue; }
 
-            // X-only GJ filter
-            let mut x_ok = true;
-            for gc in &gj_x_only {
-                let ba = (x_bits >> gc.a_bit) & 1;
-                let bb = (x_bits >> gc.b_bit) & 1;
-                if (ba ^ bb) != gc.need_xor { x_ok = false; break; }
+            // GJ equality filter on boundary variables
+            let mut ok = true;
+            for &(a, b, equal) in &equalities {
+                let va = (a.unsigned_abs() as usize) - 1;
+                let vb = (b.unsigned_abs() as usize) - 1;
+                let pa = va % n; let pb = vb % n;
+                if !is_bnd(pa) || !is_bnd(pb) { continue; }
+                let pos_to_bit = |pos: usize| -> u32 {
+                    if pos < k { pos as u32 } else { (k + pos - (n - k)) as u32 }
+                };
+                let ba = if va < n { (x_bits >> pos_to_bit(pa)) & 1 } else { (y_bits >> pos_to_bit(pa)) & 1 };
+                let bb = if vb < n { (x_bits >> pos_to_bit(pb)) & 1 } else { (y_bits >> pos_to_bit(pb)) & 1 };
+                let need_xor = (a < 0) as u32 ^ (b < 0) as u32 ^ (!equal) as u32;
+                if (ba ^ bb) != need_xor { ok = false; break; }
             }
-            if !x_ok { continue; }
-
-            // Get y entries for this x_bits
-            let y_entries = self.get_y_entries(x_bits);
-            if y_entries.is_empty() { continue; }
-
-            for &y_bits in y_entries {
-                // Y boundary sum check
-                let y_bnd_sum = (2 * y_bits.count_ones() as i16) - (2 * k) as i16;
-                let y_mid = y_sum_required - y_bnd_sum;
-                if y_mid.abs() > middle_len as i32 as i16 || (y_mid + middle_len as i16) % 2 != 0 { continue; }
-
-                // Cross GJ filter
-                let mut ok = true;
-                for gc in &gj_cross {
-                    let ba = if gc.a_is_x { (x_bits >> gc.a_bit) & 1 } else { (y_bits >> gc.a_bit) & 1 };
-                    let bb = if gc.b_is_x { (x_bits >> gc.b_bit) & 1 } else { (y_bits >> gc.b_bit) & 1 };
-                    if (ba ^ bb) != gc.need_xor { ok = false; break; }
-                }
-                if !ok { continue; }
-
-                // Autocorrelation filter on combined x+y boundary
-                for lf in &x_lag_filters {
-                    let mut disagree = 0u32;
-                    for &(bi, bj) in &lf.pairs {
-                        disagree += ((x_bits >> bi) ^ (x_bits >> bj)) & 1;
-                        disagree += ((y_bits >> bi) ^ (y_bits >> bj)) & 1;
-                    }
-                    let kn = lf.num_bnd_pairs - 2 * disagree as i32;
-                    if (targets[lf.s] - kn).abs() > lf.max_unknown { ok = false; break; }
-                }
-                if !ok { continue; }
+            if !ok { continue; }
 
                     // Expand bits only for entries passing all filters
                     let mut xv = [0i8; 64]; let mut yv = [0i8; 64];
@@ -2448,7 +2391,6 @@ impl XYBoundaryTable {
                             }
                         }
                     }
-            }
         }
         None
     }
@@ -2618,7 +2560,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     } else {
         match XYBoundaryTable::load(&table_path, problem.n) {
             Some(t) => {
-                if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {} index slots)", table_path, t.n, t.k, t.x_dim); }
+                if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {} Z/W index slots)", table_path, t.n, t.k, t.zw_dim); }
                 Some(Arc::new(t))
             }
             None => {
