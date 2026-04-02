@@ -140,8 +140,9 @@ struct QuadPbConstraint {
     terms: Vec<QuadPbTerm>,  // single Vec instead of 10 separate ones
     target: u32,
     num_terms: u32,
-    sum_true: i32,
-    sum_maybe: i32,
+    /// Branchless counter array indexed by state: sums[0]=dead(unused), sums[1]=maybe, sums[2]=true.
+    /// Replaces separate sum_true/sum_maybe fields for branch-free updates.
+    sums: [i32; 3],
 }
 
 /// Reason a variable was assigned (for conflict analysis).
@@ -430,8 +431,7 @@ impl Solver {
         self.quad_pb_constraints.push(QuadPbConstraint {
             target,
             num_terms: terms.len() as u32,
-            sum_true: 0,
-            sum_maybe: coeffs.iter().sum::<u32>() as i32,
+            sums: [0, coeffs.iter().sum::<u32>() as i32, 0],
             terms,
         });
 
@@ -522,13 +522,12 @@ impl Solver {
 
     /// Reset a quad PB constraint's incremental state from precomputed values.
     /// Used for fast boundary config switching without backtracking.
-    pub fn reset_quad_pb_state(&mut self, qi: usize, term_state: &[u8], sum_true: i32, sum_maybe: i32) {
+    pub fn reset_quad_pb_state(&mut self, qi: usize, term_state: &[u8], #[allow(unused)] sum_true: i32, sum_maybe: i32) {
         let qc = &mut self.quad_pb_constraints[qi];
         for (i, &s) in term_state.iter().enumerate() {
             qc.terms[i].state = s;
         }
-        qc.sum_true = sum_true;
-        qc.sum_maybe = sum_maybe;
+        qc.sums = [0, sum_maybe, sum_true];
     }
 
     /// Get the number of quad PB constraints.
@@ -862,10 +861,10 @@ impl Solver {
         if old_state == new_state { return; }
 
         let c = qc.terms[ti].coeff as i32;
-        if old_state == 1 { qc.sum_maybe -= c; }
-        else if old_state == 2 { qc.sum_true -= c; }
-        if new_state == 1 { qc.sum_maybe += c; }
-        else if new_state == 2 { qc.sum_true += c; }
+        // Branchless: decrement old bucket, increment new bucket.
+        // sums[0] (dead) is unused but absorbs index 0 writes harmlessly.
+        qc.sums[old_state as usize] -= c;
+        qc.sums[new_state as usize] += c;
         qc.terms[ti].state = new_state;
     }
 
@@ -876,8 +875,8 @@ impl Solver {
         let qc = &self.quad_pb_constraints[qi as usize];
         let n = qc.num_terms as usize;
         let target = qc.target as i64;
-        let sum_true = qc.sum_true as i64;
-        let sum_maybe = qc.sum_maybe as i64;
+        let sum_true = qc.sums[2] as i64;
+        let sum_maybe = qc.sums[1] as i64;
 
         if sum_true + sum_maybe < target || sum_true > target {
             return Some(Reason::QuadPb(qi)); // conflict
@@ -1162,8 +1161,7 @@ impl Solver {
         if level == 0 && self.skip_backtrack_quad_pb && !self.quad_pb_constraints.is_empty() {
             for qc in &mut self.quad_pb_constraints {
                 let total: i32 = qc.terms.iter().map(|t| t.coeff as i32).sum();
-                qc.sum_true = 0;
-                qc.sum_maybe = total;
+                qc.sums = [0, total, 0];
                 for t in qc.terms.iter_mut() { t.state = 1; } // all MAYBE
             }
         }
