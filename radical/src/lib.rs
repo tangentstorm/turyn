@@ -79,14 +79,23 @@ struct PbConstraint {
 struct QuadPbTerm {
     lit_a: Lit,
     lit_b: Lit,
-    var_a: u32,     // variable index (was usize, but u32 is sufficient and saves space)
-    var_b: u32,
     coeff: u32,
-    true_val_a: LBool,  // the LBool value that means "literal a is true"
-    true_val_b: LBool,
-    neg_a: bool,
-    neg_b: bool,
     state: u8,      // 0=DEAD, 1=MAYBE, 2=TRUE
+}
+
+impl QuadPbTerm {
+    #[inline(always)]
+    fn var_a(&self) -> usize { var_of(self.lit_a) }
+    #[inline(always)]
+    fn var_b(&self) -> usize { var_of(self.lit_b) }
+    #[inline(always)]
+    fn true_val_a(&self) -> LBool { if self.lit_a > 0 { LBool::True } else { LBool::False } }
+    #[inline(always)]
+    fn true_val_b(&self) -> LBool { if self.lit_b > 0 { LBool::True } else { LBool::False } }
+    #[inline(always)]
+    fn neg_a(&self) -> bool { self.lit_a < 0 }
+    #[inline(always)]
+    fn neg_b(&self) -> bool { self.lit_b < 0 }
 }
 
 #[derive(Clone, Debug)]
@@ -375,13 +384,7 @@ impl Solver {
             QuadPbTerm {
                 lit_a: lits_a[i],
                 lit_b: lits_b[i],
-                var_a: var_of(lits_a[i]) as u32,
-                var_b: var_of(lits_b[i]) as u32,
                 coeff: coeffs[i],
-                true_val_a: if lits_a[i] > 0 { LBool::True } else { LBool::False },
-                true_val_b: if lits_b[i] > 0 { LBool::True } else { LBool::False },
-                neg_a: lits_a[i] < 0,
-                neg_b: lits_b[i] < 0,
                 state: 1, // MAYBE
             }
         }).collect();
@@ -498,7 +501,7 @@ impl Solver {
     /// Get quad PB term info for precomputation.
     pub fn quad_pb_term_info(&self, qi: usize, ti: usize) -> (usize, usize, bool, bool) {
         let t = &self.quad_pb_constraints[qi].terms[ti];
-        (t.var_a as usize, t.var_b as usize, t.neg_a, t.neg_b)
+        (t.var_a(), t.var_b(), t.neg_a(), t.neg_b())
     }
 
     /// Full reset to base state: unassign all variables, clear trail, reset conflicts.
@@ -806,18 +809,18 @@ impl Solver {
     #[inline(never)]
     fn update_quad_pb_term(&mut self, qi: u32, ti: usize) {
         let t = &self.quad_pb_constraints[qi as usize].terms[ti];
-        let aa = self.assigns[t.var_a as usize];
-        let ab = self.assigns[t.var_b as usize];
+        let aa = self.assigns[t.var_a()];
+        let ab = self.assigns[t.var_b()];
 
         let new_state = if aa == LBool::Undef {
             if ab == LBool::Undef { 1u8 }
-            else if ab != t.true_val_b { 0u8 }
+            else if ab != t.true_val_b() { 0u8 }
             else { 1u8 }
         } else if ab == LBool::Undef {
-            if aa != t.true_val_a { 0u8 }
+            if aa != t.true_val_a() { 0u8 }
             else { 1u8 }
         } else {
-            if (aa != t.true_val_a) | (ab != t.true_val_b) { 0u8 } else { 2u8 }
+            if (aa != t.true_val_a()) | (ab != t.true_val_b()) { 0u8 } else { 2u8 }
         };
 
         let qc = &mut self.quad_pb_constraints[qi as usize];
@@ -857,10 +860,10 @@ impl Solver {
 
         for i in 0..n {
             let t = &self.quad_pb_constraints[qi as usize].terms[i];
-            let aa = self.assigns[t.var_a as usize];
-            let ab = self.assigns[t.var_b as usize];
-            let a_false = aa != LBool::Undef && aa != t.true_val_a;
-            let b_false = ab != LBool::Undef && ab != t.true_val_b;
+            let aa = self.assigns[t.var_a()];
+            let ab = self.assigns[t.var_b()];
+            let a_false = aa != LBool::Undef && aa != t.true_val_a();
+            let b_false = ab != LBool::Undef && ab != t.true_val_b();
             if a_false | b_false { continue; }
             let a_undef = aa == LBool::Undef;
             let b_undef = ab == LBool::Undef;
@@ -887,12 +890,12 @@ impl Solver {
             {
                 let terms = &self.quad_pb_constraints[qi as usize].terms;
                 for t in terms {
-                    let va = t.var_a as usize;
-                    let vb = t.var_b as usize;
+                    let va = t.var_a();
+                    let vb = t.var_b();
                     let aa = self.assigns[va];
                     let ab = self.assigns[vb];
-                    let af = (aa == LBool::True && t.neg_a) || (aa == LBool::False && !t.neg_a);
-                    let bf = (ab == LBool::True && t.neg_b) || (ab == LBool::False && !t.neg_b);
+                    let af = (aa == LBool::True && t.neg_a()) || (aa == LBool::False && !t.neg_a());
+                    let bf = (ab == LBool::True && t.neg_b()) || (ab == LBool::False && !t.neg_b());
 
                     if af || bf {
                         let (lit, v) = if af { (t.lit_a, va) } else { (t.lit_b, vb) };
@@ -973,7 +976,7 @@ impl Solver {
                         let mut lits = Vec::new();
                         let mut seen_v = vec![false; self.num_vars];
                         for t in terms {
-                            for &(lit, v) in &[(t.lit_a, t.var_a as usize), (t.lit_b, t.var_b as usize)] {
+                            for &(lit, v) in &[(t.lit_a, t.var_a()), (t.lit_b, t.var_b())] {
                                 if !seen_v[v] && self.assigns[v] != LBool::Undef && self.level[v] > 0 {
                                     seen_v[v] = true;
                                     lits.push(if self.lit_value(lit) == LBool::False { lit } else { negate(lit) });
