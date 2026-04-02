@@ -2155,8 +2155,10 @@ struct XYBoundaryTable {
 
 impl XYBoundaryTable {
     fn load(path: &str, n: usize) -> Option<Self> {
-        let f = std::fs::File::open(path).ok()?;
-        let mmap = unsafe { memmap2::Mmap::map(&f).ok()? };
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut mmap = Vec::new();
+        f.read_to_end(&mut mmap).ok()?;
         if mmap.len() < 28 { return None; }
 
         if &mmap[0..4] != b"XYTT" { return None; }
