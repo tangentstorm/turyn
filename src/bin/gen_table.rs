@@ -9,12 +9,12 @@
 ///   Sig directory (num_sigs × 8 bytes): [offset_u32, count_u32] per signature
 ///   XY data: packed (x_bits: u32, y_bits: u32) pairs, 8 bytes each
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(26);
-    let k: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(6);
+    let k: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(7);
     let default_outfile = format!("xy-table-n{}-k{}.bin", n, k);
     let outfile = args.get(3).map(|s| s.as_str()).unwrap_or(&default_outfile);
 
@@ -197,7 +197,25 @@ fn main() {
     let total_size = header_size + zw_index_size + sig_dir_size + sub_idx_size + xy_data_size;
     eprintln!("Writing: {:.1} MB total", total_size as f64 / 1_048_576.0);
 
-    let mut f = std::fs::File::create(outfile).expect("Failed to create file");
+    let file = std::fs::File::create(outfile).expect("Failed to create file");
+    let mut f = BufWriter::with_capacity(8 * 1024 * 1024, file);
+
+    // Helper: write a &[u32] slice as raw little-endian bytes (no per-element loop)
+    #[cfg(target_endian = "little")]
+    fn write_u32_slice(f: &mut impl Write, data: &[u32]) {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+        };
+        f.write_all(bytes).unwrap();
+    }
+    // Helper: write a &[(u32,u32)] slice as raw bytes
+    #[cfg(target_endian = "little")]
+    fn write_u32_pair_slice(f: &mut impl Write, data: &[(u32, u32)]) {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
+        };
+        f.write_all(bytes).unwrap();
+    }
 
     // Header
     f.write_all(b"XYTT").unwrap();
@@ -208,28 +226,24 @@ fn main() {
     f.write_all(&(num_sigs as u32).to_le_bytes()).unwrap();
     f.write_all(&(sum_dim as u32).to_le_bytes()).unwrap();
 
-    // ZW index: sig_id per slot
-    for &id in &zw_index {
-        f.write_all(&id.to_le_bytes()).unwrap();
-    }
+    // ZW index: sig_id per slot (bulk write)
+    write_u32_slice(&mut f, &zw_index);
 
     // Sig directory: (offset, count) per signature
+    let mut sig_dir: Vec<u32> = Vec::with_capacity(num_sigs * 2);
     for i in 0..num_sigs {
-        f.write_all(&sig_offsets[i].to_le_bytes()).unwrap();
-        f.write_all(&sig_counts[i].to_le_bytes()).unwrap();
+        sig_dir.push(sig_offsets[i]);
+        sig_dir.push(sig_counts[i]);
     }
+    write_u32_slice(&mut f, &sig_dir);
 
     // Sub-index: (offset_within_sig, count) per (sig, x_sum_idx, y_sum_idx)
-    for &(off, cnt) in &sub_index {
-        f.write_all(&off.to_le_bytes()).unwrap();
-        f.write_all(&cnt.to_le_bytes()).unwrap();
-    }
+    write_u32_pair_slice(&mut f, &sub_index);
 
     // XY data
-    for &(xb, yb) in &xy_data {
-        f.write_all(&xb.to_le_bytes()).unwrap();
-        f.write_all(&yb.to_le_bytes()).unwrap();
-    }
+    write_u32_pair_slice(&mut f, &xy_data);
+
+    f.flush().unwrap();
 
     let file_size = std::fs::metadata(outfile).map(|m| m.len()).unwrap_or(0);
     eprintln!("Wrote {} ({:.1} MB)", outfile, file_size as f64 / 1_048_576.0);

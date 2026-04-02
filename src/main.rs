@@ -234,7 +234,7 @@ struct SearchConfig {
     /// Run only Phase A (print tuples) or Phase B (print Z/W pairs).
     phase_only: Option<String>,
     /// Path to XY boundary table file for table-based Phase C.
-    /// Defaults to "./xy-table-n{N}-k6.bin".
+    /// Defaults to "./xy-table-n{N}-k7.bin".
     xy_table_path: Option<String>,
     /// Run without XY boundary table (slower).
     no_table: bool,
@@ -2619,10 +2619,10 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
     let phase_a_elapsed = phase_a_start.elapsed();
 
-    // Load XY boundary table (default: ./xy-table.bin).
-    // Skip table for n < 12: the search space is tiny and boundary signature
-    // matching with k=6 covers the entire sequence, over-restricting Z/W pairing.
-    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| format!("./xy-table-n{}-k6.bin", problem.n));
+    // Load XY boundary table (default: ./xy-table-n{N}-k7.bin).
+    // Skip table for n < 14: the search space is tiny and boundary signature
+    // matching with k=7 covers the entire sequence, over-restricting Z/W pairing.
+    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| format!("./xy-table-n{}-k7.bin", problem.n));
     let xy_table: Option<Arc<XYBoundaryTable>> = if cfg.no_table || problem.n < 12 {
         None
     } else {
