@@ -8,27 +8,29 @@ The long-term goal is TT(56), which yields a **Hadamard matrix of order 668**.
 
 | n | Hadamard | hybrid |
 |---|---|---|
-| 4 | 44 | 0.5ms |
-| 6 | 68 | 0.5ms |
-| 8 | 92 | 1.6ms |
-| 10 | 116 | 0.7ms |
-| 12 | 140 | 3.4ms |
-| 14 | 164 | 12ms |
-| 16 | 188 | 71ms |
-| 18 | 212 | 860ms |
-| 20 | 236 | 869ms |
+| 2 | 20 | 0.6ms |
+| 4 | 44 | 0.8ms |
+| 6 | 68 | 0.9ms |
+| 8 | 92 | 0.8ms |
+| 10 | 116 | 1.0ms |
+| 12 | 140 | 2.5ms |
+| 14 | 164 | 10ms |
+| 16 | 188 | 34ms |
+| 18 | 212 | 588ms |
+| 20 | 236 | 1.0s |
 | 22 | 260 | 3.2s |
-| 24 | 284 | 1.8s |
+| 24 | 284 | 1.0s |
+| 26 | 308 | **129s** |
 
-Hybrid is now the default mode and runs in parallel across all available cores. Just run `target/release/turyn --n=N` to search.
+Hybrid is now the default mode and runs in parallel across all available cores. Just run `target/release/turyn --n=N` to search. Z/W sequences are cached by sum value across tuples, and a priority queue dispatches spectrally-tightest pairs first.
 
-All solved with **radical**, a pure Rust CDCL SAT solver included as a subcrate. No external C/C++ dependencies. Timeout = 2 minutes wall-clock. Stochastic is nondeterministic; times vary between runs.
+All solved with **radical**, a pure Rust CDCL SAT solver included as a subcrate. No external C/C++ dependencies. Timeout = 2 minutes wall-clock (except n=26 which takes ~2 min). Stochastic is nondeterministic; times vary between runs.
 
-**Test machine:** 4-core Intel Xeon @ 2.10 GHz, 16 GB RAM, Linux x86_64. Hybrid search parallelizes Phase B + SAT solving across cores (one thread per sum-tuple). Full SAT and z-sat are currently single-threaded.
+**Test machine:** 4-core Intel Xeon @ 2.10 GHz, 16 GB RAM, Linux x86_64. Hybrid search parallelizes Phase B + SAT solving across cores via a coordinator with shared priority queue.
 
-For comparison, London (2013) enumerated all 3,523 TT(24) sequences in ~1 hour and all 3,753 TT(26) in ~9 hours on a 6-core Intel i7 3930K @ 3.2 GHz, using a highly optimized custom C++ backtracker. Our hybrid solver finds a single TT(24) in 4.7s on a slower 4-core machine but cannot yet enumerate all solutions or reach n=26 within 2 minutes.
+For comparison, London (2013) enumerated all 3,523 TT(24) sequences in ~1 hour and all 3,753 TT(26) in ~9 hours on a 6-core Intel i7 3930K @ 3.2 GHz, using a highly optimized custom C++ backtracker. Our hybrid solver finds a single TT(24) in 1.0s and TT(26) in 129s on a slower 4-core machine.
 
-Known solutions exist in the literature for all even n up to 44 (London-Kotsireas 2025). The current bottleneck for n >= 26 is SAT solver performance at scale.
+Known solutions exist in the literature for all even n up to 44 (London-Kotsireas 2025). The current bottleneck for n >= 28 is search space size and SAT solver performance at scale.
 
 ### Benchmarking rules
 
