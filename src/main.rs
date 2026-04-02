@@ -2140,77 +2140,86 @@ fn run_sat_search(problem: Problem, verbose: bool) -> SearchReport {
 
 /// Pre-computed table of valid X/Y boundary configurations.
 /// Grouped by (x_bnd_sum, y_bnd_sum, high_lag_signature) for fast lookup.
-/// The high_lag_signature captures autocorrelation at lags where all pairs are
-/// boundary-only (max_unknown=0), enabling exact-match filtering at load time.
-enum TableBacking {
-    Owned(Vec<u8>),
-    Mmap(memmap2::Mmap),
-}
-
-impl TableBacking {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            TableBacking::Owned(v) => v,
-            TableBacking::Mmap(m) => m,
-        }
-    }
-}
-
 struct XYBoundaryTable {
     n: usize,
     k: usize,
-    zw_dim: usize,        // z_dim * w_dim — total index entries
     w_dim: usize,         // 2^(2k) — W bits dimension
-    _backing: TableBacking,
-    index: *const u8,     // zw_dim entries of (offset_u64, count_u32)
-    data: *const u8,      // packed (x_bits: u32, y_bits: u32) pairs, 8 bytes each
+    zw_index: Vec<u32>,   // sig_id per Z/W config (0xFFFFFFFF = empty)
+    sig_offsets: Vec<u32>, // offset into xy_data per signature
+    sig_counts: Vec<u32>,  // count per signature
+    xy_data: Vec<(u32, u32)>, // all unique (x_bits, y_bits) pairs
 }
-
-// Safety: the mmap data is immutable and the pointers are derived from it
-unsafe impl Send for XYBoundaryTable {}
-unsafe impl Sync for XYBoundaryTable {}
 
 impl XYBoundaryTable {
     fn load(path: &str, n: usize) -> Option<Self> {
         let f = std::fs::File::open(path).ok()?;
         let mmap = unsafe { memmap2::Mmap::map(&f).ok()? };
-        if mmap.len() < 20 { return None; }
+        if mmap.len() < 24 { return None; }
 
         if &mmap[0..4] != b"XYTT" { return None; }
         let version = u32::from_le_bytes(mmap[4..8].try_into().ok()?);
-        if version != 3 { return None; }
+        if version != 4 {
+            eprintln!("Error: table version {} not supported (need v4). Regenerate with gen_table.", version);
+            return None;
+        }
 
         let _table_n = u32::from_le_bytes(mmap[8..12].try_into().ok()?) as usize;
         let k = u32::from_le_bytes(mmap[12..16].try_into().ok()?) as usize;
         let zw_dim = u32::from_le_bytes(mmap[16..20].try_into().ok()?) as usize;
+        let num_sigs = u32::from_le_bytes(mmap[20..24].try_into().ok()?) as usize;
         let w_dim = 1usize << (2 * k);
 
         if n < 2 * k { return None; }
 
-        let index_start = 20;
-        let index_size = zw_dim * 12;
-        let data_start = index_start + index_size;
-        if mmap.len() < data_start { return None; }
+        let header = 24;
+        let zw_idx_end = header + zw_dim * 4;
+        let sig_dir_end = zw_idx_end + num_sigs * 8;
 
-        let index = mmap[index_start..].as_ptr();
-        let data = mmap[data_start..].as_ptr();
+        // Read ZW index
+        let mut zw_index = vec![0u32; zw_dim];
+        for i in 0..zw_dim {
+            let off = header + i * 4;
+            zw_index[i] = u32::from_le_bytes(mmap[off..off+4].try_into().ok()?);
+        }
 
-        Some(Self { n, k, zw_dim, w_dim, _backing: TableBacking::Mmap(mmap), index, data })
+        // Read sig directory
+        let mut sig_offsets = vec![0u32; num_sigs];
+        let mut sig_counts = vec![0u32; num_sigs];
+        for i in 0..num_sigs {
+            let off = zw_idx_end + i * 8;
+            sig_offsets[i] = u32::from_le_bytes(mmap[off..off+4].try_into().ok()?);
+            sig_counts[i] = u32::from_le_bytes(mmap[off+4..off+8].try_into().ok()?);
+        }
+
+        // Read XY data
+        let xy_bytes = mmap.len() - sig_dir_end;
+        let num_xy = xy_bytes / 8;
+        let mut xy_data = Vec::with_capacity(num_xy);
+        for i in 0..num_xy {
+            let off = sig_dir_end + i * 8;
+            let xb = u32::from_le_bytes(mmap[off..off+4].try_into().ok()?);
+            let yb = u32::from_le_bytes(mmap[off+4..off+8].try_into().ok()?);
+            xy_data.push((xb, yb));
+        }
+
+        eprintln!("  {} sigs, {} unique XY entries ({:.1} MB in RAM)",
+            num_sigs, xy_data.len(),
+            (zw_dim * 4 + num_sigs * 8 + xy_data.len() * 8) as f64 / 1_048_576.0);
+
+        Some(Self { n, k, w_dim, zw_index, sig_offsets, sig_counts, xy_data })
     }
 
-    /// Get (x_bits, y_bits) pairs for a given Z/W boundary. Direct array index, O(1).
+    /// Get (x_bits, y_bits) pairs for a given Z/W boundary. O(1).
     #[inline]
     fn get_xy_entries(&self, z_bits: u32, w_bits: u32) -> &[(u32, u32)] {
         let idx = z_bits as usize * self.w_dim + w_bits as usize;
-        if idx >= self.zw_dim { return &[]; }
-        unsafe {
-            let idx_ptr = self.index.add(idx * 12);
-            let offset = u64::from_le_bytes(*(idx_ptr as *const [u8; 8])) as usize;
-            let count = u32::from_le_bytes(*(idx_ptr.add(8) as *const [u8; 4])) as usize;
-            if count == 0 { return &[]; }
-            let data_ptr = self.data.add(offset * 8) as *const (u32, u32);
-            std::slice::from_raw_parts(data_ptr, count)
-        }
+        if idx >= self.zw_index.len() { return &[]; }
+        let sig_id = self.zw_index[idx];
+        if sig_id == 0xFFFFFFFF { return &[]; }
+        let si = sig_id as usize;
+        let offset = self.sig_offsets[si] as usize;
+        let count = self.sig_counts[si] as usize;
+        &self.xy_data[offset..offset + count]
     }
 
     /// Expand boundary bits into full sequence values at boundary positions.
@@ -2290,6 +2299,27 @@ impl XYBoundaryTable {
         let xy_entries = self.get_xy_entries(z_bits, w_bits);
         if xy_entries.is_empty() { return None; }
 
+        // Precompute partial-lag autocorrelation filters (lags with some but not all boundary pairs)
+        let pos_to_bit = |pos: usize| -> u32 {
+            if pos < k { pos as u32 } else { (k + pos - (n - k)) as u32 }
+        };
+        let targets: Vec<i32> = (0..n).map(|s| if s == 0 { 0 } else { -candidate.zw_autocorr[s] }).collect();
+        struct LagFilter { s: usize, pairs: Vec<(u32, u32)>, max_unknown: i32, num_bnd_pairs: i32 }
+        let mut lag_filters: Vec<LagFilter> = Vec::new();
+        for s in 1..n {
+            let mut pairs = Vec::new();
+            let mut unk = 0i32;
+            for i in 0..n - s {
+                if is_bnd(i) && is_bnd(i + s) {
+                    pairs.push((pos_to_bit(i), pos_to_bit(i + s)));
+                } else { unk += 2; }
+            }
+            if !pairs.is_empty() && unk > 0 {
+                lag_filters.push(LagFilter { s, pairs: pairs.clone(), max_unknown: unk, num_bnd_pairs: 2 * pairs.len() as i32 });
+            }
+        }
+        lag_filters.sort_by_key(|f| f.max_unknown);
+
         // Pre-allocate buffers for term state injection
         let max_terms = qpb_term_info.iter().map(|v| v.len()).max().unwrap_or(0);
         let mut term_state_buf = vec![0u8; max_terms];
@@ -2318,6 +2348,18 @@ impl XYBoundaryTable {
                 let bb = if vb < n { (x_bits >> pos_to_bit(pb)) & 1 } else { (y_bits >> pos_to_bit(pb)) & 1 };
                 let need_xor = (a < 0) as u32 ^ (b < 0) as u32 ^ (!equal) as u32;
                 if (ba ^ bb) != need_xor { ok = false; break; }
+            }
+            if !ok { continue; }
+
+            // Partial-lag autocorrelation filter
+            for lf in &lag_filters {
+                let mut disagree = 0u32;
+                for &(bi, bj) in &lf.pairs {
+                    disagree += ((x_bits >> bi) ^ (x_bits >> bj)) & 1;
+                    disagree += ((y_bits >> bi) ^ (y_bits >> bj)) & 1;
+                }
+                let kn = lf.num_bnd_pairs - 2 * disagree as i32;
+                if (targets[lf.s] - kn).abs() > lf.max_unknown { ok = false; break; }
             }
             if !ok { continue; }
 
@@ -2560,7 +2602,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     } else {
         match XYBoundaryTable::load(&table_path, problem.n) {
             Some(t) => {
-                if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {} Z/W index slots)", table_path, t.n, t.k, t.zw_dim); }
+                if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {} sigs, {} XY entries)", table_path, t.n, t.k, t.sig_counts.len(), t.xy_data.len()); }
                 Some(Arc::new(t))
             }
             None => {
