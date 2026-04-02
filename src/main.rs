@@ -683,36 +683,41 @@ impl SpectralIndex {
         Self { sorted_by_freq }
     }
 
-    /// Find W candidates that pass budget constraints at the top-2 tightest frequencies.
-    /// Uses binary search on the tightest, then filters by the second-tightest.
+    /// Find W candidates that pass budget constraints at the top-4 tightest frequencies.
+    /// Uses binary search on the tightest, then filters by frequencies 2-4.
     /// Results are written into `out` (cleared first) as W indices.
     fn candidates_for(&self, z_spectrum: &[f64], pair_bound: f64, w_candidates: &[SeqWithSpectrum], out: &mut Vec<usize>) {
         out.clear();
         if self.sorted_by_freq.is_empty() { return; }
-        // Find top-2 tightest frequencies (highest Z power = least budget for W)
-        let mut freq1 = 0;
-        let mut freq2 = 0;
-        let mut power1 = f64::MIN;
-        let mut power2 = f64::MIN;
+        // Find top-4 tightest frequencies (highest Z power = least budget for W)
+        let mut top: [(f64, usize); 4] = [(f64::MIN, 0); 4];
         for (f, &zp) in z_spectrum.iter().enumerate() {
-            if zp > power1 {
-                power2 = power1;
-                freq2 = freq1;
-                power1 = zp;
-                freq1 = f;
-            } else if zp > power2 {
-                power2 = zp;
-                freq2 = f;
+            if zp > top[3].0 {
+                top[3] = (zp, f);
+                // Bubble up
+                for i in (0..3).rev() {
+                    if top[i + 1].0 > top[i].0 {
+                        top.swap(i, i + 1);
+                    } else {
+                        break;
+                    }
+                }
             }
         }
         // Binary search on tightest frequency
-        let budget1 = pair_bound - power1;
-        let sorted = &self.sorted_by_freq[freq1];
-        let cutoff = sorted.partition_point(|(wp, _)| *wp <= budget1);
-        // Filter by second-tightest frequency
-        let budget2 = pair_bound - power2;
+        let budget0 = pair_bound - top[0].0;
+        let sorted = &self.sorted_by_freq[top[0].1];
+        let cutoff = sorted.partition_point(|(wp, _)| *wp <= budget0);
+        // Filter by frequencies 2-4
+        let budget1 = pair_bound - top[1].0;
+        let budget2 = pair_bound - top[2].0;
+        let budget3 = pair_bound - top[3].0;
+        let f1 = top[1].1;
+        let f2 = top[2].1;
+        let f3 = top[3].1;
         for &(_, wi) in &sorted[..cutoff] {
-            if w_candidates[wi].spectrum[freq2] <= budget2 {
+            let spec = &w_candidates[wi].spectrum;
+            if spec[f1] <= budget1 && spec[f2] <= budget2 && spec[f3] <= budget3 {
                 out.push(wi);
             }
         }
@@ -721,7 +726,7 @@ impl SpectralIndex {
 
 /// Streaming Z×W pairing with spectral index for fast candidate lookup.
 /// For each spectrally-valid Z, uses the index to find W candidates that pass
-/// the top-2 tightest frequency constraints, then full-checks only those.
+/// the top-4 tightest frequency constraints, then full-checks only those.
 fn stream_zw_candidates(
     problem: Problem,
     z_sum: i32,
