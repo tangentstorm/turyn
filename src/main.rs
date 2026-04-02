@@ -683,30 +683,45 @@ impl SpectralIndex {
         Self { sorted_by_freq }
     }
 
-    /// Find W candidates that pass the budget at the tightest frequency of z_spectrum.
-    /// Returns a slice of (power, W index) pairs.
-    fn candidates_for(&self, z_spectrum: &[f64], pair_bound: f64) -> &[(f64, usize)] {
-        if self.sorted_by_freq.is_empty() { return &[]; }
-        // Find tightest frequency: where z_spectrum is highest (least budget for W)
-        let mut best_freq = 0;
-        let mut best_z_power = f64::MIN;
+    /// Find W candidates that pass budget constraints at the top-2 tightest frequencies.
+    /// Uses binary search on the tightest, then filters by the second-tightest.
+    /// Results are written into `out` (cleared first) as W indices.
+    fn candidates_for(&self, z_spectrum: &[f64], pair_bound: f64, w_candidates: &[SeqWithSpectrum], out: &mut Vec<usize>) {
+        out.clear();
+        if self.sorted_by_freq.is_empty() { return; }
+        // Find top-2 tightest frequencies (highest Z power = least budget for W)
+        let mut freq1 = 0;
+        let mut freq2 = 0;
+        let mut power1 = f64::MIN;
+        let mut power2 = f64::MIN;
         for (f, &zp) in z_spectrum.iter().enumerate() {
-            if zp > best_z_power {
-                best_z_power = zp;
-                best_freq = f;
+            if zp > power1 {
+                power2 = power1;
+                freq2 = freq1;
+                power1 = zp;
+                freq1 = f;
+            } else if zp > power2 {
+                power2 = zp;
+                freq2 = f;
             }
         }
-        let budget = pair_bound - best_z_power;
-        let sorted = &self.sorted_by_freq[best_freq];
-        // Binary search: find how many W have power ≤ budget at this frequency
-        let cutoff = sorted.partition_point(|(wp, _)| *wp <= budget);
-        &sorted[..cutoff]
+        // Binary search on tightest frequency
+        let budget1 = pair_bound - power1;
+        let sorted = &self.sorted_by_freq[freq1];
+        let cutoff = sorted.partition_point(|(wp, _)| *wp <= budget1);
+        // Filter by second-tightest frequency
+        let budget2 = pair_bound - power2;
+        for &(_, wi) in &sorted[..cutoff] {
+            if w_candidates[wi].spectrum[freq2] <= budget2 {
+                out.push(wi);
+            }
+        }
     }
 }
 
 /// Streaming Z×W pairing with spectral index for fast candidate lookup.
 /// For each spectrally-valid Z, uses the index to find W candidates that pass
-/// the tightest single-frequency constraint, then full-checks only those.
+/// the top-2 tightest frequency constraints, then full-checks only those.
 fn stream_zw_candidates(
     problem: Problem,
     z_sum: i32,
@@ -721,6 +736,7 @@ fn stream_zw_candidates(
     let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
     let mut out = Vec::new();
     let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
+    let mut idx_buf = Vec::new();
     generate_sequences_with_sum_visit(problem.n, z_sum, true, true, cfg.max_z, |values| {
         if found.load(AtomicOrdering::Relaxed) { return false; }
         stats.z_generated += 1;
@@ -729,8 +745,8 @@ fn stream_zw_candidates(
         stats.z_spectral_ok += 1;
         let z_seq = PackedSeq::from_values(values);
         let mut z_auto: Option<Vec<i32>> = None;
-        let candidates = w_index.candidates_for(&z_spectrum, pair_bound);
-        for &(_, wi) in candidates {
+        w_index.candidates_for(&z_spectrum, pair_bound, w_candidates, &mut idx_buf);
+        for &wi in &idx_buf {
             let w = &w_candidates[wi];
             stats.candidate_pair_attempts += 1;
             if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
@@ -782,6 +798,7 @@ fn stream_zw_candidates_to_channel(
     let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
     let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
     let mut seen = std::collections::HashSet::new();
+    let mut idx_buf = Vec::new();
     generate_sequences_with_sum_visit(problem.n, tuple.z, true, true, cfg.max_z, |values| {
         if found.load(AtomicOrdering::Relaxed) { return false; }
         stats.z_generated += 1;
@@ -790,8 +807,8 @@ fn stream_zw_candidates_to_channel(
         stats.z_spectral_ok += 1;
         let z_seq = PackedSeq::from_values(values);
         let mut z_auto: Option<Vec<i32>> = None;
-        let candidates = w_index.candidates_for(&z_spectrum, pair_bound);
-        for &(_, wi) in candidates {
+        w_index.candidates_for(&z_spectrum, pair_bound, w_candidates, &mut idx_buf);
+        for &wi in &idx_buf {
             let w = &w_candidates[wi];
             stats.candidate_pair_attempts += 1;
             if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
