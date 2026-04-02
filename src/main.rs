@@ -135,18 +135,6 @@ impl PackedSeq {
         acc
     }
 
-    #[allow(dead_code)]
-    fn boundary_signature(&self, k: usize) -> Vec<i8> {
-        let k = k.min(self.len);
-        let mut sig = Vec::with_capacity(k * 2);
-        for i in 0..k {
-            sig.push(self.get(i));
-        }
-        for i in (self.len - k)..self.len {
-            sig.push(self.get(i));
-        }
-        sig
-    }
 
     #[allow(dead_code)]
     fn as_string(&self) -> String {
@@ -228,10 +216,8 @@ impl fmt::Display for SumTuple {
 struct SearchConfig {
     problem: Problem,
     theta_samples: usize,
-    boundary_k: usize,
     max_z: usize,
     max_w: usize,
-    max_pairs_per_bucket: usize,
     benchmark_repeats: usize,
     stochastic: bool,
     stochastic_seconds: u64,
@@ -268,10 +254,8 @@ impl Default for SearchConfig {
         Self {
             problem: Problem::new(56),
             theta_samples: 128,
-            boundary_k: 0,
             max_z: 200_000,
             max_w: 200_000,
-            max_pairs_per_bucket: 5_000,
             benchmark_repeats: 0,
             stochastic: false,
             stochastic_seconds: 0,
@@ -344,11 +328,7 @@ struct SeqWithSpectrum {
     autocorr: Option<Vec<i32>>,  // lazily computed at pair time
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-enum BoundarySignature {
-    Packed { bits: u64, len: u8 },
-    Raw(Vec<i8>),
-}
+// BoundarySignature removed: bucketing provided no benefit (see commit history).
 
 #[derive(Clone)]
 struct SpectralFilter {
@@ -425,32 +405,7 @@ fn grouped_splits(raw: &[SumTuple]) -> BTreeMap<(i32, i32), Vec<SumTuple>> {
     m
 }
 
-fn boundary_signature_from_values(values: &[i8], k: usize) -> BoundarySignature {
-    let k = k.min(values.len());
-    let len = k * 2;
-    if len <= 64 {
-        let mut bits = 0u64;
-        for i in 0..k {
-            if values[i] == 1 {
-                bits |= 1u64 << i;
-            }
-        }
-        for i in 0..k {
-            if values[values.len() - k + i] == 1 {
-                bits |= 1u64 << (k + i);
-            }
-        }
-        BoundarySignature::Packed {
-            bits,
-            len: len as u8,
-        }
-    } else {
-        let mut sig = Vec::with_capacity(len);
-        sig.extend_from_slice(&values[..k]);
-        sig.extend_from_slice(&values[values.len() - k..]);
-        BoundarySignature::Raw(sig)
-    }
-}
+// boundary_signature_from_values removed: bucketing eliminated.
 
 #[allow(dead_code)]
 fn autocorrs_from_values(values: &[i8]) -> Vec<i32> {
@@ -673,55 +628,18 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8]) -> bool>(
     );
 }
 
-/// Type alias for bucket map used in Z/W sequence caching.
-type SeqBuckets = HashMap<BoundarySignature, Vec<SeqWithSpectrum>>;
-
-/// Generate Z sequences for a given sum, returning buckets keyed by boundary signature.
-/// Results can be cached by (n, sum) to avoid regenerating for different tuples.
-fn build_z_buckets(
-    problem: Problem,
-    z_sum: i32,
-    cfg: &SearchConfig,
-    spectral_z: &SpectralFilter,
-    stats: &mut SearchStats,
-    found: &AtomicBool,
-) -> SeqBuckets {
-    let individual_bound = problem.spectral_bound();
-    let mut z_buckets: SeqBuckets = HashMap::new();
-    let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
-    generate_sequences_with_sum_visit(problem.n, z_sum, true, true, cfg.max_z, |values| {
-        if found.load(AtomicOrdering::Relaxed) { return false; }
-        stats.z_generated += 1;
-        if let Some(spectrum) =
-            spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf)
-        {
-            stats.z_spectral_ok += 1;
-            let bucket = z_buckets.entry(boundary_signature_from_values(values, cfg.boundary_k)).or_default();
-            if bucket.len() < cfg.max_pairs_per_bucket.max(1) {
-                bucket.push(SeqWithSpectrum {
-                    spectrum,
-                    autocorr: None,
-                    seq: PackedSeq::from_values(values),
-                });
-            }
-        }
-        true
-    });
-    z_buckets
-}
-
-/// Generate W sequences for a given sum, returning buckets keyed by boundary signature.
-/// Results can be cached by (m, sum) to avoid regenerating for different tuples.
-fn build_w_buckets(
+/// Generate all spectrally-valid W sequences for a given sum.
+/// W is the shorter sequence (length n-1) so we materialize it; Z is streamed.
+fn build_w_candidates(
     problem: Problem,
     w_sum: i32,
     cfg: &SearchConfig,
     spectral_w: &SpectralFilter,
     stats: &mut SearchStats,
     found: &AtomicBool,
-) -> SeqBuckets {
+) -> Vec<SeqWithSpectrum> {
     let individual_bound = problem.spectral_bound();
-    let mut w_buckets: SeqBuckets = HashMap::new();
+    let mut w_candidates: Vec<SeqWithSpectrum> = Vec::new();
     let mut fft_buf = Vec::with_capacity(spectral_w.fft_size);
     generate_sequences_with_sum_visit(problem.m(), w_sum, true, false, cfg.max_w, |values| {
         if found.load(AtomicOrdering::Relaxed) { return false; }
@@ -730,78 +648,134 @@ fn build_w_buckets(
             spectrum_if_ok(values, spectral_w, individual_bound, &mut fft_buf)
         {
             stats.w_spectral_ok += 1;
-            let bucket = w_buckets.entry(boundary_signature_from_values(values, cfg.boundary_k)).or_default();
-            if bucket.len() < cfg.max_pairs_per_bucket.max(1) {
-                bucket.push(SeqWithSpectrum {
-                    spectrum,
-                    autocorr: None,
-                    seq: PackedSeq::from_values(values),
+            w_candidates.push(SeqWithSpectrum {
+                spectrum,
+                autocorr: None,
+                seq: PackedSeq::from_values(values),
+            });
+        }
+        true
+    });
+    w_candidates
+}
+
+/// Streaming Z×W pairing: generate Z sequences via DFS, and for each spectrally-valid Z,
+/// immediately pair it against all stored W candidates. No intermediate Z storage.
+/// The pair spectral bound |Z(θ)|²+|W(θ)|² ≤ spectral_bound is a necessary condition.
+fn stream_zw_candidates(
+    problem: Problem,
+    z_sum: i32,
+    w_candidates: &[SeqWithSpectrum],
+    cfg: &SearchConfig,
+    spectral_z: &SpectralFilter,
+    stats: &mut SearchStats,
+    found: &AtomicBool,
+) -> Vec<CandidateZW> {
+    let individual_bound = problem.spectral_bound();
+    let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
+    let mut out = Vec::new();
+    let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
+    generate_sequences_with_sum_visit(problem.n, z_sum, true, true, cfg.max_z, |values| {
+        if found.load(AtomicOrdering::Relaxed) { return false; }
+        stats.z_generated += 1;
+        let Some(z_spectrum) =
+            spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf) else { return true; };
+        stats.z_spectral_ok += 1;
+        let z_seq = PackedSeq::from_values(values);
+        // Lazily compute Z autocorrelation only if at least one W pair passes
+        let mut z_auto: Option<Vec<i32>> = None;
+        for w in w_candidates {
+            stats.candidate_pair_attempts += 1;
+            if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
+            let max_power = spectral_pair_max_power(&z_spectrum, &w.spectrum);
+            stats.candidate_pair_spectral_ok += 1;
+            let z_auto = z_auto.get_or_insert_with(|| {
+                let mut a = vec![0i32; problem.n];
+                for s in 1..problem.n { a[s] = z_seq.autocorrelation(s); }
+                a
+            });
+            let w_auto = w.autocorr.as_ref().cloned()
+                .unwrap_or_else(|| {
+                    let mut a = vec![0i32; problem.m()];
+                    for s in 1..problem.m() { a[s] = w.seq.autocorrelation(s); }
+                    a
                 });
+            let mut zw = vec![0; problem.n];
+            for (s, slot) in zw.iter_mut().enumerate().skip(1) {
+                let nz = z_auto[s];
+                let nw = if s < problem.m() { w_auto[s] } else { 0 };
+                *slot = 2 * nz + 2 * nw;
+            }
+            out.push(CandidateZW {
+                z: z_seq.clone(),
+                w: w.seq.clone(),
+                zw_autocorr: zw,
+                max_pair_power: max_power,
+            });
+        }
+        true
+    });
+    out
+}
+
+/// Streaming Z×W pairing that sends pairs directly to a channel.
+/// Used by the hybrid producer thread to feed the priority queue without buffering.
+fn stream_zw_candidates_to_channel(
+    problem: Problem,
+    tuple: SumTuple,
+    w_candidates: &[SeqWithSpectrum],
+    cfg: &SearchConfig,
+    spectral_z: &SpectralFilter,
+    stats: &mut SearchStats,
+    found: &AtomicBool,
+    tx: &std::sync::mpsc::Sender<(SumTuple, CandidateZW)>,
+) {
+    let individual_bound = problem.spectral_bound();
+    let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
+    let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
+    let mut seen = std::collections::HashSet::new();
+    generate_sequences_with_sum_visit(problem.n, tuple.z, true, true, cfg.max_z, |values| {
+        if found.load(AtomicOrdering::Relaxed) { return false; }
+        stats.z_generated += 1;
+        let Some(z_spectrum) =
+            spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf) else { return true; };
+        stats.z_spectral_ok += 1;
+        let z_seq = PackedSeq::from_values(values);
+        let mut z_auto: Option<Vec<i32>> = None;
+        for w in w_candidates {
+            stats.candidate_pair_attempts += 1;
+            if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
+            let max_power = spectral_pair_max_power(&z_spectrum, &w.spectrum);
+            stats.candidate_pair_spectral_ok += 1;
+            let z_auto = z_auto.get_or_insert_with(|| {
+                let mut a = vec![0i32; problem.n];
+                for s in 1..problem.n { a[s] = z_seq.autocorrelation(s); }
+                a
+            });
+            let w_auto = w.autocorr.as_ref().cloned()
+                .unwrap_or_else(|| {
+                    let mut a = vec![0i32; problem.m()];
+                    for s in 1..problem.m() { a[s] = w.seq.autocorrelation(s); }
+                    a
+                });
+            let mut zw = vec![0; problem.n];
+            for (s, slot) in zw.iter_mut().enumerate().skip(1) {
+                let nz = z_auto[s];
+                let nw = if s < problem.m() { w_auto[s] } else { 0 };
+                *slot = 2 * nz + 2 * nw;
+            }
+            let candidate = CandidateZW {
+                z: z_seq.clone(),
+                w: w.seq.clone(),
+                zw_autocorr: zw,
+                max_pair_power: max_power,
+            };
+            if seen.insert(candidate.zw_autocorr.clone()) {
+                if tx.send((tuple, candidate)).is_err() { return false; }
             }
         }
         true
     });
-    w_buckets
-}
-
-/// Pair Z and W buckets into candidates. The tight pair spectral bound
-/// |Z(θ)|²+|W(θ)|² ≤ spectral_bound is a necessary condition (not heuristic).
-fn pair_zw_candidates(
-    problem: Problem,
-    z_buckets: &SeqBuckets,
-    w_buckets: &SeqBuckets,
-    cfg: &SearchConfig,
-    stats: &mut SearchStats,
-) -> Vec<CandidateZW> {
-    let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
-    let mut out = Vec::new();
-    for (sig, zs) in z_buckets {
-        let Some(ws) = w_buckets.get(sig) else {
-            continue;
-        };
-
-        let mut taken = 0usize;
-        for z in zs {
-            for w in ws {
-                stats.candidate_pair_attempts += 1;
-                if !spectral_pair_ok(&z.spectrum, &w.spectrum, pair_bound) { continue; }
-                let max_power = spectral_pair_max_power(&z.spectrum, &w.spectrum);
-                stats.candidate_pair_spectral_ok += 1;
-                let z_auto = z.autocorr.as_ref().cloned()
-                    .unwrap_or_else(|| {
-                        let mut a = vec![0i32; problem.n];
-                        for s in 1..problem.n { a[s] = z.seq.autocorrelation(s); }
-                        a
-                    });
-                let w_auto = w.autocorr.as_ref().cloned()
-                    .unwrap_or_else(|| {
-                        let mut a = vec![0i32; problem.m()];
-                        for s in 1..problem.m() { a[s] = w.seq.autocorrelation(s); }
-                        a
-                    });
-                let mut zw = vec![0; problem.n];
-                for (s, slot) in zw.iter_mut().enumerate().skip(1) {
-                    let nz = z_auto[s];
-                    let nw = if s < problem.m() { w_auto[s] } else { 0 };
-                    *slot = 2 * nz + 2 * nw;
-                }
-                out.push(CandidateZW {
-                    z: z.seq.clone(),
-                    w: w.seq.clone(),
-                    zw_autocorr: zw,
-                    max_pair_power: max_power,
-                });
-                taken += 1;
-                if taken >= cfg.max_pairs_per_bucket {
-                    break;
-                }
-            }
-            if taken >= cfg.max_pairs_per_bucket {
-                break;
-            }
-        }
-    }
-    out
 }
 
 fn build_zw_candidates(
@@ -813,43 +787,31 @@ fn build_zw_candidates(
     stats: &mut SearchStats,
     found: &AtomicBool,
 ) -> Vec<CandidateZW> {
-    let z_buckets = build_z_buckets(problem, tuple.z, cfg, spectral_z, stats, found);
+    let w_candidates = build_w_candidates(problem, tuple.w, cfg, spectral_w, stats, found);
     if found.load(AtomicOrdering::Relaxed) { return Vec::new(); }
-    let w_buckets = build_w_buckets(problem, tuple.w, cfg, spectral_w, stats, found);
-    pair_zw_candidates(problem, &z_buckets, &w_buckets, cfg, stats)
+    stream_zw_candidates(problem, tuple.z, &w_candidates, cfg, spectral_z, stats, found)
 }
 
-/// Cached version: uses pre-built Z/W bucket caches keyed by sum value.
-/// Avoids regenerating sequences when multiple tuples share the same z or w sum.
+/// Cached version: caches W candidates by sum value (W is shorter, so we store it).
+/// Z is streamed fresh each time — no storage limit, every spectrally-valid Z is tried.
+#[allow(dead_code)]
 fn build_zw_candidates_cached(
     problem: Problem,
     tuple: SumTuple,
     cfg: &SearchConfig,
     spectral_z: &SpectralFilter,
     spectral_w: &SpectralFilter,
-    z_cache: &mut HashMap<i32, SeqBuckets>,
-    w_cache: &mut HashMap<i32, SeqBuckets>,
+    w_cache: &mut HashMap<i32, Vec<SeqWithSpectrum>>,
     stats: &mut SearchStats,
     found: &AtomicBool,
 ) -> Vec<CandidateZW> {
-    // Z sequences: cache by sum (Z has length n, first/last element = +1)
-    // Note: Z with sum s and Z with sum -s are related by negation, but the
-    // boundary signature matching means we can't trivially reuse one for the other.
-    // We cache exact sum values.
-    if !z_cache.contains_key(&tuple.z) {
-        let buckets = build_z_buckets(problem, tuple.z, cfg, spectral_z, stats, found);
-        z_cache.insert(tuple.z, buckets);
+    if !w_cache.contains_key(&tuple.w) {
+        let w_candidates = build_w_candidates(problem, tuple.w, cfg, spectral_w, stats, found);
+        w_cache.insert(tuple.w, w_candidates);
     }
     if found.load(AtomicOrdering::Relaxed) { return Vec::new(); }
-
-    if !w_cache.contains_key(&tuple.w) {
-        let buckets = build_w_buckets(problem, tuple.w, cfg, spectral_w, stats, found);
-        w_cache.insert(tuple.w, buckets);
-    }
-
-    let z_buckets = z_cache.get(&tuple.z).unwrap();
-    let w_buckets = w_cache.get(&tuple.w).unwrap();
-    pair_zw_candidates(problem, z_buckets, w_buckets, cfg, stats)
+    let w_candidates = w_cache.get(&tuple.w).unwrap();
+    stream_zw_candidates(problem, tuple.z, w_candidates, cfg, spectral_z, stats, found)
 }
 
 #[derive(Clone)]
@@ -3215,13 +3177,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         }
     };
 
-    // When no table is loaded, boundary signature matching is pointless —
-    // it only restricts Z/W pairing without benefit. Set boundary_k=0 so
-    // all sequences land in the same bucket (full Cartesian pairing).
-    let mut cfg = cfg.clone();
-    if xy_table.is_none() {
-        cfg.boundary_k = 0;
-    }
+    let cfg = cfg.clone();
     let cfg = cfg; // re-bind as immutable
 
     let workers = std::thread::available_parallelism()
@@ -3369,8 +3325,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
             let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
             let mut stats = SearchStats::default();
-            let mut z_cache: HashMap<i32, SeqBuckets> = HashMap::new();
-            let mut w_cache: HashMap<i32, SeqBuckets> = HashMap::new();
+            let mut w_cache: HashMap<i32, Vec<SeqWithSpectrum>> = HashMap::new();
             loop {
                 if found.load(AtomicOrdering::Relaxed) { break; }
                 // Throttle: if queue is deep, brief sleep to yield CPU to SAT workers
@@ -3383,17 +3338,18 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 if idx >= tuples.len() { break; }
                 let tuple = tuples[idx];
                 let b_start = Instant::now();
-                let candidates = build_zw_candidates_cached(
-                    problem, tuple, &cfg, &spectral_z, &spectral_w,
-                    &mut z_cache, &mut w_cache, &mut stats, &found);
-                stats.phase_b_nanos += b_start.elapsed().as_nanos() as u64;
-                let mut seen = std::collections::HashSet::new();
-                for c in candidates {
-                    if found.load(AtomicOrdering::Relaxed) { break; }
-                    if seen.insert(c.zw_autocorr.clone()) {
-                        if tx.send((tuple, c)).is_err() { break; }
-                    }
+                // Cache W candidates by sum (W is shorter); stream Z fresh each time
+                if !w_cache.contains_key(&tuple.w) {
+                    let w_candidates = build_w_candidates(
+                        problem, tuple.w, &cfg, &spectral_w, &mut stats, &found);
+                    w_cache.insert(tuple.w, w_candidates);
                 }
+                if found.load(AtomicOrdering::Relaxed) { break; }
+                let w_candidates = w_cache.get(&tuple.w).unwrap();
+                stream_zw_candidates_to_channel(
+                    problem, tuple, w_candidates, &cfg, &spectral_z,
+                    &mut stats, &found, &tx);
+                stats.phase_b_nanos += b_start.elapsed().as_nanos() as u64;
                 tuples_produced.fetch_add(1, AtomicOrdering::Relaxed);
             }
             stats
@@ -3545,14 +3501,10 @@ fn parse_args() -> SearchConfig {
             cfg.problem = Problem::new(v.parse().unwrap_or(cfg.problem.n));
         } else if let Some(v) = arg.strip_prefix("--theta=") {
             cfg.theta_samples = v.parse().unwrap_or(cfg.theta_samples);
-        } else if let Some(v) = arg.strip_prefix("--k=") {
-            cfg.boundary_k = v.parse().unwrap_or(cfg.boundary_k);
         } else if let Some(v) = arg.strip_prefix("--max-z=") {
             cfg.max_z = v.parse().unwrap_or(cfg.max_z);
         } else if let Some(v) = arg.strip_prefix("--max-w=") {
             cfg.max_w = v.parse().unwrap_or(cfg.max_w);
-        } else if let Some(v) = arg.strip_prefix("--max-pairs=") {
-            cfg.max_pairs_per_bucket = v.parse().unwrap_or(cfg.max_pairs_per_bucket);
         } else if let Some(v) = arg.strip_prefix("--benchmark=") {
             cfg.benchmark_repeats = v.parse().unwrap_or(1);
         } else if arg == "--benchmark" {
@@ -3803,10 +3755,8 @@ mod tests {
         let cfg = SearchConfig {
             problem: Problem::new(4),
             theta_samples: 64,
-            boundary_k: 6,
             max_z: 200_000,
             max_w: 200_000,
-            max_pairs_per_bucket: 2_000,
             benchmark_repeats: 1,
             stochastic: false,
             stochastic_seconds: 0,
