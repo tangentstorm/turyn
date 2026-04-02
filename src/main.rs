@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -194,12 +194,6 @@ impl SumTuple {
         (xx, yy, self.z.abs(), self.w.abs())
     }
 
-    fn split_key(&self) -> (i32, i32) {
-        (
-            self.x * self.x + self.y * self.y,
-            2 * self.z * self.z + 2 * self.w * self.w,
-        )
-    }
 }
 
 impl fmt::Display for SumTuple {
@@ -299,10 +293,6 @@ struct SearchStats {
 }
 
 impl SearchStats {
-    fn work_units(&self) -> usize {
-        self.z_generated + self.w_generated + self.candidate_pair_attempts + self.xy_nodes
-    }
-
     fn merge_from(&mut self, other: &SearchStats) {
         self.z_generated += other.z_generated;
         self.z_spectral_ok += other.z_spectral_ok;
@@ -395,15 +385,6 @@ fn normalized_tuples(raw: &[SumTuple]) -> Vec<SumTuple> {
     items
 }
 
-fn grouped_splits(raw: &[SumTuple]) -> BTreeMap<(i32, i32), Vec<SumTuple>> {
-    let mut m = BTreeMap::new();
-    for &t in raw {
-        m.entry(t.split_key()).or_insert_with(Vec::new).push(t);
-    }
-    m
-}
-
-// boundary_signature_from_values removed: bucketing eliminated.
 
 #[allow(dead_code)]
 fn autocorrs_from_values(values: &[i8]) -> Vec<i32> {
@@ -1376,45 +1357,6 @@ fn verify_tt(problem: Problem, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &
     true
 }
 
-fn find_small_tt_exhaustive(problem: Problem, stats: &mut SearchStats) -> bool {
-    if problem.n > 4 {
-        return false;
-    }
-
-    fn decode(mask: usize, len: usize) -> Vec<i8> {
-        let mut out = vec![-1; len];
-        for (i, slot) in out.iter_mut().enumerate().take(len) {
-            if ((mask >> i) & 1) == 1 {
-                *slot = 1;
-            }
-        }
-        out
-    }
-
-    let n = problem.n;
-    let m = problem.m();
-    for mx in 0..(1usize << n) {
-        let x = decode(mx, n);
-        for my in 0..(1usize << n) {
-            let y = decode(my, n);
-            for mz in 0..(1usize << n) {
-                let z = decode(mz, n);
-                for mw in 0..(1usize << m) {
-                    let w = decode(mw, m);
-                    stats.xy_nodes += 1;
-                    let px = PackedSeq::from_values(&x);
-                    let py = PackedSeq::from_values(&y);
-                    let pz = PackedSeq::from_values(&z);
-                    let pw = PackedSeq::from_values(&w);
-                    if verify_tt(problem, &px, &py, &pz, &pw) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
 
 #[derive(Clone, Debug)]
 struct SearchReport {
