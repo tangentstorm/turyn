@@ -234,7 +234,7 @@ struct SearchConfig {
     /// Run only Phase A (print tuples) or Phase B (print Z/W pairs).
     phase_only: Option<String>,
     /// Path to XY boundary table file for table-based Phase C.
-    /// Defaults to "./xy-table-n{N}-k7.bin".
+    /// Defaults to "./xy-table-k7.bin".
     xy_table_path: Option<String>,
     /// Run without XY boundary table (slower).
     no_table: bool,
@@ -2159,25 +2159,39 @@ impl XYBoundaryTable {
         let mut f = std::fs::File::open(path).ok()?;
         let mut mmap = Vec::new();
         f.read_to_end(&mut mmap).ok()?;
-        if mmap.len() < 28 { return None; }
+        if mmap.len() < 24 { return None; }
 
         if &mmap[0..4] != b"XYTT" { return None; }
         let version = u32::from_le_bytes(mmap[4..8].try_into().ok()?);
-        if version != 4 {
-            eprintln!("Error: table version {} not supported (need v4). Regenerate with gen_table.", version);
-            return None;
-        }
 
-        let _table_n = u32::from_le_bytes(mmap[8..12].try_into().ok()?) as usize;
-        let k = u32::from_le_bytes(mmap[12..16].try_into().ok()?) as usize;
-        let zw_dim = u32::from_le_bytes(mmap[16..20].try_into().ok()?) as usize;
-        let num_sigs = u32::from_le_bytes(mmap[20..24].try_into().ok()?) as usize;
-        let sum_dim = u32::from_le_bytes(mmap[24..28].try_into().ok()?) as usize;
+        let (k, zw_dim, num_sigs, sum_dim, header) = match version {
+            5 => {
+                // v5: n-independent. Header: magic, version, k, zw_dim, num_sigs, sum_dim (24 bytes)
+                let k = u32::from_le_bytes(mmap[8..12].try_into().ok()?) as usize;
+                let zw_dim = u32::from_le_bytes(mmap[12..16].try_into().ok()?) as usize;
+                let num_sigs = u32::from_le_bytes(mmap[16..20].try_into().ok()?) as usize;
+                let sum_dim = u32::from_le_bytes(mmap[20..24].try_into().ok()?) as usize;
+                (k, zw_dim, num_sigs, sum_dim, 24)
+            }
+            4 => {
+                // v4 (legacy): Header: magic, version, n, k, zw_dim, num_sigs, sum_dim (28 bytes)
+                if mmap.len() < 28 { return None; }
+                let _table_n = u32::from_le_bytes(mmap[8..12].try_into().ok()?) as usize;
+                let k = u32::from_le_bytes(mmap[12..16].try_into().ok()?) as usize;
+                let zw_dim = u32::from_le_bytes(mmap[16..20].try_into().ok()?) as usize;
+                let num_sigs = u32::from_le_bytes(mmap[20..24].try_into().ok()?) as usize;
+                let sum_dim = u32::from_le_bytes(mmap[24..28].try_into().ok()?) as usize;
+                (k, zw_dim, num_sigs, sum_dim, 28)
+            }
+            _ => {
+                eprintln!("Error: table version {} not supported (need v4 or v5). Regenerate with gen_table.", version);
+                return None;
+            }
+        };
         let w_dim = 1usize << (2 * k);
 
         if n < 2 * k { return None; }
 
-        let header = 28;
         let zw_idx_end = header + zw_dim * 4;
         let sig_dir_end = zw_idx_end + num_sigs * 8;
         let sub_idx_entries = num_sigs * sum_dim * sum_dim;
@@ -2619,23 +2633,23 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
     let phase_a_elapsed = phase_a_start.elapsed();
 
-    // Load XY boundary table (default: ./xy-table-n{N}-k7.bin).
-    // Skip table for n < 14: the search space is tiny and boundary signature
-    // matching with k=7 covers the entire sequence, over-restricting Z/W pairing.
-    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| format!("./xy-table-n{}-k7.bin", problem.n));
-    let xy_table: Option<Arc<XYBoundaryTable>> = if cfg.no_table || problem.n < 12 {
+    // Load XY boundary table (default: ./xy-table-k7.bin).
+    // Table is n-independent (pure function of k), valid for all n >= 2k.
+    // Skip table for n < 2k: boundary covers the entire sequence.
+    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table-k7.bin".to_string());
+    let xy_table: Option<Arc<XYBoundaryTable>> = if cfg.no_table {
         None
     } else {
         match XYBoundaryTable::load(&table_path, problem.n) {
             Some(t) => {
-                if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {} sigs, {} XY entries)", table_path, t.n, t.k, t.sig_offsets.len(), t.xy_data.len()); }
+                if verbose { eprintln!("Loaded XY boundary table from {} (k={}, {} sigs, {} XY entries)", table_path, t.k, t.sig_offsets.len(), t.xy_data.len()); }
                 Some(Arc::new(t))
             }
             None => {
                 eprintln!("Error: XY boundary table not found at '{}'", table_path);
                 eprintln!("Generate it once with:");
                 eprintln!("  cargo build --release --bin gen_table");
-                eprintln!("  target/release/gen_table {} 6", problem.n);
+                eprintln!("  target/release/gen_table 7");
                 eprintln!("For better performance (larger table, ~2GB):");
                 eprintln!("  target/release/gen_table {} 7", problem.n);
                 eprintln!("Or run with --no-table to skip (slower).");
