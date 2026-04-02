@@ -657,13 +657,61 @@ fn build_w_candidates(
     w_candidates
 }
 
-/// Streaming Z×W pairing: generate Z sequences via DFS, and for each spectrally-valid Z,
-/// immediately pair it against all stored W candidates. No intermediate Z storage.
-/// The pair spectral bound |Z(θ)|²+|W(θ)|² ≤ spectral_bound is a necessary condition.
+/// Index for fast spectral pair lookups.
+/// For each frequency, stores W candidate indices sorted by power at that frequency.
+/// Given a Z spectrum, we find the tightest frequency (highest Z power), then binary
+/// search to find only the W candidates that could pass at that frequency.
+struct SpectralIndex {
+    /// For each frequency f: Vec of (w_power_at_f, w_index), sorted by power.
+    sorted_by_freq: Vec<Vec<(f64, usize)>>,
+}
+
+impl SpectralIndex {
+    fn build(w_candidates: &[SeqWithSpectrum]) -> Self {
+        if w_candidates.is_empty() {
+            return Self { sorted_by_freq: Vec::new() };
+        }
+        let num_freqs = w_candidates[0].spectrum.len();
+        let mut sorted_by_freq = Vec::with_capacity(num_freqs);
+        for f in 0..num_freqs {
+            let mut entries: Vec<(f64, usize)> = w_candidates.iter().enumerate()
+                .map(|(i, w)| (w.spectrum[f], i))
+                .collect();
+            entries.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            sorted_by_freq.push(entries);
+        }
+        Self { sorted_by_freq }
+    }
+
+    /// Find W candidates that pass the budget at the tightest frequency of z_spectrum.
+    /// Returns a slice of (power, W index) pairs.
+    fn candidates_for(&self, z_spectrum: &[f64], pair_bound: f64) -> &[(f64, usize)] {
+        if self.sorted_by_freq.is_empty() { return &[]; }
+        // Find tightest frequency: where z_spectrum is highest (least budget for W)
+        let mut best_freq = 0;
+        let mut best_z_power = f64::MIN;
+        for (f, &zp) in z_spectrum.iter().enumerate() {
+            if zp > best_z_power {
+                best_z_power = zp;
+                best_freq = f;
+            }
+        }
+        let budget = pair_bound - best_z_power;
+        let sorted = &self.sorted_by_freq[best_freq];
+        // Binary search: find how many W have power ≤ budget at this frequency
+        let cutoff = sorted.partition_point(|(wp, _)| *wp <= budget);
+        &sorted[..cutoff]
+    }
+}
+
+/// Streaming Z×W pairing with spectral index for fast candidate lookup.
+/// For each spectrally-valid Z, uses the index to find W candidates that pass
+/// the tightest single-frequency constraint, then full-checks only those.
 fn stream_zw_candidates(
     problem: Problem,
     z_sum: i32,
     w_candidates: &[SeqWithSpectrum],
+    w_index: &SpectralIndex,
     cfg: &SearchConfig,
     spectral_z: &SpectralFilter,
     stats: &mut SearchStats,
@@ -680,9 +728,10 @@ fn stream_zw_candidates(
             spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf) else { return true; };
         stats.z_spectral_ok += 1;
         let z_seq = PackedSeq::from_values(values);
-        // Lazily compute Z autocorrelation only if at least one W pair passes
         let mut z_auto: Option<Vec<i32>> = None;
-        for w in w_candidates {
+        let candidates = w_index.candidates_for(&z_spectrum, pair_bound);
+        for &(_, wi) in candidates {
+            let w = &w_candidates[wi];
             stats.candidate_pair_attempts += 1;
             if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
             let max_power = spectral_pair_max_power(&z_spectrum, &w.spectrum);
@@ -722,6 +771,7 @@ fn stream_zw_candidates_to_channel(
     problem: Problem,
     tuple: SumTuple,
     w_candidates: &[SeqWithSpectrum],
+    w_index: &SpectralIndex,
     cfg: &SearchConfig,
     spectral_z: &SpectralFilter,
     stats: &mut SearchStats,
@@ -740,7 +790,9 @@ fn stream_zw_candidates_to_channel(
         stats.z_spectral_ok += 1;
         let z_seq = PackedSeq::from_values(values);
         let mut z_auto: Option<Vec<i32>> = None;
-        for w in w_candidates {
+        let candidates = w_index.candidates_for(&z_spectrum, pair_bound);
+        for &(_, wi) in candidates {
+            let w = &w_candidates[wi];
             stats.candidate_pair_attempts += 1;
             if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
             let max_power = spectral_pair_max_power(&z_spectrum, &w.spectrum);
@@ -787,10 +839,11 @@ fn build_zw_candidates(
 ) -> Vec<CandidateZW> {
     let w_candidates = build_w_candidates(problem, tuple.w, cfg, spectral_w, stats, found);
     if found.load(AtomicOrdering::Relaxed) { return Vec::new(); }
-    stream_zw_candidates(problem, tuple.z, &w_candidates, cfg, spectral_z, stats, found)
+    let w_index = SpectralIndex::build(&w_candidates);
+    stream_zw_candidates(problem, tuple.z, &w_candidates, &w_index, cfg, spectral_z, stats, found)
 }
 
-/// Cached version: caches W candidates by sum value (W is shorter, so we store it).
+/// Cached version: caches W candidates and spectral index by sum value.
 /// Z is streamed fresh each time — no storage limit, every spectrally-valid Z is tried.
 #[allow(dead_code)]
 fn build_zw_candidates_cached(
@@ -799,17 +852,18 @@ fn build_zw_candidates_cached(
     cfg: &SearchConfig,
     spectral_z: &SpectralFilter,
     spectral_w: &SpectralFilter,
-    w_cache: &mut HashMap<i32, Vec<SeqWithSpectrum>>,
+    w_cache: &mut HashMap<i32, (Vec<SeqWithSpectrum>, SpectralIndex)>,
     stats: &mut SearchStats,
     found: &AtomicBool,
 ) -> Vec<CandidateZW> {
     if !w_cache.contains_key(&tuple.w) {
         let w_candidates = build_w_candidates(problem, tuple.w, cfg, spectral_w, stats, found);
-        w_cache.insert(tuple.w, w_candidates);
+        let w_index = SpectralIndex::build(&w_candidates);
+        w_cache.insert(tuple.w, (w_candidates, w_index));
     }
     if found.load(AtomicOrdering::Relaxed) { return Vec::new(); }
-    let w_candidates = w_cache.get(&tuple.w).unwrap();
-    stream_zw_candidates(problem, tuple.z, w_candidates, cfg, spectral_z, stats, found)
+    let (w_candidates, w_index) = w_cache.get(&tuple.w).unwrap();
+    stream_zw_candidates(problem, tuple.z, w_candidates, w_index, cfg, spectral_z, stats, found)
 }
 
 /// Pre-built SAT template for X/Y solving. Contains the structural clauses
@@ -2755,7 +2809,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
             let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
             let mut stats = SearchStats::default();
-            let mut w_cache: HashMap<i32, Vec<SeqWithSpectrum>> = HashMap::new();
+            let mut w_cache: HashMap<i32, (Vec<SeqWithSpectrum>, SpectralIndex)> = HashMap::new();
             loop {
                 if found.load(AtomicOrdering::Relaxed) { break; }
                 // Throttle: if queue is deep, brief sleep to yield CPU to SAT workers
@@ -2768,16 +2822,17 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 if idx >= tuples.len() { break; }
                 let tuple = tuples[idx];
                 let b_start = Instant::now();
-                // Cache W candidates by sum (W is shorter); stream Z fresh each time
+                // Cache W candidates + spectral index by sum; stream Z fresh each time
                 if !w_cache.contains_key(&tuple.w) {
                     let w_candidates = build_w_candidates(
                         problem, tuple.w, &cfg, &spectral_w, &mut stats, &found);
-                    w_cache.insert(tuple.w, w_candidates);
+                    let w_index = SpectralIndex::build(&w_candidates);
+                    w_cache.insert(tuple.w, (w_candidates, w_index));
                 }
                 if found.load(AtomicOrdering::Relaxed) { break; }
-                let w_candidates = w_cache.get(&tuple.w).unwrap();
+                let (w_candidates, w_index) = w_cache.get(&tuple.w).unwrap();
                 stream_zw_candidates_to_channel(
-                    problem, tuple, w_candidates, &cfg, &spectral_z,
+                    problem, tuple, w_candidates, w_index, &cfg, &spectral_z,
                     &mut stats, &found, &tx);
                 stats.phase_b_nanos += b_start.elapsed().as_nanos() as u64;
                 tuples_produced.fetch_add(1, AtomicOrdering::Relaxed);
