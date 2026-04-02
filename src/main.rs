@@ -135,18 +135,6 @@ impl PackedSeq {
         acc
     }
 
-    #[allow(dead_code)]
-    fn boundary_signature(&self, k: usize) -> Vec<i8> {
-        let k = k.min(self.len);
-        let mut sig = Vec::with_capacity(k * 2);
-        for i in 0..k {
-            sig.push(self.get(i));
-        }
-        for i in (self.len - k)..self.len {
-            sig.push(self.get(i));
-        }
-        sig
-    }
 
     #[allow(dead_code)]
     fn as_string(&self) -> String {
@@ -228,17 +216,14 @@ impl fmt::Display for SumTuple {
 struct SearchConfig {
     problem: Problem,
     theta_samples: usize,
-    boundary_k: usize,
     max_z: usize,
     max_w: usize,
-    max_pairs_per_bucket: usize,
     benchmark_repeats: usize,
     stochastic: bool,
     stochastic_seconds: u64,
     sat: bool,
     sat_xy: bool,
     z_sat: bool,
-    dfs: bool,
     /// London §5.1: restrict spectral pair sum to ≤ max_spectral.
     /// If None, uses the default spectral_bound (= (6n-2)/2).
     /// Setting this lower than spectral_bound trades completeness for speed.
@@ -268,17 +253,14 @@ impl Default for SearchConfig {
         Self {
             problem: Problem::new(56),
             theta_samples: 128,
-            boundary_k: 0,
             max_z: 200_000,
             max_w: 200_000,
-            max_pairs_per_bucket: 5_000,
             benchmark_repeats: 0,
             stochastic: false,
             stochastic_seconds: 0,
             sat: false,
             sat_xy: false,
             z_sat: false,
-            dfs: false,
             max_spectral: None,
             verify_seqs: None,
             test_zw: None,
@@ -344,11 +326,7 @@ struct SeqWithSpectrum {
     autocorr: Option<Vec<i32>>,  // lazily computed at pair time
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-enum BoundarySignature {
-    Packed { bits: u64, len: u8 },
-    Raw(Vec<i8>),
-}
+// BoundarySignature removed: bucketing provided no benefit (see commit history).
 
 #[derive(Clone)]
 struct SpectralFilter {
@@ -425,32 +403,7 @@ fn grouped_splits(raw: &[SumTuple]) -> BTreeMap<(i32, i32), Vec<SumTuple>> {
     m
 }
 
-fn boundary_signature_from_values(values: &[i8], k: usize) -> BoundarySignature {
-    let k = k.min(values.len());
-    let len = k * 2;
-    if len <= 64 {
-        let mut bits = 0u64;
-        for i in 0..k {
-            if values[i] == 1 {
-                bits |= 1u64 << i;
-            }
-        }
-        for i in 0..k {
-            if values[values.len() - k + i] == 1 {
-                bits |= 1u64 << (k + i);
-            }
-        }
-        BoundarySignature::Packed {
-            bits,
-            len: len as u8,
-        }
-    } else {
-        let mut sig = Vec::with_capacity(len);
-        sig.extend_from_slice(&values[..k]);
-        sig.extend_from_slice(&values[values.len() - k..]);
-        BoundarySignature::Raw(sig)
-    }
-}
+// boundary_signature_from_values removed: bucketing eliminated.
 
 #[allow(dead_code)]
 fn autocorrs_from_values(values: &[i8]) -> Vec<i32> {
@@ -673,55 +626,18 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8]) -> bool>(
     );
 }
 
-/// Type alias for bucket map used in Z/W sequence caching.
-type SeqBuckets = HashMap<BoundarySignature, Vec<SeqWithSpectrum>>;
-
-/// Generate Z sequences for a given sum, returning buckets keyed by boundary signature.
-/// Results can be cached by (n, sum) to avoid regenerating for different tuples.
-fn build_z_buckets(
-    problem: Problem,
-    z_sum: i32,
-    cfg: &SearchConfig,
-    spectral_z: &SpectralFilter,
-    stats: &mut SearchStats,
-    found: &AtomicBool,
-) -> SeqBuckets {
-    let individual_bound = problem.spectral_bound();
-    let mut z_buckets: SeqBuckets = HashMap::new();
-    let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
-    generate_sequences_with_sum_visit(problem.n, z_sum, true, true, cfg.max_z, |values| {
-        if found.load(AtomicOrdering::Relaxed) { return false; }
-        stats.z_generated += 1;
-        if let Some(spectrum) =
-            spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf)
-        {
-            stats.z_spectral_ok += 1;
-            let bucket = z_buckets.entry(boundary_signature_from_values(values, cfg.boundary_k)).or_default();
-            if bucket.len() < cfg.max_pairs_per_bucket.max(1) {
-                bucket.push(SeqWithSpectrum {
-                    spectrum,
-                    autocorr: None,
-                    seq: PackedSeq::from_values(values),
-                });
-            }
-        }
-        true
-    });
-    z_buckets
-}
-
-/// Generate W sequences for a given sum, returning buckets keyed by boundary signature.
-/// Results can be cached by (m, sum) to avoid regenerating for different tuples.
-fn build_w_buckets(
+/// Generate all spectrally-valid W sequences for a given sum.
+/// W is the shorter sequence (length n-1) so we materialize it; Z is streamed.
+fn build_w_candidates(
     problem: Problem,
     w_sum: i32,
     cfg: &SearchConfig,
     spectral_w: &SpectralFilter,
     stats: &mut SearchStats,
     found: &AtomicBool,
-) -> SeqBuckets {
+) -> Vec<SeqWithSpectrum> {
     let individual_bound = problem.spectral_bound();
-    let mut w_buckets: SeqBuckets = HashMap::new();
+    let mut w_candidates: Vec<SeqWithSpectrum> = Vec::new();
     let mut fft_buf = Vec::with_capacity(spectral_w.fft_size);
     generate_sequences_with_sum_visit(problem.m(), w_sum, true, false, cfg.max_w, |values| {
         if found.load(AtomicOrdering::Relaxed) { return false; }
@@ -730,78 +646,208 @@ fn build_w_buckets(
             spectrum_if_ok(values, spectral_w, individual_bound, &mut fft_buf)
         {
             stats.w_spectral_ok += 1;
-            let bucket = w_buckets.entry(boundary_signature_from_values(values, cfg.boundary_k)).or_default();
-            if bucket.len() < cfg.max_pairs_per_bucket.max(1) {
-                bucket.push(SeqWithSpectrum {
-                    spectrum,
-                    autocorr: None,
-                    seq: PackedSeq::from_values(values),
+            w_candidates.push(SeqWithSpectrum {
+                spectrum,
+                autocorr: None,
+                seq: PackedSeq::from_values(values),
+            });
+        }
+        true
+    });
+    w_candidates
+}
+
+/// Index for fast spectral pair lookups.
+/// For each frequency, stores W candidate indices sorted by power at that frequency.
+/// Given a Z spectrum, we find the tightest frequency (highest Z power), then binary
+/// search to find only the W candidates that could pass at that frequency.
+struct SpectralIndex {
+    /// For each frequency f: Vec of (w_power_at_f, w_index), sorted by power.
+    sorted_by_freq: Vec<Vec<(f64, usize)>>,
+}
+
+impl SpectralIndex {
+    fn build(w_candidates: &[SeqWithSpectrum]) -> Self {
+        if w_candidates.is_empty() {
+            return Self { sorted_by_freq: Vec::new() };
+        }
+        let num_freqs = w_candidates[0].spectrum.len();
+        let mut sorted_by_freq = Vec::with_capacity(num_freqs);
+        for f in 0..num_freqs {
+            let mut entries: Vec<(f64, usize)> = w_candidates.iter().enumerate()
+                .map(|(i, w)| (w.spectrum[f], i))
+                .collect();
+            entries.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            sorted_by_freq.push(entries);
+        }
+        Self { sorted_by_freq }
+    }
+
+    /// Find W candidates that pass budget constraints at the top-4 tightest frequencies.
+    /// Uses binary search on the tightest, then filters by frequencies 2-4.
+    /// Results are written into `out` (cleared first) as W indices.
+    fn candidates_for(&self, z_spectrum: &[f64], pair_bound: f64, w_candidates: &[SeqWithSpectrum], out: &mut Vec<usize>) {
+        out.clear();
+        if self.sorted_by_freq.is_empty() { return; }
+        // Find top-4 tightest frequencies (highest Z power = least budget for W)
+        let mut top: [(f64, usize); 4] = [(f64::MIN, 0); 4];
+        for (f, &zp) in z_spectrum.iter().enumerate() {
+            if zp > top[3].0 {
+                top[3] = (zp, f);
+                // Bubble up
+                for i in (0..3).rev() {
+                    if top[i + 1].0 > top[i].0 {
+                        top.swap(i, i + 1);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        // Binary search on tightest frequency
+        let budget0 = pair_bound - top[0].0;
+        let sorted = &self.sorted_by_freq[top[0].1];
+        let cutoff = sorted.partition_point(|(wp, _)| *wp <= budget0);
+        // Filter by frequencies 2-4
+        let budget1 = pair_bound - top[1].0;
+        let budget2 = pair_bound - top[2].0;
+        let budget3 = pair_bound - top[3].0;
+        let f1 = top[1].1;
+        let f2 = top[2].1;
+        let f3 = top[3].1;
+        for &(_, wi) in &sorted[..cutoff] {
+            let spec = &w_candidates[wi].spectrum;
+            if spec[f1] <= budget1 && spec[f2] <= budget2 && spec[f3] <= budget3 {
+                out.push(wi);
+            }
+        }
+    }
+}
+
+/// Streaming Z×W pairing with spectral index for fast candidate lookup.
+/// For each spectrally-valid Z, uses the index to find W candidates that pass
+/// the top-4 tightest frequency constraints, then full-checks only those.
+fn stream_zw_candidates(
+    problem: Problem,
+    z_sum: i32,
+    w_candidates: &[SeqWithSpectrum],
+    w_index: &SpectralIndex,
+    cfg: &SearchConfig,
+    spectral_z: &SpectralFilter,
+    stats: &mut SearchStats,
+    found: &AtomicBool,
+) -> Vec<CandidateZW> {
+    let individual_bound = problem.spectral_bound();
+    let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
+    let mut out = Vec::new();
+    let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
+    let mut idx_buf = Vec::new();
+    generate_sequences_with_sum_visit(problem.n, z_sum, true, true, cfg.max_z, |values| {
+        if found.load(AtomicOrdering::Relaxed) { return false; }
+        stats.z_generated += 1;
+        let Some(z_spectrum) =
+            spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf) else { return true; };
+        stats.z_spectral_ok += 1;
+        let z_seq = PackedSeq::from_values(values);
+        let mut z_auto: Option<Vec<i32>> = None;
+        w_index.candidates_for(&z_spectrum, pair_bound, w_candidates, &mut idx_buf);
+        for &wi in &idx_buf {
+            let w = &w_candidates[wi];
+            stats.candidate_pair_attempts += 1;
+            if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
+            let max_power = spectral_pair_max_power(&z_spectrum, &w.spectrum);
+            stats.candidate_pair_spectral_ok += 1;
+            let z_auto = z_auto.get_or_insert_with(|| {
+                let mut a = vec![0i32; problem.n];
+                for s in 1..problem.n { a[s] = z_seq.autocorrelation(s); }
+                a
+            });
+            let w_auto = w.autocorr.as_ref().cloned()
+                .unwrap_or_else(|| {
+                    let mut a = vec![0i32; problem.m()];
+                    for s in 1..problem.m() { a[s] = w.seq.autocorrelation(s); }
+                    a
                 });
+            let mut zw = vec![0; problem.n];
+            for (s, slot) in zw.iter_mut().enumerate().skip(1) {
+                let nz = z_auto[s];
+                let nw = if s < problem.m() { w_auto[s] } else { 0 };
+                *slot = 2 * nz + 2 * nw;
+            }
+            out.push(CandidateZW {
+                z: z_seq.clone(),
+                w: w.seq.clone(),
+                zw_autocorr: zw,
+                max_pair_power: max_power,
+            });
+        }
+        true
+    });
+    out
+}
+
+/// Streaming Z×W pairing that sends pairs directly to a channel.
+/// Used by the hybrid producer thread to feed the priority queue without buffering.
+fn stream_zw_candidates_to_channel(
+    problem: Problem,
+    tuple: SumTuple,
+    w_candidates: &[SeqWithSpectrum],
+    w_index: &SpectralIndex,
+    cfg: &SearchConfig,
+    spectral_z: &SpectralFilter,
+    stats: &mut SearchStats,
+    found: &AtomicBool,
+    tx: &std::sync::mpsc::Sender<(SumTuple, CandidateZW)>,
+) {
+    let individual_bound = problem.spectral_bound();
+    let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
+    let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
+    let mut seen = std::collections::HashSet::new();
+    let mut idx_buf = Vec::new();
+    generate_sequences_with_sum_visit(problem.n, tuple.z, true, true, cfg.max_z, |values| {
+        if found.load(AtomicOrdering::Relaxed) { return false; }
+        stats.z_generated += 1;
+        let Some(z_spectrum) =
+            spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf) else { return true; };
+        stats.z_spectral_ok += 1;
+        let z_seq = PackedSeq::from_values(values);
+        let mut z_auto: Option<Vec<i32>> = None;
+        w_index.candidates_for(&z_spectrum, pair_bound, w_candidates, &mut idx_buf);
+        for &wi in &idx_buf {
+            let w = &w_candidates[wi];
+            stats.candidate_pair_attempts += 1;
+            if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
+            let max_power = spectral_pair_max_power(&z_spectrum, &w.spectrum);
+            stats.candidate_pair_spectral_ok += 1;
+            let z_auto = z_auto.get_or_insert_with(|| {
+                let mut a = vec![0i32; problem.n];
+                for s in 1..problem.n { a[s] = z_seq.autocorrelation(s); }
+                a
+            });
+            let w_auto = w.autocorr.as_ref().cloned()
+                .unwrap_or_else(|| {
+                    let mut a = vec![0i32; problem.m()];
+                    for s in 1..problem.m() { a[s] = w.seq.autocorrelation(s); }
+                    a
+                });
+            let mut zw = vec![0; problem.n];
+            for (s, slot) in zw.iter_mut().enumerate().skip(1) {
+                let nz = z_auto[s];
+                let nw = if s < problem.m() { w_auto[s] } else { 0 };
+                *slot = 2 * nz + 2 * nw;
+            }
+            let candidate = CandidateZW {
+                z: z_seq.clone(),
+                w: w.seq.clone(),
+                zw_autocorr: zw,
+                max_pair_power: max_power,
+            };
+            if seen.insert(candidate.zw_autocorr.clone()) {
+                if tx.send((tuple, candidate)).is_err() { return false; }
             }
         }
         true
     });
-    w_buckets
-}
-
-/// Pair Z and W buckets into candidates. The tight pair spectral bound
-/// |Z(θ)|²+|W(θ)|² ≤ spectral_bound is a necessary condition (not heuristic).
-fn pair_zw_candidates(
-    problem: Problem,
-    z_buckets: &SeqBuckets,
-    w_buckets: &SeqBuckets,
-    cfg: &SearchConfig,
-    stats: &mut SearchStats,
-) -> Vec<CandidateZW> {
-    let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
-    let mut out = Vec::new();
-    for (sig, zs) in z_buckets {
-        let Some(ws) = w_buckets.get(sig) else {
-            continue;
-        };
-
-        let mut taken = 0usize;
-        for z in zs {
-            for w in ws {
-                stats.candidate_pair_attempts += 1;
-                if !spectral_pair_ok(&z.spectrum, &w.spectrum, pair_bound) { continue; }
-                let max_power = spectral_pair_max_power(&z.spectrum, &w.spectrum);
-                stats.candidate_pair_spectral_ok += 1;
-                let z_auto = z.autocorr.as_ref().cloned()
-                    .unwrap_or_else(|| {
-                        let mut a = vec![0i32; problem.n];
-                        for s in 1..problem.n { a[s] = z.seq.autocorrelation(s); }
-                        a
-                    });
-                let w_auto = w.autocorr.as_ref().cloned()
-                    .unwrap_or_else(|| {
-                        let mut a = vec![0i32; problem.m()];
-                        for s in 1..problem.m() { a[s] = w.seq.autocorrelation(s); }
-                        a
-                    });
-                let mut zw = vec![0; problem.n];
-                for (s, slot) in zw.iter_mut().enumerate().skip(1) {
-                    let nz = z_auto[s];
-                    let nw = if s < problem.m() { w_auto[s] } else { 0 };
-                    *slot = 2 * nz + 2 * nw;
-                }
-                out.push(CandidateZW {
-                    z: z.seq.clone(),
-                    w: w.seq.clone(),
-                    zw_autocorr: zw,
-                    max_pair_power: max_power,
-                });
-                taken += 1;
-                if taken >= cfg.max_pairs_per_bucket {
-                    break;
-                }
-            }
-            if taken >= cfg.max_pairs_per_bucket {
-                break;
-            }
-        }
-    }
-    out
 }
 
 fn build_zw_candidates(
@@ -813,363 +859,33 @@ fn build_zw_candidates(
     stats: &mut SearchStats,
     found: &AtomicBool,
 ) -> Vec<CandidateZW> {
-    let z_buckets = build_z_buckets(problem, tuple.z, cfg, spectral_z, stats, found);
+    let w_candidates = build_w_candidates(problem, tuple.w, cfg, spectral_w, stats, found);
     if found.load(AtomicOrdering::Relaxed) { return Vec::new(); }
-    let w_buckets = build_w_buckets(problem, tuple.w, cfg, spectral_w, stats, found);
-    pair_zw_candidates(problem, &z_buckets, &w_buckets, cfg, stats)
+    let w_index = SpectralIndex::build(&w_candidates);
+    stream_zw_candidates(problem, tuple.z, &w_candidates, &w_index, cfg, spectral_z, stats, found)
 }
 
-/// Cached version: uses pre-built Z/W bucket caches keyed by sum value.
-/// Avoids regenerating sequences when multiple tuples share the same z or w sum.
+/// Cached version: caches W candidates and spectral index by sum value.
+/// Z is streamed fresh each time — no storage limit, every spectrally-valid Z is tried.
+#[allow(dead_code)]
 fn build_zw_candidates_cached(
     problem: Problem,
     tuple: SumTuple,
     cfg: &SearchConfig,
     spectral_z: &SpectralFilter,
     spectral_w: &SpectralFilter,
-    z_cache: &mut HashMap<i32, SeqBuckets>,
-    w_cache: &mut HashMap<i32, SeqBuckets>,
+    w_cache: &mut HashMap<i32, (Vec<SeqWithSpectrum>, SpectralIndex)>,
     stats: &mut SearchStats,
     found: &AtomicBool,
 ) -> Vec<CandidateZW> {
-    // Z sequences: cache by sum (Z has length n, first/last element = +1)
-    // Note: Z with sum s and Z with sum -s are related by negation, but the
-    // boundary signature matching means we can't trivially reuse one for the other.
-    // We cache exact sum values.
-    if !z_cache.contains_key(&tuple.z) {
-        let buckets = build_z_buckets(problem, tuple.z, cfg, spectral_z, stats, found);
-        z_cache.insert(tuple.z, buckets);
+    if !w_cache.contains_key(&tuple.w) {
+        let w_candidates = build_w_candidates(problem, tuple.w, cfg, spectral_w, stats, found);
+        let w_index = SpectralIndex::build(&w_candidates);
+        w_cache.insert(tuple.w, (w_candidates, w_index));
     }
     if found.load(AtomicOrdering::Relaxed) { return Vec::new(); }
-
-    if !w_cache.contains_key(&tuple.w) {
-        let buckets = build_w_buckets(problem, tuple.w, cfg, spectral_w, stats, found);
-        w_cache.insert(tuple.w, buckets);
-    }
-
-    let z_buckets = z_cache.get(&tuple.z).unwrap();
-    let w_buckets = w_cache.get(&tuple.w).unwrap();
-    pair_zw_candidates(problem, z_buckets, w_buckets, cfg, stats)
-}
-
-#[derive(Clone)]
-struct XYState {
-    x: Vec<i8>,
-    y: Vec<i8>,
-    assigned: Vec<bool>,
-    assigned_positions: Vec<usize>,
-    assigned_position_slot: Vec<usize>,
-    known_lag: Vec<i32>,
-    unknown_lag: Vec<i32>,
-    sum_x: i32,
-    sum_y: i32,
-    remaining_unassigned: usize,
-}
-
-impl XYState {
-    fn new(n: usize) -> Self {
-        let mut unknown_lag = vec![0; n];
-        for (s, slot) in unknown_lag.iter_mut().enumerate().skip(1) {
-            *slot = (n - s) as i32;
-        }
-        Self {
-            x: vec![1; n],
-            y: vec![1; n],
-            assigned: vec![false; n],
-            assigned_positions: Vec::with_capacity(n),
-            assigned_position_slot: vec![usize::MAX; n],
-            known_lag: vec![0; n],
-            unknown_lag,
-            sum_x: 0,
-            sum_y: 0,
-            remaining_unassigned: n,
-        }
-    }
-
-    fn set_pair(&mut self, idx: usize, xv: i8, yv: i8) {
-        if !self.assigned[idx] {
-            self.x[idx] = xv;
-            self.y[idx] = yv;
-            self.update_lags_for_set(idx);
-            self.assigned[idx] = true;
-            self.assigned_position_slot[idx] = self.assigned_positions.len();
-            self.assigned_positions.push(idx);
-            self.sum_x += xv as i32;
-            self.sum_y += yv as i32;
-            self.remaining_unassigned -= 1;
-        }
-    }
-
-    fn unset_pair(&mut self, idx: usize) {
-        if self.assigned[idx] {
-            self.update_lags_for_unset(idx);
-            self.sum_x -= self.x[idx] as i32;
-            self.sum_y -= self.y[idx] as i32;
-            self.assigned[idx] = false;
-            let slot = self.assigned_position_slot[idx];
-            let last = self.assigned_positions.len() - 1;
-            let moved = if slot < last {
-                Some(self.assigned_positions[last])
-            } else {
-                None
-            };
-            self.assigned_positions.swap_remove(slot);
-            self.assigned_position_slot[idx] = usize::MAX;
-            if let Some(moved_idx) = moved {
-                self.assigned_position_slot[moved_idx] = slot;
-            }
-            self.remaining_unassigned += 1;
-        }
-    }
-
-    fn update_lags_for_set(&mut self, idx: usize) {
-        let xi = self.x[idx] as i32;
-        let yi = self.y[idx] as i32;
-        for &j in &self.assigned_positions {
-            let s = idx.abs_diff(j);
-            if s == 0 {
-                continue;
-            }
-            self.unknown_lag[s] -= 1;
-            self.known_lag[s] += (self.x[j] as i32) * xi + (self.y[j] as i32) * yi;
-        }
-    }
-
-    fn update_lags_for_unset(&mut self, idx: usize) {
-        let xi = self.x[idx] as i32;
-        let yi = self.y[idx] as i32;
-        for &j in &self.assigned_positions {
-            let s = idx.abs_diff(j);
-            if s == 0 {
-                continue;
-            }
-            self.unknown_lag[s] += 1;
-            self.known_lag[s] -= (self.x[j] as i32) * xi + (self.y[j] as i32) * yi;
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.remaining_unassigned == 0
-    }
-}
-
-fn partial_autocorr_bounds(known: i32, unknown_pairs: i32, target: i32) -> bool {
-    let min_possible = known - 2 * unknown_pairs;
-    let max_possible = known + 2 * unknown_pairs;
-    target >= min_possible && target <= max_possible
-}
-
-fn lex_leq(a: &[i8], b: &[i8]) -> bool {
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        match x.cmp(&y) {
-            Ordering::Less => return true,
-            Ordering::Greater => return false,
-            Ordering::Equal => continue,
-        }
-    }
-    true
-}
-
-fn lex_leq_reversed(a: &[i8]) -> bool {
-    let n = a.len();
-    for i in 0..n {
-        match a[i].cmp(&a[n - 1 - i]) {
-            Ordering::Less => return true,
-            Ordering::Greater => return false,
-            Ordering::Equal => continue,
-        }
-    }
-    true
-}
-
-fn backtrack_xy(
-    problem: Problem,
-    tuple: SumTuple,
-    candidate: &CandidateZW,
-    stats: &mut SearchStats,
-) -> Option<(PackedSeq, PackedSeq)> {
-    let mut st = XYState::new(problem.n);
-    st.set_pair(0, 1, 1);
-
-    fn recurse(
-        problem: Problem,
-        tuple: SumTuple,
-        cand: &CandidateZW,
-        st: &mut XYState,
-        stats: &mut SearchStats,
-    ) -> bool {
-        stats.xy_nodes += 1;
-        if st.is_complete() {
-            if st.sum_x != tuple.x || st.sum_y != tuple.y || !st.is_complete() {
-                return false;
-            }
-            for s in 1..problem.n {
-                let mut acc = cand.zw_autocorr[s];
-                let limit = problem.n - s;
-                let mut i = 0usize;
-                while i + 4 <= limit {
-                    acc += (st.x[i] as i32) * (st.x[i + s] as i32)
-                        + (st.y[i] as i32) * (st.y[i + s] as i32);
-                    acc += (st.x[i + 1] as i32) * (st.x[i + 1 + s] as i32)
-                        + (st.y[i + 1] as i32) * (st.y[i + 1 + s] as i32);
-                    acc += (st.x[i + 2] as i32) * (st.x[i + 2 + s] as i32)
-                        + (st.y[i + 2] as i32) * (st.y[i + 2 + s] as i32);
-                    acc += (st.x[i + 3] as i32) * (st.x[i + 3 + s] as i32)
-                        + (st.y[i + 3] as i32) * (st.y[i + 3 + s] as i32);
-                    i += 4;
-                }
-                while i < limit {
-                    acc += (st.x[i] as i32) * (st.x[i + s] as i32)
-                        + (st.y[i] as i32) * (st.y[i + s] as i32);
-                    i += 1;
-                }
-                if acc != 0 {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        let mut best_pos = None;
-        let mut best_score = i32::MIN;
-        for pos in 1..problem.n {
-            if st.assigned[pos] {
-                continue;
-            }
-            let mirror = problem.n - 1 - pos;
-            let mut score = 0i32;
-            for &j in &st.assigned_positions {
-                if j == pos || j == mirror {
-                    continue;
-                }
-                if pos.abs_diff(j) > 0 {
-                    score += 1;
-                }
-                if mirror != pos && mirror.abs_diff(j) > 0 {
-                    score += 1;
-                }
-            }
-            if score > best_score {
-                best_score = score;
-                best_pos = Some(pos);
-            }
-        }
-        let Some(pos) = best_pos else {
-            return false;
-        };
-
-        let mirror = problem.n - 1 - pos;
-        let assignments: &[(i8, i8)] = &[(-1, 1), (1, -1), (1, 1), (-1, -1)];
-
-        for &(xp, yp) in assignments {
-            st.set_pair(pos, xp, yp);
-
-            // London §3.3: check sum feasibility after setting pos, before mirror.
-            // Early prune avoids expensive set_pair(mirror) lag updates.
-            let rem_after_pos = st.remaining_unassigned as i32;
-            if tuple.x < st.sum_x - rem_after_pos
-                || tuple.x > st.sum_x + rem_after_pos
-                || tuple.y < st.sum_y - rem_after_pos
-                || tuple.y > st.sum_y + rem_after_pos
-            {
-                stats.xy_pruned_sum += 1;
-                st.unset_pair(pos);
-                continue;
-            }
-
-            let mirror_already_assigned = st.assigned[mirror];
-
-            if pos == mirror || mirror_already_assigned {
-                // Self-mirror or mirror already assigned: only pos is new
-                let mut ok = true;
-                for s in 1..problem.n {
-                    let target = -cand.zw_autocorr[s];
-                    if !partial_autocorr_bounds(st.known_lag[s], st.unknown_lag[s], target) {
-                        stats.xy_pruned_autocorr += 1;
-                        ok = false;
-                        break;
-                    }
-                }
-                if ok && st.is_complete() {
-                    if !lex_leq_reversed(&st.x) || !lex_leq_reversed(&st.y) {
-                        stats.xy_pruned_lex += 1;
-                        ok = false;
-                    }
-                    if ok && !lex_leq(&st.x, &st.y) {
-                        stats.xy_pruned_lex += 1;
-                        ok = false;
-                    }
-                }
-                if ok && recurse(problem, tuple, cand, st, stats) {
-                    return true;
-                }
-                st.unset_pair(pos);
-                continue;
-            }
-
-            for &xq in &[1, -1] {
-                // London §3.3: pre-check x sum feasibility for mirror before set_pair
-                let sum_x_after = st.sum_x + xq as i32;
-                let rem_after_both = rem_after_pos - 1;
-                if tuple.x < sum_x_after - rem_after_both
-                    || tuple.x > sum_x_after + rem_after_both
-                {
-                    stats.xy_pruned_sum += 1;
-                    continue;
-                }
-
-                for &yq in &[1, -1] {
-                    // Pre-check y sum feasibility before expensive set_pair(mirror)
-                    let sum_y_after = st.sum_y + yq as i32;
-                    if tuple.y < sum_y_after - rem_after_both
-                        || tuple.y > sum_y_after + rem_after_both
-                    {
-                        stats.xy_pruned_sum += 1;
-                        continue;
-                    }
-
-                    st.set_pair(mirror, xq, yq);
-
-                    let mut ok = true;
-                    for s in 1..problem.n {
-                        let target = -cand.zw_autocorr[s];
-                        if !partial_autocorr_bounds(st.known_lag[s], st.unknown_lag[s], target) {
-                            stats.xy_pruned_autocorr += 1;
-                            ok = false;
-                            break;
-                        }
-                    }
-
-                    if ok && st.is_complete() {
-                        if !lex_leq_reversed(&st.x) || !lex_leq_reversed(&st.y) {
-                            stats.xy_pruned_lex += 1;
-                            ok = false;
-                        }
-                        if ok && !lex_leq(&st.x, &st.y) {
-                            stats.xy_pruned_lex += 1;
-                            ok = false;
-                        }
-                    }
-
-                    if ok && recurse(problem, tuple, cand, st, stats) {
-                        return true;
-                    }
-
-                    st.unset_pair(mirror);
-                }
-            }
-
-            st.unset_pair(pos);
-        }
-
-        false
-    }
-
-    if recurse(problem, tuple, candidate, &mut st, stats) {
-        Some((PackedSeq::from_values(&st.x), PackedSeq::from_values(&st.y)))
-    } else {
-        None
-    }
+    let (w_candidates, w_index) = w_cache.get(&tuple.w).unwrap();
+    stream_zw_candidates(problem, tuple.z, w_candidates, w_index, cfg, spectral_z, stats, found)
 }
 
 /// Pre-built SAT template for X/Y solving. Contains the structural clauses
@@ -1882,211 +1598,9 @@ fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false }
 }
 
-fn run_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
-    let problem = cfg.problem;
-    let run_start = Instant::now();
-    let mut stats = SearchStats::default();
-
-    if problem.n <= 4 {
-        let found_solution = find_small_tt_exhaustive(problem, &mut stats);
-        return SearchReport {
-            stats,
-            elapsed: run_start.elapsed(),
-            found_solution,
-        };
-    }
-
-    // Both z (length n) and w (length m=n-1) filters must use same FFT size
-    // so their spectrums align for spectral_pair_ok comparison.
-    let max_seq_len = problem.n;
-    let spectral_z = SpectralFilter::new(max_seq_len, cfg.theta_samples);
-    let spectral_w = SpectralFilter::new(max_seq_len, cfg.theta_samples);
-
-    let phase_a_start = Instant::now();
-    let raw = enumerate_sum_tuples(problem);
-    let norm = normalized_tuples(&raw);
-    let groups = grouped_splits(&raw);
-    let phase_a_elapsed = phase_a_start.elapsed();
-
-    if verbose {
-        println!(
-            "TT({}): target energy {}. Phase A: {} raw tuples, {} normalized",
-            problem.n,
-            problem.target_energy(),
-            raw.len(),
-            norm.len()
-        );
-        println!("Phase A: {} split groups", groups.len());
-        println!("Phase A elapsed: {:.3?}", phase_a_elapsed);
-    }
-
-    if !verbose {
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .max(1);
-        if norm.len() < workers * 2 {
-            let mut found_solution = false;
-            for tuple in &norm {
-                let zw_candidates =
-                    build_zw_candidates(problem, *tuple, cfg, &spectral_z, &spectral_w, &mut stats, &AtomicBool::new(false));
-                for cand in &zw_candidates {
-                    if let Some((x, y)) = backtrack_xy(problem, *tuple, cand, &mut stats) {
-                        found_solution = verify_tt(problem, &x, &y, &cand.z, &cand.w);
-                        if found_solution {
-                            break;
-                        }
-                    }
-                }
-                if found_solution {
-                    break;
-                }
-            }
-
-            return SearchReport {
-                stats,
-                elapsed: run_start.elapsed(),
-                found_solution,
-            };
-        }
-
-        let chunk_size = norm.len().div_ceil(workers).max(1);
-        let norm_arc = Arc::new(norm);
-        let spectral_z = Arc::new(spectral_z);
-        let spectral_w = Arc::new(spectral_w);
-        let mut handles = Vec::new();
-
-        for chunk_idx in 0..workers {
-            let start = chunk_idx * chunk_size;
-            if start >= norm_arc.len() {
-                break;
-            }
-            let end = ((chunk_idx + 1) * chunk_size).min(norm_arc.len());
-            let tuples = Arc::clone(&norm_arc);
-            let sz = Arc::clone(&spectral_z);
-            let sw = Arc::clone(&spectral_w);
-            let cfg = cfg.clone();
-
-            handles.push(std::thread::spawn(move || {
-                let mut local_stats = SearchStats::default();
-                let mut found_solution = false;
-                for idx in start..end {
-                    let tuple = tuples[idx];
-                    let zw_candidates =
-                        build_zw_candidates(problem, tuple, &cfg, &sz, &sw, &mut local_stats, &AtomicBool::new(false));
-                    for cand in &zw_candidates {
-                        if let Some((x, y)) = backtrack_xy(problem, tuple, cand, &mut local_stats) {
-                            found_solution = verify_tt(problem, &x, &y, &cand.z, &cand.w);
-                            if found_solution {
-                                break;
-                            }
-                        }
-                    }
-                    if found_solution {
-                        break;
-                    }
-                }
-                (local_stats, found_solution)
-            }));
-        }
-
-        let mut found_solution = false;
-        for handle in handles {
-            if let Ok((local, found)) = handle.join() {
-                stats.merge_from(&local);
-                found_solution |= found;
-            }
-        }
-
-        return SearchReport {
-            stats,
-            elapsed: run_start.elapsed(),
-            found_solution,
-        };
-    }
-
-    for tuple in norm {
-        let phase_b_start = Instant::now();
-        if verbose {
-            println!("Trying tuple family {tuple}");
-        }
-        let zw_candidates =
-            build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats, &AtomicBool::new(false));
-        if verbose {
-            println!("  Phase B: {} candidate (Z,W) pairs", zw_candidates.len());
-            println!("  Phase B elapsed: {:.3?}", phase_b_start.elapsed());
-        }
-
-        for (idx, cand) in zw_candidates.iter().enumerate() {
-            let phase_c_start = Instant::now();
-            if let Some((x, y)) = backtrack_xy(problem, tuple, cand, &mut stats) {
-                if verbose {
-                    print_solution(&format!("Solution (bucket {})", idx), &x, &y, &cand.z, &cand.w);
-                }
-                let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
-                if verbose {
-                    println!("Verification: {ok}");
-                    println!("Phase C elapsed: {:.3?}", phase_c_start.elapsed());
-                    println!(
-                        "Search stats: z_gen={}, z_spec_ok={}, w_gen={}, w_spec_ok={}, pair_attempts={}, pair_spec_ok={}, xy_nodes={}, prune_sum={}, prune_ac={}, prune_lex={}, total_elapsed={:.3?}",
-                        stats.z_generated,
-                        stats.z_spectral_ok,
-                        stats.w_generated,
-                        stats.w_spectral_ok,
-                        stats.candidate_pair_attempts,
-                        stats.candidate_pair_spectral_ok,
-                        stats.xy_nodes,
-                        stats.xy_pruned_sum,
-                        stats.xy_pruned_autocorr,
-                        stats.xy_pruned_lex,
-                        run_start.elapsed(),
-                    );
-                }
-                return SearchReport {
-                    stats,
-                    elapsed: run_start.elapsed(),
-                    found_solution: ok,
-                };
-            }
-            if verbose {
-                println!(
-                    "  Phase C elapsed (bucket {}): {:.3?}",
-                    idx,
-                    phase_c_start.elapsed()
-                );
-            }
-        }
-    }
-
-    if verbose {
-        println!(
-            "Search stats: z_gen={}, z_spec_ok={}, w_gen={}, w_spec_ok={}, pair_attempts={}, pair_spec_ok={}, xy_nodes={}, prune_sum={}, prune_ac={}, prune_lex={}, total_elapsed={:.3?}",
-            stats.z_generated,
-            stats.z_spectral_ok,
-            stats.w_generated,
-            stats.w_spectral_ok,
-            stats.candidate_pair_attempts,
-            stats.candidate_pair_spectral_ok,
-            stats.xy_nodes,
-            stats.xy_pruned_sum,
-            stats.xy_pruned_autocorr,
-            stats.xy_pruned_lex,
-            run_start.elapsed(),
-        );
-        println!("No solution found with current bounds; increase limits for deeper search.");
-    }
-    SearchReport {
-        stats,
-        elapsed: run_start.elapsed(),
-        found_solution: false,
-    }
-}
-
 fn run_benchmark(cfg: &SearchConfig) {
     if cfg.stochastic {
         run_stochastic_benchmark(cfg);
-    } else if cfg.dfs {
-        run_exhaustive_benchmark(cfg);
     } else {
         run_hybrid_benchmark(cfg);
     }
@@ -2112,52 +1626,6 @@ fn run_hybrid_benchmark(cfg: &SearchConfig) {
     let median = elapsed_ms[elapsed_ms.len() / 2];
     let mean = elapsed_ms.iter().sum::<f64>() / elapsed_ms.len() as f64;
     println!("benchmark,summary,mean_ms={:.3},median_ms={:.3},repeats={}", mean, median, repeats);
-}
-
-fn run_exhaustive_benchmark(cfg: &SearchConfig) {
-    let repeats = cfg.benchmark_repeats.max(1);
-    let warmup = run_search(cfg, false);
-    println!(
-        "benchmark,warmup,elapsed_ms={:.3},work_units={},found_solution={}",
-        warmup.elapsed.as_secs_f64() * 1000.0,
-        warmup.stats.work_units(),
-        warmup.found_solution
-    );
-    println!(
-        "benchmark,run,elapsed_ms,work_units,work_units_per_sec,z_gen,w_gen,pair_attempts,xy_nodes,found_solution"
-    );
-    let mut elapsed_ms = Vec::with_capacity(repeats);
-    for run in 1..=repeats {
-        let report = run_search(cfg, false);
-        let ms = report.elapsed.as_secs_f64() * 1000.0;
-        let work = report.stats.work_units();
-        let rate = if report.elapsed.as_secs_f64() > 0.0 {
-            work as f64 / report.elapsed.as_secs_f64()
-        } else {
-            0.0
-        };
-        elapsed_ms.push(ms);
-        println!(
-            "benchmark,{},{:.3},{},{:.3},{},{},{},{},{}",
-            run,
-            ms,
-            work,
-            rate,
-            report.stats.z_generated,
-            report.stats.w_generated,
-            report.stats.candidate_pair_attempts,
-            report.stats.xy_nodes,
-            report.found_solution
-        );
-    }
-
-    elapsed_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let median = elapsed_ms[elapsed_ms.len() / 2];
-    let mean = elapsed_ms.iter().sum::<f64>() / elapsed_ms.len() as f64;
-    println!(
-        "benchmark,summary,mean_ms={:.3},median_ms={:.3},repeats={}",
-        mean, median, repeats
-    );
 }
 
 fn run_stochastic_benchmark(cfg: &SearchConfig) {
@@ -3215,13 +2683,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         }
     };
 
-    // When no table is loaded, boundary signature matching is pointless —
-    // it only restricts Z/W pairing without benefit. Set boundary_k=0 so
-    // all sequences land in the same bucket (full Cartesian pairing).
-    let mut cfg = cfg.clone();
-    if xy_table.is_none() {
-        cfg.boundary_k = 0;
-    }
+    let cfg = cfg.clone();
     let cfg = cfg; // re-bind as immutable
 
     let workers = std::thread::available_parallelism()
@@ -3369,8 +2831,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
             let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
             let mut stats = SearchStats::default();
-            let mut z_cache: HashMap<i32, SeqBuckets> = HashMap::new();
-            let mut w_cache: HashMap<i32, SeqBuckets> = HashMap::new();
+            let mut w_cache: HashMap<i32, (Vec<SeqWithSpectrum>, SpectralIndex)> = HashMap::new();
             loop {
                 if found.load(AtomicOrdering::Relaxed) { break; }
                 // Throttle: if queue is deep, brief sleep to yield CPU to SAT workers
@@ -3383,17 +2844,19 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 if idx >= tuples.len() { break; }
                 let tuple = tuples[idx];
                 let b_start = Instant::now();
-                let candidates = build_zw_candidates_cached(
-                    problem, tuple, &cfg, &spectral_z, &spectral_w,
-                    &mut z_cache, &mut w_cache, &mut stats, &found);
-                stats.phase_b_nanos += b_start.elapsed().as_nanos() as u64;
-                let mut seen = std::collections::HashSet::new();
-                for c in candidates {
-                    if found.load(AtomicOrdering::Relaxed) { break; }
-                    if seen.insert(c.zw_autocorr.clone()) {
-                        if tx.send((tuple, c)).is_err() { break; }
-                    }
+                // Cache W candidates + spectral index by sum; stream Z fresh each time
+                if !w_cache.contains_key(&tuple.w) {
+                    let w_candidates = build_w_candidates(
+                        problem, tuple.w, &cfg, &spectral_w, &mut stats, &found);
+                    let w_index = SpectralIndex::build(&w_candidates);
+                    w_cache.insert(tuple.w, (w_candidates, w_index));
                 }
+                if found.load(AtomicOrdering::Relaxed) { break; }
+                let (w_candidates, w_index) = w_cache.get(&tuple.w).unwrap();
+                stream_zw_candidates_to_channel(
+                    problem, tuple, w_candidates, w_index, &cfg, &spectral_z,
+                    &mut stats, &found, &tx);
+                stats.phase_b_nanos += b_start.elapsed().as_nanos() as u64;
                 tuples_produced.fetch_add(1, AtomicOrdering::Relaxed);
             }
             stats
@@ -3545,14 +3008,10 @@ fn parse_args() -> SearchConfig {
             cfg.problem = Problem::new(v.parse().unwrap_or(cfg.problem.n));
         } else if let Some(v) = arg.strip_prefix("--theta=") {
             cfg.theta_samples = v.parse().unwrap_or(cfg.theta_samples);
-        } else if let Some(v) = arg.strip_prefix("--k=") {
-            cfg.boundary_k = v.parse().unwrap_or(cfg.boundary_k);
         } else if let Some(v) = arg.strip_prefix("--max-z=") {
             cfg.max_z = v.parse().unwrap_or(cfg.max_z);
         } else if let Some(v) = arg.strip_prefix("--max-w=") {
             cfg.max_w = v.parse().unwrap_or(cfg.max_w);
-        } else if let Some(v) = arg.strip_prefix("--max-pairs=") {
-            cfg.max_pairs_per_bucket = v.parse().unwrap_or(cfg.max_pairs_per_bucket);
         } else if let Some(v) = arg.strip_prefix("--benchmark=") {
             cfg.benchmark_repeats = v.parse().unwrap_or(1);
         } else if arg == "--benchmark" {
@@ -3567,8 +3026,6 @@ fn parse_args() -> SearchConfig {
         } else if arg == "--sat-xy" {
             // Legacy alias — hybrid is now the default
             cfg.sat_xy = true;
-        } else if arg == "--dfs" {
-            cfg.dfs = true;
         } else if arg == "--z-sat" {
             cfg.z_sat = true;
         } else if let Some(v) = arg.strip_prefix("--max-spectral=") {
@@ -3742,10 +3199,8 @@ fn main() {
     } else if cfg.stochastic {
         let report = stochastic_search(cfg.problem, true, cfg.stochastic_seconds);
         println!("Stochastic search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
-    } else if cfg.dfs {
-        run_search(&cfg, true);
     } else {
-        // Default: hybrid search (Phase B → SAT X/Y). Use --sat, --stochastic, or --dfs to override.
+        // Default: hybrid search (Phase B → SAT X/Y). Use --sat or --stochastic to override.
         let report = run_hybrid_search(&cfg, true);
         println!("Hybrid search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     }
@@ -3803,17 +3258,14 @@ mod tests {
         let cfg = SearchConfig {
             problem: Problem::new(4),
             theta_samples: 64,
-            boundary_k: 6,
             max_z: 200_000,
             max_w: 200_000,
-            max_pairs_per_bucket: 2_000,
             benchmark_repeats: 1,
             stochastic: false,
             stochastic_seconds: 0,
             sat: false,
             sat_xy: false,
             z_sat: false,
-            dfs: false,
             max_spectral: None,
             verify_seqs: None,
             test_zw: None,
@@ -3824,7 +3276,7 @@ mod tests {
             no_table: true,
             dump_dimacs: None,
         };
-        let report = run_search(&cfg, false);
+        let report = run_hybrid_search(&cfg, false);
         assert!(report.found_solution);
         assert!(report.elapsed.as_secs_f64() < 10.0);
     }
@@ -3839,38 +3291,6 @@ mod tests {
         assert!(verify_tt(p, &x, &y, &z, &w));
     }
 
-    #[test]
-    fn non_shortcut_backtrack_path_finds_xy_for_known_tt6_zw() {
-        let p = Problem::new(6);
-        let z = PackedSeq::from_values(&[-1, -1, 1, -1, 1, 1]);
-        let w = PackedSeq::from_values(&[-1, 1, 1, 1, -1]);
-
-        let mut zw = vec![0; p.n];
-        for (s, slot) in zw.iter_mut().enumerate().skip(1) {
-            let nz = z.autocorrelation(s);
-            let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
-            *slot = 2 * nz + 2 * nw;
-        }
-        let candidate = CandidateZW {
-            z: z.clone(),
-            w: w.clone(),
-            zw_autocorr: zw,
-            max_pair_power: 0.0,
-        };
-        let tuple = SumTuple {
-            x: 4,
-            y: 4,
-            z: z.sum(),
-            w: w.sum(),
-        };
-
-        let mut stats = SearchStats::default();
-        let Some((x, y)) = backtrack_xy(p, tuple, &candidate, &mut stats) else {
-            panic!("expected non-shortcut backtracking path to find an (X,Y) assignment");
-        };
-        assert!(verify_tt(p, &x, &y, &candidate.z, &candidate.w));
-        assert!(stats.xy_nodes > 0);
-    }
 
     #[test]
     fn stochastic_search_finds_tt8() {
@@ -4580,29 +4000,4 @@ mod tests {
         assert!(verify_tt(p, &x, &y, &z, &w), "Solution should verify");
     }
 
-    #[test]
-    fn sat_solves_tt6_known_zw() {
-        // Known TT(6) solution: Z=[-1,-1,1,-1,1,1], W=[-1,1,1,1,-1]
-        // Negated to match root_one: Z=[1,1,-1,1,-1,-1], W=[1,-1,-1,-1,1]
-        let p = Problem::new(6);
-        let z = PackedSeq::from_values(&[1, 1, -1, 1, -1, -1]);
-        let w = PackedSeq::from_values(&[1, -1, -1, -1, 1]);
-        let z_sum: i32 = [1, 1, -1, 1, -1, -1].iter().sum();
-        let w_sum: i32 = [1, -1, -1, -1, 1].iter().sum();
-        let tuple = SumTuple { x: 0, y: 0, z: z_sum, w: w_sum };
-        // Check tuple is valid
-        assert_eq!(tuple.x*tuple.x + tuple.y*tuple.y + 2*tuple.z*tuple.z + 2*tuple.w*tuple.w,
-                   p.target_energy(), "Tuple should satisfy energy equation");
-        let mut zw = vec![0i32; p.n];
-        for s in 1..p.n {
-            let nz = z.autocorrelation(s);
-            let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
-            zw[s] = 2 * nz + 2 * nw;
-        }
-        let candidate = CandidateZW { z, w, zw_autocorr: zw, max_pair_power: 0.0 };
-        let template = SatXYTemplate::build(p, tuple);
-        assert!(template.is_some(), "Template should build for n=6 tuple {:?}", tuple);
-        let result = template.unwrap().solve_for(&candidate);
-        assert!(result.is_some(), "SAT should find X,Y for known TT(6) Z,W pair");
-    }
 }

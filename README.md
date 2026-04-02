@@ -66,9 +66,6 @@ target/release/turyn --n=14 --z-sat --theta=128 --max-z=50000
 # Stochastic search via simulated annealing
 target/release/turyn --n=16 --stochastic
 
-# Exhaustive DFS search (original method, small n only)
-target/release/turyn --n=8 --dfs --theta=64 --max-z=200000 --max-w=200000 --max-pairs=2000
-
 # Dump DIMACS CNF for external solvers
 target/release/turyn --n=14 --dump-dimacs=tt14.cnf
 
@@ -88,7 +85,6 @@ target/release/turyn --n=14 --benchmark=3
 | *(default)* | Hybrid search: Phase B + SAT X/Y, parallelized across cores |
 | `--sat` | Full SAT encoding of all four sequences |
 | `--z-sat` | DFS generates Z only, SAT solves X/Y/W jointly |
-| `--dfs` | Exhaustive DFS with spectral filtering (small n only) |
 | `--stochastic` | Multi-threaded simulated annealing |
 | `--sat-xy` | Legacy alias for hybrid (no-op, hybrid is now default) |
 
@@ -98,10 +94,8 @@ target/release/turyn --n=14 --benchmark=3
 |---|---|---|
 | `--n=N` | 56 | Problem size (search for TT(n)) |
 | `--theta=SAMPLES` | 128 | Number of frequency samples for spectral filtering |
-| `--k=K` | 0 | XY boundary table prefix/suffix size |
-| `--max-z=N` | 200000 | Max Z sequences to generate in Phase B |
-| `--max-w=N` | 200000 | Max W sequences to generate in Phase B |
-| `--max-pairs=N` | 5000 | Max Z/W pairs per signature bucket |
+| `--max-z=N` | 200000 | Max Z sequences to enumerate in Phase B |
+| `--max-w=N` | 200000 | Max W sequences to enumerate in Phase B |
 | `--max-spectral=M` | *(auto)* | Tighter spectral bound (London §5.1, default = (6n-2)/2) |
 | `--conflict-limit=N` | 0 | Max SAT conflicts per solve (0 = unlimited) |
 
@@ -152,8 +146,7 @@ At n >= 28, no Z/W pairs survive the spectral pair filter -- this is the Phase B
 
 Given a valid (Z,W) pair, find X and Y. Three approaches:
 
-- **Custom backtracker** (`backtrack_xy`): DFS with autocorrelation bounds pruning. The original method.
-- **SAT X/Y** (`--sat-xy`): Encode X/Y constraints as CNF with totalizer cardinality encoding, solve with radical. Proves UNSAT in milliseconds vs hours for the backtracker.
+- **SAT X/Y** (default hybrid): Encode X/Y constraints as CNF with totalizer cardinality encoding, solve with radical.
 - **SAT X/Y/W** (`--z-sat`): Skip W from Phase B. Generate only Z via DFS + spectral filtering, then SAT-solve X/Y/W jointly. Bypasses the spectral pairing bottleneck entirely.
 
 ### Full SAT (`--sat`)
