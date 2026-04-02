@@ -15,7 +15,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(26);
     let k: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(6);
-    let outfile = args.get(3).map(|s| s.as_str()).unwrap_or("xy-table.bin");
+    let default_outfile = format!("xy-table-n{}-k{}.bin", n, k);
+    let outfile = args.get(3).map(|s| s.as_str()).unwrap_or(&default_outfile);
 
     assert!(2 * k <= n, "2*k must be <= n");
     assert!(k <= 13, "k must be <= 13");

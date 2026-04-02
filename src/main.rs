@@ -234,7 +234,7 @@ struct SearchConfig {
     /// Run only Phase A (print tuples) or Phase B (print Z/W pairs).
     phase_only: Option<String>,
     /// Path to XY boundary table file for table-based Phase C.
-    /// Defaults to "./xy-table.bin".
+    /// Defaults to "./xy-table-n{N}-k6.bin".
     xy_table_path: Option<String>,
     /// Run without XY boundary table (slower).
     no_table: bool,
@@ -2620,7 +2620,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     // Load XY boundary table (default: ./xy-table.bin).
     // Skip table for n < 12: the search space is tiny and boundary signature
     // matching with k=6 covers the entire sequence, over-restricting Z/W pairing.
-    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table.bin".to_string());
+    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| format!("./xy-table-n{}-k6.bin", problem.n));
     let xy_table: Option<Arc<XYBoundaryTable>> = if cfg.no_table || problem.n < 12 {
         None
     } else {
@@ -2631,9 +2631,11 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             }
             None => {
                 eprintln!("Error: XY boundary table not found at '{}'", table_path);
-                eprintln!("Generate it once (reusable for any n):");
+                eprintln!("Generate it once with:");
                 eprintln!("  cargo build --release --bin gen_table");
-                eprintln!("  target/release/gen_table {} 6 {}", problem.n, table_path);
+                eprintln!("  target/release/gen_table {} 6", problem.n);
+                eprintln!("For better performance (larger table, ~2GB):");
+                eprintln!("  target/release/gen_table {} 7", problem.n);
                 eprintln!("Or run with --no-table to skip (slower).");
                 std::process::exit(1);
             }
