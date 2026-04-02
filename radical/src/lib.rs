@@ -75,18 +75,64 @@ struct PbConstraint {
 /// lits are undef or one is true → force a false assignment to prevent exceeding.
 /// Per-term data for a quadratic PB constraint, packed into a single struct
 /// for cache-friendly access and cheap cloning (one Vec instead of ten).
+/// State lookup table for quad PB terms. Indexed by:
+///   aa * 12 + ab * 4 + tv_offset
+/// where aa/ab are LBool as u8 (Undef=0, True=1, False=2) and
+/// tv_offset encodes the true_val pair (0-3).
+/// Returns: 0=DEAD, 1=MAYBE, 2=TRUE.
+static QPB_STATE_TABLE: [u8; 36] = [
+    // aa=Undef(0), ab=Undef(0): always MAYBE
+    1, 1, 1, 1,
+    // aa=Undef(0), ab=True(1): MAYBE if mb, DEAD if !mb
+    //   tv=(T,T)→mb=1→M, tv=(T,F)→mb=0→D, tv=(F,T)→mb=1→M, tv=(F,F)→mb=0→D
+    1, 0, 1, 0,
+    // aa=Undef(0), ab=False(2): MAYBE if mb, DEAD if !mb
+    //   tv=(T,T)→mb=0→D, tv=(T,F)→mb=1→M, tv=(F,T)→mb=0→D, tv=(F,F)→mb=1→M
+    0, 1, 0, 1,
+    // aa=True(1), ab=Undef(0): MAYBE if ma, DEAD if !ma
+    //   tv=(T,*)→ma=1→M, tv=(F,*)→ma=0→D
+    1, 1, 0, 0,
+    // aa=True(1), ab=True(1): TRUE if ma&&mb, else DEAD
+    2, 0, 0, 0,
+    // aa=True(1), ab=False(2)
+    0, 2, 0, 0,
+    // aa=False(2), ab=Undef(0)
+    0, 0, 1, 1,
+    // aa=False(2), ab=True(1)
+    0, 0, 2, 0,
+    // aa=False(2), ab=False(2)
+    0, 0, 0, 2,
+];
+
 #[derive(Clone, Copy, Debug)]
 struct QuadPbTerm {
     lit_a: Lit,
     lit_b: Lit,
-    var_a: u32,     // variable index (was usize, but u32 is sufficient and saves space)
-    var_b: u32,
-    coeff: u32,
-    true_val_a: LBool,  // the LBool value that means "literal a is true"
-    true_val_b: LBool,
-    neg_a: bool,
-    neg_b: bool,
+    coeff: u16,
+    var_a: u16,     // cached var_of(lit_a) as u16
+    var_b: u16,     // cached var_of(lit_b) as u16
     state: u8,      // 0=DEAD, 1=MAYBE, 2=TRUE
+    tv_offset: u8,  // precomputed: (if lit_a < 0 { 2 } else { 0 }) + (if lit_b < 0 { 1 } else { 0 })
+}
+
+impl QuadPbTerm {
+    #[inline(always)]
+    fn var_a(&self) -> usize { self.var_a as usize }
+    #[inline(always)]
+    fn var_b(&self) -> usize { self.var_b as usize }
+    #[inline(always)]
+    fn true_val_a(&self) -> LBool { if self.lit_a > 0 { LBool::True } else { LBool::False } }
+    #[inline(always)]
+    fn true_val_b(&self) -> LBool { if self.lit_b > 0 { LBool::True } else { LBool::False } }
+    #[inline(always)]
+    fn neg_a(&self) -> bool { self.lit_a < 0 }
+    #[inline(always)]
+    fn neg_b(&self) -> bool { self.lit_b < 0 }
+    /// Compute state from two LBool assignments using branchless table lookup.
+    #[inline(always)]
+    fn compute_state(&self, aa: LBool, ab: LBool) -> u8 {
+        QPB_STATE_TABLE[(aa as u8 as usize) * 12 + (ab as u8 as usize) * 4 + self.tv_offset as usize]
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -94,8 +140,9 @@ struct QuadPbConstraint {
     terms: Vec<QuadPbTerm>,  // single Vec instead of 10 separate ones
     target: u32,
     num_terms: u32,
-    sum_true: i32,
-    sum_maybe: i32,
+    /// Branchless counter array indexed by state: sums[0]=dead(unused), sums[1]=maybe, sums[2]=true.
+    /// Replaces separate sum_true/sum_maybe fields for branch-free updates.
+    sums: [i32; 3],
 }
 
 /// Reason a variable was assigned (for conflict analysis).
@@ -148,10 +195,13 @@ pub struct Solver {
     // Quadratic PB constraints
     quad_pb_constraints: Vec<QuadPbConstraint>,
     quad_pb_var_watches: Vec<Vec<u32>>,       // quad_pb_var_watches[var] = list of constraint indices
-    quad_pb_var_terms: Vec<Vec<(u32, u16)>>,
+    quad_pb_var_terms: Vec<Vec<(u32, u16, bool)>>,  // (constraint_idx, term_idx, is_var_a)
     // Stored explanations: captured at propagation time, used during analysis.
     // Indexed by variable. Cleared on backtrack.
     quad_pb_reasons: Vec<Option<Vec<Lit>>>,
+    // Reusable scratch buffers for propagate_quad_pb (avoid per-call allocation)
+    quad_pb_expl_buf: Vec<Lit>,
+    quad_pb_seen_buf: Vec<bool>,
 
     // Propagation queue
     prop_head: usize, // next trail entry to propagate
@@ -213,6 +263,8 @@ impl Solver {
             quad_pb_var_watches: Vec::new(),
             quad_pb_var_terms: Vec::new(),
             quad_pb_reasons: Vec::new(),
+            quad_pb_expl_buf: Vec::new(),
+            quad_pb_seen_buf: Vec::new(),
             activity: Vec::new(),
             var_inc: 1.0,
             var_decay: 0.95,
@@ -357,34 +409,29 @@ impl Solver {
         // Watch by variable + build term index
         let mut watched = std::collections::HashSet::new();
         for i in 0..lits_a.len() {
-            for &lit in &[lits_a[i], lits_b[i]] {
-                let v = var_of(lit);
-                if watched.insert(v) {
-                    self.quad_pb_var_watches[v].push(qi);
-                }
-                self.quad_pb_var_terms[v].push((qi, i as u16));
-            }
+            let va = var_of(lits_a[i]);
+            let vb = var_of(lits_b[i]);
+            if watched.insert(va) { self.quad_pb_var_watches[va].push(qi); }
+            if watched.insert(vb) { self.quad_pb_var_watches[vb].push(qi); }
+            self.quad_pb_var_terms[va].push((qi, i as u16, true));   // is_var_a = true
+            self.quad_pb_var_terms[vb].push((qi, i as u16, false));  // is_var_a = false
         }
 
         let terms: Vec<QuadPbTerm> = (0..lits_a.len()).map(|i| {
             QuadPbTerm {
                 lit_a: lits_a[i],
                 lit_b: lits_b[i],
-                var_a: var_of(lits_a[i]) as u32,
-                var_b: var_of(lits_b[i]) as u32,
-                coeff: coeffs[i],
-                true_val_a: if lits_a[i] > 0 { LBool::True } else { LBool::False },
-                true_val_b: if lits_b[i] > 0 { LBool::True } else { LBool::False },
-                neg_a: lits_a[i] < 0,
-                neg_b: lits_b[i] < 0,
+                coeff: coeffs[i] as u16,
+                var_a: var_of(lits_a[i]) as u16,
+                var_b: var_of(lits_b[i]) as u16,
                 state: 1, // MAYBE
+                tv_offset: (if lits_a[i] < 0 { 2u8 } else { 0 }) + (if lits_b[i] < 0 { 1 } else { 0 }),
             }
         }).collect();
         self.quad_pb_constraints.push(QuadPbConstraint {
             target,
             num_terms: terms.len() as u32,
-            sum_true: 0,
-            sum_maybe: coeffs.iter().sum::<u32>() as i32,
+            sums: [0, coeffs.iter().sum::<u32>() as i32, 0],
             terms,
         });
 
@@ -475,13 +522,12 @@ impl Solver {
 
     /// Reset a quad PB constraint's incremental state from precomputed values.
     /// Used for fast boundary config switching without backtracking.
-    pub fn reset_quad_pb_state(&mut self, qi: usize, term_state: &[u8], sum_true: i32, sum_maybe: i32) {
+    pub fn reset_quad_pb_state(&mut self, qi: usize, term_state: &[u8], #[allow(unused)] sum_true: i32, sum_maybe: i32) {
         let qc = &mut self.quad_pb_constraints[qi];
         for (i, &s) in term_state.iter().enumerate() {
             qc.terms[i].state = s;
         }
-        qc.sum_true = sum_true;
-        qc.sum_maybe = sum_maybe;
+        qc.sums = [0, sum_maybe, sum_true];
     }
 
     /// Get the number of quad PB constraints.
@@ -493,7 +539,7 @@ impl Solver {
     /// Get quad PB term info for precomputation.
     pub fn quad_pb_term_info(&self, qi: usize, ti: usize) -> (usize, usize, bool, bool) {
         let t = &self.quad_pb_constraints[qi].terms[ti];
-        (t.var_a as usize, t.var_b as usize, t.neg_a, t.neg_b)
+        (t.var_a(), t.var_b(), t.neg_a(), t.neg_b())
     }
 
     /// Full reset to base state: unassign all variables, clear trail, reset conflicts.
@@ -636,10 +682,11 @@ impl Solver {
             // Quadratic PB: incremental update + propagation
             if !self.quad_pb_constraints.is_empty() {
                 let v = var_of(lit);
+                let known_val = self.assigns[v]; // just assigned, hot in cache
                 // Update term states for all terms involving this variable
                 for idx in 0..self.quad_pb_var_terms[v].len() {
-                    let (qi, ti) = self.quad_pb_var_terms[v][idx];
-                    self.update_quad_pb_term(qi, ti as usize);
+                    let (qi, ti, is_a) = self.quad_pb_var_terms[v][idx];
+                    self.update_quad_pb_term_hint(qi, ti as usize, known_val, is_a);
                 }
                 // Propagate constraints watching this variable
                 for idx in 0..self.quad_pb_var_watches[v].len() {
@@ -794,47 +841,42 @@ impl Solver {
         clause
     }
 
-    /// Propagate a quadratic PB constraint: sum(coeffs[i] * a_i * b_i) = target.
-    /// Single-pass: computes slack and finds propagation in one scan.
-    /// Recompute a single term's state and update incremental counters.
-    /// Returns the new state (0=DEAD, 1=MAYBE, 2=TRUE).
-    #[inline(never)]
-    fn update_quad_pb_term(&mut self, qi: u32, ti: usize) {
+    /// Update a single quad PB term's state with a hint: the caller knows the
+    /// value of one variable (is_a=true → var_a's value, is_a=false → var_b's value).
+    /// This avoids one random assigns[] lookup per call (the 40% hotspot).
+    #[inline(always)]
+    fn update_quad_pb_term_hint(&mut self, qi: u32, ti: usize, known_val: LBool, is_a: bool) {
         let t = &self.quad_pb_constraints[qi as usize].terms[ti];
-        let aa = self.assigns[t.var_a as usize];
-        let ab = self.assigns[t.var_b as usize];
-
-        let new_state = if aa == LBool::Undef {
-            if ab == LBool::Undef { 1u8 }
-            else if ab != t.true_val_b { 0u8 }
-            else { 1u8 }
-        } else if ab == LBool::Undef {
-            if aa != t.true_val_a { 0u8 }
-            else { 1u8 }
+        // Only look up the *other* variable's assignment
+        let (aa, ab) = if is_a {
+            (known_val, self.assigns[t.var_b()])
         } else {
-            if (aa != t.true_val_a) | (ab != t.true_val_b) { 0u8 } else { 2u8 }
+            (self.assigns[t.var_a()], known_val)
         };
+
+        let new_state = t.compute_state(aa, ab);
 
         let qc = &mut self.quad_pb_constraints[qi as usize];
         let old_state = qc.terms[ti].state;
         if old_state == new_state { return; }
 
         let c = qc.terms[ti].coeff as i32;
-        if old_state == 1 { qc.sum_maybe -= c; }
-        else if old_state == 2 { qc.sum_true -= c; }
-        if new_state == 1 { qc.sum_maybe += c; }
-        else if new_state == 2 { qc.sum_true += c; }
+        // Branchless: decrement old bucket, increment new bucket.
+        // sums[0] (dead) is unused but absorbs index 0 writes harmlessly.
+        qc.sums[old_state as usize] -= c;
+        qc.sums[new_state as usize] += c;
         qc.terms[ti].state = new_state;
     }
 
     /// Propagate a quadratic PB constraint using incremental counters.
-    #[inline(never)]
+    /// Single-pass: finds propagation and builds explanation in one fused scan.
+    #[inline]
     fn propagate_quad_pb(&mut self, qi: u32) -> Option<Reason> {
         let qc = &self.quad_pb_constraints[qi as usize];
         let n = qc.num_terms as usize;
         let target = qc.target as i64;
-        let sum_true = qc.sum_true as i64;
-        let sum_maybe = qc.sum_maybe as i64;
+        let sum_true = qc.sums[2] as i64;
+        let sum_maybe = qc.sums[1] as i64;
 
         if sum_true + sum_maybe < target || sum_true > target {
             return Some(Reason::QuadPb(qi)); // conflict
@@ -844,12 +886,17 @@ impl Solver {
         let slack_down = target - sum_true;
         if slack_up > 0 && slack_down > 0 { return None; }
 
+        // Grow seen buffer if needed; clear only used entries after each propagation
+        if self.quad_pb_seen_buf.len() < self.num_vars {
+            self.quad_pb_seen_buf.resize(self.num_vars, false);
+        }
+
         for i in 0..n {
             let t = &self.quad_pb_constraints[qi as usize].terms[i];
-            let aa = self.assigns[t.var_a as usize];
-            let ab = self.assigns[t.var_b as usize];
-            let a_false = aa != LBool::Undef && aa != t.true_val_a;
-            let b_false = ab != LBool::Undef && ab != t.true_val_b;
+            let aa = self.assigns[t.var_a()];
+            let ab = self.assigns[t.var_b()];
+            let a_false = aa != LBool::Undef && aa != t.true_val_a();
+            let b_false = ab != LBool::Undef && ab != t.true_val_b();
             if a_false | b_false { continue; }
             let a_undef = aa == LBool::Undef;
             let b_undef = ab == LBool::Undef;
@@ -869,35 +916,44 @@ impl Solver {
 
             let pv = var_of(propagated_lit);
             let is_upper = c > slack_down;
-            let mut explanation = Vec::new();
+
+            // Reuse scratch buffers instead of allocating
+            self.quad_pb_expl_buf.clear();
+            let seen = &mut self.quad_pb_seen_buf;
             {
                 let terms = &self.quad_pb_constraints[qi as usize].terms;
-                let mut seen_v = vec![false; self.num_vars];
                 for t in terms {
-                    let va = t.var_a as usize;
-                    let vb = t.var_b as usize;
+                    let va = t.var_a();
+                    let vb = t.var_b();
                     let aa = self.assigns[va];
                     let ab = self.assigns[vb];
-                    let a_false = (aa == LBool::True && t.neg_a) || (aa == LBool::False && !t.neg_a);
-                    let b_false = (ab == LBool::True && t.neg_b) || (ab == LBool::False && !t.neg_b);
+                    let af = (aa == LBool::True && t.neg_a()) || (aa == LBool::False && !t.neg_a());
+                    let bf = (ab == LBool::True && t.neg_b()) || (ab == LBool::False && !t.neg_b());
 
-                    if a_false || b_false {
-                        let (lit, v) = if a_false { (t.lit_a, va) } else { (t.lit_b, vb) };
-                        if v != pv && !seen_v[v] && self.level[v] > 0 {
-                            seen_v[v] = true;
-                            explanation.push(lit);
+                    if af || bf {
+                        let (lit, v) = if af { (t.lit_a, va) } else { (t.lit_b, vb) };
+                        if v != pv && !seen[v] && self.level[v] > 0 {
+                            seen[v] = true;
+                            self.quad_pb_expl_buf.push(lit);
                         }
                     } else if is_upper && aa != LBool::Undef && ab != LBool::Undef {
-                        for &(lit, v) in &[(t.lit_a, va), (t.lit_b, vb)] {
-                            if v != pv && !seen_v[v] && self.level[v] > 0 {
-                                seen_v[v] = true;
-                                explanation.push(negate(lit));
-                            }
+                        if va != pv && !seen[va] && self.level[va] > 0 {
+                            seen[va] = true;
+                            self.quad_pb_expl_buf.push(negate(t.lit_a));
+                        }
+                        if vb != pv && !seen[vb] && self.level[vb] > 0 {
+                            seen[vb] = true;
+                            self.quad_pb_expl_buf.push(negate(t.lit_b));
                         }
                     }
                 }
             }
-            self.quad_pb_reasons[pv] = Some(explanation);
+            // Clear seen flags for used entries
+            for &lit in &self.quad_pb_expl_buf {
+                seen[var_of(lit)] = false;
+            }
+            // Clone into storage, keeping buffer capacity for reuse
+            self.quad_pb_reasons[pv] = Some(self.quad_pb_expl_buf.clone());
             self.enqueue(propagated_lit, Reason::QuadPb(qi));
             return None;
         }
@@ -953,7 +1009,7 @@ impl Solver {
                         let mut lits = Vec::new();
                         let mut seen_v = vec![false; self.num_vars];
                         for t in terms {
-                            for &(lit, v) in &[(t.lit_a, t.var_a as usize), (t.lit_b, t.var_b as usize)] {
+                            for &(lit, v) in &[(t.lit_a, t.var_a()), (t.lit_b, t.var_b())] {
                                 if !seen_v[v] && self.assigns[v] != LBool::Undef && self.level[v] > 0 {
                                     seen_v[v] = true;
                                     lits.push(if self.lit_value(lit) == LBool::False { lit } else { negate(lit) });
@@ -1091,8 +1147,8 @@ impl Solver {
             // Skip for level 0 when caller manages state externally (table path).
             if !(level == 0 && self.skip_backtrack_quad_pb) {
                 for idx in 0..self.quad_pb_var_terms[v].len() {
-                    let (qi, ti) = self.quad_pb_var_terms[v][idx];
-                    self.update_quad_pb_term(qi, ti as usize);
+                    let (qi, ti, is_a) = self.quad_pb_var_terms[v][idx];
+                    self.update_quad_pb_term_hint(qi, ti as usize, LBool::Undef, is_a);
                 }
             }
             self.heap_insert(v);
@@ -1105,8 +1161,7 @@ impl Solver {
         if level == 0 && self.skip_backtrack_quad_pb && !self.quad_pb_constraints.is_empty() {
             for qc in &mut self.quad_pb_constraints {
                 let total: i32 = qc.terms.iter().map(|t| t.coeff as i32).sum();
-                qc.sum_true = 0;
-                qc.sum_maybe = total;
+                qc.sums = [0, total, 0];
                 for t in qc.terms.iter_mut() { t.state = 1; } // all MAYBE
             }
         }

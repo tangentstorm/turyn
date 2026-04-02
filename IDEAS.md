@@ -126,6 +126,8 @@ London holds the record for longest known Turyn type sequences (TT(40)). His the
 
 ### Implemented from London thesis
 
+- **Z/W-indexed boundary table** *(London §3.3, Step 1)*: Pre-enumerate all valid X/Y boundary configurations (prefix+suffix of length k) and index them by Z/W boundary bits. At runtime, given a Z/W candidate, extract its boundary bits, do a single O(1) array lookup, and get all compatible (x_bits, y_bits) pairs. The precomputation checks autocorrelation constraints for boundary-only lags (lags where all position pairs fall within the boundary). For n=26, k=6: 27K distinct X/Y autocorrelation signatures, 444M total stored (z,w,x,y) matches, 3.6GB table, ~264 X/Y configs per Z/W lookup on average. Table is mmap'd at runtime. **Implemented.**
+
 - **Spectral budget restriction (`--max-spectral`)** *(London §5.1)*: Added `--max-spectral=M` CLI parameter. Restricts spectral pair filter to `|Z(ω)|² + |W(ω)|² ≤ M` at every frequency. Individual filtering still uses full spectral_bound. Trades completeness for dramatically reduced search space at larger n. London used M=66 for first TT(32), M=84 for first TT(40). No regression on existing benchmarks (pair filter already rejects everything at n=16). **Implemented.**
 
 - **Early sum feasibility pruning in XY backtracker** *(London §3.3, Step 6)*: Restructured backtrack_xy to set pos first, then pre-check sum feasibility for the mirror position BEFORE the expensive set_pair(mirror) call. Also checks x and y sum bounds independently for xq and yq. Additionally fixed a latent bug where the backtracker would corrupt state when the mirror position was already assigned. Phase C benchmark (n=16, θ=100): xy_nodes `901,772 → 10,368` (**87× reduction**), runtime `1903ms → 17.5ms` (**-99.1%**). Primary exhaustive benchmark (θ=20000): neutral (Phase C not triggered). **Implemented.**
@@ -137,6 +139,22 @@ London holds the record for longest known Turyn type sequences (TT(40)). His the
 - **Pair-based tuple searching** *(London §3.4, item 4)*: Checked whether normalized tuples share (|z|, |w|) sums, which would allow reusing Z/W candidates across tuples. For n=16: all 4 tuples have unique (|z|, |w|) pairs. For n=22: all 10 tuples have unique (|z|, |w|) pairs. No savings possible at current benchmark sizes. **Not implemented.**
 
 - **Optimal theta ≈ 100** *(London §3.4, item 6)*: Tested theta values 50–20000 on both exhaustive and solution-finding benchmarks. Results are configuration-dependent: theta=100 is fastest for Phase B (FFT cost scales with theta) but lets more Z/W pairs through, triggering expensive Phase C at n=16 (1622ms). theta=200+ rejects all pairs at n=16, giving 22ms. London's theta=100 is optimal for his non-FFT spectral computation; for our FFT-based approach, theta=200–256 is the sweet spot for n=16. **Configuration finding, not code change.**
+
+### Table refinement ideas (not yet implemented)
+
+The Z/W-indexed boundary table works well at k=6 (3.6GB, 444M matches) but explodes at k=7 (87GB, 11.5B matches). Several refinements could shrink the table and enable larger k:
+
+1. **Sum-tuple filtering in gen_table**: Only store (x,y) configs where the boundary sums are compatible with at least one valid sum tuple for the given n. Currently the table stores ALL autocorrelation-compatible configs regardless of sum feasibility. Since sum tuples are sparse (e.g. 192 tuples for n=26), this could cut the table size dramatically.
+
+2. **Partial-lag autocorrelation filtering**: In addition to exact lags (all pairs in boundary), also check partial lags where most but not all pairs are in the boundary. The boundary-only portion of a partial lag constrains the allowed range for the middle portion. Filtering configs that exceed this range at gen_table time would reduce stored matches.
+
+3. **GJ equality pre-filtering**: Some GJ equalities (e.g. x[i] = ±y[j] for boundary positions i,j) hold for ALL Z/W candidates at certain lags. Pre-filtering these in gen_table would further reduce stored configs.
+
+4. **Sub-indexing by sum pair**: Within each Z/W bucket, sort (x,y) entries by (x_bnd_sum, y_bnd_sum). At runtime, binary-search to the sum-matching sub-range instead of scanning all entries. Cuts the per-candidate scan from ~264 to ~20-30 entries.
+
+5. **Compressed storage**: Many Z/W configs map to the same set of (x,y) pairs (because the exact-lag signature is what determines compatibility, and many Z/W configs share the same signature). Store unique (x,y) lists once, with the index pointing to shared lists. Could reduce the 3.6GB table to ~200-500MB.
+
+6. **Lazy mmap with real file-backed mapping**: For k≥8 tables (16GB+), use actual OS mmap instead of read-to-vec. Only the pages touched during a run get loaded into RAM. The OS handles paging automatically.
 
 ## Re-check (2026-03-30, after user follow-up)
 
