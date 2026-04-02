@@ -152,6 +152,9 @@ pub struct Solver {
     // Stored explanations: captured at propagation time, used during analysis.
     // Indexed by variable. Cleared on backtrack.
     quad_pb_reasons: Vec<Option<Vec<Lit>>>,
+    // Reusable scratch buffers for propagate_quad_pb (avoid per-call allocation)
+    quad_pb_expl_buf: Vec<Lit>,
+    quad_pb_seen_buf: Vec<bool>,
 
     // Propagation queue
     prop_head: usize, // next trail entry to propagate
@@ -213,6 +216,8 @@ impl Solver {
             quad_pb_var_watches: Vec::new(),
             quad_pb_var_terms: Vec::new(),
             quad_pb_reasons: Vec::new(),
+            quad_pb_expl_buf: Vec::new(),
+            quad_pb_seen_buf: Vec::new(),
             activity: Vec::new(),
             var_inc: 1.0,
             var_decay: 0.95,
@@ -828,6 +833,7 @@ impl Solver {
     }
 
     /// Propagate a quadratic PB constraint using incremental counters.
+    /// Single-pass: finds propagation and builds explanation in one fused scan.
     #[inline(never)]
     fn propagate_quad_pb(&mut self, qi: u32) -> Option<Reason> {
         let qc = &self.quad_pb_constraints[qi as usize];
@@ -843,6 +849,11 @@ impl Solver {
         let slack_up = sum_true + sum_maybe - target;
         let slack_down = target - sum_true;
         if slack_up > 0 && slack_down > 0 { return None; }
+
+        // Grow seen buffer if needed; clear only used entries after each propagation
+        if self.quad_pb_seen_buf.len() < self.num_vars {
+            self.quad_pb_seen_buf.resize(self.num_vars, false);
+        }
 
         for i in 0..n {
             let t = &self.quad_pb_constraints[qi as usize].terms[i];
@@ -869,35 +880,44 @@ impl Solver {
 
             let pv = var_of(propagated_lit);
             let is_upper = c > slack_down;
-            let mut explanation = Vec::new();
+
+            // Reuse scratch buffers instead of allocating
+            self.quad_pb_expl_buf.clear();
+            let seen = &mut self.quad_pb_seen_buf;
             {
                 let terms = &self.quad_pb_constraints[qi as usize].terms;
-                let mut seen_v = vec![false; self.num_vars];
                 for t in terms {
                     let va = t.var_a as usize;
                     let vb = t.var_b as usize;
                     let aa = self.assigns[va];
                     let ab = self.assigns[vb];
-                    let a_false = (aa == LBool::True && t.neg_a) || (aa == LBool::False && !t.neg_a);
-                    let b_false = (ab == LBool::True && t.neg_b) || (ab == LBool::False && !t.neg_b);
+                    let af = (aa == LBool::True && t.neg_a) || (aa == LBool::False && !t.neg_a);
+                    let bf = (ab == LBool::True && t.neg_b) || (ab == LBool::False && !t.neg_b);
 
-                    if a_false || b_false {
-                        let (lit, v) = if a_false { (t.lit_a, va) } else { (t.lit_b, vb) };
-                        if v != pv && !seen_v[v] && self.level[v] > 0 {
-                            seen_v[v] = true;
-                            explanation.push(lit);
+                    if af || bf {
+                        let (lit, v) = if af { (t.lit_a, va) } else { (t.lit_b, vb) };
+                        if v != pv && !seen[v] && self.level[v] > 0 {
+                            seen[v] = true;
+                            self.quad_pb_expl_buf.push(lit);
                         }
                     } else if is_upper && aa != LBool::Undef && ab != LBool::Undef {
-                        for &(lit, v) in &[(t.lit_a, va), (t.lit_b, vb)] {
-                            if v != pv && !seen_v[v] && self.level[v] > 0 {
-                                seen_v[v] = true;
-                                explanation.push(negate(lit));
-                            }
+                        if va != pv && !seen[va] && self.level[va] > 0 {
+                            seen[va] = true;
+                            self.quad_pb_expl_buf.push(negate(t.lit_a));
+                        }
+                        if vb != pv && !seen[vb] && self.level[vb] > 0 {
+                            seen[vb] = true;
+                            self.quad_pb_expl_buf.push(negate(t.lit_b));
                         }
                     }
                 }
             }
-            self.quad_pb_reasons[pv] = Some(explanation);
+            // Clear seen flags for used entries
+            for &lit in &self.quad_pb_expl_buf {
+                seen[var_of(lit)] = false;
+            }
+            // Clone into storage, keeping buffer capacity for reuse
+            self.quad_pb_reasons[pv] = Some(self.quad_pb_expl_buf.clone());
             self.enqueue(propagated_lit, Reason::QuadPb(qi));
             return None;
         }
