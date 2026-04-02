@@ -180,8 +180,10 @@ fn colored_pm(seq: &PackedSeq) -> String {
 
 fn print_solution(label: &str, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &PackedSeq) {
     println!("\n{}", label);
+    let n = x.len();
     for (name, seq) in [("X", x), ("Y", y), ("Z", z), ("W", w)] {
-        println!("{} =: '{}'  NB. {}", name, colored_pm(seq), seq.sum());
+        let pad = " ".repeat(n - seq.len()); // W is 1 shorter; pad to align NB column
+        println!("{} =: '{}'{}  NB. {}", name, colored_pm(seq), pad, seq.sum());
     }
     println!();
 }
