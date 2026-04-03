@@ -460,6 +460,14 @@ impl Solver {
     pub fn solve_with_assumptions(&mut self, assumptions: &[Lit]) -> Option<bool> {
         if !self.ok { return Some(false); }
 
+        // Pre-size reusable buffers once per solve
+        if self.quad_pb_seen_buf.len() < self.num_vars {
+            self.quad_pb_seen_buf.resize(self.num_vars, false);
+        }
+        if self.analyze_seen.len() < self.num_vars {
+            self.analyze_seen.resize(self.num_vars, false);
+        }
+
         let assumption_level: u32 = if assumptions.is_empty() { 0 } else { 1 };
 
         // Assert assumptions at decision level 1
@@ -936,10 +944,6 @@ impl Solver {
         let qi = (qi_encoded & 0x7FFFFFFF) as usize;
         let pv_pos = self.trail_pos[pv];
 
-        if self.quad_pb_seen_buf.len() < self.num_vars {
-            self.quad_pb_seen_buf.resize(self.num_vars, false);
-        }
-
         let mut lits = Vec::new();
         let seen = &mut self.quad_pb_seen_buf;
         let terms = &self.quad_pb_constraints[qi].terms;
@@ -979,9 +983,8 @@ impl Solver {
     /// 1-UIP conflict analysis with learnt clause minimization.
     /// Returns (learnt clause, backtrack level).
     fn analyze(&mut self, conflict_reason: Reason) -> (Vec<Lit>, u32) {
-        // Reuse solver-level seen buffer (avoid per-conflict allocation)
-        self.analyze_seen.clear();
-        self.analyze_seen.resize(self.num_vars, false);
+        // Reuse solver-level seen buffer (pre-sized at solve entry)
+        self.analyze_seen[..self.num_vars].fill(false);
         let mut counter = 0;
         let mut learnt = Vec::new();
         let mut bt_level: u32 = 0;
@@ -1047,10 +1050,7 @@ impl Solver {
                         lits.push(p);
                         self.analyze_reason_buf = lits;
                     } else {
-                        // Conflict: use quad_pb_seen_buf for dedup
-                        if self.quad_pb_seen_buf.len() < self.num_vars {
-                            self.quad_pb_seen_buf.resize(self.num_vars, false);
-                        }
+                        // Conflict: use quad_pb_seen_buf for dedup (pre-sized at solve entry)
                         let terms = &self.quad_pb_constraints[qi].terms;
                         for t in terms {
                             for &(lit, v) in &[(t.lit_a, t.var_a()), (t.lit_b, t.var_b())] {
@@ -1098,15 +1098,7 @@ impl Solver {
                         for &lit in &learnt[1..] {
                             bt_level = bt_level.max(self.level[var_of(lit)]);
                         }
-                        // Clear seen (sparse clear using learnt + trail scan)
-                        for &lit in &learnt {
-                            self.analyze_seen[var_of(lit)] = false;
-                        }
-                        // Also clear any seen vars at current decision level
-                        for idx in trail_idx..self.trail.len() {
-                            let v = var_of(self.trail[idx].lit);
-                            self.analyze_seen[v] = false;
-                        }
+                        // No need to clear seen — next analyze() call does fill(false)
                         return (learnt, bt_level);
                     }
                     current_reason = entry.reason;
