@@ -924,7 +924,12 @@ impl Solver {
     #[inline]
     fn propagate_quad_pb(&mut self, qi: u32) -> Option<Reason> {
         if self.quad_pb_constraints[qi as usize].stale {
-            self.recompute_quad_pb(qi);
+            // Batch recompute all stale constraints at once (better cache locality)
+            for i in 0..self.quad_pb_constraints.len() {
+                if self.quad_pb_constraints[i].stale {
+                    self.recompute_quad_pb(i as u32);
+                }
+            }
         }
         let qc = &self.quad_pb_constraints[qi as usize];
         let n = qc.num_terms as usize;
