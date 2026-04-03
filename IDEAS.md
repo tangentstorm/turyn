@@ -335,6 +335,8 @@ In `solve_xy_with_sat`, line 2764: `configs_tested % 1 == 0` always evaluates tr
 
 `compute_quad_pb_explanation` checks `quad_pb_seen_buf.len() < num_vars` and resizes on first call per solve. Move the resize to `solve_with_assumptions` entry point so it's done once per solve, not checked on every explanation computation.
 
+**Result:** Pre-sized both `quad_pb_seen_buf` and `analyze_seen` at solve entry. Removed per-call resize checks. Phase C n=26: neutral (18.44 → 18.86s, within noise). The buffers are tiny (44 elements) so the branch-removal savings are negligible. **Accepted** as code cleanup.
+
 ### P7. Avoid heap allocation in `propagate_quad_pb` propagation scan
 
 The `propagate_quad_pb` function accesses `quad_pb_constraints[qi]` twice (once for counters, once for term scan). The borrow checker forces this because `self.enqueue()` is called inside the loop. Restructure to collect propagation decisions first, then enqueue after the loop, eliminating the need for split borrows and reducing instruction count.
@@ -346,6 +348,8 @@ Learnt clauses in `analyze()` and `add_learnt_clause()` use `Vec<Lit>` which hea
 ### P9. Skip quad PB propagation for constraints with large slack
 
 In `propagate_quad_pb`, when both `slack_up` and `slack_down` are large (> max_coeff), no propagation is possible. Currently we still iterate all terms looking for propagation candidates. Add a `max_coeff` field to `QuadPbConstraint` and early-exit when both slacks exceed it.
+
+**Result:** Already implemented! Line 904: `if slack_up > 0 && slack_down > 0 { return None; }`. Since all coefficients are 1, this is equivalent to `max_coeff <= min(slack_up, slack_down)`. The term scan only runs when one slack is exactly 0 (propagation required). No improvement possible. **Skipped.**
 
 ### P10. Avoid `HashSet::insert` allocation in `stream_zw_candidates_to_channel` dedup
 
