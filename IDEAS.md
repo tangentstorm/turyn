@@ -323,19 +323,13 @@ Phase C (SAT) dominates >90% of runtime. The 10 interventions below target alloc
 
 In `solve_xy_with_sat`, line 2764: `configs_tested % 1 == 0` always evaluates true, meaning `clear_learnt` is called after every single boundary config SAT solve. This is wasteful — `clear_learnt` iterates all clause metadata + all watch lists. Batch to every N configs (e.g., 64 or 128) or skip entirely and rely on `reduce_db` in the solve loop.
 
-**Result:** Removing entirely → **+40% regression** (stale clauses poison solver). batch=64 neutral. batch=8 optimal: 18.79s → 18.44s (**-1.9%**). Phase B neutral. **Accepted** with batch=8.
-
 ### P4. Skip `propagate_pb` for already-satisfied constraints
 
 `propagate_pb` does a full scan of all literals in the constraint on every trigger. For PB constraints with large slack (many true literals), the scan is wasted work. Add a `satisfied` flag or slack cache that short-circuits when the constraint is trivially satisfied.
 
-**Result:** Skipped — `propagate_pb` already returns early when `slack > 0` (line 824). The remaining 3% is the scan to compute slack, which would require incremental slack tracking with backtrack restore (complex bookkeeping). The PB constraints only have ~26 unit-coefficient lits at n=26 so each scan is cheap. Not worth the complexity. **Skipped.**
-
 ### P5. Eliminate `configs_tested % 1 == 0` dead code and reduce `clear_learnt` overhead
 
 `clear_learnt()` iterates all `clause_meta` to mark learnt clauses deleted, then iterates all watch lists to retain. With incremental solving, learnt clauses from previous configs may actually help future configs. Try removing `clear_learnt` entirely from the table path — the solve loop's `reduce_db` already manages clause database size.
-
-**Result:** Folded into P3. Removing entirely caused +40% regression — learnt clauses from different boundary configs with different quad PB targets actively mislead the solver. The `clear_learnt` is necessary. **Rejected** as standalone; see P3 for batching approach.
 
 ### P6. Pre-size `quad_pb_seen_buf` at solver construction
 
