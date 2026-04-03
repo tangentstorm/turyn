@@ -1579,119 +1579,110 @@ fn sat_solve_xyw(
     }
 }
 
-/// Given fixed W values, SAT-solve for X, Y, Z.
-fn sat_solve_xyz(
+/// Given fixed W, find Z candidates via SAT with range constraints per lag.
+///
+/// For each lag k: N_X(k) + N_Y(k) + 2*N_Z(k) + 2*N_W(k) = 0
+/// W is fixed → 2*N_W(k) is known. N_Z(k) = 2*agZ - (n-k).
+/// We need -(2*N_Z(k) + 2*N_W(k)) = N_X(k) + N_Y(k) to be achievable,
+/// i.e. |2*N_Z(k) + 2*N_W(k)| ≤ 2*(n-k), giving a range for agZ.
+///
+/// Returns multiple Z candidates by blocking previous solutions.
+fn sat_find_z_candidates(
     problem: Problem,
-    tuple: SumTuple,
+    z_sum: i32,
     w_values: &[i8],
-    verbose: bool,
-) -> Option<(PackedSeq, PackedSeq, PackedSeq)> {
+    max_candidates: usize,
+) -> Vec<PackedSeq> {
     let n = problem.n;
     let m = problem.m();
-    // Variables: X=1..n, Y=n+1..2n, Z=2n+1..3n
-    let total_vars = 3 * n;
-    let mut enc = SatEncoder { n: total_vars, m: 0, next_var: (total_vars + 1) as i32 };
+
+    if (z_sum + n as i32) % 2 != 0 { return Vec::new(); }
+    let z_pos = ((z_sum + n as i32) / 2) as usize;
+
+    let mut enc = SatEncoder { n: 0, m: 0, next_var: (n + 1) as i32 };
     let mut solver: radical::Solver = Default::default();
 
-    let x_var = |i: usize| -> i32 { (i + 1) as i32 };
-    let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
-    let z_var = |i: usize| -> i32 { (2 * n + i + 1) as i32 };
+    let z_var = |i: usize| -> i32 { (i + 1) as i32 };
 
-    // Symmetry breaking
-    solver.add_clause([x_var(0)]); // x[0] = +1
-    solver.add_clause([z_var(0)]); // z[0] = +1
+    // Symmetry breaking: z[0] = +1
+    solver.add_clause([z_var(0)]);
 
-    // Sum constraints
-    if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0
-        || (tuple.z + n as i32) % 2 != 0 { return None; }
-    let x_pos = ((tuple.x + n as i32) / 2) as usize;
-    let y_pos = ((tuple.y + n as i32) / 2) as usize;
-    let z_pos = ((tuple.z + n as i32) / 2) as usize;
-    let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
-    let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+    // Sum constraint
     let z_lits: Vec<i32> = (0..n).map(|i| z_var(i)).collect();
-    enc.encode_cardinality_eq(&mut solver, &x_lits, x_pos);
-    enc.encode_cardinality_eq(&mut solver, &y_lits, y_pos);
     enc.encode_cardinality_eq(&mut solver, &z_lits, z_pos);
 
-    // Precompute W autocorrelations (constants)
+    // Precompute W autocorrelations
     let w_autocorr: Vec<i32> = (0..n).map(|s| {
         if s == 0 || s >= m { 0 } else {
             (0..(m - s)).map(|i| (w_values[i] as i32) * (w_values[i + s] as i32)).sum()
         }
     }).collect();
 
-    // Autocorrelation constraints: N_X(k) + N_Y(k) + 2*N_Z(k) + 2*N_W(k) = 0
-    // W is fixed, so 2*N_W(k) is a constant.
-    // N_X(k) + N_Y(k) + 2*N_Z(k) = -2*N_W(k)
-    // Using agree counts:
-    // N_X = 2*agX - (n-k), N_Y = 2*agY - (n-k), N_Z = 2*agZ - (n-k)
-    // 2*agX + 2*agY + 4*agZ - 4*(n-k) = -2*N_W(k)
-    // agX + agY + 2*agZ = 2*(n-k) - N_W(k)
+    // Per-lag range constraints on Z autocorrelation.
+    // N_X(k) + N_Y(k) = -(2*N_Z(k) + 2*N_W(k))
+    // |N_X(k) + N_Y(k)| ≤ 2*(n-k)  (since each contributes at most n-k)
+    // → -2*(n-k) ≤ -(2*N_Z(k) + 2*N_W(k)) ≤ 2*(n-k)
+    // → -2*(n-k) - 2*N_W(k) ≤ 2*N_Z(k) ≤ 2*(n-k) - 2*N_W(k)
+    // → -(n-k) - N_W(k) ≤ N_Z(k) ≤ (n-k) - N_W(k)
+    // N_Z(k) = 2*agZ(k) - (n-k), so agZ(k) ∈ [lo, hi]:
+    //   lo = max(0, ceil(((n-k) + (-(n-k) - N_W(k))) / 2)) = max(0, ceil(-N_W(k) / 2))
+    //   hi = min(n-k, floor(((n-k) + ((n-k) - N_W(k))) / 2)) = min(n-k, floor((2*(n-k) - N_W(k)) / 2))
+    //   = min(n-k, (2*(n-k) - N_W(k)) / 2)  [integer division]
     for k in 1..n {
-        let target_i = 2 * (n - k) as i32 - w_autocorr[k];
-        if target_i < 0 || target_i as usize > 2 * (n - k) + 2 * (n - k) {
-            return None; // infeasible
-        }
-        let target = target_i as usize;
+        let pairs = n - k;
+        let nw = w_autocorr[k];
 
-        // XY agrees (weight 1 each)
-        let mut xy_lits = Vec::new();
-        for i in 0..(n - k) {
-            xy_lits.push(enc.encode_xnor(&mut solver, x_var(i), x_var(i + k)));
-        }
-        for i in 0..(n - k) {
-            xy_lits.push(enc.encode_xnor(&mut solver, y_var(i), y_var(i + k)));
-        }
+        // agZ range from the XY feasibility constraint
+        let lo = ((-nw) as f64 / 2.0).ceil().max(0.0) as usize;
+        let hi_val = (2 * pairs as i32 - nw) as f64 / 2.0;
+        let hi = (hi_val.floor() as usize).min(pairs);
 
-        // Z agrees (weight 2)
-        let mut z_agree_lits = Vec::new();
-        for i in 0..(n - k) {
+        if lo > hi { return Vec::new(); } // infeasible
+
+        // Build agree-count for Z at lag k
+        let mut z_agree_lits = Vec::with_capacity(pairs);
+        for i in 0..pairs {
             z_agree_lits.push(enc.encode_xnor(&mut solver, z_var(i), z_var(i + k)));
         }
 
-        let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
-        let z_ctr = enc.build_counter(&mut solver, &z_agree_lits);
-
-        let mut selectors = Vec::new();
-        for c_z in 0..=z_agree_lits.len() {
-            let rem = target as isize - 2 * c_z as isize;
-            if rem < 0 || rem as usize > xy_lits.len() { continue; }
-            let c_xy = rem as usize;
-            let sel = enc.fresh();
-            if c_xy > 0 {
-                if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 { solver.add_clause([-sel, xy_ctr[c_xy]]); }
-                else { solver.add_clause([-sel]); continue; }
-            }
-            if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 { solver.add_clause([-sel, -xy_ctr[c_xy + 1]]); }
-            if c_z > 0 {
-                if c_z < z_ctr.len() && z_ctr[c_z] != 0 { solver.add_clause([-sel, z_ctr[c_z]]); }
-                else { solver.add_clause([-sel]); continue; }
-            }
-            if c_z + 1 < z_ctr.len() && z_ctr[c_z + 1] != 0 { solver.add_clause([-sel, -z_ctr[c_z + 1]]); }
-            selectors.push(sel);
+        // Encode: lo ≤ count(z_agree) ≤ hi
+        let ctr = enc.build_counter(&mut solver, &z_agree_lits);
+        // At least lo: ctr[lo] must be true (if lo > 0)
+        if lo > 0 && lo < ctr.len() && ctr[lo] != 0 {
+            solver.add_clause([ctr[lo]]);
+        } else if lo > 0 {
+            return Vec::new(); // can't achieve minimum
         }
-        if selectors.is_empty() { return None; }
-        solver.add_clause(selectors.iter().copied());
-    }
-
-    if verbose {
-        eprintln!("  SAT X/Y/Z: {} vars, w_sum={}", enc.next_var - 1, tuple.w);
-    }
-
-    match solver.solve() {
-        Some(true) => {
-            let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            let z: Vec<i8> = (0..n).map(|i| if solver.value(z_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y), PackedSeq::from_values(&z)))
+        // At most hi: ctr[hi+1] must be false (if hi+1 is valid)
+        if hi + 1 < ctr.len() && ctr[hi + 1] != 0 {
+            solver.add_clause([-ctr[hi + 1]]);
         }
-        _ => None,
     }
+
+    // Find multiple Z by solving + blocking
+    let mut results = Vec::new();
+    for _ in 0..max_candidates {
+        match solver.solve() {
+            Some(true) => {
+                let z: Vec<i8> = (0..n).map(|i| {
+                    if solver.value(z_var(i)) == Some(true) { 1 } else { -1 }
+                }).collect();
+                // Block this solution
+                let block: Vec<i32> = (0..n).map(|i| {
+                    if z[i] == 1 { -z_var(i) } else { z_var(i) }
+                }).collect();
+                solver.add_clause(block);
+                results.push(PackedSeq::from_values(&z));
+            }
+            _ => break,
+        }
+    }
+    results
 }
 
-/// W-enumerate + SAT X/Y/Z search. Generates W candidates with spectral filtering,
-/// then uses SAT to find X/Y/Z for each W.
+/// W-enumerate + SAT-Z + Phase C XY pipeline.
+/// For each spectrally-valid W: use SAT to find compatible Z candidates,
+/// then send each (Z, W) pair to the existing XY solver.
 fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
     let run_start = Instant::now();
@@ -1702,24 +1693,30 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let raw = enumerate_sum_tuples(problem);
     let mut seen = std::collections::HashSet::new();
     let tuples: Vec<SumTuple> = raw.into_iter().filter(|t| seen.insert((t.x, t.y, t.z, t.w))).collect();
-    if verbose {
-        println!("TT({}): W-enumerate + SAT X/Y/Z search, {} tuples", problem.n, tuples.len());
-    }
 
-    // Group tuples by w_sum to avoid regenerating W for each tuple
+    // Group tuples by w_sum
     let mut tuples_by_w: std::collections::HashMap<i32, Vec<SumTuple>> = std::collections::HashMap::new();
     for &tuple in &tuples {
         tuples_by_w.entry(tuple.w).or_default().push(tuple);
     }
 
+    if verbose {
+        println!("TT({}): W-SAT search (W enum → SAT Z → Phase C XY), {} tuples, {} w_sums",
+            problem.n, tuples.len(), tuples_by_w.len());
+    }
+
     let mut fft_buf = Vec::with_capacity(spectral_w.fft_size);
     let individual_bound = problem.spectral_bound();
+    let max_z_per_w = 10; // SAT Z candidates per W
 
     for (&w_sum, w_tuples) in &tuples_by_w {
         if (w_sum + problem.m() as i32) % 2 != 0 { continue; }
         let mut w_count = 0usize;
         let mut w_ok = 0usize;
+        let mut total_z_found = 0usize;
+        let mut total_xy_solved = 0usize;
         let mut found = false;
+
         generate_sequences_permuted(problem.m(), w_sum, true, false, cfg.max_w, |w_values| {
             if found { return false; }
             w_count += 1;
@@ -1727,27 +1724,68 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 return true;
             }
             w_ok += 1;
-            // Try each tuple with this W
+
+            // For each tuple that uses this w_sum, SAT-find Z candidates
             for &tuple in w_tuples {
+                if (tuple.z + problem.n as i32) % 2 != 0 { continue; }
                 if (tuple.x + problem.n as i32) % 2 != 0 { continue; }
                 if (tuple.y + problem.n as i32) % 2 != 0 { continue; }
-                if (tuple.z + problem.n as i32) % 2 != 0 { continue; }
-                if let Some((x, y, z)) = sat_solve_xyz(problem, tuple, w_values, verbose) {
+
+                let z_candidates = sat_find_z_candidates(problem, tuple.z, w_values, max_z_per_w);
+                total_z_found += z_candidates.len();
+
+                for z_seq in &z_candidates {
+                    // Build (Z, W) candidate and solve for XY via existing Phase C
+                    let z_auto: Vec<i32> = (0..problem.n).map(|s| {
+                        if s == 0 { 0 } else { z_seq.autocorrelation(s) }
+                    }).collect();
                     let pw = PackedSeq::from_values(w_values);
-                    let ok = verify_tt(problem, &x, &y, &z, &pw);
-                    if verbose {
-                        print_solution(
-                            &format!("TT({}) W-SAT (w_sum={}, w #{}, {:.3?}, verified={})",
-                                problem.n, w_sum, w_ok, run_start.elapsed(), ok),
-                            &x, &y, &z, &pw);
+                    let w_auto: Vec<i32> = (0..problem.m()).map(|s| {
+                        if s == 0 { 0 } else { pw.autocorrelation(s) }
+                    }).collect();
+                    let mut zw = vec![0i32; problem.n];
+                    for s in 1..problem.n {
+                        let nz = z_auto[s];
+                        let nw = if s < problem.m() { w_auto[s] } else { 0 };
+                        zw[s] = 2 * nz + 2 * nw;
                     }
-                    if ok { found = true; return false; }
+
+                    let candidate = CandidateZW {
+                        z: z_seq.clone(),
+                        w: pw.clone(),
+                        zw_autocorr: zw,
+                        max_pair_power: 0.0,
+                    };
+
+                    // Use existing SAT XY solver (Phase C)
+                    let template = SatXYTemplate::build(problem, tuple);
+                    if let Some(template) = template {
+                        total_xy_solved += 1;
+                        if let Some((x, y)) = template.solve_for(&candidate) {
+                            if verify_tt(problem, &x, &y, z_seq, &pw) {
+                                if verbose {
+                                    print_solution(
+                                        &format!("TT({}) W-SAT (w_sum={}, w #{}, z_found={}, {:.3?})",
+                                            problem.n, w_sum, w_ok, z_candidates.len(), run_start.elapsed()),
+                                        &x, &y, z_seq, &pw);
+                                }
+                                found = true;
+                                return false;
+                            }
+                        }
+                    }
                 }
+            }
+            if w_ok % 100 == 0 && w_ok > 0 {
+                eprintln!("  w_sum={}: w_ok={} z_found={} xy_tried={} ({:.1?})",
+                    w_sum, w_ok, total_z_found, total_xy_solved, run_start.elapsed());
             }
             true
         });
+
         if verbose {
-            eprintln!("  w_sum={}: w_gen={} w_ok={}", w_sum, w_count, w_ok);
+            eprintln!("  w_sum={}: w_gen={} w_ok={} z_found={} xy_tried={}",
+                w_sum, w_count, w_ok, total_z_found, total_xy_solved);
         }
         if found {
             return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
