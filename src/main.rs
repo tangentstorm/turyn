@@ -187,19 +187,22 @@ struct SumTuple {
 impl SumTuple {
     /// Normalization key for tuple deduplication in hybrid search.
     ///
-    /// With x[0]=+1 symmetry breaking in the SAT solver, the valid symmetries are:
-    /// - Negate Y (no y[0] constraint): σ_Y → |σ_Y|
-    /// - Negate Z (no z[0] constraint): σ_Z → |σ_Z|
-    /// - Negate W (no w[0] constraint): σ_W → |σ_W|
-    /// - X↔Y swap + Y negation: (σ_X, σ_Y) can be swapped if we also adjust signs.
-    ///   Concretely: if solution (X,Y) works for (a,b), then (Y,X) works for (b,a)
-    ///   but only if y[0]=+1 — which isn't guaranteed.
+    /// The hybrid SAT solver fixes both x[0]=+1 and y[0]=+1. With these constraints:
+    /// - Negate X: flips x[0] → NOT safe
+    /// - Negate Y: flips y[0] → NOT safe
+    /// - Negate Z: no z[0] constraint → safe: σ_Z → |σ_Z|
+    /// - Negate W: no w[0] constraint → safe: σ_W → |σ_W|
+    /// - X↔Y swap: both have first element +1, so swap preserves constraints → safe
     ///
-    /// Safe normalization: keep x sign, abs(y), abs(z), abs(w).
-    /// X↔Y swap is NOT safe because y[0] isn't constrained.
-    /// This gives factor-8 reduction (2^3 for Y/Z/W sign flips).
+    /// This gives factor ~8 reduction: 2 (Z sign) × 2 (W sign) × 2 (X↔Y swap when x≠y).
     fn norm_key(&self) -> (i32, i32, i32, i32) {
-        (self.x, self.y.abs(), self.z.abs(), self.w.abs())
+        let (xx, yy) = if self.y.abs() > self.x.abs()
+            || (self.x.abs() == self.y.abs() && self.y > self.x) {
+            (self.y, self.x)
+        } else {
+            (self.x, self.y)
+        };
+        (xx, yy, self.z.abs(), self.w.abs())
     }
 
 }
