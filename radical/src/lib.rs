@@ -231,6 +231,7 @@ pub struct Solver {
 impl Solver {
     /// Get the literals of clause `ci`.
     #[inline]
+    #[allow(dead_code)]
     fn clause_lits(&self, ci: u32) -> &[Lit] {
         let m = &self.clause_meta[ci as usize];
         &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)]
@@ -713,7 +714,13 @@ impl Solver {
                 for idx in 0..self.quad_pb_var_watches[v].len() {
                     let qi = self.quad_pb_var_watches[v][idx];
                     if self.quad_pb_constraints[qi as usize].stale {
-                        self.recompute_quad_pb(qi);
+                        // Batch: recompute all stale at once for cache locality
+                        for i in 0..self.quad_pb_constraints.len() {
+                            if self.quad_pb_constraints[i].stale {
+                                self.recompute_quad_pb(i as u32);
+                            }
+                        }
+                        break;
                     }
                 }
                 // Update term states for all terms involving this variable
