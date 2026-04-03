@@ -7,8 +7,8 @@
 /// Deduplicated format: many Z/W configs share the same X/Y signature, so
 /// we store unique (x,y) lists once and have the index point to them.
 ///
-/// Format v5 (n-independent):
-///   Header (24 bytes): magic "XYTT", version=5, k, zw_dim, num_sigs, sum_dim
+/// Format:
+///   Header (24 bytes): magic "XYTT", version=1, k, zw_dim, num_sigs, sum_dim
 ///   ZW index (zw_dim × 4 bytes): sig_id (u32) per Z/W config, 0xFFFFFFFF = empty
 ///   Sig directory (num_sigs × 8 bytes): [offset_u32, count_u32] per signature
 ///   Sub-index (num_sigs × sum_dim² × 8 bytes): (offset_within_sig, count) per bucket
@@ -198,7 +198,7 @@ fn main() {
 
     // Header: magic, version=5, k, zw_dim, num_sigs, sum_dim
     f.write_all(b"XYTT").unwrap();
-    f.write_all(&5u32.to_le_bytes()).unwrap();
+    f.write_all(&1u32.to_le_bytes()).unwrap();
     f.write_all(&(k as u32).to_le_bytes()).unwrap();
     f.write_all(&(total_zw_index as u32).to_le_bytes()).unwrap();
     f.write_all(&(num_sigs as u32).to_le_bytes()).unwrap();
