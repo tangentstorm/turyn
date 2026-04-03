@@ -338,9 +338,11 @@ In `solve_xy_with_sat`, line 2764: `configs_tested % 1 == 0` always evaluates tr
 
 **Result:** Pre-sized both `quad_pb_seen_buf` and `analyze_seen` at solve entry. Removed per-call resize checks. Phase C n=26: neutral (18.44 → 18.86s, within noise). The buffers are tiny (44 elements) so the branch-removal savings are negligible. **Accepted** as code cleanup.
 
-### P7. Avoid heap allocation in `propagate_quad_pb` propagation scan
+### P7. Skip DEAD/TRUE terms in `propagate_quad_pb` using state field
 
-The `propagate_quad_pb` function accesses `quad_pb_constraints[qi]` twice (once for counters, once for term scan). The borrow checker forces this because `self.enqueue()` is called inside the loop. Restructure to collect propagation decisions first, then enqueue after the loop, eliminating the need for split borrows and reducing instruction count.
+The `propagate_quad_pb` inner loop checks `assigns[var_a]` and `assigns[var_b]` for every term to determine if it's a propagation candidate. But the precomputed `state` field (maintained by `update_quad_pb_term_hint`) already encodes whether a term is DEAD (0), MAYBE (1), or TRUE (2). Add `if t.state != 1 { continue; }` to skip non-MAYBE terms with a single byte compare instead of two memory loads + branching.
+
+**Result:** Phase C n=26: 16.99s → 16.41s (**-3.4%**). Phase B neutral. All tests pass. **Accepted.**
 
 ### P8. Use `SmallVec` or inline storage for learnt clauses
 
