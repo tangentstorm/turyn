@@ -280,7 +280,7 @@ impl Solver {
             minimize_levels: Vec::new(),
             activity: Vec::new(),
             var_inc: 1.0,
-            var_decay: 0.95,
+            var_decay: 0.975,
             heap: Vec::new(),
             heap_pos: Vec::new(),
             prop_head: 0,
@@ -625,12 +625,11 @@ impl Solver {
                 self.add_learnt_clause(learnt_clause);
                 self.decay_activities();
 
-                // Restart check
+                // Restart check (no reduce_db — clear_learnt handles clause cleanup)
                 if self.conflicts >= self.restart_limit {
                     self.restart_limit += 100 * luby(self.luby_index);
                     self.luby_index += 1;
                     self.backtrack(base_level);
-                    self.reduce_db();
                 }
             } else {
                 // No conflict
@@ -1149,7 +1148,7 @@ impl Solver {
                     counter -= 1;
                     if counter == 0 {
                         learnt.insert(0, negate(p));
-                        self.minimize_learnt(&mut learnt);
+                        // self.minimize_learnt(&mut learnt); // disabled: see if cheaper without it
                         bt_level = 0;
                         for &lit in &learnt[1..] {
                             bt_level = bt_level.max(self.level[var_of(lit)]);
