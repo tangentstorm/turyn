@@ -21,13 +21,15 @@ The long-term goal is TT(56), which yields a **Hadamard matrix of order 668**.
 | 22 | 260 | 2.8s |
 | 24 | 284 | 9.5s |
 
-Hybrid is now the default mode and runs in parallel across all available cores. Just run `target/release/turyn --n=N` to search. Z/W sequences are cached by sum value across tuples, and a priority queue dispatches spectrally-tightest pairs first.
+n >= 14 includes ~2.3s of k=7 boundary table load time. For n < 14, the table is auto-skipped.
 
-All solved with **radical**, a pure Rust CDCL SAT solver included as a subcrate. No external C/C++ dependencies. For n >= 14, the k=7 boundary table is loaded automatically (generate once with `target/release/gen_table`). For n < 14, the table is auto-skipped.
+Hybrid is the default mode and runs in parallel across all available cores. Just run `target/release/turyn --n=N` to search. Sum tuples are deduplicated by symmetry (Y/Z/W sign negation, X↔Y swap), Z/W sequences are cached by sum value, and a priority queue dispatches spectrally-tightest pairs first.
 
-**Test machine:** 4-core Intel Xeon @ 2.10 GHz, 16 GB RAM, Linux x86_64. Hybrid search parallelizes Phase B + SAT solving across cores via a coordinator with shared priority queue.
+All solved with **radical**, a pure Rust CDCL SAT solver included as a subcrate. No external C/C++ dependencies.
 
-For comparison, London (2013) enumerated all 3,523 TT(24) sequences in ~1 hour and all 3,753 TT(26) in ~9 hours on a 6-core Intel i7 3930K @ 3.2 GHz, using a highly optimized custom C++ backtracker. Our hybrid solver finds a single TT(24) in 1.0s and TT(26) in 129s on a slower 4-core machine.
+**Test machine:** 4-core Intel Xeon @ 2.10 GHz, 16 GB RAM, Linux x86_64.
+
+For comparison, London (2013) enumerated all 3,523 TT(24) sequences in ~1 hour and all 3,753 TT(26) in ~9 hours on a 6-core Intel i7 3930K @ 3.2 GHz, using a highly optimized custom C++ backtracker.
 
 Known solutions exist in the literature for all even n up to 44 (London-Kotsireas 2025). The current bottleneck for n >= 28 is search space size and SAT solver performance at scale.
 
