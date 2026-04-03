@@ -8,8 +8,9 @@ Turyn-type sequence search engine. Finds TT(n) — four {+1,-1} sequences whose 
 
 ```bash
 cargo build --release
-target/release/turyn --n=26          # default hybrid search (needs table)
+target/release/turyn --n=26          # default hybrid search (uses table for n>=14)
 target/release/turyn --n=26 --no-table  # without table (slower)
+target/release/turyn --n=8            # auto-skips table for n<14 (table requires n>=2k)
 ```
 
 ## Startup: generate XY boundary table

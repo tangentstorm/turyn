@@ -2925,13 +2925,27 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let phase_a_elapsed = phase_a_start.elapsed();
 
     let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table-k7.bin".to_string());
-    let xy_table: Option<Arc<XYBoundaryTable>> = if cfg.no_table {
+    // The k=7 table requires n >= 2k = 14. Auto-skip for smaller n.
+    let skip_table = cfg.no_table || problem.n < 14;
+    let xy_table: Option<Arc<XYBoundaryTable>> = if skip_table {
+        if !cfg.no_table && problem.n < 14 && verbose {
+            eprintln!("Note: n={} < 14 (2*k for k=7 table), running without table", problem.n);
+        }
         None
     } else {
         match XYBoundaryTable::load(&table_path) {
             Some(t) => {
-                if verbose { eprintln!("Loaded XY boundary table from {} (k={}, {} sigs, {} XY entries)", table_path, t.k, t.sig_offsets.len(), t.xy_data.len()); }
-                Some(Arc::new(t))
+                // Verify n >= 2*k for the loaded table
+                if problem.n < 2 * t.k {
+                    if verbose {
+                        eprintln!("Note: n={} < {} (2*k for k={} table), running without table",
+                            problem.n, 2 * t.k, t.k);
+                    }
+                    None
+                } else {
+                    if verbose { eprintln!("Loaded XY boundary table from {} (k={}, {} sigs, {} XY entries)", table_path, t.k, t.sig_offsets.len(), t.xy_data.len()); }
+                    Some(Arc::new(t))
+                }
             }
             None => {
                 eprintln!("Error: XY boundary table not found at '{}'", table_path);
