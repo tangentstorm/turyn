@@ -361,3 +361,50 @@ In `propagate_quad_pb`, when both `slack_up` and `slack_down` are large (> max_c
 The `seen` HashSet in `stream_zw_candidates_to_channel` allocates a `Vec<i32>` clone for every `zw_autocorr` on insert. Switch to a hash of the autocorrelation vector (e.g., FxHash of the raw bytes) stored in a `HashSet<u64>`, avoiding the Vec clone. This reduces Phase B allocation pressure.
 
 **Result:** Skipped �� Phase B is <0.2% of runtime at n=26 (32ms out of 16s). The dedup HashSet handles at most ~573 entries per tuple. Not worth optimizing for the SAT-heavy benchmark. **Skipped.**
+
+## Round 2 performance interventions — April 2026 (credit: Claude)
+
+Re-profiled after round 1 (5 accepted changes, n=26: 869s -> 577s). New baseline: 14.0s on SAT-heavy microbenchmark.
+Excluding coordinator overhead (51%), the SAT-only profile:
+- `recompute_quad_pb` 12.3%, `propagate` 10.3%, `compute_quad_pb_explanation_into` 8.1%
+- `solve_with_assumptions` 7.4%, `propagate_quad_pb` 3.2%, `propagate_pb` 1.8%, `backtrack` 1.4%
+
+### R1. Fuse recompute with propagation: single-pass recompute+check
+
+`recompute_quad_pb` (12.3%) scans all ~80 terms to rebuild sums, then `propagate_quad_pb` loads sums and often returns immediately (slack > 0). When the constraint is stale, fuse both into one pass: compute states, accumulate sums, AND check propagation in a single traversal. Saves the redundant sums load and the second function call for the majority case (no propagation needed).
+
+### R2. Avoid redundant `recompute_quad_pb` calls by tracking stale set
+
+Currently when any stale constraint is encountered, ALL stale constraints are recomputed (batch recompute). But the subsequent per-variable propagation loop may trigger recompute again for constraints that were already recomputed in the batch. Track a "recompute generation" to skip re-recomputing constraints that were just refreshed in this propagation round.
+
+### R3. Skip forward `update_quad_pb_term_hint` when constraint was just recomputed
+
+In `propagate()`, we first recompute stale constraints, then call `update_quad_pb_term_hint` for all terms involving the current variable. If a constraint was just recomputed (including the current variable's assignment), the term state is already correct -- the `update_quad_pb_term_hint` is redundant. Skip the update for constraints that were recomputed in the same propagation step.
+
+### R4. Reduce `compute_quad_pb_explanation_into` cost by using state-based filtering
+
+At 8.1%, the explanation function scans all ~80 terms. But terms with state DEAD have at least one false variable (the one that kills the term). If both variables were assigned before the propagated variable, the state is accurate and we can use it to skip the `trail_pos` check. For MAYBE terms with both variables Undef, they can't contribute to the explanation. Pre-filter using the term state byte before loading assigns/trail_pos.
+
+### R5. Pre-compute `propagate_pb` slack incrementally
+
+`propagate_pb` (1.8%) scans all ~26 literals to compute slack on every trigger. With unit coefficients, slack = count(non-false) - bound. Track `count_false` per PB constraint incrementally: increment on assign-false, decrement on backtrack. Compute slack as `n - count_false - bound` in O(1).
+
+### R6. Move `propagate_lit` deleted-clause check after blocker check
+
+In `propagate_lit` (10.3%), the deleted-clause check happens BEFORE the blocker check. But the blocker check (line 753) is cheaper and more likely to short-circuit (most watched clauses are satisfied). Swap the order: check blocker first, then deleted. Saves a `clause_meta[ci]` load for satisfied clauses.
+
+### R7. Compact `quad_pb_var_terms` and `quad_pb_var_watches` into contiguous arrays
+
+Currently `quad_pb_var_terms[v]` and `quad_pb_var_watches[v]` are `Vec<Vec<...>>` -- each variable's entry is a separate heap-allocated Vec. Replace with flat arrays + offset indices for cache-contiguous access during propagation. Eliminates pointer chasing.
+
+### R8. Eliminate `propagate_pb` by converting sum constraints to clauses + quad PB
+
+PB constraints encode `sum(x_i) = k`. With 44 vars and unit coefficients, the at-least-k and at-most-k constraints can be handled purely by quad PB (which already tracks cardinality via agree counts) or by exhaustive clause encoding for small sums. Eliminating the separate PB propagation pass saves 1.8%.
+
+### R9. Avoid `std::mem::take` in `propagate_lit` by using raw pointer swap
+
+`propagate_lit` does `std::mem::take(&mut self.watches[watch_idx])` which zeroes the Vec and later restores it. At 10.3% of runtime, even micro-overhead matters. Replace with unsafe raw pointer swap or manual index management to avoid the zeroing cost.
+
+### R10. Reduce recompute cost by sorting terms by variable index
+
+In `recompute_quad_pb`, the inner loop loads `assigns[var_a()]` and `assigns[var_b()]` for each term. With ~80 terms accessing ~44 variables, many accesses hit the same cache line. Sorting terms by `(var_a, var_b)` at constraint creation time maximizes sequential access patterns and reduces L1 misses.
