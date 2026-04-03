@@ -185,13 +185,21 @@ struct SumTuple {
 }
 
 impl SumTuple {
+    /// Normalization key for tuple deduplication in hybrid search.
+    ///
+    /// With x[0]=+1 symmetry breaking in the SAT solver, the valid symmetries are:
+    /// - Negate Y (no y[0] constraint): σ_Y → |σ_Y|
+    /// - Negate Z (no z[0] constraint): σ_Z → |σ_Z|
+    /// - Negate W (no w[0] constraint): σ_W → |σ_W|
+    /// - X↔Y swap + Y negation: (σ_X, σ_Y) can be swapped if we also adjust signs.
+    ///   Concretely: if solution (X,Y) works for (a,b), then (Y,X) works for (b,a)
+    ///   but only if y[0]=+1 — which isn't guaranteed.
+    ///
+    /// Safe normalization: keep x sign, abs(y), abs(z), abs(w).
+    /// X↔Y swap is NOT safe because y[0] isn't constrained.
+    /// This gives factor-8 reduction (2^3 for Y/Z/W sign flips).
     fn norm_key(&self) -> (i32, i32, i32, i32) {
-        let mut xx = self.x.abs();
-        let mut yy = self.y.abs();
-        if yy > xx {
-            std::mem::swap(&mut xx, &mut yy);
-        }
-        (xx, yy, self.z.abs(), self.w.abs())
+        (self.x, self.y.abs(), self.z.abs(), self.w.abs())
     }
 
 }
@@ -380,7 +388,11 @@ fn enumerate_sum_tuples(problem: Problem) -> Vec<SumTuple> {
 fn normalized_tuples(raw: &[SumTuple]) -> Vec<SumTuple> {
     let mut seen = HashMap::new();
     for t in raw {
-        seen.entry(t.norm_key()).or_insert(*t);
+        let key = t.norm_key();
+        // Store canonical form: all positive, x >= y
+        seen.entry(key).or_insert(SumTuple {
+            x: key.0, y: key.1, z: key.2, w: key.3,
+        });
     }
     let mut items: Vec<_> = seen.into_values().collect();
     items.sort_by_key(|t| t.norm_key());
@@ -2879,9 +2891,10 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
     let phase_a_start = Instant::now();
     let raw = enumerate_sum_tuples(problem);
-    let mut seen = std::collections::HashSet::new();
-    let mut tuples: Vec<SumTuple> = raw.into_iter()
-        .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+    // Normalize: deduplicate by sign/swap equivalence.
+    // Negating any sequence preserves autocorrelation; swapping X↔Y is symmetric.
+    // norm_key = (sorted |x|,|y|, |z|, |w|) captures this equivalence.
+    let mut tuples: Vec<SumTuple> = normalized_tuples(&raw).into_iter()
         .filter(|t| {
             (t.x + problem.n as i32) % 2 == 0
             && (t.y + problem.n as i32) % 2 == 0
