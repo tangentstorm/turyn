@@ -2759,9 +2759,8 @@ impl XYBoundaryTable {
                             return Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)));
                         }
                         _ => {
-                            // Periodically clear learnt clauses to prevent watch list bloat
                             configs_tested += 1;
-                            if configs_tested % 1 == 0 {
+                            if configs_tested % 8 == 0 {
                                 solver.clear_learnt();
                             }
                         }

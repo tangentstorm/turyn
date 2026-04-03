@@ -311,9 +311,13 @@ Phase C (SAT) dominates >90% of runtime. The 10 interventions below target alloc
 
 `analyze()` allocates `vec![false; num_vars]` on every conflict. `lit_removable()` allocates `visited` and `stack` on every call. Move these to solver-level reusable buffers (clear between uses). At n=26 with ~44 vars and hundreds of conflicts per solve, this eliminates thousands of heap allocations. Target: reduce malloc/free from 6% by ~1-2%.
 
+**Result:** Phase C n=26: 18.99s → 18.79s (**-1.1%**, within noise). Phase B neutral. The 44-var instances have tiny allocations; savings are real but small. Also eliminated `.to_vec()` copy for Clause reasons in analyze (P2 folded in). **Accepted** — marginal but correct.
+
 ### P2. Avoid Vec allocation for `reason_lits` in `analyze()`
 
 `analyze()` creates a `Vec<Lit>` for `reason_lits` on every resolution step (Clause, Pb, QuadPb). For Clause reasons, this is a needless `.to_vec()` copy. Switch to iterating the clause slice directly via an enum/index approach, avoiding allocation entirely for the clause case. The QuadPb and Pb paths still need allocation but are less frequent.
+
+**Result:** Folded into P1 — the Clause path now iterates `clause_lits[cstart..cstart+clen]` directly with index-based access, no `.to_vec()`. PB and QuadPb paths reuse `analyze_reason_buf`.
 
 ### P3. Batch `clear_learnt` — don't call after every single config
 
