@@ -715,7 +715,7 @@ fn build_w_candidates(
     let individual_bound = problem.spectral_bound();
     let mut w_candidates: Vec<SeqWithSpectrum> = Vec::new();
     let mut fft_buf = Vec::with_capacity(spectral_w.fft_size);
-    generate_sequences_with_sum_visit(problem.m(), w_sum, true, false, cfg.max_w, |values| {
+    generate_sequences_permuted(problem.m(), w_sum, true, false, cfg.max_w, |values| {
         if found.load(AtomicOrdering::Relaxed) { return false; }
         stats.w_generated += 1;
         if let Some(spectrum) =
