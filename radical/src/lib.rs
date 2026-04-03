@@ -1148,7 +1148,7 @@ impl Solver {
                     counter -= 1;
                     if counter == 0 {
                         learnt.insert(0, negate(p));
-                        // self.minimize_learnt(&mut learnt); // disabled: see if cheaper without it
+                        self.minimize_learnt(&mut learnt);
                         bt_level = 0;
                         for &lit in &learnt[1..] {
                             bt_level = bt_level.max(self.level[var_of(lit)]);
