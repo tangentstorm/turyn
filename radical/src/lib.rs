@@ -910,6 +910,8 @@ impl Solver {
 
         for i in 0..n {
             let t = &self.quad_pb_constraints[qi as usize].terms[i];
+            // Fast path: DEAD and TRUE terms can never propagate
+            if t.state != 1 { continue; }
             let aa = self.assigns[t.var_a()];
             let ab = self.assigns[t.var_b()];
             let a_false = aa != LBool::Undef && aa != t.true_val_a();
