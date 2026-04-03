@@ -297,3 +297,52 @@ All four features (rephasing, compaction, subsumption, BVE) address problems in 
 ### 9. Incremental slack tracking for quad PB *(from Claude)*
 
 Currently `propagate_quad_pb` recomputes `sum_true` and `sum_maybe` from scratch on every call by scanning all ~80 terms. With ~21 constraints checked per variable assignment, this is O(21 * 80) = ~1680 term evaluations per assignment. Incremental tracking would store `sum_true` and `sum_maybe` per constraint and update them delta-style when a variable changes (+/- one term's coefficient). This requires careful bookkeeping during backtrack (restore old values). Expected to reduce the per-assignment cost from O(terms) to O(1) amortized.
+
+## Performance interventions — April 2026 profile-guided round (credit: Claude)
+
+Profiling n=26 with callgrind (tuple 8,8,2,3, 26 Z/W pairs, 78s):
+- `propagate` 13%, `backtrack` 10%, `propagate_quad_pb` 8%, `compute_quad_pb_explanation` 8%
+- `solve_inner` 7%, `propagate_pb` 3%, malloc/free/realloc 6%
+- `clear_learnt` 0.5%, `reset_quad_pb_state` 0.6%
+
+Phase C (SAT) dominates >90% of runtime. The 10 interventions below target allocation reduction, hot loop efficiency, and unnecessary work elimination.
+
+### P1. Reuse `seen` and `stack` allocations in conflict analysis
+
+`analyze()` allocates `vec![false; num_vars]` on every conflict. `lit_removable()` allocates `visited` and `stack` on every call. Move these to solver-level reusable buffers (clear between uses). At n=26 with ~44 vars and hundreds of conflicts per solve, this eliminates thousands of heap allocations. Target: reduce malloc/free from 6% by ~1-2%.
+
+### P2. Avoid Vec allocation for `reason_lits` in `analyze()`
+
+`analyze()` creates a `Vec<Lit>` for `reason_lits` on every resolution step (Clause, Pb, QuadPb). For Clause reasons, this is a needless `.to_vec()` copy. Switch to iterating the clause slice directly via an enum/index approach, avoiding allocation entirely for the clause case. The QuadPb and Pb paths still need allocation but are less frequent.
+
+### P3. Batch `clear_learnt` — don't call after every single config
+
+In `solve_xy_with_sat`, line 2764: `configs_tested % 1 == 0` always evaluates true, meaning `clear_learnt` is called after every single boundary config SAT solve. This is wasteful — `clear_learnt` iterates all clause metadata + all watch lists. Batch to every N configs (e.g., 64 or 128) or skip entirely and rely on `reduce_db` in the solve loop.
+
+### P4. Skip `propagate_pb` for already-satisfied constraints
+
+`propagate_pb` does a full scan of all literals in the constraint on every trigger. For PB constraints with large slack (many true literals), the scan is wasted work. Add a `satisfied` flag or slack cache that short-circuits when the constraint is trivially satisfied.
+
+### P5. Eliminate `configs_tested % 1 == 0` dead code and reduce `clear_learnt` overhead
+
+`clear_learnt()` iterates all `clause_meta` to mark learnt clauses deleted, then iterates all watch lists to retain. With incremental solving, learnt clauses from previous configs may actually help future configs. Try removing `clear_learnt` entirely from the table path — the solve loop's `reduce_db` already manages clause database size.
+
+### P6. Pre-size `quad_pb_seen_buf` at solver construction
+
+`compute_quad_pb_explanation` checks `quad_pb_seen_buf.len() < num_vars` and resizes on first call per solve. Move the resize to `solve_with_assumptions` entry point so it's done once per solve, not checked on every explanation computation.
+
+### P7. Avoid heap allocation in `propagate_quad_pb` propagation scan
+
+The `propagate_quad_pb` function accesses `quad_pb_constraints[qi]` twice (once for counters, once for term scan). The borrow checker forces this because `self.enqueue()` is called inside the loop. Restructure to collect propagation decisions first, then enqueue after the loop, eliminating the need for split borrows and reducing instruction count.
+
+### P8. Use `SmallVec` or inline storage for learnt clauses
+
+Learnt clauses in `analyze()` and `add_learnt_clause()` use `Vec<Lit>` which heap-allocates. Most learnt clauses at n=26 are short (2-5 literals). Use `SmallVec<[Lit; 8]>` or a stack-allocated buffer to avoid heap allocation for typical clause sizes. Target: reduce malloc overhead for the analysis path.
+
+### P9. Skip quad PB propagation for constraints with large slack
+
+In `propagate_quad_pb`, when both `slack_up` and `slack_down` are large (> max_coeff), no propagation is possible. Currently we still iterate all terms looking for propagation candidates. Add a `max_coeff` field to `QuadPbConstraint` and early-exit when both slacks exceed it.
+
+### P10. Avoid `HashSet::insert` allocation in `stream_zw_candidates_to_channel` dedup
+
+The `seen` HashSet in `stream_zw_candidates_to_channel` allocates a `Vec<i32>` clone for every `zw_autocorr` on insert. Switch to a hash of the autocorrelation vector (e.g., FxHash of the raw bytes) stored in a `HashSet<u64>`, avoiding the Vec clone. This reduces Phase B allocation pressure.
