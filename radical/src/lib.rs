@@ -151,7 +151,7 @@ enum Reason {
     Decision,
     Clause(u32),  // index into clause database
     Pb(u32),      // index into pb_constraints
-    QuadPb(u32),  // index into quad_pb_constraints
+    QuadPb(u32),  // index into quad_pb_constraints; bit 31 = is_upper flag
 }
 
 /// Trail entry: records an assignment.
@@ -170,6 +170,7 @@ pub struct Solver {
     assigns: Vec<LBool>,    // indexed by var (0-based)
     level: Vec<u32>,         // decision level of each var
     reason: Vec<Reason>,     // reason for assignment
+    trail_pos: Vec<usize>,   // trail position when variable was assigned (for lazy explanation filtering)
     phase: Vec<bool>,        // phase saving: last polarity of each var
 
     // Trail
@@ -196,11 +197,7 @@ pub struct Solver {
     quad_pb_constraints: Vec<QuadPbConstraint>,
     quad_pb_var_watches: Vec<Vec<u32>>,       // quad_pb_var_watches[var] = list of constraint indices
     quad_pb_var_terms: Vec<Vec<(u32, u16, bool)>>,  // (constraint_idx, term_idx, is_var_a)
-    // Stored explanations: captured at propagation time, used during analysis.
-    // Indexed by variable. Cleared on backtrack.
-    quad_pb_reasons: Vec<Option<Vec<Lit>>>,
-    // Reusable scratch buffers for propagate_quad_pb (avoid per-call allocation)
-    quad_pb_expl_buf: Vec<Lit>,
+    // Reusable scratch buffer for quad PB explanation building (on-demand during analysis)
     quad_pb_seen_buf: Vec<bool>,
 
     // Propagation queue
@@ -251,6 +248,7 @@ impl Solver {
             assigns: Vec::new(),
             level: Vec::new(),
             reason: Vec::new(),
+            trail_pos: Vec::new(),
             phase: Vec::new(),
             trail: Vec::new(),
             trail_lim: Vec::new(),
@@ -262,8 +260,6 @@ impl Solver {
             quad_pb_constraints: Vec::new(),
             quad_pb_var_watches: Vec::new(),
             quad_pb_var_terms: Vec::new(),
-            quad_pb_reasons: Vec::new(),
-            quad_pb_expl_buf: Vec::new(),
             quad_pb_seen_buf: Vec::new(),
             activity: Vec::new(),
             var_inc: 1.0,
@@ -288,6 +284,7 @@ impl Solver {
             self.assigns.push(LBool::Undef);
             self.level.push(0);
             self.reason.push(Reason::Decision);
+            self.trail_pos.push(0);
             self.phase.push(true); // default: branch positive
             self.activity.push(0.0);
             self.watches.push(Vec::new()); // positive literal watch
@@ -296,7 +293,6 @@ impl Solver {
             self.pb_watches.push(Vec::new()); // negative literal PB
             self.quad_pb_var_watches.push(Vec::new());
             self.quad_pb_var_terms.push(Vec::new());
-            self.quad_pb_reasons.push(None);
             self.heap_pos.push(self.heap.len());
             self.heap.push(idx);
         }
@@ -654,6 +650,7 @@ impl Solver {
         debug_assert!(self.assigns[v] == LBool::Undef,
             "enqueue lit={} but var {} already assigned {:?}", lit, v, self.assigns[v]);
         self.assigns[v] = if lit > 0 { LBool::True } else { LBool::False };
+        self.trail_pos[v] = self.trail.len();
         self.level[v] = self.decision_level();
         self.reason[v] = reason;
         self.trail.push(TrailEntry { lit, level: self.decision_level(), reason });
@@ -886,11 +883,6 @@ impl Solver {
         let slack_down = target - sum_true;
         if slack_up > 0 && slack_down > 0 { return None; }
 
-        // Grow seen buffer if needed; clear only used entries after each propagation
-        if self.quad_pb_seen_buf.len() < self.num_vars {
-            self.quad_pb_seen_buf.resize(self.num_vars, false);
-        }
-
         for i in 0..n {
             let t = &self.quad_pb_constraints[qi as usize].terms[i];
             let aa = self.assigns[t.var_a()];
@@ -914,50 +906,62 @@ impl Solver {
                 else { continue; }
             } else { continue; }
 
-            let pv = var_of(propagated_lit);
+            // Lazy explanation: encode is_upper in bit 31 of qi, defer building to analyze time.
             let is_upper = c > slack_down;
-
-            // Reuse scratch buffers instead of allocating
-            self.quad_pb_expl_buf.clear();
-            let seen = &mut self.quad_pb_seen_buf;
-            {
-                let terms = &self.quad_pb_constraints[qi as usize].terms;
-                for t in terms {
-                    let va = t.var_a();
-                    let vb = t.var_b();
-                    let aa = self.assigns[va];
-                    let ab = self.assigns[vb];
-                    let af = (aa == LBool::True && t.neg_a()) || (aa == LBool::False && !t.neg_a());
-                    let bf = (ab == LBool::True && t.neg_b()) || (ab == LBool::False && !t.neg_b());
-
-                    if af || bf {
-                        let (lit, v) = if af { (t.lit_a, va) } else { (t.lit_b, vb) };
-                        if v != pv && !seen[v] && self.level[v] > 0 {
-                            seen[v] = true;
-                            self.quad_pb_expl_buf.push(lit);
-                        }
-                    } else if is_upper && aa != LBool::Undef && ab != LBool::Undef {
-                        if va != pv && !seen[va] && self.level[va] > 0 {
-                            seen[va] = true;
-                            self.quad_pb_expl_buf.push(negate(t.lit_a));
-                        }
-                        if vb != pv && !seen[vb] && self.level[vb] > 0 {
-                            seen[vb] = true;
-                            self.quad_pb_expl_buf.push(negate(t.lit_b));
-                        }
-                    }
-                }
-            }
-            // Clear seen flags for used entries
-            for &lit in &self.quad_pb_expl_buf {
-                seen[var_of(lit)] = false;
-            }
-            // Clone into storage, keeping buffer capacity for reuse
-            self.quad_pb_reasons[pv] = Some(self.quad_pb_expl_buf.clone());
-            self.enqueue(propagated_lit, Reason::QuadPb(qi));
+            let reason_qi = qi | if is_upper { 1u32 << 31 } else { 0 };
+            self.enqueue(propagated_lit, Reason::QuadPb(reason_qi));
             return None;
         }
         None
+    }
+
+    /// Compute quad PB explanation on-demand (lazy). Called during conflict analysis.
+    /// `qi_encoded` has bit 31 = is_upper flag, bits 0-30 = constraint index.
+    /// `pv` is the propagated variable (excluded from explanation).
+    /// Only includes variables assigned before `pv` on the trail (trail_pos filter).
+    fn compute_quad_pb_explanation(&mut self, qi_encoded: u32, pv: usize) -> Vec<Lit> {
+        let is_upper = (qi_encoded >> 31) != 0;
+        let qi = (qi_encoded & 0x7FFFFFFF) as usize;
+        let pv_pos = self.trail_pos[pv];
+
+        if self.quad_pb_seen_buf.len() < self.num_vars {
+            self.quad_pb_seen_buf.resize(self.num_vars, false);
+        }
+
+        let mut lits = Vec::new();
+        let seen = &mut self.quad_pb_seen_buf;
+        let terms = &self.quad_pb_constraints[qi].terms;
+        for t in terms {
+            let va = t.var_a();
+            let vb = t.var_b();
+            // Only consider variables assigned before the propagated variable
+            let aa = if self.assigns[va] != LBool::Undef && self.trail_pos[va] < pv_pos { self.assigns[va] } else { LBool::Undef };
+            let ab = if self.assigns[vb] != LBool::Undef && self.trail_pos[vb] < pv_pos { self.assigns[vb] } else { LBool::Undef };
+            let af = (aa == LBool::True && t.neg_a()) || (aa == LBool::False && !t.neg_a());
+            let bf = (ab == LBool::True && t.neg_b()) || (ab == LBool::False && !t.neg_b());
+
+            if af || bf {
+                let (lit, v) = if af { (t.lit_a, va) } else { (t.lit_b, vb) };
+                if v != pv && !seen[v] && self.level[v] > 0 {
+                    seen[v] = true;
+                    lits.push(lit);
+                }
+            } else if is_upper && aa != LBool::Undef && ab != LBool::Undef {
+                if va != pv && !seen[va] && self.level[va] > 0 {
+                    seen[va] = true;
+                    lits.push(negate(t.lit_a));
+                }
+                if vb != pv && !seen[vb] && self.level[vb] > 0 {
+                    seen[vb] = true;
+                    lits.push(negate(t.lit_b));
+                }
+            }
+        }
+        // Clear seen flags
+        for &lit in &lits {
+            seen[var_of(lit)] = false;
+        }
+        lits
     }
 
     /// 1-UIP conflict analysis with learnt clause minimization.
@@ -996,16 +1000,17 @@ impl Solver {
                     }
                     lits
                 }
-                Reason::QuadPb(qi) => {
+                Reason::QuadPb(qi_encoded) => {
+                    let qi = (qi_encoded & 0x7FFFFFFF) as usize;
                     if p != 0 {
-                        // Propagation: use stored explanation (captured at propagation time)
+                        // Propagation: compute explanation lazily (deferred from propagation time)
                         let pv = var_of(p);
-                        let mut lits = self.quad_pb_reasons[pv].take().unwrap_or_default();
+                        let mut lits = self.compute_quad_pb_explanation(qi_encoded, pv);
                         lits.push(p);
                         lits
                     } else {
                         // Conflict: compute from current state (haven't backtracked yet)
-                        let terms = &self.quad_pb_constraints[qi as usize].terms;
+                        let terms = &self.quad_pb_constraints[qi].terms;
                         let mut lits = Vec::new();
                         let mut seen_v = vec![false; self.num_vars];
                         for t in terms {
@@ -1062,7 +1067,7 @@ impl Solver {
     }
 
     /// Recursive clause minimization (MiniSat-style).
-    fn minimize_learnt(&self, learnt: &mut Vec<Lit>, seen: &[bool]) {
+    fn minimize_learnt(&mut self, learnt: &mut Vec<Lit>, seen: &[bool]) {
         let mut levels_in_learnt = vec![false; self.decision_level() as usize + 1];
         for &lit in learnt.iter() {
             let lv = self.level[var_of(lit)] as usize;
@@ -1090,7 +1095,7 @@ impl Solver {
     }
 
     /// Check if a literal's antecedent chain is covered by the learnt clause.
-    fn lit_removable(&self, v: usize, seen: &[bool], levels_in_learnt: &[bool]) -> bool {
+    fn lit_removable(&mut self, v: usize, seen: &[bool], levels_in_learnt: &[bool]) -> bool {
         let mut stack: Vec<usize> = vec![v];
         let mut visited = vec![false; self.num_vars];
         visited[v] = true;
@@ -1105,14 +1110,9 @@ impl Solver {
                         .filter(|&l| var_of(l) != cur && self.lit_value(l) == LBool::False)
                         .collect()
                 }
-                Reason::QuadPb(_qi) => {
-                    // Use stored explanation if available
-                    if let Some(ref lits) = self.quad_pb_reasons[cur] {
-                        lits.clone()
-                    } else {
-                        // Fallback: can't minimize without explanation
-                        return false;
-                    }
+                Reason::QuadPb(qi_encoded) => {
+                    // Compute explanation lazily on-demand
+                    self.compute_quad_pb_explanation(qi_encoded, cur)
                 }
                 Reason::Decision => return false,
             };
@@ -1142,7 +1142,6 @@ impl Solver {
             let v = var_of(entry.lit);
             self.phase[v] = entry.lit > 0;
             self.assigns[v] = LBool::Undef;
-            if v < self.quad_pb_reasons.len() { self.quad_pb_reasons[v] = None; }
             // Incrementally update quad PB term states after unassigning.
             // Skip for level 0 when caller manages state externally (table path).
             if !(level == 0 && self.skip_backtrack_quad_pb) {

@@ -126,7 +126,7 @@ London holds the record for longest known Turyn type sequences (TT(40)). His the
 
 ### Implemented from London thesis
 
-- **Z/W-indexed boundary table** *(London §3.3, Step 1)*: Pre-enumerate all valid X/Y boundary configurations (prefix+suffix of length k) and index them by Z/W boundary bits. At runtime, given a Z/W candidate, extract its boundary bits, do a single O(1) array lookup, and get all compatible (x_bits, y_bits) pairs. The precomputation checks autocorrelation constraints for boundary-only lags (lags where all position pairs fall within the boundary). For n=26, k=6: 27K distinct X/Y autocorrelation signatures, 444M total stored (z,w,x,y) matches, 3.6GB table, ~264 X/Y configs per Z/W lookup on average. Table is mmap'd at runtime. **Implemented.**
+- **Z/W-indexed boundary table** *(London §3.3, Step 1)*: Pre-enumerate all valid X/Y boundary configurations (prefix+suffix of length k) and index them by Z/W boundary bits. At runtime, given a Z/W candidate, extract its boundary bits, do a single O(1) array lookup, and get all compatible (x_bits, y_bits) pairs. The precomputation checks autocorrelation constraints for boundary-only lags (lags where all position pairs fall within the boundary). Deduplicated format: many Z/W configs share the same X/Y signature, so unique (x,y) lists are stored once with indices pointing to shared lists. For k=6: 27K distinct signatures, 4.2M unique X/Y entries, 131MB table. For k=7: table generation is feasible but table is much larger. **Implemented.**
 
 - **Spectral budget restriction (`--max-spectral`)** *(London §5.1)*: Added `--max-spectral=M` CLI parameter. Restricts spectral pair filter to `|Z(ω)|² + |W(ω)|² ≤ M` at every frequency. Individual filtering still uses full spectral_bound. Trades completeness for dramatically reduced search space at larger n. London used M=66 for first TT(32), M=84 for first TT(40). No regression on existing benchmarks (pair filter already rejects everything at n=16). **Implemented.**
 
@@ -142,7 +142,7 @@ London holds the record for longest known Turyn type sequences (TT(40)). His the
 
 ### Table refinement ideas (not yet implemented)
 
-The Z/W-indexed boundary table works well at k=6 (3.6GB, 444M matches) but explodes at k=7 (87GB, 11.5B matches). Several refinements could shrink the table and enable larger k:
+The Z/W-indexed boundary table with deduplication is 131MB at k=6 (27K signatures, 4.2M X/Y entries). Several refinements could further shrink the table and enable larger k:
 
 1. **Sum-tuple filtering in gen_table**: Only store (x,y) configs where the boundary sums are compatible with at least one valid sum tuple for the given n. Currently the table stores ALL autocorrelation-compatible configs regardless of sum feasibility. Since sum tuples are sparse (e.g. 192 tuples for n=26), this could cut the table size dramatically.
 
@@ -152,7 +152,7 @@ The Z/W-indexed boundary table works well at k=6 (3.6GB, 444M matches) but explo
 
 4. **Sub-indexing by sum pair**: Within each Z/W bucket, sort (x,y) entries by (x_bnd_sum, y_bnd_sum). At runtime, binary-search to the sum-matching sub-range instead of scanning all entries. Cuts the per-candidate scan from ~264 to ~20-30 entries.
 
-5. **Compressed storage**: Many Z/W configs map to the same set of (x,y) pairs (because the exact-lag signature is what determines compatibility, and many Z/W configs share the same signature). Store unique (x,y) lists once, with the index pointing to shared lists. Could reduce the 3.6GB table to ~200-500MB.
+5. **Compressed storage**: ~~Many Z/W configs map to the same set of (x,y) pairs. Store unique (x,y) lists once.~~ **Done** — the deduplicated format already implements this (131MB for k=6, down from ~3.6GB non-deduplicated).
 
 6. **Lazy mmap with real file-backed mapping**: For k≥8 tables (16GB+), use actual OS mmap instead of read-to-vec. Only the pages touched during a run get loaded into RAM. The OS handles paging automatically.
 

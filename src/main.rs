@@ -167,13 +167,18 @@ fn colored_pm(seq: &PackedSeq) -> String {
 }
 
 fn print_solution(label: &str, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &PackedSeq) {
-    println!("\n{}", label);
+    use std::io::Write;
     let n = x.len();
+    let mut buf = format!("\n{}\n", label);
     for (name, seq) in [("X", x), ("Y", y), ("Z", z), ("W", w)] {
-        let pad = " ".repeat(n - seq.len()); // W is 1 shorter; pad to align NB column
-        println!("{} =: '{}'{}  NB. {}", name, colored_pm(seq), pad, seq.sum());
+        let pad = " ".repeat(n - seq.len());
+        buf.push_str(&format!("{} =: '{}'{}  NB. {}\n", name, colored_pm(seq), pad, seq.sum()));
     }
-    println!();
+    buf.push('\n');
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let _ = lock.write_all(buf.as_bytes());
+    let _ = lock.flush();
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -185,12 +190,23 @@ struct SumTuple {
 }
 
 impl SumTuple {
+    /// Normalization key for tuple deduplication in hybrid search.
+    ///
+    /// The hybrid SAT solver fixes both x[0]=+1 and y[0]=+1. With these constraints:
+    /// - Negate X: flips x[0] → NOT safe
+    /// - Negate Y: flips y[0] → NOT safe
+    /// - Negate Z: no z[0] constraint → safe: σ_Z → |σ_Z|
+    /// - Negate W: no w[0] constraint → safe: σ_W → |σ_W|
+    /// - X↔Y swap: both have first element +1, so swap preserves constraints → safe
+    ///
+    /// This gives factor ~8 reduction: 2 (Z sign) × 2 (W sign) × 2 (X↔Y swap when x≠y).
     fn norm_key(&self) -> (i32, i32, i32, i32) {
-        let mut xx = self.x.abs();
-        let mut yy = self.y.abs();
-        if yy > xx {
-            std::mem::swap(&mut xx, &mut yy);
-        }
+        let (xx, yy) = if self.y.abs() > self.x.abs()
+            || (self.x.abs() == self.y.abs() && self.y > self.x) {
+            (self.y, self.x)
+        } else {
+            (self.x, self.y)
+        };
         (xx, yy, self.z.abs(), self.w.abs())
     }
 
@@ -380,7 +396,11 @@ fn enumerate_sum_tuples(problem: Problem) -> Vec<SumTuple> {
 fn normalized_tuples(raw: &[SumTuple]) -> Vec<SumTuple> {
     let mut seen = HashMap::new();
     for t in raw {
-        seen.entry(t.norm_key()).or_insert(*t);
+        let key = t.norm_key();
+        // Store canonical form: all positive, x >= y
+        seen.entry(key).or_insert(SumTuple {
+            x: key.0, y: key.1, z: key.2, w: key.3,
+        });
     }
     let mut items: Vec<_> = seen.into_values().collect();
     items.sort_by_key(|t| t.norm_key());
@@ -2879,9 +2899,10 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
     let phase_a_start = Instant::now();
     let raw = enumerate_sum_tuples(problem);
-    let mut seen = std::collections::HashSet::new();
-    let mut tuples: Vec<SumTuple> = raw.into_iter()
-        .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+    // Normalize: deduplicate by sign/swap equivalence.
+    // Negating any sequence preserves autocorrelation; swapping X↔Y is symmetric.
+    // norm_key = (sorted |x|,|y|, |z|, |w|) captures this equivalence.
+    let mut tuples: Vec<SumTuple> = normalized_tuples(&raw).into_iter()
         .filter(|t| {
             (t.x + problem.n as i32) % 2 == 0
             && (t.y + problem.n as i32) % 2 == 0
@@ -2909,13 +2930,27 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let phase_a_elapsed = phase_a_start.elapsed();
 
     let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table-k7.bin".to_string());
-    let xy_table: Option<Arc<XYBoundaryTable>> = if cfg.no_table {
+    // The k=7 table requires n >= 2k = 14. Auto-skip for smaller n.
+    let skip_table = cfg.no_table || problem.n < 14;
+    let xy_table: Option<Arc<XYBoundaryTable>> = if skip_table {
+        if !cfg.no_table && problem.n < 14 && verbose {
+            eprintln!("Note: n={} < 14 (2*k for k=7 table), running without table", problem.n);
+        }
         None
     } else {
         match XYBoundaryTable::load(&table_path) {
             Some(t) => {
-                if verbose { eprintln!("Loaded XY boundary table from {} (k={}, {} sigs, {} XY entries)", table_path, t.k, t.sig_offsets.len(), t.xy_data.len()); }
-                Some(Arc::new(t))
+                // Verify n >= 2*k for the loaded table
+                if problem.n < 2 * t.k {
+                    if verbose {
+                        eprintln!("Note: n={} < {} (2*k for k={} table), running without table",
+                            problem.n, 2 * t.k, t.k);
+                    }
+                    None
+                } else {
+                    if verbose { eprintln!("Loaded XY boundary table from {} (k={}, {} sigs, {} XY entries)", table_path, t.k, t.sig_offsets.len(), t.xy_data.len()); }
+                    Some(Arc::new(t))
+                }
             }
             None => {
                 eprintln!("Error: XY boundary table not found at '{}'", table_path);
