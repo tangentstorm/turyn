@@ -2782,10 +2782,17 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 }
                 if found.load(AtomicOrdering::Relaxed) { break; }
                 let (w_candidates, w_index) = w_cache.get(&tuple.w).unwrap();
+                let before = (stats.z_generated, stats.z_spectral_ok, stats.candidate_pair_spectral_ok);
                 stream_zw_candidates_to_channel(
                     problem, tuple, w_candidates, w_index, &cfg, &spectral_z,
                     &mut stats, &found, &tx);
                 stats.phase_b_nanos += b_start.elapsed().as_nanos() as u64;
+                let z_gen = stats.z_generated - before.0;
+                let z_ok = stats.z_spectral_ok - before.1;
+                let pairs = stats.candidate_pair_spectral_ok - before.2;
+                eprintln!("  tuple {}/{} (sums {},{},{},{}): z_gen={} z_ok={} w={} pairs={}",
+                    idx+1, tuples.len(), tuple.x, tuple.y, tuple.z, tuple.w,
+                    z_gen, z_ok, w_candidates.len(), pairs);
                 tuples_produced.fetch_add(1, AtomicOrdering::Relaxed);
             }
             stats
