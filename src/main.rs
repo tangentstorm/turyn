@@ -167,13 +167,18 @@ fn colored_pm(seq: &PackedSeq) -> String {
 }
 
 fn print_solution(label: &str, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &PackedSeq) {
-    println!("\n{}", label);
+    use std::io::Write;
     let n = x.len();
+    let mut buf = format!("\n{}\n", label);
     for (name, seq) in [("X", x), ("Y", y), ("Z", z), ("W", w)] {
-        let pad = " ".repeat(n - seq.len()); // W is 1 shorter; pad to align NB column
-        println!("{} =: '{}'{}  NB. {}", name, colored_pm(seq), pad, seq.sum());
+        let pad = " ".repeat(n - seq.len());
+        buf.push_str(&format!("{} =: '{}'{}  NB. {}\n", name, colored_pm(seq), pad, seq.sum()));
     }
-    println!();
+    buf.push('\n');
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let _ = lock.write_all(buf.as_bytes());
+    let _ = lock.flush();
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
