@@ -311,7 +311,8 @@ Phase C (SAT) dominates >90% of runtime. The 10 interventions below target alloc
 
 `analyze()` allocates `vec![false; num_vars]` on every conflict. `lit_removable()` allocates `visited` and `stack` on every call. Move these to solver-level reusable buffers (clear between uses). At n=26 with ~44 vars and hundreds of conflicts per solve, this eliminates thousands of heap allocations. Target: reduce malloc/free from 6% by ~1-2%.
 
-**Result:** Phase C n=26: 18.99s → 18.79s (**-1.1%**, within noise). Phase B neutral. The 44-var instances have tiny allocations; savings are real but small. Also eliminated `.to_vec()` copy for Clause reasons in analyze (P2 folded in). **Accepted** — marginal but correct.
+**Result (v1):** Phase C n=26: 18.99s → 18.79s (-1.1%, within noise). Reverted — not a decisive win.
+**Result (v2, iterated):** Extended to cover `compute_quad_pb_explanation` (16.67% of runtime returning `Vec<Lit>`), `lit_removable`, and all conflict analysis paths. Uses `mem::take` pattern for borrow-checker-safe buffer reuse. Phase C n=26: 18.88s → 16.99s (**-10.0%**). malloc/free dropped from 8.5% to ~2%. **Accepted.**
 
 ### P2. Avoid Vec allocation for `reason_lits` in `analyze()`
 
