@@ -348,6 +348,8 @@ The `propagate_quad_pb` inner loop checks `assigns[var_a]` and `assigns[var_b]` 
 
 Learnt clauses in `analyze()` and `add_learnt_clause()` use `Vec<Lit>` which heap-allocates. Most learnt clauses at n=26 are short (2-5 literals). Use `SmallVec<[Lit; 8]>` or a stack-allocated buffer to avoid heap allocation for typical clause sizes. Target: reduce malloc overhead for the analysis path.
 
+**Result:** Superseded by P1v2 which eliminated nearly all per-conflict allocations. The learnt clause Vec is the only remaining allocation per conflict, but `analyze` now returns it and `add_learnt_clause` takes ownership — one alloc per conflict is cheap. malloc dropped from 8.5% → 0.2%. **Skipped.**
+
 ### P9. Skip quad PB propagation for constraints with large slack
 
 In `propagate_quad_pb`, when both `slack_up` and `slack_down` are large (> max_coeff), no propagation is possible. Currently we still iterate all terms looking for propagation candidates. Add a `max_coeff` field to `QuadPbConstraint` and early-exit when both slacks exceed it.
@@ -357,3 +359,5 @@ In `propagate_quad_pb`, when both `slack_up` and `slack_down` are large (> max_c
 ### P10. Avoid `HashSet::insert` allocation in `stream_zw_candidates_to_channel` dedup
 
 The `seen` HashSet in `stream_zw_candidates_to_channel` allocates a `Vec<i32>` clone for every `zw_autocorr` on insert. Switch to a hash of the autocorrelation vector (e.g., FxHash of the raw bytes) stored in a `HashSet<u64>`, avoiding the Vec clone. This reduces Phase B allocation pressure.
+
+**Result:** Skipped �� Phase B is <0.2% of runtime at n=26 (32ms out of 16s). The dedup HashSet handles at most ~573 entries per tuple. Not worth optimizing for the SAT-heavy benchmark. **Skipped.**
