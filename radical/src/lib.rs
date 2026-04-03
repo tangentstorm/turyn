@@ -280,7 +280,7 @@ impl Solver {
             minimize_levels: Vec::new(),
             activity: Vec::new(),
             var_inc: 1.0,
-            var_decay: 0.975,
+            var_decay: 0.95,
             heap: Vec::new(),
             heap_pos: Vec::new(),
             prop_head: 0,
@@ -625,11 +625,12 @@ impl Solver {
                 self.add_learnt_clause(learnt_clause);
                 self.decay_activities();
 
-                // Restart check (no reduce_db — clear_learnt handles clause cleanup)
+                // Restart check
                 if self.conflicts >= self.restart_limit {
                     self.restart_limit += 100 * luby(self.luby_index);
                     self.luby_index += 1;
                     self.backtrack(base_level);
+                    self.reduce_db();
                 }
             } else {
                 // No conflict
