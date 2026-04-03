@@ -143,6 +143,8 @@ struct QuadPbConstraint {
     /// Branchless counter array indexed by state: sums[0]=dead(unused), sums[1]=maybe, sums[2]=true.
     /// Replaces separate sum_true/sum_maybe fields for branch-free updates.
     sums: [i32; 3],
+    /// When true, sums[] and term states are stale (need recomputation before use).
+    stale: bool,
 }
 
 /// Reason a variable was assigned (for conflict analysis).
@@ -200,6 +202,14 @@ pub struct Solver {
     // Reusable scratch buffer for quad PB explanation building (on-demand during analysis)
     quad_pb_seen_buf: Vec<bool>,
 
+    // Reusable scratch buffers for conflict analysis (avoids per-conflict heap allocations)
+    analyze_seen: Vec<bool>,           // seen[] in analyze()
+    analyze_reason_buf: Vec<Lit>,      // reusable for quad PB explanation in analyze
+    analyze_reason_buf2: Vec<Lit>,     // reusable for quad PB explanation in lit_removable
+    minimize_stack: Vec<usize>,        // stack for lit_removable()
+    minimize_visited: Vec<bool>,       // visited[] for lit_removable()
+    minimize_levels: Vec<bool>,        // levels_in_learnt for minimize_learnt()
+
     // Propagation queue
     prop_head: usize, // next trail entry to propagate
 
@@ -221,6 +231,7 @@ pub struct Solver {
 impl Solver {
     /// Get the literals of clause `ci`.
     #[inline]
+    #[allow(dead_code)]
     fn clause_lits(&self, ci: u32) -> &[Lit] {
         let m = &self.clause_meta[ci as usize];
         &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)]
@@ -261,6 +272,12 @@ impl Solver {
             quad_pb_var_watches: Vec::new(),
             quad_pb_var_terms: Vec::new(),
             quad_pb_seen_buf: Vec::new(),
+            analyze_seen: Vec::new(),
+            analyze_reason_buf: Vec::new(),
+            analyze_reason_buf2: Vec::new(),
+            minimize_stack: Vec::new(),
+            minimize_visited: Vec::new(),
+            minimize_levels: Vec::new(),
             activity: Vec::new(),
             var_inc: 1.0,
             var_decay: 0.95,
@@ -429,6 +446,7 @@ impl Solver {
             num_terms: terms.len() as u32,
             sums: [0, coeffs.iter().sum::<u32>() as i32, 0],
             terms,
+            stale: false,
         });
 
         // Initial propagation
@@ -447,6 +465,17 @@ impl Solver {
     /// to level 0, so assumptions don't persist but learnt clauses do.
     pub fn solve_with_assumptions(&mut self, assumptions: &[Lit]) -> Option<bool> {
         if !self.ok { return Some(false); }
+
+        // Pre-size reusable buffers for analysis and explanation
+        if self.quad_pb_seen_buf.len() < self.num_vars {
+            self.quad_pb_seen_buf.resize(self.num_vars, false);
+        }
+        if self.analyze_seen.len() < self.num_vars {
+            self.analyze_seen.resize(self.num_vars, false);
+        }
+        if self.minimize_visited.len() < self.num_vars {
+            self.minimize_visited.resize(self.num_vars, false);
+        }
 
         let assumption_level: u32 = if assumptions.is_empty() { 0 } else { 1 };
 
@@ -524,6 +553,7 @@ impl Solver {
             qc.terms[i].state = s;
         }
         qc.sums = [0, sum_maybe, sum_true];
+        qc.stale = false;
     }
 
     /// Get the number of quad PB constraints.
@@ -680,6 +710,19 @@ impl Solver {
             if !self.quad_pb_constraints.is_empty() {
                 let v = var_of(lit);
                 let known_val = self.assigns[v]; // just assigned, hot in cache
+                // Recompute stale constraints before incremental updates
+                for idx in 0..self.quad_pb_var_watches[v].len() {
+                    let qi = self.quad_pb_var_watches[v][idx];
+                    if self.quad_pb_constraints[qi as usize].stale {
+                        // Batch: recompute all stale at once for cache locality
+                        for i in 0..self.quad_pb_constraints.len() {
+                            if self.quad_pb_constraints[i].stale {
+                                self.recompute_quad_pb(i as u32);
+                            }
+                        }
+                        break;
+                    }
+                }
                 // Update term states for all terms involving this variable
                 for idx in 0..self.quad_pb_var_terms[v].len() {
                     let (qi, ti, is_a) = self.quad_pb_var_terms[v][idx];
@@ -866,9 +909,35 @@ impl Solver {
     }
 
     /// Propagate a quadratic PB constraint using incremental counters.
+    /// Recompute term states and sums for a stale quad PB constraint.
+    #[inline]
+    fn recompute_quad_pb(&mut self, qi: u32) {
+        let qi = qi as usize;
+        let nt = self.quad_pb_constraints[qi].num_terms as usize;
+        let mut sums = [0i32, 0, 0];
+        for ti in 0..nt {
+            let t = &self.quad_pb_constraints[qi].terms[ti];
+            let aa = self.assigns[t.var_a()];
+            let ab = self.assigns[t.var_b()];
+            let new_state = t.compute_state(aa, ab);
+            sums[new_state as usize] += t.coeff as i32;
+            self.quad_pb_constraints[qi].terms[ti].state = new_state;
+        }
+        self.quad_pb_constraints[qi].sums = sums;
+        self.quad_pb_constraints[qi].stale = false;
+    }
+
     /// Single-pass: finds propagation and builds explanation in one fused scan.
     #[inline]
     fn propagate_quad_pb(&mut self, qi: u32) -> Option<Reason> {
+        if self.quad_pb_constraints[qi as usize].stale {
+            // Batch recompute all stale constraints at once (better cache locality)
+            for i in 0..self.quad_pb_constraints.len() {
+                if self.quad_pb_constraints[i].stale {
+                    self.recompute_quad_pb(i as u32);
+                }
+            }
+        }
         let qc = &self.quad_pb_constraints[qi as usize];
         let n = qc.num_terms as usize;
         let target = qc.target as i64;
@@ -885,6 +954,8 @@ impl Solver {
 
         for i in 0..n {
             let t = &self.quad_pb_constraints[qi as usize].terms[i];
+            // Fast path: DEAD and TRUE terms can never propagate
+            if t.state != 1 { continue; }
             let aa = self.assigns[t.var_a()];
             let ab = self.assigns[t.var_b()];
             let a_false = aa != LBool::Undef && aa != t.true_val_a();
@@ -919,22 +990,19 @@ impl Solver {
     /// `qi_encoded` has bit 31 = is_upper flag, bits 0-30 = constraint index.
     /// `pv` is the propagated variable (excluded from explanation).
     /// Only includes variables assigned before `pv` on the trail (trail_pos filter).
-    fn compute_quad_pb_explanation(&mut self, qi_encoded: u32, pv: usize) -> Vec<Lit> {
+    /// Compute quad PB explanation into a provided output buffer.
+    /// Clears `out` first, appends explanation literals.
+    fn compute_quad_pb_explanation_into(&mut self, qi_encoded: u32, pv: usize, out: &mut Vec<Lit>) {
+        out.clear();
         let is_upper = (qi_encoded >> 31) != 0;
         let qi = (qi_encoded & 0x7FFFFFFF) as usize;
         let pv_pos = self.trail_pos[pv];
 
-        if self.quad_pb_seen_buf.len() < self.num_vars {
-            self.quad_pb_seen_buf.resize(self.num_vars, false);
-        }
-
-        let mut lits = Vec::new();
         let seen = &mut self.quad_pb_seen_buf;
         let terms = &self.quad_pb_constraints[qi].terms;
         for t in terms {
             let va = t.var_a();
             let vb = t.var_b();
-            // Only consider variables assigned before the propagated variable
             let aa = if self.assigns[va] != LBool::Undef && self.trail_pos[va] < pv_pos { self.assigns[va] } else { LBool::Undef };
             let ab = if self.assigns[vb] != LBool::Undef && self.trail_pos[vb] < pv_pos { self.assigns[vb] } else { LBool::Undef };
             let af = (aa == LBool::True && t.neg_a()) || (aa == LBool::False && !t.neg_a());
@@ -944,30 +1012,33 @@ impl Solver {
                 let (lit, v) = if af { (t.lit_a, va) } else { (t.lit_b, vb) };
                 if v != pv && !seen[v] && self.level[v] > 0 {
                     seen[v] = true;
-                    lits.push(lit);
+                    out.push(lit);
                 }
             } else if is_upper && aa != LBool::Undef && ab != LBool::Undef {
                 if va != pv && !seen[va] && self.level[va] > 0 {
                     seen[va] = true;
-                    lits.push(negate(t.lit_a));
+                    out.push(negate(t.lit_a));
                 }
                 if vb != pv && !seen[vb] && self.level[vb] > 0 {
                     seen[vb] = true;
-                    lits.push(negate(t.lit_b));
+                    out.push(negate(t.lit_b));
                 }
             }
         }
         // Clear seen flags
-        for &lit in &lits {
-            seen[var_of(lit)] = false;
+        for i in 0..out.len() {
+            seen[var_of(out[i])] = false;
         }
-        lits
     }
 
     /// 1-UIP conflict analysis with learnt clause minimization.
     /// Returns (learnt clause, backtrack level).
+    /// Uses solver-level reusable buffers to eliminate per-conflict allocations.
     fn analyze(&mut self, conflict_reason: Reason) -> (Vec<Lit>, u32) {
-        let mut seen = vec![false; self.num_vars];
+        // Reuse analyze_seen buffer (fill is O(num_vars) = O(44) at n=26)
+        self.analyze_seen.resize(self.num_vars, false);
+        self.analyze_seen.fill(false);
+
         let mut counter = 0;
         let mut learnt = Vec::new();
         let mut bt_level: u32 = 0;
@@ -976,70 +1047,96 @@ impl Solver {
         let mut p: Lit = 0;
 
         loop {
-            // Get the literals of the reason (clause or PB explanation)
-            let reason_lits: Vec<Lit> = match current_reason {
+            // Process reason literals inline — avoid Vec allocation for Clause path
+            match current_reason {
                 Reason::Clause(ci) => {
                     let m = self.clause_meta[ci as usize];
                     let cstart = m.start as usize;
                     let clen = m.len as usize;
-                    self.clause_lits[cstart..cstart + clen].to_vec()
-                }
-                Reason::Pb(pbi) => {
-                    // For PB conflict/propagation: generate clause from all false lits
-                    let pb = &self.pb_constraints[pbi as usize];
-                    let mut lits = Vec::new();
-                    for i in 0..pb.lits.len() {
-                        let lit = pb.lits[i];
-                        if lit == negate(p) { continue; } // skip the propagated lit's negation
-                        if self.lit_value(lit) == LBool::False {
-                            lits.push(lit); // false literal, part of the reason
+                    for idx in 0..clen {
+                        let lit = self.clause_lits[cstart + idx];
+                        if lit == p { continue; }
+                        let v = var_of(lit);
+                        if self.analyze_seen[v] { continue; }
+                        self.analyze_seen[v] = true;
+                        self.bump_activity(v);
+                        if self.level[v] == self.decision_level() {
+                            counter += 1;
+                        } else if self.level[v] > 0 {
+                            learnt.push(lit);
+                            bt_level = bt_level.max(self.level[v]);
                         }
                     }
-                    if p != 0 {
-                        lits.push(p); // the propagated literal itself
+                }
+                Reason::Pb(pbi) => {
+                    // Collect into reusable buffer
+                    self.analyze_reason_buf.clear();
+                    let pb = &self.pb_constraints[pbi as usize];
+                    for i in 0..pb.lits.len() {
+                        let lit = pb.lits[i];
+                        if lit == negate(p) { continue; }
+                        if self.lit_value(lit) == LBool::False {
+                            self.analyze_reason_buf.push(lit);
+                        }
                     }
-                    lits
+                    if p != 0 { self.analyze_reason_buf.push(p); }
+                    for idx in 0..self.analyze_reason_buf.len() {
+                        let lit = self.analyze_reason_buf[idx];
+                        if lit == p { continue; }
+                        let v = var_of(lit);
+                        if self.analyze_seen[v] { continue; }
+                        self.analyze_seen[v] = true;
+                        self.bump_activity(v);
+                        if self.level[v] == self.decision_level() {
+                            counter += 1;
+                        } else if self.level[v] > 0 {
+                            learnt.push(lit);
+                            bt_level = bt_level.max(self.level[v]);
+                        }
+                    }
                 }
                 Reason::QuadPb(qi_encoded) => {
                     let qi = (qi_encoded & 0x7FFFFFFF) as usize;
+                    let mut buf = std::mem::take(&mut self.analyze_reason_buf);
                     if p != 0 {
-                        // Propagation: compute explanation lazily (deferred from propagation time)
                         let pv = var_of(p);
-                        let mut lits = self.compute_quad_pb_explanation(qi_encoded, pv);
-                        lits.push(p);
-                        lits
+                        self.compute_quad_pb_explanation_into(qi_encoded, pv, &mut buf);
+                        buf.push(p);
                     } else {
-                        // Conflict: compute from current state (haven't backtracked yet)
-                        let terms = &self.quad_pb_constraints[qi].terms;
-                        let mut lits = Vec::new();
-                        let mut seen_v = vec![false; self.num_vars];
-                        for t in terms {
-                            for &(lit, v) in &[(t.lit_a, t.var_a()), (t.lit_b, t.var_b())] {
-                                if !seen_v[v] && self.assigns[v] != LBool::Undef && self.level[v] > 0 {
-                                    seen_v[v] = true;
-                                    lits.push(if self.lit_value(lit) == LBool::False { lit } else { negate(lit) });
+                        // Conflict: compute from current state
+                        buf.clear();
+                        let nt = self.quad_pb_constraints[qi].num_terms as usize;
+                        for ti in 0..nt {
+                            let t = &self.quad_pb_constraints[qi].terms[ti];
+                            let pairs: [(Lit, usize); 2] = [(t.lit_a, t.var_a()), (t.lit_b, t.var_b())];
+                            for &(lit, v) in &pairs {
+                                if !self.quad_pb_seen_buf[v] && self.assigns[v] != LBool::Undef && self.level[v] > 0 {
+                                    self.quad_pb_seen_buf[v] = true;
+                                    buf.push(if self.lit_value(lit) == LBool::False { lit } else { negate(lit) });
                                 }
                             }
                         }
-                        lits
+                        for idx in 0..buf.len() {
+                            self.quad_pb_seen_buf[var_of(buf[idx])] = false;
+                        }
                     }
+                    for idx in 0..buf.len() {
+                        let lit = buf[idx];
+                        if lit == p { continue; }
+                        let v = var_of(lit);
+                        if self.analyze_seen[v] { continue; }
+                        self.analyze_seen[v] = true;
+                        self.bump_activity(v);
+                        if self.level[v] == self.decision_level() {
+                            counter += 1;
+                        } else if self.level[v] > 0 {
+                            learnt.push(lit);
+                            bt_level = bt_level.max(self.level[v]);
+                        }
+                    }
+                    self.analyze_reason_buf = buf;
                 }
                 Reason::Decision => { unreachable!(); }
-            };
-
-            for &lit in &reason_lits {
-                if lit == p { continue; }
-                let v = var_of(lit);
-                if seen[v] { continue; }
-                seen[v] = true;
-                self.bump_activity(v);
-
-                if self.level[v] == self.decision_level() {
-                    counter += 1;
-                } else if self.level[v] > 0 {
-                    learnt.push(lit);
-                    bt_level = bt_level.max(self.level[v]);
-                }
             }
 
             // Find next literal on trail at current decision level that was seen
@@ -1047,12 +1144,12 @@ impl Solver {
                 trail_idx -= 1;
                 let entry = &self.trail[trail_idx];
                 let v = var_of(entry.lit);
-                if seen[v] && entry.level == self.decision_level() {
+                if self.analyze_seen[v] && entry.level == self.decision_level() {
                     p = entry.lit;
                     counter -= 1;
                     if counter == 0 {
                         learnt.insert(0, negate(p));
-                        self.minimize_learnt(&mut learnt, &seen);
+                        self.minimize_learnt(&mut learnt);
                         bt_level = 0;
                         for &lit in &learnt[1..] {
                             bt_level = bt_level.max(self.level[var_of(lit)]);
@@ -1067,24 +1164,23 @@ impl Solver {
     }
 
     /// Recursive clause minimization (MiniSat-style).
-    fn minimize_learnt(&mut self, learnt: &mut Vec<Lit>, seen: &[bool]) {
-        let mut levels_in_learnt = vec![false; self.decision_level() as usize + 1];
+    /// Uses `analyze_seen` (populated by analyze()) and reusable buffers.
+    fn minimize_learnt(&mut self, learnt: &mut Vec<Lit>) {
+        let dl = self.decision_level() as usize + 1;
+        self.minimize_levels.resize(dl, false);
+        self.minimize_levels.fill(false);
         for &lit in learnt.iter() {
             let lv = self.level[var_of(lit)] as usize;
-            if lv < levels_in_learnt.len() {
-                levels_in_learnt[lv] = true;
-            }
+            if lv < dl { self.minimize_levels[lv] = true; }
         }
 
-        let mut j = 1; // keep learnt[0] (the asserting literal)
+        let mut j = 1;
         for i in 1..learnt.len() {
             let lit = learnt[i];
             let v = var_of(lit);
             match self.reason[v] {
                 Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) => {
-                    if self.lit_removable(v, seen, &levels_in_learnt) {
-                        continue;
-                    }
+                    if self.lit_removable(v) { continue; }
                 }
                 Reason::Decision => {}
             }
@@ -1095,39 +1191,77 @@ impl Solver {
     }
 
     /// Check if a literal's antecedent chain is covered by the learnt clause.
-    fn lit_removable(&mut self, v: usize, seen: &[bool], levels_in_learnt: &[bool]) -> bool {
-        let mut stack: Vec<usize> = vec![v];
-        let mut visited = vec![false; self.num_vars];
-        visited[v] = true;
+    /// Uses `analyze_seen` and `minimize_levels` from caller, and reusable
+    /// `minimize_stack`/`minimize_visited`/`analyze_reason_buf2` buffers.
+    fn lit_removable(&mut self, v: usize) -> bool {
+        self.minimize_stack.clear();
+        self.minimize_stack.push(v);
+        self.minimize_visited.resize(self.num_vars, false);
+        self.minimize_visited.fill(false);
+        self.minimize_visited[v] = true;
 
-        while let Some(cur) = stack.pop() {
-            // Get reason literals (clause or PB explanation)
-            let reason_lits: Vec<Lit> = match self.reason[cur] {
-                Reason::Clause(ci) => self.clause_lits(ci).to_vec(),
+        while let Some(cur) = self.minimize_stack.pop() {
+            // Process reason literals inline to avoid allocation
+            match self.reason[cur] {
+                Reason::Clause(ci) => {
+                    let m = self.clause_meta[ci as usize];
+                    let cstart = m.start as usize;
+                    let clen = m.len as usize;
+                    for idx in 0..clen {
+                        let lit = self.clause_lits[cstart + idx];
+                        let u = var_of(lit);
+                        if u == cur || self.minimize_visited[u] { continue; }
+                        self.minimize_visited[u] = true;
+                        if self.level[u] == 0 { continue; }
+                        if self.analyze_seen[u] { continue; }
+                        let lv = self.level[u] as usize;
+                        if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { return false; }
+                        match self.reason[u] {
+                            Reason::Decision => return false,
+                            _ => { self.minimize_stack.push(u); }
+                        }
+                    }
+                }
                 Reason::Pb(pbi) => {
-                    let pb = &self.pb_constraints[pbi as usize];
-                    pb.lits.iter().copied()
-                        .filter(|&l| var_of(l) != cur && self.lit_value(l) == LBool::False)
-                        .collect()
+                    let n = self.pb_constraints[pbi as usize].lits.len();
+                    for i in 0..n {
+                        let lit = self.pb_constraints[pbi as usize].lits[i];
+                        let u = var_of(lit);
+                        if u == cur || self.minimize_visited[u] { continue; }
+                        if self.lit_value(lit) != LBool::False { continue; }
+                        self.minimize_visited[u] = true;
+                        if self.level[u] == 0 { continue; }
+                        if self.analyze_seen[u] { continue; }
+                        let lv = self.level[u] as usize;
+                        if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { return false; }
+                        match self.reason[u] {
+                            Reason::Decision => return false,
+                            _ => { self.minimize_stack.push(u); }
+                        }
+                    }
                 }
                 Reason::QuadPb(qi_encoded) => {
-                    // Compute explanation lazily on-demand
-                    self.compute_quad_pb_explanation(qi_encoded, cur)
+                    let mut buf2 = std::mem::take(&mut self.analyze_reason_buf2);
+                    self.compute_quad_pb_explanation_into(qi_encoded, cur, &mut buf2);
+                    let mut fail = false;
+                    for idx in 0..buf2.len() {
+                        let lit = buf2[idx];
+                        let u = var_of(lit);
+                        if u == cur || self.minimize_visited[u] { continue; }
+                        self.minimize_visited[u] = true;
+                        if self.level[u] == 0 { continue; }
+                        if self.analyze_seen[u] { continue; }
+                        let lv = self.level[u] as usize;
+                        if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { fail = true; break; }
+                        match self.reason[u] {
+                            Reason::Decision => { fail = true; break; }
+                            _ => { self.minimize_stack.push(u); }
+                        }
+                    }
+                    self.analyze_reason_buf2 = buf2;
+                    if fail { return false; }
                 }
                 Reason::Decision => return false,
-            };
-            for &lit in &reason_lits {
-                let u = var_of(lit);
-                if u == cur || visited[u] { continue; }
-                visited[u] = true;
-                if self.level[u] == 0 { continue; }
-                if seen[u] { continue; }
-                let lv = self.level[u] as usize;
-                if lv >= levels_in_learnt.len() || !levels_in_learnt[lv] { return false; }
-                match self.reason[u] {
-                    Reason::Decision => return false,
-                    Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) => { stack.push(u); }
-                }
             }
         }
         true
@@ -1142,12 +1276,12 @@ impl Solver {
             let v = var_of(entry.lit);
             self.phase[v] = entry.lit > 0;
             self.assigns[v] = LBool::Undef;
-            // Incrementally update quad PB term states after unassigning.
+            // Mark quad PB constraints involving this variable as stale.
             // Skip for level 0 when caller manages state externally (table path).
             if !(level == 0 && self.skip_backtrack_quad_pb) {
-                for idx in 0..self.quad_pb_var_terms[v].len() {
-                    let (qi, ti, is_a) = self.quad_pb_var_terms[v][idx];
-                    self.update_quad_pb_term_hint(qi, ti as usize, LBool::Undef, is_a);
+                for idx in 0..self.quad_pb_var_watches[v].len() {
+                    let qi = self.quad_pb_var_watches[v][idx];
+                    self.quad_pb_constraints[qi as usize].stale = true;
                 }
             }
             self.heap_insert(v);
@@ -1162,6 +1296,7 @@ impl Solver {
                 let total: i32 = qc.terms.iter().map(|t| t.coeff as i32).sum();
                 qc.sums = [0, total, 0];
                 for t in qc.terms.iter_mut() { t.state = 1; } // all MAYBE
+                qc.stale = false;
             }
         }
     }

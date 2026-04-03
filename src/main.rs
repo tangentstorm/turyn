@@ -2759,9 +2759,8 @@ impl XYBoundaryTable {
                             return Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)));
                         }
                         _ => {
-                            // Periodically clear learnt clauses to prevent watch list bloat
                             configs_tested += 1;
-                            if configs_tested % 1 == 0 {
+                            if configs_tested % 8 == 0 {
                                 solver.clear_learnt();
                             }
                         }
@@ -2974,8 +2973,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
     let found = Arc::new(AtomicBool::new(false));
 
-    // For single-thread or very few tuples, run sequentially
-    if workers <= 1 || tuples.len() <= 1 {
+    // For single-thread, run sequentially
+    if workers <= 1 {
         let mut stats = SearchStats::default();
         for tuple in &tuples {
             let (result, local_stats) = hybrid_solve_tuple(problem, *tuple, &cfg, &found, verbose, xy_table.as_ref().map(|a| &**a));

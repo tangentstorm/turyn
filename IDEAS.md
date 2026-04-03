@@ -297,3 +297,114 @@ All four features (rephasing, compaction, subsumption, BVE) address problems in 
 ### 9. Incremental slack tracking for quad PB *(from Claude)*
 
 Currently `propagate_quad_pb` recomputes `sum_true` and `sum_maybe` from scratch on every call by scanning all ~80 terms. With ~21 constraints checked per variable assignment, this is O(21 * 80) = ~1680 term evaluations per assignment. Incremental tracking would store `sum_true` and `sum_maybe` per constraint and update them delta-style when a variable changes (+/- one term's coefficient). This requires careful bookkeeping during backtrack (restore old values). Expected to reduce the per-assignment cost from O(terms) to O(1) amortized.
+
+## Performance interventions — April 2026 profile-guided round (credit: Claude)
+
+Profiling n=26 with callgrind (tuple 8,8,2,3, 26 Z/W pairs, 78s):
+- `propagate` 13%, `backtrack` 10%, `propagate_quad_pb` 8%, `compute_quad_pb_explanation` 8%
+- `solve_inner` 7%, `propagate_pb` 3%, malloc/free/realloc 6%
+- `clear_learnt` 0.5%, `reset_quad_pb_state` 0.6%
+
+Phase C (SAT) dominates >90% of runtime. The 10 interventions below target allocation reduction, hot loop efficiency, and unnecessary work elimination.
+
+### P1. Reuse `seen` and `stack` allocations in conflict analysis
+
+`analyze()` allocates `vec![false; num_vars]` on every conflict. `lit_removable()` allocates `visited` and `stack` on every call. Move these to solver-level reusable buffers (clear between uses). At n=26 with ~44 vars and hundreds of conflicts per solve, this eliminates thousands of heap allocations. Target: reduce malloc/free from 6% by ~1-2%.
+
+**Result (v1):** Phase C n=26: 18.99s → 18.79s (-1.1%, within noise). Reverted — not a decisive win.
+**Result (v2, iterated):** Extended to cover `compute_quad_pb_explanation` (16.67% of runtime returning `Vec<Lit>`), `lit_removable`, and all conflict analysis paths. Uses `mem::take` pattern for borrow-checker-safe buffer reuse. Phase C n=26: 18.88s → 16.99s (**-10.0%**). malloc/free dropped from 8.5% to ~2%. **Accepted.**
+
+### P2. Avoid Vec allocation for `reason_lits` in `analyze()`
+
+`analyze()` creates a `Vec<Lit>` for `reason_lits` on every resolution step (Clause, Pb, QuadPb). For Clause reasons, this is a needless `.to_vec()` copy. Switch to iterating the clause slice directly via an enum/index approach, avoiding allocation entirely for the clause case. The QuadPb and Pb paths still need allocation but are less frequent.
+
+**Result:** Folded into P1 — the Clause path now iterates `clause_lits[cstart..cstart+clen]` directly with index-based access, no `.to_vec()`. PB and QuadPb paths reuse `analyze_reason_buf`.
+
+### P3. Batch `clear_learnt` — don't call after every single config
+
+In `solve_xy_with_sat`, line 2764: `configs_tested % 1 == 0` always evaluates true, meaning `clear_learnt` is called after every single boundary config SAT solve. This is wasteful — `clear_learnt` iterates all clause metadata + all watch lists. Batch to every N configs (e.g., 64 or 128) or skip entirely and rely on `reduce_db` in the solve loop.
+
+### P4. Skip `propagate_pb` for already-satisfied constraints
+
+`propagate_pb` does a full scan of all literals in the constraint on every trigger. For PB constraints with large slack (many true literals), the scan is wasted work. Add a `satisfied` flag or slack cache that short-circuits when the constraint is trivially satisfied.
+
+### P5. Eliminate `configs_tested % 1 == 0` dead code and reduce `clear_learnt` overhead
+
+`clear_learnt()` iterates all `clause_meta` to mark learnt clauses deleted, then iterates all watch lists to retain. With incremental solving, learnt clauses from previous configs may actually help future configs. Try removing `clear_learnt` entirely from the table path — the solve loop's `reduce_db` already manages clause database size.
+
+### P6. Pre-size `quad_pb_seen_buf` at solver construction
+
+`compute_quad_pb_explanation` checks `quad_pb_seen_buf.len() < num_vars` and resizes on first call per solve. Move the resize to `solve_with_assumptions` entry point so it's done once per solve, not checked on every explanation computation.
+
+**Result:** Pre-sized both `quad_pb_seen_buf` and `analyze_seen` at solve entry. Removed per-call resize checks. Phase C n=26: neutral (18.44 → 18.86s, within noise). The buffers are tiny (44 elements) so the branch-removal savings are negligible. **Accepted** as code cleanup.
+
+### P7. Skip DEAD/TRUE terms in `propagate_quad_pb` using state field
+
+The `propagate_quad_pb` inner loop checks `assigns[var_a]` and `assigns[var_b]` for every term to determine if it's a propagation candidate. But the precomputed `state` field (maintained by `update_quad_pb_term_hint`) already encodes whether a term is DEAD (0), MAYBE (1), or TRUE (2). Add `if t.state != 1 { continue; }` to skip non-MAYBE terms with a single byte compare instead of two memory loads + branching.
+
+**Result:** Phase C n=26: 16.99s → 16.41s (**-3.4%**). Phase B neutral. All tests pass. **Accepted.**
+
+### P8. Use `SmallVec` or inline storage for learnt clauses
+
+Learnt clauses in `analyze()` and `add_learnt_clause()` use `Vec<Lit>` which heap-allocates. Most learnt clauses at n=26 are short (2-5 literals). Use `SmallVec<[Lit; 8]>` or a stack-allocated buffer to avoid heap allocation for typical clause sizes. Target: reduce malloc overhead for the analysis path.
+
+**Result:** Superseded by P1v2 which eliminated nearly all per-conflict allocations. The learnt clause Vec is the only remaining allocation per conflict, but `analyze` now returns it and `add_learnt_clause` takes ownership — one alloc per conflict is cheap. malloc dropped from 8.5% → 0.2%. **Skipped.**
+
+### P9. Skip quad PB propagation for constraints with large slack
+
+In `propagate_quad_pb`, when both `slack_up` and `slack_down` are large (> max_coeff), no propagation is possible. Currently we still iterate all terms looking for propagation candidates. Add a `max_coeff` field to `QuadPbConstraint` and early-exit when both slacks exceed it.
+
+**Result:** Already implemented! Line 904: `if slack_up > 0 && slack_down > 0 { return None; }`. Since all coefficients are 1, this is equivalent to `max_coeff <= min(slack_up, slack_down)`. The term scan only runs when one slack is exactly 0 (propagation required). No improvement possible. **Skipped.**
+
+### P10. Avoid `HashSet::insert` allocation in `stream_zw_candidates_to_channel` dedup
+
+The `seen` HashSet in `stream_zw_candidates_to_channel` allocates a `Vec<i32>` clone for every `zw_autocorr` on insert. Switch to a hash of the autocorrelation vector (e.g., FxHash of the raw bytes) stored in a `HashSet<u64>`, avoiding the Vec clone. This reduces Phase B allocation pressure.
+
+**Result:** Skipped �� Phase B is <0.2% of runtime at n=26 (32ms out of 16s). The dedup HashSet handles at most ~573 entries per tuple. Not worth optimizing for the SAT-heavy benchmark. **Skipped.**
+
+## Round 2 performance interventions — April 2026 (credit: Claude)
+
+Re-profiled after round 1 (5 accepted changes, n=26: 869s -> 577s). New baseline: 14.0s on SAT-heavy microbenchmark.
+Excluding coordinator overhead (51%), the SAT-only profile:
+- `recompute_quad_pb` 12.3%, `propagate` 10.3%, `compute_quad_pb_explanation_into` 8.1%
+- `solve_with_assumptions` 7.4%, `propagate_quad_pb` 3.2%, `propagate_pb` 1.8%, `backtrack` 1.4%
+
+### R1. Fuse recompute with propagation: single-pass recompute+check
+
+`recompute_quad_pb` (12.3%) scans all ~80 terms to rebuild sums, then `propagate_quad_pb` loads sums and often returns immediately (slack > 0). When the constraint is stale, fuse both into one pass: compute states, accumulate sums, AND check propagation in a single traversal. Saves the redundant sums load and the second function call for the majority case (no propagation needed).
+
+### R2. Avoid redundant `recompute_quad_pb` calls by tracking stale set
+
+Currently when any stale constraint is encountered, ALL stale constraints are recomputed (batch recompute). But the subsequent per-variable propagation loop may trigger recompute again for constraints that were already recomputed in the batch. Track a "recompute generation" to skip re-recomputing constraints that were just refreshed in this propagation round.
+
+### R3. Skip forward `update_quad_pb_term_hint` when constraint was just recomputed
+
+In `propagate()`, we first recompute stale constraints, then call `update_quad_pb_term_hint` for all terms involving the current variable. If a constraint was just recomputed (including the current variable's assignment), the term state is already correct -- the `update_quad_pb_term_hint` is redundant. Skip the update for constraints that were recomputed in the same propagation step.
+
+### R4. Reduce `compute_quad_pb_explanation_into` cost by using state-based filtering
+
+At 8.1%, the explanation function scans all ~80 terms. But terms with state DEAD have at least one false variable (the one that kills the term). If both variables were assigned before the propagated variable, the state is accurate and we can use it to skip the `trail_pos` check. For MAYBE terms with both variables Undef, they can't contribute to the explanation. Pre-filter using the term state byte before loading assigns/trail_pos.
+
+### R5. Pre-compute `propagate_pb` slack incrementally
+
+`propagate_pb` (1.8%) scans all ~26 literals to compute slack on every trigger. With unit coefficients, slack = count(non-false) - bound. Track `count_false` per PB constraint incrementally: increment on assign-false, decrement on backtrack. Compute slack as `n - count_false - bound` in O(1).
+
+### R6. Move `propagate_lit` deleted-clause check after blocker check
+
+In `propagate_lit` (10.3%), the deleted-clause check happens BEFORE the blocker check. But the blocker check (line 753) is cheaper and more likely to short-circuit (most watched clauses are satisfied). Swap the order: check blocker first, then deleted. Saves a `clause_meta[ci]` load for satisfied clauses.
+
+### R7. Compact `quad_pb_var_terms` and `quad_pb_var_watches` into contiguous arrays
+
+Currently `quad_pb_var_terms[v]` and `quad_pb_var_watches[v]` are `Vec<Vec<...>>` -- each variable's entry is a separate heap-allocated Vec. Replace with flat arrays + offset indices for cache-contiguous access during propagation. Eliminates pointer chasing.
+
+### R8. Eliminate `propagate_pb` by converting sum constraints to clauses + quad PB
+
+PB constraints encode `sum(x_i) = k`. With 44 vars and unit coefficients, the at-least-k and at-most-k constraints can be handled purely by quad PB (which already tracks cardinality via agree counts) or by exhaustive clause encoding for small sums. Eliminating the separate PB propagation pass saves 1.8%.
+
+### R9. Avoid `std::mem::take` in `propagate_lit` by using raw pointer swap
+
+`propagate_lit` does `std::mem::take(&mut self.watches[watch_idx])` which zeroes the Vec and later restores it. At 10.3% of runtime, even micro-overhead matters. Replace with unsafe raw pointer swap or manual index management to avoid the zeroing cost.
+
+### R10. Reduce recompute cost by sorting terms by variable index
+
+In `recompute_quad_pb`, the inner loop loads `assigns[var_a()]` and `assigns[var_b()]` for each term. With ~80 terms accessing ~44 variables, many accesses hit the same cache line. Sorting terms by `(var_a, var_b)` at constraint creation time maximizes sequential access patterns and reduces L1 misses.
