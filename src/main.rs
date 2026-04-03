@@ -607,6 +607,101 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8]) -> bool>(
     );
 }
 
+/// Compute binomial coefficient C(n, k) as u128 (enough for n ≤ 60).
+fn binom(n: usize, k: usize) -> u128 {
+    if k > n { return 0; }
+    let k = k.min(n - k);
+    let mut result = 1u128;
+    for i in 0..k {
+        result = result * (n - i) as u128 / (i + 1) as u128;
+    }
+    result
+}
+
+/// Unrank: given index `rank` in [0, C(f, r)), produce the rank-th combination
+/// of choosing r positions from f slots (in colex order).
+/// Writes +1/-1 into `out[start..start+f]`.
+fn unrank_combination(rank: u128, f: usize, r: usize, out: &mut [i8], start: usize) {
+    // Set all to -1, then place r ones
+    for i in 0..f { out[start + i] = -1; }
+    let mut remaining_rank = rank;
+    let mut remaining_choose = r;
+    let mut pos = f;
+    while remaining_choose > 0 {
+        pos -= 1;
+        let c = binom(pos, remaining_choose);
+        if remaining_rank >= c {
+            remaining_rank -= c;
+            out[start + pos] = 1;
+            remaining_choose -= 1;
+        }
+    }
+}
+
+/// Generate ±1 sequences with a given sum in permuted (pseudo-random) order.
+/// Uses an LCG bijection over [0, C(f, r)) to visit every sequence exactly once
+/// but in a scattered order, so the first `limit` sequences are representative
+/// of the full space rather than clustered lexicographically.
+fn generate_sequences_permuted<F: FnMut(&[i8]) -> bool>(
+    len: usize,
+    target_sum: i32,
+    root_one: bool,
+    tail_one: bool,
+    limit: usize,
+    mut visit: F,
+) {
+    // Determine fixed positions and free count
+    let fixed_sum: i32 = (if root_one { 1 } else { 0 }) + (if tail_one { 1 } else { 0 });
+    let free_start = if root_one { 1 } else { 0 };
+    let free_end = if tail_one { len - 1 } else { len };
+    let f = free_end - free_start; // number of free positions
+    let free_target = target_sum - fixed_sum; // sum needed from free positions
+    // free positions have values in {-1, +1}, sum = 2*ones - f
+    // so ones = (free_target + f) / 2
+    if (free_target + f as i32) % 2 != 0 { return; }
+    let r_signed = (free_target + f as i32) / 2;
+    if r_signed < 0 || r_signed > f as i32 { return; }
+    let r = r_signed as usize; // number of +1s among free positions
+
+    let total = binom(f, r);
+    let n_visit = (limit as u128).min(total);
+
+    let mut curr = vec![1i8; len];
+    if root_one { curr[0] = 1; }
+    if tail_one { curr[len - 1] = 1; }
+
+    // If the full space fits within the limit, DFS is faster (no unranking overhead).
+    if total <= limit as u128 {
+        generate_sequences_with_sum_visit(len, target_sum, root_one, tail_one, limit, visit);
+        return;
+    }
+
+    // Bijective scatter: index i -> (a * i + c) mod total
+    // `a` coprime to `total` guarantees a permutation of [0, total).
+    let m = total;
+    let a = {
+        let mut candidate = 6364136223846793005u128 % m;
+        if candidate == 0 { candidate = 1; }
+        while gcd128(candidate, m) != 1 {
+            candidate = (candidate + 1) % m;
+            if candidate == 0 { candidate = 1; }
+        }
+        candidate
+    };
+    let c = 1442695040888963407u128 % m;
+
+    for i in 0..n_visit {
+        let rank = (a * i + c) % m;
+        unrank_combination(rank, f, r, &mut curr, free_start);
+        if !visit(&curr) { return; }
+    }
+}
+
+fn gcd128(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 { let t = b; b = a % b; a = t; }
+    a
+}
+
 /// Generate all spectrally-valid W sequences for a given sum.
 /// W is the shorter sequence (length n-1) so we materialize it; Z is streamed.
 fn build_w_candidates(
@@ -723,7 +818,7 @@ fn stream_zw_candidates(
     let mut out = Vec::new();
     let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
     let mut idx_buf = Vec::new();
-    generate_sequences_with_sum_visit(problem.n, z_sum, true, true, cfg.max_z, |values| {
+    generate_sequences_permuted(problem.n, z_sum, true, true, cfg.max_z, |values| {
         if found.load(AtomicOrdering::Relaxed) { return false; }
         stats.z_generated += 1;
         let Some(z_spectrum) =
@@ -785,7 +880,7 @@ fn stream_zw_candidates_to_channel(
     let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
     let mut seen = std::collections::HashSet::new();
     let mut idx_buf = Vec::new();
-    generate_sequences_with_sum_visit(problem.n, tuple.z, true, true, cfg.max_z, |values| {
+    generate_sequences_permuted(problem.n, tuple.z, true, true, cfg.max_z, |values| {
         if found.load(AtomicOrdering::Relaxed) { return false; }
         stats.z_generated += 1;
         let Some(z_spectrum) =
@@ -1507,7 +1602,7 @@ fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
         let mut z_count = 0usize;
         let mut found = false;
-        generate_sequences_with_sum_visit(problem.n, tuple.z, true, true, cfg.max_z, |z_values| {
+        generate_sequences_permuted(problem.n, tuple.z, true, true, cfg.max_z, |z_values| {
             if found { return false; }
             z_count += 1;
             // Spectral filter on Z alone
@@ -2782,10 +2877,17 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 }
                 if found.load(AtomicOrdering::Relaxed) { break; }
                 let (w_candidates, w_index) = w_cache.get(&tuple.w).unwrap();
+                let before = (stats.z_generated, stats.z_spectral_ok, stats.candidate_pair_spectral_ok);
                 stream_zw_candidates_to_channel(
                     problem, tuple, w_candidates, w_index, &cfg, &spectral_z,
                     &mut stats, &found, &tx);
                 stats.phase_b_nanos += b_start.elapsed().as_nanos() as u64;
+                let z_gen = stats.z_generated - before.0;
+                let z_ok = stats.z_spectral_ok - before.1;
+                let pairs = stats.candidate_pair_spectral_ok - before.2;
+                eprintln!("  tuple {}/{} (sums {},{},{},{}): z_gen={} z_ok={} w={} pairs={}",
+                    idx+1, tuples.len(), tuple.x, tuple.y, tuple.z, tuple.w,
+                    z_gen, z_ok, w_candidates.len(), pairs);
                 tuples_produced.fetch_add(1, AtomicOrdering::Relaxed);
             }
             stats
