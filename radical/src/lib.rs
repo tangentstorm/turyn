@@ -143,6 +143,8 @@ struct QuadPbConstraint {
     /// Branchless counter array indexed by state: sums[0]=dead(unused), sums[1]=maybe, sums[2]=true.
     /// Replaces separate sum_true/sum_maybe fields for branch-free updates.
     sums: [i32; 3],
+    /// When true, sums[] and term states are stale (need recomputation before use).
+    stale: bool,
 }
 
 /// Reason a variable was assigned (for conflict analysis).
@@ -443,6 +445,7 @@ impl Solver {
             num_terms: terms.len() as u32,
             sums: [0, coeffs.iter().sum::<u32>() as i32, 0],
             terms,
+            stale: false,
         });
 
         // Initial propagation
@@ -549,6 +552,7 @@ impl Solver {
             qc.terms[i].state = s;
         }
         qc.sums = [0, sum_maybe, sum_true];
+        qc.stale = false;
     }
 
     /// Get the number of quad PB constraints.
@@ -705,6 +709,13 @@ impl Solver {
             if !self.quad_pb_constraints.is_empty() {
                 let v = var_of(lit);
                 let known_val = self.assigns[v]; // just assigned, hot in cache
+                // Recompute stale constraints before incremental updates
+                for idx in 0..self.quad_pb_var_watches[v].len() {
+                    let qi = self.quad_pb_var_watches[v][idx];
+                    if self.quad_pb_constraints[qi as usize].stale {
+                        self.recompute_quad_pb(qi);
+                    }
+                }
                 // Update term states for all terms involving this variable
                 for idx in 0..self.quad_pb_var_terms[v].len() {
                     let (qi, ti, is_a) = self.quad_pb_var_terms[v][idx];
@@ -891,9 +902,30 @@ impl Solver {
     }
 
     /// Propagate a quadratic PB constraint using incremental counters.
+    /// Recompute term states and sums for a stale quad PB constraint.
+    #[inline]
+    fn recompute_quad_pb(&mut self, qi: u32) {
+        let qi = qi as usize;
+        let nt = self.quad_pb_constraints[qi].num_terms as usize;
+        let mut sums = [0i32, 0, 0];
+        for ti in 0..nt {
+            let t = &self.quad_pb_constraints[qi].terms[ti];
+            let aa = self.assigns[t.var_a()];
+            let ab = self.assigns[t.var_b()];
+            let new_state = t.compute_state(aa, ab);
+            sums[new_state as usize] += t.coeff as i32;
+            self.quad_pb_constraints[qi].terms[ti].state = new_state;
+        }
+        self.quad_pb_constraints[qi].sums = sums;
+        self.quad_pb_constraints[qi].stale = false;
+    }
+
     /// Single-pass: finds propagation and builds explanation in one fused scan.
     #[inline]
     fn propagate_quad_pb(&mut self, qi: u32) -> Option<Reason> {
+        if self.quad_pb_constraints[qi as usize].stale {
+            self.recompute_quad_pb(qi);
+        }
         let qc = &self.quad_pb_constraints[qi as usize];
         let n = qc.num_terms as usize;
         let target = qc.target as i64;
@@ -1232,12 +1264,12 @@ impl Solver {
             let v = var_of(entry.lit);
             self.phase[v] = entry.lit > 0;
             self.assigns[v] = LBool::Undef;
-            // Incrementally update quad PB term states after unassigning.
+            // Mark quad PB constraints involving this variable as stale.
             // Skip for level 0 when caller manages state externally (table path).
             if !(level == 0 && self.skip_backtrack_quad_pb) {
-                for idx in 0..self.quad_pb_var_terms[v].len() {
-                    let (qi, ti, is_a) = self.quad_pb_var_terms[v][idx];
-                    self.update_quad_pb_term_hint(qi, ti as usize, LBool::Undef, is_a);
+                for idx in 0..self.quad_pb_var_watches[v].len() {
+                    let qi = self.quad_pb_var_watches[v][idx];
+                    self.quad_pb_constraints[qi as usize].stale = true;
                 }
             }
             self.heap_insert(v);
@@ -1252,6 +1284,7 @@ impl Solver {
                 let total: i32 = qc.terms.iter().map(|t| t.coeff as i32).sum();
                 qc.sums = [0, total, 0];
                 for t in qc.terms.iter_mut() { t.state = 1; } // all MAYBE
+                qc.stale = false;
             }
         }
     }
