@@ -1,26 +1,29 @@
 /// Generate Z/W-indexed boundary table for Turyn X/Y sequences.
 ///
+/// The table is a pure function of k (boundary width). The exact-lag bit pairs
+/// depend only on k, not on the sequence length n, so one table works for all
+/// n ≥ 2k.
+///
 /// Deduplicated format: many Z/W configs share the same X/Y signature, so
 /// we store unique (x,y) lists once and have the index point to them.
 ///
-/// Format v4:
-///   Header (24 bytes): magic "XYTT", version=4, n, k, zw_dim, num_sigs
+/// Format:
+///   Header (24 bytes): magic "XYTT", version=1, k, zw_dim, num_sigs, sum_dim
 ///   ZW index (zw_dim × 4 bytes): sig_id (u32) per Z/W config, 0xFFFFFFFF = empty
 ///   Sig directory (num_sigs × 8 bytes): [offset_u32, count_u32] per signature
+///   Sub-index (num_sigs × sum_dim² × 8 bytes): (offset_within_sig, count) per bucket
 ///   XY data: packed (x_bits: u32, y_bits: u32) pairs, 8 bytes each
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(26);
-    let k: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(6);
-    let default_outfile = format!("xy-table-n{}-k{}.bin", n, k);
-    let outfile = args.get(3).map(|s| s.as_str()).unwrap_or(&default_outfile);
+    let k: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(7);
+    let default_outfile = format!("xy-table-k{}.bin", k);
+    let outfile = args.get(2).map(|s| s.as_str()).unwrap_or(&default_outfile);
 
-    assert!(2 * k <= n, "2*k must be <= n");
+    assert!(k >= 1, "k must be >= 1");
     assert!(k <= 13, "k must be <= 13");
-    let m = n - 1;
 
     let z_dim = 1usize << (2 * k);
     let w_dim = 1usize << (2 * k);
@@ -29,15 +32,14 @@ fn main() {
     let xy_configs = 1u64 << (x_free + y_free);
     let total_zw_index = z_dim * w_dim;
 
-    eprintln!("Generating Z/W-indexed table for n={}, k={}", n, k);
+    eprintln!("Generating boundary table for k={} (valid for all n >= {})", k, 2 * k);
     eprintln!("X/Y configs: {}, Z/W index slots: {}", xy_configs, total_zw_index);
 
-    // Find exact lags
-    let is_bnd = |pos: usize, len: usize, bk: usize| pos < bk || pos >= len - bk;
-    let pos_to_bit = |pos: usize, len: usize, bk: usize| -> u32 {
-        if pos < bk { pos as u32 } else { (bk + pos - (len - bk)) as u32 }
-    };
-
+    // Build exact-lag bit pairs directly from k.
+    // For lag index j (0..k), the absolute lag is s = n-k+j for any n >= 2k.
+    // X/Y (length n): pairs (i, k+i+j) for i = 0..k-j-1
+    // Z   (length n): same as X/Y
+    // W   (length n-1): pairs (i, k+i+j+1) for i = 0..k-j-2  (only when j < k-1)
     struct ExactLag {
         xy_pairs: Vec<(u32, u32)>,
         z_pairs: Vec<(u32, u32)>,
@@ -45,36 +47,22 @@ fn main() {
         has_w: bool,
     }
     let mut exact_lags: Vec<ExactLag> = Vec::new();
-    let mut exact_lag_indices: Vec<usize> = Vec::new();
-    for s in 1..n {
-        let mut xy_all = true; let mut xy_pairs = Vec::new();
-        for i in 0..n-s {
-            if is_bnd(i, n, k) && is_bnd(i+s, n, k) {
-                xy_pairs.push((pos_to_bit(i, n, k), pos_to_bit(i+s, n, k)));
-            } else { xy_all = false; }
-        }
-        if !xy_all || xy_pairs.is_empty() { continue; }
-
-        let mut z_all = true; let mut z_pairs = Vec::new();
-        for i in 0..n-s {
-            if is_bnd(i, n, k) && is_bnd(i+s, n, k) {
-                z_pairs.push((pos_to_bit(i, n, k), pos_to_bit(i+s, n, k)));
-            } else { z_all = false; }
-        }
-        let has_w = s < m;
-        let mut w_all = true; let mut w_pairs = Vec::new();
-        if has_w {
-            for i in 0..m-s {
-                if is_bnd(i, m, k) && is_bnd(i+s, m, k) {
-                    w_pairs.push((pos_to_bit(i, m, k), pos_to_bit(i+s, m, k)));
-                } else { w_all = false; }
-            }
-        }
-        if !z_all || (has_w && !w_all) { continue; }
-        exact_lag_indices.push(s);
+    for j in 0..k {
+        let xy_pairs: Vec<(u32, u32)> = (0..k-j)
+            .map(|i| (i as u32, (k + i + j) as u32))
+            .collect();
+        let z_pairs = xy_pairs.clone();
+        let has_w = j < k - 1;
+        let w_pairs: Vec<(u32, u32)> = if has_w {
+            (0..k-j-1)
+                .map(|i| (i as u32, (k + i + j + 1) as u32))
+                .collect()
+        } else {
+            Vec::new()
+        };
         exact_lags.push(ExactLag { xy_pairs, z_pairs, w_pairs, has_w });
     }
-    eprintln!("Exact lags: {:?}", exact_lag_indices);
+    eprintln!("{} exact lags (lag indices 0..{})", exact_lags.len(), k - 1);
 
     // Phase 1: Group X/Y configs by autocorrelation signature
     eprintln!("Phase 1: grouping {} X/Y configs by signature...", xy_configs);
@@ -97,20 +85,15 @@ fn main() {
     }
 
     // Assign signature IDs and build flat data, sorted by (x_sum, y_sum) within each sig.
-    // Also build a per-sig sub-index: for each (x_sum_idx, y_sum_idx) within the sig,
-    // store the (offset_within_sig, count) so runtime can jump to matching entries.
     let num_sigs = xy_groups.len();
-    let sum_dim = 2 * k + 1; // distinct sum values per axis
-    let sub_idx_per_sig = sum_dim * sum_dim; // (x_sum_idx, y_sum_idx) buckets
+    let sum_dim = 2 * k + 1;
+    let sub_idx_per_sig = sum_dim * sum_dim;
     eprintln!("  {} distinct signatures, {} sum sub-buckets per sig", num_sigs, sub_idx_per_sig);
 
     let mut sig_to_id: HashMap<Vec<i16>, u32> = HashMap::new();
     let mut sig_offsets: Vec<u32> = Vec::with_capacity(num_sigs);
     let mut sig_counts: Vec<u32> = Vec::with_capacity(num_sigs);
     let mut xy_data: Vec<(u32, u32)> = Vec::new();
-    // Per-sig sub-index: flattened [num_sigs * sub_idx_per_sig] of (offset_within_sig: u32, count: u16)
-    // Packed as u64: offset in low 32, count in high 16, to save space.
-    // Actually just use (u32, u32) for simplicity.
     let mut sub_index: Vec<(u32, u32)> = Vec::with_capacity(num_sigs * sub_idx_per_sig);
 
     let sum_to_idx = |sum: i32| -> usize { ((sum + 2 * k as i32) / 2) as usize };
@@ -125,7 +108,6 @@ fn main() {
         sig_offsets.push(sig_start);
         sig_counts.push(entries.len() as u32);
 
-        // Group entries by (x_sum, y_sum)
         let mut sum_buckets: Vec<Vec<(u32, u32)>> = vec![Vec::new(); sub_idx_per_sig];
         for &(xb, yb) in entries {
             let xs = (2 * xb.count_ones() as i32) - (2 * k) as i32;
@@ -134,7 +116,6 @@ fn main() {
             sum_buckets[bi].push((xb, yb));
         }
 
-        // Write entries sorted by sum bucket, build sub-index
         let mut within_offset = 0u32;
         for bi in 0..sub_idx_per_sig {
             let count = sum_buckets[bi].len() as u32;
@@ -189,7 +170,7 @@ fn main() {
     eprintln!("  Non-empty Z/W slots: {}/{}", nonempty, total_zw_index);
 
     // Write file
-    let header_size = 28usize; // added sum_dim field
+    let header_size = 24usize;
     let zw_index_size = total_zw_index * 4;
     let sig_dir_size = num_sigs * 8;
     let sub_idx_size = sub_index.len() * 8;
@@ -197,39 +178,45 @@ fn main() {
     let total_size = header_size + zw_index_size + sig_dir_size + sub_idx_size + xy_data_size;
     eprintln!("Writing: {:.1} MB total", total_size as f64 / 1_048_576.0);
 
-    let mut f = std::fs::File::create(outfile).expect("Failed to create file");
+    let file = std::fs::File::create(outfile).expect("Failed to create file");
+    let mut f = BufWriter::with_capacity(8 * 1024 * 1024, file);
 
-    // Header
+    #[cfg(target_endian = "little")]
+    fn write_u32_slice(f: &mut impl Write, data: &[u32]) {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+        };
+        f.write_all(bytes).unwrap();
+    }
+    #[cfg(target_endian = "little")]
+    fn write_u32_pair_slice(f: &mut impl Write, data: &[(u32, u32)]) {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
+        };
+        f.write_all(bytes).unwrap();
+    }
+
+    // Header: magic, version=5, k, zw_dim, num_sigs, sum_dim
     f.write_all(b"XYTT").unwrap();
-    f.write_all(&4u32.to_le_bytes()).unwrap();
-    f.write_all(&(n as u32).to_le_bytes()).unwrap();
+    f.write_all(&1u32.to_le_bytes()).unwrap();
     f.write_all(&(k as u32).to_le_bytes()).unwrap();
     f.write_all(&(total_zw_index as u32).to_le_bytes()).unwrap();
     f.write_all(&(num_sigs as u32).to_le_bytes()).unwrap();
     f.write_all(&(sum_dim as u32).to_le_bytes()).unwrap();
 
-    // ZW index: sig_id per slot
-    for &id in &zw_index {
-        f.write_all(&id.to_le_bytes()).unwrap();
-    }
+    write_u32_slice(&mut f, &zw_index);
 
-    // Sig directory: (offset, count) per signature
+    let mut sig_dir: Vec<u32> = Vec::with_capacity(num_sigs * 2);
     for i in 0..num_sigs {
-        f.write_all(&sig_offsets[i].to_le_bytes()).unwrap();
-        f.write_all(&sig_counts[i].to_le_bytes()).unwrap();
+        sig_dir.push(sig_offsets[i]);
+        sig_dir.push(sig_counts[i]);
     }
+    write_u32_slice(&mut f, &sig_dir);
 
-    // Sub-index: (offset_within_sig, count) per (sig, x_sum_idx, y_sum_idx)
-    for &(off, cnt) in &sub_index {
-        f.write_all(&off.to_le_bytes()).unwrap();
-        f.write_all(&cnt.to_le_bytes()).unwrap();
-    }
+    write_u32_pair_slice(&mut f, &sub_index);
+    write_u32_pair_slice(&mut f, &xy_data);
 
-    // XY data
-    for &(xb, yb) in &xy_data {
-        f.write_all(&xb.to_le_bytes()).unwrap();
-        f.write_all(&yb.to_le_bytes()).unwrap();
-    }
+    f.flush().unwrap();
 
     let file_size = std::fs::metadata(outfile).map(|m| m.len()).unwrap_or(0);
     eprintln!("Wrote {} ({:.1} MB)", outfile, file_size as f64 / 1_048_576.0);
@@ -237,7 +224,7 @@ fn main() {
 
 fn decode_xy(bits: u64, k: usize) -> (u32, u32) {
     let mut xb = 1u32;
-    let mut yb = 1u32; // y[0]=+1
+    let mut yb = 1u32;
     let mut bi = 0usize;
     for i in 1..(2*k) { let v = ((bits >> bi) & 1) as u32; bi += 1; xb |= v << i; }
     for i in 1..(2*k) { let v = ((bits >> bi) & 1) as u32; bi += 1; yb |= v << i; }

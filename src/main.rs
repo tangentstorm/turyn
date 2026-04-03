@@ -234,7 +234,7 @@ struct SearchConfig {
     /// Run only Phase A (print tuples) or Phase B (print Z/W pairs).
     phase_only: Option<String>,
     /// Path to XY boundary table file for table-based Phase C.
-    /// Defaults to "./xy-table-n{N}-k6.bin".
+    /// Defaults to "./xy-table-k7.bin".
     xy_table_path: Option<String>,
     /// Run without XY boundary table (slower).
     no_table: bool,
@@ -2141,7 +2141,6 @@ fn run_sat_search(problem: Problem, verbose: bool) -> SearchReport {
 /// Pre-computed table of valid X/Y boundary configurations.
 /// Grouped by (x_bnd_sum, y_bnd_sum, high_lag_signature) for fast lookup.
 struct XYBoundaryTable {
-    n: usize,
     k: usize,
     w_dim: usize,          // 2^(2k) — W bits dimension
     sum_dim: usize,        // 2k+1 — distinct sum values per axis
@@ -2154,73 +2153,49 @@ struct XYBoundaryTable {
 }
 
 impl XYBoundaryTable {
-    fn load(path: &str, n: usize) -> Option<Self> {
+    fn load(path: &str) -> Option<Self> {
         use std::io::Read;
-        let mut f = std::fs::File::open(path).ok()?;
-        let mut mmap = Vec::new();
-        f.read_to_end(&mut mmap).ok()?;
-        if mmap.len() < 28 { return None; }
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).ok()?;
 
-        if &mmap[0..4] != b"XYTT" { return None; }
-        let version = u32::from_le_bytes(mmap[4..8].try_into().ok()?);
-        if version != 4 {
-            eprintln!("Error: table version {} not supported (need v4). Regenerate with gen_table.", version);
-            return None;
-        }
+        let u32_at = |off: usize| u32::from_le_bytes(buf[off..off+4].try_into().unwrap());
+        assert!(&buf[0..4] == b"XYTT", "bad table magic");
 
-        let _table_n = u32::from_le_bytes(mmap[8..12].try_into().ok()?) as usize;
-        let k = u32::from_le_bytes(mmap[12..16].try_into().ok()?) as usize;
-        let zw_dim = u32::from_le_bytes(mmap[16..20].try_into().ok()?) as usize;
-        let num_sigs = u32::from_le_bytes(mmap[20..24].try_into().ok()?) as usize;
-        let sum_dim = u32::from_le_bytes(mmap[24..28].try_into().ok()?) as usize;
+        // Header (24 bytes): "XYTT" version k zw_dim num_sigs sum_dim
+        let k = u32_at(8) as usize;
+        let zw_dim = u32_at(12) as usize;
+        let num_sigs = u32_at(16) as usize;
+        let sum_dim = u32_at(20) as usize;
         let w_dim = 1usize << (2 * k);
 
-        if n < 2 * k { return None; }
+        let mut off = 24;
 
-        let header = 28;
-        let zw_idx_end = header + zw_dim * 4;
-        let sig_dir_end = zw_idx_end + num_sigs * 8;
-        let sub_idx_entries = num_sigs * sum_dim * sum_dim;
-        let sub_idx_end = sig_dir_end + sub_idx_entries * 8;
-
-        // Read ZW index
         let mut zw_index = vec![0u32; zw_dim];
-        for i in 0..zw_dim {
-            let off = header + i * 4;
-            zw_index[i] = u32::from_le_bytes(mmap[off..off+4].try_into().ok()?);
-        }
+        for i in 0..zw_dim { zw_index[i] = u32_at(off + i * 4); }
+        off += zw_dim * 4;
 
-        // Read sig directory
         let mut sig_offsets = vec![0u32; num_sigs];
-        for i in 0..num_sigs {
-            let off = zw_idx_end + i * 8;
-            sig_offsets[i] = u32::from_le_bytes(mmap[off..off+4].try_into().ok()?);
-        }
+        for i in 0..num_sigs { sig_offsets[i] = u32_at(off + i * 8); }
+        off += num_sigs * 8;
 
-        // Read sub-index
+        let sub_idx_entries = num_sigs * sum_dim * sum_dim;
         let mut sub_index = Vec::with_capacity(sub_idx_entries);
         for i in 0..sub_idx_entries {
-            let off = sig_dir_end + i * 8;
-            let o = u32::from_le_bytes(mmap[off..off+4].try_into().ok()?);
-            let c = u32::from_le_bytes(mmap[off+4..off+8].try_into().ok()?);
-            sub_index.push((o, c));
+            sub_index.push((u32_at(off + i * 8), u32_at(off + i * 8 + 4)));
         }
+        off += sub_idx_entries * 8;
 
-        // Read XY data
-        let xy_bytes = mmap.len() - sub_idx_end;
-        let num_xy = xy_bytes / 8;
+        let num_xy = (buf.len() - off) / 8;
         let mut xy_data = Vec::with_capacity(num_xy);
         for i in 0..num_xy {
-            let off = sub_idx_end + i * 8;
-            let xb = u32::from_le_bytes(mmap[off..off+4].try_into().ok()?);
-            let yb = u32::from_le_bytes(mmap[off+4..off+8].try_into().ok()?);
-            xy_data.push((xb, yb));
+            xy_data.push((u32_at(off + i * 8), u32_at(off + i * 8 + 4)));
         }
 
         let ram = (zw_dim * 4 + sub_index.len() * 8 + xy_data.len() * 8) as f64 / 1_048_576.0;
         eprintln!("  {} sigs, {} XY entries, {:.1} MB in RAM", num_sigs, xy_data.len(), ram);
 
-        Some(Self { n, k, w_dim, sum_dim, zw_index, sig_offsets, sub_index, xy_data })
+        Some(Self { k, w_dim, sum_dim, zw_index, sig_offsets, sub_index, xy_data })
     }
 
     /// Get (x_bits, y_bits) pairs for a given Z/W boundary AND sum pair. O(1).
@@ -2249,7 +2224,7 @@ impl XYBoundaryTable {
     #[allow(dead_code)]
     fn expand_boundary(&self, bits: u32, seq: &mut [i8]) {
         let k = self.k;
-        let n = self.n;
+        let n = seq.len();
         for i in 0..k {
             seq[i] = if (bits >> i) & 1 == 1 { 1 } else { -1 };
         }
@@ -2619,25 +2594,18 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
     let phase_a_elapsed = phase_a_start.elapsed();
 
-    // Load XY boundary table (default: ./xy-table.bin).
-    // Skip table for n < 12: the search space is tiny and boundary signature
-    // matching with k=6 covers the entire sequence, over-restricting Z/W pairing.
-    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| format!("./xy-table-n{}-k6.bin", problem.n));
-    let xy_table: Option<Arc<XYBoundaryTable>> = if cfg.no_table || problem.n < 12 {
+    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table-k7.bin".to_string());
+    let xy_table: Option<Arc<XYBoundaryTable>> = if cfg.no_table {
         None
     } else {
-        match XYBoundaryTable::load(&table_path, problem.n) {
+        match XYBoundaryTable::load(&table_path) {
             Some(t) => {
-                if verbose { eprintln!("Loaded XY boundary table from {} (n={}, k={}, {} sigs, {} XY entries)", table_path, t.n, t.k, t.sig_offsets.len(), t.xy_data.len()); }
+                if verbose { eprintln!("Loaded XY boundary table from {} (k={}, {} sigs, {} XY entries)", table_path, t.k, t.sig_offsets.len(), t.xy_data.len()); }
                 Some(Arc::new(t))
             }
             None => {
                 eprintln!("Error: XY boundary table not found at '{}'", table_path);
-                eprintln!("Generate it once with:");
-                eprintln!("  cargo build --release --bin gen_table");
-                eprintln!("  target/release/gen_table {} 6", problem.n);
-                eprintln!("For better performance (larger table, ~2GB):");
-                eprintln!("  target/release/gen_table {} 7", problem.n);
+                eprintln!("Generate it once with: cargo build --release --bin gen_table && target/release/gen_table");
                 eprintln!("Or run with --no-table to skip (slower).");
                 std::process::exit(1);
             }
