@@ -198,7 +198,7 @@ impl Default for SolverConfig {
             ema_restarts: false,
             probing: false,
             rephasing: false,
-            xor_propagation: false,
+            xor_propagation: true,
         }
     }
 }
@@ -566,22 +566,24 @@ impl Solver {
             assigned_xor,
         });
 
-        // Immediate propagation check
+        // Immediate check (no propagation — the main solve loop handles that)
         if num_unknown == 0 {
             if assigned_xor != p {
                 self.ok = false;
             }
         } else if num_unknown == 1 {
-            // Find the one unassigned variable and force it
+            // Find the one unassigned variable and force it.
+            // Update the constraint state immediately so propagate() doesn't double-count.
             let xc = &self.xor_constraints[xi as usize];
             for &v in &xc.vars {
                 if self.assigns[v] == LBool::Undef {
                     let need_true = xc.assigned_xor ^ xc.parity;
                     let lit = if need_true { (v + 1) as Lit } else { -((v + 1) as Lit) };
+                    let val = need_true;
+                    let xc = &mut self.xor_constraints[xi as usize];
+                    xc.num_unknown = 0;
+                    xc.assigned_xor ^= val;
                     self.enqueue(lit, Reason::Xor(xi));
-                    if self.propagate().is_some() {
-                        self.ok = false;
-                    }
                     break;
                 }
             }
@@ -915,6 +917,7 @@ impl Solver {
                 for idx in 0..self.xor_var_watches[v].len() {
                     let xi = self.xor_var_watches[v][idx];
                     let xc = &mut self.xor_constraints[xi as usize];
+                    if xc.num_unknown == 0 { continue; } // already fully resolved (e.g. by add_xor)
                     xc.num_unknown -= 1;
                     xc.assigned_xor ^= val;
                     if xc.num_unknown == 0 {
