@@ -201,12 +201,8 @@ impl SumTuple {
     ///
     /// This gives factor ~8 reduction: 2 (Z sign) × 2 (W sign) × 2 (X↔Y swap when x≠y).
     fn norm_key(&self) -> (i32, i32, i32, i32) {
-        let (xx, yy) = if self.y.abs() > self.x.abs()
-            || (self.x.abs() == self.y.abs() && self.y > self.x) {
-            (self.y, self.x)
-        } else {
-            (self.x, self.y)
-        };
+        let (xa, ya) = (self.x.abs(), self.y.abs());
+        let (xx, yy) = if xa <= ya { (xa, ya) } else { (ya, xa) };
         (xx, yy, self.z.abs(), self.w.abs())
     }
 
@@ -396,7 +392,7 @@ fn normalized_tuples(raw: &[SumTuple]) -> Vec<SumTuple> {
     let mut seen = HashMap::new();
     for t in raw {
         let key = t.norm_key();
-        // Store canonical form: all positive, x >= y
+        // Store canonical form: all positive, x <= y
         seen.entry(key).or_insert(SumTuple {
             x: key.0, y: key.1, z: key.2, w: key.3,
         });
@@ -406,19 +402,11 @@ fn normalized_tuples(raw: &[SumTuple]) -> Vec<SumTuple> {
     items
 }
 
-/// Unified Phase A: enumerate sum-tuples with dedup, parity filter, and --tuple filter.
-/// `normalize`: if true, returns canonical forms (for hybrid/stochastic);
-///              if false, returns raw sign-specific forms (for SAT modes).
-fn phase_a_tuples(problem: Problem, test_tuple: Option<&SumTuple>, normalize: bool) -> Vec<SumTuple> {
+/// Unified Phase A: enumerate sum-tuples with normalization, dedup, parity filter, and --tuple filter.
+/// Returns canonical forms: all positive, x <= y.
+fn phase_a_tuples(problem: Problem, test_tuple: Option<&SumTuple>) -> Vec<SumTuple> {
     let raw = enumerate_sum_tuples(problem);
-    let mut tuples = if normalize {
-        normalized_tuples(&raw)
-    } else {
-        let mut seen = std::collections::HashSet::new();
-        raw.into_iter()
-            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
-            .collect()
-    };
+    let mut tuples = normalized_tuples(&raw);
     // Parity filter
     tuples.retain(|t| {
         (t.x + problem.n as i32) % 2 == 0
@@ -426,7 +414,7 @@ fn phase_a_tuples(problem: Problem, test_tuple: Option<&SumTuple>, normalize: bo
             && (t.z + problem.n as i32) % 2 == 0
             && (t.w + problem.m() as i32) % 2 == 0
     });
-    // --tuple filter: match by norm_key so it works for both raw and normalized
+    // --tuple filter
     if let Some(tt) = test_tuple {
         let key = tt.norm_key();
         tuples.retain(|u| u.norm_key() == key);
@@ -2014,7 +2002,7 @@ fn sat_find_z_candidates(
 /// then send each (Z, W) pair to the existing XY solver.
 fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
-    let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref(), false);
+    let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
     // Group tuples by w_sum
     let mut tuples_by_w: HashMap<i32, Vec<SumTuple>> = HashMap::new();
     for &tuple in &tuples {
@@ -2065,7 +2053,7 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 /// spectral filtering, then uses SAT to find X/Y/W for each Z.
 fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
-    let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref(), false);
+    let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
     if verbose {
         eprintln!("{} sum-tuples", tuples.len());
     }
@@ -2203,7 +2191,7 @@ fn stochastic_search(problem: Problem, test_tuple: Option<&SumTuple>, verbose: b
         None
     };
     let found = Arc::new(AtomicBool::new(false));
-    let norm = Arc::new(phase_a_tuples(problem, test_tuple, true));
+    let norm = Arc::new(phase_a_tuples(problem, test_tuple));
     let deadline = time_limit.map(|d| Instant::now() + d);
     let mut handles = Vec::new();
     for tid in 0..workers {
@@ -2657,9 +2645,9 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
 fn run_sat_search(problem: Problem, test_tuple: Option<&SumTuple>, verbose: bool) -> SearchReport {
     // Use raw tuples (not normalized) because SAT symmetry breaking
     // (x[0]=1, z[0]=z[n-1]=1, etc.) is only compatible with specific sign combos.
-    let tuples = phase_a_tuples(problem, test_tuple, false);
+    let tuples = phase_a_tuples(problem, test_tuple);
     if verbose {
-        eprintln!("{} sum-tuples (raw, sign-specific for SAT symmetry breaking)", tuples.len());
+        eprintln!("{} sum-tuples", tuples.len());
     }
     run_parallel_search(problem, None, move |tx, found| {
         let stats = SearchStats::default();
@@ -2985,7 +2973,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
 
     // Phase A: enumerate and normalize tuples
-    let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref(), true);
+    let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
     // Heuristic tuple ordering depends on problem size.
     if problem.n >= 26 {
         tuples.sort_by_key(|t| ((t.x - t.y).abs(), t.z.abs() + t.w.abs(), t.x.abs() + t.y.abs()));
@@ -3236,7 +3224,7 @@ fn main() {
         }
         let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr };
         // Try all sum tuples that match this Z/W
-        let mut tuples = phase_a_tuples(p, cfg.test_tuple.as_ref(), false);
+        let mut tuples = phase_a_tuples(p, cfg.test_tuple.as_ref());
         tuples.retain(|t| t.z == zs && t.w == ws);
         println!("TT({}): testing Z(sum={}) W(sum={}) against {} tuples", n, zs, ws, tuples.len());
         print_solution("  Z/W", &PackedSeq::from_values(&[0]), &PackedSeq::from_values(&[0]), &z, &w);
@@ -3256,7 +3244,7 @@ fn main() {
     }
     if let Some(ref phase) = cfg.phase_only {
         let problem = cfg.problem;
-        let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref(), true);
+        let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
         // Heuristic tuple ordering: try small |z|+|w| first (cheap Phase B),
     // break ties by small |x-y| (solutions often have x≈y).
     tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
@@ -3285,7 +3273,7 @@ fn main() {
     }
     if let Some(ref path) = cfg.dump_dimacs {
         let problem = cfg.problem;
-        let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref(), false);
+        let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
         tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs()));
         let tuple = tuples[0];
         println!("Dumping DIMACS for TT({}) tuple {} to {}", problem.n, tuple, path);
