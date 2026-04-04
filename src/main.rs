@@ -955,6 +955,7 @@ fn stream_zw_candidates_to_channel(
                     w: SeqInput::Fixed(w.seq.clone()),
                     zw_autocorr: Some(zw),
                     priority: max_power,
+                    boundary: None,
                 });
             }
         }
@@ -1507,6 +1508,17 @@ enum SeqInput {
     Fixed(PackedSeq),
 }
 
+/// Pre-screened boundary configuration (prefix + suffix bits) for all four sequences.
+/// Each `*_bits` packs k prefix bits (low) and k suffix bits (high).
+#[derive(Clone)]
+struct BoundaryConfig {
+    k: usize,
+    x_bits: u32,
+    y_bits: u32,
+    z_bits: u32,
+    w_bits: u32,
+}
+
 /// A unit of SAT work sent from producer → coordinator → worker.
 struct SatWorkItem {
     tuple: SumTuple,
@@ -1518,6 +1530,8 @@ struct SatWorkItem {
     zw_autocorr: Option<Vec<i32>>,
     /// Lower = higher priority in the coordinator queue. 0.0 = FIFO.
     priority: f64,
+    /// Optional boundary config: fix prefix/suffix bits of all 4 sequences.
+    boundary: Option<BoundaryConfig>,
 }
 
 fn compute_zw_autocorr(problem: Problem, z: &PackedSeq, w: &PackedSeq) -> Vec<i32> {
@@ -1541,7 +1555,7 @@ fn solve_work_item(
     match (&item.x, &item.y, &item.z, &item.w) {
         // All blank: pure SAT for all four sequences
         (SeqInput::Blank, SeqInput::Blank, SeqInput::Blank, SeqInput::Blank) => {
-            sat_search(problem, item.tuple, false).map(|(x, y, z, w)|
+            sat_search(problem, item.tuple, item.boundary.as_ref(), false).map(|(x, y, z, w)|
                 (PackedSeq::from_values(&x), PackedSeq::from_values(&y),
                  PackedSeq::from_values(&z), PackedSeq::from_values(&w)))
         }
@@ -2039,6 +2053,7 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                             z: SeqInput::Fixed(z_seq.clone()),
                             w: SeqInput::Fixed(pw.clone()),
                             zw_autocorr: Some(zw_autocorr), priority: 0.0,
+                            boundary: None,
                         });
                     }
                 }
@@ -2078,6 +2093,7 @@ fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                     tuple: *tuple, x: SeqInput::Blank, y: SeqInput::Blank,
                     z: SeqInput::Fixed(z), w: SeqInput::Blank,
                     zw_autocorr: None, priority: 0.0,
+                    boundary: None,
                 });
                 true
             });
@@ -2606,11 +2622,37 @@ fn sat_encode(problem: Problem, tuple: SumTuple) -> (SatEncoder, radical::Solver
     (enc, solver)
 }
 
-fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>)> {
+fn sat_search(problem: Problem, tuple: SumTuple, boundary: Option<&BoundaryConfig>, verbose: bool) -> Option<(Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>)> {
     let encode_start = Instant::now();
     let n = problem.n;
     let m = problem.m();
     let (enc, mut solver) = sat_encode(problem, tuple);
+
+    // Fix boundary variables if a pre-screened config is provided
+    if let Some(bnd) = boundary {
+        let k = bnd.k;
+        for i in 0..k {
+            let lit = enc.x_var(i);
+            solver.add_clause([if (bnd.x_bits >> i) & 1 == 1 { lit } else { -lit }]);
+            let lit = enc.x_var(n - k + i);
+            solver.add_clause([if (bnd.x_bits >> (k + i)) & 1 == 1 { lit } else { -lit }]);
+
+            let lit = enc.y_var(i);
+            solver.add_clause([if (bnd.y_bits >> i) & 1 == 1 { lit } else { -lit }]);
+            let lit = enc.y_var(n - k + i);
+            solver.add_clause([if (bnd.y_bits >> (k + i)) & 1 == 1 { lit } else { -lit }]);
+
+            let lit = enc.z_var(i);
+            solver.add_clause([if (bnd.z_bits >> i) & 1 == 1 { lit } else { -lit }]);
+            let lit = enc.z_var(n - k + i);
+            solver.add_clause([if (bnd.z_bits >> (k + i)) & 1 == 1 { lit } else { -lit }]);
+
+            let lit = enc.w_var(i);
+            solver.add_clause([if (bnd.w_bits >> i) & 1 == 1 { lit } else { -lit }]);
+            let lit = enc.w_var(m - k + i);
+            solver.add_clause([if (bnd.w_bits >> (k + i)) & 1 == 1 { lit } else { -lit }]);
+        }
+    }
 
     let encode_elapsed = encode_start.elapsed();
     if verbose {
@@ -2642,22 +2684,95 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
     }
 }
 
-fn run_sat_search(problem: Problem, test_tuple: Option<&SumTuple>, verbose: bool) -> SearchReport {
-    // Use raw tuples (not normalized) because SAT symmetry breaking
-    // (x[0]=1, z[0]=z[n-1]=1, etc.) is only compatible with specific sign combos.
-    let tuples = phase_a_tuples(problem, test_tuple);
+fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
+    let problem = cfg.problem;
+    let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
     if verbose {
         eprintln!("{} sum-tuples", tuples.len());
     }
-    run_parallel_search(problem, None, move |tx, found| {
+
+    // Try to load the boundary table for cube-and-conquer
+    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table-k7.bin".to_string());
+    let skip_table = cfg.no_table || problem.n < 14;
+    let xy_table: Option<Arc<XYBoundaryTable>> = if skip_table {
+        None
+    } else {
+        XYBoundaryTable::load(&table_path).and_then(|t| {
+            if problem.n < 2 * t.k {
+                if verbose {
+                    eprintln!("Note: n={} < {} (2*k), running without table", problem.n, 2 * t.k);
+                }
+                None
+            } else {
+                Some(Arc::new(t))
+            }
+        })
+    };
+
+    let table_for_producer = xy_table.clone();
+    run_parallel_search(problem, xy_table, move |tx, found| {
         let stats = SearchStats::default();
-        for tuple in tuples {
-            if found.load(AtomicOrdering::Relaxed) { break; }
-            let _ = tx.send(SatWorkItem {
-                tuple, x: SeqInput::Blank, y: SeqInput::Blank,
-                z: SeqInput::Blank, w: SeqInput::Blank,
-                zw_autocorr: None, priority: 0.0,
-            });
+        if let Some(ref table) = table_for_producer {
+            // Table-based cube-and-conquer: enumerate boundary configs
+            let k = table.k;
+            let n = problem.n;
+            let m = problem.m();
+            let middle_n = n - 2 * k;
+            let middle_m = m - 2 * k;
+            let max_bnd_sum = (2 * k) as i32;
+            let zw_dim = 1u32 << (2 * k);
+
+            for tuple in &tuples {
+                if found.load(AtomicOrdering::Relaxed) { break; }
+                for z_bits in 0..zw_dim {
+                    if found.load(AtomicOrdering::Relaxed) { break; }
+                    let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - max_bnd_sum;
+                    let z_mid = tuple.z - z_bnd_sum;
+                    if z_mid.abs() > middle_n as i32 || (z_mid + middle_n as i32) % 2 != 0 { continue; }
+
+                    for w_bits in 0..zw_dim {
+                        if found.load(AtomicOrdering::Relaxed) { break; }
+                        let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
+                        let w_mid = tuple.w - w_bnd_sum;
+                        if w_mid.abs() > middle_m as i32 || (w_mid + middle_m as i32) % 2 != 0 { continue; }
+
+                        for x_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
+                            let x_mid = tuple.x - x_bnd_sum;
+                            if x_mid.abs() > middle_n as i32 || (x_mid + middle_n as i32) % 2 != 0 { continue; }
+
+                            for y_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
+                                let y_mid = tuple.y - y_bnd_sum;
+                                if y_mid.abs() > middle_n as i32 || (y_mid + middle_n as i32) % 2 != 0 { continue; }
+
+                                let xy_entries = table.get_xy_entries(z_bits, w_bits, x_bnd_sum, y_bnd_sum);
+                                for &(x_bits, y_bits) in xy_entries {
+                                    if found.load(AtomicOrdering::Relaxed) { break; }
+                                    let _ = tx.send(SatWorkItem {
+                                        tuple: *tuple,
+                                        x: SeqInput::Blank, y: SeqInput::Blank,
+                                        z: SeqInput::Blank, w: SeqInput::Blank,
+                                        zw_autocorr: None, priority: 0.0,
+                                        boundary: Some(BoundaryConfig {
+                                            k, x_bits, y_bits, z_bits, w_bits,
+                                        }),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback: one monolithic SAT per tuple
+            for tuple in tuples {
+                if found.load(AtomicOrdering::Relaxed) { break; }
+                let _ = tx.send(SatWorkItem {
+                    tuple, x: SeqInput::Blank, y: SeqInput::Blank,
+                    z: SeqInput::Blank, w: SeqInput::Blank,
+                    zw_autocorr: None, priority: 0.0,
+                    boundary: None,
+                });
+            }
         }
         stats
     }, verbose, "pure SAT")
@@ -3292,7 +3407,7 @@ fn main() {
         let report = run_z_sat_search(&cfg, true);
         println!("XYZ-SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     } else if cfg.sat {
-        let report = run_sat_search(cfg.problem, cfg.test_tuple.as_ref(), true);
+        let report = run_sat_search(&cfg, true);
         println!("SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     } else if cfg.stochastic {
         let report = stochastic_search(cfg.problem, cfg.test_tuple.as_ref(), true, cfg.stochastic_seconds);
@@ -3469,8 +3584,8 @@ mod tests {
 
     #[test]
     fn sat_finds_tt6() {
-        let p = Problem::new(6);
-        let report = run_sat_search(p, None, true);
+        let cfg = SearchConfig { problem: Problem::new(6), no_table: true, ..Default::default() };
+        let report = run_sat_search(&cfg, true);
         assert!(report.found_solution, "SAT should find TT(6)");
     }
 
@@ -3695,8 +3810,8 @@ mod tests {
 
     #[test]
     fn sat_finds_tt4() {
-        let p = Problem::new(4);
-        let report = run_sat_search(p, None, false);
+        let cfg = SearchConfig { problem: Problem::new(4), no_table: true, ..Default::default() };
+        let report = run_sat_search(&cfg, false);
         assert!(report.found_solution, "SAT should find TT(4)");
     }
 
