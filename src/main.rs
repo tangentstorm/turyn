@@ -3531,6 +3531,19 @@ fn parse_seq(s: &str) -> PackedSeq {
     PackedSeq::from_values(&vals)
 }
 
+fn run_info() -> String {
+    let hostname = std::process::Command::new("hostname")
+        .output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default().trim().to_string();
+    let git_hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default().trim().to_string();
+    format!("host={}, commit={}", hostname, git_hash)
+}
+
 fn main() {
     let cfg = parse_args();
     if let Some(ref seqs) = cfg.verify_seqs {
@@ -3625,20 +3638,20 @@ fn main() {
         run_benchmark(&cfg);
     } else if cfg.w_sat {
         let report = run_w_sat_search(&cfg, true);
-        println!("W-SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
+        println!("W-SAT search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     } else if cfg.z_sat {
         let report = run_z_sat_search(&cfg, true);
-        println!("XYZ-SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
+        println!("XYZ-SAT search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     } else if cfg.sat {
         let report = run_sat_search(&cfg, true);
-        println!("SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
+        println!("SAT search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     } else if cfg.stochastic {
         let report = stochastic_search(cfg.problem, cfg.test_tuple.as_ref(), true, cfg.stochastic_seconds);
-        println!("Stochastic search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
+        println!("Stochastic search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     } else {
         // Default: hybrid search (Phase B → SAT X/Y). Use --sat or --stochastic to override.
         let report = run_hybrid_search(&cfg, true);
-        println!("Hybrid search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
+        println!("Hybrid search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     }
 }
 
