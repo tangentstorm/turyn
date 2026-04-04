@@ -406,6 +406,34 @@ fn normalized_tuples(raw: &[SumTuple]) -> Vec<SumTuple> {
     items
 }
 
+/// Unified Phase A: enumerate sum-tuples with dedup, parity filter, and --tuple filter.
+/// `normalize`: if true, returns canonical forms (for hybrid/stochastic);
+///              if false, returns raw sign-specific forms (for SAT modes).
+fn phase_a_tuples(problem: Problem, test_tuple: Option<&SumTuple>, normalize: bool) -> Vec<SumTuple> {
+    let raw = enumerate_sum_tuples(problem);
+    let mut tuples = if normalize {
+        normalized_tuples(&raw)
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        raw.into_iter()
+            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+            .collect()
+    };
+    // Parity filter
+    tuples.retain(|t| {
+        (t.x + problem.n as i32) % 2 == 0
+            && (t.y + problem.n as i32) % 2 == 0
+            && (t.z + problem.n as i32) % 2 == 0
+            && (t.w + problem.m() as i32) % 2 == 0
+    });
+    // --tuple filter: match by norm_key so it works for both raw and normalized
+    if let Some(tt) = test_tuple {
+        let key = tt.norm_key();
+        tuples.retain(|u| u.norm_key() == key);
+    }
+    tuples
+}
+
 
 #[allow(dead_code)]
 fn autocorrs_from_values(values: &[i8]) -> Vec<i32> {
@@ -1986,12 +2014,8 @@ fn sat_find_z_candidates(
 /// then send each (Z, W) pair to the existing XY solver.
 fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
-    let raw = enumerate_sum_tuples(problem);
-    let mut seen = std::collections::HashSet::new();
-    let tuples: Vec<SumTuple> = raw.into_iter()
-        .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
-        .collect();
-    // Group tuples by w_sum (filter parity inside producer)
+    let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref(), false);
+    // Group tuples by w_sum
     let mut tuples_by_w: HashMap<i32, Vec<SumTuple>> = HashMap::new();
     for &tuple in &tuples {
         tuples_by_w.entry(tuple.w).or_default().push(tuple);
@@ -2008,7 +2032,6 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let max_z_per_w = 10;
         let mut fft_buf = Vec::with_capacity(spectral_w.fft_size);
         for (&w_sum, w_tuples) in &tuples_by_w {
-            if (w_sum + problem.m() as i32) % 2 != 0 { continue; }
             if found.load(AtomicOrdering::Relaxed) { break; }
             generate_sequences_permuted(problem.m(), w_sum, true, false, max_w, |w_values| {
                 if found.load(AtomicOrdering::Relaxed) { return false; }
@@ -2019,8 +2042,6 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 stats.w_spectral_ok += 1;
                 let pw = PackedSeq::from_values(w_values);
                 for &tuple in w_tuples {
-                    if (tuple.z + problem.n as i32) % 2 != 0 { continue; }
-                    if (tuple.x + problem.n as i32) % 2 != 0 { continue; }
                     if (tuple.y + problem.n as i32) % 2 != 0 { continue; }
                     let z_candidates = sat_find_z_candidates(problem, tuple.z, w_values, max_z_per_w);
                     for z_seq in &z_candidates {
@@ -2044,17 +2065,7 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 /// spectral filtering, then uses SAT to find X/Y/W for each Z.
 fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
-    let raw = enumerate_sum_tuples(problem);
-    let mut seen = std::collections::HashSet::new();
-    let tuples: Vec<SumTuple> = raw.into_iter()
-        .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
-        .filter(|t| {
-            (t.x + problem.n as i32) % 2 == 0
-            && (t.y + problem.n as i32) % 2 == 0
-            && (t.z + problem.n as i32) % 2 == 0
-            && (t.w + problem.m() as i32) % 2 == 0
-        })
-        .collect();
+    let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref(), false);
     if verbose {
         eprintln!("{} sum-tuples", tuples.len());
     }
@@ -2121,7 +2132,7 @@ fn run_stochastic_benchmark(cfg: &SearchConfig) {
     let secs = if cfg.stochastic_seconds > 0 { cfg.stochastic_seconds } else { 10 };
     let repeats = cfg.benchmark_repeats.max(1);
     // Warmup
-    let warmup = stochastic_search(cfg.problem, false, secs);
+    let warmup = stochastic_search(cfg.problem, cfg.test_tuple.as_ref(), false, secs);
     let warmup_rate = warmup.stats.xy_nodes as f64 / warmup.elapsed.as_secs_f64();
     println!(
         "benchmark,warmup,elapsed_s={:.3},flips={},flips_per_sec={:.0},found_solution={}",
@@ -2133,7 +2144,7 @@ fn run_stochastic_benchmark(cfg: &SearchConfig) {
     println!("benchmark,run,elapsed_s,flips,flips_per_sec,found_solution");
     let mut rates = Vec::with_capacity(repeats);
     for run in 1..=repeats {
-        let report = stochastic_search(cfg.problem, false, secs);
+        let report = stochastic_search(cfg.problem, cfg.test_tuple.as_ref(), false, secs);
         let rate = report.stats.xy_nodes as f64 / report.elapsed.as_secs_f64();
         rates.push(rate);
         println!(
@@ -2179,7 +2190,7 @@ fn defect_from_corr(corr: &[i32]) -> i64 {
     corr.iter().skip(1).map(|&c| (c as i64) * (c as i64)).sum()
 }
 
-fn stochastic_search(problem: Problem, verbose: bool, time_limit_secs: u64) -> SearchReport {
+fn stochastic_search(problem: Problem, test_tuple: Option<&SumTuple>, verbose: bool, time_limit_secs: u64) -> SearchReport {
     let run_start = Instant::now();
     let workers = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(1).max(1);
@@ -2192,7 +2203,7 @@ fn stochastic_search(problem: Problem, verbose: bool, time_limit_secs: u64) -> S
         None
     };
     let found = Arc::new(AtomicBool::new(false));
-    let norm = Arc::new(normalized_tuples(&enumerate_sum_tuples(problem)));
+    let norm = Arc::new(phase_a_tuples(problem, test_tuple, true));
     let deadline = time_limit.map(|d| Instant::now() + d);
     let mut handles = Vec::new();
     for tid in 0..workers {
@@ -2643,20 +2654,10 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
     }
 }
 
-fn run_sat_search(problem: Problem, verbose: bool) -> SearchReport {
-    let raw = enumerate_sum_tuples(problem);
+fn run_sat_search(problem: Problem, test_tuple: Option<&SumTuple>, verbose: bool) -> SearchReport {
     // Use raw tuples (not normalized) because SAT symmetry breaking
     // (x[0]=1, z[0]=z[n-1]=1, etc.) is only compatible with specific sign combos.
-    let mut seen = std::collections::HashSet::new();
-    let tuples: Vec<SumTuple> = raw.into_iter()
-        .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
-        .filter(|t| {
-            (t.x + problem.n as i32) % 2 == 0
-            && (t.y + problem.n as i32) % 2 == 0
-            && (t.z + problem.n as i32) % 2 == 0
-            && (t.w + problem.m() as i32) % 2 == 0
-        })
-        .collect();
+    let tuples = phase_a_tuples(problem, test_tuple, false);
     if verbose {
         eprintln!("{} sum-tuples (raw, sign-specific for SAT symmetry breaking)", tuples.len());
     }
@@ -2984,18 +2985,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
 
     // Phase A: enumerate and normalize tuples
-    let raw = enumerate_sum_tuples(problem);
-    let mut tuples: Vec<SumTuple> = normalized_tuples(&raw).into_iter()
-        .filter(|t| {
-            (t.x + problem.n as i32) % 2 == 0
-            && (t.y + problem.n as i32) % 2 == 0
-            && (t.z + problem.n as i32) % 2 == 0
-            && (t.w + problem.m() as i32) % 2 == 0
-        })
-        .collect();
-    if let Some(ref t) = cfg.test_tuple {
-        tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
-    }
+    let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref(), true);
     // Heuristic tuple ordering depends on problem size.
     if problem.n >= 26 {
         tuples.sort_by_key(|t| ((t.x - t.y).abs(), t.z.abs() + t.w.abs(), t.x.abs() + t.y.abs()));
@@ -3246,13 +3236,8 @@ fn main() {
         }
         let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr };
         // Try all sum tuples that match this Z/W
-        let raw = enumerate_sum_tuples(p);
-        let mut seen = std::collections::HashSet::new();
-        let tuples: Vec<SumTuple> = raw.into_iter()
-            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
-            .filter(|t| t.z == zs && t.w == ws)
-            .filter(|t| (t.x + n as i32) % 2 == 0 && (t.y + n as i32) % 2 == 0)
-            .collect();
+        let mut tuples = phase_a_tuples(p, cfg.test_tuple.as_ref(), false);
+        tuples.retain(|t| t.z == zs && t.w == ws);
         println!("TT({}): testing Z(sum={}) W(sum={}) against {} tuples", n, zs, ws, tuples.len());
         print_solution("  Z/W", &PackedSeq::from_values(&[0]), &PackedSeq::from_values(&[0]), &z, &w);
         for tuple in &tuples {
@@ -3271,18 +3256,7 @@ fn main() {
     }
     if let Some(ref phase) = cfg.phase_only {
         let problem = cfg.problem;
-        let raw = enumerate_sum_tuples(problem);
-        let mut tuples: Vec<SumTuple> = normalized_tuples(&raw).into_iter()
-            .filter(|t| {
-                (t.x + problem.n as i32) % 2 == 0
-                && (t.y + problem.n as i32) % 2 == 0
-                && (t.z + problem.n as i32) % 2 == 0
-                && (t.w + problem.m() as i32) % 2 == 0
-            })
-            .collect();
-        if let Some(ref t) = cfg.test_tuple {
-            tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
-        }
+        let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref(), true);
         // Heuristic tuple ordering: try small |z|+|w| first (cheap Phase B),
     // break ties by small |x-y| (solutions often have x≈y).
     tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
@@ -3311,20 +3285,7 @@ fn main() {
     }
     if let Some(ref path) = cfg.dump_dimacs {
         let problem = cfg.problem;
-        let raw = enumerate_sum_tuples(problem);
-        let mut seen = std::collections::HashSet::new();
-        let mut tuples: Vec<SumTuple> = raw.into_iter()
-            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
-            .filter(|t| {
-                (t.x + problem.n as i32) % 2 == 0
-                && (t.y + problem.n as i32) % 2 == 0
-                && (t.z + problem.n as i32) % 2 == 0
-                && (t.w + problem.m() as i32) % 2 == 0
-            })
-            .collect();
-        if let Some(ref t) = cfg.test_tuple {
-            tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
-        }
+        let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref(), false);
         tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs()));
         let tuple = tuples[0];
         println!("Dumping DIMACS for TT({}) tuple {} to {}", problem.n, tuple, path);
@@ -3343,10 +3304,10 @@ fn main() {
         let report = run_z_sat_search(&cfg, true);
         println!("XYZ-SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     } else if cfg.sat {
-        let report = run_sat_search(cfg.problem, true);
+        let report = run_sat_search(cfg.problem, cfg.test_tuple.as_ref(), true);
         println!("SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     } else if cfg.stochastic {
-        let report = stochastic_search(cfg.problem, true, cfg.stochastic_seconds);
+        let report = stochastic_search(cfg.problem, cfg.test_tuple.as_ref(), true, cfg.stochastic_seconds);
         println!("Stochastic search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
     } else {
         // Default: hybrid search (Phase B → SAT X/Y). Use --sat or --stochastic to override.
@@ -3445,7 +3406,7 @@ mod tests {
     #[test]
     fn stochastic_search_finds_tt8() {
         let p = Problem::new(8);
-        let report = stochastic_search(p, false, 0);
+        let report = stochastic_search(p, None, false, 0);
         assert!(report.found_solution);
         assert!(report.elapsed.as_secs_f64() < 30.0);
     }
@@ -3521,7 +3482,7 @@ mod tests {
     #[test]
     fn sat_finds_tt6() {
         let p = Problem::new(6);
-        let report = run_sat_search(p, true);
+        let report = run_sat_search(p, None, true);
         assert!(report.found_solution, "SAT should find TT(6)");
     }
 
@@ -3747,7 +3708,7 @@ mod tests {
     #[test]
     fn sat_finds_tt4() {
         let p = Problem::new(4);
-        let report = run_sat_search(p, false);
+        let report = run_sat_search(p, None, false);
         assert!(report.found_solution, "SAT should find TT(4)");
     }
 
