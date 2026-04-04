@@ -3510,6 +3510,10 @@ fn parse_args() -> SearchConfig {
             cfg.no_table = true;
         } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
             cfg.dump_dimacs = Some(v.to_string());
+        } else {
+            eprintln!("error: unknown option '{}'\n", arg);
+            print_help();
+            std::process::exit(1);
         }
     }
     // --n is required unless --verify or --test-zw supply their own sequences
