@@ -291,7 +291,6 @@ struct CandidateZW {
     z: PackedSeq,
     w: PackedSeq,
     zw_autocorr: Vec<i32>,
-    max_pair_power: f64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -853,7 +852,6 @@ fn stream_zw_candidates(
             let w = &w_candidates[wi];
             stats.candidate_pair_attempts += 1;
             if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
-            let max_power = spectral_pair_max_power(&z_spectrum, &w.spectrum);
             stats.candidate_pair_spectral_ok += 1;
             let z_auto = z_auto.get_or_insert_with(|| {
                 let mut a = vec![0i32; problem.n];
@@ -876,7 +874,6 @@ fn stream_zw_candidates(
                 z: z_seq.clone(),
                 w: w.seq.clone(),
                 zw_autocorr: zw,
-                max_pair_power: max_power,
             });
         }
         true
@@ -895,7 +892,7 @@ fn stream_zw_candidates_to_channel(
     spectral_z: &SpectralFilter,
     stats: &mut SearchStats,
     found: &AtomicBool,
-    tx: &std::sync::mpsc::Sender<(SumTuple, CandidateZW)>,
+    tx: &std::sync::mpsc::Sender<SatWorkItem>,
 ) {
     let individual_bound = problem.spectral_bound();
     let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
@@ -934,14 +931,15 @@ fn stream_zw_candidates_to_channel(
                 let nw = if s < problem.m() { w_auto[s] } else { 0 };
                 *slot = 2 * nz + 2 * nw;
             }
-            let candidate = CandidateZW {
-                z: z_seq.clone(),
-                w: w.seq.clone(),
-                zw_autocorr: zw,
-                max_pair_power: max_power,
-            };
-            if seen.insert(candidate.zw_autocorr.clone()) {
-                if tx.send((tuple, candidate)).is_err() { return false; }
+            if seen.insert(zw.clone()) {
+                let _ = tx.send(SatWorkItem {
+                    tuple,
+                    x: SeqInput::Blank, y: SeqInput::Blank,
+                    z: SeqInput::Fixed(z_seq.clone()),
+                    w: SeqInput::Fixed(w.seq.clone()),
+                    zw_autocorr: Some(zw),
+                    priority: max_power,
+                });
             }
         }
         true
@@ -1482,6 +1480,289 @@ struct SearchReport {
     found_solution: bool,
 }
 
+// ==================== Unified SAT work-item types ====================
+
+/// What a worker should do with one sequence slot.
+#[derive(Clone)]
+enum SeqInput {
+    /// SAT must find this sequence (sum comes from the SumTuple).
+    Blank,
+    /// Sequence already determined — treat as constant in the encoding.
+    Fixed(PackedSeq),
+}
+
+/// A unit of SAT work sent from producer → coordinator → worker.
+struct SatWorkItem {
+    tuple: SumTuple,
+    x: SeqInput,
+    y: SeqInput,
+    z: SeqInput,
+    w: SeqInput,
+    /// Pre-computed 2*N_Z(k)+2*N_W(k) when both z and w are Fixed.
+    zw_autocorr: Option<Vec<i32>>,
+    /// Lower = higher priority in the coordinator queue. 0.0 = FIFO.
+    priority: f64,
+}
+
+fn compute_zw_autocorr(problem: Problem, z: &PackedSeq, w: &PackedSeq) -> Vec<i32> {
+    let mut zw = vec![0i32; problem.n];
+    for s in 1..problem.n {
+        let nz = z.autocorrelation(s);
+        let nw = if s < problem.m() { w.autocorrelation(s) } else { 0 };
+        zw[s] = 2 * nz + 2 * nw;
+    }
+    zw
+}
+
+/// Dispatch a work item to the appropriate SAT solver based on which
+/// sequences are Blank vs Fixed.
+fn solve_work_item(
+    problem: Problem,
+    item: &SatWorkItem,
+    template_cache: &mut HashMap<(i32, i32, i32, i32), SatXYTemplate>,
+    xy_table: Option<&XYBoundaryTable>,
+) -> Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)> {
+    match (&item.x, &item.y, &item.z, &item.w) {
+        // All blank: pure SAT for all four sequences
+        (SeqInput::Blank, SeqInput::Blank, SeqInput::Blank, SeqInput::Blank) => {
+            sat_search(problem, item.tuple, false).map(|(x, y, z, w)|
+                (PackedSeq::from_values(&x), PackedSeq::from_values(&y),
+                 PackedSeq::from_values(&z), PackedSeq::from_values(&w)))
+        }
+        // Z fixed, rest blank: SAT for X/Y/W
+        (SeqInput::Blank, SeqInput::Blank, SeqInput::Fixed(z), SeqInput::Blank) => {
+            let z_vals: Vec<i8> = (0..z.len()).map(|i| z.get(i)).collect();
+            sat_solve_xyw(problem, item.tuple, &z_vals, false)
+                .map(|(x, y, w)| (x, y, z.clone(), w))
+        }
+        // Z and W fixed: SAT for X/Y
+        (SeqInput::Blank, SeqInput::Blank, SeqInput::Fixed(z), SeqInput::Fixed(w)) => {
+            let tuple_key = (item.tuple.x, item.tuple.y, item.tuple.z, item.tuple.w);
+            let template = template_cache.entry(tuple_key).or_insert_with(|| {
+                SatXYTemplate::build(problem, item.tuple).unwrap()
+            });
+            let zw_autocorr = item.zw_autocorr.clone().unwrap_or_else(|| {
+                compute_zw_autocorr(problem, z, w)
+            });
+            let candidate = CandidateZW {
+                z: z.clone(), w: w.clone(), zw_autocorr,
+            };
+            if let Some(table) = xy_table {
+                table.solve_xy_with_sat(problem, item.tuple, &candidate, template)
+                    .map(|(x, y)| (x, y, z.clone(), w.clone()))
+            } else {
+                template.solve_for(&candidate)
+                    .map(|(x, y)| (x, y, z.clone(), w.clone()))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Generic producer-consumer SAT search runner.
+///
+/// All search modes (--sat, --z-sat, --w-sat, hybrid) funnel through here.
+/// The caller provides a `produce` closure that generates `SatWorkItem`s;
+/// workers dispatch each item to the right SAT solver via `solve_work_item`.
+fn run_parallel_search<P>(
+    problem: Problem,
+    xy_table: Option<Arc<XYBoundaryTable>>,
+    produce: P,
+    verbose: bool,
+    mode_name: &str,
+) -> SearchReport
+where
+    P: FnOnce(std::sync::mpsc::Sender<SatWorkItem>, Arc<AtomicBool>) -> SearchStats
+        + Send + 'static,
+{
+    let run_start = Instant::now();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get()).unwrap_or(1).max(1);
+    if verbose {
+        eprintln!("TT({}): {} search, {} threads", problem.n, mode_name, workers);
+    }
+
+    let found = Arc::new(AtomicBool::new(false));
+
+    use std::collections::BinaryHeap;
+
+    // Channels
+    let (producer_tx, producer_rx) = std::sync::mpsc::channel::<SatWorkItem>();
+    let (result_tx, result_rx) =
+        std::sync::mpsc::channel::<Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>>();
+    let mut worker_txs: Vec<std::sync::mpsc::SyncSender<Option<SatWorkItem>>> = Vec::new();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<usize>();
+
+    // Shared counters
+    let items_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let phase_c_nanos_shared = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Spawn workers
+    for tid in 0..workers {
+        let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<Option<SatWorkItem>>(1);
+        worker_txs.push(work_tx);
+        let found = Arc::clone(&found);
+        let ready_tx = ready_tx.clone();
+        let result_tx = result_tx.clone();
+        let xy_table = xy_table.clone();
+        let items_completed = Arc::clone(&items_completed);
+        let phase_c_nanos_shared = Arc::clone(&phase_c_nanos_shared);
+
+        std::thread::spawn(move || {
+            let mut template_cache: HashMap<(i32, i32, i32, i32), SatXYTemplate> = HashMap::new();
+            let _ = ready_tx.send(tid);
+            while let Ok(Some(item)) = work_rx.recv() {
+                if found.load(AtomicOrdering::Relaxed) { break; }
+                let c_start = Instant::now();
+                let solved = solve_work_item(
+                    problem, &item, &mut template_cache,
+                    xy_table.as_deref(),
+                );
+                phase_c_nanos_shared.fetch_add(
+                    c_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
+                items_completed.fetch_add(1, AtomicOrdering::Relaxed);
+
+                if let Some(ref sol) = solved {
+                    if verify_tt(problem, &sol.0, &sol.1, &sol.2, &sol.3) {
+                        found.store(true, AtomicOrdering::Relaxed);
+                        let _ = result_tx.send(solved);
+                        break;
+                    }
+                }
+                let _ = ready_tx.send(tid);
+            }
+        });
+    }
+    drop(ready_tx);
+    drop(result_tx);
+
+    // Spawn producer
+    let producer_found = Arc::clone(&found);
+    let producer_handle = std::thread::spawn(move || produce(producer_tx, producer_found));
+
+    // Coordinator: priority queue + dispatch loop
+    struct PqItem { priority: f64, item: SatWorkItem }
+    impl PartialEq for PqItem {
+        fn eq(&self, other: &Self) -> bool { self.priority == other.priority }
+    }
+    impl Eq for PqItem {}
+    impl PartialOrd for PqItem {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+    }
+    impl Ord for PqItem {
+        fn cmp(&self, other: &Self) -> Ordering {
+            // Reverse: lower priority value = higher queue priority
+            other.priority.partial_cmp(&self.priority).unwrap_or(Ordering::Equal)
+        }
+    }
+
+    let mut pq: BinaryHeap<PqItem> = BinaryHeap::new();
+    let mut idle_workers: Vec<usize> = Vec::new();
+    let mut found_solution = false;
+    let mut dispatched = 0usize;
+    let mut last_progress = Instant::now();
+
+    let dispatch = |pq: &mut BinaryHeap<PqItem>, idle: &mut Vec<usize>,
+                    worker_txs: &[std::sync::mpsc::SyncSender<Option<SatWorkItem>>],
+                    dispatched: &mut usize| {
+        while let Some(tid) = idle.pop() {
+            if let Some(pqi) = pq.pop() {
+                *dispatched += 1;
+                let _ = worker_txs[tid].send(Some(pqi.item));
+            } else {
+                idle.push(tid);
+                break;
+            }
+        }
+    };
+
+    let mut producer_done = false;
+    loop {
+        if found.load(AtomicOrdering::Relaxed) {
+            if let Ok(Some(sol)) = result_rx.recv() {
+                if verbose {
+                    print_solution(
+                        &format!("TT({}) SOLUTION", problem.n),
+                        &sol.0, &sol.1, &sol.2, &sol.3);
+                }
+                found_solution = true;
+            }
+            break;
+        }
+
+        // Drain producer channel (non-blocking)
+        loop {
+            match producer_rx.try_recv() {
+                Ok(item) => {
+                    let priority = item.priority;
+                    pq.push(PqItem { priority, item });
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    producer_done = true;
+                    break;
+                }
+            }
+        }
+
+        // Drain ready signals (non-blocking)
+        loop {
+            match ready_rx.try_recv() {
+                Ok(tid) => idle_workers.push(tid),
+                Err(_) => break,
+            }
+        }
+
+        dispatch(&mut pq, &mut idle_workers, &worker_txs, &mut dispatched);
+
+        if producer_done && pq.is_empty() && idle_workers.len() == workers {
+            break;
+        }
+
+        if verbose && last_progress.elapsed().as_secs() >= 10 {
+            let elapsed = run_start.elapsed().as_secs_f64();
+            let done = items_completed.load(AtomicOrdering::Relaxed);
+            eprintln!("[{:.0}s] {} | queue {} | dispatched {} | done {} | {:.1} items/s",
+                elapsed, mode_name, pq.len(), dispatched, done,
+                if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 });
+            last_progress = Instant::now();
+        }
+
+        std::thread::yield_now();
+    }
+
+    // Shutdown workers
+    for tx in &worker_txs {
+        let _ = tx.send(None);
+    }
+
+    // Collect producer stats
+    let mut stats = SearchStats::default();
+    if let Ok(producer_stats) = producer_handle.join() {
+        stats.merge_from(&producer_stats);
+    }
+    stats.phase_c_nanos = phase_c_nanos_shared.load(AtomicOrdering::Relaxed);
+
+    if verbose {
+        let total = run_start.elapsed();
+        let phase_b = std::time::Duration::from_nanos(stats.phase_b_nanos);
+        let phase_c = std::time::Duration::from_nanos(stats.phase_c_nanos);
+        let done = items_completed.load(AtomicOrdering::Relaxed);
+        println!("\n--- {} ({} threads) ---", mode_name, workers);
+        if stats.phase_b_nanos > 0 {
+            println!("  Phase B (candidate gen):  {:>10.3?}  (thread-sum)", phase_b);
+        }
+        println!("  Phase C (SAT solve):      {:>10.3?}  (thread-sum)", phase_c);
+        println!("  Items dispatched:         {:>10}", dispatched);
+        println!("  Items completed:          {:>10}", done);
+        println!("  Wall-clock:               {:>10.3?}", total);
+        if !found_solution {
+            println!("No solution found.");
+        }
+    }
+    SearchReport { stats, elapsed: run_start.elapsed(), found_solution }
+}
+
 /// SAT-based X/Y/W solver: given fixed Z (from DFS), encode X/Y/W + autocorrelation
 /// constraints and solve. This avoids the spectral pairing bottleneck of Phase B.
 ///
@@ -1705,173 +1986,105 @@ fn sat_find_z_candidates(
 /// then send each (Z, W) pair to the existing XY solver.
 fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
-    let run_start = Instant::now();
-    let stats = SearchStats::default();
-
-    let spectral_w = SpectralFilter::new(problem.m(), cfg.theta_samples);
-
     let raw = enumerate_sum_tuples(problem);
     let mut seen = std::collections::HashSet::new();
-    let tuples: Vec<SumTuple> = raw.into_iter().filter(|t| seen.insert((t.x, t.y, t.z, t.w))).collect();
-
-    // Group tuples by w_sum
-    let mut tuples_by_w: std::collections::HashMap<i32, Vec<SumTuple>> = std::collections::HashMap::new();
+    let tuples: Vec<SumTuple> = raw.into_iter()
+        .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+        .collect();
+    // Group tuples by w_sum (filter parity inside producer)
+    let mut tuples_by_w: HashMap<i32, Vec<SumTuple>> = HashMap::new();
     for &tuple in &tuples {
         tuples_by_w.entry(tuple.w).or_default().push(tuple);
     }
-
     if verbose {
-        println!("TT({}): W-SAT search (W enum → SAT Z → Phase C XY), {} tuples, {} w_sums",
-            problem.n, tuples.len(), tuples_by_w.len());
+        eprintln!("{} sum-tuples, {} distinct w_sums", tuples.len(), tuples_by_w.len());
     }
-
-    let mut fft_buf = Vec::with_capacity(spectral_w.fft_size);
-    let individual_bound = problem.spectral_bound();
-    let max_z_per_w = 10; // SAT Z candidates per W
-
-    for (&w_sum, w_tuples) in &tuples_by_w {
-        if (w_sum + problem.m() as i32) % 2 != 0 { continue; }
-        let mut w_count = 0usize;
-        let mut w_ok = 0usize;
-        let mut total_z_found = 0usize;
-        let mut total_xy_solved = 0usize;
-        let mut found = false;
-
-        generate_sequences_permuted(problem.m(), w_sum, true, false, cfg.max_w, |w_values| {
-            if found { return false; }
-            w_count += 1;
-            if spectrum_if_ok(w_values, &spectral_w, individual_bound, &mut fft_buf).is_none() {
-                return true;
-            }
-            w_ok += 1;
-
-            // For each tuple that uses this w_sum, SAT-find Z candidates
-            for &tuple in w_tuples {
-                if (tuple.z + problem.n as i32) % 2 != 0 { continue; }
-                if (tuple.x + problem.n as i32) % 2 != 0 { continue; }
-                if (tuple.y + problem.n as i32) % 2 != 0 { continue; }
-
-                let z_candidates = sat_find_z_candidates(problem, tuple.z, w_values, max_z_per_w);
-                total_z_found += z_candidates.len();
-
-                for z_seq in &z_candidates {
-                    // Build (Z, W) candidate and solve for XY via existing Phase C
-                    let z_auto: Vec<i32> = (0..problem.n).map(|s| {
-                        if s == 0 { 0 } else { z_seq.autocorrelation(s) }
-                    }).collect();
-                    let pw = PackedSeq::from_values(w_values);
-                    let w_auto: Vec<i32> = (0..problem.m()).map(|s| {
-                        if s == 0 { 0 } else { pw.autocorrelation(s) }
-                    }).collect();
-                    let mut zw = vec![0i32; problem.n];
-                    for s in 1..problem.n {
-                        let nz = z_auto[s];
-                        let nw = if s < problem.m() { w_auto[s] } else { 0 };
-                        zw[s] = 2 * nz + 2 * nw;
-                    }
-
-                    let candidate = CandidateZW {
-                        z: z_seq.clone(),
-                        w: pw.clone(),
-                        zw_autocorr: zw,
-                        max_pair_power: 0.0,
-                    };
-
-                    // Use existing SAT XY solver (Phase C)
-                    let template = SatXYTemplate::build(problem, tuple);
-                    if let Some(template) = template {
-                        total_xy_solved += 1;
-                        if let Some((x, y)) = template.solve_for(&candidate) {
-                            if verify_tt(problem, &x, &y, z_seq, &pw) {
-                                if verbose {
-                                    print_solution(
-                                        &format!("TT({}) W-SAT (w_sum={}, w #{}, z_found={}, {:.3?})",
-                                            problem.n, w_sum, w_ok, z_candidates.len(), run_start.elapsed()),
-                                        &x, &y, z_seq, &pw);
-                                }
-                                found = true;
-                                return false;
-                            }
-                        }
+    let theta = cfg.theta_samples;
+    let max_w = cfg.max_w;
+    run_parallel_search(problem, None, move |tx, found| {
+        let spectral_w = SpectralFilter::new(problem.m(), theta);
+        let mut stats = SearchStats::default();
+        let individual_bound = problem.spectral_bound();
+        let max_z_per_w = 10;
+        let mut fft_buf = Vec::with_capacity(spectral_w.fft_size);
+        for (&w_sum, w_tuples) in &tuples_by_w {
+            if (w_sum + problem.m() as i32) % 2 != 0 { continue; }
+            if found.load(AtomicOrdering::Relaxed) { break; }
+            generate_sequences_permuted(problem.m(), w_sum, true, false, max_w, |w_values| {
+                if found.load(AtomicOrdering::Relaxed) { return false; }
+                stats.w_generated += 1;
+                if spectrum_if_ok(w_values, &spectral_w, individual_bound, &mut fft_buf).is_none() {
+                    return true;
+                }
+                stats.w_spectral_ok += 1;
+                let pw = PackedSeq::from_values(w_values);
+                for &tuple in w_tuples {
+                    if (tuple.z + problem.n as i32) % 2 != 0 { continue; }
+                    if (tuple.x + problem.n as i32) % 2 != 0 { continue; }
+                    if (tuple.y + problem.n as i32) % 2 != 0 { continue; }
+                    let z_candidates = sat_find_z_candidates(problem, tuple.z, w_values, max_z_per_w);
+                    for z_seq in &z_candidates {
+                        let zw_autocorr = compute_zw_autocorr(problem, z_seq, &pw);
+                        let _ = tx.send(SatWorkItem {
+                            tuple, x: SeqInput::Blank, y: SeqInput::Blank,
+                            z: SeqInput::Fixed(z_seq.clone()),
+                            w: SeqInput::Fixed(pw.clone()),
+                            zw_autocorr: Some(zw_autocorr), priority: 0.0,
+                        });
                     }
                 }
-            }
-            if w_ok % 100 == 0 && w_ok > 0 {
-                eprintln!("  w_sum={}: w_ok={} z_found={} xy_tried={} ({:.1?})",
-                    w_sum, w_ok, total_z_found, total_xy_solved, run_start.elapsed());
-            }
-            true
-        });
-
-        if verbose {
-            eprintln!("  w_sum={}: w_gen={} w_ok={} z_found={} xy_tried={}",
-                w_sum, w_count, w_ok, total_z_found, total_xy_solved);
+                true
+            });
         }
-        if found {
-            return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
-        }
-    }
-
-    if verbose { println!("No solution found, elapsed={:.3?}", run_start.elapsed()); }
-    SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false }
+        stats
+    }, verbose, "W-enum + SAT Z + SAT XY")
 }
 
 /// Hybrid Z-DFS + SAT X/Y/W search. Generates Z candidates via DFS with
 /// spectral filtering, then uses SAT to find X/Y/W for each Z.
 fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
-    let run_start = Instant::now();
-    let stats = SearchStats::default();
-
-    let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
-
     let raw = enumerate_sum_tuples(problem);
     let mut seen = std::collections::HashSet::new();
-    let tuples: Vec<SumTuple> = raw.into_iter().filter(|t| seen.insert((t.x, t.y, t.z, t.w))).collect();
+    let tuples: Vec<SumTuple> = raw.into_iter()
+        .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+        .filter(|t| {
+            (t.x + problem.n as i32) % 2 == 0
+            && (t.y + problem.n as i32) % 2 == 0
+            && (t.z + problem.n as i32) % 2 == 0
+            && (t.w + problem.m() as i32) % 2 == 0
+        })
+        .collect();
     if verbose {
-        println!("TT({}): Z-DFS + SAT X/Y/W search, {} tuples", problem.n, tuples.len());
+        eprintln!("{} sum-tuples", tuples.len());
     }
-
-    for tuple in &tuples {
-        if (tuple.x + problem.n as i32) % 2 != 0 { continue; }
-        if (tuple.y + problem.n as i32) % 2 != 0 { continue; }
-        if (tuple.z + problem.n as i32) % 2 != 0 { continue; }
-        if (tuple.w + problem.m() as i32) % 2 != 0 { continue; }
-
-        let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
-        let mut z_count = 0usize;
-        let mut found = false;
-        generate_sequences_permuted(problem.n, tuple.z, true, true, cfg.max_z, |z_values| {
-            if found { return false; }
-            z_count += 1;
-            // Spectral filter on Z alone
-            if spectrum_if_ok(z_values, &spectral_z, problem.spectral_bound(), &mut fft_buf).is_none() {
-                return true;
-            }
-            // Try SAT for X/Y/W given this Z
-            if let Some((x, y, w)) = sat_solve_xyw(problem, *tuple, z_values, verbose) {
-                let pz = PackedSeq::from_values(z_values);
-                let ok = verify_tt(problem, &x, &y, &pz, &w);
-                if verbose {
-                    print_solution(
-                        &format!("TT({}) Z-SAT (tuple {}, z #{}, {:.3?}, verified={})",
-                            problem.n, tuple, z_count, run_start.elapsed(), ok),
-                        &x, &y, &pz, &w);
+    let theta = cfg.theta_samples;
+    let max_z = cfg.max_z;
+    run_parallel_search(problem, None, move |tx, found| {
+        let spectral_z = SpectralFilter::new(problem.n, theta);
+        let mut stats = SearchStats::default();
+        let individual_bound = problem.spectral_bound();
+        for tuple in &tuples {
+            if found.load(AtomicOrdering::Relaxed) { break; }
+            let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
+            generate_sequences_permuted(problem.n, tuple.z, true, true, max_z, |z_values| {
+                if found.load(AtomicOrdering::Relaxed) { return false; }
+                stats.z_generated += 1;
+                if spectrum_if_ok(z_values, &spectral_z, individual_bound, &mut fft_buf).is_none() {
+                    return true;
                 }
-                if ok { found = true; return false; }
-            }
-            true
-        });
-        if found {
-            return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
+                stats.z_spectral_ok += 1;
+                let z = PackedSeq::from_values(z_values);
+                let _ = tx.send(SatWorkItem {
+                    tuple: *tuple, x: SeqInput::Blank, y: SeqInput::Blank,
+                    z: SeqInput::Fixed(z), w: SeqInput::Blank,
+                    zw_autocorr: None, priority: 0.0,
+                });
+                true
+            });
         }
-        if verbose && z_count > 0 {
-            println!("Tuple {}: {} Z candidates tried, {:.3?}", tuple, z_count, run_start.elapsed());
-        }
-    }
-
-    if verbose { println!("No solution found, elapsed={:.3?}", run_start.elapsed()); }
-    SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false }
+        stats
+    }, verbose, "Z-DFS + SAT XYW")
 }
 
 fn run_benchmark(cfg: &SearchConfig) {
@@ -2431,43 +2644,34 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
 }
 
 fn run_sat_search(problem: Problem, verbose: bool) -> SearchReport {
-    let run_start = Instant::now();
-    let stats = SearchStats::default();
     let raw = enumerate_sum_tuples(problem);
     // Use raw tuples (not normalized) because SAT symmetry breaking
     // (x[0]=1, z[0]=z[n-1]=1, etc.) is only compatible with specific sign combos.
-    // Deduplicate by the actual (x,y,z,w) sums.
     let mut seen = std::collections::HashSet::new();
-    let tuples: Vec<SumTuple> = raw.into_iter().filter(|t| seen.insert((t.x, t.y, t.z, t.w))).collect();
+    let tuples: Vec<SumTuple> = raw.into_iter()
+        .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+        .filter(|t| {
+            (t.x + problem.n as i32) % 2 == 0
+            && (t.y + problem.n as i32) % 2 == 0
+            && (t.z + problem.n as i32) % 2 == 0
+            && (t.w + problem.m() as i32) % 2 == 0
+        })
+        .collect();
     if verbose {
-        println!("TT({}): SAT search over {} distinct sum-tuples", problem.n, tuples.len());
+        eprintln!("{} sum-tuples (raw, sign-specific for SAT symmetry breaking)", tuples.len());
     }
-    for tuple in &tuples {
-        // Skip tuples where sum parities don't work
-        if (tuple.x + problem.n as i32) % 2 != 0 { continue; }
-        if (tuple.y + problem.n as i32) % 2 != 0 { continue; }
-        if (tuple.z + problem.n as i32) % 2 != 0 { continue; }
-        if (tuple.w + problem.m() as i32) % 2 != 0 { continue; }
-
-        let tuple_start = Instant::now();
-        if let Some((x, y, z, w)) = sat_search(problem, *tuple, verbose) {
-            let px = PackedSeq::from_values(&x);
-            let py = PackedSeq::from_values(&y);
-            let pz = PackedSeq::from_values(&z);
-            let pw = PackedSeq::from_values(&w);
-            let ok = verify_tt(problem, &px, &py, &pz, &pw);
-            if verbose {
-                println!("SAT found solution for tuple {} in {:.3?} (verified={})", tuple, tuple_start.elapsed(), ok);
-                print_solution(&format!("TT({}) SAT (tuple {}, {:.3?})", problem.n, tuple, tuple_start.elapsed()), &px, &py, &pz, &pw);
-            }
-            if ok {
-                return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
-            }
-        } else if verbose {
-            println!("Tuple {} exhausted in {:.3?}", tuple, tuple_start.elapsed());
+    run_parallel_search(problem, None, move |tx, found| {
+        let stats = SearchStats::default();
+        for tuple in tuples {
+            if found.load(AtomicOrdering::Relaxed) { break; }
+            let _ = tx.send(SatWorkItem {
+                tuple, x: SeqInput::Blank, y: SeqInput::Blank,
+                z: SeqInput::Blank, w: SeqInput::Blank,
+                zw_autocorr: None, priority: 0.0,
+            });
         }
-    }
-    SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false }
+        stats
+    }, verbose, "pure SAT")
 }
 
 // ==================== Prefix/suffix table for fast X/Y completion ====================
@@ -2776,131 +2980,11 @@ impl XYBoundaryTable {
 /// followed by SAT-based X/Y solving for each candidate (Z,W) pair.
 /// Process a single sum-tuple: Phase B (Z/W generation) + Phase C (SAT X/Y solving).
 /// Returns Some((x, y, z, w, stats)) if a solution is found.
-fn hybrid_solve_tuple(
-    problem: Problem,
-    tuple: SumTuple,
-    cfg: &SearchConfig,
-    found: &AtomicBool,
-    verbose: bool,
-    xy_table: Option<&XYBoundaryTable>,
-) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SearchStats) {
-    let mut stats = SearchStats::default();
-    if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
-
-    let max_seq_len = problem.n;
-    let spectral_z = SpectralFilter::new(max_seq_len, cfg.theta_samples);
-    let spectral_w = SpectralFilter::new(max_seq_len, cfg.theta_samples);
-
-    // Phase B: generate Z/W candidates and Phase C: SAT-test them in batches.
-    // Instead of generating ALL candidates then testing, we generate a batch of Z/W
-    // pairs, SAT-test them, then generate more. This interleaves Phase B and C so
-    // we don't spend minutes in Phase B before trying any SAT.
-    let phase_b_start = Instant::now();
-    let zw_candidates =
-        build_zw_candidates(problem, tuple, cfg, &spectral_z, &spectral_w, &mut stats, found);
-    let phase_b_elapsed = phase_b_start.elapsed();
-    stats.phase_b_nanos += phase_b_elapsed.as_nanos() as u64;
-    if verbose && !zw_candidates.is_empty() {
-        println!("Tuple {}: {} Z/W pairs (Phase B: {:.3?})", tuple, zw_candidates.len(), phase_b_elapsed);
-    }
-    if zw_candidates.is_empty() { return (None, stats); }
-    if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
-
-    // Deduplicate Z/W pairs by autocorrelation vector
-    let mut seen_autocorr = std::collections::HashSet::new();
-    let unique_candidates: Vec<&CandidateZW> = zw_candidates.iter()
-        .filter(|c| seen_autocorr.insert(c.zw_autocorr.clone()))
-        .collect();
-    if verbose && unique_candidates.len() < zw_candidates.len() {
-        println!("  Dedup: {} unique autocorr vectors from {} pairs",
-            unique_candidates.len(), zw_candidates.len());
-    }
-
-    let Some(template) = SatXYTemplate::build(problem, tuple) else { return (None, stats); };
-
-    // Table-based Phase C: pre-seed SAT with boundary configurations
-    if let Some(table) = xy_table {
-        for (idx, cand) in unique_candidates.iter().enumerate() {
-            if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
-            let start = Instant::now();
-            if let Some((x, y)) = table.solve_xy_with_sat(problem, tuple, cand, &template) {
-                stats.phase_c_nanos += start.elapsed().as_nanos() as u64;
-                let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
-                if verbose {
-                    print_solution(&format!("TT({}) table+SAT (pair {}, {:.3?}, verified={})",
-                        problem.n, idx, start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
-                }
-                if ok {
-                    found.store(true, AtomicOrdering::Relaxed);
-                    return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
-                }
-            } else {
-                stats.phase_c_nanos += start.elapsed().as_nanos() as u64;
-            }
-        }
-        return (None, stats);
-    }
-
-    // For large n, use conflict limit to quickly reject easy-UNSAT pairs,
-    // then retry deferred (UNKNOWN) pairs without limit.
-    let conflict_limit = if problem.n >= 26 { 50000u64 } else { 0 };
-    let mut deferred: Vec<usize> = Vec::new();
-
-    for (idx, cand) in unique_candidates.iter().enumerate() {
-        if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
-        let sat_start = Instant::now();
-        let (result, was_limited) = template.solve_for_limited(cand, conflict_limit);
-        stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
-        if let Some((x, y)) = result {
-            let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
-            if verbose {
-                print_solution(&format!("TT({}) hybrid (pair {}, {:.3?}, verified={})", problem.n, idx, sat_start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
-            }
-            if ok {
-                found.store(true, AtomicOrdering::Relaxed);
-                return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
-            }
-        } else if was_limited {
-            deferred.push(idx);
-        } else if verbose {
-            println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
-        }
-    }
-
-    // Pass 2: retry deferred candidates without limit
-    for &idx in &deferred {
-        if found.load(AtomicOrdering::Relaxed) { return (None, stats); }
-        let cand = unique_candidates[idx];
-        let sat_start = Instant::now();
-        if let Some((x, y)) = template.solve_for(cand) {
-            stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
-            let ok = verify_tt(problem, &x, &y, &cand.z, &cand.w);
-            if verbose {
-                print_solution(&format!("TT({}) hybrid (pair {}, {:.3?}, verified={})", problem.n, idx, sat_start.elapsed(), ok), &x, &y, &cand.z, &cand.w);
-            }
-            if ok {
-                found.store(true, AtomicOrdering::Relaxed);
-                return (Some((x, y, cand.z.clone(), cand.w.clone())), stats);
-            }
-        } else {
-            stats.phase_c_nanos += sat_start.elapsed().as_nanos() as u64;
-            if verbose {
-                println!("SAT X/Y: UNSAT for pair {} in {:.3?}", idx, sat_start.elapsed());
-            }
-        }
-    }
-    (None, stats)
-}
-
 fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
-    let run_start = Instant::now();
 
-    let phase_a_start = Instant::now();
+    // Phase A: enumerate and normalize tuples
     let raw = enumerate_sum_tuples(problem);
-    // Normalize: deduplicate by sign/swap equivalence.
-    // Negating any sequence preserves autocorrelation; swapping X↔Y is symmetric.
-    // norm_key = (sorted |x|,|y|, |z|, |w|) captures this equivalence.
     let mut tuples: Vec<SumTuple> = normalized_tuples(&raw).into_iter()
         .filter(|t| {
             (t.x + problem.n as i32) % 2 == 0
@@ -2909,27 +2993,18 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             && (t.w + problem.m() as i32) % 2 == 0
         })
         .collect();
-    // Filter to specific tuple if --tuple is set
     if let Some(ref t) = cfg.test_tuple {
         tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
     }
-
-    let cfg = cfg.clone();
-    let cfg = cfg;
-
     // Heuristic tuple ordering depends on problem size.
-    // For smaller n: cheap Phase B first (small |z|+|w|), since Phase B dominates.
-    // For larger n: solution-likely first (small |x-y|), since Phase C dominates
-    // and we want to reach the solution tuple early.
     if problem.n >= 26 {
         tuples.sort_by_key(|t| ((t.x - t.y).abs(), t.z.abs() + t.w.abs(), t.x.abs() + t.y.abs()));
     } else {
         tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
     }
-    let phase_a_elapsed = phase_a_start.elapsed();
 
+    // Load boundary table
     let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table-k7.bin".to_string());
-    // The k=7 table requires n >= 2k = 14. Auto-skip for smaller n.
     let skip_table = cfg.no_table || problem.n < 14;
     let xy_table: Option<Arc<XYBoundaryTable>> = if skip_table {
         if !cfg.no_table && problem.n < 14 && verbose {
@@ -2939,7 +3014,6 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     } else {
         match XYBoundaryTable::load(&table_path) {
             Some(t) => {
-                // Verify n >= 2*k for the loaded table
                 if problem.n < 2 * t.k {
                     if verbose {
                         eprintln!("Note: n={} < {} (2*k for k={} table), running without table",
@@ -2960,329 +3034,42 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         }
     };
 
-    let cfg = cfg.clone();
-    let cfg = cfg; // re-bind as immutable
-
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get()).unwrap_or(1).max(1);
     if verbose {
         let method = if xy_table.is_some() { "table+SAT" } else { "SAT X/Y" };
-        println!("TT({}): hybrid search (Phase B → {}), {} tuples, {} threads",
-            problem.n, method, tuples.len(), workers);
+        eprintln!("{} normalized tuples, Phase C: {}", tuples.len(), method);
     }
 
-    let found = Arc::new(AtomicBool::new(false));
-
-    // For single-thread, run sequentially
-    if workers <= 1 {
+    let cfg = cfg.clone();
+    run_parallel_search(problem, xy_table, move |tx, found| {
+        let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
+        let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
         let mut stats = SearchStats::default();
-        for tuple in &tuples {
-            let (result, local_stats) = hybrid_solve_tuple(problem, *tuple, &cfg, &found, verbose, xy_table.as_ref().map(|a| &**a));
-            stats.merge_from(&local_stats);
-            if let Some((x, y, z, w)) = result {
-                if verbose {
-                    print_solution(&format!("TT({}) SOLUTION", problem.n), &x, &y, &z, &w);
-                }
-                return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: true };
+        let mut w_cache: HashMap<i32, (Vec<SeqWithSpectrum>, SpectralIndex)> = HashMap::new();
+        for (idx, &tuple) in tuples.iter().enumerate() {
+            if found.load(AtomicOrdering::Relaxed) { break; }
+            let b_start = Instant::now();
+            if !w_cache.contains_key(&tuple.w) {
+                let w_candidates = build_w_candidates(
+                    problem, tuple.w, &cfg, &spectral_w, &mut stats, &found);
+                let w_index = SpectralIndex::build(&w_candidates);
+                w_cache.insert(tuple.w, (w_candidates, w_index));
             }
+            if found.load(AtomicOrdering::Relaxed) { break; }
+            let (w_candidates, w_index) = w_cache.get(&tuple.w).unwrap();
+            let before = (stats.z_generated, stats.z_spectral_ok, stats.candidate_pair_spectral_ok);
+            stream_zw_candidates_to_channel(
+                problem, tuple, w_candidates, w_index, &cfg, &spectral_z,
+                &mut stats, &found, &tx);
+            stats.phase_b_nanos += b_start.elapsed().as_nanos() as u64;
+            let z_gen = stats.z_generated - before.0;
+            let z_ok = stats.z_spectral_ok - before.1;
+            let pairs = stats.candidate_pair_spectral_ok - before.2;
+            eprintln!("  tuple {}/{} (sums {},{},{},{}): z_gen={} z_ok={} w={} pairs={}",
+                idx+1, tuples.len(), tuple.x, tuple.y, tuple.z, tuple.w,
+                z_gen, z_ok, w_candidates.len(), pairs);
         }
-        if verbose {
-            println!("Hybrid search: no solution found. Stats: z_gen={}, w_gen={}, pairs={}, elapsed={:.3?}",
-                stats.z_generated, stats.w_generated, stats.candidate_pair_spectral_ok, run_start.elapsed());
-        }
-        return SearchReport { stats, elapsed: run_start.elapsed(), found_solution: false };
-    }
-
-    // Channel-based coordinator with shared priority queue.
-    // All pairs from all tuples go into one queue, dispatched tightest-first.
-    // - Producer thread: runs Phase B for all tuples, sends candidates to coordinator
-    // - Coordinator (this thread): receives candidates, inserts into priority queue,
-    //   dispatches to idle workers (tightest spectral first)
-    // - Worker threads: receive work items via channel, run Phase C, send results back
-    // No mutex contention — coordinator is the only one touching the priority queue.
-
-    use std::collections::BinaryHeap;
-
-    // The pair spectral bound at spectral_bound() = (6n-2)/2 is a necessary
-    // condition (not heuristic): 2|Z|²+2|W|² ≤ 6n-2 → |Z|²+|W|² ≤ (6n-2)/2.
-    // The previous auto-widening to 2*spectral_bound for n≥28 was a no-op
-    // (individual bounds already enforce this) and has been removed.
-    let producer_cfg = cfg.clone();
-
-    // Work item sent from coordinator to workers
-    struct WorkItem {
-        tuple: SumTuple,
-        candidate: CandidateZW,
-    }
-
-    // Channels
-    let (producer_tx, producer_rx) = std::sync::mpsc::channel::<(SumTuple, CandidateZW)>();
-    let (result_tx, result_rx) = std::sync::mpsc::channel::<Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>>();
-    // Per-worker channels: coordinator sends work, worker receives
-    let mut worker_txs: Vec<std::sync::mpsc::SyncSender<Option<WorkItem>>> = Vec::new();
-    let _worker_ready_tx_list: Vec<std::sync::mpsc::Sender<usize>> = Vec::new();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<usize>(); // workers signal "I'm idle"
-
-    // Shared counters for progress reporting and timing
-    let tuples_produced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let pairs_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let phase_c_nanos_shared = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-    // Spawn workers
-    let xy_table = xy_table.map(Arc::new);
-    for tid in 0..workers {
-        let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<Option<WorkItem>>(1);
-        worker_txs.push(work_tx);
-        let found = Arc::clone(&found);
-        let ready_tx = ready_tx.clone();
-        let result_tx = result_tx.clone();
-        let xy_table = xy_table.clone();
-        let pairs_completed = Arc::clone(&pairs_completed);
-        let phase_c_nanos_shared = Arc::clone(&phase_c_nanos_shared);
-
-        std::thread::spawn(move || {
-            let mut template_cache: HashMap<(i32,i32,i32,i32), SatXYTemplate> = HashMap::new();
-            // Signal ready immediately
-            let _ = ready_tx.send(tid);
-            while let Ok(Some(item)) = work_rx.recv() {
-                if found.load(AtomicOrdering::Relaxed) { break; }
-                let tuple_key = (item.tuple.x, item.tuple.y, item.tuple.z, item.tuple.w);
-                let template = template_cache.entry(tuple_key).or_insert_with(|| {
-                    SatXYTemplate::build(problem, item.tuple).unwrap()
-                });
-
-                let c_start = Instant::now();
-                let mut solved = None;
-                if let Some(ref table) = xy_table {
-                    let t: &XYBoundaryTable = table;
-                    if let Some((x, y)) = t.solve_xy_with_sat(problem, item.tuple, &item.candidate, template) {
-                        if verify_tt(problem, &x, &y, &item.candidate.z, &item.candidate.w) {
-                            solved = Some((x, y, item.candidate.z.clone(), item.candidate.w.clone()));
-                        }
-                    }
-                } else {
-                    if let Some((x, y)) = template.solve_for(&item.candidate) {
-                        if verify_tt(problem, &x, &y, &item.candidate.z, &item.candidate.w) {
-                            solved = Some((x, y, item.candidate.z.clone(), item.candidate.w.clone()));
-                        }
-                    }
-                }
-                phase_c_nanos_shared.fetch_add(c_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
-
-                pairs_completed.fetch_add(1, AtomicOrdering::Relaxed);
-
-                if solved.is_some() {
-                    found.store(true, AtomicOrdering::Relaxed);
-                    let _ = result_tx.send(solved);
-                    break;
-                }
-                // Signal ready for more work
-                let _ = ready_tx.send(tid);
-            }
-        });
-    }
-    drop(ready_tx); // coordinator uses ready_rx only
-    drop(result_tx); // only workers send results
-
-    // Single producer thread with adaptive throttling.
-    // Pair generation is far cheaper than SAT solving, so one producer can
-    // easily keep the queue full.  When the queue is deep, the producer sleeps
-    // to yield its CPU core to SAT workers.  It wakes periodically to generate
-    // one tuple's worth of pairs, then goes back to sleep if still pressured.
-    let tuples = Arc::new(tuples);
-    let total_tuples = tuples.len();
-    let producer_cfg = Arc::new(producer_cfg);
-    let next_tuple = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let queue_pressure = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let queue_pressure_producer = Arc::clone(&queue_pressure);
-    let mut producer_handles = Vec::new();
-    {
-        let found = Arc::clone(&found);
-        let tx = producer_tx.clone();
-        let tuples = Arc::clone(&tuples);
-        let cfg = Arc::clone(&producer_cfg);
-        let next = Arc::clone(&next_tuple);
-        let tuples_produced = Arc::clone(&tuples_produced);
-        let pressure_threshold = workers * 32;
-        producer_handles.push(std::thread::spawn(move || {
-            let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
-            let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
-            let mut stats = SearchStats::default();
-            let mut w_cache: HashMap<i32, (Vec<SeqWithSpectrum>, SpectralIndex)> = HashMap::new();
-            loop {
-                if found.load(AtomicOrdering::Relaxed) { break; }
-                // Throttle: if queue is deep, brief sleep to yield CPU to SAT workers
-                while queue_pressure_producer.load(AtomicOrdering::Relaxed) > pressure_threshold {
-                    if found.load(AtomicOrdering::Relaxed) { break; }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                if found.load(AtomicOrdering::Relaxed) { break; }
-                let idx = next.fetch_add(1, AtomicOrdering::Relaxed);
-                if idx >= tuples.len() { break; }
-                let tuple = tuples[idx];
-                let b_start = Instant::now();
-                // Cache W candidates + spectral index by sum; stream Z fresh each time
-                if !w_cache.contains_key(&tuple.w) {
-                    let w_candidates = build_w_candidates(
-                        problem, tuple.w, &cfg, &spectral_w, &mut stats, &found);
-                    let w_index = SpectralIndex::build(&w_candidates);
-                    w_cache.insert(tuple.w, (w_candidates, w_index));
-                }
-                if found.load(AtomicOrdering::Relaxed) { break; }
-                let (w_candidates, w_index) = w_cache.get(&tuple.w).unwrap();
-                let before = (stats.z_generated, stats.z_spectral_ok, stats.candidate_pair_spectral_ok);
-                stream_zw_candidates_to_channel(
-                    problem, tuple, w_candidates, w_index, &cfg, &spectral_z,
-                    &mut stats, &found, &tx);
-                stats.phase_b_nanos += b_start.elapsed().as_nanos() as u64;
-                let z_gen = stats.z_generated - before.0;
-                let z_ok = stats.z_spectral_ok - before.1;
-                let pairs = stats.candidate_pair_spectral_ok - before.2;
-                eprintln!("  tuple {}/{} (sums {},{},{},{}): z_gen={} z_ok={} w={} pairs={}",
-                    idx+1, tuples.len(), tuple.x, tuple.y, tuple.z, tuple.w,
-                    z_gen, z_ok, w_candidates.len(), pairs);
-                tuples_produced.fetch_add(1, AtomicOrdering::Relaxed);
-            }
-            stats
-        }));
-    }
-    drop(producer_tx); // close channel when all producers finish
-
-    // Coordinator: priority queue + dispatch loop
-    // Ord impl for priority queue (min-heap by max_pair_power)
-    struct PqItem { power: f64, tuple: SumTuple, candidate: CandidateZW }
-    impl PartialEq for PqItem { fn eq(&self, other: &Self) -> bool { self.power == other.power } }
-    impl Eq for PqItem {}
-    impl PartialOrd for PqItem {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
-    }
-    impl Ord for PqItem {
-        fn cmp(&self, other: &Self) -> Ordering {
-            // Reverse ordering: lower power = higher priority
-            other.power.partial_cmp(&self.power).unwrap_or(Ordering::Equal)
-        }
-    }
-
-    let mut pq: BinaryHeap<PqItem> = BinaryHeap::new();
-    let mut idle_workers: Vec<usize> = Vec::new();
-    let mut found_solution = false;
-    let mut stats = SearchStats::default();
-    let mut pairs_dispatched = 0usize;
-    let mut last_progress = std::time::Instant::now();
-
-    // Helper: dispatch from pq to an idle worker
-    let dispatch = |pq: &mut BinaryHeap<PqItem>, idle: &mut Vec<usize>,
-                    worker_txs: &[std::sync::mpsc::SyncSender<Option<WorkItem>>],
-                    dispatched: &mut usize| {
-        while let Some(tid) = idle.pop() {
-            if let Some(item) = pq.pop() {
-                *dispatched += 1;
-                let _ = worker_txs[tid].send(Some(WorkItem {
-                    tuple: item.tuple, candidate: item.candidate,
-                }));
-            } else {
-                idle.push(tid);
-                break;
-            }
-        }
-    };
-
-    let mut producer_done = false;
-    loop {
-        if found.load(AtomicOrdering::Relaxed) {
-            // Solution found — blocking recv to ensure we collect the result.
-            // The worker sets found=true then sends the result, so it's guaranteed
-            // to arrive (use recv() not try_recv() to avoid the race).
-            if let Ok(Some(sol)) = result_rx.recv() {
-                if verbose {
-                    print_solution(&format!("TT({}) SOLUTION", problem.n),
-                        &sol.0, &sol.1, &sol.2, &sol.3);
-                }
-                found_solution = true;
-            }
-            break;
-        }
-
-        // Receive candidates from producer (non-blocking)
-        loop {
-            match producer_rx.try_recv() {
-                Ok((tuple, candidate)) => {
-                    let power = candidate.max_pair_power;
-                    pq.push(PqItem { power, tuple, candidate });
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => { producer_done = true; break; }
-            }
-        }
-
-        // Receive "ready" signals from workers (non-blocking)
-        loop {
-            match ready_rx.try_recv() {
-                Ok(tid) => idle_workers.push(tid),
-                Err(_) => break,
-            }
-        }
-
-        // Update queue pressure so producer can throttle
-        queue_pressure.store(pq.len(), AtomicOrdering::Relaxed);
-
-        // Dispatch work
-        dispatch(&mut pq, &mut idle_workers, &worker_txs, &mut pairs_dispatched);
-
-        // Check if we're done (producer finished + queue empty + all workers idle)
-        if producer_done && pq.is_empty() && idle_workers.len() == workers {
-            break;
-        }
-
-        // Progress reporting every ~10s
-        if verbose && last_progress.elapsed().as_secs() >= 10 {
-            let elapsed = run_start.elapsed().as_secs_f64();
-            let t_done = tuples_produced.load(AtomicOrdering::Relaxed);
-            let p_done = pairs_completed.load(AtomicOrdering::Relaxed);
-            eprintln!("[{:.0}s] tuples {}/{}, queue {}, dispatched {}, done {}, {:.1} pairs/s",
-                elapsed, t_done, total_tuples, pq.len(), pairs_dispatched, p_done,
-                p_done as f64 / elapsed);
-            last_progress = std::time::Instant::now();
-        }
-
-        // Brief yield to avoid busy-spinning — use thread::yield instead of sleep
-        // to minimize latency
-        std::thread::yield_now();
-    }
-
-    // Shutdown workers
-    for tx in &worker_txs {
-        let _ = tx.send(None);
-    }
-
-    // Collect producer stats
-    for h in producer_handles {
-        if let Ok(producer_stats) = h.join() {
-            stats.merge_from(&producer_stats);
-        }
-    }
-
-    // Merge Phase C timing from workers
-    stats.phase_c_nanos = phase_c_nanos_shared.load(AtomicOrdering::Relaxed);
-
-    if verbose {
-        let total = run_start.elapsed();
-        let phase_b = std::time::Duration::from_nanos(stats.phase_b_nanos);
-        let phase_c = std::time::Duration::from_nanos(stats.phase_c_nanos);
-        let p_done = pairs_completed.load(AtomicOrdering::Relaxed);
-        println!("\n--- Phase timing (wall-clock, {} threads) ---", workers);
-        println!("  Phase A (tuple enum):       {:>10.3?}", phase_a_elapsed);
-        println!("  Phase B (Z/W gen+spectral): {:>10.3?}  (thread-sum)", phase_b);
-        println!("  Phase C (SAT X/Y):          {:>10.3?}  (thread-sum)", phase_c);
-        println!("  Pairs dispatched:           {:>10}", pairs_dispatched);
-        println!("  Pairs completed:            {:>10}", p_done);
-        println!("  Total wall-clock:           {:>10.3?}", total);
-        if !found_solution {
-            println!("Hybrid search: no solution found. Stats: z_gen={}, w_gen={}, pairs={}",
-                stats.z_generated, stats.w_generated, stats.candidate_pair_spectral_ok);
-        }
-    }
-    SearchReport { stats, elapsed: run_start.elapsed(), found_solution }
+        stats
+    }, verbose, "hybrid (Phase B → SAT XY)")
 }
 
 fn print_help() {
@@ -3457,7 +3244,7 @@ fn main() {
             let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
             zw_autocorr[s] = 2 * nz + 2 * nw;
         }
-        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr, max_pair_power: 0.0 };
+        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr };
         // Try all sum tuples that match this Z/W
         let raw = enumerate_sum_tuples(p);
         let mut seen = std::collections::HashSet::new();
@@ -3485,9 +3272,7 @@ fn main() {
     if let Some(ref phase) = cfg.phase_only {
         let problem = cfg.problem;
         let raw = enumerate_sum_tuples(problem);
-        let mut seen = std::collections::HashSet::new();
-        let mut tuples: Vec<SumTuple> = raw.into_iter()
-            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+        let mut tuples: Vec<SumTuple> = normalized_tuples(&raw).into_iter()
             .filter(|t| {
                 (t.x + problem.n as i32) % 2 == 0
                 && (t.y + problem.n as i32) % 2 == 0
@@ -3767,9 +3552,9 @@ mod tests {
             let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
             *slot = 2 * nz + 2 * nw;
         }
-        let candidate = CandidateZW { z, w, zw_autocorr: zw, max_pair_power: 0.0 };
+        let candidate = CandidateZW { z, w, zw_autocorr: zw };
         let tuple = SumTuple { x: 0, y: 6, z: 8, w: 5 };
-        let mut stats = SearchStats::default();
+        let _stats = SearchStats::default();
         // Test 1: can the SAT solver find X/Y from scratch?
         let template = SatXYTemplate::build(p, tuple).expect("template should build");
         assert!(template.is_feasible(&candidate), "known Z/W should be feasible");
@@ -4356,7 +4141,7 @@ mod tests {
             let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
             zw[s] = 2 * nz + 2 * nw;
         }
-        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr: zw, max_pair_power: 0.0 };
+        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr: zw };
         let template = SatXYTemplate::build(p, tuple);
         assert!(template.is_some(), "Template should build for n=2");
         let result = template.unwrap().solve_for(&candidate);
