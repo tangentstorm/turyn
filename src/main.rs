@@ -1439,6 +1439,40 @@ impl SatXYTemplate {
             solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
         }
 
+        // GF(2) XOR constraints: parity of agree count at each lag.
+        // For lag s with agree target T and k = 2*(n-s) pairs:
+        //   XOR of {x[i] ⊕ x[i+s] for i in 0..n-s} ⊕ {y[i] ⊕ y[i+s] for i in 0..n-s} = (T+k) mod 2
+        // Each variable v appears in the XOR with multiplicity = (# pairs containing v) mod 2.
+        if solver.config.xor_propagation {
+            for s in 1..n {
+                let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
+                if target_raw < 0 || target_raw % 2 != 0 { continue; }
+                let target = (target_raw / 2) as usize;
+                let k = 2 * (n - s);
+                let parity = ((target + k) % 2) == 1;
+
+                // Build variable list: each var appears with multiplicity = # pairs it's in, mod 2
+                let mut in_xor = vec![false; 2 * n];
+                // X pairs: (i, i+s) for i in 0..n-s
+                for i in 0..(n - s) {
+                    in_xor[i] ^= true;
+                    in_xor[i + s] ^= true;
+                }
+                // Y pairs: (n+i, n+i+s) for i in 0..n-s
+                for i in 0..(n - s) {
+                    in_xor[n + i] ^= true;
+                    in_xor[n + i + s] ^= true;
+                }
+                let vars: Vec<i32> = in_xor.iter().enumerate()
+                    .filter(|&(_, &v)| v)
+                    .map(|(i, _)| (i + 1) as i32)  // 1-based
+                    .collect();
+                if !vars.is_empty() {
+                    solver.add_xor(&vars, parity);
+                }
+            }
+        }
+
         match solver.solve() {
             Some(true) => {
                 let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
@@ -3452,6 +3486,8 @@ fn parse_args() -> SearchConfig {
             cfg.sat_config.probing = true;
         } else if arg == "--rephasing" {
             cfg.sat_config.rephasing = true;
+        } else if arg == "--xor-propagation" {
+            cfg.sat_config.xor_propagation = true;
         } else if arg == "--phase-a" || arg == "--phase-b" {
             cfg.phase_only = Some(arg[2..].to_string());
         } else if let Some(v) = arg.strip_prefix("--tuple=") {

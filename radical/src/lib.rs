@@ -59,6 +59,18 @@ struct PbConstraint {
     bound: u32,
 }
 
+/// An XOR (GF(2)) constraint: XOR of variables = parity.
+/// Propagation: when exactly one variable is unassigned, force it
+/// to satisfy the parity. Incremental: track count of unknowns and
+/// running XOR of assigned values.
+#[derive(Clone, Debug)]
+struct XorConstraint {
+    vars: Vec<usize>,     // 0-based variable indices
+    parity: bool,         // RHS: XOR of all vars must equal this
+    num_unknown: u32,     // count of currently-unassigned vars
+    assigned_xor: bool,   // XOR of assigned variable values (true = 1)
+}
+
 /// A quadratic pseudo-boolean constraint with exact target:
 ///   sum(coeffs[i] * lits_a[i] * lits_b[i]) = target
 /// Each term contributes coeffs[i] iff both lits_a[i] and lits_b[i] are true.
@@ -154,6 +166,7 @@ enum Reason {
     Clause(u32),  // index into clause database
     Pb(u32),      // index into pb_constraints
     QuadPb(u32),  // index into quad_pb_constraints; bit 31 = is_upper flag
+    Xor(u32),     // index into xor_constraints
 }
 
 /// Trail entry: records an assignment.
@@ -175,6 +188,8 @@ pub struct SolverConfig {
     pub probing: bool,
     /// Periodically reset phase saving (rephasing).
     pub rephasing: bool,
+    /// Enable GF(2) XOR propagation during BCP.
+    pub xor_propagation: bool,
 }
 
 impl Default for SolverConfig {
@@ -183,6 +198,7 @@ impl Default for SolverConfig {
             ema_restarts: false,
             probing: false,
             rephasing: false,
+            xor_propagation: false,
         }
     }
 }
@@ -234,6 +250,10 @@ pub struct Solver {
     minimize_stack: Vec<usize>,        // stack for lit_removable()
     minimize_visited: Vec<bool>,       // visited[] for lit_removable()
     minimize_levels: Vec<bool>,        // levels_in_learnt for minimize_learnt()
+
+    // XOR (GF(2)) constraints
+    xor_constraints: Vec<XorConstraint>,
+    xor_var_watches: Vec<Vec<u32>>,  // xor_var_watches[var] = list of XOR constraint indices
 
     // Propagation queue
     prop_head: usize, // next trail entry to propagate
@@ -310,6 +330,8 @@ impl Solver {
             quad_pb_var_watches: Vec::new(),
             quad_pb_var_terms: Vec::new(),
             quad_pb_seen_buf: Vec::new(),
+            xor_constraints: Vec::new(),
+            xor_var_watches: Vec::new(),
             analyze_seen: Vec::new(),
             analyze_reason_buf: Vec::new(),
             analyze_reason_buf2: Vec::new(),
@@ -356,6 +378,7 @@ impl Solver {
             self.pb_watches.push(Vec::new()); // negative literal PB
             self.quad_pb_var_watches.push(Vec::new());
             self.quad_pb_var_terms.push(Vec::new());
+            self.xor_var_watches.push(Vec::new());
             self.heap_pos.push(self.heap.len());
             self.heap.push(idx);
         }
@@ -498,6 +521,70 @@ impl Solver {
         // Initial propagation
         if self.propagate_quad_pb(qi).is_some() {
             self.ok = false;
+        }
+    }
+
+    /// Add an XOR constraint: XOR of the given variables (1-based) = parity.
+    /// The constraint propagates during BCP: when exactly one variable remains
+    /// unassigned, it is forced to satisfy the parity.
+    pub fn add_xor(&mut self, vars_1based: &[i32], parity: bool) {
+        if !self.ok { return; }
+        let mut vars: Vec<usize> = Vec::with_capacity(vars_1based.len());
+        for &v in vars_1based {
+            let uv = v.unsigned_abs() as usize;
+            assert!(uv > 0);
+            self.ensure_var(uv);
+            vars.push(uv - 1); // convert to 0-based
+        }
+        // Adjust parity for negated literals
+        let mut p = parity;
+        for &v in vars_1based {
+            if v < 0 { p = !p; }
+        }
+
+        let xi = self.xor_constraints.len() as u32;
+        for &v in &vars {
+            self.xor_var_watches[v].push(xi);
+        }
+
+        // Check for already-assigned variables
+        let mut num_unknown = vars.len() as u32;
+        let mut assigned_xor = false;
+        for &v in &vars {
+            if self.assigns[v] != LBool::Undef {
+                num_unknown -= 1;
+                if self.assigns[v] == LBool::True {
+                    assigned_xor ^= true;
+                }
+            }
+        }
+
+        self.xor_constraints.push(XorConstraint {
+            vars,
+            parity: p,
+            num_unknown,
+            assigned_xor,
+        });
+
+        // Immediate propagation check
+        if num_unknown == 0 {
+            if assigned_xor != p {
+                self.ok = false;
+            }
+        } else if num_unknown == 1 {
+            // Find the one unassigned variable and force it
+            let xc = &self.xor_constraints[xi as usize];
+            for &v in &xc.vars {
+                if self.assigns[v] == LBool::Undef {
+                    let need_true = xc.assigned_xor ^ xc.parity;
+                    let lit = if need_true { (v + 1) as Lit } else { -((v + 1) as Lit) };
+                    self.enqueue(lit, Reason::Xor(xi));
+                    if self.propagate().is_some() {
+                        self.ok = false;
+                    }
+                    break;
+                }
+            }
         }
     }
 
@@ -818,6 +905,45 @@ impl Solver {
                     let qi = self.quad_pb_var_watches[v][idx];
                     if let Some(conflict_reason) = self.propagate_quad_pb(qi) {
                         return Some(conflict_reason);
+                    }
+                }
+            }
+            // XOR (GF(2)) propagation
+            if !self.xor_constraints.is_empty() {
+                let v = var_of(lit);
+                let val = self.assigns[v] == LBool::True;
+                for idx in 0..self.xor_var_watches[v].len() {
+                    let xi = self.xor_var_watches[v][idx];
+                    let xc = &mut self.xor_constraints[xi as usize];
+                    xc.num_unknown -= 1;
+                    xc.assigned_xor ^= val;
+                    if xc.num_unknown == 0 {
+                        // All assigned: check parity
+                        if xc.assigned_xor != xc.parity {
+                            return Some(Reason::Xor(xi));
+                        }
+                    } else if xc.num_unknown == 1 {
+                        // One unknown left: force it
+                        let need_true = xc.assigned_xor ^ xc.parity;
+                        // Find the unassigned var
+                        let mut forced_var = 0;
+                        for &xv in &xc.vars {
+                            if self.assigns[xv] == LBool::Undef {
+                                forced_var = xv;
+                                break;
+                            }
+                        }
+                        let forced_lit = if need_true {
+                            (forced_var + 1) as Lit
+                        } else {
+                            -((forced_var + 1) as Lit)
+                        };
+                        if self.lit_value(forced_lit) == LBool::False {
+                            return Some(Reason::Xor(xi));
+                        }
+                        if self.lit_value(forced_lit) == LBool::Undef {
+                            self.enqueue(forced_lit, Reason::Xor(xi));
+                        }
                     }
                 }
             }
@@ -1221,6 +1347,37 @@ impl Solver {
                     }
                     self.analyze_reason_buf = buf;
                 }
+                Reason::Xor(xi) => {
+                    // XOR reason: all assigned variables in the constraint
+                    // form the reason clause. Each assigned var contributes
+                    // its negated literal (it was assigned, forcing the propagation).
+                    let mut buf = std::mem::take(&mut self.analyze_reason_buf);
+                    buf.clear();
+                    let xc = &self.xor_constraints[xi as usize];
+                    for &v in &xc.vars {
+                        if self.assigns[v] == LBool::Undef { continue; }
+                        let lit_v = (v + 1) as Lit;
+                        let neg_lit = if self.assigns[v] == LBool::True { -lit_v } else { lit_v };
+                        buf.push(neg_lit);
+                    }
+                    // Also include the propagated literal itself (if not conflict)
+                    if p != 0 { buf.push(p); }
+                    for idx in 0..buf.len() {
+                        let lit = buf[idx];
+                        if lit == p { continue; }
+                        let v = var_of(lit);
+                        if self.analyze_seen[v] { continue; }
+                        self.analyze_seen[v] = true;
+                        self.bump_activity(v);
+                        if self.level[v] == self.decision_level() {
+                            counter += 1;
+                        } else if self.level[v] > 0 {
+                            learnt.push(lit);
+                            bt_level = bt_level.max(self.level[v]);
+                        }
+                    }
+                    self.analyze_reason_buf = buf;
+                }
                 Reason::Decision => { unreachable!(); }
             }
 
@@ -1264,7 +1421,7 @@ impl Solver {
             let lit = learnt[i];
             let v = var_of(lit);
             match self.reason[v] {
-                Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) => {
+                Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) | Reason::Xor(_) => {
                     if self.lit_removable(v) { continue; }
                 }
                 Reason::Decision => {}
@@ -1346,6 +1503,23 @@ impl Solver {
                     self.analyze_reason_buf2 = buf2;
                     if fail { return false; }
                 }
+                Reason::Xor(xi) => {
+                    let xc = &self.xor_constraints[xi as usize];
+                    for vi in 0..xc.vars.len() {
+                        let u = xc.vars[vi];
+                        if u == cur || self.minimize_visited[u] { continue; }
+                        if self.assigns[u] == LBool::Undef { continue; }
+                        self.minimize_visited[u] = true;
+                        if self.level[u] == 0 { continue; }
+                        if self.analyze_seen[u] { continue; }
+                        let lv = self.level[u] as usize;
+                        if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { return false; }
+                        match self.reason[u] {
+                            Reason::Decision => return false,
+                            _ => { self.minimize_stack.push(u); }
+                        }
+                    }
+                }
                 Reason::Decision => return false,
             }
         }
@@ -1367,6 +1541,16 @@ impl Solver {
                 for idx in 0..self.quad_pb_var_watches[v].len() {
                     let qi = self.quad_pb_var_watches[v][idx];
                     self.quad_pb_constraints[qi as usize].stale = true;
+                }
+            }
+            // Undo XOR constraint updates
+            if !self.xor_constraints.is_empty() {
+                let val = entry.lit > 0;
+                for idx in 0..self.xor_var_watches[v].len() {
+                    let xi = self.xor_var_watches[v][idx];
+                    let xc = &mut self.xor_constraints[xi as usize];
+                    xc.num_unknown += 1;
+                    xc.assigned_xor ^= val;
                 }
             }
             self.heap_insert(v);
