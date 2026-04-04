@@ -408,3 +408,67 @@ PB constraints encode `sum(x_i) = k`. With 44 vars and unit coefficients, the at
 ### R10. Reduce recompute cost by sorting terms by variable index
 
 In `recompute_quad_pb`, the inner loop loads `assigns[var_a()]` and `assigns[var_b()]` for each term. With ~80 terms accessing ~44 variables, many accesses hit the same cache line. Sorting terms by `(var_a, var_b)` at constraint creation time maximizes sequential access patterns and reduces L1 misses.
+
+## Ideas from CryptoMiniSat and other advanced SAT solvers (credit: Claude, April 2026)
+
+These target the SAT solver (radical), which dominates runtime at n >= 22. Sourced from CryptoMiniSat, CaDiCaL, Kissat, Lingeling, and MapleSAT.
+
+### CMS1. Gauss-Jordan elimination for XOR propagation (CryptoMiniSat)
+
+CryptoMiniSat's signature feature: full GF(2) Gaussian elimination interleaved with BCP. Our XOR constraints currently only propagate when `num_unknown == 1` (unit propagation). GJ maintains an echeloned GF(2) matrix and deduces implications when multiple XORs interact — e.g., if XOR₁ and XOR₂ share variables, their sum may force a variable that neither alone could. For Turyn sequences, the autocorrelation parity constraints produce heavily overlapping XOR systems.
+
+**Implementation plan:** In `propagate()`, after BCP, run a GJ elimination pass on the XOR constraint matrix. Maintain the matrix in row-echelon form incrementally (add/remove rows on assign/backtrack). When a row reduces to a single variable, enqueue it as a unit propagation. Expected high impact due to dense, interdependent XOR structure.
+
+### CMS2. Vivification / clause strengthening (CaDiCaL / Kissat)
+
+Take an existing clause, tentatively assume each literal is false in order, and propagate. If a conflict arises before exhausting the clause, the clause can be shortened. Unlike self-subsumption (tried, had correctness issues with watch invariants), vivification works on a temporary propagation that gets fully undone — no watch list corruption risk. Apply periodically to learnt clauses during restarts.
+
+**Implementation plan:** After each restart, pick the top N learnt clauses by LBD. For each clause, save trail state, assume negations of literals left-to-right, propagate. If conflict at literal k, shorten clause to first k literals. Restore trail. Our glue clauses (LBD ≤ 3) are kept forever — vivifying them to be tighter compounds their value.
+
+### CMS3. Equivalent literal substitution via SCC (Lingeling / CryptoMiniSat)
+
+Build the binary implication graph from 2-literal clauses and implications derived from PB/XOR constraints. Run Tarjan's SCC to find equivalent literal pairs (if `a → b` and `b → a`, they're equivalent). Replace one with the other throughout the formula. Shrinks variable count and simplifies all constraints.
+
+**Implementation plan:** At solver construction (or periodically), extract binary implications from watch lists and XOR/PB constraints. Run Tarjan SCC. For each equivalence class, pick a representative and substitute throughout all clause, PB, and quad PB data structures. The autocorrelation structure likely creates equivalences, especially in the XOR system.
+
+### CMS4. Bounded variable elimination (BVE) as inprocessing (MiniSat / CaDiCaL)
+
+Resolve out variables that don't increase clause count: for variable x, compute all resolvents of clauses containing x with clauses containing ¬x. If the resolvent set is no larger than the original, eliminate x. Apply during preprocessing and periodically during search.
+
+**Implementation plan:** Before first `solve()`, scan for variables appearing in few clauses. For each candidate, compute resolvents. If resolvent count ≤ original clause count, apply elimination: remove old clauses, add resolvents, mark variable as eliminated. Especially effective for auxiliary variables from sequential counter / totalizer encodings. Note: with quad PB encoding we have very few clauses, so focus on any remaining CNF clauses (symmetry breaking, learnt).
+
+### CMS5. Warm-start learnt clause and phase transfer across SAT calls
+
+We solve many SAT instances across different Z/W pairs, each time starting mostly fresh. Keep a pool of high-quality learnt clauses (low LBD) and saved phases from previous solves, and seed new instances with them. The structural similarity between Z/W pairs means clauses about X/Y variable interactions are highly reusable.
+
+**Implementation plan:** After each `solve_with_assumptions()` call, extract learnt clauses with LBD ≤ 2 that don't mention assumption variables. Store in a shared pool (cap at ~100 clauses). Before the next solve, inject pool clauses into the solver. Also save the phase vector from SAT results and use as initial phase for the next call. More aggressive than current assumptions-based incremental solving — transfers learned knowledge across structurally similar instances.
+
+### CMS6. Local search integration / phase advising (CryptoMiniSat 5.x / Kissat)
+
+Use our existing simulated annealing engine as a phase advisor: when the CDCL solver restarts, run a short burst of local search (a few thousand flips) on the current partial assignment to find a good assignment, then import that as the saved phase vector. Combines completeness of CDCL with local search's ability to find good regions quickly.
+
+**Implementation plan:** On every Nth restart (e.g., every 4th), extract current partial assignment as a starting point for SA. Run ~5000 flips targeting the X/Y autocorrelation defect. Import the resulting assignment as the phase[] vector. The SA engine already achieves 41M flips/sec, so 5000 flips costs ~0.1ms. Key question: whether the SA-guided phases actually lead to better CDCL decisions or just add overhead.
+
+### CMS7. Lucky phases (Kissat)
+
+Before starting the main CDCL search, try a handful of "lucky" complete assignments: all-positive, all-negative, Jeroslow-Wang heuristic, and a few random ones. Just propagate each to completion — if any yields a solution or gets very far, win cheaply. For Turyn sequences, add domain-specific lucky phases: phases from previously found solutions at nearby n.
+
+**Implementation plan:** Before the main `solve_inner()` loop, try 4-8 candidate phase vectors. For each: set all variables according to the phase, propagate, check if consistent. If a conflict arises, record the depth reached. If any reaches a solution, return immediately. Cost: ~8 propagation passes, essentially free per SAT call. Over thousands of SAT calls, catching even 1-2% trivially saves meaningful time.
+
+### CMS8. Chronological backtracking (CaDiCaL / MapleSAT)
+
+Our solver always does non-chronological backjumping. The 2018 insight (Nadel & Ryvchin) is that sometimes backtracking just one level (chronological) is better — it avoids re-deriving implications already on the trail. Heuristic: if the backjump level is "close" to the current level (within some threshold), backtrack chronologically instead.
+
+**Implementation plan:** In `analyze()`, after computing the backjump level, check `current_level - backjump_level < threshold` (e.g., threshold=3). If so, backtrack to `current_level - 1` instead. Requires handling "re-propagated" literals (literals on the trail above the backjump level that are still valid). The mix of PB/QuadPB/XOR constraints likely creates many shallow conflicts where this helps.
+
+### CMS9. Clause distillation / inprocessing simplification (Lingeling / CaDiCaL)
+
+Periodically during search (e.g., every N restarts), pause and run a simplification pass: subsumption (remove clauses subsumed by others), self-subsuming resolution (strengthen clauses), and strengthening via unit propagation. Different from vivification — focuses on inter-clause relationships.
+
+**Implementation plan:** Every 100 restarts, at decision level 0: (1) sort all clauses by length, (2) for each clause, check if any shorter clause subsumes it (mark subsumed for deletion), (3) for pairs differing by one literal, check if self-subsuming resolution applies (strengthen the longer clause). With our clone+short-solve pattern, focus on the template's original clauses, not per-solve learnt clauses.
+
+### CMS10. Community-structure-aware branching (CryptoMiniSat / ModularSAT)
+
+Partition variables into "communities" based on clause co-occurrence. Bias branching to fully assign one community before moving to another. For Turyn sequences, the natural communities are X variables, Y variables, and lag groups (all variables involved in autocorrelation at lag k).
+
+**Implementation plan:** At solver construction, compute variable co-occurrence from quad PB constraints. Assign each variable to a community (X-sequence vs Y-sequence, or by lag interaction density). Add a community-awareness bonus to VSIDS: when picking the next decision variable, prefer variables in the same community as the most recent decision. This focuses the search and produces lower-LBD learnt clauses.
