@@ -15,7 +15,7 @@ struct Problem {
 
 impl Problem {
     fn new(n: usize) -> Self {
-        assert!(n >= 2, "n must be at least 2");
+        assert!(n == 0 || n >= 2, "n must be at least 2");
         Self { n }
     }
 
@@ -262,7 +262,7 @@ struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            problem: Problem::new(56),
+            problem: Problem::new(0),
             theta_samples: 128,
             max_z: 200_000,
             max_w: 200_000,
@@ -3285,11 +3285,80 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     SearchReport { stats, elapsed: run_start.elapsed(), found_solution }
 }
 
+fn print_help() {
+    eprintln!("turyn - Find Turyn-type sequences TT(n) for constructing Hadamard matrices");
+    eprintln!();
+    eprintln!("Searches for four {{+1,-1}} sequences (X,Y,Z,W) whose combined aperiodic");
+    eprintln!("autocorrelations vanish. Pipeline: Phase A enumerates sum-tuples, Phase B");
+    eprintln!("generates Z/W candidates with spectral filtering, Phase C solves X/Y via SAT.");
+    eprintln!();
+    eprintln!("USAGE: turyn --n=<N> [OPTIONS]");
+    eprintln!();
+    eprintln!("  --n=<N>                  Sequence length to search (required)");
+    eprintln!();
+    eprintln!("SEARCH MODE (pick one, default is hybrid):");
+    eprintln!("  (default)                Hybrid: enumerate Z/W, then solve X/Y with SAT");
+    eprintln!("                           Uses precomputed XY boundary table for n >= 14");
+    eprintln!("  --sat                    Pure SAT: encode all four sequences into one SAT problem");
+    eprintln!("  --stochastic             Stochastic local search over all four sequences");
+    eprintln!("  --stochastic-secs=<S>    Stochastic search, stop after S seconds (default: 10)");
+    eprintln!();
+    eprintln!("SEARCH TUNING:");
+    eprintln!("  --theta=<N>              Number of angle samples for spectral power filtering in");
+    eprintln!("                           Phase B; higher = tighter filter, slower (default: 128)");
+    eprintln!("  --max-z=<N>              Cap on Z candidates kept from Phase B (default: 200000)");
+    eprintln!("  --max-w=<N>              Cap on W candidates kept from Phase B (default: 200000)");
+    eprintln!("  --max-spectral=<F>       Upper bound on spectral pair power sum; lower values");
+    eprintln!("                           prune more aggressively (faster but may miss solutions)");
+    eprintln!("  --conflict-limit=<N>     Max CDCL conflicts per SAT call before giving up on");
+    eprintln!("                           that candidate; 0 = unlimited (default: 0)");
+    eprintln!();
+    eprintln!("SAT VARIANT FLAGS:");
+    eprintln!("  --z-sat, --xyz-sat       Solve Z via SAT instead of enumeration");
+    eprintln!("  --w-sat                  Solve W via SAT instead of enumeration");
+    eprintln!();
+    eprintln!("XY BOUNDARY TABLE:");
+    eprintln!("  --xy-table=<PATH>        Path to precomputed table (default: ./xy-table-k7.bin)");
+    eprintln!("                           Generate with: gen_table 7 xy-table-k7.bin");
+    eprintln!("  --no-table               Skip table lookup, solve X/Y from scratch (slower)");
+    eprintln!();
+    eprintln!("DEBUGGING / TESTING:");
+    eprintln!("  --verify=<X,Y,Z,W>      Check if four +/- sequences form a valid TT(n)");
+    eprintln!("                           Example: --verify=++--+-,+-+-++,+++-,+-+-");
+    eprintln!("  --test-zw=<Z,W>          Fix Z/W and only run Phase C (SAT X/Y) on them");
+    eprintln!("  --tuple=<x,y,z,w>        Restrict search to one sum-tuple (4 integers)");
+    eprintln!("  --phase-a                Print all sum-tuples for n, then exit");
+    eprintln!("  --phase-b                Run Phases A+B, print Z/W pairs, then exit");
+    eprintln!("  --dump-dimacs=<PATH>     Write the SAT encoding to a DIMACS CNF file");
+    eprintln!();
+    eprintln!("BENCHMARKING:");
+    eprintln!("  --benchmark              Run the search 5 times and report timing");
+    eprintln!("  --benchmark=<N>          Run the search N times and report timing");
+    eprintln!();
+    eprintln!("  -h, --help               Show this help message");
+    eprintln!();
+    eprintln!("EXAMPLES:");
+    eprintln!("  turyn --n=26                          # search for TT(26)");
+    eprintln!("  turyn --n=26 --no-table                # same, without precomputed table");
+    eprintln!("  turyn --n=16 --benchmark=3             # benchmark Phase B throughput");
+    eprintln!("  turyn --verify=++--+-,+-+-++,+++-,+-+- # verify a candidate solution");
+}
+
 fn parse_args() -> SearchConfig {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
+        print_help();
+        std::process::exit(0);
+    }
     let mut cfg = SearchConfig::default();
-    for arg in env::args().skip(1) {
+    for arg in &args {
         if let Some(v) = arg.strip_prefix("--n=") {
-            cfg.problem = Problem::new(v.parse().unwrap_or(cfg.problem.n));
+            if let Ok(n) = v.parse::<usize>() {
+                cfg.problem = Problem::new(n);
+            } else {
+                eprintln!("error: invalid value for --n: {}", v);
+                std::process::exit(1);
+            }
         } else if let Some(v) = arg.strip_prefix("--theta=") {
             cfg.theta_samples = v.parse().unwrap_or(cfg.theta_samples);
         } else if let Some(v) = arg.strip_prefix("--max-z=") {
@@ -3343,6 +3412,12 @@ fn parse_args() -> SearchConfig {
         } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
             cfg.dump_dimacs = Some(v.to_string());
         }
+    }
+    // --n is required unless --verify or --test-zw supply their own sequences
+    if cfg.problem.n == 0 && cfg.verify_seqs.is_none() && cfg.test_zw.is_none() {
+        eprintln!("error: --n=<N> is required\n");
+        print_help();
+        std::process::exit(1);
     }
     cfg
 }
