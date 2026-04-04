@@ -253,6 +253,8 @@ struct SearchConfig {
     no_table: bool,
     /// Dump DIMACS CNF to this path instead of solving.
     dump_dimacs: Option<String>,
+    /// SAT solver feature flags.
+    sat_config: radical::SolverConfig,
 }
 
 impl Default for SearchConfig {
@@ -278,6 +280,7 @@ impl Default for SearchConfig {
             xy_table_path: None,
             no_table: false,
             dump_dimacs: None,
+            sat_config: radical::SolverConfig::default(),
         }
     }
 }
@@ -1372,9 +1375,9 @@ impl SatSolver for cadical::Solver {
 }
 
 impl SatXYTemplate {
-    fn build(problem: Problem, tuple: SumTuple) -> Option<Self> {
+    fn build(problem: Problem, tuple: SumTuple, sat_config: &radical::SolverConfig) -> Option<Self> {
         #[cfg(not(feature = "cadical"))]
-        let mut solver: radical::Solver = Default::default();
+        let mut solver: radical::Solver = { let mut s = radical::Solver::new(); s.config = sat_config.clone(); s };
         #[cfg(feature = "cadical")]
         let mut solver: cadical::Solver = Default::default();
 
@@ -1460,7 +1463,7 @@ fn sat_solve_xy(
     candidate: &CandidateZW,
     _stats: &mut SearchStats,
 ) -> Option<(PackedSeq, PackedSeq)> {
-    let template = SatXYTemplate::build(problem, tuple)?;
+    let template = SatXYTemplate::build(problem, tuple, &radical::SolverConfig::default())?;
     template.solve_for(candidate)
 }
 
@@ -1551,6 +1554,7 @@ fn solve_work_item(
     item: &SatWorkItem,
     template_cache: &mut HashMap<(i32, i32, i32, i32), SatXYTemplate>,
     xy_table: Option<&XYBoundaryTable>,
+    sat_config: &radical::SolverConfig,
 ) -> Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)> {
     match (&item.x, &item.y, &item.z, &item.w) {
         // All blank: pure SAT for all four sequences
@@ -1569,7 +1573,7 @@ fn solve_work_item(
         (SeqInput::Blank, SeqInput::Blank, SeqInput::Fixed(z), SeqInput::Fixed(w)) => {
             let tuple_key = (item.tuple.x, item.tuple.y, item.tuple.z, item.tuple.w);
             let template = template_cache.entry(tuple_key).or_insert_with(|| {
-                SatXYTemplate::build(problem, item.tuple).unwrap()
+                SatXYTemplate::build(problem, item.tuple, sat_config).unwrap()
             });
             let zw_autocorr = item.zw_autocorr.clone().unwrap_or_else(|| {
                 compute_zw_autocorr(problem, z, w)
@@ -1597,6 +1601,7 @@ fn solve_work_item(
 fn run_parallel_search<P>(
     problem: Problem,
     xy_table: Option<Arc<XYBoundaryTable>>,
+    sat_config: radical::SolverConfig,
     produce: P,
     verbose: bool,
     mode_name: &str,
@@ -1637,6 +1642,7 @@ where
         let xy_table = xy_table.clone();
         let items_completed = Arc::clone(&items_completed);
         let phase_c_nanos_shared = Arc::clone(&phase_c_nanos_shared);
+        let sat_config = sat_config.clone();
 
         std::thread::spawn(move || {
             let mut template_cache: HashMap<(i32, i32, i32, i32), SatXYTemplate> = HashMap::new();
@@ -1646,7 +1652,7 @@ where
                 let c_start = Instant::now();
                 let solved = solve_work_item(
                     problem, &item, &mut template_cache,
-                    xy_table.as_deref(),
+                    xy_table.as_deref(), &sat_config,
                 );
                 phase_c_nanos_shared.fetch_add(
                     c_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
@@ -2027,7 +2033,7 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
     let theta = cfg.theta_samples;
     let max_w = cfg.max_w;
-    run_parallel_search(problem, None, move |tx, found| {
+    run_parallel_search(problem, None, cfg.sat_config.clone(), move |tx, found| {
         let spectral_w = SpectralFilter::new(problem.m(), theta);
         let mut stats = SearchStats::default();
         let individual_bound = problem.spectral_bound();
@@ -2074,7 +2080,7 @@ fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
     let theta = cfg.theta_samples;
     let max_z = cfg.max_z;
-    run_parallel_search(problem, None, move |tx, found| {
+    run_parallel_search(problem, None, cfg.sat_config.clone(), move |tx, found| {
         let spectral_z = SpectralFilter::new(problem.n, theta);
         let mut stats = SearchStats::default();
         let individual_bound = problem.spectral_bound();
@@ -2705,7 +2711,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
     if k == 0 {
         // Monolithic SAT: one big problem per tuple
-        run_parallel_search(problem, None, move |tx, found| {
+        run_parallel_search(problem, None, cfg.sat_config.clone(), move |tx, found| {
             let stats = SearchStats::default();
             for tuple in tuples {
                 if found.load(AtomicOrdering::Relaxed) { break; }
@@ -3294,7 +3300,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
 
     let cfg = cfg.clone();
-    run_parallel_search(problem, xy_table, move |tx, found| {
+    let sat_config = cfg.sat_config.clone();
+    run_parallel_search(problem, xy_table, sat_config, move |tx, found| {
         let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
         let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
         let mut stats = SearchStats::default();
@@ -3439,6 +3446,12 @@ fn parse_args() -> SearchConfig {
             }
         } else if let Some(v) = arg.strip_prefix("--conflict-limit=") {
             cfg.conflict_limit = v.parse().unwrap_or(0);
+        } else if arg == "--ema-restarts" {
+            cfg.sat_config.ema_restarts = true;
+        } else if arg == "--probing" {
+            cfg.sat_config.probing = true;
+        } else if arg == "--rephasing" {
+            cfg.sat_config.rephasing = true;
         } else if arg == "--phase-a" || arg == "--phase-b" {
             cfg.phase_only = Some(arg[2..].to_string());
         } else if let Some(v) = arg.strip_prefix("--tuple=") {
@@ -3506,7 +3519,7 @@ fn main() {
         print_solution("  Z/W", &PackedSeq::from_values(&[0]), &PackedSeq::from_values(&[0]), &z, &w);
         for tuple in &tuples {
             let start = Instant::now();
-            let Some(template) = SatXYTemplate::build(p, *tuple) else { continue };
+            let Some(template) = SatXYTemplate::build(p, *tuple, &radical::SolverConfig::default()) else { continue };
             if let Some((x, y)) = template.solve_for(&candidate) {
                 let ok = verify_tt(p, &x, &y, &z, &w);
                 print_solution(&format!("FOUND for tuple {} ({:.3?}, verified={})", tuple, start.elapsed(), ok), &x, &y, &z, &w);
@@ -3650,6 +3663,7 @@ mod tests {
             xy_table_path: None,
             no_table: true,
             dump_dimacs: None,
+            sat_config: radical::SolverConfig::default(),
         };
         let report = run_hybrid_search(&cfg, false);
         assert!(report.found_solution);
@@ -3781,7 +3795,7 @@ mod tests {
         let tuple = SumTuple { x: 0, y: 6, z: 8, w: 5 };
         let _stats = SearchStats::default();
         // Test 1: can the SAT solver find X/Y from scratch?
-        let template = SatXYTemplate::build(p, tuple).expect("template should build");
+        let template = SatXYTemplate::build(p, tuple, &radical::SolverConfig::default()).expect("template should build");
         assert!(template.is_feasible(&candidate), "known Z/W should be feasible");
 
         // Test 2: hardcode the known X/Y and check consistency
@@ -4367,7 +4381,7 @@ mod tests {
             zw[s] = 2 * nz + 2 * nw;
         }
         let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr: zw };
-        let template = SatXYTemplate::build(p, tuple);
+        let template = SatXYTemplate::build(p, tuple, &radical::SolverConfig::default());
         assert!(template.is_some(), "Template should build for n=2");
         let result = template.unwrap().solve_for(&candidate);
         assert!(result.is_some(), "SAT should find X,Y for TT(2)");

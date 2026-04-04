@@ -164,9 +164,34 @@ struct TrailEntry {
     reason: Reason,
 }
 
+/// Configuration flags for optional solver features.
+/// All default to `false` (disabled). Checked at non-hot decision points
+/// (once per conflict/restart), so branch prediction makes them zero-cost.
+#[derive(Clone, Debug)]
+pub struct SolverConfig {
+    /// Use glucose-style EMA restarts instead of Luby.
+    pub ema_restarts: bool,
+    /// Run failed literal probing before solve.
+    pub probing: bool,
+    /// Periodically reset phase saving (rephasing).
+    pub rephasing: bool,
+}
+
+impl Default for SolverConfig {
+    fn default() -> Self {
+        Self {
+            ema_restarts: false,
+            probing: false,
+            rephasing: false,
+        }
+    }
+}
+
 /// CDCL SAT Solver.
 #[derive(Clone)]
 pub struct Solver {
+    /// Feature flags (checked at non-hot decision points).
+    pub config: SolverConfig,
     // Variable state
     num_vars: usize,
     assigns: Vec<LBool>,    // indexed by var (0-based)
@@ -213,10 +238,22 @@ pub struct Solver {
     // Propagation queue
     prop_head: usize, // next trail entry to propagate
 
-    // Restart
+    // Restart (Luby)
     conflicts: u64,
     restart_limit: u64,
     luby_index: u32,
+
+    // Restart (EMA) — glucose-style adaptive restarts
+    ema_lbd_fast: f64,   // fast EMA of recent LBD (α ≈ 1/32)
+    ema_lbd_slow: f64,   // slow EMA of global LBD (α ≈ 1/4096)
+    ema_restart_block: u64, // conflicts since last restart (for blocking)
+    ema_trail_fast: f64, // fast EMA of trail size (for blocking)
+    ema_trail_slow: f64, // slow EMA of trail size
+
+    // Rephasing state
+    rephase_conflicts: u64, // next conflict count to trigger rephase
+    best_phase: Vec<bool>,  // best known phase assignment
+    best_phase_set: bool,   // whether best_phase has been populated
 
     // Limits
     conflict_limit: u64,  // 0 = no limit
@@ -255,6 +292,7 @@ impl Default for Solver {
 impl Solver {
     pub fn new() -> Self {
         Self {
+            config: SolverConfig::default(),
             num_vars: 0,
             assigns: Vec::new(),
             level: Vec::new(),
@@ -287,6 +325,14 @@ impl Solver {
             conflicts: 0,
             restart_limit: 100,
             luby_index: 0,
+            ema_lbd_fast: 0.0,
+            ema_lbd_slow: 0.0,
+            ema_restart_block: 0,
+            ema_trail_fast: 0.0,
+            ema_trail_slow: 0.0,
+            rephase_conflicts: 10000,
+            best_phase: Vec::new(),
+            best_phase_set: false,
             conflict_limit: 0,
             ok: true,
             skip_backtrack_quad_pb: false,
@@ -476,6 +522,15 @@ impl Solver {
         if self.minimize_visited.len() < self.num_vars {
             self.minimize_visited.resize(self.num_vars, false);
         }
+        if self.best_phase.len() < self.num_vars {
+            self.best_phase.resize(self.num_vars, false);
+        }
+
+        // Failed literal probing (runs once before first solve)
+        if self.config.probing && self.conflicts == 0 {
+            self.probe();
+            if !self.ok { return Some(false); }
+        }
 
         let assumption_level: u32 = if assumptions.is_empty() { 0 } else { 1 };
 
@@ -625,12 +680,42 @@ impl Solver {
                 self.add_learnt_clause(learnt_clause);
                 self.decay_activities();
 
+                // Update EMA stats (always, regardless of restart strategy)
+                let lbd = self.clause_meta.last().map(|m| m.lbd as f64).unwrap_or(1.0);
+                self.ema_lbd_fast += (lbd - self.ema_lbd_fast) / 32.0;
+                self.ema_lbd_slow += (lbd - self.ema_lbd_slow) / 4096.0;
+                let trail_sz = self.trail.len() as f64;
+                self.ema_trail_fast += (trail_sz - self.ema_trail_fast) / 32.0;
+                self.ema_trail_slow += (trail_sz - self.ema_trail_slow) / 4096.0;
+                self.ema_restart_block += 1;
+
                 // Restart check
-                if self.conflicts >= self.restart_limit {
-                    self.restart_limit += 100 * luby(self.luby_index);
-                    self.luby_index += 1;
+                let should_restart = if self.config.ema_restarts {
+                    // Glucose-style: restart when recent LBD quality is worse than global,
+                    // but block if trail is unusually long (making good progress).
+                    let lbd_trigger = self.conflicts > 100
+                        && self.ema_lbd_fast > 1.25 * self.ema_lbd_slow;
+                    let blocked = self.ema_restart_block < 50
+                        || self.ema_trail_fast > 1.4 * self.ema_trail_slow;
+                    lbd_trigger && !blocked
+                } else {
+                    // Luby restart schedule
+                    self.conflicts >= self.restart_limit
+                };
+                if should_restart {
+                    if !self.config.ema_restarts {
+                        self.restart_limit += 100 * luby(self.luby_index);
+                        self.luby_index += 1;
+                    }
+                    self.ema_restart_block = 0;
                     self.backtrack(base_level);
                     self.reduce_db();
+
+                    // Rephasing: periodically reset phases
+                    if self.config.rephasing && self.conflicts >= self.rephase_conflicts {
+                        self.rephase();
+                        self.rephase_conflicts = self.conflicts + 10000;
+                    }
                 }
             } else {
                 // No conflict
@@ -1474,6 +1559,54 @@ impl Solver {
         // Clean watch lists
         for wl in &mut self.watches {
             wl.retain(|&(ci, _)| !self.clause_meta[ci as usize].deleted);
+        }
+    }
+
+    /// Rephasing: alternate between resetting to best-known phase and random phases.
+    fn rephase(&mut self) {
+        if self.best_phase_set {
+            // Alternate: 50% best phase, 50% inverted
+            let invert = (self.rephase_conflicts / 10000) % 2 == 1;
+            for v in 0..self.num_vars {
+                self.phase[v] = if invert { !self.best_phase[v] } else { self.best_phase[v] };
+            }
+        }
+        // else: keep current phases (no best known yet)
+    }
+
+    /// Failed literal probing: for each unassigned literal, assume it true and propagate.
+    /// If conflict, the literal must be false — enqueue its negation at level 0.
+    pub fn probe(&mut self) {
+        if self.num_vars == 0 { return; }
+        self.backtrack(0);
+        let nv = self.num_vars;
+        let max_probes = nv.min(200); // limit to avoid excessive cost
+        // Probe most active variables first
+        let mut vars_by_activity: Vec<usize> = (0..nv).collect();
+        vars_by_activity.sort_by(|&a, &b|
+            self.activity[b].partial_cmp(&self.activity[a]).unwrap_or(std::cmp::Ordering::Equal));
+
+        for &v in vars_by_activity.iter().take(max_probes) {
+            if self.assigns[v] != LBool::Undef { continue; }
+            let lit = (v + 1) as Lit;
+            // Try positive
+            for sign in [lit, -lit] {
+                self.new_decision_level();
+                self.enqueue(sign, Reason::Decision);
+                let conflict = self.propagate().is_some();
+                self.backtrack(0);
+                if conflict {
+                    // sign leads to conflict, so negate(sign) is forced
+                    if self.assigns[v] == LBool::Undef {
+                        self.enqueue(-sign, Reason::Decision);
+                        if self.propagate().is_some() {
+                            self.ok = false;
+                            return;
+                        }
+                    }
+                    break; // no need to try the other polarity
+                }
+            }
         }
     }
 }
