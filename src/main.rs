@@ -2691,79 +2691,22 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         eprintln!("{} sum-tuples", tuples.len());
     }
 
-    // Try to load the boundary table for cube-and-conquer
-    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table-k7.bin".to_string());
-    let skip_table = cfg.no_table || problem.n < 14;
-    let xy_table: Option<Arc<XYBoundaryTable>> = if skip_table {
-        None
+    let n = problem.n;
+    let m = problem.m();
+    // Choose cubing depth: k positions from each end of each sequence.
+    // n >= 2k required. Larger k = more cubes but more precomputation.
+    // ZW signature precomputation is O(2^{4k}), so keep k modest.
+    let k = if cfg.no_table || n < 8 {
+        0 // no cubing, monolithic SAT
     } else {
-        XYBoundaryTable::load(&table_path).and_then(|t| {
-            if problem.n < 2 * t.k {
-                if verbose {
-                    eprintln!("Note: n={} < {} (2*k), running without table", problem.n, 2 * t.k);
-                }
-                None
-            } else {
-                Some(Arc::new(t))
-            }
-        })
+        let max_k = (n - 1) / 2; // leave at least 1 middle position
+        6usize.min(max_k)
     };
 
-    let table_for_producer = xy_table.clone();
-    run_parallel_search(problem, xy_table, move |tx, found| {
-        let stats = SearchStats::default();
-        if let Some(ref table) = table_for_producer {
-            // Table-based cube-and-conquer: enumerate boundary configs
-            let k = table.k;
-            let n = problem.n;
-            let m = problem.m();
-            let middle_n = n - 2 * k;
-            let middle_m = m - 2 * k;
-            let max_bnd_sum = (2 * k) as i32;
-            let zw_dim = 1u32 << (2 * k);
-
-            for tuple in &tuples {
-                if found.load(AtomicOrdering::Relaxed) { break; }
-                for z_bits in 0..zw_dim {
-                    if found.load(AtomicOrdering::Relaxed) { break; }
-                    let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - max_bnd_sum;
-                    let z_mid = tuple.z - z_bnd_sum;
-                    if z_mid.abs() > middle_n as i32 || (z_mid + middle_n as i32) % 2 != 0 { continue; }
-
-                    for w_bits in 0..zw_dim {
-                        if found.load(AtomicOrdering::Relaxed) { break; }
-                        let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
-                        let w_mid = tuple.w - w_bnd_sum;
-                        if w_mid.abs() > middle_m as i32 || (w_mid + middle_m as i32) % 2 != 0 { continue; }
-
-                        for x_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
-                            let x_mid = tuple.x - x_bnd_sum;
-                            if x_mid.abs() > middle_n as i32 || (x_mid + middle_n as i32) % 2 != 0 { continue; }
-
-                            for y_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
-                                let y_mid = tuple.y - y_bnd_sum;
-                                if y_mid.abs() > middle_n as i32 || (y_mid + middle_n as i32) % 2 != 0 { continue; }
-
-                                let xy_entries = table.get_xy_entries(z_bits, w_bits, x_bnd_sum, y_bnd_sum);
-                                for &(x_bits, y_bits) in xy_entries {
-                                    if found.load(AtomicOrdering::Relaxed) { break; }
-                                    let _ = tx.send(SatWorkItem {
-                                        tuple: *tuple,
-                                        x: SeqInput::Blank, y: SeqInput::Blank,
-                                        z: SeqInput::Blank, w: SeqInput::Blank,
-                                        zw_autocorr: None, priority: 0.0,
-                                        boundary: Some(BoundaryConfig {
-                                            k, x_bits, y_bits, z_bits, w_bits,
-                                        }),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            // Fallback: one monolithic SAT per tuple
+    if k == 0 {
+        // Monolithic SAT: one big problem per tuple
+        run_parallel_search(problem, None, move |tx, found| {
+            let stats = SearchStats::default();
             for tuple in tuples {
                 if found.load(AtomicOrdering::Relaxed) { break; }
                 let _ = tx.send(SatWorkItem {
@@ -2773,9 +2716,227 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                     boundary: None,
                 });
             }
+            stats
+        }, verbose, "pure SAT")
+    } else {
+        // On-the-fly boundary enumeration: compute exact-lag constraints directly
+        // and enumerate all valid 4-sequence boundary configs as SAT cubes.
+        //
+        // Build exact-lag bit pairs (same math as gen_table).
+        // For lag index j (0..k), the absolute lag is s = n-k+j.
+        // X/Y/Z (length n): pairs (i, k+i+j) for i = 0..k-j-1
+        // W (length n-1): pairs (i, k+i+j+1) for i = 0..k-j-2 (only when j < k-1)
+        struct ExactLag {
+            xy_pairs: Vec<(u32, u32)>,
+            z_pairs: Vec<(u32, u32)>,
+            w_pairs: Vec<(u32, u32)>,
         }
-        stats
-    }, verbose, "pure SAT")
+        let mut exact_lags: Vec<ExactLag> = Vec::new();
+        for j in 0..k {
+            let xy_pairs: Vec<(u32, u32)> = (0..k-j)
+                .map(|i| (i as u32, (k + i + j) as u32))
+                .collect();
+            let z_pairs = xy_pairs.clone();
+            let w_pairs: Vec<(u32, u32)> = if j < k - 1 {
+                (0..k-j-1).map(|i| (i as u32, (k + i + j + 1) as u32)).collect()
+            } else {
+                Vec::new()
+            };
+            exact_lags.push(ExactLag { xy_pairs, z_pairs, w_pairs });
+        }
+
+        let middle_n = n - 2 * k;
+        let middle_m = m - 2 * k;
+        let max_bnd_sum = (2 * k) as i32;
+
+        // Helper: compute boundary autocorrelation contribution for one bit pattern
+        let bnd_autocorr = |bits: u32, pairs: &[(u32, u32)]| -> i32 {
+            let mut val = 0i32;
+            for &(bi, bj) in pairs {
+                val += 1 - 2 * (((bits >> bi) ^ (bits >> bj)) & 1) as i32;
+            }
+            val
+        };
+
+        // X/Y symmetry breaking: x[0] = +1 (bit 0 set)
+        // So x_bits always has bit 0 set (we only enumerate x_bits with bit 0 = 1).
+        let x_configs = 1u32 << (2 * k - 1); // x[0] fixed, 2k-1 free bits
+        let y_configs = 1u32 << (2 * k);      // all 2k bits free
+        let z_configs = 1u32 << (2 * k);      // all 2k bits free
+        let w_configs = 1u32 << (2 * k);      // all 2k bits free
+
+        if verbose {
+            eprintln!("On-the-fly cubing k={}: enumerating X({})*Y({})*Z({})*W({}) boundary configs",
+                k, x_configs, y_configs, z_configs, w_configs);
+        }
+
+        // Precompute X/Y signatures: group (x_bits, y_bits) by their combined
+        // autocorrelation signature AND boundary sum pair.
+        // We only store the XY side; ZW is iterated on the fly.
+        if verbose {
+            eprintln!("Precomputing X/Y boundary signatures...");
+        }
+        // Key: (autocorr_sig, x_bnd_sum, y_bnd_sum) → list of (x_bits, y_bits)
+        let mut xy_by_sig_sum: HashMap<(Vec<i16>, i32, i32), Vec<(u32, u32)>> = HashMap::new();
+        for xr in 0..x_configs {
+            let x_bits = (xr << 1) | 1; // bit 0 = 1 (x[0] = +1)
+            let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
+            for y_bits in 0..y_configs {
+                let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
+                let sig: Vec<i16> = exact_lags.iter().map(|el| {
+                    let x_val = bnd_autocorr(x_bits, &el.xy_pairs);
+                    let y_val = bnd_autocorr(y_bits, &el.xy_pairs);
+                    (x_val + y_val) as i16
+                }).collect();
+                xy_by_sig_sum.entry((sig, x_bnd_sum, y_bnd_sum)).or_default().push((x_bits, y_bits));
+            }
+        }
+        if verbose {
+            let total_xy: usize = xy_by_sig_sum.values().map(|v| v.len()).sum();
+            eprintln!("  {} XY buckets, {} total entries", xy_by_sig_sum.len(), total_xy);
+        }
+
+        // Parallel solve: each worker iterates a slice of z_bits, computes matching
+        // configs on the fly, and solves them immediately. No pre-enumeration needed.
+        let run_start = Instant::now();
+        let workers = std::thread::available_parallelism()
+            .map(|w| w.get()).unwrap_or(1).max(1);
+        if verbose {
+            eprintln!("TT({}): SAT cubed k={}, {} threads",
+                n, k, workers);
+        }
+        let found = Arc::new(AtomicBool::new(false));
+        let items_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let z_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let xy_by_sig_sum = Arc::new(xy_by_sig_sum);
+
+        // Pre-build SAT encoding templates (one per tuple, clone per config)
+        let templates: Vec<(SatEncoder, radical::Solver)> = tuples.iter()
+            .map(|&tuple| sat_encode(problem, tuple))
+            .collect();
+        let templates = Arc::new(templates);
+        let tuples = Arc::new(tuples);
+
+        let mut handles = Vec::new();
+        for _tid in 0..workers {
+            let found = Arc::clone(&found);
+            let items_done = Arc::clone(&items_done);
+            let z_idx = Arc::clone(&z_idx);
+            let xy_by_sig_sum = Arc::clone(&xy_by_sig_sum);
+            let templates = Arc::clone(&templates);
+            let tuples = Arc::clone(&tuples);
+            let exact_lags_clone: Vec<(Vec<(u32, u32)>, Vec<(u32, u32)>, Vec<(u32, u32)>)> = exact_lags.iter()
+                .map(|el| (el.xy_pairs.clone(), el.z_pairs.clone(), el.w_pairs.clone()))
+                .collect();
+
+            handles.push(std::thread::spawn(move || {
+                let bnd_autocorr = |bits: u32, pairs: &[(u32, u32)]| -> i32 {
+                    let mut val = 0i32;
+                    for &(bi, bj) in pairs {
+                        val += 1 - 2 * (((bits >> bi) ^ (bits >> bj)) & 1) as i32;
+                    }
+                    val
+                };
+
+                loop {
+                    if found.load(AtomicOrdering::Relaxed) { break; }
+                    let z_bits = z_idx.fetch_add(1, AtomicOrdering::Relaxed) as u32;
+                    if z_bits >= z_configs { break; }
+
+                    let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - max_bnd_sum;
+
+                    for w_bits in 0..w_configs {
+                        if found.load(AtomicOrdering::Relaxed) { break; }
+                        let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
+
+                        let req_sig: Vec<i16> = exact_lags_clone.iter().map(|(_, z_pairs, w_pairs)| {
+                            let z_val = bnd_autocorr(z_bits, z_pairs);
+                            let w_val = bnd_autocorr(w_bits, w_pairs);
+                            -(2 * z_val + 2 * w_val) as i16
+                        }).collect();
+
+                        for (ti, tuple) in tuples.iter().enumerate() {
+                            let z_mid = tuple.z - z_bnd_sum;
+                            if z_mid.abs() > middle_n as i32 || (z_mid + middle_n as i32) % 2 != 0 { continue; }
+                            let w_mid = tuple.w - w_bnd_sum;
+                            if w_mid.abs() > middle_m as i32 || (w_mid + middle_m as i32) % 2 != 0 { continue; }
+
+                            for x_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
+                                let x_mid = tuple.x - x_bnd_sum;
+                                if x_mid.abs() > middle_n as i32 || (x_mid + middle_n as i32) % 2 != 0 { continue; }
+                                for y_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
+                                    let y_mid = tuple.y - y_bnd_sum;
+                                    if y_mid.abs() > middle_n as i32 || (y_mid + middle_n as i32) % 2 != 0 { continue; }
+
+                                    let key = (req_sig.clone(), x_bnd_sum, y_bnd_sum);
+                                    if let Some(xy_list) = xy_by_sig_sum.get(&key) {
+                                        for &(x_bits, y_bits) in xy_list {
+                                            if found.load(AtomicOrdering::Relaxed) { break; }
+
+                                            let (ref enc, ref template_solver) = templates[ti];
+                                            let mut solver = template_solver.clone();
+
+                                            for i in 0..k {
+                                                solver.add_clause([if (x_bits >> i) & 1 == 1 { enc.x_var(i) } else { -enc.x_var(i) }]);
+                                                solver.add_clause([if (x_bits >> (k + i)) & 1 == 1 { enc.x_var(n - k + i) } else { -enc.x_var(n - k + i) }]);
+                                                solver.add_clause([if (y_bits >> i) & 1 == 1 { enc.y_var(i) } else { -enc.y_var(i) }]);
+                                                solver.add_clause([if (y_bits >> (k + i)) & 1 == 1 { enc.y_var(n - k + i) } else { -enc.y_var(n - k + i) }]);
+                                                solver.add_clause([if (z_bits >> i) & 1 == 1 { enc.z_var(i) } else { -enc.z_var(i) }]);
+                                                solver.add_clause([if (z_bits >> (k + i)) & 1 == 1 { enc.z_var(n - k + i) } else { -enc.z_var(n - k + i) }]);
+                                                solver.add_clause([if (w_bits >> i) & 1 == 1 { enc.w_var(i) } else { -enc.w_var(i) }]);
+                                                solver.add_clause([if (w_bits >> (k + i)) & 1 == 1 { enc.w_var(m - k + i) } else { -enc.w_var(m - k + i) }]);
+                                            }
+
+                                            if let Some(true) = solver.solve() {
+                                                let x = PackedSeq::from_values(&(0..n).map(|i|
+                                                    if solver.value(enc.x_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                                                let y = PackedSeq::from_values(&(0..n).map(|i|
+                                                    if solver.value(enc.y_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                                                let z = PackedSeq::from_values(&(0..n).map(|i|
+                                                    if solver.value(enc.z_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                                                let w = PackedSeq::from_values(&(0..m).map(|i|
+                                                    if solver.value(enc.w_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+
+                                                if verify_tt(problem, &x, &y, &z, &w) {
+                                                    found.store(true, AtomicOrdering::Relaxed);
+                                                    print_solution("TT SOLUTION", &x, &y, &z, &w);
+                                                }
+                                            }
+                                            items_done.fetch_add(1, AtomicOrdering::Relaxed);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+
+        // Progress reporting
+        let total_z = z_configs as usize;
+        while !found.load(AtomicOrdering::Relaxed)
+            && z_idx.load(AtomicOrdering::Relaxed) < total_z
+        {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            let done = items_done.load(AtomicOrdering::Relaxed);
+            let z_done = z_idx.load(AtomicOrdering::Relaxed).min(total_z);
+            let elapsed = run_start.elapsed().as_secs_f64();
+            let rate = done as f64 / elapsed;
+            if verbose {
+                eprintln!("[{:.0}s] SAT cubed k={} | z {}/{} | solved {} | {:.1} configs/s",
+                    elapsed, k, z_done, total_z, done, rate);
+            }
+        }
+
+        for h in handles { let _ = h.join(); }
+
+        SearchReport {
+            stats: SearchStats::default(),
+            elapsed: run_start.elapsed(),
+            found_solution: found.load(AtomicOrdering::Relaxed),
+        }
+    }
 }
 
 // ==================== Prefix/suffix table for fast X/Y completion ====================
