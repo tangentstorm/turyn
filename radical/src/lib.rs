@@ -59,6 +59,18 @@ struct PbConstraint {
     bound: u32,
 }
 
+/// An XOR (GF(2)) constraint: XOR of variables = parity.
+/// Propagation: when exactly one variable is unassigned, force it
+/// to satisfy the parity. Incremental: track count of unknowns and
+/// running XOR of assigned values.
+#[derive(Clone, Debug)]
+struct XorConstraint {
+    vars: Vec<usize>,     // 0-based variable indices
+    parity: bool,         // RHS: XOR of all vars must equal this
+    num_unknown: u32,     // count of currently-unassigned vars
+    assigned_xor: bool,   // XOR of assigned variable values (true = 1)
+}
+
 /// A quadratic pseudo-boolean constraint with exact target:
 ///   sum(coeffs[i] * lits_a[i] * lits_b[i]) = target
 /// Each term contributes coeffs[i] iff both lits_a[i] and lits_b[i] are true.
@@ -154,6 +166,7 @@ enum Reason {
     Clause(u32),  // index into clause database
     Pb(u32),      // index into pb_constraints
     QuadPb(u32),  // index into quad_pb_constraints; bit 31 = is_upper flag
+    Xor(u32),     // index into xor_constraints
 }
 
 /// Trail entry: records an assignment.
@@ -164,9 +177,37 @@ struct TrailEntry {
     reason: Reason,
 }
 
+/// Configuration flags for optional solver features.
+/// All default to `false` (disabled). Checked at non-hot decision points
+/// (once per conflict/restart), so branch prediction makes them zero-cost.
+#[derive(Clone, Debug)]
+pub struct SolverConfig {
+    /// Use glucose-style EMA restarts instead of Luby.
+    pub ema_restarts: bool,
+    /// Run failed literal probing before solve.
+    pub probing: bool,
+    /// Periodically reset phase saving (rephasing).
+    pub rephasing: bool,
+    /// Enable GF(2) XOR propagation during BCP.
+    pub xor_propagation: bool,
+}
+
+impl Default for SolverConfig {
+    fn default() -> Self {
+        Self {
+            ema_restarts: false,
+            probing: false,
+            rephasing: false,
+            xor_propagation: true,
+        }
+    }
+}
+
 /// CDCL SAT Solver.
 #[derive(Clone)]
 pub struct Solver {
+    /// Feature flags (checked at non-hot decision points).
+    pub config: SolverConfig,
     // Variable state
     num_vars: usize,
     assigns: Vec<LBool>,    // indexed by var (0-based)
@@ -210,13 +251,29 @@ pub struct Solver {
     minimize_visited: Vec<bool>,       // visited[] for lit_removable()
     minimize_levels: Vec<bool>,        // levels_in_learnt for minimize_learnt()
 
+    // XOR (GF(2)) constraints
+    xor_constraints: Vec<XorConstraint>,
+    xor_var_watches: Vec<Vec<u32>>,  // xor_var_watches[var] = list of XOR constraint indices
+
     // Propagation queue
     prop_head: usize, // next trail entry to propagate
 
-    // Restart
+    // Restart (Luby)
     conflicts: u64,
     restart_limit: u64,
     luby_index: u32,
+
+    // Restart (EMA) — glucose-style adaptive restarts
+    ema_lbd_fast: f64,   // fast EMA of recent LBD (α ≈ 1/32)
+    ema_lbd_slow: f64,   // slow EMA of global LBD (α ≈ 1/4096)
+    ema_restart_block: u64, // conflicts since last restart (for blocking)
+    ema_trail_fast: f64, // fast EMA of trail size (for blocking)
+    ema_trail_slow: f64, // slow EMA of trail size
+
+    // Rephasing state
+    rephase_conflicts: u64, // next conflict count to trigger rephase
+    best_phase: Vec<bool>,  // best known phase assignment
+    best_phase_set: bool,   // whether best_phase has been populated
 
     // Limits
     conflict_limit: u64,  // 0 = no limit
@@ -255,6 +312,7 @@ impl Default for Solver {
 impl Solver {
     pub fn new() -> Self {
         Self {
+            config: SolverConfig::default(),
             num_vars: 0,
             assigns: Vec::new(),
             level: Vec::new(),
@@ -272,6 +330,8 @@ impl Solver {
             quad_pb_var_watches: Vec::new(),
             quad_pb_var_terms: Vec::new(),
             quad_pb_seen_buf: Vec::new(),
+            xor_constraints: Vec::new(),
+            xor_var_watches: Vec::new(),
             analyze_seen: Vec::new(),
             analyze_reason_buf: Vec::new(),
             analyze_reason_buf2: Vec::new(),
@@ -287,6 +347,14 @@ impl Solver {
             conflicts: 0,
             restart_limit: 100,
             luby_index: 0,
+            ema_lbd_fast: 0.0,
+            ema_lbd_slow: 0.0,
+            ema_restart_block: 0,
+            ema_trail_fast: 0.0,
+            ema_trail_slow: 0.0,
+            rephase_conflicts: 10000,
+            best_phase: Vec::new(),
+            best_phase_set: false,
             conflict_limit: 0,
             ok: true,
             skip_backtrack_quad_pb: false,
@@ -310,6 +378,7 @@ impl Solver {
             self.pb_watches.push(Vec::new()); // negative literal PB
             self.quad_pb_var_watches.push(Vec::new());
             self.quad_pb_var_terms.push(Vec::new());
+            self.xor_var_watches.push(Vec::new());
             self.heap_pos.push(self.heap.len());
             self.heap.push(idx);
         }
@@ -455,6 +524,72 @@ impl Solver {
         }
     }
 
+    /// Add an XOR constraint: XOR of the given variables (1-based) = parity.
+    /// The constraint propagates during BCP: when exactly one variable remains
+    /// unassigned, it is forced to satisfy the parity.
+    pub fn add_xor(&mut self, vars_1based: &[i32], parity: bool) {
+        if !self.ok { return; }
+        let mut vars: Vec<usize> = Vec::with_capacity(vars_1based.len());
+        for &v in vars_1based {
+            let uv = v.unsigned_abs() as usize;
+            assert!(uv > 0);
+            self.ensure_var(uv);
+            vars.push(uv - 1); // convert to 0-based
+        }
+        // Adjust parity for negated literals
+        let mut p = parity;
+        for &v in vars_1based {
+            if v < 0 { p = !p; }
+        }
+
+        let xi = self.xor_constraints.len() as u32;
+        for &v in &vars {
+            self.xor_var_watches[v].push(xi);
+        }
+
+        // Check for already-assigned variables
+        let mut num_unknown = vars.len() as u32;
+        let mut assigned_xor = false;
+        for &v in &vars {
+            if self.assigns[v] != LBool::Undef {
+                num_unknown -= 1;
+                if self.assigns[v] == LBool::True {
+                    assigned_xor ^= true;
+                }
+            }
+        }
+
+        self.xor_constraints.push(XorConstraint {
+            vars,
+            parity: p,
+            num_unknown,
+            assigned_xor,
+        });
+
+        // Immediate check (no propagation — the main solve loop handles that)
+        if num_unknown == 0 {
+            if assigned_xor != p {
+                self.ok = false;
+            }
+        } else if num_unknown == 1 {
+            // Find the one unassigned variable and force it.
+            // Update the constraint state immediately so propagate() doesn't double-count.
+            let xc = &self.xor_constraints[xi as usize];
+            for &v in &xc.vars {
+                if self.assigns[v] == LBool::Undef {
+                    let need_true = xc.assigned_xor ^ xc.parity;
+                    let lit = if need_true { (v + 1) as Lit } else { -((v + 1) as Lit) };
+                    let val = need_true;
+                    let xc = &mut self.xor_constraints[xi as usize];
+                    xc.num_unknown = 0;
+                    xc.assigned_xor ^= val;
+                    self.enqueue(lit, Reason::Xor(xi));
+                    break;
+                }
+            }
+        }
+    }
+
     /// Solve the formula. Returns Some(true) if SAT, Some(false) if UNSAT.
     pub fn solve(&mut self) -> Option<bool> {
         self.solve_with_assumptions(&[])
@@ -475,6 +610,15 @@ impl Solver {
         }
         if self.minimize_visited.len() < self.num_vars {
             self.minimize_visited.resize(self.num_vars, false);
+        }
+        if self.best_phase.len() < self.num_vars {
+            self.best_phase.resize(self.num_vars, false);
+        }
+
+        // Failed literal probing (runs once before first solve)
+        if self.config.probing && self.conflicts == 0 {
+            self.probe();
+            if !self.ok { return Some(false); }
         }
 
         let assumption_level: u32 = if assumptions.is_empty() { 0 } else { 1 };
@@ -625,12 +769,42 @@ impl Solver {
                 self.add_learnt_clause(learnt_clause);
                 self.decay_activities();
 
+                // Update EMA stats (always, regardless of restart strategy)
+                let lbd = self.clause_meta.last().map(|m| m.lbd as f64).unwrap_or(1.0);
+                self.ema_lbd_fast += (lbd - self.ema_lbd_fast) / 32.0;
+                self.ema_lbd_slow += (lbd - self.ema_lbd_slow) / 4096.0;
+                let trail_sz = self.trail.len() as f64;
+                self.ema_trail_fast += (trail_sz - self.ema_trail_fast) / 32.0;
+                self.ema_trail_slow += (trail_sz - self.ema_trail_slow) / 4096.0;
+                self.ema_restart_block += 1;
+
                 // Restart check
-                if self.conflicts >= self.restart_limit {
-                    self.restart_limit += 100 * luby(self.luby_index);
-                    self.luby_index += 1;
+                let should_restart = if self.config.ema_restarts {
+                    // Glucose-style: restart when recent LBD quality is worse than global,
+                    // but block if trail is unusually long (making good progress).
+                    let lbd_trigger = self.conflicts > 100
+                        && self.ema_lbd_fast > 1.25 * self.ema_lbd_slow;
+                    let blocked = self.ema_restart_block < 50
+                        || self.ema_trail_fast > 1.4 * self.ema_trail_slow;
+                    lbd_trigger && !blocked
+                } else {
+                    // Luby restart schedule
+                    self.conflicts >= self.restart_limit
+                };
+                if should_restart {
+                    if !self.config.ema_restarts {
+                        self.restart_limit += 100 * luby(self.luby_index);
+                        self.luby_index += 1;
+                    }
+                    self.ema_restart_block = 0;
                     self.backtrack(base_level);
                     self.reduce_db();
+
+                    // Rephasing: periodically reset phases
+                    if self.config.rephasing && self.conflicts >= self.rephase_conflicts {
+                        self.rephase();
+                        self.rephase_conflicts = self.conflicts + 10000;
+                    }
                 }
             } else {
                 // No conflict
@@ -733,6 +907,46 @@ impl Solver {
                     let qi = self.quad_pb_var_watches[v][idx];
                     if let Some(conflict_reason) = self.propagate_quad_pb(qi) {
                         return Some(conflict_reason);
+                    }
+                }
+            }
+            // XOR (GF(2)) propagation
+            if !self.xor_constraints.is_empty() {
+                let v = var_of(lit);
+                let val = self.assigns[v] == LBool::True;
+                for idx in 0..self.xor_var_watches[v].len() {
+                    let xi = self.xor_var_watches[v][idx];
+                    let xc = &mut self.xor_constraints[xi as usize];
+                    if xc.num_unknown == 0 { continue; } // already fully resolved (e.g. by add_xor)
+                    xc.num_unknown -= 1;
+                    xc.assigned_xor ^= val;
+                    if xc.num_unknown == 0 {
+                        // All assigned: check parity
+                        if xc.assigned_xor != xc.parity {
+                            return Some(Reason::Xor(xi));
+                        }
+                    } else if xc.num_unknown == 1 {
+                        // One unknown left: force it
+                        let need_true = xc.assigned_xor ^ xc.parity;
+                        // Find the unassigned var
+                        let mut forced_var = 0;
+                        for &xv in &xc.vars {
+                            if self.assigns[xv] == LBool::Undef {
+                                forced_var = xv;
+                                break;
+                            }
+                        }
+                        let forced_lit = if need_true {
+                            (forced_var + 1) as Lit
+                        } else {
+                            -((forced_var + 1) as Lit)
+                        };
+                        if self.lit_value(forced_lit) == LBool::False {
+                            return Some(Reason::Xor(xi));
+                        }
+                        if self.lit_value(forced_lit) == LBool::Undef {
+                            self.enqueue(forced_lit, Reason::Xor(xi));
+                        }
                     }
                 }
             }
@@ -1136,6 +1350,37 @@ impl Solver {
                     }
                     self.analyze_reason_buf = buf;
                 }
+                Reason::Xor(xi) => {
+                    // XOR reason: all assigned variables in the constraint
+                    // form the reason clause. Each assigned var contributes
+                    // its negated literal (it was assigned, forcing the propagation).
+                    let mut buf = std::mem::take(&mut self.analyze_reason_buf);
+                    buf.clear();
+                    let xc = &self.xor_constraints[xi as usize];
+                    for &v in &xc.vars {
+                        if self.assigns[v] == LBool::Undef { continue; }
+                        let lit_v = (v + 1) as Lit;
+                        let neg_lit = if self.assigns[v] == LBool::True { -lit_v } else { lit_v };
+                        buf.push(neg_lit);
+                    }
+                    // Also include the propagated literal itself (if not conflict)
+                    if p != 0 { buf.push(p); }
+                    for idx in 0..buf.len() {
+                        let lit = buf[idx];
+                        if lit == p { continue; }
+                        let v = var_of(lit);
+                        if self.analyze_seen[v] { continue; }
+                        self.analyze_seen[v] = true;
+                        self.bump_activity(v);
+                        if self.level[v] == self.decision_level() {
+                            counter += 1;
+                        } else if self.level[v] > 0 {
+                            learnt.push(lit);
+                            bt_level = bt_level.max(self.level[v]);
+                        }
+                    }
+                    self.analyze_reason_buf = buf;
+                }
                 Reason::Decision => { unreachable!(); }
             }
 
@@ -1179,7 +1424,7 @@ impl Solver {
             let lit = learnt[i];
             let v = var_of(lit);
             match self.reason[v] {
-                Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) => {
+                Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) | Reason::Xor(_) => {
                     if self.lit_removable(v) { continue; }
                 }
                 Reason::Decision => {}
@@ -1261,6 +1506,23 @@ impl Solver {
                     self.analyze_reason_buf2 = buf2;
                     if fail { return false; }
                 }
+                Reason::Xor(xi) => {
+                    let xc = &self.xor_constraints[xi as usize];
+                    for vi in 0..xc.vars.len() {
+                        let u = xc.vars[vi];
+                        if u == cur || self.minimize_visited[u] { continue; }
+                        if self.assigns[u] == LBool::Undef { continue; }
+                        self.minimize_visited[u] = true;
+                        if self.level[u] == 0 { continue; }
+                        if self.analyze_seen[u] { continue; }
+                        let lv = self.level[u] as usize;
+                        if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { return false; }
+                        match self.reason[u] {
+                            Reason::Decision => return false,
+                            _ => { self.minimize_stack.push(u); }
+                        }
+                    }
+                }
                 Reason::Decision => return false,
             }
         }
@@ -1282,6 +1544,16 @@ impl Solver {
                 for idx in 0..self.quad_pb_var_watches[v].len() {
                     let qi = self.quad_pb_var_watches[v][idx];
                     self.quad_pb_constraints[qi as usize].stale = true;
+                }
+            }
+            // Undo XOR constraint updates
+            if !self.xor_constraints.is_empty() {
+                let val = entry.lit > 0;
+                for idx in 0..self.xor_var_watches[v].len() {
+                    let xi = self.xor_var_watches[v][idx];
+                    let xc = &mut self.xor_constraints[xi as usize];
+                    xc.num_unknown += 1;
+                    xc.assigned_xor ^= val;
                 }
             }
             self.heap_insert(v);
@@ -1474,6 +1746,54 @@ impl Solver {
         // Clean watch lists
         for wl in &mut self.watches {
             wl.retain(|&(ci, _)| !self.clause_meta[ci as usize].deleted);
+        }
+    }
+
+    /// Rephasing: alternate between resetting to best-known phase and random phases.
+    fn rephase(&mut self) {
+        if self.best_phase_set {
+            // Alternate: 50% best phase, 50% inverted
+            let invert = (self.rephase_conflicts / 10000) % 2 == 1;
+            for v in 0..self.num_vars {
+                self.phase[v] = if invert { !self.best_phase[v] } else { self.best_phase[v] };
+            }
+        }
+        // else: keep current phases (no best known yet)
+    }
+
+    /// Failed literal probing: for each unassigned literal, assume it true and propagate.
+    /// If conflict, the literal must be false — enqueue its negation at level 0.
+    pub fn probe(&mut self) {
+        if self.num_vars == 0 { return; }
+        self.backtrack(0);
+        let nv = self.num_vars;
+        let max_probes = nv.min(200); // limit to avoid excessive cost
+        // Probe most active variables first
+        let mut vars_by_activity: Vec<usize> = (0..nv).collect();
+        vars_by_activity.sort_by(|&a, &b|
+            self.activity[b].partial_cmp(&self.activity[a]).unwrap_or(std::cmp::Ordering::Equal));
+
+        for &v in vars_by_activity.iter().take(max_probes) {
+            if self.assigns[v] != LBool::Undef { continue; }
+            let lit = (v + 1) as Lit;
+            // Try positive
+            for sign in [lit, -lit] {
+                self.new_decision_level();
+                self.enqueue(sign, Reason::Decision);
+                let conflict = self.propagate().is_some();
+                self.backtrack(0);
+                if conflict {
+                    // sign leads to conflict, so negate(sign) is forced
+                    if self.assigns[v] == LBool::Undef {
+                        self.enqueue(-sign, Reason::Decision);
+                        if self.propagate().is_some() {
+                            self.ok = false;
+                            return;
+                        }
+                    }
+                    break; // no need to try the other polarity
+                }
+            }
         }
     }
 }

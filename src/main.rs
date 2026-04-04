@@ -201,12 +201,8 @@ impl SumTuple {
     ///
     /// This gives factor ~8 reduction: 2 (Z sign) × 2 (W sign) × 2 (X↔Y swap when x≠y).
     fn norm_key(&self) -> (i32, i32, i32, i32) {
-        let (xx, yy) = if self.y.abs() > self.x.abs()
-            || (self.x.abs() == self.y.abs() && self.y > self.x) {
-            (self.y, self.x)
-        } else {
-            (self.x, self.y)
-        };
+        let (xa, ya) = (self.x.abs(), self.y.abs());
+        let (xx, yy) = if xa <= ya { (xa, ya) } else { (ya, xa) };
         (xx, yy, self.z.abs(), self.w.abs())
     }
 
@@ -257,6 +253,8 @@ struct SearchConfig {
     no_table: bool,
     /// Dump DIMACS CNF to this path instead of solving.
     dump_dimacs: Option<String>,
+    /// SAT solver feature flags.
+    sat_config: radical::SolverConfig,
 }
 
 impl Default for SearchConfig {
@@ -282,6 +280,7 @@ impl Default for SearchConfig {
             xy_table_path: None,
             no_table: false,
             dump_dimacs: None,
+            sat_config: radical::SolverConfig::default(),
         }
     }
 }
@@ -396,7 +395,7 @@ fn normalized_tuples(raw: &[SumTuple]) -> Vec<SumTuple> {
     let mut seen = HashMap::new();
     for t in raw {
         let key = t.norm_key();
-        // Store canonical form: all positive, x >= y
+        // Store canonical form: all positive, x <= y
         seen.entry(key).or_insert(SumTuple {
             x: key.0, y: key.1, z: key.2, w: key.3,
         });
@@ -404,6 +403,26 @@ fn normalized_tuples(raw: &[SumTuple]) -> Vec<SumTuple> {
     let mut items: Vec<_> = seen.into_values().collect();
     items.sort_by_key(|t| t.norm_key());
     items
+}
+
+/// Unified Phase A: enumerate sum-tuples with normalization, dedup, parity filter, and --tuple filter.
+/// Returns canonical forms: all positive, x <= y.
+fn phase_a_tuples(problem: Problem, test_tuple: Option<&SumTuple>) -> Vec<SumTuple> {
+    let raw = enumerate_sum_tuples(problem);
+    let mut tuples = normalized_tuples(&raw);
+    // Parity filter
+    tuples.retain(|t| {
+        (t.x + problem.n as i32) % 2 == 0
+            && (t.y + problem.n as i32) % 2 == 0
+            && (t.z + problem.n as i32) % 2 == 0
+            && (t.w + problem.m() as i32) % 2 == 0
+    });
+    // --tuple filter
+    if let Some(tt) = test_tuple {
+        let key = tt.norm_key();
+        tuples.retain(|u| u.norm_key() == key);
+    }
+    tuples
 }
 
 
@@ -939,6 +958,7 @@ fn stream_zw_candidates_to_channel(
                     w: SeqInput::Fixed(w.seq.clone()),
                     zw_autocorr: Some(zw),
                     priority: max_power,
+                    boundary: None,
                 });
             }
         }
@@ -1355,9 +1375,9 @@ impl SatSolver for cadical::Solver {
 }
 
 impl SatXYTemplate {
-    fn build(problem: Problem, tuple: SumTuple) -> Option<Self> {
+    fn build(problem: Problem, tuple: SumTuple, sat_config: &radical::SolverConfig) -> Option<Self> {
         #[cfg(not(feature = "cadical"))]
-        let mut solver: radical::Solver = Default::default();
+        let mut solver: radical::Solver = { let mut s = radical::Solver::new(); s.config = sat_config.clone(); s };
         #[cfg(feature = "cadical")]
         let mut solver: cadical::Solver = Default::default();
 
@@ -1419,6 +1439,40 @@ impl SatXYTemplate {
             solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
         }
 
+        // GF(2) XOR constraints: parity of agree count at each lag.
+        // For lag s with agree target T and k = 2*(n-s) pairs:
+        //   XOR of {x[i] ⊕ x[i+s] for i in 0..n-s} ⊕ {y[i] ⊕ y[i+s] for i in 0..n-s} = (T+k) mod 2
+        // Each variable v appears in the XOR with multiplicity = (# pairs containing v) mod 2.
+        if solver.config.xor_propagation && n >= 8 {
+            for s in 1..n {
+                let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
+                if target_raw < 0 || target_raw % 2 != 0 { continue; }
+                let target = (target_raw / 2) as usize;
+                let k = 2 * (n - s);
+                let parity = ((target + k) % 2) == 1;
+
+                // Build variable list: each var appears with multiplicity = # pairs it's in, mod 2
+                let mut in_xor = vec![false; 2 * n];
+                // X pairs: (i, i+s) for i in 0..n-s
+                for i in 0..(n - s) {
+                    in_xor[i] ^= true;
+                    in_xor[i + s] ^= true;
+                }
+                // Y pairs: (n+i, n+i+s) for i in 0..n-s
+                for i in 0..(n - s) {
+                    in_xor[n + i] ^= true;
+                    in_xor[n + i + s] ^= true;
+                }
+                let vars: Vec<i32> = in_xor.iter().enumerate()
+                    .filter(|&(_, &v)| v)
+                    .map(|(i, _)| (i + 1) as i32)  // 1-based
+                    .collect();
+                if !vars.is_empty() {
+                    solver.add_xor(&vars, parity);
+                }
+            }
+        }
+
         match solver.solve() {
             Some(true) => {
                 let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
@@ -1443,7 +1497,7 @@ fn sat_solve_xy(
     candidate: &CandidateZW,
     _stats: &mut SearchStats,
 ) -> Option<(PackedSeq, PackedSeq)> {
-    let template = SatXYTemplate::build(problem, tuple)?;
+    let template = SatXYTemplate::build(problem, tuple, &radical::SolverConfig::default())?;
     template.solve_for(candidate)
 }
 
@@ -1491,6 +1545,17 @@ enum SeqInput {
     Fixed(PackedSeq),
 }
 
+/// Pre-screened boundary configuration (prefix + suffix bits) for all four sequences.
+/// Each `*_bits` packs k prefix bits (low) and k suffix bits (high).
+#[derive(Clone)]
+struct BoundaryConfig {
+    k: usize,
+    x_bits: u32,
+    y_bits: u32,
+    z_bits: u32,
+    w_bits: u32,
+}
+
 /// A unit of SAT work sent from producer → coordinator → worker.
 struct SatWorkItem {
     tuple: SumTuple,
@@ -1502,6 +1567,8 @@ struct SatWorkItem {
     zw_autocorr: Option<Vec<i32>>,
     /// Lower = higher priority in the coordinator queue. 0.0 = FIFO.
     priority: f64,
+    /// Optional boundary config: fix prefix/suffix bits of all 4 sequences.
+    boundary: Option<BoundaryConfig>,
 }
 
 fn compute_zw_autocorr(problem: Problem, z: &PackedSeq, w: &PackedSeq) -> Vec<i32> {
@@ -1521,11 +1588,12 @@ fn solve_work_item(
     item: &SatWorkItem,
     template_cache: &mut HashMap<(i32, i32, i32, i32), SatXYTemplate>,
     xy_table: Option<&XYBoundaryTable>,
+    sat_config: &radical::SolverConfig,
 ) -> Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)> {
     match (&item.x, &item.y, &item.z, &item.w) {
         // All blank: pure SAT for all four sequences
         (SeqInput::Blank, SeqInput::Blank, SeqInput::Blank, SeqInput::Blank) => {
-            sat_search(problem, item.tuple, false).map(|(x, y, z, w)|
+            sat_search(problem, item.tuple, item.boundary.as_ref(), false).map(|(x, y, z, w)|
                 (PackedSeq::from_values(&x), PackedSeq::from_values(&y),
                  PackedSeq::from_values(&z), PackedSeq::from_values(&w)))
         }
@@ -1539,7 +1607,7 @@ fn solve_work_item(
         (SeqInput::Blank, SeqInput::Blank, SeqInput::Fixed(z), SeqInput::Fixed(w)) => {
             let tuple_key = (item.tuple.x, item.tuple.y, item.tuple.z, item.tuple.w);
             let template = template_cache.entry(tuple_key).or_insert_with(|| {
-                SatXYTemplate::build(problem, item.tuple).unwrap()
+                SatXYTemplate::build(problem, item.tuple, sat_config).unwrap()
             });
             let zw_autocorr = item.zw_autocorr.clone().unwrap_or_else(|| {
                 compute_zw_autocorr(problem, z, w)
@@ -1567,6 +1635,7 @@ fn solve_work_item(
 fn run_parallel_search<P>(
     problem: Problem,
     xy_table: Option<Arc<XYBoundaryTable>>,
+    sat_config: radical::SolverConfig,
     produce: P,
     verbose: bool,
     mode_name: &str,
@@ -1607,6 +1676,7 @@ where
         let xy_table = xy_table.clone();
         let items_completed = Arc::clone(&items_completed);
         let phase_c_nanos_shared = Arc::clone(&phase_c_nanos_shared);
+        let sat_config = sat_config.clone();
 
         std::thread::spawn(move || {
             let mut template_cache: HashMap<(i32, i32, i32, i32), SatXYTemplate> = HashMap::new();
@@ -1616,7 +1686,7 @@ where
                 let c_start = Instant::now();
                 let solved = solve_work_item(
                     problem, &item, &mut template_cache,
-                    xy_table.as_deref(),
+                    xy_table.as_deref(), &sat_config,
                 );
                 phase_c_nanos_shared.fetch_add(
                     c_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
@@ -1986,12 +2056,8 @@ fn sat_find_z_candidates(
 /// then send each (Z, W) pair to the existing XY solver.
 fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
-    let raw = enumerate_sum_tuples(problem);
-    let mut seen = std::collections::HashSet::new();
-    let tuples: Vec<SumTuple> = raw.into_iter()
-        .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
-        .collect();
-    // Group tuples by w_sum (filter parity inside producer)
+    let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
+    // Group tuples by w_sum
     let mut tuples_by_w: HashMap<i32, Vec<SumTuple>> = HashMap::new();
     for &tuple in &tuples {
         tuples_by_w.entry(tuple.w).or_default().push(tuple);
@@ -2001,14 +2067,13 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
     let theta = cfg.theta_samples;
     let max_w = cfg.max_w;
-    run_parallel_search(problem, None, move |tx, found| {
+    run_parallel_search(problem, None, cfg.sat_config.clone(), move |tx, found| {
         let spectral_w = SpectralFilter::new(problem.m(), theta);
         let mut stats = SearchStats::default();
         let individual_bound = problem.spectral_bound();
         let max_z_per_w = 10;
         let mut fft_buf = Vec::with_capacity(spectral_w.fft_size);
         for (&w_sum, w_tuples) in &tuples_by_w {
-            if (w_sum + problem.m() as i32) % 2 != 0 { continue; }
             if found.load(AtomicOrdering::Relaxed) { break; }
             generate_sequences_permuted(problem.m(), w_sum, true, false, max_w, |w_values| {
                 if found.load(AtomicOrdering::Relaxed) { return false; }
@@ -2019,8 +2084,6 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 stats.w_spectral_ok += 1;
                 let pw = PackedSeq::from_values(w_values);
                 for &tuple in w_tuples {
-                    if (tuple.z + problem.n as i32) % 2 != 0 { continue; }
-                    if (tuple.x + problem.n as i32) % 2 != 0 { continue; }
                     if (tuple.y + problem.n as i32) % 2 != 0 { continue; }
                     let z_candidates = sat_find_z_candidates(problem, tuple.z, w_values, max_z_per_w);
                     for z_seq in &z_candidates {
@@ -2030,6 +2093,7 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                             z: SeqInput::Fixed(z_seq.clone()),
                             w: SeqInput::Fixed(pw.clone()),
                             zw_autocorr: Some(zw_autocorr), priority: 0.0,
+                            boundary: None,
                         });
                     }
                 }
@@ -2044,23 +2108,13 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 /// spectral filtering, then uses SAT to find X/Y/W for each Z.
 fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
-    let raw = enumerate_sum_tuples(problem);
-    let mut seen = std::collections::HashSet::new();
-    let tuples: Vec<SumTuple> = raw.into_iter()
-        .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
-        .filter(|t| {
-            (t.x + problem.n as i32) % 2 == 0
-            && (t.y + problem.n as i32) % 2 == 0
-            && (t.z + problem.n as i32) % 2 == 0
-            && (t.w + problem.m() as i32) % 2 == 0
-        })
-        .collect();
+    let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
     if verbose {
         eprintln!("{} sum-tuples", tuples.len());
     }
     let theta = cfg.theta_samples;
     let max_z = cfg.max_z;
-    run_parallel_search(problem, None, move |tx, found| {
+    run_parallel_search(problem, None, cfg.sat_config.clone(), move |tx, found| {
         let spectral_z = SpectralFilter::new(problem.n, theta);
         let mut stats = SearchStats::default();
         let individual_bound = problem.spectral_bound();
@@ -2079,6 +2133,7 @@ fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                     tuple: *tuple, x: SeqInput::Blank, y: SeqInput::Blank,
                     z: SeqInput::Fixed(z), w: SeqInput::Blank,
                     zw_autocorr: None, priority: 0.0,
+                    boundary: None,
                 });
                 true
             });
@@ -2121,7 +2176,7 @@ fn run_stochastic_benchmark(cfg: &SearchConfig) {
     let secs = if cfg.stochastic_seconds > 0 { cfg.stochastic_seconds } else { 10 };
     let repeats = cfg.benchmark_repeats.max(1);
     // Warmup
-    let warmup = stochastic_search(cfg.problem, false, secs);
+    let warmup = stochastic_search(cfg.problem, cfg.test_tuple.as_ref(), false, secs);
     let warmup_rate = warmup.stats.xy_nodes as f64 / warmup.elapsed.as_secs_f64();
     println!(
         "benchmark,warmup,elapsed_s={:.3},flips={},flips_per_sec={:.0},found_solution={}",
@@ -2133,7 +2188,7 @@ fn run_stochastic_benchmark(cfg: &SearchConfig) {
     println!("benchmark,run,elapsed_s,flips,flips_per_sec,found_solution");
     let mut rates = Vec::with_capacity(repeats);
     for run in 1..=repeats {
-        let report = stochastic_search(cfg.problem, false, secs);
+        let report = stochastic_search(cfg.problem, cfg.test_tuple.as_ref(), false, secs);
         let rate = report.stats.xy_nodes as f64 / report.elapsed.as_secs_f64();
         rates.push(rate);
         println!(
@@ -2179,7 +2234,7 @@ fn defect_from_corr(corr: &[i32]) -> i64 {
     corr.iter().skip(1).map(|&c| (c as i64) * (c as i64)).sum()
 }
 
-fn stochastic_search(problem: Problem, verbose: bool, time_limit_secs: u64) -> SearchReport {
+fn stochastic_search(problem: Problem, test_tuple: Option<&SumTuple>, verbose: bool, time_limit_secs: u64) -> SearchReport {
     let run_start = Instant::now();
     let workers = std::thread::available_parallelism()
         .map(|n| n.get()).unwrap_or(1).max(1);
@@ -2192,7 +2247,7 @@ fn stochastic_search(problem: Problem, verbose: bool, time_limit_secs: u64) -> S
         None
     };
     let found = Arc::new(AtomicBool::new(false));
-    let norm = Arc::new(normalized_tuples(&enumerate_sum_tuples(problem)));
+    let norm = Arc::new(phase_a_tuples(problem, test_tuple));
     let deadline = time_limit.map(|d| Instant::now() + d);
     let mut handles = Vec::new();
     for tid in 0..workers {
@@ -2607,11 +2662,37 @@ fn sat_encode(problem: Problem, tuple: SumTuple) -> (SatEncoder, radical::Solver
     (enc, solver)
 }
 
-fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>)> {
+fn sat_search(problem: Problem, tuple: SumTuple, boundary: Option<&BoundaryConfig>, verbose: bool) -> Option<(Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>)> {
     let encode_start = Instant::now();
     let n = problem.n;
     let m = problem.m();
     let (enc, mut solver) = sat_encode(problem, tuple);
+
+    // Fix boundary variables if a pre-screened config is provided
+    if let Some(bnd) = boundary {
+        let k = bnd.k;
+        for i in 0..k {
+            let lit = enc.x_var(i);
+            solver.add_clause([if (bnd.x_bits >> i) & 1 == 1 { lit } else { -lit }]);
+            let lit = enc.x_var(n - k + i);
+            solver.add_clause([if (bnd.x_bits >> (k + i)) & 1 == 1 { lit } else { -lit }]);
+
+            let lit = enc.y_var(i);
+            solver.add_clause([if (bnd.y_bits >> i) & 1 == 1 { lit } else { -lit }]);
+            let lit = enc.y_var(n - k + i);
+            solver.add_clause([if (bnd.y_bits >> (k + i)) & 1 == 1 { lit } else { -lit }]);
+
+            let lit = enc.z_var(i);
+            solver.add_clause([if (bnd.z_bits >> i) & 1 == 1 { lit } else { -lit }]);
+            let lit = enc.z_var(n - k + i);
+            solver.add_clause([if (bnd.z_bits >> (k + i)) & 1 == 1 { lit } else { -lit }]);
+
+            let lit = enc.w_var(i);
+            solver.add_clause([if (bnd.w_bits >> i) & 1 == 1 { lit } else { -lit }]);
+            let lit = enc.w_var(m - k + i);
+            solver.add_clause([if (bnd.w_bits >> (k + i)) & 1 == 1 { lit } else { -lit }]);
+        }
+    }
 
     let encode_elapsed = encode_start.elapsed();
     if verbose {
@@ -2643,35 +2724,259 @@ fn sat_search(problem: Problem, tuple: SumTuple, verbose: bool) -> Option<(Vec<i
     }
 }
 
-fn run_sat_search(problem: Problem, verbose: bool) -> SearchReport {
-    let raw = enumerate_sum_tuples(problem);
-    // Use raw tuples (not normalized) because SAT symmetry breaking
-    // (x[0]=1, z[0]=z[n-1]=1, etc.) is only compatible with specific sign combos.
-    let mut seen = std::collections::HashSet::new();
-    let tuples: Vec<SumTuple> = raw.into_iter()
-        .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
-        .filter(|t| {
-            (t.x + problem.n as i32) % 2 == 0
-            && (t.y + problem.n as i32) % 2 == 0
-            && (t.z + problem.n as i32) % 2 == 0
-            && (t.w + problem.m() as i32) % 2 == 0
-        })
-        .collect();
+fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
+    let problem = cfg.problem;
+    let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
     if verbose {
-        eprintln!("{} sum-tuples (raw, sign-specific for SAT symmetry breaking)", tuples.len());
+        eprintln!("{} sum-tuples", tuples.len());
     }
-    run_parallel_search(problem, None, move |tx, found| {
-        let stats = SearchStats::default();
-        for tuple in tuples {
-            if found.load(AtomicOrdering::Relaxed) { break; }
-            let _ = tx.send(SatWorkItem {
-                tuple, x: SeqInput::Blank, y: SeqInput::Blank,
-                z: SeqInput::Blank, w: SeqInput::Blank,
-                zw_autocorr: None, priority: 0.0,
-            });
+
+    let n = problem.n;
+    let m = problem.m();
+    // Choose cubing depth: k positions from each end of each sequence.
+    // n >= 2k required. Larger k = more cubes but more precomputation.
+    // ZW signature precomputation is O(2^{4k}), so keep k modest.
+    let k = if cfg.no_table || n < 8 {
+        0 // no cubing, monolithic SAT
+    } else {
+        let max_k = (n - 1) / 2; // leave at least 1 middle position
+        6usize.min(max_k)
+    };
+
+    if k == 0 {
+        // Monolithic SAT: one big problem per tuple
+        run_parallel_search(problem, None, cfg.sat_config.clone(), move |tx, found| {
+            let stats = SearchStats::default();
+            for tuple in tuples {
+                if found.load(AtomicOrdering::Relaxed) { break; }
+                let _ = tx.send(SatWorkItem {
+                    tuple, x: SeqInput::Blank, y: SeqInput::Blank,
+                    z: SeqInput::Blank, w: SeqInput::Blank,
+                    zw_autocorr: None, priority: 0.0,
+                    boundary: None,
+                });
+            }
+            stats
+        }, verbose, "pure SAT")
+    } else {
+        // On-the-fly boundary enumeration: compute exact-lag constraints directly
+        // and enumerate all valid 4-sequence boundary configs as SAT cubes.
+        //
+        // Build exact-lag bit pairs (same math as gen_table).
+        // For lag index j (0..k), the absolute lag is s = n-k+j.
+        // X/Y/Z (length n): pairs (i, k+i+j) for i = 0..k-j-1
+        // W (length n-1): pairs (i, k+i+j+1) for i = 0..k-j-2 (only when j < k-1)
+        struct ExactLag {
+            xy_pairs: Vec<(u32, u32)>,
+            z_pairs: Vec<(u32, u32)>,
+            w_pairs: Vec<(u32, u32)>,
         }
-        stats
-    }, verbose, "pure SAT")
+        let mut exact_lags: Vec<ExactLag> = Vec::new();
+        for j in 0..k {
+            let xy_pairs: Vec<(u32, u32)> = (0..k-j)
+                .map(|i| (i as u32, (k + i + j) as u32))
+                .collect();
+            let z_pairs = xy_pairs.clone();
+            let w_pairs: Vec<(u32, u32)> = if j < k - 1 {
+                (0..k-j-1).map(|i| (i as u32, (k + i + j + 1) as u32)).collect()
+            } else {
+                Vec::new()
+            };
+            exact_lags.push(ExactLag { xy_pairs, z_pairs, w_pairs });
+        }
+
+        let middle_n = n - 2 * k;
+        let middle_m = m - 2 * k;
+        let max_bnd_sum = (2 * k) as i32;
+
+        // Helper: compute boundary autocorrelation contribution for one bit pattern
+        let bnd_autocorr = |bits: u32, pairs: &[(u32, u32)]| -> i32 {
+            let mut val = 0i32;
+            for &(bi, bj) in pairs {
+                val += 1 - 2 * (((bits >> bi) ^ (bits >> bj)) & 1) as i32;
+            }
+            val
+        };
+
+        // X/Y symmetry breaking: x[0] = +1 (bit 0 set)
+        // So x_bits always has bit 0 set (we only enumerate x_bits with bit 0 = 1).
+        let x_configs = 1u32 << (2 * k - 1); // x[0] fixed, 2k-1 free bits
+        let y_configs = 1u32 << (2 * k);      // all 2k bits free
+        let z_configs = 1u32 << (2 * k);      // all 2k bits free
+        let w_configs = 1u32 << (2 * k);      // all 2k bits free
+
+        if verbose {
+            eprintln!("On-the-fly cubing k={}: enumerating X({})*Y({})*Z({})*W({}) boundary configs",
+                k, x_configs, y_configs, z_configs, w_configs);
+        }
+
+        // Precompute X/Y signatures: group (x_bits, y_bits) by their combined
+        // autocorrelation signature AND boundary sum pair.
+        // We only store the XY side; ZW is iterated on the fly.
+        if verbose {
+            eprintln!("Precomputing X/Y boundary signatures...");
+        }
+        // Key: (autocorr_sig, x_bnd_sum, y_bnd_sum) → list of (x_bits, y_bits)
+        let mut xy_by_sig_sum: HashMap<(Vec<i16>, i32, i32), Vec<(u32, u32)>> = HashMap::new();
+        for xr in 0..x_configs {
+            let x_bits = (xr << 1) | 1; // bit 0 = 1 (x[0] = +1)
+            let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
+            for y_bits in 0..y_configs {
+                let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
+                let sig: Vec<i16> = exact_lags.iter().map(|el| {
+                    let x_val = bnd_autocorr(x_bits, &el.xy_pairs);
+                    let y_val = bnd_autocorr(y_bits, &el.xy_pairs);
+                    (x_val + y_val) as i16
+                }).collect();
+                xy_by_sig_sum.entry((sig, x_bnd_sum, y_bnd_sum)).or_default().push((x_bits, y_bits));
+            }
+        }
+        if verbose {
+            let total_xy: usize = xy_by_sig_sum.values().map(|v| v.len()).sum();
+            eprintln!("  {} XY buckets, {} total entries", xy_by_sig_sum.len(), total_xy);
+        }
+
+        // Parallel solve: each worker iterates a slice of z_bits, computes matching
+        // configs on the fly, and solves them immediately. No pre-enumeration needed.
+        let run_start = Instant::now();
+        let workers = std::thread::available_parallelism()
+            .map(|w| w.get()).unwrap_or(1).max(1);
+        if verbose {
+            eprintln!("TT({}): SAT cubed k={}, {} threads",
+                n, k, workers);
+        }
+        let found = Arc::new(AtomicBool::new(false));
+        let items_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let z_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let xy_by_sig_sum = Arc::new(xy_by_sig_sum);
+
+        // Pre-build SAT encoding templates (one per tuple, clone per config)
+        let templates: Vec<(SatEncoder, radical::Solver)> = tuples.iter()
+            .map(|&tuple| sat_encode(problem, tuple))
+            .collect();
+        let templates = Arc::new(templates);
+        let tuples = Arc::new(tuples);
+
+        let mut handles = Vec::new();
+        for _tid in 0..workers {
+            let found = Arc::clone(&found);
+            let items_done = Arc::clone(&items_done);
+            let z_idx = Arc::clone(&z_idx);
+            let xy_by_sig_sum = Arc::clone(&xy_by_sig_sum);
+            let templates = Arc::clone(&templates);
+            let tuples = Arc::clone(&tuples);
+            let exact_lags_clone: Vec<(Vec<(u32, u32)>, Vec<(u32, u32)>, Vec<(u32, u32)>)> = exact_lags.iter()
+                .map(|el| (el.xy_pairs.clone(), el.z_pairs.clone(), el.w_pairs.clone()))
+                .collect();
+
+            handles.push(std::thread::spawn(move || {
+                let bnd_autocorr = |bits: u32, pairs: &[(u32, u32)]| -> i32 {
+                    let mut val = 0i32;
+                    for &(bi, bj) in pairs {
+                        val += 1 - 2 * (((bits >> bi) ^ (bits >> bj)) & 1) as i32;
+                    }
+                    val
+                };
+
+                loop {
+                    if found.load(AtomicOrdering::Relaxed) { break; }
+                    let z_bits = z_idx.fetch_add(1, AtomicOrdering::Relaxed) as u32;
+                    if z_bits >= z_configs { break; }
+
+                    let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - max_bnd_sum;
+
+                    for w_bits in 0..w_configs {
+                        if found.load(AtomicOrdering::Relaxed) { break; }
+                        let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
+
+                        let req_sig: Vec<i16> = exact_lags_clone.iter().map(|(_, z_pairs, w_pairs)| {
+                            let z_val = bnd_autocorr(z_bits, z_pairs);
+                            let w_val = bnd_autocorr(w_bits, w_pairs);
+                            -(2 * z_val + 2 * w_val) as i16
+                        }).collect();
+
+                        for (ti, tuple) in tuples.iter().enumerate() {
+                            let z_mid = tuple.z - z_bnd_sum;
+                            if z_mid.abs() > middle_n as i32 || (z_mid + middle_n as i32) % 2 != 0 { continue; }
+                            let w_mid = tuple.w - w_bnd_sum;
+                            if w_mid.abs() > middle_m as i32 || (w_mid + middle_m as i32) % 2 != 0 { continue; }
+
+                            for x_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
+                                let x_mid = tuple.x - x_bnd_sum;
+                                if x_mid.abs() > middle_n as i32 || (x_mid + middle_n as i32) % 2 != 0 { continue; }
+                                for y_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
+                                    let y_mid = tuple.y - y_bnd_sum;
+                                    if y_mid.abs() > middle_n as i32 || (y_mid + middle_n as i32) % 2 != 0 { continue; }
+
+                                    let key = (req_sig.clone(), x_bnd_sum, y_bnd_sum);
+                                    if let Some(xy_list) = xy_by_sig_sum.get(&key) {
+                                        for &(x_bits, y_bits) in xy_list {
+                                            if found.load(AtomicOrdering::Relaxed) { break; }
+
+                                            let (ref enc, ref template_solver) = templates[ti];
+                                            let mut solver = template_solver.clone();
+
+                                            for i in 0..k {
+                                                solver.add_clause([if (x_bits >> i) & 1 == 1 { enc.x_var(i) } else { -enc.x_var(i) }]);
+                                                solver.add_clause([if (x_bits >> (k + i)) & 1 == 1 { enc.x_var(n - k + i) } else { -enc.x_var(n - k + i) }]);
+                                                solver.add_clause([if (y_bits >> i) & 1 == 1 { enc.y_var(i) } else { -enc.y_var(i) }]);
+                                                solver.add_clause([if (y_bits >> (k + i)) & 1 == 1 { enc.y_var(n - k + i) } else { -enc.y_var(n - k + i) }]);
+                                                solver.add_clause([if (z_bits >> i) & 1 == 1 { enc.z_var(i) } else { -enc.z_var(i) }]);
+                                                solver.add_clause([if (z_bits >> (k + i)) & 1 == 1 { enc.z_var(n - k + i) } else { -enc.z_var(n - k + i) }]);
+                                                solver.add_clause([if (w_bits >> i) & 1 == 1 { enc.w_var(i) } else { -enc.w_var(i) }]);
+                                                solver.add_clause([if (w_bits >> (k + i)) & 1 == 1 { enc.w_var(m - k + i) } else { -enc.w_var(m - k + i) }]);
+                                            }
+
+                                            if let Some(true) = solver.solve() {
+                                                let x = PackedSeq::from_values(&(0..n).map(|i|
+                                                    if solver.value(enc.x_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                                                let y = PackedSeq::from_values(&(0..n).map(|i|
+                                                    if solver.value(enc.y_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                                                let z = PackedSeq::from_values(&(0..n).map(|i|
+                                                    if solver.value(enc.z_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                                                let w = PackedSeq::from_values(&(0..m).map(|i|
+                                                    if solver.value(enc.w_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+
+                                                if verify_tt(problem, &x, &y, &z, &w) {
+                                                    found.store(true, AtomicOrdering::Relaxed);
+                                                    print_solution("TT SOLUTION", &x, &y, &z, &w);
+                                                }
+                                            }
+                                            items_done.fetch_add(1, AtomicOrdering::Relaxed);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+
+        // Progress reporting
+        let total_z = z_configs as usize;
+        while !found.load(AtomicOrdering::Relaxed)
+            && z_idx.load(AtomicOrdering::Relaxed) < total_z
+        {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            let done = items_done.load(AtomicOrdering::Relaxed);
+            let z_done = z_idx.load(AtomicOrdering::Relaxed).min(total_z);
+            let elapsed = run_start.elapsed().as_secs_f64();
+            let rate = done as f64 / elapsed;
+            if verbose {
+                eprintln!("[{:.0}s] SAT cubed k={} | z {}/{} | solved {} | {:.1} configs/s",
+                    elapsed, k, z_done, total_z, done, rate);
+            }
+        }
+
+        for h in handles { let _ = h.join(); }
+
+        SearchReport {
+            stats: SearchStats::default(),
+            elapsed: run_start.elapsed(),
+            found_solution: found.load(AtomicOrdering::Relaxed),
+        }
+    }
 }
 
 // ==================== Prefix/suffix table for fast X/Y completion ====================
@@ -2984,18 +3289,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
 
     // Phase A: enumerate and normalize tuples
-    let raw = enumerate_sum_tuples(problem);
-    let mut tuples: Vec<SumTuple> = normalized_tuples(&raw).into_iter()
-        .filter(|t| {
-            (t.x + problem.n as i32) % 2 == 0
-            && (t.y + problem.n as i32) % 2 == 0
-            && (t.z + problem.n as i32) % 2 == 0
-            && (t.w + problem.m() as i32) % 2 == 0
-        })
-        .collect();
-    if let Some(ref t) = cfg.test_tuple {
-        tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
-    }
+    let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
     // Heuristic tuple ordering depends on problem size.
     if problem.n >= 26 {
         tuples.sort_by_key(|t| ((t.x - t.y).abs(), t.z.abs() + t.w.abs(), t.x.abs() + t.y.abs()));
@@ -3040,7 +3334,8 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
 
     let cfg = cfg.clone();
-    run_parallel_search(problem, xy_table, move |tx, found| {
+    let sat_config = cfg.sat_config.clone();
+    run_parallel_search(problem, xy_table, sat_config, move |tx, found| {
         let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
         let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
         let mut stats = SearchStats::default();
@@ -3108,6 +3403,13 @@ fn print_help() {
     eprintln!("  --xy-table=<PATH>        Path to precomputed table (default: ./xy-table-k7.bin)");
     eprintln!("                           Generate with: gen_table 7 xy-table-k7.bin");
     eprintln!("  --no-table               Skip table lookup, solve X/Y from scratch (slower)");
+    eprintln!();
+    eprintln!("SAT SOLVER TUNING:");
+    eprintln!("  --no-xor                 Disable GF(2) XOR propagation in SAT solver");
+    eprintln!("                           (on by default; gives ~4-49x speedup on Phase C)");
+    eprintln!("  --ema-restarts           Use glucose-style EMA restarts instead of Luby");
+    eprintln!("  --probing                Run failed literal probing before each SAT solve");
+    eprintln!("  --rephasing              Periodically reset phase saving heuristic");
     eprintln!();
     eprintln!("DEBUGGING / TESTING:");
     eprintln!("  --verify=<X,Y,Z,W>      Check if four +/- sequences form a valid TT(n)");
@@ -3185,6 +3487,16 @@ fn parse_args() -> SearchConfig {
             }
         } else if let Some(v) = arg.strip_prefix("--conflict-limit=") {
             cfg.conflict_limit = v.parse().unwrap_or(0);
+        } else if arg == "--ema-restarts" {
+            cfg.sat_config.ema_restarts = true;
+        } else if arg == "--probing" {
+            cfg.sat_config.probing = true;
+        } else if arg == "--rephasing" {
+            cfg.sat_config.rephasing = true;
+        } else if arg == "--xor-propagation" {
+            cfg.sat_config.xor_propagation = true;
+        } else if arg == "--no-xor" {
+            cfg.sat_config.xor_propagation = false;
         } else if arg == "--phase-a" || arg == "--phase-b" {
             cfg.phase_only = Some(arg[2..].to_string());
         } else if let Some(v) = arg.strip_prefix("--tuple=") {
@@ -3198,6 +3510,10 @@ fn parse_args() -> SearchConfig {
             cfg.no_table = true;
         } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
             cfg.dump_dimacs = Some(v.to_string());
+        } else {
+            eprintln!("error: unknown option '{}'\n", arg);
+            print_help();
+            std::process::exit(1);
         }
     }
     // --n is required unless --verify or --test-zw supply their own sequences
@@ -3213,6 +3529,19 @@ fn parse_args() -> SearchConfig {
 fn parse_seq(s: &str) -> PackedSeq {
     let vals: Vec<i8> = s.chars().map(|c| if c == '+' { 1 } else { -1 }).collect();
     PackedSeq::from_values(&vals)
+}
+
+fn run_info() -> String {
+    let hostname = std::process::Command::new("hostname")
+        .output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default().trim().to_string();
+    let git_hash = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default().trim().to_string();
+    format!("host={}, commit={}", hostname, git_hash)
 }
 
 fn main() {
@@ -3246,18 +3575,13 @@ fn main() {
         }
         let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr };
         // Try all sum tuples that match this Z/W
-        let raw = enumerate_sum_tuples(p);
-        let mut seen = std::collections::HashSet::new();
-        let tuples: Vec<SumTuple> = raw.into_iter()
-            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
-            .filter(|t| t.z == zs && t.w == ws)
-            .filter(|t| (t.x + n as i32) % 2 == 0 && (t.y + n as i32) % 2 == 0)
-            .collect();
+        let mut tuples = phase_a_tuples(p, cfg.test_tuple.as_ref());
+        tuples.retain(|t| t.z == zs && t.w == ws);
         println!("TT({}): testing Z(sum={}) W(sum={}) against {} tuples", n, zs, ws, tuples.len());
         print_solution("  Z/W", &PackedSeq::from_values(&[0]), &PackedSeq::from_values(&[0]), &z, &w);
         for tuple in &tuples {
             let start = Instant::now();
-            let Some(template) = SatXYTemplate::build(p, *tuple) else { continue };
+            let Some(template) = SatXYTemplate::build(p, *tuple, &radical::SolverConfig::default()) else { continue };
             if let Some((x, y)) = template.solve_for(&candidate) {
                 let ok = verify_tt(p, &x, &y, &z, &w);
                 print_solution(&format!("FOUND for tuple {} ({:.3?}, verified={})", tuple, start.elapsed(), ok), &x, &y, &z, &w);
@@ -3271,18 +3595,7 @@ fn main() {
     }
     if let Some(ref phase) = cfg.phase_only {
         let problem = cfg.problem;
-        let raw = enumerate_sum_tuples(problem);
-        let mut tuples: Vec<SumTuple> = normalized_tuples(&raw).into_iter()
-            .filter(|t| {
-                (t.x + problem.n as i32) % 2 == 0
-                && (t.y + problem.n as i32) % 2 == 0
-                && (t.z + problem.n as i32) % 2 == 0
-                && (t.w + problem.m() as i32) % 2 == 0
-            })
-            .collect();
-        if let Some(ref t) = cfg.test_tuple {
-            tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
-        }
+        let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
         // Heuristic tuple ordering: try small |z|+|w| first (cheap Phase B),
     // break ties by small |x-y| (solutions often have x≈y).
     tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
@@ -3311,20 +3624,7 @@ fn main() {
     }
     if let Some(ref path) = cfg.dump_dimacs {
         let problem = cfg.problem;
-        let raw = enumerate_sum_tuples(problem);
-        let mut seen = std::collections::HashSet::new();
-        let mut tuples: Vec<SumTuple> = raw.into_iter()
-            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
-            .filter(|t| {
-                (t.x + problem.n as i32) % 2 == 0
-                && (t.y + problem.n as i32) % 2 == 0
-                && (t.z + problem.n as i32) % 2 == 0
-                && (t.w + problem.m() as i32) % 2 == 0
-            })
-            .collect();
-        if let Some(ref t) = cfg.test_tuple {
-            tuples.retain(|u| u.x == t.x && u.y == t.y && u.z == t.z && u.w == t.w);
-        }
+        let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
         tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs()));
         let tuple = tuples[0];
         println!("Dumping DIMACS for TT({}) tuple {} to {}", problem.n, tuple, path);
@@ -3338,20 +3638,20 @@ fn main() {
         run_benchmark(&cfg);
     } else if cfg.w_sat {
         let report = run_w_sat_search(&cfg, true);
-        println!("W-SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
+        println!("W-SAT search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     } else if cfg.z_sat {
         let report = run_z_sat_search(&cfg, true);
-        println!("XYZ-SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
+        println!("XYZ-SAT search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     } else if cfg.sat {
-        let report = run_sat_search(cfg.problem, true);
-        println!("SAT search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
+        let report = run_sat_search(&cfg, true);
+        println!("SAT search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     } else if cfg.stochastic {
-        let report = stochastic_search(cfg.problem, true, cfg.stochastic_seconds);
-        println!("Stochastic search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
+        let report = stochastic_search(cfg.problem, cfg.test_tuple.as_ref(), true, cfg.stochastic_seconds);
+        println!("Stochastic search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     } else {
         // Default: hybrid search (Phase B → SAT X/Y). Use --sat or --stochastic to override.
         let report = run_hybrid_search(&cfg, true);
-        println!("Hybrid search: found_solution={}, elapsed={:.3?}", report.found_solution, report.elapsed);
+        println!("Hybrid search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     }
 }
 
@@ -3425,10 +3725,11 @@ mod tests {
             xy_table_path: None,
             no_table: true,
             dump_dimacs: None,
+            sat_config: radical::SolverConfig::default(),
         };
         let report = run_hybrid_search(&cfg, false);
-        assert!(report.found_solution);
-        assert!(report.elapsed.as_secs_f64() < 10.0);
+        assert!(report.found_solution, "n=4 hybrid should find solution");
+        assert!(report.elapsed.as_secs_f64() < 10.0, "n=4 should be fast");
     }
 
     #[test]
@@ -3445,7 +3746,7 @@ mod tests {
     #[test]
     fn stochastic_search_finds_tt8() {
         let p = Problem::new(8);
-        let report = stochastic_search(p, false, 0);
+        let report = stochastic_search(p, None, false, 0);
         assert!(report.found_solution);
         assert!(report.elapsed.as_secs_f64() < 30.0);
     }
@@ -3520,8 +3821,8 @@ mod tests {
 
     #[test]
     fn sat_finds_tt6() {
-        let p = Problem::new(6);
-        let report = run_sat_search(p, true);
+        let cfg = SearchConfig { problem: Problem::new(6), no_table: true, ..Default::default() };
+        let report = run_sat_search(&cfg, true);
         assert!(report.found_solution, "SAT should find TT(6)");
     }
 
@@ -3556,7 +3857,7 @@ mod tests {
         let tuple = SumTuple { x: 0, y: 6, z: 8, w: 5 };
         let _stats = SearchStats::default();
         // Test 1: can the SAT solver find X/Y from scratch?
-        let template = SatXYTemplate::build(p, tuple).expect("template should build");
+        let template = SatXYTemplate::build(p, tuple, &radical::SolverConfig::default()).expect("template should build");
         assert!(template.is_feasible(&candidate), "known Z/W should be feasible");
 
         // Test 2: hardcode the known X/Y and check consistency
@@ -3746,8 +4047,8 @@ mod tests {
 
     #[test]
     fn sat_finds_tt4() {
-        let p = Problem::new(4);
-        let report = run_sat_search(p, false);
+        let cfg = SearchConfig { problem: Problem::new(4), no_table: true, ..Default::default() };
+        let report = run_sat_search(&cfg, false);
         assert!(report.found_solution, "SAT should find TT(4)");
     }
 
@@ -4142,7 +4443,7 @@ mod tests {
             zw[s] = 2 * nz + 2 * nw;
         }
         let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr: zw };
-        let template = SatXYTemplate::build(p, tuple);
+        let template = SatXYTemplate::build(p, tuple, &radical::SolverConfig::default());
         assert!(template.is_some(), "Template should build for n=2");
         let result = template.unwrap().solve_for(&candidate);
         assert!(result.is_some(), "SAT should find X,Y for TT(2)");
