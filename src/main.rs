@@ -291,7 +291,6 @@ struct CandidateZW {
     z: PackedSeq,
     w: PackedSeq,
     zw_autocorr: Vec<i32>,
-    max_pair_power: f64,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -853,7 +852,6 @@ fn stream_zw_candidates(
             let w = &w_candidates[wi];
             stats.candidate_pair_attempts += 1;
             if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
-            let max_power = spectral_pair_max_power(&z_spectrum, &w.spectrum);
             stats.candidate_pair_spectral_ok += 1;
             let z_auto = z_auto.get_or_insert_with(|| {
                 let mut a = vec![0i32; problem.n];
@@ -876,7 +874,6 @@ fn stream_zw_candidates(
                 z: z_seq.clone(),
                 w: w.seq.clone(),
                 zw_autocorr: zw,
-                max_pair_power: max_power,
             });
         }
         true
@@ -1548,7 +1545,7 @@ fn solve_work_item(
                 compute_zw_autocorr(problem, z, w)
             });
             let candidate = CandidateZW {
-                z: z.clone(), w: w.clone(), zw_autocorr, max_pair_power: item.priority,
+                z: z.clone(), w: w.clone(), zw_autocorr,
             };
             if let Some(table) = xy_table {
                 table.solve_xy_with_sat(problem, item.tuple, &candidate, template)
@@ -3247,7 +3244,7 @@ fn main() {
             let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
             zw_autocorr[s] = 2 * nz + 2 * nw;
         }
-        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr, max_pair_power: 0.0 };
+        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr };
         // Try all sum tuples that match this Z/W
         let raw = enumerate_sum_tuples(p);
         let mut seen = std::collections::HashSet::new();
@@ -3555,9 +3552,9 @@ mod tests {
             let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
             *slot = 2 * nz + 2 * nw;
         }
-        let candidate = CandidateZW { z, w, zw_autocorr: zw, max_pair_power: 0.0 };
+        let candidate = CandidateZW { z, w, zw_autocorr: zw };
         let tuple = SumTuple { x: 0, y: 6, z: 8, w: 5 };
-        let mut stats = SearchStats::default();
+        let _stats = SearchStats::default();
         // Test 1: can the SAT solver find X/Y from scratch?
         let template = SatXYTemplate::build(p, tuple).expect("template should build");
         assert!(template.is_feasible(&candidate), "known Z/W should be feasible");
@@ -4144,7 +4141,7 @@ mod tests {
             let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
             zw[s] = 2 * nz + 2 * nw;
         }
-        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr: zw, max_pair_power: 0.0 };
+        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr: zw };
         let template = SatXYTemplate::build(p, tuple);
         assert!(template.is_some(), "Template should build for n=2");
         let result = template.unwrap().solve_for(&candidate);
