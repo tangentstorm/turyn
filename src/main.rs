@@ -3485,9 +3485,7 @@ fn main() {
     if let Some(ref phase) = cfg.phase_only {
         let problem = cfg.problem;
         let raw = enumerate_sum_tuples(problem);
-        let mut seen = std::collections::HashSet::new();
-        let mut tuples: Vec<SumTuple> = raw.into_iter()
-            .filter(|t| seen.insert((t.x, t.y, t.z, t.w)))
+        let mut tuples: Vec<SumTuple> = normalized_tuples(&raw).into_iter()
             .filter(|t| {
                 (t.x + problem.n as i32) % 2 == 0
                 && (t.y + problem.n as i32) % 2 == 0
