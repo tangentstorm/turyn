@@ -413,8 +413,20 @@ In `recompute_quad_pb`, the inner loop loads `assigns[var_a()]` and `assigns[var
 
 These target the SAT solver (radical), which dominates runtime at n >= 22. Sourced from CryptoMiniSat, CaDiCaL, Kissat, Lingeling, and MapleSAT.
 
-**Benchmark:** `turyn --n=56 --tuple=8,14,6,1 --theta=50 --max-spectral=200 --max-z=50000 --max-w=50000 --benchmark=3`
-Baseline: mean=35688ms, median=35499ms (229 SAT instances, 4 threads)
+**Benchmark:** `turyn --n=56 --sat --tuple=8,14,6,1 --sat-secs=60 --conflict-limit=2000`
+With k=7 table. Baseline (no CMS): 101 solves/60s, 1.63/s, avg 653 conflicts.
+Note: --sat mode uses totalizer encoding (52K vars, 576K clauses at n=56).
+
+### Results summary
+
+| Idea | Status | n=56 solves/60s | Rate | Notes |
+|------|--------|-----------------|------|-------|
+| Baseline (no CMS) | — | 101 | 1.63/s | |
+| CMS1: Warm-start | **Accepted** | — | +18% (n=26) | Phase/clause transfer across solves |
+| CMS2: Lucky phases | Rejected | — | -17% | Full propagation on UNSAT too expensive |
+| CMS4: Vivification | **Accepted** | 115-125 | 1.84-2.02/s | +18% on n=56, shortens learnt clauses |
+| CMS5: SCC equiv | Rejected | 106-118 | 1.55-1.71/s | 6372 equiv pairs found but no speedup |
+| CMS8: BVE | Rejected | 99-104 | 1.55-1.64/s | 9360 vars eliminated, net neutral |
 
 ### CMS1. Warm-start learnt clause and phase transfer across SAT calls
 
