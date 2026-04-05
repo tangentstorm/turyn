@@ -653,6 +653,34 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8]) -> bool>(
     );
 }
 
+/// Print search space statistics for a set of tuples.
+/// For each tuple, shows C(n, (n+s)/2) for each sequence — the number of
+/// {+1,-1} strings of the given length with the given sum.
+/// Print search space statistics for a set of tuples.
+/// For each tuple, shows C(n, (n+s)/2) for each sequence — the number of
+/// {+1,-1} strings of the given length with the given sum.
+fn print_search_space(problem: Problem, tuples: &[SumTuple]) {
+    let n = problem.n;
+    let m = problem.m();
+    let mut grand_total: f64 = 0.0;
+    for t in tuples {
+        let cx = binom(n, ((t.x + n as i32) / 2) as usize);
+        let cy = binom(n, ((t.y + n as i32) / 2) as usize);
+        let cz = binom(n, ((t.z + n as i32) / 2) as usize);
+        let cw = binom(m, ((t.w + m as i32) / 2) as usize);
+        let prod = cx as f64 * cy as f64 * cz as f64 * cw as f64;
+        grand_total += prod;
+        eprintln!("  ({:>2},{:>2},{:>2},{:>2})  X:C({},{})={:.3e}  Y:C({},{})={:.3e}  Z:C({},{})={:.3e}  W:C({},{})={:.3e}  total {:.3e}",
+            t.x, t.y, t.z, t.w,
+            n, (t.x + n as i32) / 2, cx as f64,
+            n, (t.y + n as i32) / 2, cy as f64,
+            n, (t.z + n as i32) / 2, cz as f64,
+            m, (t.w + m as i32) / 2, cw as f64,
+            prod);
+    }
+    eprintln!("  Brute-force search space (all tuples): {:.3e}", grand_total);
+}
+
 /// Compute binomial coefficient C(n, k) as u128 (enough for n ≤ 60).
 fn binom(n: usize, k: usize) -> u128 {
     if k > n { return 0; }
@@ -3000,6 +3028,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
     if verbose {
         eprintln!("{} sum-tuples", tuples.len());
+        print_search_space(problem, &tuples);
     }
 
     let n = problem.n;
@@ -3794,6 +3823,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     if verbose {
         let method = if xy_table.is_some() { "table+SAT" } else { "SAT X/Y" };
         eprintln!("{} normalized tuples, Phase C: {}", tuples.len(), method);
+        print_search_space(problem, &tuples);
     }
 
     let cfg = cfg.clone();
@@ -4078,6 +4108,7 @@ fn main() {
             for t in &tuples {
                 println!("  ({},{},{},{})", t.x, t.y, t.z, t.w);
             }
+            print_search_space(problem, &tuples);
         } else if phase == "phase-b" {
             let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
             let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
