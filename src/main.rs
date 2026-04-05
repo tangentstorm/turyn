@@ -656,9 +656,6 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8]) -> bool>(
 /// Print search space statistics for a set of tuples.
 /// For each tuple, shows C(n, (n+s)/2) for each sequence — the number of
 /// {+1,-1} strings of the given length with the given sum.
-/// Print search space statistics for a set of tuples.
-/// For each tuple, shows C(n, (n+s)/2) for each sequence — the number of
-/// {+1,-1} strings of the given length with the given sum.
 fn print_search_space(problem: Problem, tuples: &[SumTuple]) {
     let n = problem.n;
     let m = problem.m();
@@ -3213,19 +3210,15 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let use_quad_pb = cfg.quad_pb;
         let templates: Vec<(SatEncoder, radical::Solver)> = tuples.iter()
             .map(|&tuple| {
-                if use_quad_pb {
-                    let (enc, mut solver) = sat_encode_quad_pb_unified(
-                        problem, tuple, None, None, None, None,
-                    ).expect("quad PB encoding infeasible for tuple");
-                    solver.config.vivification = true;
-                    solver.config.chrono_bt = true;
-                    (enc, solver)
+                let (enc, mut solver) = if use_quad_pb {
+                    sat_encode_quad_pb_unified(problem, tuple, None, None, None, None)
+                        .expect("quad PB encoding infeasible for tuple")
                 } else {
-                    let (enc, mut solver) = sat_encode(problem, tuple);
-                    solver.config.vivification = true;
-                    solver.config.chrono_bt = true;
-                    (enc, solver)
-                }
+                    sat_encode(problem, tuple)
+                };
+                solver.config.vivification = true;
+                solver.config.chrono_bt = true;
+                (enc, solver)
             })
             .collect();
         let templates = Arc::new(templates);
@@ -3260,7 +3253,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 };
 
                 // Warm-start state: phase-only transfer (clause transfer is harmful per testing)
-                let mut warm_phase: Option<Vec<bool>> = None;
+                let mut warm_phase: Vec<bool> = Vec::new();
 
                 let should_stop = || found.load(AtomicOrdering::Relaxed) || timed_out.load(AtomicOrdering::Relaxed);
                 loop {
@@ -3329,17 +3322,20 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                         let (ref enc, ref template_solver) = templates[ti];
                                         let mut solver = template_solver.clone();
                                         // Warm-start: phase-only transfer
-                                        if let Some(ref ph) = warm_phase {
-                                            solver.set_phase(ph);
+                                        if !warm_phase.is_empty() {
+                                            solver.set_phase(&warm_phase);
                                         }
 
                                         // Fix Z/W boundary (permanent — same for all XY configs)
+                                        // Batch all 4*k unit clauses with a single propagation pass.
+                                        let mut zw_units: Vec<i32> = Vec::with_capacity(4 * k);
                                         for i in 0..k {
-                                            solver.add_clause([if (z_bits >> i) & 1 == 1 { enc.z_var(i) } else { -enc.z_var(i) }]);
-                                            solver.add_clause([if (z_bits >> (k + i)) & 1 == 1 { enc.z_var(n - k + i) } else { -enc.z_var(n - k + i) }]);
-                                            solver.add_clause([if (w_bits >> i) & 1 == 1 { enc.w_var(i) } else { -enc.w_var(i) }]);
-                                            solver.add_clause([if (w_bits >> (k + i)) & 1 == 1 { enc.w_var(m - k + i) } else { -enc.w_var(m - k + i) }]);
+                                            zw_units.push(if (z_bits >> i) & 1 == 1 { enc.z_var(i) } else { -enc.z_var(i) });
+                                            zw_units.push(if (z_bits >> (k + i)) & 1 == 1 { enc.z_var(n - k + i) } else { -enc.z_var(n - k + i) });
+                                            zw_units.push(if (w_bits >> i) & 1 == 1 { enc.w_var(i) } else { -enc.w_var(i) });
+                                            zw_units.push(if (w_bits >> (k + i)) & 1 == 1 { enc.w_var(m - k + i) } else { -enc.w_var(m - k + i) });
                                         }
+                                        solver.add_unit_clauses_batch(&zw_units);
 
                                         // If Z/W boundary caused contradiction, skip all XY configs
                                         if !solver.is_ok() {
@@ -3371,7 +3367,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                             let nc = solver.num_conflicts() - conflicts_before;
                                             total_conflicts.fetch_add(nc, AtomicOrdering::Relaxed);
                                             // Save phase for warm-start
-                                            warm_phase = Some(solver.get_phase());
+                                            solver.copy_phase_into(&mut warm_phase);
 
                                             if result == Some(true) {
                                                 let x = PackedSeq::from_values(&(0..n).map(|i|

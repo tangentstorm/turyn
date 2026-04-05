@@ -1185,6 +1185,12 @@ impl Solver {
         self.phase.clone()
     }
 
+    /// Copy current phase into an existing buffer (avoids allocation).
+    pub fn copy_phase_into(&self, buf: &mut Vec<bool>) {
+        buf.clear();
+        buf.extend_from_slice(&self.phase);
+    }
+
     /// Set the phase saving vector (for warm-starting).
     /// Only sets entries up to min(phase.len(), self.phase.len()).
     pub fn set_phase(&mut self, phase: &[bool]) {
