@@ -703,6 +703,179 @@ impl Solver {
     /// Set to 0 to disable.
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
 
+    /// Bounded variable elimination (BVE) preprocessing.
+    /// Resolves out variables that appear in few clauses when the resolvent
+    /// set is no larger than the original. Variables in `protected` are never eliminated.
+    /// Returns number of eliminated variables.
+    pub fn preprocess_bve(&mut self) -> usize {
+        self.preprocess_bve_with_protection(&[])
+    }
+
+    /// BVE with a set of protected variable indices (0-based) that won't be eliminated.
+    pub fn preprocess_bve_with_protection(&mut self, protected: &[usize]) -> usize {
+        if !self.ok { return 0; }
+        // Propagate first to simplify
+        if self.propagate().is_some() {
+            self.ok = false;
+            return 0;
+        }
+
+        let mut eliminated = 0usize;
+        let num_vars = self.num_vars;
+
+        // Build occurrence lists: for each variable, which non-deleted clauses contain it
+        let mut pos_occs: Vec<Vec<u32>> = vec![Vec::new(); num_vars];
+        let mut neg_occs: Vec<Vec<u32>> = vec![Vec::new(); num_vars];
+        for (ci, m) in self.clause_meta.iter().enumerate() {
+            if m.deleted { continue; }
+            let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
+            for &lit in lits {
+                let v = var_of(lit);
+                if self.assigns[v] != LBool::Undef { continue; } // skip assigned vars
+                if lit > 0 {
+                    pos_occs[v].push(ci as u32);
+                } else {
+                    neg_occs[v].push(ci as u32);
+                }
+            }
+        }
+
+        // Try to eliminate variables with few occurrences
+        // Skip protected vars and vars involved in PB, quad PB, or XOR constraints
+        let mut pb_vars = vec![false; num_vars];
+        for &v in protected {
+            if v < num_vars { pb_vars[v] = true; }
+        }
+        for pbc in &self.pb_constraints {
+            for &lit in &pbc.lits { pb_vars[var_of(lit)] = true; }
+        }
+        for qpbc in &self.quad_pb_constraints {
+            for t in &qpbc.terms {
+                pb_vars[t.var_a()] = true;
+                pb_vars[t.var_b()] = true;
+            }
+        }
+        for xc in &self.xor_constraints {
+            for &v in &xc.vars { pb_vars[v] = true; }
+        }
+
+        // Process variables in order of increasing occurrence count
+        let mut candidates: Vec<(usize, usize)> = (0..num_vars)
+            .filter(|&v| {
+                self.assigns[v] == LBool::Undef
+                && !pb_vars[v]
+                && !pos_occs[v].is_empty()
+                && !neg_occs[v].is_empty()
+            })
+            .map(|v| (pos_occs[v].len() * neg_occs[v].len(), v))
+            .collect();
+        candidates.sort_unstable();
+
+        for &(product, v) in &candidates {
+            // Skip if too many resolvents
+            if product > 100 { break; }
+
+            let pos = &pos_occs[v];
+            let neg = &neg_occs[v];
+
+            // Check all clauses are still non-deleted
+            let pos_valid: Vec<u32> = pos.iter().copied()
+                .filter(|&ci| !self.clause_meta[ci as usize].deleted)
+                .collect();
+            let neg_valid: Vec<u32> = neg.iter().copied()
+                .filter(|&ci| !self.clause_meta[ci as usize].deleted)
+                .collect();
+
+            if pos_valid.is_empty() || neg_valid.is_empty() { continue; }
+
+            let original_count = pos_valid.len() + neg_valid.len();
+
+            // Compute all resolvents
+            let mut resolvents: Vec<Vec<Lit>> = Vec::new();
+            let mut too_many = false;
+            let var_lit_pos = (v + 1) as i32;
+            let var_lit_neg = -((v + 1) as i32);
+
+            for &pci in &pos_valid {
+                let pm = &self.clause_meta[pci as usize];
+                let p_lits = &self.clause_lits[pm.start as usize..(pm.start as usize + pm.len as usize)];
+                for &nci in &neg_valid {
+                    let nm = &self.clause_meta[nci as usize];
+                    let n_lits = &self.clause_lits[nm.start as usize..(nm.start as usize + nm.len as usize)];
+
+                    // Resolve: merge p_lits and n_lits, removing var_lit_pos and var_lit_neg
+                    let mut resolvent: Vec<Lit> = Vec::new();
+                    let mut tautology = false;
+                    for &lit in p_lits {
+                        if lit == var_lit_pos { continue; }
+                        resolvent.push(lit);
+                    }
+                    for &lit in n_lits {
+                        if lit == var_lit_neg { continue; }
+                        // Check for tautology (complementary literals)
+                        if resolvent.contains(&-lit) { tautology = true; break; }
+                        if !resolvent.contains(&lit) {
+                            resolvent.push(lit);
+                        }
+                    }
+                    if tautology { continue; }
+                    resolvents.push(resolvent);
+                    if resolvents.len() > original_count {
+                        too_many = true;
+                        break;
+                    }
+                }
+                if too_many { break; }
+            }
+
+            if too_many || resolvents.len() > original_count { continue; }
+
+            // Elimination is beneficial: delete original clauses, add resolvents
+            for &ci in &pos_valid {
+                self.clause_meta[ci as usize].deleted = true;
+            }
+            for &ci in &neg_valid {
+                self.clause_meta[ci as usize].deleted = true;
+            }
+            // Clean watches for deleted clauses
+            for li in 0..self.watches.len() {
+                self.watches[li].retain(|&(ci, _)| !self.clause_meta[ci as usize].deleted);
+            }
+
+            // Add resolvents
+            for resolvent in resolvents {
+                if resolvent.is_empty() {
+                    self.ok = false;
+                    return eliminated;
+                } else if resolvent.len() == 1 {
+                    let lit = resolvent[0];
+                    match self.lit_value(lit) {
+                        LBool::True => {}
+                        LBool::False => { self.ok = false; return eliminated; }
+                        LBool::Undef => {
+                            self.enqueue(lit, Reason::Decision);
+                            if self.propagate().is_some() {
+                                self.ok = false;
+                                return eliminated;
+                            }
+                        }
+                    }
+                } else {
+                    let ci = self.clause_meta.len() as u32;
+                    let start = self.clause_lits.len() as u32;
+                    self.watches[lit_index(negate(resolvent[0]))].push((ci, resolvent[1]));
+                    self.watches[lit_index(negate(resolvent[1]))].push((ci, resolvent[0]));
+                    self.clause_lits.extend_from_slice(&resolvent);
+                    self.clause_meta.push(ClauseMeta {
+                        start, len: resolvent.len() as u16, learnt: false, lbd: 0, deleted: false
+                    });
+                }
+            }
+            eliminated += 1;
+        }
+        eliminated
+    }
+
     /// Extract high-quality learnt clauses (LBD <= max_lbd) as Vec<Vec<Lit>>.
     /// Only returns non-deleted learnt clauses.
     pub fn extract_learnt_clauses(&self, max_lbd: u8) -> Vec<Vec<Lit>> {
