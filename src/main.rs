@@ -3039,7 +3039,11 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         // Pre-build SAT encoding templates (one per tuple, clone per config)
         // Run BVE preprocessing to eliminate auxiliary variables from totalizer encoding
         let templates: Vec<(SatEncoder, radical::Solver)> = tuples.iter()
-            .map(|&tuple| sat_encode(problem, tuple))
+            .map(|&tuple| {
+                let (enc, mut solver) = sat_encode(problem, tuple);
+                solver.config.vivification = true;
+                (enc, solver)
+            })
             .collect();
         let templates = Arc::new(templates);
         let tuples = Arc::new(tuples);

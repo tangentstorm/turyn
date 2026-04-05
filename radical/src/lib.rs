@@ -192,6 +192,8 @@ pub struct SolverConfig {
     pub xor_propagation: bool,
     /// Try saved phase as complete assignment before CDCL search (Kissat-style).
     pub lucky_phases: bool,
+    /// Periodically vivify (shorten) learnt clauses during restarts.
+    pub vivification: bool,
 }
 
 impl Default for SolverConfig {
@@ -202,6 +204,7 @@ impl Default for SolverConfig {
             rephasing: false,
             xor_propagation: true,
             lucky_phases: false,
+            vivification: false,
         }
     }
 }
@@ -983,6 +986,104 @@ impl Solver {
         self.trail.reserve(self.num_vars);
     }
 
+    /// Vivify (try to shorten) up to `max_clauses` learnt clauses.
+    /// Must be called at decision level `base_level` with all propagation done.
+    fn vivify_clauses(&mut self, base_level: u32, max_clauses: usize) {
+        debug_assert!(self.decision_level() == base_level);
+
+        // Collect candidate clause indices (learnt, non-deleted, len >= 3, small LBD)
+        let mut candidates: Vec<(u8, u32)> = Vec::new(); // (lbd, ci)
+        for (ci, m) in self.clause_meta.iter().enumerate() {
+            if m.deleted || !m.learnt || m.len < 3 || m.lbd > 6 { continue; }
+            candidates.push((m.lbd, ci as u32));
+        }
+        candidates.sort_unstable(); // sort by LBD (best first)
+        candidates.truncate(max_clauses);
+
+        for &(_, ci) in &candidates {
+            let m = &self.clause_meta[ci as usize];
+            if m.deleted { continue; }
+            let len = m.len as usize;
+            let start = m.start as usize;
+
+            // Copy clause literals (we may modify the clause)
+            let lits: Vec<Lit> = self.clause_lits[start..start + len].to_vec();
+
+            // Try to shorten: assume negation of each literal, propagate
+            let mut shortened = false;
+            let mut new_len = len;
+
+            for k in 0..len {
+                let lit = lits[k];
+                let val = self.lit_value(lit);
+
+                if val == LBool::True {
+                    // Literal is already true at this level — clause is satisfied
+                    // Can strengthen by removing this literal (it's redundant)
+                    // But we need to be careful with watches
+                    break;
+                }
+                if val == LBool::False {
+                    // Literal already false — skip (it contributes nothing)
+                    continue;
+                }
+
+                // Assume negation of this literal
+                self.new_decision_level();
+                self.enqueue(-lit, Reason::Decision);
+                if let Some(_conflict) = self.propagate() {
+                    // Conflict! The clause can be shortened to lits[0..k] + asserting lit
+                    new_len = k + 1;
+                    shortened = true;
+                    self.backtrack(base_level);
+                    break;
+                }
+            }
+
+            // Undo any decisions we made
+            if self.decision_level() > base_level {
+                self.backtrack(base_level);
+            }
+
+            if shortened && new_len < len {
+                // Mark old clause as deleted
+                self.clause_meta[ci as usize].deleted = true;
+                // Remove watches for old clause
+                for li in 0..self.watches.len() {
+                    self.watches[li].retain(|&(wci, _)| wci != ci);
+                }
+
+                // Add shortened clause
+                let short_lits: Vec<Lit> = lits[..new_len].to_vec();
+                if short_lits.len() == 1 {
+                    // Unit clause — propagate immediately
+                    let unit = short_lits[0];
+                    if self.lit_value(unit) == LBool::Undef {
+                        self.enqueue(unit, Reason::Decision);
+                        if self.propagate().is_some() {
+                            self.ok = false;
+                            return;
+                        }
+                    } else if self.lit_value(unit) == LBool::False {
+                        self.ok = false;
+                        return;
+                    }
+                } else {
+                    let new_ci = self.clause_meta.len() as u32;
+                    let new_start = self.clause_lits.len() as u32;
+                    let lbd = self.compute_lbd(&short_lits).min(new_len as u32) as u8;
+                    self.watches[lit_index(negate(short_lits[0]))].push((new_ci, short_lits[1]));
+                    self.watches[lit_index(negate(short_lits[1]))].push((new_ci, short_lits[0]));
+                    self.clause_lits.extend_from_slice(&short_lits);
+                    self.clause_meta.push(ClauseMeta {
+                        start: new_start, len: short_lits.len() as u16,
+                        learnt: true, lbd, deleted: false,
+                    });
+                }
+            }
+        }
+    }
+
     /// Try assigning all unassigned variables according to the phase vector.
     /// Returns Some(true) if a solution is found, Some(false) if a conflict
     /// occurs, or None if we couldn't make progress.
@@ -1063,6 +1164,11 @@ impl Solver {
                     self.ema_restart_block = 0;
                     self.backtrack(base_level);
                     self.reduce_db();
+
+                    // Vivification: periodically try to shorten clauses
+                    if self.config.vivification && self.conflicts % 500 == 0 {
+                        self.vivify_clauses(base_level, 50);
+                    }
 
                     // Rephasing: periodically reset phases
                     if self.config.rephasing && self.conflicts >= self.rephase_conflicts {
