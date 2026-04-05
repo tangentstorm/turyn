@@ -2736,13 +2736,26 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
     let n = problem.n;
     let m = problem.m();
+
+    // Try to load XY boundary table for larger k
+    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table-k7.bin".to_string());
+    let xy_table: Option<XYBoundaryTable> = if cfg.no_table || n < 14 {
+        None
+    } else {
+        XYBoundaryTable::load(&table_path).and_then(|t| {
+            if n >= 2 * t.k { Some(t) } else { None }
+        })
+    };
+
     // Choose cubing depth: k positions from each end of each sequence.
-    // n >= 2k required. Larger k = more cubes but more precomputation.
-    // ZW signature precomputation is O(2^{4k}), so keep k modest.
+    // Use table's k if available, otherwise fall back to k=6.
     let k = if cfg.no_table || n < 8 {
         0 // no cubing, monolithic SAT
+    } else if let Some(ref tbl) = xy_table {
+        let max_k = (n - 1) / 2;
+        tbl.k.min(max_k)
     } else {
-        let max_k = (n - 1) / 2; // leave at least 1 middle position
+        let max_k = (n - 1) / 2;
         6usize.min(max_k)
     };
 
@@ -2808,70 +2821,73 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let z_configs = 1u32 << (2 * k);      // all 2k bits free
         let w_configs = 1u32 << (2 * k);      // all 2k bits free
 
+        let use_table = xy_table.is_some();
         if verbose {
-            eprintln!("On-the-fly cubing k={}: enumerating X({})*Y({})*Z({})*W({}) boundary configs",
-                k, x_configs, y_configs, z_configs, w_configs);
-        }
-
-        // Precompute X/Y signatures: group (x_bits, y_bits) by their combined
-        // autocorrelation signature AND boundary sum pair.
-        // We only store the XY side; ZW is iterated on the fly.
-        if verbose {
-            eprintln!("Precomputing X/Y boundary signatures...");
-        }
-        // Key: packed (autocorr_sig, x_bnd_sum, y_bnd_sum) → list of (x_bits, y_bits)
-        // Pack signature (up to 6 i16 values) + two sums into a compact hash key.
-        // For k=6: 6 sig values (-12..12 each, fits in 5 bits signed) + 2 sums (-12..12).
-        // Total: 8 values × 5 bits = 40 bits, fits in a u64.
-        let pack_key = |sig: &[i16], x_sum: i32, y_sum: i32| -> u64 {
-            let mut key: u64 = 0;
-            for (i, &v) in sig.iter().enumerate() {
-                key |= ((v as i64 + 64) as u64 & 0x7F) << (i * 7);
+            if use_table {
+                eprintln!("Table-based cubing k={}: Z({})*W({}) boundary configs, XY from table",
+                    k, z_configs, w_configs);
+            } else {
+                eprintln!("On-the-fly cubing k={}: enumerating X({})*Y({})*Z({})*W({}) boundary configs",
+                    k, x_configs, y_configs, z_configs, w_configs);
             }
-            key |= ((x_sum as i64 + 64) as u64 & 0x7F) << (sig.len() * 7);
-            key |= ((y_sum as i64 + 64) as u64 & 0x7F) << ((sig.len() + 1) * 7);
-            key
-        };
-
-        // Pre-compute per-X and per-Y autocorrelation contributions separately,
-        // then combine. Avoids redundant recomputation in the inner loop.
-        let num_lags = exact_lags.len();
-        let mut x_autocorr: Vec<Vec<i16>> = Vec::with_capacity(x_configs as usize);
-        for xr in 0..x_configs {
-            let x_bits = (xr << 1) | 1;
-            let vals: Vec<i16> = exact_lags.iter()
-                .map(|el| bnd_autocorr(x_bits, &el.xy_pairs) as i16)
-                .collect();
-            x_autocorr.push(vals);
-        }
-        let mut y_autocorr: Vec<Vec<i16>> = Vec::with_capacity(y_configs as usize);
-        for y_bits in 0..y_configs {
-            let vals: Vec<i16> = exact_lags.iter()
-                .map(|el| bnd_autocorr(y_bits, &el.xy_pairs) as i16)
-                .collect();
-            y_autocorr.push(vals);
         }
 
-        let mut xy_by_sig_sum: HashMap<u64, Vec<(u32, u32)>> = HashMap::new();
-        let mut sig_buf = vec![0i16; num_lags];
-        for xr in 0..x_configs {
-            let x_bits = (xr << 1) | 1;
-            let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
-            let x_ac = &x_autocorr[xr as usize];
-            for y_bits in 0..y_configs {
-                let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
-                let y_ac = &y_autocorr[y_bits as usize];
-                for j in 0..num_lags {
-                    sig_buf[j] = x_ac[j] + y_ac[j];
+        // On-the-fly XY precomputation (only when table not available)
+        let xy_by_sig_sum: HashMap<u64, Vec<(u32, u32)>> = if use_table {
+            HashMap::new() // not used — table provides XY lookup
+        } else {
+            if verbose {
+                eprintln!("Precomputing X/Y boundary signatures...");
+            }
+            let pack_key = |sig: &[i16], x_sum: i32, y_sum: i32| -> u64 {
+                let mut key: u64 = 0;
+                for (i, &v) in sig.iter().enumerate() {
+                    key |= ((v as i64 + 64) as u64 & 0x7F) << (i * 7);
                 }
-                let key = pack_key(&sig_buf, x_bnd_sum, y_bnd_sum);
-                xy_by_sig_sum.entry(key).or_default().push((x_bits, y_bits));
+                key |= ((x_sum as i64 + 64) as u64 & 0x7F) << (sig.len() * 7);
+                key |= ((y_sum as i64 + 64) as u64 & 0x7F) << ((sig.len() + 1) * 7);
+                key
+            };
+
+            let num_lags = exact_lags.len();
+            let mut x_autocorr: Vec<Vec<i16>> = Vec::with_capacity(x_configs as usize);
+            for xr in 0..x_configs {
+                let x_bits = (xr << 1) | 1;
+                let vals: Vec<i16> = exact_lags.iter()
+                    .map(|el| bnd_autocorr(x_bits, &el.xy_pairs) as i16)
+                    .collect();
+                x_autocorr.push(vals);
             }
-        }
-        if verbose {
-            let total_xy: usize = xy_by_sig_sum.values().map(|v| v.len()).sum();
-            eprintln!("  {} XY buckets, {} total entries", xy_by_sig_sum.len(), total_xy);
-        }
+            let mut y_autocorr: Vec<Vec<i16>> = Vec::with_capacity(y_configs as usize);
+            for y_bits in 0..y_configs {
+                let vals: Vec<i16> = exact_lags.iter()
+                    .map(|el| bnd_autocorr(y_bits, &el.xy_pairs) as i16)
+                    .collect();
+                y_autocorr.push(vals);
+            }
+
+            let mut map: HashMap<u64, Vec<(u32, u32)>> = HashMap::new();
+            let mut sig_buf = vec![0i16; num_lags];
+            for xr in 0..x_configs {
+                let x_bits = (xr << 1) | 1;
+                let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
+                let x_ac = &x_autocorr[xr as usize];
+                for y_bits in 0..y_configs {
+                    let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
+                    let y_ac = &y_autocorr[y_bits as usize];
+                    for j in 0..num_lags {
+                        sig_buf[j] = x_ac[j] + y_ac[j];
+                    }
+                    let key = pack_key(&sig_buf, x_bnd_sum, y_bnd_sum);
+                    map.entry(key).or_default().push((x_bits, y_bits));
+                }
+            }
+            if verbose {
+                let total_xy: usize = map.values().map(|v| v.len()).sum();
+                eprintln!("  {} XY buckets, {} total entries", map.len(), total_xy);
+            }
+            map
+        };
 
         // Parallel solve: each worker iterates a slice of z_bits, computes matching
         // configs on the fly, and solves them immediately. No pre-enumeration needed.
@@ -2894,6 +2910,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let time_limit_secs = cfg.sat_secs;
         let conflict_limit = cfg.conflict_limit;
         let xy_by_sig_sum = Arc::new(xy_by_sig_sum);
+        let xy_table = Arc::new(xy_table);
 
         // Pre-build SAT encoding templates (one per tuple, clone per config)
         let templates: Vec<(SatEncoder, radical::Solver)> = tuples.iter()
@@ -2914,6 +2931,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             let total_conflicts = Arc::clone(&total_conflicts);
             let z_idx = Arc::clone(&z_idx);
             let xy_by_sig_sum = Arc::clone(&xy_by_sig_sum);
+            let xy_table = Arc::clone(&xy_table);
             let templates = Arc::clone(&templates);
             let tuples = Arc::clone(&tuples);
             let exact_lags_clone: Vec<(Vec<(u32, u32)>, Vec<(u32, u32)>, Vec<(u32, u32)>)> = exact_lags.iter()
@@ -2947,12 +2965,15 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                         w_scanned.fetch_add(1, AtomicOrdering::Relaxed);
                         let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
 
+                        // Compute ZW signature for on-the-fly path (skip if table available)
                         let num_lags = exact_lags_clone.len();
                         let mut req_sig = vec![0i16; num_lags];
-                        for (j, (_, z_pairs, w_pairs)) in exact_lags_clone.iter().enumerate() {
-                            let z_val = bnd_autocorr(z_bits, z_pairs);
-                            let w_val = bnd_autocorr(w_bits, w_pairs);
-                            req_sig[j] = -(2 * z_val + 2 * w_val) as i16;
+                        if xy_table.is_none() {
+                            for (j, (_, z_pairs, w_pairs)) in exact_lags_clone.iter().enumerate() {
+                                let z_val = bnd_autocorr(z_bits, z_pairs);
+                                let w_val = bnd_autocorr(w_bits, w_pairs);
+                                req_sig[j] = -(2 * z_val + 2 * w_val) as i16;
+                            }
                         }
 
                         for (ti, tuple) in tuples.iter().enumerate() {
@@ -2968,18 +2989,30 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                     let y_mid = tuple.y - y_bnd_sum;
                                     if y_mid.abs() > middle_n as i32 || (y_mid + middle_n as i32) % 2 != 0 { continue; }
 
-                                    let key = {
-                                        let mut k: u64 = 0;
-                                        for (i, &v) in req_sig.iter().enumerate() {
-                                            k |= ((v as i64 + 64) as u64 & 0x7F) << (i * 7);
-                                        }
-                                        k |= ((x_bnd_sum as i64 + 64) as u64 & 0x7F) << (num_lags * 7);
-                                        k |= ((y_bnd_sum as i64 + 64) as u64 & 0x7F) << ((num_lags + 1) * 7);
-                                        k
-                                    };
-                                    if let Some(xy_list) = xy_by_sig_sum.get(&key) {
-                                        xy_matches.fetch_add(xy_list.len(), AtomicOrdering::Relaxed);
-                                        for &(x_bits, y_bits) in xy_list {
+                                    // Look up XY boundary configs: table (O(1)) or HashMap
+                                    let xy_slice: &[(u32, u32)];
+                                    let xy_vec_holder: Vec<(u32, u32)>;
+                                    if let Some(ref tbl) = *xy_table {
+                                        xy_slice = tbl.get_xy_entries(z_bits, w_bits, x_bnd_sum, y_bnd_sum);
+                                    } else {
+                                        let key = {
+                                            let mut k: u64 = 0;
+                                            for (i, &v) in req_sig.iter().enumerate() {
+                                                k |= ((v as i64 + 64) as u64 & 0x7F) << (i * 7);
+                                            }
+                                            k |= ((x_bnd_sum as i64 + 64) as u64 & 0x7F) << (num_lags * 7);
+                                            k |= ((y_bnd_sum as i64 + 64) as u64 & 0x7F) << ((num_lags + 1) * 7);
+                                            k
+                                        };
+                                        xy_vec_holder = Vec::new(); // lifetime anchor
+                                        xy_slice = match xy_by_sig_sum.get(&key) {
+                                            Some(v) => v.as_slice(),
+                                            None => &xy_vec_holder,
+                                        };
+                                    }
+                                    if !xy_slice.is_empty() {
+                                        xy_matches.fetch_add(xy_slice.len(), AtomicOrdering::Relaxed);
+                                        for &(x_bits, y_bits) in xy_slice {
                                             if should_stop() { break; }
 
                                             let (ref enc, ref template_solver) = templates[ti];
