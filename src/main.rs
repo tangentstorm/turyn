@@ -1490,6 +1490,109 @@ impl SatXYTemplate {
     fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
         self.solve_for_limited(candidate, 0).0
     }
+
+    /// Solve with warm-start: inject saved clauses/phases before solving,
+    /// extract learnt clauses/phases after solving.
+    fn solve_for_warm(
+        &self,
+        candidate: &CandidateZW,
+        warm: &mut WarmStartState,
+    ) -> Option<(PackedSeq, PackedSeq)> {
+        if !self.is_feasible(candidate) { return None; }
+        let n = self.n;
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+        let Some(equalities) = gj_candidate_equalities(n, candidate) else {
+            return None;
+        };
+
+        let mut solver = self.solver.clone();
+
+        // Inject warm-start data
+        if warm.inject_clauses && !warm.clauses.is_empty() {
+            solver.inject_clauses(&warm.clauses, 2);
+        }
+        if warm.inject_phase {
+            if let Some(ref ph) = warm.phase {
+                solver.set_phase(ph);
+            }
+        }
+
+        for &(a, b, equal) in &equalities {
+            if equal {
+                solver.add_clause([-a, b]);
+                solver.add_clause([a, -b]);
+            } else {
+                solver.add_clause([-a, -b]);
+                solver.add_clause([a, b]);
+            }
+        }
+
+        for s in 1..n {
+            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
+            let target = (target_raw / 2) as usize;
+            let lp = &self.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+        }
+
+        if solver.config.xor_propagation && n >= 8 {
+            for s in 1..n {
+                let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
+                if target_raw < 0 || target_raw % 2 != 0 { continue; }
+                let target = (target_raw / 2) as usize;
+                let k = 2 * (n - s);
+                let parity = ((target + k) % 2) == 1;
+                let mut in_xor = vec![false; 2 * n];
+                for i in 0..(n - s) {
+                    in_xor[i] ^= true;
+                    in_xor[i + s] ^= true;
+                }
+                for i in 0..(n - s) {
+                    in_xor[n + i] ^= true;
+                    in_xor[n + i + s] ^= true;
+                }
+                let vars: Vec<i32> = in_xor.iter().enumerate()
+                    .filter(|&(_, &v)| v)
+                    .map(|(i, _)| (i + 1) as i32)
+                    .collect();
+                if !vars.is_empty() {
+                    solver.add_xor(&vars, parity);
+                }
+            }
+        }
+
+        let result = solver.solve();
+
+        // Extract warm-start data for next solve
+        let new_clauses = solver.extract_learnt_clauses(warm.max_lbd);
+        for c in new_clauses {
+            if warm.clauses.len() < warm.max_clauses {
+                warm.clauses.push(c);
+            }
+        }
+        warm.phase = Some(solver.get_phase());
+
+        match result {
+            Some(true) => {
+                let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
+                let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
+                Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Per-worker warm-start state for clause/phase transfer between SAT solves.
+struct WarmStartState {
+    clauses: Vec<Vec<i32>>,
+    phase: Option<Vec<bool>>,
+    max_clauses: usize,
+    max_lbd: u8,
+    inject_clauses: bool,
+    inject_phase: bool,
 }
 
 /// SAT-based X/Y solver: given fixed Z/W, encode just X/Y constraints and solve.
@@ -1592,6 +1695,7 @@ fn solve_work_item(
     template_cache: &mut HashMap<(i32, i32, i32, i32), SatXYTemplate>,
     xy_table: Option<&XYBoundaryTable>,
     sat_config: &radical::SolverConfig,
+    warm: &mut WarmStartState,
 ) -> Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)> {
     match (&item.x, &item.y, &item.z, &item.w) {
         // All blank: pure SAT for all four sequences
@@ -1622,7 +1726,7 @@ fn solve_work_item(
                 table.solve_xy_with_sat(problem, item.tuple, &candidate, template)
                     .map(|(x, y)| (x, y, z.clone(), w.clone()))
             } else {
-                template.solve_for(&candidate)
+                template.solve_for_warm(&candidate, warm)
                     .map(|(x, y)| (x, y, z.clone(), w.clone()))
             }
         }
@@ -1642,6 +1746,7 @@ fn run_parallel_search<P>(
     produce: P,
     verbose: bool,
     mode_name: &str,
+    time_limit_secs: u64,
 ) -> SearchReport
 where
     P: FnOnce(std::sync::mpsc::Sender<SatWorkItem>, Arc<AtomicBool>) -> SearchStats
@@ -1683,6 +1788,14 @@ where
 
         std::thread::spawn(move || {
             let mut template_cache: HashMap<(i32, i32, i32, i32), SatXYTemplate> = HashMap::new();
+            let mut warm = WarmStartState {
+                clauses: Vec::new(),
+                phase: None,
+                max_clauses: 100,
+                max_lbd: 2,
+                inject_clauses: false,
+                inject_phase: true,
+            };
             let _ = ready_tx.send(tid);
             while let Ok(Some(item)) = work_rx.recv() {
                 if found.load(AtomicOrdering::Relaxed) { break; }
@@ -1690,6 +1803,7 @@ where
                 let solved = solve_work_item(
                     problem, &item, &mut template_cache,
                     xy_table.as_deref(), &sat_config,
+                    &mut warm,
                 );
                 phase_c_nanos_shared.fetch_add(
                     c_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
@@ -1792,6 +1906,15 @@ where
             break;
         }
 
+        // Time limit check
+        if time_limit_secs > 0 && run_start.elapsed().as_secs() >= time_limit_secs {
+            if verbose {
+                eprintln!("  Time limit reached ({}s)", time_limit_secs);
+            }
+            found.store(true, AtomicOrdering::Relaxed); // signal producer + workers to stop
+            break;
+        }
+
         if verbose && last_progress.elapsed().as_secs() >= 10 {
             let elapsed = run_start.elapsed().as_secs_f64();
             let done = items_completed.load(AtomicOrdering::Relaxed);
@@ -1828,6 +1951,7 @@ where
         println!("  Phase C (SAT solve):      {:>10.3?}  (thread-sum)", phase_c);
         println!("  Items dispatched:         {:>10}", dispatched);
         println!("  Items completed:          {:>10}", done);
+        println!("  Rate:                     {:.2} solves/s", done as f64 / total.as_secs_f64());
         println!("  Wall-clock:               {:>10.3?}", total);
         if !found_solution {
             println!("No solution found.");
@@ -2104,7 +2228,7 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             });
         }
         stats
-    }, verbose, "W-enum + SAT Z + SAT XY")
+    }, verbose, "W-enum + SAT Z + SAT XY", 0)
 }
 
 /// Hybrid Z-DFS + SAT X/Y/W search. Generates Z candidates via DFS with
@@ -2142,7 +2266,7 @@ fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             });
         }
         stats
-    }, verbose, "Z-DFS + SAT XYW")
+    }, verbose, "Z-DFS + SAT XYW", 0)
 }
 
 fn run_benchmark(cfg: &SearchConfig) {
@@ -2773,7 +2897,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 });
             }
             stats
-        }, verbose, "pure SAT")
+        }, verbose, "pure SAT", 0)
     } else {
         // On-the-fly boundary enumeration: compute exact-lag constraints directly
         // and enumerate all valid 4-sequence boundary configs as SAT cubes.
@@ -2913,6 +3037,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let xy_table = Arc::new(xy_table);
 
         // Pre-build SAT encoding templates (one per tuple, clone per config)
+        // Run BVE preprocessing to eliminate auxiliary variables from totalizer encoding
         let templates: Vec<(SatEncoder, radical::Solver)> = tuples.iter()
             .map(|&tuple| sat_encode(problem, tuple))
             .collect();
@@ -3503,6 +3628,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     }
 
     let cfg = cfg.clone();
+    let sat_secs = cfg.sat_secs;
     let sat_config = cfg.sat_config.clone();
     run_parallel_search(problem, xy_table, sat_config, move |tx, found| {
         let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
@@ -3533,7 +3659,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 z_gen, z_ok, w_candidates.len(), pairs);
         }
         stats
-    }, verbose, "hybrid (Phase B → SAT XY)")
+    }, verbose, "hybrid (Phase B \u{2192} SAT XY)", sat_secs)
 }
 
 fn print_help() {
