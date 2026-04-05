@@ -257,6 +257,8 @@ struct SearchConfig {
     sat_config: radical::SolverConfig,
     /// Time limit in seconds for --sat mode (0 = unlimited).
     sat_secs: u64,
+    /// Use quad PB encoding instead of totalizer in --sat cubed mode.
+    quad_pb: bool,
 }
 
 impl Default for SearchConfig {
@@ -284,6 +286,7 @@ impl Default for SearchConfig {
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
             sat_secs: 0,
+            quad_pb: true,
         }
     }
 }
@@ -648,6 +651,31 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8]) -> bool>(
         tail_one,
         &mut visit,
     );
+}
+
+/// Print search space statistics for a set of tuples.
+/// For each tuple, shows C(n, (n+s)/2) for each sequence — the number of
+/// {+1,-1} strings of the given length with the given sum.
+fn print_search_space(problem: Problem, tuples: &[SumTuple]) {
+    let n = problem.n;
+    let m = problem.m();
+    let mut grand_total: f64 = 0.0;
+    for t in tuples {
+        let cx = binom(n, ((t.x + n as i32) / 2) as usize);
+        let cy = binom(n, ((t.y + n as i32) / 2) as usize);
+        let cz = binom(n, ((t.z + n as i32) / 2) as usize);
+        let cw = binom(m, ((t.w + m as i32) / 2) as usize);
+        let prod = cx as f64 * cy as f64 * cz as f64 * cw as f64;
+        grand_total += prod;
+        eprintln!("  ({:>2},{:>2},{:>2},{:>2})  X:C({},{})={:.3e}  Y:C({},{})={:.3e}  Z:C({},{})={:.3e}  W:C({},{})={:.3e}  total {:.3e}",
+            t.x, t.y, t.z, t.w,
+            n, (t.x + n as i32) / 2, cx as f64,
+            n, (t.y + n as i32) / 2, cy as f64,
+            n, (t.z + n as i32) / 2, cz as f64,
+            m, (t.w + m as i32) / 2, cw as f64,
+            prod);
+    }
+    eprintln!("  Brute-force search space (all tuples): {:.3e}", grand_total);
 }
 
 /// Compute binomial coefficient C(n, k) as u128 (enough for n ≤ 60).
@@ -1704,6 +1732,7 @@ fn solve_work_item(
     xy_table: Option<&XYBoundaryTable>,
     sat_config: &radical::SolverConfig,
     warm: &mut WarmStartState,
+    use_quad_pb: bool,
 ) -> Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)> {
     match (&item.x, &item.y, &item.z, &item.w) {
         // All blank: pure SAT for all four sequences
@@ -1715,8 +1744,27 @@ fn solve_work_item(
         // Z fixed, rest blank: SAT for X/Y/W
         (SeqInput::Blank, SeqInput::Blank, SeqInput::Fixed(z), SeqInput::Blank) => {
             let z_vals: Vec<i8> = (0..z.len()).map(|i| z.get(i)).collect();
-            sat_solve_xyw(problem, item.tuple, &z_vals, false)
-                .map(|(x, y, w)| (x, y, z.clone(), w))
+            if use_quad_pb {
+                let (enc, mut solver) = sat_encode_quad_pb_unified(
+                    problem, item.tuple, None, None, Some(&z_vals), None)?;
+                let n = problem.n;
+                let m = problem.m();
+                match solver.solve() {
+                    Some(true) => {
+                        let x = PackedSeq::from_values(&(0..n).map(|i|
+                            if solver.value(enc.x_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                        let y = PackedSeq::from_values(&(0..n).map(|i|
+                            if solver.value(enc.y_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                        let w = PackedSeq::from_values(&(0..m).map(|i|
+                            if solver.value(enc.w_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                        Some((x, y, z.clone(), w))
+                    }
+                    _ => None,
+                }
+            } else {
+                sat_solve_xyw(problem, item.tuple, &z_vals, false)
+                    .map(|(x, y, w)| (x, y, z.clone(), w))
+            }
         }
         // Z and W fixed: SAT for X/Y
         (SeqInput::Blank, SeqInput::Blank, SeqInput::Fixed(z), SeqInput::Fixed(w)) => {
@@ -1755,6 +1803,7 @@ fn run_parallel_search<P>(
     verbose: bool,
     mode_name: &str,
     time_limit_secs: u64,
+    use_quad_pb: bool,
 ) -> SearchReport
 where
     P: FnOnce(std::sync::mpsc::Sender<SatWorkItem>, Arc<AtomicBool>) -> SearchStats
@@ -1811,7 +1860,7 @@ where
                 let solved = solve_work_item(
                     problem, &item, &mut template_cache,
                     xy_table.as_deref(), &sat_config,
-                    &mut warm,
+                    &mut warm, use_quad_pb,
                 );
                 phase_c_nanos_shared.fetch_add(
                     c_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
@@ -2236,7 +2285,7 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             });
         }
         stats
-    }, verbose, "W-enum + SAT Z + SAT XY", 0)
+    }, verbose, "W-enum + SAT Z + SAT XY", 0, cfg.quad_pb)
 }
 
 /// Hybrid Z-DFS + SAT X/Y/W search. Generates Z candidates via DFS with
@@ -2274,7 +2323,7 @@ fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             });
         }
         stats
-    }, verbose, "Z-DFS + SAT XYW", 0)
+    }, verbose, "Z-DFS + SAT XYW", 0, cfg.quad_pb)
 }
 
 fn run_benchmark(cfg: &SearchConfig) {
@@ -2800,6 +2849,115 @@ fn sat_encode(problem: Problem, tuple: SumTuple) -> (SatEncoder, radical::Solver
     (enc, solver)
 }
 
+/// Unified quad PB encoding for any combination of fixed/free sequences.
+/// Fixed sequences have their agree contributions folded into the constraint targets.
+/// Free sequences get PB sum constraints and quad PB autocorrelation terms.
+/// Returns None if structurally infeasible (parity mismatch, target out of range).
+fn sat_encode_quad_pb_unified(
+    problem: Problem,
+    tuple: SumTuple,
+    x_fixed: Option<&[i8]>,
+    y_fixed: Option<&[i8]>,
+    z_fixed: Option<&[i8]>,
+    w_fixed: Option<&[i8]>,
+) -> Option<(SatEncoder, radical::Solver)> {
+    let n = problem.n;
+    let m = problem.m();
+    let enc = SatEncoder::new(n);
+    let mut solver = radical::Solver::new();
+
+    // Symmetry breaking for free sequences
+    if x_fixed.is_none() { solver.add_clause([enc.x_var(0)]); }
+
+    // Helper: check sum parity
+    let check_sum = |sum: i32, len: usize| -> Option<u32> {
+        if (sum + len as i32) % 2 != 0 { return None; }
+        let pos = (sum + len as i32) / 2;
+        if pos < 0 || pos as usize > len { return None; }
+        Some(pos as u32)
+    };
+
+    // For each sequence: if free, add PB sum constraint; if fixed, verify sum
+    struct SeqInfo<'a> { fixed: Option<&'a [i8]>, sum: i32, len: usize }
+    let seqs = [
+        SeqInfo { fixed: x_fixed, sum: tuple.x, len: n },
+        SeqInfo { fixed: y_fixed, sum: tuple.y, len: n },
+        SeqInfo { fixed: z_fixed, sum: tuple.z, len: n },
+        SeqInfo { fixed: w_fixed, sum: tuple.w, len: m },
+    ];
+    let seq_var = |si: usize, i: usize| -> i32 {
+        match si { 0 => enc.x_var(i), 1 => enc.y_var(i), 2 => enc.z_var(i), _ => enc.w_var(i) }
+    };
+
+    for (si, seq) in seqs.iter().enumerate() {
+        match seq.fixed {
+            None => {
+                let pos = check_sum(seq.sum, seq.len)?;
+                let lits: Vec<i32> = (0..seq.len).map(|i| seq_var(si, i)).collect();
+                let ones: Vec<u32> = vec![1; seq.len];
+                solver.add_pb_eq(&lits, &ones, pos);
+            }
+            Some(vals) => {
+                let actual_sum: i32 = vals.iter().map(|&v| v as i32).sum();
+                if actual_sum != seq.sum { return None; }
+                // Fix variables
+                for i in 0..seq.len {
+                    solver.add_clause([if vals[i] > 0 { seq_var(si,i) } else { -seq_var(si,i) }]);
+                }
+            }
+        }
+    }
+
+    // Autocorrelation constraints: agree_x + agree_y + 2*agree_z + 2*agree_w = 2*(n-k) + (m-k)
+    // Fixed sequences contribute constant agree counts, subtracted from the target.
+    let coeff_weight = [1u32, 1, 2, 2]; // X, Y have weight 1; Z, W have weight 2
+    let seq_lens = [n, n, n, m];
+
+    for k in 1..n {
+        let w_overlap = if k < m { m - k } else { 0 };
+        let full_target = (2 * (n - k) + w_overlap) as i32;
+        let mut target_i = full_target;
+
+        // Subtract fixed-sequence agree contributions
+        for (si, seq) in seqs.iter().enumerate() {
+            if let Some(vals) = seq.fixed {
+                let len = seq_lens[si];
+                let overlap = if k < len { len - k } else { 0 };
+                let agree: i32 = (0..overlap).filter(|&i| vals[i] == vals[i + k]).count() as i32;
+                target_i -= coeff_weight[si] as i32 * agree;
+            }
+        }
+
+        if target_i < 0 { return None; }
+
+        // Build quad PB terms for free sequences
+        let mut lits_a = Vec::new();
+        let mut lits_b = Vec::new();
+        let mut coeffs = Vec::new();
+
+        for (si, seq) in seqs.iter().enumerate() {
+            if seq.fixed.is_some() { continue; }
+            let len = seq_lens[si];
+            let overlap = if k < len { len - k } else { 0 };
+            let w = coeff_weight[si];
+            for i in 0..overlap {
+                lits_a.push(seq_var(si,i)); lits_b.push(seq_var(si,i + k)); coeffs.push(w);
+                lits_a.push(-seq_var(si,i)); lits_b.push(-seq_var(si,i + k)); coeffs.push(w);
+            }
+        }
+
+        if lits_a.is_empty() {
+            if target_i != 0 { return None; } // all fixed, must equal 0
+        } else {
+            let max_val: i32 = coeffs.iter().sum::<u32>() as i32;
+            if target_i > max_val { return None; }
+            solver.add_quad_pb_eq(&lits_a, &lits_b, &coeffs, target_i as u32);
+        }
+    }
+
+    Some((enc, solver))
+}
+
 fn sat_search(problem: Problem, tuple: SumTuple, boundary: Option<&BoundaryConfig>, verbose: bool) -> Option<(Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>)> {
     let encode_start = Instant::now();
     let n = problem.n;
@@ -2867,6 +3025,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
     if verbose {
         eprintln!("{} sum-tuples", tuples.len());
+        print_search_space(problem, &tuples);
     }
 
     let n = problem.n;
@@ -2908,7 +3067,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 });
             }
             stats
-        }, verbose, "pure SAT", 0)
+        }, verbose, "pure SAT", 0, cfg.quad_pb)
     } else {
         // On-the-fly boundary enumeration: compute exact-lag constraints directly
         // and enumerate all valid 4-sequence boundary configs as SAT cubes.
@@ -3048,13 +3207,17 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let xy_table = Arc::new(xy_table);
 
         // Pre-build SAT encoding templates (one per tuple, clone per config)
-        // Run BVE preprocessing to eliminate auxiliary variables from totalizer encoding
+        let use_quad_pb = cfg.quad_pb;
         let templates: Vec<(SatEncoder, radical::Solver)> = tuples.iter()
             .map(|&tuple| {
-                let (enc, mut solver) = sat_encode(problem, tuple);
+                let (enc, mut solver) = if use_quad_pb {
+                    sat_encode_quad_pb_unified(problem, tuple, None, None, None, None)
+                        .expect("quad PB encoding infeasible for tuple")
+                } else {
+                    sat_encode(problem, tuple)
+                };
                 solver.config.vivification = true;
                 solver.config.chrono_bt = true;
-                // Note: XOR constraints for XNOR triples OOM at n=56 scale (52K vars, ~25K triples)
                 (enc, solver)
             })
             .collect();
@@ -3090,7 +3253,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 };
 
                 // Warm-start state: phase-only transfer (clause transfer is harmful per testing)
-                let mut warm_phase: Option<Vec<bool>> = None;
+                let mut warm_phase: Vec<bool> = Vec::new();
 
                 let should_stop = || found.load(AtomicOrdering::Relaxed) || timed_out.load(AtomicOrdering::Relaxed);
                 loop {
@@ -3152,35 +3315,59 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                     }
                                     if !xy_slice.is_empty() {
                                         xy_matches.fetch_add(xy_slice.len(), AtomicOrdering::Relaxed);
+
+                                        // Clone once per (z_bits, w_bits, tuple) group.
+                                        // Add Z/W boundary as permanent unit clauses,
+                                        // then iterate XY configs using assumptions.
+                                        let (ref enc, ref template_solver) = templates[ti];
+                                        let mut solver = template_solver.clone();
+                                        // Warm-start: phase-only transfer
+                                        if !warm_phase.is_empty() {
+                                            solver.set_phase(&warm_phase);
+                                        }
+
+                                        // Fix Z/W boundary (permanent — same for all XY configs)
+                                        // Batch all 4*k unit clauses with a single propagation pass.
+                                        let mut zw_units: Vec<i32> = Vec::with_capacity(4 * k);
+                                        for i in 0..k {
+                                            zw_units.push(if (z_bits >> i) & 1 == 1 { enc.z_var(i) } else { -enc.z_var(i) });
+                                            zw_units.push(if (z_bits >> (k + i)) & 1 == 1 { enc.z_var(n - k + i) } else { -enc.z_var(n - k + i) });
+                                            zw_units.push(if (w_bits >> i) & 1 == 1 { enc.w_var(i) } else { -enc.w_var(i) });
+                                            zw_units.push(if (w_bits >> (k + i)) & 1 == 1 { enc.w_var(m - k + i) } else { -enc.w_var(m - k + i) });
+                                        }
+                                        solver.add_unit_clauses_batch(&zw_units);
+
+                                        // If Z/W boundary caused contradiction, skip all XY configs
+                                        if !solver.is_ok() {
+                                            let skip_count = xy_slice.len();
+                                            unsat_count.fetch_add(skip_count, AtomicOrdering::Relaxed);
+                                            items_done.fetch_add(skip_count, AtomicOrdering::Relaxed);
+                                            continue;
+                                        }
+
+                                        let mut xy_assumptions: Vec<i32> = Vec::with_capacity(4 * k);
                                         for &(x_bits, y_bits) in xy_slice {
                                             if should_stop() { break; }
 
-                                            let (ref enc, ref template_solver) = templates[ti];
-                                            let mut solver = template_solver.clone();
                                             if conflict_limit > 0 {
-                                                solver.set_conflict_limit(conflict_limit);
-                                            }
-                                            // Warm-start: phase-only transfer
-                                            if let Some(ref ph) = warm_phase {
-                                                solver.set_phase(ph);
+                                                solver.set_conflict_budget(conflict_limit);
                                             }
 
+                                            // XY boundary as assumptions (temporary per solve)
+                                            xy_assumptions.clear();
                                             for i in 0..k {
-                                                solver.add_clause([if (x_bits >> i) & 1 == 1 { enc.x_var(i) } else { -enc.x_var(i) }]);
-                                                solver.add_clause([if (x_bits >> (k + i)) & 1 == 1 { enc.x_var(n - k + i) } else { -enc.x_var(n - k + i) }]);
-                                                solver.add_clause([if (y_bits >> i) & 1 == 1 { enc.y_var(i) } else { -enc.y_var(i) }]);
-                                                solver.add_clause([if (y_bits >> (k + i)) & 1 == 1 { enc.y_var(n - k + i) } else { -enc.y_var(n - k + i) }]);
-                                                solver.add_clause([if (z_bits >> i) & 1 == 1 { enc.z_var(i) } else { -enc.z_var(i) }]);
-                                                solver.add_clause([if (z_bits >> (k + i)) & 1 == 1 { enc.z_var(n - k + i) } else { -enc.z_var(n - k + i) }]);
-                                                solver.add_clause([if (w_bits >> i) & 1 == 1 { enc.w_var(i) } else { -enc.w_var(i) }]);
-                                                solver.add_clause([if (w_bits >> (k + i)) & 1 == 1 { enc.w_var(m - k + i) } else { -enc.w_var(m - k + i) }]);
+                                                xy_assumptions.push(if (x_bits >> i) & 1 == 1 { enc.x_var(i) } else { -enc.x_var(i) });
+                                                xy_assumptions.push(if (x_bits >> (k + i)) & 1 == 1 { enc.x_var(n - k + i) } else { -enc.x_var(n - k + i) });
+                                                xy_assumptions.push(if (y_bits >> i) & 1 == 1 { enc.y_var(i) } else { -enc.y_var(i) });
+                                                xy_assumptions.push(if (y_bits >> (k + i)) & 1 == 1 { enc.y_var(n - k + i) } else { -enc.y_var(n - k + i) });
                                             }
 
-                                            let result = solver.solve();
-                                            let nc = solver.num_conflicts();
+                                            let conflicts_before = solver.num_conflicts();
+                                            let result = solver.solve_with_assumptions(&xy_assumptions);
+                                            let nc = solver.num_conflicts() - conflicts_before;
                                             total_conflicts.fetch_add(nc, AtomicOrdering::Relaxed);
-                                            // Save phase for warm-start (no clause transfer)
-                                            warm_phase = Some(solver.get_phase());
+                                            // Save phase for warm-start
+                                            solver.copy_phase_into(&mut warm_phase);
 
                                             if result == Some(true) {
                                                 let x = PackedSeq::from_values(&(0..n).map(|i|
@@ -3191,6 +3378,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                                     if solver.value(enc.z_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
                                                 let w = PackedSeq::from_values(&(0..m).map(|i|
                                                     if solver.value(enc.w_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                                                solver.reset(); // backtrack for next solve
 
                                                 if verify_tt(problem, &x, &y, &z, &w) {
                                                     found.store(true, AtomicOrdering::Relaxed);
@@ -3631,6 +3819,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     if verbose {
         let method = if xy_table.is_some() { "table+SAT" } else { "SAT X/Y" };
         eprintln!("{} normalized tuples, Phase C: {}", tuples.len(), method);
+        print_search_space(problem, &tuples);
     }
 
     let cfg = cfg.clone();
@@ -3665,7 +3854,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 z_gen, z_ok, w_candidates.len(), pairs);
         }
         stats
-    }, verbose, "hybrid (Phase B \u{2192} SAT XY)", sat_secs)
+    }, verbose, "hybrid (Phase B \u{2192} SAT XY)", sat_secs, false)
 }
 
 fn print_help() {
@@ -3813,6 +4002,10 @@ fn parse_args() -> SearchConfig {
             cfg.xy_table_path = Some(v.to_string());
         } else if arg == "--no-table" {
             cfg.no_table = true;
+        } else if arg == "--quad-pb" {
+            cfg.quad_pb = true;
+        } else if arg == "--no-quad-pb" {
+            cfg.quad_pb = false;
         } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
             cfg.dump_dimacs = Some(v.to_string());
         } else {
@@ -3911,6 +4104,7 @@ fn main() {
             for t in &tuples {
                 println!("  ({},{},{},{})", t.x, t.y, t.z, t.w);
             }
+            print_search_space(problem, &tuples);
         } else if phase == "phase-b" {
             let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
             let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
@@ -4032,6 +4226,7 @@ mod tests {
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
             sat_secs: 0,
+            quad_pb: true,
         };
         let report = run_hybrid_search(&cfg, false);
         assert!(report.found_solution, "n=4 hybrid should find solution");
@@ -4048,6 +4243,65 @@ mod tests {
         assert!(verify_tt(p, &x, &y, &z, &w));
     }
 
+    #[test]
+    fn quad_pb_accepts_known_tt6() {
+        // Known TT(6) solution — negated X to match x[0]=+1 symmetry breaking
+        // Original: x=[-1,-1,-1,-1,1,-1] → negated: [1,1,1,1,-1,1]
+        let x_vals: &[i8] = &[1, 1, 1, 1, -1, 1];
+        let y_vals: &[i8] = &[-1, -1, -1, 1, -1, -1]; // y is independent
+        let z_vals: &[i8] = &[-1, -1, 1, -1, 1, 1];
+        let w_vals: &[i8] = &[-1, 1, 1, 1, -1];
+
+        let p = Problem::new(6);
+        let x = PackedSeq::from_values(x_vals);
+        let y = PackedSeq::from_values(y_vals);
+        let z = PackedSeq::from_values(z_vals);
+        let w = PackedSeq::from_values(w_vals);
+        assert!(verify_tt(p, &x, &y, &z, &w), "Known TT(6) should verify");
+
+        // Find the matching sum tuple
+        let xs: i32 = x_vals.iter().map(|&v| v as i32).sum();
+        let ys: i32 = y_vals.iter().map(|&v| v as i32).sum();
+        let zs: i32 = z_vals.iter().map(|&v| v as i32).sum();
+        let ws: i32 = w_vals.iter().map(|&v| v as i32).sum();
+        let tuple = SumTuple { x: xs, y: ys, z: zs, w: ws };
+
+        // Test 1: all-free encoding, fix all variables via unit clauses
+        let (enc, mut solver) = sat_encode_quad_pb_unified(p, tuple, None, None, None, None)
+            .expect("unified quad PB should be feasible");
+        let n = p.n;
+        let m = p.m();
+        for i in 0..n {
+            solver.add_clause([if x_vals[i] > 0 { enc.x_var(i) } else { -enc.x_var(i) }]);
+            solver.add_clause([if y_vals[i] > 0 { enc.y_var(i) } else { -enc.y_var(i) }]);
+            solver.add_clause([if z_vals[i] > 0 { enc.z_var(i) } else { -enc.z_var(i) }]);
+        }
+        for i in 0..m {
+            solver.add_clause([if w_vals[i] > 0 { enc.w_var(i) } else { -enc.w_var(i) }]);
+        }
+        assert_eq!(solver.solve(), Some(true), "All-free quad PB should accept known TT(6)");
+
+        // Test 2: Z-fixed encoding (simulates --z-sat --quad-pb)
+        let (enc2, mut solver2) = sat_encode_quad_pb_unified(p, tuple, None, None, Some(z_vals), None)
+            .expect("Z-fixed quad PB should be feasible");
+        for i in 0..n {
+            solver2.add_clause([if x_vals[i] > 0 { enc2.x_var(i) } else { -enc2.x_var(i) }]);
+            solver2.add_clause([if y_vals[i] > 0 { enc2.y_var(i) } else { -enc2.y_var(i) }]);
+        }
+        for i in 0..m {
+            solver2.add_clause([if w_vals[i] > 0 { enc2.w_var(i) } else { -enc2.w_var(i) }]);
+        }
+        assert_eq!(solver2.solve(), Some(true), "Z-fixed quad PB should accept known TT(6)");
+
+        // Test 3: Z+W fixed encoding (simulates hybrid --quad-pb)
+        let (enc3, mut solver3) = sat_encode_quad_pb_unified(p, tuple, None, None, Some(z_vals), Some(w_vals))
+            .expect("Z+W fixed quad PB should be feasible");
+        for i in 0..n {
+            solver3.add_clause([if x_vals[i] > 0 { enc3.x_var(i) } else { -enc3.x_var(i) }]);
+            solver3.add_clause([if y_vals[i] > 0 { enc3.y_var(i) } else { -enc3.y_var(i) }]);
+        }
+        assert_eq!(solver3.solve(), Some(true), "Z+W fixed quad PB should accept known TT(6)");
+    }
 
     #[test]
     fn stochastic_search_finds_tt8() {

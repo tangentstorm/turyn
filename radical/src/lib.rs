@@ -524,10 +524,11 @@ impl Solver {
             num_terms: terms.len() as u32,
             sums: [0, coeffs.iter().sum::<u32>() as i32, 0],
             terms,
-            stale: false,
+            stale: true, // must recompute: some vars may already be assigned
         });
 
-        // Initial propagation
+        // Recompute from current assignments, then propagate
+        self.recompute_quad_pb(qi);
         if self.propagate_quad_pb(qi).is_some() {
             self.ok = false;
         }
@@ -707,7 +708,40 @@ impl Solver {
 
     /// Set a conflict limit. Solve returns None if limit is reached.
     /// Set to 0 to disable.
+    /// Returns true if the solver is in a consistent state (no top-level contradiction detected).
+    pub fn is_ok(&self) -> bool { self.ok }
+
+    /// Add multiple unit clauses and propagate once at the end.
+    /// More efficient than calling add_clause() for each unit individually.
+    pub fn add_unit_clauses_batch(&mut self, units: &[Lit]) {
+        if !self.ok { return; }
+        for &lit in units {
+            self.ensure_var(lit.unsigned_abs() as usize);
+            let val = self.lit_value(lit);
+            match val {
+                LBool::True => {} // already satisfied
+                LBool::False => { self.ok = false; return; }
+                LBool::Undef => {
+                    let ci = self.clause_meta.len() as u32;
+                    let start = self.clause_lits.len() as u32;
+                    self.clause_lits.push(lit);
+                    self.clause_meta.push(ClauseMeta { start, len: 1, learnt: false, lbd: 0, deleted: false });
+                    self.enqueue(lit, Reason::Clause(ci));
+                }
+            }
+        }
+        // Single propagation pass for all enqueued units
+        if self.propagate().is_some() {
+            self.ok = false;
+        }
+    }
+
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
+
+    /// Set a per-call conflict budget: solver stops after `budget` additional conflicts.
+    pub fn set_conflict_budget(&mut self, budget: u64) {
+        self.conflict_limit = self.conflicts + budget;
+    }
 
     /// Find equivalent literals via SCC on the binary implication graph.
     /// Returns number of equivalences found and applied.
@@ -1073,6 +1107,30 @@ impl Solver {
 
     /// Simplify clause database using level-0 assignments.
     /// Removes satisfied clauses and false literals.
+    /// Simplify the clause database using level-0 assignments.
+    /// Removes satisfied clauses and false literals. Also rebuilds watch lists.
+    /// Returns the number of clauses removed.
+    pub fn simplify(&mut self) -> usize {
+        if !self.ok { return 0; }
+        if self.propagate().is_some() {
+            self.ok = false;
+            return 0;
+        }
+        let before = self.clause_meta.iter().filter(|m| !m.deleted).count();
+        self.simplify_clauses_at_level0();
+        if !self.ok { return 0; }
+        let after = self.clause_meta.iter().filter(|m| !m.deleted).count();
+        // Rebuild watch lists from scratch (since clauses were modified)
+        for wl in &mut self.watches { wl.clear(); }
+        for (ci, m) in self.clause_meta.iter().enumerate() {
+            if m.deleted || m.len < 2 { continue; }
+            let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
+            self.watches[lit_index(negate(lits[0]))].push((ci as u32, lits[1]));
+            self.watches[lit_index(negate(lits[1]))].push((ci as u32, lits[0]));
+        }
+        before - after
+    }
+
     fn simplify_clauses_at_level0(&mut self) {
         for ci in 0..self.clause_meta.len() {
             let m = &self.clause_meta[ci];
@@ -1125,6 +1183,12 @@ impl Solver {
     /// Get a copy of the current phase saving vector.
     pub fn get_phase(&self) -> Vec<bool> {
         self.phase.clone()
+    }
+
+    /// Copy current phase into an existing buffer (avoids allocation).
+    pub fn copy_phase_into(&self, buf: &mut Vec<bool>) {
+        buf.clear();
+        buf.extend_from_slice(&self.phase);
     }
 
     /// Set the phase saving vector (for warm-starting).

@@ -324,13 +324,19 @@ Phase C (SAT) dominates >90% of runtime. The 10 interventions below target alloc
 
 In `solve_xy_with_sat`, line 2764: `configs_tested % 1 == 0` always evaluates true, meaning `clear_learnt` is called after every single boundary config SAT solve. This is wasteful — `clear_learnt` iterates all clause metadata + all watch lists. Batch to every N configs (e.g., 64 or 128) or skip entirely and rely on `reduce_db` in the solve loop.
 
+**Status:** Already implemented (batched to every 8 configs, accepted in round 1, see optimization log). **N/A for n=56 cubed SAT** (only applies to `solve_xy_with_sat` hybrid path).
+
 ### P4. Skip `propagate_pb` for already-satisfied constraints
 
 `propagate_pb` does a full scan of all literals in the constraint on every trigger. For PB constraints with large slack (many true literals), the scan is wasted work. Add a `satisfied` flag or slack cache that short-circuits when the constraint is trivially satisfied.
 
+**Status: N/A for n=56 cubed SAT** — totalizer encoding uses only regular clauses, no PB constraints.
+
 ### P5. Eliminate `configs_tested % 1 == 0` dead code and reduce `clear_learnt` overhead
 
 `clear_learnt()` iterates all `clause_meta` to mark learnt clauses deleted, then iterates all watch lists to retain. With incremental solving, learnt clauses from previous configs may actually help future configs. Try removing `clear_learnt` entirely from the table path — the solve loop's `reduce_db` already manages clause database size.
+
+**Status:** Superseded by P3 implementation. **N/A for n=56 cubed SAT** (only applies to `solve_xy_with_sat` hybrid path).
 
 ### P6. Pre-size `quad_pb_seen_buf` at solver construction
 
@@ -369,6 +375,19 @@ Excluding coordinator overhead (51%), the SAT-only profile:
 - `recompute_quad_pb` 12.3%, `propagate` 10.3%, `compute_quad_pb_explanation_into` 8.1%
 - `solve_with_assumptions` 7.4%, `propagate_quad_pb` 3.2%, `propagate_pb` 1.8%, `backtrack` 1.4%
 
+**NOTE (2026-04-05):** R1-R10 were profiled on n=26 hybrid path.
+
+**UPDATE (2026-04-05):** `--quad-pb` is now the default encoding: 223 vars, 55 quad PB constraints, 4 PB constraints. 797 solves/s at n=56 (vs 140/s with totalizer, **+470%**). Profile: `propagate` 55%, `solve_inner` 12%, `recompute_quad_pb` 4.4%, `backtrack` 2.6%.
+
+R-series tested on n=56 `--quad-pb` (797/s baseline):
+- **R2** (global stale flag): within noise (796/s). Stale check scan is cheap (55 entries, branch predictor handles it).
+- **R3** (skip term update after recompute): **-6.5% regression** (745/s). Removing the incremental update breaks the propagation path.
+- **R4** (state-based explanation filtering): within noise (800/s). MAYBE term skip saves ~50% of term scans but branch overhead roughly equals savings.
+- **R10** (sort terms by variable index): **-2.4% regression** (778/s). Sorted order disrupts propagation candidate ordering.
+- **CMS6/rephasing** tested at 200-conflict intervals: neutral to slight regression (792/s). Phase saving already well-targeted.
+
+Remaining untested: R1 (fuse recompute — only 4.4% target, ~1% expected gain), R5 (PB slack — PB is negligible at 0.3%), R7 (flat arrays — 223 inner Vecs is small), R9 (mem::take — trivially cheap at 223 vars).
+
 ### R1. Fuse recompute with propagation: single-pass recompute+check
 
 `recompute_quad_pb` (12.3%) scans all ~80 terms to rebuild sums, then `propagate_quad_pb` loads sums and often returns immediately (slack > 0). When the constraint is stale, fuse both into one pass: compute states, accumulate sums, AND check propagation in a single traversal. Saves the redundant sums load and the second function call for the majority case (no propagation needed).
@@ -392,6 +411,8 @@ At 8.1%, the explanation function scans all ~80 terms. But terms with state DEAD
 ### R6. Move `propagate_lit` deleted-clause check after blocker check
 
 In `propagate_lit` (10.3%), the deleted-clause check happens BEFORE the blocker check. But the blocker check (line 753) is cheaper and more likely to short-circuit (most watched clauses are satisfied). Swap the order: check blocker first, then deleted. Saves a `clause_meta[ci]` load for satisfied clauses.
+
+**Result (n=56 SAT cubed):** 69.0-71.3 vs baseline 69.0-70.1 — within noise. At n=56 scale with 576K clauses, the blocker short-circuit rate doesn't dominate. **Rejected.**
 
 ### R7. Compact `quad_pb_var_terms` and `quad_pb_var_watches` into contiguous arrays
 
