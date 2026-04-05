@@ -324,13 +324,19 @@ Phase C (SAT) dominates >90% of runtime. The 10 interventions below target alloc
 
 In `solve_xy_with_sat`, line 2764: `configs_tested % 1 == 0` always evaluates true, meaning `clear_learnt` is called after every single boundary config SAT solve. This is wasteful — `clear_learnt` iterates all clause metadata + all watch lists. Batch to every N configs (e.g., 64 or 128) or skip entirely and rely on `reduce_db` in the solve loop.
 
+**Status:** Already implemented (batched to every 8 configs, accepted in round 1, see optimization log). **N/A for n=56 cubed SAT** (only applies to `solve_xy_with_sat` hybrid path).
+
 ### P4. Skip `propagate_pb` for already-satisfied constraints
 
 `propagate_pb` does a full scan of all literals in the constraint on every trigger. For PB constraints with large slack (many true literals), the scan is wasted work. Add a `satisfied` flag or slack cache that short-circuits when the constraint is trivially satisfied.
 
+**Status: N/A for n=56 cubed SAT** — totalizer encoding uses only regular clauses, no PB constraints.
+
 ### P5. Eliminate `configs_tested % 1 == 0` dead code and reduce `clear_learnt` overhead
 
 `clear_learnt()` iterates all `clause_meta` to mark learnt clauses deleted, then iterates all watch lists to retain. With incremental solving, learnt clauses from previous configs may actually help future configs. Try removing `clear_learnt` entirely from the table path — the solve loop's `reduce_db` already manages clause database size.
+
+**Status:** Superseded by P3 implementation. **N/A for n=56 cubed SAT** (only applies to `solve_xy_with_sat` hybrid path).
 
 ### P6. Pre-size `quad_pb_seen_buf` at solver construction
 
@@ -369,6 +375,10 @@ Excluding coordinator overhead (51%), the SAT-only profile:
 - `recompute_quad_pb` 12.3%, `propagate` 10.3%, `compute_quad_pb_explanation_into` 8.1%
 - `solve_with_assumptions` 7.4%, `propagate_quad_pb` 3.2%, `propagate_pb` 1.8%, `backtrack` 1.4%
 
+**NOTE (2026-04-05):** R1-R10 were profiled on n=26 hybrid path which uses quad PB and PB constraints. The n=56 `--sat` cubed path uses **totalizer encoding** (52K vars, 576K clauses, all regular CNF) — no quad PB or PB constraints. R1-R5, R7-R10 do NOT apply to the n=56 benchmark. R6 was tested on n=56 and was within noise.
+
+The dominant n=56 bottleneck is solver clone overhead (104K watch list allocations per clone). This was addressed by batching clones per ZW group (+44%).
+
 ### R1. Fuse recompute with propagation: single-pass recompute+check
 
 `recompute_quad_pb` (12.3%) scans all ~80 terms to rebuild sums, then `propagate_quad_pb` loads sums and often returns immediately (slack > 0). When the constraint is stale, fuse both into one pass: compute states, accumulate sums, AND check propagation in a single traversal. Saves the redundant sums load and the second function call for the majority case (no propagation needed).
@@ -392,6 +402,8 @@ At 8.1%, the explanation function scans all ~80 terms. But terms with state DEAD
 ### R6. Move `propagate_lit` deleted-clause check after blocker check
 
 In `propagate_lit` (10.3%), the deleted-clause check happens BEFORE the blocker check. But the blocker check (line 753) is cheaper and more likely to short-circuit (most watched clauses are satisfied). Swap the order: check blocker first, then deleted. Saves a `clause_meta[ci]` load for satisfied clauses.
+
+**Result (n=56 SAT cubed):** 69.0-71.3 vs baseline 69.0-70.1 — within noise. At n=56 scale with 576K clauses, the blocker short-circuit rate doesn't dominate. **Rejected.**
 
 ### R7. Compact `quad_pb_var_terms` and `quad_pb_var_watches` into contiguous arrays
 

@@ -3054,7 +3054,6 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 let (enc, mut solver) = sat_encode(problem, tuple);
                 solver.config.vivification = true;
                 solver.config.chrono_bt = true;
-                // Note: XOR constraints for XNOR triples OOM at n=56 scale (52K vars, ~25K triples)
                 (enc, solver)
             })
             .collect();
@@ -3169,6 +3168,14 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                             solver.add_clause([if (z_bits >> (k + i)) & 1 == 1 { enc.z_var(n - k + i) } else { -enc.z_var(n - k + i) }]);
                                             solver.add_clause([if (w_bits >> i) & 1 == 1 { enc.w_var(i) } else { -enc.w_var(i) }]);
                                             solver.add_clause([if (w_bits >> (k + i)) & 1 == 1 { enc.w_var(m - k + i) } else { -enc.w_var(m - k + i) }]);
+                                        }
+
+                                        // If Z/W boundary caused contradiction, skip all XY configs
+                                        if !solver.is_ok() {
+                                            let skip_count = xy_slice.len();
+                                            unsat_count.fetch_add(skip_count, AtomicOrdering::Relaxed);
+                                            items_done.fetch_add(skip_count, AtomicOrdering::Relaxed);
+                                            continue;
                                         }
 
                                         let mut xy_assumptions: Vec<i32> = Vec::with_capacity(4 * k);

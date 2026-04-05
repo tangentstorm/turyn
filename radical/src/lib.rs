@@ -707,6 +707,9 @@ impl Solver {
 
     /// Set a conflict limit. Solve returns None if limit is reached.
     /// Set to 0 to disable.
+    /// Returns true if the solver is in a consistent state (no top-level contradiction detected).
+    pub fn is_ok(&self) -> bool { self.ok }
+
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
 
     /// Set a per-call conflict budget: solver stops after `budget` additional conflicts.
@@ -1078,6 +1081,30 @@ impl Solver {
 
     /// Simplify clause database using level-0 assignments.
     /// Removes satisfied clauses and false literals.
+    /// Simplify the clause database using level-0 assignments.
+    /// Removes satisfied clauses and false literals. Also rebuilds watch lists.
+    /// Returns the number of clauses removed.
+    pub fn simplify(&mut self) -> usize {
+        if !self.ok { return 0; }
+        if self.propagate().is_some() {
+            self.ok = false;
+            return 0;
+        }
+        let before = self.clause_meta.iter().filter(|m| !m.deleted).count();
+        self.simplify_clauses_at_level0();
+        if !self.ok { return 0; }
+        let after = self.clause_meta.iter().filter(|m| !m.deleted).count();
+        // Rebuild watch lists from scratch (since clauses were modified)
+        for wl in &mut self.watches { wl.clear(); }
+        for (ci, m) in self.clause_meta.iter().enumerate() {
+            if m.deleted || m.len < 2 { continue; }
+            let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
+            self.watches[lit_index(negate(lits[0]))].push((ci as u32, lits[1]));
+            self.watches[lit_index(negate(lits[1]))].push((ci as u32, lits[0]));
+        }
+        before - after
+    }
+
     fn simplify_clauses_at_level0(&mut self) {
         for ci in 0..self.clause_meta.len() {
             let m = &self.clause_meta[ci];
