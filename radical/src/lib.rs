@@ -710,6 +710,31 @@ impl Solver {
     /// Returns true if the solver is in a consistent state (no top-level contradiction detected).
     pub fn is_ok(&self) -> bool { self.ok }
 
+    /// Add multiple unit clauses and propagate once at the end.
+    /// More efficient than calling add_clause() for each unit individually.
+    pub fn add_unit_clauses_batch(&mut self, units: &[Lit]) {
+        if !self.ok { return; }
+        for &lit in units {
+            self.ensure_var(lit.unsigned_abs() as usize);
+            let val = self.lit_value(lit);
+            match val {
+                LBool::True => {} // already satisfied
+                LBool::False => { self.ok = false; return; }
+                LBool::Undef => {
+                    let ci = self.clause_meta.len() as u32;
+                    let start = self.clause_lits.len() as u32;
+                    self.clause_lits.push(lit);
+                    self.clause_meta.push(ClauseMeta { start, len: 1, learnt: false, lbd: 0, deleted: false });
+                    self.enqueue(lit, Reason::Clause(ci));
+                }
+            }
+        }
+        // Single propagation pass for all enqueued units
+        if self.propagate().is_some() {
+            self.ok = false;
+        }
+    }
+
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
 
     /// Set a per-call conflict budget: solver stops after `budget` additional conflicts.
