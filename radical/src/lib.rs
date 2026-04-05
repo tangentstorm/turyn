@@ -524,10 +524,11 @@ impl Solver {
             num_terms: terms.len() as u32,
             sums: [0, coeffs.iter().sum::<u32>() as i32, 0],
             terms,
-            stale: false,
+            stale: true, // must recompute: some vars may already be assigned
         });
 
-        // Initial propagation
+        // Recompute from current assignments, then propagate
+        self.recompute_quad_pb(qi);
         if self.propagate_quad_pb(qi).is_some() {
             self.ok = false;
         }
