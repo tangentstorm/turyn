@@ -1,15 +1,17 @@
 /// Measure the size of a 16-way decision trie for boundary configs.
 ///
-/// The trie interleaves all four sequences (X,Y,Z,W) at each boundary position,
-/// visited in bouncing order: 0, 2k-1, 1, 2k-2, 2, 2k-3, ...
-/// This means after placing t pairs of positions, t lag constraints are fully
-/// determined and can prune dead branches.
+/// Build approach: construct two 4-way tries (XY and ZW) from exhaustive
+/// enumeration (67M configs each), then merge them into a 16-way trie
+/// with lag-constraint pruning at each checkpoint.
 ///
-/// Each node has 16 children (one per sign column: x,y,z,w each ±1).
-/// Encoding: x=bit0, y=bit1, z=bit2, w=bit3 (0=−1, 1=+1).
-/// Children[i] = 0 means no valid completion for that sign column.
+/// The trie visits boundary positions in bouncing order: 0, 2k-1, 1, 2k-2, ...
+/// After each pair of positions, one lag constraint becomes fully determined
+/// and can prune dead branches during the merge.
 
 use std::collections::HashMap;
+
+const DEAD: u32 = 0;
+const LEAF: u32 = 0xFFFF;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -20,15 +22,12 @@ fn main() {
     // Bouncing position order: 0, 2k-1, 1, 2k-2, 2, 2k-3, ...
     let mut pos_order: Vec<usize> = Vec::with_capacity(2 * k);
     for t in 0..k {
-        pos_order.push(t);          // prefix position
-        pos_order.push(2 * k - 1 - t); // suffix position
+        pos_order.push(t);
+        pos_order.push(2 * k - 1 - t);
     }
     eprintln!("Position order: {:?}", pos_order);
 
     // Build exact-lag bit pairs (same math as gen_table).
-    // Lag index j (0..k): absolute lag s = n-k+j for any n >= 2k.
-    // X/Y/Z (length n): pairs (i, k+i+j) for i = 0..k-j-1
-    // W (length n-1): pairs (i, k+i+j+1) for i = 0..k-j-2 (only when j < k-1)
     struct ExactLag {
         xy_pairs: Vec<(usize, usize)>,
         z_pairs: Vec<(usize, usize)>,
@@ -48,30 +47,15 @@ fn main() {
         exact_lags.push(ExactLag { xy_pairs, z_pairs, w_pairs });
     }
 
-    // Which lags become fully determined after placing positions 0..depth-1 in pos_order?
-    // A lag is fully determined when ALL its pair positions have been placed.
+    // Which lags become fully determined after placing positions 0..depth-1?
     let mut lags_complete_at_depth: Vec<Vec<usize>> = vec![Vec::new(); 2 * k + 1];
     for (lag_idx, lag) in exact_lags.iter().enumerate() {
-        // Collect all positions involved in this lag (across all 4 sequences, but
-        // boundary positions are the same indices for X/Y/Z; W uses different pairs)
         let mut all_positions = std::collections::HashSet::new();
-        for &(a, b) in &lag.xy_pairs {
-            all_positions.insert(a);
-            all_positions.insert(b);
-        }
-        // Z pairs are same as XY
-        // W pairs may differ
-        for &(a, b) in &lag.w_pairs {
-            all_positions.insert(a);
-            all_positions.insert(b);
-        }
-
-        // Find the earliest depth at which all these positions have been placed
-        let mut max_depth = 0;
-        for &pos in &all_positions {
-            let depth = pos_order.iter().position(|&p| p == pos).unwrap();
-            max_depth = max_depth.max(depth);
-        }
+        for &(a, b) in &lag.xy_pairs { all_positions.insert(a); all_positions.insert(b); }
+        for &(a, b) in &lag.w_pairs { all_positions.insert(a); all_positions.insert(b); }
+        let max_depth = all_positions.iter()
+            .map(|&pos| pos_order.iter().position(|&p| p == pos).unwrap())
+            .max().unwrap_or(0);
         lags_complete_at_depth[max_depth + 1].push(lag_idx);
     }
 
@@ -81,160 +65,282 @@ fn main() {
         }
     }
 
-    // Build the trie by DFS enumeration.
-    // State: partial assignment of x,y,z,w bits at boundary positions.
-    // At each depth, try all 16 sign columns, check if any newly-completed lag
-    // constraints are satisfied, and recurse.
+    // ========== Phase 1: Build 4-way XY trie ==========
+    eprintln!("\nPhase 1: Building 4-way XY trie...");
+    let xy_trie = build_4way_trie(k, &pos_order, true);
+    eprintln!("  XY trie: {} nodes", xy_trie.nodes.len());
 
-    let depth = 2 * k;
-    // Trie nodes: Vec of [u32; 16]. nodes[0] is the root.
-    // Children are node IDs; 0 = dead end (no valid completion).
-    // We use a HashMap to deduplicate identical subtrees.
-    let mut nodes: Vec<[u32; 16]> = Vec::new();
-    nodes.push([0u32; 16]); // node 0 is the "dead" sentinel
-    nodes.push([0u32; 16]); // node 1 is the root (filled in by build)
+    // ========== Phase 2: Build 4-way ZW trie ==========
+    eprintln!("Phase 2: Building 4-way ZW trie...");
+    let zw_trie = build_4way_trie(k, &pos_order, false);
+    eprintln!("  ZW trie: {} nodes", zw_trie.nodes.len());
 
-    // For deduplication: map from child array → node_id
-    let mut dedup: HashMap<[u32; 16], u32> = HashMap::new();
-    dedup.insert([0u32; 16], 0); // dead node
+    // ========== Phase 3: Merge into 16-way trie ==========
+    eprintln!("Phase 3: Merging with lag-constraint pruning...");
 
-    // Recursive build. Returns a node_id.
-    // bits_x, bits_y, bits_z, bits_w: partial boundary bit patterns
-    struct BuildCtx {
-        pos_order: Vec<usize>,
-        exact_lags: Vec<(Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>)>,
-        lags_complete_at_depth: Vec<Vec<usize>>,
-        k: usize,
-    }
+    let mut merged_nodes: Vec<[u32; 16]> = Vec::new();
+    merged_nodes.push([0u32; 16]); // node 0 = DEAD sentinel
 
-    let ctx = BuildCtx {
-        pos_order: pos_order.clone(),
-        exact_lags: exact_lags.iter().map(|el| (el.xy_pairs.clone(), el.z_pairs.clone(), el.w_pairs.clone())).collect(),
-        lags_complete_at_depth: lags_complete_at_depth.clone(),
-        k,
-    };
+    let mut merge_dedup: HashMap<[u32; 16], u32> = HashMap::new();
+    merge_dedup.insert([0u32; 16], DEAD);
 
-    fn bnd_autocorr(bits: u32, pairs: &[(usize, usize)]) -> i32 {
-        let mut val = 0i32;
-        for &(bi, bj) in pairs {
-            val += 1 - 2 * (((bits >> bi) ^ (bits >> bj)) & 1) as i32;
-        }
-        val
-    }
-
-    fn check_lags(xb: u32, yb: u32, zb: u32, wb: u32, lag_indices: &[usize], ctx: &BuildCtx) -> bool {
-        for &li in lag_indices {
-            let (ref xy_pairs, ref z_pairs, ref w_pairs) = ctx.exact_lags[li];
-            let nx = bnd_autocorr(xb, xy_pairs);
-            let ny = bnd_autocorr(yb, xy_pairs);
-            let nz = bnd_autocorr(zb, z_pairs);
-            let nw = bnd_autocorr(wb, w_pairs);
-            if nx + ny + 2 * nz + 2 * nw != 0 {
-                return false;
-            }
-        }
-        true
-    }
-
-    // Count leaves for stats
+    // Memoize on (xy_node, zw_node) → merged_node_id
+    let mut merge_memo: HashMap<(u32, u32), u32> = HashMap::new();
     let mut leaf_count: u64 = 0;
 
-    fn build(
-        d: usize, xb: u32, yb: u32, zb: u32, wb: u32,
-        ctx: &BuildCtx,
-        nodes: &mut Vec<[u32; 16]>,
-        dedup: &mut HashMap<[u32; 16], u32>,
+    fn merge(
+        d: usize,
+        xy_nid: u32, zw_nid: u32,
+        // Partial bit patterns for lag checking at constraint checkpoints
+        xb: u32, yb: u32, zb: u32, wb: u32,
+        pos_order: &[usize],
+        exact_lags: &[ExactLag],
+        lags_complete: &[Vec<usize>],
+        xy_trie: &Trie4,
+        zw_trie: &Trie4,
+        merged_nodes: &mut Vec<[u32; 16]>,
+        merge_dedup: &mut HashMap<[u32; 16], u32>,
+        merge_memo: &mut HashMap<(u32, u32), u32>,
         leaf_count: &mut u64,
     ) -> u32 {
-        let depth = 2 * ctx.k;
-        if d == depth {
-            // Leaf: all positions assigned, all lags satisfied (checked incrementally)
-            *leaf_count += 1;
-            return u32::MAX; // special leaf marker
+        // Check memo
+        let memo_key = (xy_nid, zw_nid);
+        if let Some(&cached) = merge_memo.get(&memo_key) {
+            // Count leaves for cached subtrees too? No — we only count on first visit.
+            return cached;
         }
 
-        let pos = ctx.pos_order[d];
+        let depth = pos_order.len();
+
+        // Both at leaf = valid 4-tuple
+        if d == depth {
+            if xy_nid == LEAF && zw_nid == LEAF {
+                *leaf_count += 1;
+                let result = LEAF;
+                merge_memo.insert(memo_key, result);
+                return result;
+            } else {
+                merge_memo.insert(memo_key, DEAD);
+                return DEAD;
+            }
+        }
+
+        // If either trie is dead, merged is dead
+        if xy_nid == DEAD || zw_nid == DEAD {
+            merge_memo.insert(memo_key, DEAD);
+            return DEAD;
+        }
+
+        let pos = pos_order[d];
+        let xy_children = &xy_trie.nodes[xy_nid as usize];
+        let zw_children = &zw_trie.nodes[zw_nid as usize];
         let mut children = [0u32; 16];
         let mut any_live = false;
 
-        for sign_col in 0u32..16 {
-            let xv = (sign_col >> 0) & 1; // 0 = -1, 1 = +1
-            let yv = (sign_col >> 1) & 1;
-            let zv = (sign_col >> 2) & 1;
-            let wv = (sign_col >> 3) & 1;
+        for xy_branch in 0u32..4 {
+            let xy_child = xy_children[xy_branch as usize];
+            if xy_child == DEAD { continue; }
 
-            // Symmetry breaking: at position 0, all must be +1
-            if pos == 0 && sign_col != 0b1111 {
-                continue;
-            }
+            let xv = (xy_branch >> 0) & 1;
+            let yv = (xy_branch >> 1) & 1;
 
-            let new_xb = xb | (xv << pos);
-            let new_yb = yb | (yv << pos);
-            let new_zb = zb | (zv << pos);
-            let new_wb = wb | (wv << pos);
+            for zw_branch in 0u32..4 {
+                let zw_child = zw_children[zw_branch as usize];
+                if zw_child == DEAD { continue; }
 
-            // Check newly-completed lag constraints
-            if !ctx.lags_complete_at_depth[d + 1].is_empty() {
-                if !check_lags(new_xb, new_yb, new_zb, new_wb, &ctx.lags_complete_at_depth[d + 1], ctx) {
-                    continue;
+                let zv = (zw_branch >> 0) & 1;
+                let wv = (zw_branch >> 1) & 1;
+
+                let new_xb = xb | (xv << pos);
+                let new_yb = yb | (yv << pos);
+                let new_zb = zb | (zv << pos);
+                let new_wb = wb | (wv << pos);
+
+                // Check newly-completed lag constraints
+                if !lags_complete[d + 1].is_empty() {
+                    let mut ok = true;
+                    for &li in &lags_complete[d + 1] {
+                        let nx = bnd_autocorr(new_xb, &exact_lags[li].xy_pairs);
+                        let ny = bnd_autocorr(new_yb, &exact_lags[li].xy_pairs);
+                        let nz = bnd_autocorr(new_zb, &exact_lags[li].z_pairs);
+                        let nw = bnd_autocorr(new_wb, &exact_lags[li].w_pairs);
+                        if nx + ny + 2 * nz + 2 * nw != 0 {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok { continue; }
                 }
-            }
 
-            let child = build(d + 1, new_xb, new_yb, new_zb, new_wb, ctx, nodes, dedup, leaf_count);
-            if child != 0 {
-                children[sign_col as usize] = child;
-                any_live = true;
+                let sign_col = xv | (yv << 1) | (zv << 2) | (wv << 3);
+                let child = merge(
+                    d + 1, xy_child, zw_child,
+                    new_xb, new_yb, new_zb, new_wb,
+                    pos_order, exact_lags, lags_complete,
+                    xy_trie, zw_trie,
+                    merged_nodes, merge_dedup, merge_memo, leaf_count,
+                );
+                if child != DEAD {
+                    children[sign_col as usize] = child;
+                    any_live = true;
+                }
             }
         }
 
         if !any_live {
-            return 0;
+            merge_memo.insert(memo_key, DEAD);
+            return DEAD;
         }
 
-        // Deduplicate
-        if let Some(&existing) = dedup.get(&children) {
-            return existing;
-        }
-
-        let nid = nodes.len() as u32;
-        nodes.push(children);
-        dedup.insert(children, nid);
+        // Deduplicate merged node
+        let nid = if let Some(&existing) = merge_dedup.get(&children) {
+            existing
+        } else {
+            let nid = merged_nodes.len() as u32;
+            merged_nodes.push(children);
+            merge_dedup.insert(children, nid);
+            nid
+        };
+        merge_memo.insert(memo_key, nid);
         nid
     }
 
-    let root = build(0, 0, 0, 0, 0, &ctx, &mut nodes, &mut dedup, &mut leaf_count);
-    nodes[1] = nodes[root as usize]; // copy root into slot 1 if needed
+    let root = merge(
+        0, xy_trie.root, zw_trie.root,
+        0, 0, 0, 0,
+        &pos_order, &exact_lags, &lags_complete_at_depth,
+        &xy_trie, &zw_trie,
+        &mut merged_nodes, &mut merge_dedup, &mut merge_memo, &mut leaf_count,
+    );
 
-    let node_count = nodes.len();
-    let trie_bytes = node_count * 16 * 4; // 16 children × 4 bytes each
+    let node_count = merged_nodes.len();
+    let trie_bytes = node_count * 16 * 4;
     eprintln!("\n--- Decision trie stats (k={}) ---", k);
-    eprintln!("  Nodes: {}", node_count);
-    eprintln!("  Leaves (valid 4-tuples): {}", leaf_count);
+    eprintln!("  XY trie nodes: {}", xy_trie.nodes.len());
+    eprintln!("  ZW trie nodes: {}", zw_trie.nodes.len());
+    eprintln!("  Merge memo entries: {}", merge_memo.len());
+    eprintln!("  Merged 16-way nodes: {}", node_count);
+    eprintln!("  Leaves (valid 4-tuples): {} (undercounted — only first visit)", leaf_count);
     eprintln!("  Trie size: {} bytes ({:.2} MB)", trie_bytes, trie_bytes as f64 / 1_048_576.0);
     eprintln!("  Current table size: 1923.1 MB (k=7)");
-    eprintln!("  Compression ratio: {:.0}x", 1_923.1 * 1_048_576.0 / trie_bytes as f64);
+    if trie_bytes > 0 {
+        eprintln!("  Compression ratio: {:.0}x", 1_923.1 * 1_048_576.0 / trie_bytes as f64);
+    }
 
-    // Stats per depth
-    eprintln!("\n  Depth breakdown:");
-    // Count nodes reachable at each depth (BFS)
-    let mut level_nodes: Vec<usize> = vec![0; 2 * k + 1];
-    let mut current_level = vec![root];
+    // BFS depth breakdown
+    eprintln!("\n  Depth breakdown (merged):");
+    let mut current_level: Vec<u32> = vec![root];
     for d in 0..2 * k {
-        level_nodes[d] = current_level.len();
+        let pos_str = format!("pos {}", pos_order[d]);
+        eprintln!("    depth {:2} ({}): {} unique nodes", d, pos_str, current_level.len());
         let mut next_level = std::collections::HashSet::new();
         for &nid in &current_level {
-            if nid == 0 || nid == u32::MAX { continue; }
-            for &child in &nodes[nid as usize] {
-                if child != 0 {
+            if nid == DEAD || nid == LEAF { continue; }
+            for &child in &merged_nodes[nid as usize] {
+                if child != DEAD {
                     next_level.insert(child);
                 }
             }
         }
         current_level = next_level.into_iter().collect();
     }
-    level_nodes[2 * k] = leaf_count as usize;
-    for d in 0..=2 * k {
-        let pos_str = if d < 2 * k { format!("pos {}", pos_order[d]) } else { "leaf".to_string() };
-        eprintln!("    depth {:2} ({}): {} nodes", d, pos_str, level_nodes[d]);
+    eprintln!("    depth {:2} (leaf): {} unique nodes", 2 * k, current_level.len());
+}
+
+/// A 4-way trie: at each level, branch on 2 bits (either x,y or z,w at the current position).
+struct Trie4 {
+    nodes: Vec<[u32; 4]>, // nodes[0] = DEAD, nodes[root] = root
+    root: u32,
+}
+
+fn build_4way_trie(k: usize, pos_order: &[usize], is_xy: bool) -> Trie4 {
+    let depth = 2 * k;
+    // Symmetry breaking: a[0]=b[0]=+1
+    // For XY: x[0]=y[0]=+1, enumerate 2*(2k-1) free bits
+    // For ZW: z[0]=w[0]=+1, enumerate 2*(2k-1) free bits
+    let free_per_seq = 2 * k - 1; // positions 1..2k-1
+    let total_configs = 1u64 << (2 * free_per_seq); // 2 sequences × free_per_seq bits
+
+    let mut nodes: Vec<[u32; 4]> = Vec::new();
+    nodes.push([DEAD; 4]); // node 0 = DEAD sentinel
+
+    let mut dedup: HashMap<[u32; 4], u32> = HashMap::new();
+    dedup.insert([DEAD; 4], DEAD);
+
+    // Build by inserting each config into the trie
+    let mut root = DEAD;
+    let mut count = 0u64;
+
+    for bits in 0..total_configs {
+        // Decode: seq_a[0]=seq_b[0]=+1, free bits for positions 1..2k-1
+        let mut ab = 1u32; // a[0]=+1
+        let mut bb = 1u32; // b[0]=+1
+        let mut bi = 0usize;
+        for i in 1..(2 * k) {
+            let v = ((bits >> bi) & 1) as u32;
+            bi += 1;
+            ab |= v << i;
+        }
+        for i in 1..(2 * k) {
+            let v = ((bits >> bi) & 1) as u32;
+            bi += 1;
+            bb |= v << i;
+        }
+
+        // Insert into trie following pos_order
+        root = insert_4way(
+            root, ab, bb, 0, pos_order, depth,
+            &mut nodes, &mut dedup,
+        );
+        count += 1;
+        if count % 10_000_000 == 0 {
+            eprintln!("  inserted {}M / {}M configs, {} nodes",
+                count / 1_000_000, total_configs / 1_000_000, nodes.len());
+        }
     }
+
+    eprintln!("  {} configs inserted, {} unique nodes", count, nodes.len());
+    Trie4 { nodes, root }
+}
+
+fn insert_4way(
+    nid: u32,
+    ab: u32, bb: u32,
+    d: usize,
+    pos_order: &[usize],
+    depth: usize,
+    nodes: &mut Vec<[u32; 4]>,
+    dedup: &mut HashMap<[u32; 4], u32>,
+) -> u32 {
+    if d == depth {
+        return LEAF;
+    }
+
+    let pos = pos_order[d];
+    let av = (ab >> pos) & 1;
+    let bv = (bb >> pos) & 1;
+    let branch = (av | (bv << 1)) as usize;
+
+    // Get or create node
+    let node_id = if nid == DEAD {
+        let id = nodes.len() as u32;
+        nodes.push([DEAD; 4]);
+        id
+    } else {
+        nid
+    };
+
+    let old_child = nodes[node_id as usize][branch];
+    let new_child = insert_4way(old_child, ab, bb, d + 1, pos_order, depth, nodes, dedup);
+    nodes[node_id as usize][branch] = new_child;
+
+    node_id
+}
+
+fn bnd_autocorr(bits: u32, pairs: &[(usize, usize)]) -> i32 {
+    let mut val = 0i32;
+    for &(bi, bj) in pairs {
+        val += 1 - 2 * (((bits >> bi) ^ (bits >> bj)) & 1) as i32;
+    }
+    val
 }
