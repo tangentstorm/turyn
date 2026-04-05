@@ -375,9 +375,11 @@ Excluding coordinator overhead (51%), the SAT-only profile:
 - `recompute_quad_pb` 12.3%, `propagate` 10.3%, `compute_quad_pb_explanation_into` 8.1%
 - `solve_with_assumptions` 7.4%, `propagate_quad_pb` 3.2%, `propagate_pb` 1.8%, `backtrack` 1.4%
 
-**NOTE (2026-04-05):** R1-R10 were profiled on n=26 hybrid path which uses quad PB and PB constraints. The n=56 `--sat` cubed path uses **totalizer encoding** (52K vars, 576K clauses, all regular CNF) — no quad PB or PB constraints. R1-R5, R7-R10 do NOT apply to the n=56 benchmark. R6 was tested on n=56 and was within noise.
+**NOTE (2026-04-05):** R1-R10 were profiled on n=26 hybrid path which uses quad PB and PB constraints.
 
-The dominant n=56 bottleneck is solver clone overhead (104K watch list allocations per clone). This was addressed by batching clones per ZW group (+44%).
+The original n=56 `--sat` cubed path uses totalizer encoding (52K vars, 576K CNF clauses). R1-R10 do NOT apply there. That path was optimized by batching clones per ZW group (+44%).
+
+**NEW (2026-04-05):** `--quad-pb` encoding uses quad PB constraints instead of totalizer for the cubed path: 223 vars, 55 quad PB constraints, 4 PB constraints. This is **+37% faster** than totalizer (274 vs 202 solves/s at n=56). With --quad-pb, R1-R10 now apply. Profile shows `propagate` at 56% of SAT time (dominated by quad PB propagation over 55 constraints with ~300-400 terms each). R1 (fuse recompute+propagation) tested: within noise (the batch recompute is only 4.4% of SAT time, and the savings from fusion are marginal).
 
 ### R1. Fuse recompute with propagation: single-pass recompute+check
 
