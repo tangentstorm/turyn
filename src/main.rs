@@ -1322,6 +1322,7 @@ trait SatSolver {
     fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I);
     fn add_pb_eq(&mut self, lits: &[i32], coeffs: &[u32], target: u32);
     fn add_quad_pb_eq(&mut self, lits_a: &[i32], lits_b: &[i32], coeffs: &[u32], target: u32);
+    fn add_xor_constraint(&mut self, aux: i32, a: i32, b: i32);
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool>;
     fn value(&self, var: i32) -> Option<bool>;
     fn reset(&mut self);
@@ -1337,6 +1338,10 @@ impl SatSolver for radical::Solver {
     }
     fn add_quad_pb_eq(&mut self, lits_a: &[i32], lits_b: &[i32], coeffs: &[u32], target: u32) {
         self.add_quad_pb_eq(lits_a, lits_b, coeffs, target);
+    }
+    fn add_xor_constraint(&mut self, aux: i32, a: i32, b: i32) {
+        // XNOR: aux = (a ↔ b), i.e., aux ⊕ a ⊕ b = true (odd parity)
+        self.add_xor(&[aux, a, b], true);
     }
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool> {
         self.solve_with_assumptions(assumptions)
@@ -1362,6 +1367,9 @@ impl SatSolver for cadical::Solver {
     }
     fn add_quad_pb_eq(&mut self, _a: &[i32], _b: &[i32], _c: &[u32], _t: u32) {
         unimplemented!("CaDiCaL backend uses clause-based encoding, not quad PB");
+    }
+    fn add_xor_constraint(&mut self, _aux: i32, _a: i32, _b: i32) {
+        // CaDiCaL doesn't support native XOR — clauses handle it
     }
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool> {
         self.solve_with(assumptions.iter().copied())
@@ -1974,7 +1982,7 @@ fn sat_solve_xyw(
     let m = problem.m();
     // Variables: X=1..n, Y=n+1..2n, W=2n+1..2n+m
     let total_vars = 2 * n + m;
-    let mut enc = SatEncoder { n: total_vars, m: 0, next_var: (total_vars + 1) as i32 };
+    let mut enc = SatEncoder { n: total_vars, m: 0, next_var: (total_vars + 1) as i32, xnor_triples: Vec::new() };
     let mut solver: radical::Solver = Default::default();
 
     let x_var = |i: usize| -> i32 { (i + 1) as i32 };
@@ -2097,7 +2105,7 @@ fn sat_find_z_candidates(
     if (z_sum + n as i32) % 2 != 0 { return Vec::new(); }
     let z_pos = ((z_sum + n as i32) / 2) as usize;
 
-    let mut enc = SatEncoder { n: 0, m: 0, next_var: (n + 1) as i32 };
+    let mut enc = SatEncoder { n: 0, m: 0, next_var: (n + 1) as i32, xnor_triples: Vec::new() };
     let mut solver: radical::Solver = Default::default();
 
     let z_var = |i: usize| -> i32 { (i + 1) as i32 };
@@ -2547,12 +2555,14 @@ struct SatEncoder {
     n: usize,
     m: usize,
     next_var: i32,
+    /// XNOR triples: (aux, a, b) where aux = (a XNOR b)
+    xnor_triples: Vec<(i32, i32, i32)>,
 }
 
 impl SatEncoder {
     fn new(n: usize) -> Self {
         let m = n - 1;
-        Self { n, m, next_var: (3 * n + m + 1) as i32 }
+        Self { n, m, next_var: (3 * n + m + 1) as i32, xnor_triples: Vec::new() }
     }
 
     fn x_var(&self, i: usize) -> i32 { (i + 1) as i32 }
@@ -2572,6 +2582,7 @@ impl SatEncoder {
         solver.add_clause([-aux, a, -b]);
         solver.add_clause([a, b, aux]);
         solver.add_clause([-a, -b, aux]);
+        self.xnor_triples.push((aux, a, b));
         aux
     }
 
@@ -3043,6 +3054,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 let (enc, mut solver) = sat_encode(problem, tuple);
                 solver.config.vivification = true;
                 solver.config.chrono_bt = true;
+                // Note: XOR constraints for XNOR triples OOM at n=56 scale (52K vars, ~25K triples)
                 (enc, solver)
             })
             .collect();
@@ -4048,7 +4060,7 @@ mod tests {
     #[test]
     fn cardinality_encoding_exactly_2_of_4() {
         // Test: exactly 2 of 4 variables must be true
-        let mut enc = SatEncoder { n: 0, m: 0, next_var: 5 };
+        let mut enc = SatEncoder { n: 0, m: 0, next_var: 5, xnor_triples: Vec::new() };
         let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3, 4];
         enc.encode_cardinality_eq(&mut solver, &lits, 2);
@@ -4061,7 +4073,7 @@ mod tests {
 
     #[test]
     fn cardinality_encoding_exactly_0_of_3() {
-        let mut enc = SatEncoder { n: 0, m: 0, next_var: 4 };
+        let mut enc = SatEncoder { n: 0, m: 0, next_var: 4, xnor_triples: Vec::new() };
         let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3];
         enc.encode_cardinality_eq(&mut solver, &lits, 0);
@@ -4073,7 +4085,7 @@ mod tests {
 
     #[test]
     fn cardinality_encoding_exactly_3_of_3() {
-        let mut enc = SatEncoder { n: 0, m: 0, next_var: 4 };
+        let mut enc = SatEncoder { n: 0, m: 0, next_var: 4, xnor_triples: Vec::new() };
         let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3];
         enc.encode_cardinality_eq(&mut solver, &lits, 3);
@@ -4085,7 +4097,7 @@ mod tests {
 
     #[test]
     fn xnor_encoding_correct() {
-        let mut enc = SatEncoder { n: 0, m: 0, next_var: 3 };
+        let mut enc = SatEncoder { n: 0, m: 0, next_var: 3, xnor_triples: Vec::new() };
         let mut solver: radical::Solver = Default::default();
         // a=1, b=2, test all 4 combos
         let aux = enc.encode_xnor(&mut solver, 1, 2);
@@ -4098,7 +4110,7 @@ mod tests {
 
     #[test]
     fn build_counter_exactly_2_of_3() {
-        let mut enc = SatEncoder { n: 0, m: 0, next_var: 4 };
+        let mut enc = SatEncoder { n: 0, m: 0, next_var: 4, xnor_triples: Vec::new() };
         let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3];
         let ctr = enc.build_counter(&mut solver, &lits);
@@ -4245,7 +4257,7 @@ mod tests {
     #[test]
     fn sat_counter_with_xnor_hardcoded() {
         // Minimal test: hardcode X=[1,1,1,1], check XY agree at lag 3 = exactly 2
-        let mut enc = SatEncoder { n: 4, m: 3, next_var: 9 }; // vars 1-4=X, 5-8=Y
+        let mut enc = SatEncoder { n: 4, m: 3, next_var: 9, xnor_triples: Vec::new() }; // vars 1-4=X, 5-8=Y
         let mut solver: radical::Solver = Default::default();
         // X = [T,T,T,T], Y = [T,F,T,T]
         for v in 1..=4 { solver.add_clause([v]); } // all X = true
