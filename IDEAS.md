@@ -375,11 +375,18 @@ Excluding coordinator overhead (51%), the SAT-only profile:
 - `recompute_quad_pb` 12.3%, `propagate` 10.3%, `compute_quad_pb_explanation_into` 8.1%
 - `solve_with_assumptions` 7.4%, `propagate_quad_pb` 3.2%, `propagate_pb` 1.8%, `backtrack` 1.4%
 
-**NOTE (2026-04-05):** R1-R10 were profiled on n=26 hybrid path which uses quad PB and PB constraints.
+**NOTE (2026-04-05):** R1-R10 were profiled on n=26 hybrid path.
 
-The original n=56 `--sat` cubed path uses totalizer encoding (52K vars, 576K CNF clauses). R1-R10 do NOT apply there. That path was optimized by batching clones per ZW group (+44%).
+**UPDATE (2026-04-05):** `--quad-pb` is now the default encoding: 223 vars, 55 quad PB constraints, 4 PB constraints. 797 solves/s at n=56 (vs 140/s with totalizer, **+470%**). Profile: `propagate` 55%, `solve_inner` 12%, `recompute_quad_pb` 4.4%, `backtrack` 2.6%.
 
-**NEW (2026-04-05):** `--quad-pb` encoding uses quad PB constraints instead of totalizer for the cubed path: 223 vars, 55 quad PB constraints, 4 PB constraints. This is **+37% faster** than totalizer (274 vs 202 solves/s at n=56). With --quad-pb, R1-R10 now apply. Profile shows `propagate` at 56% of SAT time (dominated by quad PB propagation over 55 constraints with ~300-400 terms each). R1 (fuse recompute+propagation) tested: within noise (the batch recompute is only 4.4% of SAT time, and the savings from fusion are marginal).
+R-series tested on n=56 `--quad-pb` (797/s baseline):
+- **R2** (global stale flag): within noise (796/s). Stale check scan is cheap (55 entries, branch predictor handles it).
+- **R3** (skip term update after recompute): **-6.5% regression** (745/s). Removing the incremental update breaks the propagation path.
+- **R4** (state-based explanation filtering): within noise (800/s). MAYBE term skip saves ~50% of term scans but branch overhead roughly equals savings.
+- **R10** (sort terms by variable index): **-2.4% regression** (778/s). Sorted order disrupts propagation candidate ordering.
+- **CMS6/rephasing** tested at 200-conflict intervals: neutral to slight regression (792/s). Phase saving already well-targeted.
+
+Remaining untested: R1 (fuse recompute — only 4.4% target, ~1% expected gain), R5 (PB slack — PB is negligible at 0.3%), R7 (flat arrays — 223 inner Vecs is small), R9 (mem::take — trivially cheap at 223 vars).
 
 ### R1. Fuse recompute with propagation: single-pass recompute+check
 
