@@ -689,6 +689,59 @@ impl Solver {
     /// Set to 0 to disable.
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
 
+    /// Extract high-quality learnt clauses (LBD <= max_lbd) as Vec<Vec<Lit>>.
+    /// Only returns non-deleted learnt clauses.
+    pub fn extract_learnt_clauses(&self, max_lbd: u8) -> Vec<Vec<Lit>> {
+        let mut result = Vec::new();
+        for m in &self.clause_meta {
+            if m.deleted || !m.learnt || m.lbd > max_lbd { continue; }
+            let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
+            result.push(lits.to_vec());
+        }
+        result
+    }
+
+    /// Get a copy of the current phase saving vector.
+    pub fn get_phase(&self) -> Vec<bool> {
+        self.phase.clone()
+    }
+
+    /// Set the phase saving vector (for warm-starting).
+    /// Only sets entries up to min(phase.len(), self.phase.len()).
+    pub fn set_phase(&mut self, phase: &[bool]) {
+        let n = phase.len().min(self.phase.len());
+        self.phase[..n].copy_from_slice(&phase[..n]);
+    }
+
+    /// Inject clauses into the solver (for warm-starting with transferred clauses).
+    /// Clauses are added as learnt with the given LBD.
+    pub fn inject_clauses(&mut self, clauses: &[Vec<Lit>], lbd: u8) {
+        for clause in clauses {
+            if clause.len() < 2 { continue; } // skip unit/empty
+            // Check all variables are in range
+            let valid = clause.iter().all(|&lit| {
+                let v = (lit.abs() - 1) as usize;
+                v < self.num_vars
+            });
+            if !valid { continue; }
+            let start = self.clause_lits.len() as u32;
+            self.clause_lits.extend_from_slice(clause);
+            let ci = self.clause_meta.len() as u32;
+            self.clause_meta.push(ClauseMeta {
+                start,
+                len: clause.len() as u16,
+                learnt: true,
+                lbd,
+                deleted: false,
+            });
+            // Add watches for first two literals
+            let lit0 = clause[0];
+            let lit1 = clause[1];
+            self.watches[lit_index(-lit0)].push((ci, lit1));
+            self.watches[lit_index(-lit1)].push((ci, lit0));
+        }
+    }
+
     /// Reset a quad PB constraint's incremental state from precomputed values.
     /// Used for fast boundary config switching without backtracking.
     pub fn reset_quad_pb_state(&mut self, qi: usize, term_state: &[u8], #[allow(unused)] sum_true: i32, sum_maybe: i32) {
