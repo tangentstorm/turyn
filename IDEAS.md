@@ -422,11 +422,18 @@ Note: --sat mode uses totalizer encoding (52K vars, 576K clauses at n=56).
 | Idea | Status | n=56 solves/60s | Rate | Notes |
 |------|--------|-----------------|------|-------|
 | Baseline (no CMS) | — | 101 | 1.63/s | |
-| CMS1: Warm-start | **Accepted** | — | +18% (n=26) | Phase/clause transfer across solves |
+| + CMS4: Vivification | **Accepted** | 115-125 | 1.84-2.02/s | +18%, shortens learnt clauses every 500 conflicts |
+| + CMS3: Chrono backtrack | **Accepted** | 628-671 | 10.4-11.1/s | +540%, avoids expensive deep backtracks in 52K-var problem |
+| + CMS1: Phase-only warm | **Accepted** | 628 | 10.4/s | Stable ~10%, phase transfer between cubes |
 | CMS2: Lucky phases | Rejected | — | -17% | Full propagation on UNSAT too expensive |
-| CMS4: Vivification | **Accepted** | 115-125 | 1.84-2.02/s | +18% on n=56, shortens learnt clauses |
 | CMS5: SCC equiv | Rejected | 106-118 | 1.55-1.71/s | 6372 equiv pairs found but no speedup |
-| CMS8: BVE | Rejected | 99-104 | 1.55-1.64/s | 9360 vars eliminated, net neutral |
+| CMS7: XOR/GJ | Rejected | OOM | — | 25K XOR constraints + 52K vars exceeds memory |
+| CMS8: BVE | Rejected | 99-104 | 1.55-1.64/s | 9360 vars eliminated, net neutral (code available) |
+| CMS6: Local search | Skipped | — | — | SA operates on 167 primary vars, not 52K aux |
+| CMS9: Distillation | Skipped | — | — | Subsumption on 576K clauses = O(n²) |
+| CMS10: Community VSIDS | Skipped | — | — | Marginal with chrono BT already dominant |
+
+**Cumulative: ~6.4x faster** (101 → 628-671 solves/60s)
 
 ### CMS1. Warm-start learnt clause and phase transfer across SAT calls
 
