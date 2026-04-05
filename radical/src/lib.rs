@@ -955,9 +955,11 @@ impl Solver {
             let var_lit_pos = (v + 1) as i32;
             let var_lit_neg = -var_lit_pos;
 
-            // Compute all resolvents
+            // Compute all resolvents using a literal presence bitset for O(1) lookups
             let mut resolvents: Vec<Vec<Lit>> = Vec::new();
             let mut too_many = false;
+            let num_lit_indices = 2 * num_vars;
+            let mut in_resolvent = vec![false; num_lit_indices]; // lit_index → present
 
             for &pci in &pos_valid {
                 let pm = &self.clause_meta[pci as usize];
@@ -966,31 +968,38 @@ impl Solver {
                     let nm = &self.clause_meta[nci as usize];
                     let n_lits = &self.clause_lits[nm.start as usize..(nm.start as usize + nm.len as usize)];
 
-                    // Build resolvent
+                    // Build resolvent with O(1) membership testing
                     let mut resolvent: Vec<Lit> = Vec::new();
                     let mut tautology = false;
 
-                    // Add all lits from positive clause except the pivot
                     for &lit in &p_lits {
                         if lit == var_lit_pos { continue; }
-                        // Skip lits that are false at level 0
-                        if self.lit_value(lit) == LBool::False { continue; }
-                        // Skip if clause is satisfied at level 0
-                        if self.lit_value(lit) == LBool::True { tautology = true; break; }
-                        resolvent.push(lit);
-                    }
-                    if tautology { continue; }
-
-                    // Add all lits from negative clause except the pivot
-                    for &lit in n_lits {
-                        if lit == var_lit_neg { continue; }
                         if self.lit_value(lit) == LBool::False { continue; }
                         if self.lit_value(lit) == LBool::True { tautology = true; break; }
-                        if resolvent.contains(&-lit) { tautology = true; break; }
-                        if !resolvent.contains(&lit) {
+                        let li = lit_index(lit);
+                        if !in_resolvent[li] {
+                            in_resolvent[li] = true;
                             resolvent.push(lit);
                         }
                     }
+                    if !tautology {
+                        for &lit in n_lits {
+                            if lit == var_lit_neg { continue; }
+                            if self.lit_value(lit) == LBool::False { continue; }
+                            if self.lit_value(lit) == LBool::True { tautology = true; break; }
+                            // Check for complementary literal
+                            if in_resolvent[lit_index(-lit)] { tautology = true; break; }
+                            let li = lit_index(lit);
+                            if !in_resolvent[li] {
+                                in_resolvent[li] = true;
+                                resolvent.push(lit);
+                            }
+                        }
+                    }
+
+                    // Clear the bitset for next iteration
+                    for &lit in &resolvent { in_resolvent[lit_index(lit)] = false; }
+
                     if tautology { continue; }
 
                     resolvents.push(resolvent);
@@ -1213,7 +1222,7 @@ impl Solver {
         // Collect candidate clause indices (learnt, non-deleted, len >= 3, small LBD)
         let mut candidates: Vec<(u8, u32)> = Vec::new(); // (lbd, ci)
         for (ci, m) in self.clause_meta.iter().enumerate() {
-            if m.deleted || !m.learnt || m.len < 3 || m.lbd > 6 { continue; }
+            if m.deleted || !m.learnt || m.len < 3 || m.lbd > 3 { continue; }
             candidates.push((m.lbd, ci as u32));
         }
         candidates.sort_unstable(); // sort by LBD (best first)
@@ -1386,7 +1395,7 @@ impl Solver {
 
                     // Vivification: periodically try to shorten clauses
                     if self.config.vivification && self.conflicts % 500 == 0 {
-                        self.vivify_clauses(base_level, 100);
+                        self.vivify_clauses(base_level, 50);
                     }
 
                     // Rephasing: periodically reset phases
