@@ -190,6 +190,8 @@ pub struct SolverConfig {
     pub rephasing: bool,
     /// Enable GF(2) XOR propagation during BCP.
     pub xor_propagation: bool,
+    /// Try saved phase as complete assignment before CDCL search (Kissat-style).
+    pub lucky_phases: bool,
 }
 
 impl Default for SolverConfig {
@@ -199,6 +201,7 @@ impl Default for SolverConfig {
             probing: false,
             rephasing: false,
             xor_propagation: true,
+            lucky_phases: false,
         }
     }
 }
@@ -646,6 +649,17 @@ impl Solver {
             }
         }
 
+        // Lucky phase: try the saved phase vector as a complete assignment.
+        // If it propagates without conflict, we solve in 0 conflicts.
+        if self.config.lucky_phases {
+            if let Some(result) = self.try_lucky_phase(assumption_level) {
+                if result {
+                    return Some(true); // keep model for value() queries
+                }
+                // Conflict — backtrack and fall through to normal search
+            }
+        }
+
         let result = self.solve_inner(assumption_level);
 
         // Only backtrack if UNSAT — keep model for value() queries if SAT.
@@ -794,6 +808,30 @@ impl Solver {
         self.clause_lits.reserve(expected_clauses * 5);
         self.clause_meta.reserve(expected_clauses);
         self.trail.reserve(self.num_vars);
+    }
+
+    /// Try assigning all unassigned variables according to the phase vector.
+    /// Returns Some(true) if a solution is found, Some(false) if a conflict
+    /// occurs, or None if we couldn't make progress.
+    fn try_lucky_phase(&mut self, base_level: u32) -> Option<bool> {
+        // Make decisions for all unassigned variables in order
+        let n = self.num_vars;
+        for v in 0..n {
+            if self.assigns[v] != LBool::Undef { continue; }
+            let lit = if self.phase[v] { (v + 1) as i32 } else { -((v + 1) as i32) };
+            self.new_decision_level();
+            self.enqueue(lit, Reason::Decision);
+            if let Some(_conflict) = self.propagate() {
+                // Conflict — undo everything and return failure
+                self.backtrack(base_level);
+                return Some(false);
+            }
+        }
+        // All variables assigned without conflict — solution found!
+        if self.trail.len() >= n {
+            return Some(true);
+        }
+        None
     }
 
     fn solve_inner(&mut self, base_level: u32) -> Option<bool> {
