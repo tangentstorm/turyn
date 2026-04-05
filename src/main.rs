@@ -3077,10 +3077,8 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                     val
                 };
 
-                // Warm-start state: per-worker clause pool and saved phases
-                let mut warm_clauses: Vec<Vec<i32>> = Vec::new();
+                // Warm-start state: phase-only transfer (clause transfer is harmful per testing)
                 let mut warm_phase: Option<Vec<bool>> = None;
-                let max_warm_clauses = 100;
 
                 let should_stop = || found.load(AtomicOrdering::Relaxed) || timed_out.load(AtomicOrdering::Relaxed);
                 loop {
@@ -3150,10 +3148,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                             if conflict_limit > 0 {
                                                 solver.set_conflict_limit(conflict_limit);
                                             }
-                                            // Warm-start: inject saved clauses and phase
-                                            if !warm_clauses.is_empty() {
-                                                solver.inject_clauses(&warm_clauses, 2);
-                                            }
+                                            // Warm-start: phase-only transfer
                                             if let Some(ref ph) = warm_phase {
                                                 solver.set_phase(ph);
                                             }
@@ -3172,13 +3167,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                             let result = solver.solve();
                                             let nc = solver.num_conflicts();
                                             total_conflicts.fetch_add(nc, AtomicOrdering::Relaxed);
-                                            // Extract warm-start data
-                                            let new_clauses = solver.extract_learnt_clauses(2);
-                                            for c in new_clauses {
-                                                if warm_clauses.len() < max_warm_clauses {
-                                                    warm_clauses.push(c);
-                                                }
-                                            }
+                                            // Save phase for warm-start (no clause transfer)
                                             warm_phase = Some(solver.get_phase());
 
                                             if result == Some(true) {
