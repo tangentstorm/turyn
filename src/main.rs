@@ -3042,6 +3042,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             .map(|&tuple| {
                 let (enc, mut solver) = sat_encode(problem, tuple);
                 solver.config.vivification = true;
+                solver.config.chrono_bt = true;
                 (enc, solver)
             })
             .collect();

@@ -194,6 +194,8 @@ pub struct SolverConfig {
     pub lucky_phases: bool,
     /// Periodically vivify (shorten) learnt clauses during restarts.
     pub vivification: bool,
+    /// Use chronological backtracking for shallow conflicts.
+    pub chrono_bt: bool,
 }
 
 impl Default for SolverConfig {
@@ -205,6 +207,7 @@ impl Default for SolverConfig {
             xor_propagation: true,
             lucky_phases: false,
             vivification: false,
+            chrono_bt: false,
         }
     }
 }
@@ -1358,8 +1361,22 @@ impl Solver {
                         lit, self.lit_value(lit), self.level[var_of(lit)]);
                 }
                 let bt_level = bt_level.max(base_level);
-                self.backtrack(bt_level);
-                self.add_learnt_clause(learnt_clause);
+                let cur_level = self.decision_level();
+                // CMS3: Chronological backtracking — when backjump is close,
+                // backtrack just one level to avoid re-deriving implications.
+                let use_chrono = self.config.chrono_bt
+                    && cur_level > base_level + 1
+                    && cur_level - bt_level <= 2
+                    && learnt_clause.len() > 1;
+                if use_chrono {
+                    // Backtrack to current_level - 1 (chronological)
+                    self.backtrack(cur_level - 1);
+                    // Add clause but DON'T enqueue — it's not unit at this level
+                    self.add_learnt_clause_no_enqueue(learnt_clause);
+                } else {
+                    self.backtrack(bt_level);
+                    self.add_learnt_clause(learnt_clause);
+                }
                 self.decay_activities();
 
                 // Update EMA stats (always, regardless of restart strategy)
@@ -2195,6 +2212,26 @@ impl Solver {
 
         // The asserting literal (lits[0]) should be propagated
         self.enqueue(asserting_lit, Reason::Clause(ci));
+    }
+
+    /// Add a learnt clause WITHOUT enqueueing the asserting literal.
+    /// Used for chronological backtracking where the clause isn't unit.
+    fn add_learnt_clause_no_enqueue(&mut self, lits: Vec<Lit>) {
+        if lits.len() == 1 {
+            // Unit — still enqueue
+            self.enqueue(lits[0], Reason::Decision);
+            return;
+        }
+
+        let ci = self.clause_meta.len() as u32;
+        let lbd = self.compute_lbd(&lits);
+        let start = self.clause_lits.len() as u32;
+
+        self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
+        self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
+        self.clause_lits.extend_from_slice(&lits);
+        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8, deleted: false });
+        // Don't enqueue — at chronological backtrack level, clause is not unit
     }
 
     /// Compute LBD (Literal Block Distance) of a clause.
