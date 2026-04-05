@@ -2819,19 +2819,53 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         if verbose {
             eprintln!("Precomputing X/Y boundary signatures...");
         }
-        // Key: (autocorr_sig, x_bnd_sum, y_bnd_sum) → list of (x_bits, y_bits)
-        let mut xy_by_sig_sum: HashMap<(Vec<i16>, i32, i32), Vec<(u32, u32)>> = HashMap::new();
+        // Key: packed (autocorr_sig, x_bnd_sum, y_bnd_sum) → list of (x_bits, y_bits)
+        // Pack signature (up to 6 i16 values) + two sums into a compact hash key.
+        // For k=6: 6 sig values (-12..12 each, fits in 5 bits signed) + 2 sums (-12..12).
+        // Total: 8 values × 5 bits = 40 bits, fits in a u64.
+        let pack_key = |sig: &[i16], x_sum: i32, y_sum: i32| -> u64 {
+            let mut key: u64 = 0;
+            for (i, &v) in sig.iter().enumerate() {
+                key |= ((v as i64 + 64) as u64 & 0x7F) << (i * 7);
+            }
+            key |= ((x_sum as i64 + 64) as u64 & 0x7F) << (sig.len() * 7);
+            key |= ((y_sum as i64 + 64) as u64 & 0x7F) << ((sig.len() + 1) * 7);
+            key
+        };
+
+        // Pre-compute per-X and per-Y autocorrelation contributions separately,
+        // then combine. Avoids redundant recomputation in the inner loop.
+        let num_lags = exact_lags.len();
+        let mut x_autocorr: Vec<Vec<i16>> = Vec::with_capacity(x_configs as usize);
         for xr in 0..x_configs {
-            let x_bits = (xr << 1) | 1; // bit 0 = 1 (x[0] = +1)
+            let x_bits = (xr << 1) | 1;
+            let vals: Vec<i16> = exact_lags.iter()
+                .map(|el| bnd_autocorr(x_bits, &el.xy_pairs) as i16)
+                .collect();
+            x_autocorr.push(vals);
+        }
+        let mut y_autocorr: Vec<Vec<i16>> = Vec::with_capacity(y_configs as usize);
+        for y_bits in 0..y_configs {
+            let vals: Vec<i16> = exact_lags.iter()
+                .map(|el| bnd_autocorr(y_bits, &el.xy_pairs) as i16)
+                .collect();
+            y_autocorr.push(vals);
+        }
+
+        let mut xy_by_sig_sum: HashMap<u64, Vec<(u32, u32)>> = HashMap::new();
+        let mut sig_buf = vec![0i16; num_lags];
+        for xr in 0..x_configs {
+            let x_bits = (xr << 1) | 1;
             let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
+            let x_ac = &x_autocorr[xr as usize];
             for y_bits in 0..y_configs {
                 let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
-                let sig: Vec<i16> = exact_lags.iter().map(|el| {
-                    let x_val = bnd_autocorr(x_bits, &el.xy_pairs);
-                    let y_val = bnd_autocorr(y_bits, &el.xy_pairs);
-                    (x_val + y_val) as i16
-                }).collect();
-                xy_by_sig_sum.entry((sig, x_bnd_sum, y_bnd_sum)).or_default().push((x_bits, y_bits));
+                let y_ac = &y_autocorr[y_bits as usize];
+                for j in 0..num_lags {
+                    sig_buf[j] = x_ac[j] + y_ac[j];
+                }
+                let key = pack_key(&sig_buf, x_bnd_sum, y_bnd_sum);
+                xy_by_sig_sum.entry(key).or_default().push((x_bits, y_bits));
             }
         }
         if verbose {
@@ -2913,11 +2947,13 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                         w_scanned.fetch_add(1, AtomicOrdering::Relaxed);
                         let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
 
-                        let req_sig: Vec<i16> = exact_lags_clone.iter().map(|(_, z_pairs, w_pairs)| {
+                        let num_lags = exact_lags_clone.len();
+                        let mut req_sig = vec![0i16; num_lags];
+                        for (j, (_, z_pairs, w_pairs)) in exact_lags_clone.iter().enumerate() {
                             let z_val = bnd_autocorr(z_bits, z_pairs);
                             let w_val = bnd_autocorr(w_bits, w_pairs);
-                            -(2 * z_val + 2 * w_val) as i16
-                        }).collect();
+                            req_sig[j] = -(2 * z_val + 2 * w_val) as i16;
+                        }
 
                         for (ti, tuple) in tuples.iter().enumerate() {
                             let z_mid = tuple.z - z_bnd_sum;
@@ -2932,7 +2968,15 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                     let y_mid = tuple.y - y_bnd_sum;
                                     if y_mid.abs() > middle_n as i32 || (y_mid + middle_n as i32) % 2 != 0 { continue; }
 
-                                    let key = (req_sig.clone(), x_bnd_sum, y_bnd_sum);
+                                    let key = {
+                                        let mut k: u64 = 0;
+                                        for (i, &v) in req_sig.iter().enumerate() {
+                                            k |= ((v as i64 + 64) as u64 & 0x7F) << (i * 7);
+                                        }
+                                        k |= ((x_bnd_sum as i64 + 64) as u64 & 0x7F) << (num_lags * 7);
+                                        k |= ((y_bnd_sum as i64 + 64) as u64 & 0x7F) << ((num_lags + 1) * 7);
+                                        k
+                                    };
                                     if let Some(xy_list) = xy_by_sig_sum.get(&key) {
                                         xy_matches.fetch_add(xy_list.len(), AtomicOrdering::Relaxed);
                                         for &(x_bits, y_bits) in xy_list {
