@@ -706,6 +706,170 @@ impl Solver {
     /// Set to 0 to disable.
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
 
+    /// Find equivalent literals via SCC on the binary implication graph.
+    /// Returns number of equivalences found and applied.
+    pub fn preprocess_scc_equivalences(&mut self) -> usize {
+        if !self.ok { return 0; }
+        // Propagate first
+        if self.propagate().is_some() {
+            self.ok = false;
+            return 0;
+        }
+
+        let n = self.num_vars;
+        let num_lits = 2 * n;
+
+        // Build adjacency list for binary implication graph
+        // Literal l → index: pos(v) = 2*v, neg(v) = 2*v+1
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); num_lits];
+
+        for m in &self.clause_meta {
+            if m.deleted || m.len != 2 { continue; }
+            let lits = &self.clause_lits[m.start as usize..(m.start as usize + 2)];
+            let a = lits[0];
+            let b = lits[1];
+            // Clause (a, b) means: -a → b and -b → a
+            let idx_neg_a = lit_index(-a);
+            let idx_b = lit_index(b);
+            let idx_neg_b = lit_index(-b);
+            let idx_a = lit_index(a);
+            if idx_neg_a < num_lits && idx_b < num_lits {
+                adj[idx_neg_a].push(idx_b);
+            }
+            if idx_neg_b < num_lits && idx_a < num_lits {
+                adj[idx_neg_b].push(idx_a);
+            }
+        }
+
+        // Tarjan's SCC
+        let mut index_counter: usize = 0;
+        let mut stack: Vec<usize> = Vec::new();
+        let mut on_stack = vec![false; num_lits];
+        let mut lowlink = vec![0usize; num_lits];
+        let mut index = vec![usize::MAX; num_lits];
+        let mut scc_id = vec![usize::MAX; num_lits]; // which SCC each literal belongs to
+        let mut num_sccs = 0usize;
+
+        // Iterative Tarjan's to avoid stack overflow
+        let mut call_stack: Vec<(usize, usize)> = Vec::new(); // (node, neighbor_idx)
+
+        for start in 0..num_lits {
+            if index[start] != usize::MAX { continue; }
+
+            call_stack.push((start, 0));
+            index[start] = index_counter;
+            lowlink[start] = index_counter;
+            index_counter += 1;
+            stack.push(start);
+            on_stack[start] = true;
+
+            while let Some(&mut (node, ref mut ni)) = call_stack.last_mut() {
+                if *ni < adj[node].len() {
+                    let w = adj[node][*ni];
+                    *ni += 1;
+                    if index[w] == usize::MAX {
+                        index[w] = index_counter;
+                        lowlink[w] = index_counter;
+                        index_counter += 1;
+                        stack.push(w);
+                        on_stack[w] = true;
+                        call_stack.push((w, 0));
+                    } else if on_stack[w] {
+                        lowlink[node] = lowlink[node].min(index[w]);
+                    }
+                } else {
+                    // Done with this node
+                    if lowlink[node] == index[node] {
+                        // Root of SCC
+                        let scc = num_sccs;
+                        num_sccs += 1;
+                        loop {
+                            let w = stack.pop().unwrap();
+                            on_stack[w] = false;
+                            scc_id[w] = scc;
+                            if w == node { break; }
+                        }
+                    }
+                    let (popped_node, _) = call_stack.pop().unwrap();
+                    if let Some(&(parent, _)) = call_stack.last() {
+                        lowlink[parent] = lowlink[parent].min(lowlink[popped_node]);
+                    }
+                }
+            }
+        }
+
+        // Check for contradictions: if lit and -lit are in the same SCC, UNSAT
+        for v in 0..n {
+            let pos = 2 * v;
+            let neg = 2 * v + 1;
+            if scc_id[pos] != usize::MAX && scc_id[pos] == scc_id[neg] {
+                // Variable and its negation are equivalent → UNSAT
+                self.ok = false;
+                return 0;
+            }
+        }
+
+        // Find equivalent literal pairs: if scc_id[pos(v)] == scc_id[pos(w)],
+        // then v ↔ w (they must have the same value)
+        // If scc_id[pos(v)] == scc_id[neg(w)], then v ↔ -w
+        // Build a representative map: for each variable, map to its representative
+        let mut repr: Vec<i32> = (0..n).map(|v| (v + 1) as i32).collect(); // identity map (1-based)
+        let mut equivs = 0usize;
+
+        for v in 0..n {
+            if self.assigns[v] != LBool::Undef { continue; }
+            let pos_v = 2 * v;
+            if scc_id[pos_v] == usize::MAX { continue; }
+
+            for w in (v + 1)..n {
+                if self.assigns[w] != LBool::Undef { continue; }
+                let pos_w = 2 * w;
+                if scc_id[pos_w] == usize::MAX { continue; }
+
+                if scc_id[pos_v] == scc_id[pos_w] {
+                    // v ↔ w: substitute w with v
+                    repr[w] = (v + 1) as i32; // positive equivalence
+                    equivs += 1;
+                } else if scc_id[pos_v] == scc_id[2 * w + 1] {
+                    // v ↔ -w: substitute w with -v
+                    repr[w] = -((v + 1) as i32); // negative equivalence
+                    equivs += 1;
+                }
+            }
+        }
+
+        if equivs == 0 { return 0; }
+
+        // Apply substitutions to all non-deleted clauses
+        for m in &mut self.clause_meta {
+            if m.deleted { continue; }
+            let start = m.start as usize;
+            let len = m.len as usize;
+            for i in start..start + len {
+                let lit = self.clause_lits[i];
+                let v = var_of(lit);
+                let r = repr[v];
+                if r != (v + 1) as i32 {
+                    // Substitute
+                    self.clause_lits[i] = if lit > 0 { r } else { -r };
+                }
+            }
+        }
+
+        // Rebuild watches (substitution may have changed watched literals)
+        for wl in &mut self.watches {
+            wl.clear();
+        }
+        for (ci, m) in self.clause_meta.iter().enumerate() {
+            if m.deleted || m.len < 2 { continue; }
+            let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
+            self.watches[lit_index(negate(lits[0]))].push((ci as u32, lits[1]));
+            self.watches[lit_index(negate(lits[1]))].push((ci as u32, lits[0]));
+        }
+
+        equivs
+    }
+
     /// Bounded variable elimination (BVE) preprocessing.
     /// Resolves out variables that appear in few clauses when the resolvent
     /// set is no larger than the original. Variables in `protected` are never eliminated.
@@ -726,7 +890,30 @@ impl Solver {
         let mut eliminated = 0usize;
         let num_vars = self.num_vars;
 
-        // Build occurrence lists: for each variable, which non-deleted clauses contain it
+        // First pass: simplify clauses using level-0 assignments.
+        // Remove satisfied clauses, remove false literals from remaining clauses.
+        self.simplify_clauses_at_level0();
+        if !self.ok { return 0; }
+
+        // Mark protected and constrained variables
+        let mut skip_var = vec![false; num_vars];
+        for &v in protected {
+            if v < num_vars { skip_var[v] = true; }
+        }
+        for pbc in &self.pb_constraints {
+            for &lit in &pbc.lits { skip_var[var_of(lit)] = true; }
+        }
+        for qpbc in &self.quad_pb_constraints {
+            for t in &qpbc.terms {
+                skip_var[t.var_a()] = true;
+                skip_var[t.var_b()] = true;
+            }
+        }
+        for xc in &self.xor_constraints {
+            for &v in &xc.vars { skip_var[v] = true; }
+        }
+
+        // Build and maintain occurrence lists
         let mut pos_occs: Vec<Vec<u32>> = vec![Vec::new(); num_vars];
         let mut neg_occs: Vec<Vec<u32>> = vec![Vec::new(); num_vars];
         for (ci, m) in self.clause_meta.iter().enumerate() {
@@ -734,39 +921,17 @@ impl Solver {
             let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
             for &lit in lits {
                 let v = var_of(lit);
-                if self.assigns[v] != LBool::Undef { continue; } // skip assigned vars
-                if lit > 0 {
-                    pos_occs[v].push(ci as u32);
-                } else {
-                    neg_occs[v].push(ci as u32);
-                }
+                if self.assigns[v] != LBool::Undef { continue; }
+                if lit > 0 { pos_occs[v].push(ci as u32); }
+                else { neg_occs[v].push(ci as u32); }
             }
         }
 
-        // Try to eliminate variables with few occurrences
-        // Skip protected vars and vars involved in PB, quad PB, or XOR constraints
-        let mut pb_vars = vec![false; num_vars];
-        for &v in protected {
-            if v < num_vars { pb_vars[v] = true; }
-        }
-        for pbc in &self.pb_constraints {
-            for &lit in &pbc.lits { pb_vars[var_of(lit)] = true; }
-        }
-        for qpbc in &self.quad_pb_constraints {
-            for t in &qpbc.terms {
-                pb_vars[t.var_a()] = true;
-                pb_vars[t.var_b()] = true;
-            }
-        }
-        for xc in &self.xor_constraints {
-            for &v in &xc.vars { pb_vars[v] = true; }
-        }
-
-        // Process variables in order of increasing occurrence count
+        // Process variables in order of increasing resolvent product
         let mut candidates: Vec<(usize, usize)> = (0..num_vars)
             .filter(|&v| {
                 self.assigns[v] == LBool::Undef
-                && !pb_vars[v]
+                && !skip_var[v]
                 && !pos_occs[v].is_empty()
                 && !neg_occs[v].is_empty()
             })
@@ -775,53 +940,59 @@ impl Solver {
         candidates.sort_unstable();
 
         for &(product, v) in &candidates {
-            // Skip if too many resolvents
-            if product > 100 { break; }
+            if product > 50 { break; } // limit resolvent explosion
 
-            let pos = &pos_occs[v];
-            let neg = &neg_occs[v];
-
-            // Check all clauses are still non-deleted
-            let pos_valid: Vec<u32> = pos.iter().copied()
+            // Filter to non-deleted clauses
+            let pos_valid: Vec<u32> = pos_occs[v].iter().copied()
                 .filter(|&ci| !self.clause_meta[ci as usize].deleted)
                 .collect();
-            let neg_valid: Vec<u32> = neg.iter().copied()
+            let neg_valid: Vec<u32> = neg_occs[v].iter().copied()
                 .filter(|&ci| !self.clause_meta[ci as usize].deleted)
                 .collect();
-
             if pos_valid.is_empty() || neg_valid.is_empty() { continue; }
 
             let original_count = pos_valid.len() + neg_valid.len();
+            let var_lit_pos = (v + 1) as i32;
+            let var_lit_neg = -var_lit_pos;
 
             // Compute all resolvents
             let mut resolvents: Vec<Vec<Lit>> = Vec::new();
             let mut too_many = false;
-            let var_lit_pos = (v + 1) as i32;
-            let var_lit_neg = -((v + 1) as i32);
 
             for &pci in &pos_valid {
                 let pm = &self.clause_meta[pci as usize];
-                let p_lits = &self.clause_lits[pm.start as usize..(pm.start as usize + pm.len as usize)];
+                let p_lits: Vec<Lit> = self.clause_lits[pm.start as usize..(pm.start as usize + pm.len as usize)].to_vec();
                 for &nci in &neg_valid {
                     let nm = &self.clause_meta[nci as usize];
                     let n_lits = &self.clause_lits[nm.start as usize..(nm.start as usize + nm.len as usize)];
 
-                    // Resolve: merge p_lits and n_lits, removing var_lit_pos and var_lit_neg
+                    // Build resolvent
                     let mut resolvent: Vec<Lit> = Vec::new();
                     let mut tautology = false;
-                    for &lit in p_lits {
+
+                    // Add all lits from positive clause except the pivot
+                    for &lit in &p_lits {
                         if lit == var_lit_pos { continue; }
+                        // Skip lits that are false at level 0
+                        if self.lit_value(lit) == LBool::False { continue; }
+                        // Skip if clause is satisfied at level 0
+                        if self.lit_value(lit) == LBool::True { tautology = true; break; }
                         resolvent.push(lit);
                     }
+                    if tautology { continue; }
+
+                    // Add all lits from negative clause except the pivot
                     for &lit in n_lits {
                         if lit == var_lit_neg { continue; }
-                        // Check for tautology (complementary literals)
+                        if self.lit_value(lit) == LBool::False { continue; }
+                        if self.lit_value(lit) == LBool::True { tautology = true; break; }
                         if resolvent.contains(&-lit) { tautology = true; break; }
                         if !resolvent.contains(&lit) {
                             resolvent.push(lit);
                         }
                     }
                     if tautology { continue; }
+
                     resolvents.push(resolvent);
                     if resolvents.len() > original_count {
                         too_many = true;
@@ -840,43 +1011,91 @@ impl Solver {
             for &ci in &neg_valid {
                 self.clause_meta[ci as usize].deleted = true;
             }
-            // Clean watches for deleted clauses
-            for li in 0..self.watches.len() {
-                self.watches[li].retain(|&(ci, _)| !self.clause_meta[ci as usize].deleted);
-            }
 
-            // Add resolvents
-            for resolvent in resolvents {
+            // Add resolvents as new clauses
+            for resolvent in &resolvents {
                 if resolvent.is_empty() {
                     self.ok = false;
                     return eliminated;
                 } else if resolvent.len() == 1 {
                     let lit = resolvent[0];
-                    match self.lit_value(lit) {
-                        LBool::True => {}
-                        LBool::False => { self.ok = false; return eliminated; }
-                        LBool::Undef => {
-                            self.enqueue(lit, Reason::Decision);
-                            if self.propagate().is_some() {
-                                self.ok = false;
-                                return eliminated;
-                            }
+                    if self.lit_value(lit) == LBool::Undef {
+                        self.enqueue(lit, Reason::Decision);
+                        if self.propagate().is_some() {
+                            self.ok = false;
+                            return eliminated;
                         }
+                    } else if self.lit_value(lit) == LBool::False {
+                        self.ok = false;
+                        return eliminated;
                     }
                 } else {
                     let ci = self.clause_meta.len() as u32;
                     let start = self.clause_lits.len() as u32;
-                    self.watches[lit_index(negate(resolvent[0]))].push((ci, resolvent[1]));
-                    self.watches[lit_index(negate(resolvent[1]))].push((ci, resolvent[0]));
-                    self.clause_lits.extend_from_slice(&resolvent);
+                    self.clause_lits.extend_from_slice(resolvent);
                     self.clause_meta.push(ClauseMeta {
                         start, len: resolvent.len() as u16, learnt: false, lbd: 0, deleted: false
                     });
+                    // Add to occurrence lists for future iterations
+                    for &lit in resolvent {
+                        let w = var_of(lit);
+                        if lit > 0 { pos_occs[w].push(ci); }
+                        else { neg_occs[w].push(ci); }
+                    }
                 }
             }
             eliminated += 1;
         }
+
+        // Rebuild all watches from scratch (clean and correct)
+        for wl in &mut self.watches { wl.clear(); }
+        for (ci, m) in self.clause_meta.iter().enumerate() {
+            if m.deleted || m.len < 2 { continue; }
+            let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
+            self.watches[lit_index(negate(lits[0]))].push((ci as u32, lits[1]));
+            self.watches[lit_index(negate(lits[1]))].push((ci as u32, lits[0]));
+        }
+
         eliminated
+    }
+
+    /// Simplify clause database using level-0 assignments.
+    /// Removes satisfied clauses and false literals.
+    fn simplify_clauses_at_level0(&mut self) {
+        for ci in 0..self.clause_meta.len() {
+            let m = &self.clause_meta[ci];
+            if m.deleted { continue; }
+            let start = m.start as usize;
+            let len = m.len as usize;
+
+            // Check if clause is satisfied
+            let mut satisfied = false;
+            for i in start..start + len {
+                if self.lit_value(self.clause_lits[i]) == LBool::True {
+                    satisfied = true;
+                    break;
+                }
+            }
+            if satisfied {
+                self.clause_meta[ci].deleted = true;
+                continue;
+            }
+
+            // Remove false literals (compact in place)
+            let mut new_len = 0;
+            for i in start..start + len {
+                let lit = self.clause_lits[i];
+                if self.lit_value(lit) != LBool::False {
+                    self.clause_lits[start + new_len] = lit;
+                    new_len += 1;
+                }
+            }
+            if new_len == 0 {
+                self.ok = false;
+                return;
+            }
+            self.clause_meta[ci].len = new_len as u16;
+        }
     }
 
     /// Extract high-quality learnt clauses (LBD <= max_lbd) as Vec<Vec<Lit>>.
@@ -1167,7 +1386,7 @@ impl Solver {
 
                     // Vivification: periodically try to shorten clauses
                     if self.config.vivification && self.conflicts % 500 == 0 {
-                        self.vivify_clauses(base_level, 50);
+                        self.vivify_clauses(base_level, 100);
                     }
 
                     // Rephasing: periodically reset phases
