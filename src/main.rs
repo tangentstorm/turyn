@@ -3152,34 +3152,47 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                     }
                                     if !xy_slice.is_empty() {
                                         xy_matches.fetch_add(xy_slice.len(), AtomicOrdering::Relaxed);
+
+                                        // Clone once per (z_bits, w_bits, tuple) group.
+                                        // Add Z/W boundary as permanent unit clauses,
+                                        // then iterate XY configs using assumptions.
+                                        let (ref enc, ref template_solver) = templates[ti];
+                                        let mut solver = template_solver.clone();
+                                        // Warm-start: phase-only transfer
+                                        if let Some(ref ph) = warm_phase {
+                                            solver.set_phase(ph);
+                                        }
+
+                                        // Fix Z/W boundary (permanent — same for all XY configs)
+                                        for i in 0..k {
+                                            solver.add_clause([if (z_bits >> i) & 1 == 1 { enc.z_var(i) } else { -enc.z_var(i) }]);
+                                            solver.add_clause([if (z_bits >> (k + i)) & 1 == 1 { enc.z_var(n - k + i) } else { -enc.z_var(n - k + i) }]);
+                                            solver.add_clause([if (w_bits >> i) & 1 == 1 { enc.w_var(i) } else { -enc.w_var(i) }]);
+                                            solver.add_clause([if (w_bits >> (k + i)) & 1 == 1 { enc.w_var(m - k + i) } else { -enc.w_var(m - k + i) }]);
+                                        }
+
+                                        let mut xy_assumptions: Vec<i32> = Vec::with_capacity(4 * k);
                                         for &(x_bits, y_bits) in xy_slice {
                                             if should_stop() { break; }
 
-                                            let (ref enc, ref template_solver) = templates[ti];
-                                            let mut solver = template_solver.clone();
                                             if conflict_limit > 0 {
-                                                solver.set_conflict_limit(conflict_limit);
-                                            }
-                                            // Warm-start: phase-only transfer
-                                            if let Some(ref ph) = warm_phase {
-                                                solver.set_phase(ph);
+                                                solver.set_conflict_budget(conflict_limit);
                                             }
 
+                                            // XY boundary as assumptions (temporary per solve)
+                                            xy_assumptions.clear();
                                             for i in 0..k {
-                                                solver.add_clause([if (x_bits >> i) & 1 == 1 { enc.x_var(i) } else { -enc.x_var(i) }]);
-                                                solver.add_clause([if (x_bits >> (k + i)) & 1 == 1 { enc.x_var(n - k + i) } else { -enc.x_var(n - k + i) }]);
-                                                solver.add_clause([if (y_bits >> i) & 1 == 1 { enc.y_var(i) } else { -enc.y_var(i) }]);
-                                                solver.add_clause([if (y_bits >> (k + i)) & 1 == 1 { enc.y_var(n - k + i) } else { -enc.y_var(n - k + i) }]);
-                                                solver.add_clause([if (z_bits >> i) & 1 == 1 { enc.z_var(i) } else { -enc.z_var(i) }]);
-                                                solver.add_clause([if (z_bits >> (k + i)) & 1 == 1 { enc.z_var(n - k + i) } else { -enc.z_var(n - k + i) }]);
-                                                solver.add_clause([if (w_bits >> i) & 1 == 1 { enc.w_var(i) } else { -enc.w_var(i) }]);
-                                                solver.add_clause([if (w_bits >> (k + i)) & 1 == 1 { enc.w_var(m - k + i) } else { -enc.w_var(m - k + i) }]);
+                                                xy_assumptions.push(if (x_bits >> i) & 1 == 1 { enc.x_var(i) } else { -enc.x_var(i) });
+                                                xy_assumptions.push(if (x_bits >> (k + i)) & 1 == 1 { enc.x_var(n - k + i) } else { -enc.x_var(n - k + i) });
+                                                xy_assumptions.push(if (y_bits >> i) & 1 == 1 { enc.y_var(i) } else { -enc.y_var(i) });
+                                                xy_assumptions.push(if (y_bits >> (k + i)) & 1 == 1 { enc.y_var(n - k + i) } else { -enc.y_var(n - k + i) });
                                             }
 
-                                            let result = solver.solve();
-                                            let nc = solver.num_conflicts();
+                                            let conflicts_before = solver.num_conflicts();
+                                            let result = solver.solve_with_assumptions(&xy_assumptions);
+                                            let nc = solver.num_conflicts() - conflicts_before;
                                             total_conflicts.fetch_add(nc, AtomicOrdering::Relaxed);
-                                            // Save phase for warm-start (no clause transfer)
+                                            // Save phase for warm-start
                                             warm_phase = Some(solver.get_phase());
 
                                             if result == Some(true) {
@@ -3191,6 +3204,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                                     if solver.value(enc.z_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
                                                 let w = PackedSeq::from_values(&(0..m).map(|i|
                                                     if solver.value(enc.w_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                                                solver.reset(); // backtrack for next solve
 
                                                 if verify_tt(problem, &x, &y, &z, &w) {
                                                     found.store(true, AtomicOrdering::Relaxed);

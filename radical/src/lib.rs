@@ -709,6 +709,11 @@ impl Solver {
     /// Set to 0 to disable.
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
 
+    /// Set a per-call conflict budget: solver stops after `budget` additional conflicts.
+    pub fn set_conflict_budget(&mut self, budget: u64) {
+        self.conflict_limit = self.conflicts + budget;
+    }
+
     /// Find equivalent literals via SCC on the binary implication graph.
     /// Returns number of equivalences found and applied.
     pub fn preprocess_scc_equivalences(&mut self) -> usize {
