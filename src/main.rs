@@ -2038,8 +2038,10 @@ fn sat_solve_xyw(
     let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
     let w_var = |i: usize| -> i32 { (2 * n + i + 1) as i32 };
 
-    // Symmetry breaking
+    // Symmetry breaking: fix first element of each free sequence to +1
     solver.add_clause([x_var(0)]); // x[0] = +1
+    solver.add_clause([y_var(0)]); // y[0] = +1
+    solver.add_clause([w_var(0)]); // w[0] = +1
 
     // Sum constraints
     if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0
@@ -2759,11 +2761,13 @@ fn sat_encode(problem: Problem, tuple: SumTuple) -> (SatEncoder, radical::Solver
     let mut enc = SatEncoder::new(n);
     let mut solver: radical::Solver = Default::default();
 
-    // Minimal symmetry breaking: only fix x[0]=+1.
-    // Full TT symmetry group includes negation of each sequence independently,
-    // so fixing x[0]=+1 is always valid. Other constraints like z[0]=z[n-1]=+1
-    // are too restrictive for some n (e.g., TT(6)).
+    // Symmetry breaking: fix first element of each sequence to +1.
+    // Negation of any sequence preserves autocorrelation constraints,
+    // so a[0]=+1 is always valid. (But NOT a[0]=a[n-1]=+1, which is too restrictive.)
     solver.add_clause([enc.x_var(0)]);  // x[0] = +1
+    solver.add_clause([enc.y_var(0)]);  // y[0] = +1
+    solver.add_clause([enc.z_var(0)]);  // z[0] = +1
+    solver.add_clause([enc.w_var(0)]);  // w[0] = +1
 
     // Sum constraints: encode that exactly (sum+len)/2 variables are true (=+1)
     let x_pos = ((tuple.x + n as i32) / 2) as usize;
@@ -2866,8 +2870,11 @@ fn sat_encode_quad_pb_unified(
     let enc = SatEncoder::new(n);
     let mut solver = radical::Solver::new();
 
-    // Symmetry breaking for free sequences
+    // Symmetry breaking for free sequences: fix a[0]=+1
     if x_fixed.is_none() { solver.add_clause([enc.x_var(0)]); }
+    if y_fixed.is_none() { solver.add_clause([enc.y_var(0)]); }
+    if z_fixed.is_none() { solver.add_clause([enc.z_var(0)]); }
+    if w_fixed.is_none() { solver.add_clause([enc.w_var(0)]); }
 
     // Helper: check sum parity
     let check_sum = |sum: i32, len: usize| -> Option<u32> {
@@ -3108,12 +3115,12 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             val
         };
 
-        // X/Y symmetry breaking: x[0] = +1 (bit 0 set)
-        // So x_bits always has bit 0 set (we only enumerate x_bits with bit 0 = 1).
+        // Symmetry breaking: fix a[0]=+1 for all four sequences.
+        // Negation of any sequence preserves autocorrelation, so bit 0 is always 1.
         let x_configs = 1u32 << (2 * k - 1); // x[0] fixed, 2k-1 free bits
-        let y_configs = 1u32 << (2 * k);      // all 2k bits free
-        let z_configs = 1u32 << (2 * k);      // all 2k bits free
-        let w_configs = 1u32 << (2 * k);      // all 2k bits free
+        let y_configs = 1u32 << (2 * k - 1); // y[0] fixed, 2k-1 free bits
+        let z_configs = 1u32 << (2 * k - 1); // z[0] fixed, 2k-1 free bits
+        let w_configs = 1u32 << (2 * k - 1); // w[0] fixed, 2k-1 free bits
 
         let use_table = xy_table.is_some();
         if verbose {
@@ -3153,7 +3160,8 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 x_autocorr.push(vals);
             }
             let mut y_autocorr: Vec<Vec<i16>> = Vec::with_capacity(y_configs as usize);
-            for y_bits in 0..y_configs {
+            for yr in 0..y_configs {
+                let y_bits = (yr << 1) | 1;
                 let vals: Vec<i16> = exact_lags.iter()
                     .map(|el| bnd_autocorr(y_bits, &el.xy_pairs) as i16)
                     .collect();
@@ -3166,9 +3174,10 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 let x_bits = (xr << 1) | 1;
                 let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
                 let x_ac = &x_autocorr[xr as usize];
-                for y_bits in 0..y_configs {
+                for yr in 0..y_configs {
+                    let y_bits = (yr << 1) | 1;
                     let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
-                    let y_ac = &y_autocorr[y_bits as usize];
+                    let y_ac = &y_autocorr[yr as usize];
                     for j in 0..num_lags {
                         sig_buf[j] = x_ac[j] + y_ac[j];
                     }
@@ -3258,12 +3267,14 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 let should_stop = || found.load(AtomicOrdering::Relaxed) || timed_out.load(AtomicOrdering::Relaxed);
                 loop {
                     if should_stop() { break; }
-                    let z_bits = z_idx.fetch_add(1, AtomicOrdering::Relaxed) as u32;
-                    if z_bits >= z_configs { break; }
+                    let zr = z_idx.fetch_add(1, AtomicOrdering::Relaxed) as u32;
+                    if zr >= z_configs { break; }
+                    let z_bits = (zr << 1) | 1; // z[0] = +1
 
                     let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - max_bnd_sum;
 
-                    for w_bits in 0..w_configs {
+                    for wr in 0..w_configs {
+                        let w_bits = (wr << 1) | 1; // w[0] = +1
                         if should_stop() { break; }
                         w_scanned.fetch_add(1, AtomicOrdering::Relaxed);
                         let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
@@ -4245,12 +4256,12 @@ mod tests {
 
     #[test]
     fn quad_pb_accepts_known_tt6() {
-        // Known TT(6) solution — negated X to match x[0]=+1 symmetry breaking
-        // Original: x=[-1,-1,-1,-1,1,-1] → negated: [1,1,1,1,-1,1]
+        // Known TT(6) solution — all sequences negated so a[0]=+1
+        // Original: x=[-1,-1,-1,-1,1,-1], y=[-1,-1,-1,1,-1,-1], z=[-1,-1,1,-1,1,1], w=[-1,1,1,1,-1]
         let x_vals: &[i8] = &[1, 1, 1, 1, -1, 1];
-        let y_vals: &[i8] = &[-1, -1, -1, 1, -1, -1]; // y is independent
-        let z_vals: &[i8] = &[-1, -1, 1, -1, 1, 1];
-        let w_vals: &[i8] = &[-1, 1, 1, 1, -1];
+        let y_vals: &[i8] = &[1, 1, 1, -1, 1, 1];
+        let z_vals: &[i8] = &[1, 1, -1, 1, -1, -1];
+        let w_vals: &[i8] = &[1, -1, -1, -1, 1];
 
         let p = Problem::new(6);
         let x = PackedSeq::from_values(x_vals);

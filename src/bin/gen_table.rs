@@ -132,7 +132,7 @@ fn main() {
     // Phase 2: Map each Z/W config to a signature ID
     eprintln!("Phase 2: mapping Z/W configs to signatures...");
     let z_free = 2 * k - 1;
-    let w_free = 2 * k;
+    let w_free = 2 * k - 1; // w[0]=+1 symmetry breaking
     let zw_configs = 1u64 << (z_free + w_free);
 
     let compute_required_xy_sig = |zb: u32, wb: u32| -> Vec<i16> {
@@ -233,9 +233,9 @@ fn decode_xy(bits: u64, k: usize) -> (u32, u32) {
 
 fn decode_zw(bits: u64, k: usize) -> (u32, u32) {
     let mut zb = 1u32;
-    let mut wb = 0u32;
+    let mut wb = 1u32; // w[0]=+1 symmetry breaking
     let mut bi = 0usize;
     for i in 1..(2*k) { let v = ((bits >> bi) & 1) as u32; bi += 1; zb |= v << i; }
-    for i in 0..(2*k) { let v = ((bits >> bi) & 1) as u32; bi += 1; wb |= v << i; }
+    for i in 1..(2*k) { let v = ((bits >> bi) & 1) as u32; bi += 1; wb |= v << i; }
     (zb, wb)
 }
