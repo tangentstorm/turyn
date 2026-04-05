@@ -255,6 +255,8 @@ struct SearchConfig {
     dump_dimacs: Option<String>,
     /// SAT solver feature flags.
     sat_config: radical::SolverConfig,
+    /// Time limit in seconds for --sat mode (0 = unlimited).
+    sat_secs: u64,
 }
 
 impl Default for SearchConfig {
@@ -281,6 +283,7 @@ impl Default for SearchConfig {
             no_table: false,
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
+            sat_secs: 0,
         }
     }
 }
@@ -2846,6 +2849,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                 n, k, workers);
         }
         let found = Arc::new(AtomicBool::new(false));
+        let timed_out = Arc::new(AtomicBool::new(false));
         let items_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let sat_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let unsat_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2853,6 +2857,8 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let w_scanned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let total_conflicts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let z_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let time_limit_secs = cfg.sat_secs;
+        let conflict_limit = cfg.conflict_limit;
         let xy_by_sig_sum = Arc::new(xy_by_sig_sum);
 
         // Pre-build SAT encoding templates (one per tuple, clone per config)
@@ -2865,6 +2871,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let mut handles = Vec::new();
         for _tid in 0..workers {
             let found = Arc::clone(&found);
+            let timed_out = Arc::clone(&timed_out);
             let items_done = Arc::clone(&items_done);
             let sat_count = Arc::clone(&sat_count);
             let unsat_count = Arc::clone(&unsat_count);
@@ -2888,15 +2895,16 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                     val
                 };
 
+                let should_stop = || found.load(AtomicOrdering::Relaxed) || timed_out.load(AtomicOrdering::Relaxed);
                 loop {
-                    if found.load(AtomicOrdering::Relaxed) { break; }
+                    if should_stop() { break; }
                     let z_bits = z_idx.fetch_add(1, AtomicOrdering::Relaxed) as u32;
                     if z_bits >= z_configs { break; }
 
                     let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - max_bnd_sum;
 
                     for w_bits in 0..w_configs {
-                        if found.load(AtomicOrdering::Relaxed) { break; }
+                        if should_stop() { break; }
                         w_scanned.fetch_add(1, AtomicOrdering::Relaxed);
                         let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
 
@@ -2923,10 +2931,13 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                     if let Some(xy_list) = xy_by_sig_sum.get(&key) {
                                         xy_matches.fetch_add(xy_list.len(), AtomicOrdering::Relaxed);
                                         for &(x_bits, y_bits) in xy_list {
-                                            if found.load(AtomicOrdering::Relaxed) { break; }
+                                            if should_stop() { break; }
 
                                             let (ref enc, ref template_solver) = templates[ti];
                                             let mut solver = template_solver.clone();
+                                            if conflict_limit > 0 {
+                                                solver.set_conflict_limit(conflict_limit);
+                                            }
 
                                             for i in 0..k {
                                                 solver.add_clause([if (x_bits >> i) & 1 == 1 { enc.x_var(i) } else { -enc.x_var(i) }]);
@@ -2940,7 +2951,8 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                             }
 
                                             let result = solver.solve();
-                                            total_conflicts.fetch_add(solver.num_conflicts(), AtomicOrdering::Relaxed);
+                                            let nc = solver.num_conflicts();
+                                            total_conflicts.fetch_add(nc, AtomicOrdering::Relaxed);
                                             if result == Some(true) {
                                                 let x = PackedSeq::from_values(&(0..n).map(|i|
                                                     if solver.value(enc.x_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
@@ -2976,9 +2988,14 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let mut prev_done = 0usize;
         let mut prev_time = run_start.elapsed().as_secs_f64();
         while !found.load(AtomicOrdering::Relaxed)
+            && !timed_out.load(AtomicOrdering::Relaxed)
             && z_idx.load(AtomicOrdering::Relaxed) < total_z
         {
             std::thread::sleep(std::time::Duration::from_secs(10));
+            // Check time limit
+            if time_limit_secs > 0 && run_start.elapsed().as_secs() >= time_limit_secs {
+                timed_out.store(true, AtomicOrdering::Relaxed);
+            }
             let done = items_done.load(AtomicOrdering::Relaxed);
             let sats = sat_count.load(AtomicOrdering::Relaxed);
             let unsats = unsat_count.load(AtomicOrdering::Relaxed);
@@ -3001,6 +3018,29 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         }
 
         for h in handles { let _ = h.join(); }
+
+        // Final summary
+        let done = items_done.load(AtomicOrdering::Relaxed);
+        let sats = sat_count.load(AtomicOrdering::Relaxed);
+        let unsats = unsat_count.load(AtomicOrdering::Relaxed);
+        let matches = xy_matches.load(AtomicOrdering::Relaxed);
+        let w_done = w_scanned.load(AtomicOrdering::Relaxed);
+        let conflicts = total_conflicts.load(AtomicOrdering::Relaxed);
+        let elapsed = run_start.elapsed().as_secs_f64();
+        let avg_conflicts = if done > 0 { conflicts / done as u64 } else { 0 };
+        if verbose {
+            eprintln!("\n--- SAT cubed k={} final ---", k);
+            eprintln!("  Elapsed:        {:.1}s", elapsed);
+            eprintln!("  ZW scanned:     {} / {} ({:.1}%)", w_done, total_zw, 100.0 * w_done as f64 / total_zw as f64);
+            eprintln!("  XY matches:     {}", matches);
+            eprintln!("  SAT solves:     {} ({} SAT, {} UNSAT)", done, sats, unsats);
+            eprintln!("  Rate:           {:.2} solves/s", done as f64 / elapsed);
+            eprintln!("  Avg conflicts:  {}", avg_conflicts);
+            eprintln!("  Total conflicts:{}", conflicts);
+            if timed_out.load(AtomicOrdering::Relaxed) {
+                eprintln!("  (stopped: time limit {}s)", time_limit_secs);
+            }
+        }
 
         SearchReport {
             stats: SearchStats::default(),
@@ -3425,6 +3465,8 @@ fn print_help() {
     eprintln!("                           prune more aggressively (faster but may miss solutions)");
     eprintln!("  --conflict-limit=<N>     Max CDCL conflicts per SAT call before giving up on");
     eprintln!("                           that candidate; 0 = unlimited (default: 0)");
+    eprintln!("  --sat-secs=<N>           Time limit in seconds for --sat mode; stops and reports");
+    eprintln!("                           stats when reached; 0 = unlimited (default: 0)");
     eprintln!();
     eprintln!("SAT VARIANT FLAGS:");
     eprintln!("  --z-sat, --xyz-sat       Solve Z via SAT instead of enumeration");
@@ -3518,6 +3560,8 @@ fn parse_args() -> SearchConfig {
             }
         } else if let Some(v) = arg.strip_prefix("--conflict-limit=") {
             cfg.conflict_limit = v.parse().unwrap_or(0);
+        } else if let Some(v) = arg.strip_prefix("--sat-secs=") {
+            cfg.sat_secs = v.parse().unwrap_or(0);
         } else if arg == "--ema-restarts" {
             cfg.sat_config.ema_restarts = true;
         } else if arg == "--probing" {
