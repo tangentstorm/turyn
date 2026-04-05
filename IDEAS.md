@@ -408,3 +408,70 @@ PB constraints encode `sum(x_i) = k`. With 44 vars and unit coefficients, the at
 ### R10. Reduce recompute cost by sorting terms by variable index
 
 In `recompute_quad_pb`, the inner loop loads `assigns[var_a()]` and `assigns[var_b()]` for each term. With ~80 terms accessing ~44 variables, many accesses hit the same cache line. Sorting terms by `(var_a, var_b)` at constraint creation time maximizes sequential access patterns and reduces L1 misses.
+
+## Ideas from CryptoMiniSat and other advanced SAT solvers (credit: Claude, April 2026)
+
+These target the SAT solver (radical), which dominates runtime at n >= 22. Sourced from CryptoMiniSat, CaDiCaL, Kissat, Lingeling, and MapleSAT.
+
+**Benchmark:** `turyn --n=56 --tuple=8,14,6,1 --theta=50 --max-spectral=200 --max-z=50000 --max-w=50000 --benchmark=3`
+Baseline: mean=35688ms, median=35499ms (229 SAT instances, 4 threads)
+
+### CMS1. Warm-start learnt clause and phase transfer across SAT calls
+
+Keep a pool of high-quality learnt clauses (LBD <= 2) from previous solves and seed new instances with them. Save phase vectors from SAT results. The structural similarity between Z/W pairs means clauses about X/Y variable interactions are reusable.
+
+**Single commit:** In `solve_xy_with_sat`, after each `solve_with_assumptions()`, extract learnt clauses with LBD <= 2 that don't mention assumption variables. Store in a shared pool (cap ~100 clauses). Before next solve, inject pool clauses. Save phase vector from SAT results and use as initial phase.
+
+### CMS2. Lucky phases (Kissat)
+
+Before main CDCL search, try a handful of complete assignments: all-positive, all-negative, and phases from previous solutions. Propagate each to completion — if consistent, return immediately. Over thousands of SAT calls, catching even 1-2% trivially saves time.
+
+**Single commit:** In `solve_inner()` before the main loop, try 4-8 candidate phase vectors. For each: set all variables, propagate, check consistency. If any reaches a solution, return immediately. Cost: ~8 propagation passes per SAT call.
+
+### CMS3. Chronological backtracking (CaDiCaL / MapleSAT)
+
+When backjump level is close to current level (within threshold), backtrack chronologically (one level) instead. Avoids re-deriving implications already on the trail.
+
+**Single commit:** In `analyze()`, after computing backjump level, check `current_level - backjump_level < 3`. If so, backtrack to `current_level - 1` instead. Handle re-propagated literals on the trail above backjump level.
+
+### CMS4. Vivification / clause strengthening (CaDiCaL / Kissat)
+
+Shorten existing clauses by tentatively assuming each literal is false and propagating. If conflict before exhausting clause, shorten it. Safe (temporary propagation fully undone). Apply to top learnt clauses by LBD during restarts.
+
+**Single commit:** After each restart, pick top N learnt clauses by LBD. For each: save trail, assume negations left-to-right, propagate. If conflict at literal k, shorten to first k literals. Restore trail.
+
+### CMS5. Equivalent literal substitution via SCC (Lingeling)
+
+Build binary implication graph, run Tarjan's SCC to find equivalent literal pairs. Replace one with the other throughout formula. Shrinks variable count.
+
+**Single commit:** At solver construction, extract binary implications from watch lists and XOR/PB constraints. Run Tarjan SCC. For each equivalence class, pick representative and substitute throughout clause, PB, and quad PB structures.
+
+### CMS6. Local search phase advising (CryptoMiniSat 5.x)
+
+Use SA engine as phase advisor: on every Nth restart, run short burst of local search (~5000 flips), import result as phase vector. Combines CDCL completeness with local search guidance.
+
+**Single commit:** On every 4th restart, extract current partial assignment, run ~5000 SA flips targeting X/Y autocorrelation defect, import as phase[] vector. SA engine at 41M flips/s means ~0.1ms cost.
+
+### CMS7. Gauss-Jordan elimination for XOR propagation (CryptoMiniSat)
+
+Maintain XOR constraint matrix in row-echelon form. When multiple XORs interact, GJ deduces implications that individual XOR propagation misses. Dense, interdependent XOR structure makes this high-impact.
+
+**Single commit:** In `propagate()`, after BCP, run incremental GJ elimination on XOR matrix. Maintain row-echelon form (add/remove rows on assign/backtrack). When row reduces to single variable, enqueue as unit.
+
+### CMS8. Bounded variable elimination (BVE) inprocessing (CaDiCaL)
+
+Resolve out variables appearing in few clauses. If resolvent count <= original, eliminate. Focus on any remaining CNF clauses (symmetry breaking, learnt).
+
+**Single commit:** Before first `solve()`, scan for variables in few clauses. Compute resolvents. If count <= original, apply elimination. Note: with quad PB encoding we have very few clauses, so may have limited scope.
+
+### CMS9. Clause distillation / inprocessing (Lingeling)
+
+Periodically run subsumption + self-subsuming resolution on clause database. Different from vivification — focuses on inter-clause relationships.
+
+**Single commit:** Every 100 restarts at decision level 0: sort clauses by length, check for subsumption, apply self-subsuming resolution. Focus on template's original clauses.
+
+### CMS10. Community-structure-aware branching (CryptoMiniSat)
+
+Partition variables into communities (X-vars vs Y-vars, or by lag group). Bias VSIDS to prefer variables in same community as recent decisions.
+
+**Single commit:** At construction, assign each variable to community (X vs Y). Add community bonus to VSIDS: prefer same-community variables. Produces lower-LBD learnt clauses.

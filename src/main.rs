@@ -2847,6 +2847,11 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         }
         let found = Arc::new(AtomicBool::new(false));
         let items_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sat_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let unsat_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let xy_matches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w_scanned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let total_conflicts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let z_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let xy_by_sig_sum = Arc::new(xy_by_sig_sum);
 
@@ -2861,6 +2866,11 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         for _tid in 0..workers {
             let found = Arc::clone(&found);
             let items_done = Arc::clone(&items_done);
+            let sat_count = Arc::clone(&sat_count);
+            let unsat_count = Arc::clone(&unsat_count);
+            let xy_matches = Arc::clone(&xy_matches);
+            let w_scanned = Arc::clone(&w_scanned);
+            let total_conflicts = Arc::clone(&total_conflicts);
             let z_idx = Arc::clone(&z_idx);
             let xy_by_sig_sum = Arc::clone(&xy_by_sig_sum);
             let templates = Arc::clone(&templates);
@@ -2887,6 +2897,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
                     for w_bits in 0..w_configs {
                         if found.load(AtomicOrdering::Relaxed) { break; }
+                        w_scanned.fetch_add(1, AtomicOrdering::Relaxed);
                         let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
 
                         let req_sig: Vec<i16> = exact_lags_clone.iter().map(|(_, z_pairs, w_pairs)| {
@@ -2910,6 +2921,7 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
                                     let key = (req_sig.clone(), x_bnd_sum, y_bnd_sum);
                                     if let Some(xy_list) = xy_by_sig_sum.get(&key) {
+                                        xy_matches.fetch_add(xy_list.len(), AtomicOrdering::Relaxed);
                                         for &(x_bits, y_bits) in xy_list {
                                             if found.load(AtomicOrdering::Relaxed) { break; }
 
@@ -2927,7 +2939,9 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                                 solver.add_clause([if (w_bits >> (k + i)) & 1 == 1 { enc.w_var(m - k + i) } else { -enc.w_var(m - k + i) }]);
                                             }
 
-                                            if let Some(true) = solver.solve() {
+                                            let result = solver.solve();
+                                            total_conflicts.fetch_add(solver.num_conflicts(), AtomicOrdering::Relaxed);
+                                            if result == Some(true) {
                                                 let x = PackedSeq::from_values(&(0..n).map(|i|
                                                     if solver.value(enc.x_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
                                                 let y = PackedSeq::from_values(&(0..n).map(|i|
@@ -2941,6 +2955,9 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                                     found.store(true, AtomicOrdering::Relaxed);
                                                     print_solution("TT SOLUTION", &x, &y, &z, &w);
                                                 }
+                                                sat_count.fetch_add(1, AtomicOrdering::Relaxed);
+                                            } else {
+                                                unsat_count.fetch_add(1, AtomicOrdering::Relaxed);
                                             }
                                             items_done.fetch_add(1, AtomicOrdering::Relaxed);
                                         }
@@ -2955,18 +2972,32 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
         // Progress reporting
         let total_z = z_configs as usize;
+        let total_zw = total_z * w_configs as usize;
+        let mut prev_done = 0usize;
+        let mut prev_time = run_start.elapsed().as_secs_f64();
         while !found.load(AtomicOrdering::Relaxed)
             && z_idx.load(AtomicOrdering::Relaxed) < total_z
         {
             std::thread::sleep(std::time::Duration::from_secs(10));
             let done = items_done.load(AtomicOrdering::Relaxed);
+            let sats = sat_count.load(AtomicOrdering::Relaxed);
+            let unsats = unsat_count.load(AtomicOrdering::Relaxed);
+            let matches = xy_matches.load(AtomicOrdering::Relaxed);
+            let w_done = w_scanned.load(AtomicOrdering::Relaxed);
+            let conflicts = total_conflicts.load(AtomicOrdering::Relaxed);
             let z_done = z_idx.load(AtomicOrdering::Relaxed).min(total_z);
             let elapsed = run_start.elapsed().as_secs_f64();
             let rate = done as f64 / elapsed;
+            let dt = elapsed - prev_time;
+            let recent_rate = if dt > 0.0 { (done - prev_done) as f64 / dt } else { 0.0 };
+            let avg_conflicts = if done > 0 { conflicts / done as u64 } else { 0 };
+            let zw_pct = if total_zw > 0 { 100.0 * w_done as f64 / total_zw as f64 } else { 0.0 };
             if verbose {
-                eprintln!("[{:.0}s] SAT cubed k={} | z {}/{} | solved {} | {:.1} configs/s",
-                    elapsed, k, z_done, total_z, done, rate);
+                eprintln!("[{:.0}s] SAT cubed k={} | z {}/{} | zw {:.1}% | SAT {}/{} ({}sat {}unsat) | xy_match {} | {:.1}/s (recent {:.1}/s) | avg {:.0} conflicts",
+                    elapsed, k, z_done, total_z, zw_pct, done, matches, sats, unsats, matches, rate, recent_rate, avg_conflicts);
             }
+            prev_done = done;
+            prev_time = elapsed;
         }
 
         for h in handles { let _ = h.join(); }
