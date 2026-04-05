@@ -286,7 +286,7 @@ impl Default for SearchConfig {
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
             sat_secs: 0,
-            quad_pb: false,
+            quad_pb: true,
         }
     }
 }
@@ -3978,6 +3978,8 @@ fn parse_args() -> SearchConfig {
             cfg.no_table = true;
         } else if arg == "--quad-pb" {
             cfg.quad_pb = true;
+        } else if arg == "--no-quad-pb" {
+            cfg.quad_pb = false;
         } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
             cfg.dump_dimacs = Some(v.to_string());
         } else {
@@ -4197,7 +4199,7 @@ mod tests {
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
             sat_secs: 0,
-            quad_pb: false,
+            quad_pb: true,
         };
         let report = run_hybrid_search(&cfg, false);
         assert!(report.found_solution, "n=4 hybrid should find solution");
