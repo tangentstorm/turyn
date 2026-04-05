@@ -2895,6 +2895,11 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                     val
                 };
 
+                // Warm-start state: per-worker clause pool and saved phases
+                let mut warm_clauses: Vec<Vec<i32>> = Vec::new();
+                let mut warm_phase: Option<Vec<bool>> = None;
+                let max_warm_clauses = 100;
+
                 let should_stop = || found.load(AtomicOrdering::Relaxed) || timed_out.load(AtomicOrdering::Relaxed);
                 loop {
                     if should_stop() { break; }
@@ -2938,6 +2943,13 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                             if conflict_limit > 0 {
                                                 solver.set_conflict_limit(conflict_limit);
                                             }
+                                            // Warm-start: inject saved clauses and phase
+                                            if !warm_clauses.is_empty() {
+                                                solver.inject_clauses(&warm_clauses, 2);
+                                            }
+                                            if let Some(ref ph) = warm_phase {
+                                                solver.set_phase(ph);
+                                            }
 
                                             for i in 0..k {
                                                 solver.add_clause([if (x_bits >> i) & 1 == 1 { enc.x_var(i) } else { -enc.x_var(i) }]);
@@ -2953,6 +2965,15 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                             let result = solver.solve();
                                             let nc = solver.num_conflicts();
                                             total_conflicts.fetch_add(nc, AtomicOrdering::Relaxed);
+                                            // Extract warm-start data
+                                            let new_clauses = solver.extract_learnt_clauses(2);
+                                            for c in new_clauses {
+                                                if warm_clauses.len() < max_warm_clauses {
+                                                    warm_clauses.push(c);
+                                                }
+                                            }
+                                            warm_phase = Some(solver.get_phase());
+
                                             if result == Some(true) {
                                                 let x = PackedSeq::from_values(&(0..n).map(|i|
                                                     if solver.value(enc.x_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
@@ -3801,6 +3822,7 @@ mod tests {
             no_table: true,
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
+            sat_secs: 0,
         };
         let report = run_hybrid_search(&cfg, false);
         assert!(report.found_solution, "n=4 hybrid should find solution");
