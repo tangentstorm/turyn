@@ -1411,7 +1411,7 @@ impl Solver {
                     self.reduce_db();
 
                     // Vivification: periodically try to shorten clauses
-                    if self.config.vivification && self.conflicts % 500 == 0 {
+                    if self.config.vivification && self.conflicts % 1000 == 0 {
                         self.vivify_clauses(base_level, 50);
                     }
 
