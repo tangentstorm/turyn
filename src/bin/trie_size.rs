@@ -376,11 +376,32 @@ fn main() {
     let mut paths_to: HashMap<u32, u128> = HashMap::new();
     paths_to.insert(root, 1);
 
-    // BFS depth breakdown
-    eprintln!("\n  Depth breakdown:");
+    // BFS depth breakdown with cumulative pruning stats
+    eprintln!("\n  Depth breakdown (lags_checked = constraints satisfied so far):");
     let mut current_level_nodes: Vec<u32> = vec![root];
+    let mut lags_checked = 0;
     for d in 0..depth {
-        eprintln!("    depth {:2} (pos {:2}): {} unique nodes", d, pos_order[d], current_level_nodes.len());
+        // Total partial paths arriving at this depth
+        let total_arriving: u128 = current_level_nodes.iter()
+            .filter(|&&nid| nid != DEAD && nid != LEAF)
+            .map(|&nid| paths_to.get(&nid).copied().unwrap_or(0))
+            .sum();
+        // Total paths from here to leaf (valid completions)
+        let total_through: u128 = current_level_nodes.iter()
+            .filter(|&&nid| nid != DEAD && nid != LEAF)
+            .map(|&nid| {
+                let to = paths_to.get(&nid).copied().unwrap_or(0);
+                let through = path_counts.get(&nid).copied().unwrap_or(0);
+                to * through
+            })
+            .sum();
+        let lag_str = if d > 0 && !ctx.lag_check_at_level[d].is_empty() {
+            lags_checked += ctx.lag_check_at_level[d].len();
+            format!(" ← lag check ({})", lags_checked)
+        } else { String::new() };
+        eprintln!("    depth {:2} (pos {:2}): {:6} nodes, {:>15} arriving, {:>15} completions{}",
+            d, pos_order[d], current_level_nodes.len(), total_arriving, total_through, lag_str);
+
         let mut next = std::collections::HashSet::new();
         for &nid in &current_level_nodes {
             if nid == DEAD || nid == LEAF { continue; }
@@ -395,36 +416,7 @@ fn main() {
         }
         current_level_nodes = next.into_iter().collect();
     }
-    eprintln!("    depth {:2} (leaf): {}", depth, current_level_nodes.len());
-
-    // Twig analysis: nodes at depth-1 (one level above leaf)
-    // Re-do BFS to find twig nodes
-    let mut twig_nodes: Vec<u32> = Vec::new();
-    let mut level_set: Vec<u32> = vec![root];
-    for d in 0..depth - 1 {
-        let mut next = std::collections::HashSet::new();
-        for &nid in &level_set {
-            if nid == DEAD || nid == LEAF { continue; }
-            if (nid as usize) < nodes.len() {
-                for &child in &nodes[nid as usize] {
-                    if child != DEAD { next.insert(child); }
-                }
-            }
-        }
-        level_set = next.into_iter().collect();
-    }
-    twig_nodes = level_set.clone();
-    twig_nodes.sort();
-
-    eprintln!("\n  Twig nodes (depth {}, 1 above leaf):", depth - 1);
-    for &nid in &twig_nodes {
-        if nid == DEAD || nid == LEAF { continue; }
-        let paths_through = path_counts.get(&nid).copied().unwrap_or(0);
-        let arriving = paths_to.get(&nid).copied().unwrap_or(0);
-        let live_children = nodes[nid as usize].iter().filter(|&&c| c == LEAF).count();
-        eprintln!("    node {:6}: {} paths arriving, {} live branches (of 16), {} paths through",
-            nid, arriving, live_children, paths_through);
-    }
+    eprintln!("    depth {:2} (leaf):  {:6}", depth, current_level_nodes.len());
 }
 
 fn count_paths(root: u32, nodes: &[[u32; 16]]) -> u128 {
@@ -440,3 +432,4 @@ fn count_paths(root: u32, nodes: &[[u32; 16]]) -> u128 {
     }
     count(root, nodes, &mut memo)
 }
+
