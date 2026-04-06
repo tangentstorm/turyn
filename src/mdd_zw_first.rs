@@ -117,6 +117,28 @@ impl ZwFirstMdd {
             xy_max_abs.push(2 * lag.xy_pairs.len() as i32);
         }
 
+        // Max remaining contribution per lag for range pruning
+        // ZW events: |2*za*zb| = 2 or |2*wa*wb| = 2
+        let mut zw_max_remaining: Vec<Vec<i32>> = vec![vec![0i32; k]; zw_depth + 1];
+        for (li, lag) in lags.iter().enumerate() {
+            for &(a, b) in &lag.z_pairs {
+                let complete = pos_to_level[a].max(pos_to_level[b]);
+                for level in 0..=complete { zw_max_remaining[level][li] += 2; }
+            }
+            for &(a, b) in &lag.w_pairs {
+                let complete = pos_to_level[a].max(pos_to_level[b]);
+                for level in 0..=complete { zw_max_remaining[level][li] += 2; }
+            }
+        }
+        // XY events: |xa*xb + ya*yb| <= 2
+        let mut xy_max_remaining: Vec<Vec<i32>> = vec![vec![0i32; k]; zw_depth + 1];
+        for (li, lag) in lags.iter().enumerate() {
+            for &(a, b) in &lag.xy_pairs {
+                let complete = pos_to_level[a].max(pos_to_level[b]);
+                for level in 0..=complete { xy_max_remaining[level][li] += 2; }
+            }
+        }
+
         // Active position tracking for z,w half
         let mut zw_last_use: Vec<usize> = vec![0; 2 * k];
         for (level, events) in zw_events_at_level.iter().enumerate() {
@@ -171,6 +193,8 @@ impl ZwFirstMdd {
             zw_lag_check_at_level: Vec<Vec<usize>>,
             xy_lag_check_at_level: Vec<Vec<usize>>,
             xy_max_abs: Vec<i32>,
+            zw_max_remaining: Vec<Vec<i32>>,
+            xy_max_remaining: Vec<Vec<i32>>,
             zw_active_at_level: Vec<Vec<usize>>,
             zw_active_indices: Vec<HashMap<usize, usize>>,
             xy_active_at_level: Vec<Vec<usize>>,
@@ -190,6 +214,8 @@ impl ZwFirstMdd {
             zw_lag_check_at_level,
             xy_lag_check_at_level,
             xy_max_abs,
+            zw_max_remaining,
+            xy_max_remaining,
             zw_active_at_level,
             zw_active_indices,
             xy_active_at_level,
@@ -305,6 +331,14 @@ impl ZwFirstMdd {
                 let mut ok = true;
                 for &li in &ctx.xy_lag_check_at_level[level] {
                     if sums[li] != -zw_sums[li] { ok = false; break; }
+                }
+                // Range check: can remaining XY events bring sums to -zw_sums?
+                if ok && level + 1 < ctx.zw_depth {
+                    for li in 0..ctx.k {
+                        let gap = (sums[li] as i32) - (-(zw_sums[li] as i32));
+                        let remaining = ctx.xy_max_remaining[level + 1][li];
+                        if gap.abs() > remaining { ok = false; break; }
+                    }
                 }
 
                 if ok {
@@ -429,6 +463,18 @@ impl ZwFirstMdd {
                     let max_xy = ctx.xy_max_abs[li];
                     if zw_val.abs() > max_xy { ok = false; break; }
                     if (zw_val + max_xy) % 2 != 0 { ok = false; break; }
+                }
+                // Range check: can remaining ZW events keep sums achievable?
+                if ok && level + 1 < ctx.zw_depth {
+                    for li in 0..ctx.k {
+                        let zw_val = sums[li] as i32;
+                        let zw_remaining = ctx.zw_max_remaining[level + 1][li];
+                        let max_xy = ctx.xy_max_abs[li];
+                        // After all ZW events: zw_val + remaining_zw in [-max_zw_total, +max_zw_total]
+                        // Need: |final_zw_val| <= max_xy and right parity
+                        // Quick check: if |zw_val| - zw_remaining > max_xy, impossible
+                        if (zw_val.abs() - zw_remaining) > max_xy { ok = false; break; }
+                    }
                 }
 
                 if ok {

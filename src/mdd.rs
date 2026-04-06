@@ -155,7 +155,17 @@ impl BoundaryMdd {
         let mut nodes: Vec<[u32; 16]> = Vec::new();
         nodes.push([DEAD; 16]); // node 0 = DEAD
 
-        let mut unique: HashMap<(u8, [u32; 16]), u32> = HashMap::default();
+        // Use hash-based dedup: hash (level, children) → node_id.
+        // Tiny collision risk (~0.01% at 100M nodes) creates a few duplicate
+        // nodes but doesn't affect correctness.
+        fn hash_node(level: u8, children: &[u32; 16]) -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut h = rustc_hash::FxHasher::default();
+            level.hash(&mut h);
+            for &c in children { c.hash(&mut h); }
+            h.finish()
+        }
+        let mut unique: HashMap<u64, u32> = HashMap::default();
 
         type StateKey = (u128, u64);
         let mut memo: Vec<HashMap<StateKey, u32>> = (0..=depth).map(|_| HashMap::default()).collect();
@@ -182,7 +192,7 @@ impl BoundaryMdd {
             active_bits: &mut Vec<u8>,
             ctx: &Ctx,
             nodes: &mut Vec<[u32; 16]>,
-            unique: &mut HashMap<(u8, [u32; 16]), u32>,
+            unique: &mut HashMap<u64, u32>,
             memo: &mut Vec<HashMap<StateKey, u32>>,
         ) -> u32 {
             if level == ctx.depth {
@@ -282,7 +292,7 @@ impl BoundaryMdd {
                 if children.iter().all(|&c| c == first) {
                     first
                 } else {
-                    let key = (level as u8, children);
+                    let key = hash_node(level as u8, &children);
                     if let Some(&nid) = unique.get(&key) { nid }
                     else {
                         let nid = nodes.len() as u32;

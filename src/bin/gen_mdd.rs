@@ -2,6 +2,7 @@
 /// Usage: gen_mdd [k] [outfile] [--legacy]
 /// Default: k=8, outfile=mdd-{k}.bin
 /// --legacy: use 16-way interleaved build + reorder (slower, more memory)
+/// Default is ZW-first direct builder (faster, 4x less node memory)
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -11,8 +12,8 @@ fn main() {
         .filter(|s| !s.starts_with("--"))
         .map(|s| s.as_str())
         .unwrap_or(&default_out);
-    let zw_first = args.iter().any(|s| s == "--zw-first");
-    let legacy = !zw_first; // legacy is default (better memory for k>=9)
+    let legacy = args.iter().any(|s| s == "--legacy");
+    // ZW-first is default: faster, uses 4x less node memory
 
     eprintln!("Building MDD for k={} (valid for all n >= {})", k, 2 * k);
 
