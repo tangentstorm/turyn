@@ -135,104 +135,80 @@ pub fn split_16_to_4(
     Mdd4 { nodes: nodes_4, root, k: depth_16 / 2, depth: depth_4 }
 }
 
-/// Swap two adjacent levels in a 4-way MDD.
-/// Level `level` and `level+1` exchange positions.
-/// Returns the new root (if swapping level 0, root changes).
-pub fn swap_adjacent(mdd: &mut Mdd4, unique: &mut HashMap<(u16, [u32; 4]), u32>, level: u16) {
-    // Collect all nodes at `level` that need swapping
-    // For each node at `level`: its children are at `level+1`.
-    // After swap: node at `level` branches on what was `level+1`'s variable,
-    // and each child branches on what was `level`'s variable.
-    //
-    // For node N at level L with children C[0..3]:
-    //   Each C[i] at level L+1 has children D[i][0..3] at level L+2.
-    //
-    // After swap, new node N' at level L:
-    //   N'[j] = new node at level L+1
-    //   N'[j][i] = D[i][j]  (the old grandchild reached by going i then j)
-    //
-    // So: new_children_at_L[j] = make_node(L+1, [D[0][j], D[1][j], D[2][j], D[3][j]])
-    //     new_N = make_node(L, new_children_at_L)
-
-    // We need to find all nodes reachable at `level` and rebuild them.
-    // But we don't track which nodes are at which level.
-    // Instead, rebuild the full MDD from root, transforming nodes at `level`.
-
-    let old_nodes = mdd.nodes.clone();
-    let mut new_nodes: Vec<[u32; 4]> = Vec::new();
-    new_nodes.push([DEAD; 4]); // DEAD sentinel
-    let mut new_unique: HashMap<(u16, [u32; 4]), u32> = HashMap::new();
-    let mut memo: HashMap<u32, u32> = HashMap::new();
-
-    fn rebuild(
-        nid: u32,
-        current_level: u16,
-        swap_level: u16,
-        old_nodes: &[[u32; 4]],
-        new_nodes: &mut Vec<[u32; 4]>,
-        new_unique: &mut HashMap<(u16, [u32; 4]), u32>,
-        memo: &mut HashMap<u32, u32>,
-    ) -> u32 {
-        if nid == DEAD { return DEAD; }
-        if nid == LEAF { return LEAF; }
-        if let Some(&cached) = memo.get(&nid) { return cached; }
-
-        if current_level == swap_level {
-            // This node is at the swap level. Restructure.
-            let ch = old_nodes[nid as usize]; // children at swap_level+1
-
-            // Grandchildren: D[i][j] where i indexes ch (old level variable),
-            // j indexes ch[i]'s children (old level+1 variable)
-            let mut d = [[DEAD; 4]; 4];
-            for i in 0..4 {
-                if ch[i] == DEAD {
-                    d[i] = [DEAD; 4];
-                } else if ch[i] == LEAF {
-                    d[i] = [LEAF; 4];
-                } else {
-                    d[i] = old_nodes[ch[i] as usize];
-                }
+/// Swap two adjacent levels in a 4-way MDD (in-place).
+/// Only touches nodes at `level` (mutated) and creates new nodes at `level+1`.
+/// Nodes above level keep the same IDs; nodes below level+2 are unchanged.
+fn swap_adjacent_inplace(mdd: &mut Mdd4, level: u16) {
+    // Walk from root to collect all node IDs reachable at `level`.
+    let mut at_level: Vec<u32> = Vec::new();
+    {
+        let mut visited = vec![false; mdd.nodes.len()];
+        fn collect(
+            nid: u32, current: u16, target: u16,
+            nodes: &[[u32; 4]], visited: &mut [bool],
+            result: &mut Vec<u32>,
+        ) {
+            if nid == DEAD || nid == LEAF { return; }
+            let idx = nid as usize;
+            if visited[idx] { return; }
+            visited[idx] = true;
+            if current == target {
+                result.push(nid);
+                return;
             }
-
-            // New structure: branch on old level+1 variable first, then old level variable
-            let mut new_ch = [DEAD; 4]; // new children (branching on old level+1 var)
-            for j in 0..4 {
-                let mut inner = [DEAD; 4]; // branching on old level var
-                for i in 0..4 {
-                    inner[i] = rebuild(
-                        d[i][j], current_level + 2, swap_level,
-                        old_nodes, new_nodes, new_unique, memo,
-                    );
-                }
-                new_ch[j] = Mdd4::make_node(new_nodes, new_unique, swap_level + 1, inner);
+            for &ch in &nodes[idx] {
+                collect(ch, current + 1, target, nodes, visited, result);
             }
-            let result = Mdd4::make_node(new_nodes, new_unique, swap_level, new_ch);
-            memo.insert(nid, result);
-            result
-        } else {
-            // Not at swap level — just copy, recursing into children
-            let ch = old_nodes[nid as usize];
-            let mut new_ch = [DEAD; 4];
-            for i in 0..4 {
-                new_ch[i] = rebuild(
-                    ch[i], current_level + 1, swap_level,
-                    old_nodes, new_nodes, new_unique, memo,
-                );
-            }
-            let result = Mdd4::make_node(new_nodes, new_unique, current_level, new_ch);
-            memo.insert(nid, result);
-            result
         }
+        collect(mdd.root, 0, level, &mdd.nodes, &mut visited, &mut at_level);
     }
 
-    let new_root = rebuild(
-        mdd.root, 0, level,
-        &old_nodes, &mut new_nodes, &mut new_unique, &mut memo,
-    );
+    // For each node at `level`, transpose grandchildren and create new inner nodes.
+    //
+    // Before: node branches on var_L, children branch on var_{L+1}
+    //   node[i] = C_i, C_i[j] = D[i][j] (grandchild at level L+2)
+    //
+    // After:  node branches on var_{L+1}, children branch on var_L
+    //   node[j] = new_inner_j, new_inner_j[i] = D[i][j]
+    let mut inner_unique: HashMap<[u32; 4], u32> = HashMap::with_capacity(at_level.len() * 2);
 
-    mdd.nodes = new_nodes;
-    mdd.root = new_root;
-    *unique = new_unique;
+    for &nid in &at_level {
+        let ch = mdd.nodes[nid as usize];
+
+        // Read grandchildren D[i][j]
+        let mut d = [[DEAD; 4]; 4];
+        for i in 0..4 {
+            d[i] = if ch[i] == DEAD { [DEAD; 4] }
+                   else if ch[i] == LEAF { [LEAF; 4] }
+                   else { mdd.nodes[ch[i] as usize] };
+        }
+
+        // Transpose: new_ch[j] has children [D[0][j], D[1][j], D[2][j], D[3][j]]
+        let mut new_ch = [DEAD; 4];
+        for j in 0..4 {
+            let inner = [d[0][j], d[1][j], d[2][j], d[3][j]];
+            if inner.iter().all(|&c| c == DEAD) {
+                new_ch[j] = DEAD;
+            } else {
+                let first = inner[0];
+                if inner.iter().all(|&c| c == first) {
+                    new_ch[j] = first;
+                } else if let Some(&existing) = inner_unique.get(&inner) {
+                    new_ch[j] = existing;
+                } else {
+                    let new_nid = mdd.nodes.len() as u32;
+                    mdd.nodes.push(inner);
+                    inner_unique.insert(inner, new_nid);
+                    new_ch[j] = new_nid;
+                }
+            }
+        }
+
+        // Mutate level-L node in place
+        mdd.nodes[nid as usize] = new_ch;
+    }
+    // Note: old level-(L+1) nodes that are no longer referenced become garbage.
+    // This is acceptable — they waste space but don't affect correctness.
 }
 
 /// Reorder a 16-way interleaved MDD so z,w decisions come first.
@@ -254,7 +230,6 @@ pub fn reorder_zw_first(
     // xy1 is at position 3, needs to move to position 2k+1.
     // etc.
 
-    let mut unique: HashMap<(u16, [u32; 4]), u32> = HashMap::new();
     let mut swaps_done = 0;
 
     // For each xy level (originally at positions 1, 3, 5, ..., 2k-1),
@@ -314,7 +289,7 @@ pub fn reorder_zw_first(
         for i in 0..total_levels - 1 {
             if !labels[i] && labels[i + 1] {
                 // xy before zw — swap them
-                swap_adjacent(&mut mdd4, &mut unique, i as u16);
+                swap_adjacent_inplace(&mut mdd4, i as u16);
                 labels.swap(i, i + 1);
                 swaps_done += 1;
                 swapped = true;
@@ -330,6 +305,50 @@ pub fn reorder_zw_first(
         if !swapped { break; }
     }
 
-    eprintln!("  Reorder complete: {} swaps, {} nodes", swaps_done, mdd4.nodes.len());
+    eprintln!("  Reorder complete: {} swaps, {} nodes (before GC)", swaps_done, mdd4.nodes.len());
+
+    // Garbage-collect unreachable nodes left by in-place swaps
+    gc_mdd(&mut mdd4);
+    eprintln!("  After GC: {} nodes", mdd4.nodes.len());
+
     mdd4
+}
+
+/// Remove unreachable nodes and compact the node array.
+fn gc_mdd(mdd: &mut Mdd4) {
+    let n = mdd.nodes.len();
+    let mut reachable = vec![false; n];
+    // Mark reachable nodes via DFS from root
+    fn mark(nid: u32, nodes: &[[u32; 4]], reachable: &mut [bool]) {
+        if nid == DEAD || nid == LEAF { return; }
+        let idx = nid as usize;
+        if reachable[idx] { return; }
+        reachable[idx] = true;
+        for &ch in &nodes[idx] {
+            mark(ch, nodes, reachable);
+        }
+    }
+    mark(mdd.root, &mdd.nodes, &mut reachable);
+    reachable[0] = true; // DEAD sentinel
+
+    // Build compacted array with new IDs
+    let mut old_to_new = vec![0u32; n];
+    let mut new_nodes: Vec<[u32; 4]> = Vec::new();
+    for (old_id, &is_reachable) in reachable.iter().enumerate() {
+        if is_reachable {
+            old_to_new[old_id] = new_nodes.len() as u32;
+            new_nodes.push(mdd.nodes[old_id]);
+        }
+    }
+    // Remap children
+    for node in &mut new_nodes {
+        for ch in node.iter_mut() {
+            if *ch != DEAD && *ch != LEAF {
+                *ch = old_to_new[*ch as usize];
+            }
+        }
+    }
+    mdd.root = if mdd.root == DEAD || mdd.root == LEAF { mdd.root }
+               else { old_to_new[mdd.root as usize] };
+    mdd.nodes = new_nodes;
 }
