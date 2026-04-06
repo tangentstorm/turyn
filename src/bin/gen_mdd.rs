@@ -13,7 +13,7 @@ fn main() {
         .map(|s| s.as_str())
         .unwrap_or(&default_out);
     let legacy = args.iter().any(|s| s == "--legacy");
-    // ZW-first is default: faster, uses 4x less node memory
+    let sequential = args.iter().any(|s| s == "--sequential");
 
     eprintln!("Building MDD for k={} (valid for all n >= {})", k, 2 * k);
 
@@ -26,15 +26,17 @@ fn main() {
         let r = turyn::mdd_reorder::reorder_zw_first(&interleaved.nodes, interleaved.root, k);
         drop(interleaved);
         r
-    } else {
-        eprintln!("Using direct ZW-first builder...");
+    } else if sequential {
+        eprintln!("Using sequential ZW-first builder...");
         let zw = turyn::mdd_zw_first::ZwFirstMdd::build(k);
-        // Convert to Mdd4 format for saving
         turyn::mdd_reorder::Mdd4 {
-            nodes: zw.nodes,
-            root: zw.root,
-            k: zw.k,
-            depth: zw.total_depth,
+            nodes: zw.nodes, root: zw.root, k: zw.k, depth: zw.total_depth,
+        }
+    } else {
+        eprintln!("Using parallel ZW-first builder ({} cores)...", rayon::current_num_threads());
+        let zw = turyn::mdd_zw_first::ZwFirstMdd::build_parallel(k);
+        turyn::mdd_reorder::Mdd4 {
+            nodes: zw.nodes, root: zw.root, k: zw.k, depth: zw.total_depth,
         }
     };
 
