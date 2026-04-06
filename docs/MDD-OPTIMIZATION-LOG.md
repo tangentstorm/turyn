@@ -23,7 +23,7 @@ time target/release/gen_mdd 10 /dev/null
 | 8 | 7.0s | 433K | 6.6 MB |
 | 9 | 1m17s | 2.6M | 39.6 MB |
 | 10 | 21m33s | 17.2M | 262 MB |
-| 11 | ~3.5h (est) | ~170M (est) | ~2.6 GB (est) |
+| 11 | ~7h (est) | ~170M (est) | ~2.6 GB (est) |
 
 Original baselines: k=7: 4.7s, k=8: 46.6s, k=9: OOM/timeout
 
