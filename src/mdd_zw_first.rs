@@ -395,6 +395,7 @@ impl ZwFirstMdd {
             xy_memo: &mut Vec<HashMap<XyStateKey, u32>>,
             zw_memo_count: &mut usize,
             max_memo_entries: usize,
+            per_level_cap: usize,
         ) -> u32 {
             if level == ctx.zw_depth {
                 // ZW half done. Build XY sub-MDD for these zw_sums.
@@ -490,7 +491,7 @@ impl ZwFirstMdd {
                     children[branch as usize] = build_zw(
                         level + 1, sums, &mut current_vals,
                         ctx, nodes, unique, zw_memo, xy_memo,
-                        zw_memo_count, max_memo_entries,
+                        zw_memo_count, max_memo_entries, per_level_cap,
                     );
                     if level == 1 {
                         eprint!("\r  ZW level 1 branch {}/4, {} nodes, zw_memo={}   ",
@@ -523,10 +524,8 @@ impl ZwFirstMdd {
             };
 
             // Cap total memo entries to prevent OOM at large k.
-            // When over budget, evict the deepest (largest) level.
+            // When over budget, evict the level with the most entries (typically deepest).
             if *zw_memo_count >= max_memo_entries {
-                // Evict the level with the most entries (typically deepest).
-                // Don't shrink_to_fit — keep capacity for refilling.
                 let (max_lvl, _) = zw_memo.iter().enumerate()
                     .max_by_key(|(_, m)| m.len()).unwrap();
                 if zw_memo[max_lvl].len() > 0 {
@@ -541,13 +540,14 @@ impl ZwFirstMdd {
 
         // Budget ~7GB for memo (actual overhead is ~140 bytes/entry in FxHashMap)
         let max_memo_entries: usize = 50_000_000;
+        let per_level_cap: usize = max_memo_entries / (zw_depth + 1);
         let mut zw_memo_count: usize = 0;
         let mut sums = vec![0i8; k];
         let mut active_bits: Vec<u8> = Vec::new();
         let root = build_zw(
             0, &mut sums, &mut active_bits,
             &ctx, &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo,
-            &mut zw_memo_count, max_memo_entries,
+            &mut zw_memo_count, max_memo_entries, per_level_cap,
         );
 
         let zw_memo_entries: usize = zw_memo.iter().map(|m| m.len()).sum();
