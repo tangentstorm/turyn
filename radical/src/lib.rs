@@ -200,10 +200,8 @@ pub struct SpectralConstraint {
     pub re_boundary: Vec<f64>,
     pub im_boundary: Vec<f64>,
     /// Spectral power bound: |DFT(ω)|² ≤ bound for each ω
-    /// If per_freq_bound is set, uses that instead (for pair-spectral on Z).
     pub bound: f64,
-    /// Optional per-frequency bounds (e.g. B - |W(ω)|² for Z solver).
-    /// When set, check_conflict uses bounds[fi] instead of bound.
+    /// Optional per-frequency bounds (for Z pair-spectral: B - |W(ω)|²).
     pub per_freq_bound: Option<Vec<f64>>,
     /// Max possible magnitude reduction from unassigned vars, per frequency.
     /// Updated incrementally on assign/unassign.
@@ -347,13 +345,13 @@ impl SpectralConstraint {
     #[inline]
     pub fn check_conflict(&self) -> Option<usize> {
         for fi in 0..self.num_freqs {
-            let sqrt_b = if let Some(ref pfb) = self.per_freq_bound {
-                if pfb[fi] <= 0.0 { 0.0 } else { pfb[fi].sqrt() }
-            } else {
-                self.bound.sqrt()
+            let b = match self.per_freq_bound {
+                Some(ref pfb) => pfb[fi],
+                None => self.bound,
             };
+            if b <= 0.0 { return Some(fi); } // impossible bound
             let mag = (self.re[fi] * self.re[fi] + self.im[fi] * self.im[fi]).sqrt();
-            if mag - self.max_reduction[fi] > sqrt_b {
+            if mag - self.max_reduction[fi] > b.sqrt() {
                 return Some(fi);
             }
         }
@@ -1911,27 +1909,7 @@ impl Solver {
                     let val: i8 = if lit > 0 { 1 } else { -1 };
                     spec.assign(v, val);
                     if spec.check_conflict().is_some() {
-                        // Build a conflict clause from all assigned seq vars
-                        let num_sv = spec.num_seq_vars;
-                        let mut clause_lits: Vec<Lit> = Vec::with_capacity(num_sv);
-                        for sv in 0..num_sv {
-                            if !spec.assigned[sv] { continue; }
-                            let sv_lit = (sv + 1) as Lit;
-                            clause_lits.push(if spec.values[sv] > 0 { -sv_lit } else { sv_lit });
-                        }
-                        let ci = self.clause_meta.len() as u32;
-                        let cstart = self.clause_lits.len();
-                        let clen = clause_lits.len();
-                        for &l in &clause_lits { self.clause_lits.push(l); }
-                        self.clause_meta.push(ClauseMeta {
-                            start: cstart as u32, len: clen as u16,
-                            learnt: true, deleted: false, lbd: clen.min(255) as u8,
-                        });
-                        if clen >= 2 {
-                            self.watches[lit_index(clause_lits[0])].push((ci, clause_lits[1]));
-                            self.watches[lit_index(clause_lits[1])].push((ci, clause_lits[0]));
-                        }
-                        return Some(Reason::Clause(ci));
+                        return Some(Reason::Spectral);
                     }
 
                     // Unit propagation: check each unassigned seq var.
@@ -1939,6 +1917,7 @@ impl Solver {
                     let num_assigned = spec.assigned.iter().filter(|&&a| a).count();
                     if num_assigned >= spec.num_seq_vars / 2 {
                         let nf = spec.num_freqs;
+                        let sqrt_bound = spec.bound.sqrt();
                         let num_sv = spec.num_seq_vars;
                         let mut forced: Vec<Lit> = Vec::new();
                         let mut conflict = false;
@@ -1950,11 +1929,6 @@ impl Solver {
                             let mut pos_bad = false;
                             let mut neg_bad = false;
                             for fi in 0..nf {
-                                let sqrt_b = if let Some(ref pfb) = spec.per_freq_bound {
-                                    if pfb[fi] <= 0.0 { 0.0 } else { pfb[fi].sqrt() }
-                                } else {
-                                    spec.bound.sqrt()
-                                };
                                 let c = spec.cos_table[base + fi] as f64;
                                 let s = spec.sin_table[base + fi] as f64;
                                 let amp = spec.amplitudes[base + fi] as f64;
@@ -1962,14 +1936,14 @@ impl Solver {
                                 if !pos_bad {
                                     let re = spec.re[fi] + c;
                                     let im = spec.im[fi] + s;
-                                    if (re*re + im*im).sqrt() - remaining > sqrt_b {
+                                    if (re*re + im*im).sqrt() - remaining > sqrt_bound {
                                         pos_bad = true;
                                     }
                                 }
                                 if !neg_bad {
                                     let re = spec.re[fi] - c;
                                     let im = spec.im[fi] - s;
-                                    if (re*re + im*im).sqrt() - remaining > sqrt_b {
+                                    if (re*re + im*im).sqrt() - remaining > sqrt_bound {
                                         neg_bad = true;
                                     }
                                 }
@@ -1980,61 +1954,11 @@ impl Solver {
                             else if neg_bad { forced.push((u + 1) as Lit); }
                         }
 
-                        if conflict {
-                            // Build conflict clause
-                            let spec = self.spectral.as_ref().unwrap();
-                            let mut clause_lits: Vec<Lit> = Vec::with_capacity(num_sv);
-                            for sv in 0..num_sv {
-                                if !spec.assigned[sv] { continue; }
-                                let sv_lit = (sv + 1) as Lit;
-                                clause_lits.push(if spec.values[sv] > 0 { -sv_lit } else { sv_lit });
-                            }
-                            let ci = self.clause_meta.len() as u32;
-                            let cstart = self.clause_lits.len();
-                            let clen = clause_lits.len();
-                            for &l in &clause_lits { self.clause_lits.push(l); }
-                            self.clause_meta.push(ClauseMeta {
-                                start: cstart as u32, len: clen as u16,
-                                learnt: true, deleted: false, lbd: clen.min(255) as u8,
-                            });
-                            if clen >= 2 {
-                                self.watches[lit_index(clause_lits[0])].push((ci, clause_lits[1]));
-                                self.watches[lit_index(clause_lits[1])].push((ci, clause_lits[0]));
-                            }
-                            return Some(Reason::Clause(ci));
-                        }
-
-                        // Enqueue forced literals with clause-based reasons.
-                        // Build a reason clause: (¬assigned_1 ∨ ¬assigned_2 ∨ ... ∨ forced_lit)
-                        // This means "if all assigned vars have their current values, forced_lit must hold."
+                        if conflict { return Some(Reason::Spectral); }
                         for flit in forced {
-                            if self.lit_value(flit) != LBool::Undef { continue; }
-                            // Build reason clause: all assigned seq vars negated + forced lit
-                            let spec = self.spectral.as_ref().unwrap();
-                            let mut clause_lits: Vec<Lit> = Vec::with_capacity(num_assigned + 1);
-                            clause_lits.push(flit); // the forced literal goes first (watched)
-                            for sv in 0..num_sv {
-                                if !spec.assigned[sv] { continue; }
-                                let sv_lit = (sv + 1) as Lit;
-                                // Negate the current assignment
-                                let neg = if spec.values[sv] > 0 { -sv_lit } else { sv_lit };
-                                clause_lits.push(neg);
+                            if self.lit_value(flit) == LBool::Undef {
+                                self.enqueue(flit, Reason::Spectral);
                             }
-                            // Add as a regular clause — the solver's standard machinery handles it
-                            let ci = self.clause_meta.len() as u32;
-                            let cstart = self.clause_lits.len();
-                            let clen = clause_lits.len();
-                            for &l in &clause_lits { self.clause_lits.push(l); }
-                            self.clause_meta.push(ClauseMeta {
-                                start: cstart as u32, len: clen as u16,
-                                learnt: true, deleted: false, lbd: clen as u8,
-                            });
-                            // Set up watches on first two literals
-                            if clen >= 2 {
-                                self.watches[lit_index(clause_lits[0])].push((ci, clause_lits[1]));
-                                self.watches[lit_index(clause_lits[1])].push((ci, clause_lits[0]));
-                            }
-                            self.enqueue(flit, Reason::Clause(ci));
                         }
                     }
                 }
@@ -2471,24 +2395,17 @@ impl Solver {
                     self.analyze_reason_buf = buf;
                 }
                 Reason::Spectral => {
-                    // Spectral reason: all assigned sequence vars that were
-                    // PROPAGATED (not decisions) form the reason. Decisions
-                    // at the current level would break 1-UIP invariant.
+                    // Spectral reason: all assigned sequence variables contributed
+                    // to the DFT violation. Return them all as the reason.
                     let mut buf = std::mem::take(&mut self.analyze_reason_buf);
                     buf.clear();
                     if let Some(ref spec) = self.spectral {
                         for v in 0..spec.num_seq_vars {
-                            if !spec.assigned[v] { continue; }
-                            // Skip decisions at current level — they can't be resolved
-                            match self.reason[v] {
-                                Reason::Decision => {
-                                    if self.level[v] == self.decision_level() { continue; }
-                                }
-                                _ => {}
+                            if spec.assigned[v] {
+                                let lit_v = (v + 1) as Lit;
+                                let neg_lit = if spec.values[v] > 0 { -lit_v } else { lit_v };
+                                buf.push(neg_lit);
                             }
-                            let lit_v = (v + 1) as Lit;
-                            let neg_lit = if spec.values[v] > 0 { -lit_v } else { lit_v };
-                            buf.push(neg_lit);
                         }
                     }
                     if p != 0 { buf.push(p); }

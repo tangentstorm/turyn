@@ -3212,25 +3212,21 @@ fn run_mdd_sat_search(
                 );
                 let z_cp = z_solver.save_checkpoint();
                 sat_z_middle::fill_z_solver(z_solver, &z_tmpl, n, m, &z_boundary, &w_vals);
-                // Attach spectral constraint with per-frequency pair bounds: |Z(ω)|² ≤ B - |W(ω)|²
+                // Attach Z spectral constraint with per-frequency pair bounds
                 if middle_n >= 8 {
                     let mut z_spec = radical::SpectralConstraint::new(
                         n, k, &z_boundary, pair_bound, 16,
                     );
-                    // Set per-frequency bounds from W spectrum
+                    let pi2 = 2.0 * std::f64::consts::PI;
                     let mut pfb = vec![pair_bound; z_spec.num_freqs];
                     for fi in 0..z_spec.num_freqs {
-                        // Compute |W(ω_fi)|² at this spectral constraint's frequency
-                        let omega = (fi as f64 + 1.0) / (z_spec.num_freqs as f64 + 1.0)
-                            * std::f64::consts::PI;
-                        let mut w_re = 0.0f64;
-                        let mut w_im = 0.0f64;
+                        let omega = (fi as f64 + 1.0) / (z_spec.num_freqs as f64 + 1.0) * std::f64::consts::PI;
+                        let (mut w_re, mut w_im) = (0.0f64, 0.0f64);
                         for (j, &wv) in w_vals.iter().enumerate() {
                             w_re += wv as f64 * (omega * j as f64).cos();
                             w_im += wv as f64 * (omega * j as f64).sin();
                         }
-                        let w_power = w_re * w_re + w_im * w_im;
-                        pfb[fi] = (pair_bound - w_power).max(0.0);
+                        pfb[fi] = (pair_bound - w_re*w_re - w_im*w_im).max(0.0);
                     }
                     z_spec.per_freq_bound = Some(pfb);
                     z_solver.spectral = Some(z_spec);
