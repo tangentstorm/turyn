@@ -3128,9 +3128,15 @@ fn run_mdd_sat_search(
         let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
         let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
 
-        // Pre-build W solvers per feasible w_mid_sum (one per unique sum).
-        // The sum-only solver doesn't depend on boundary bits, so we reuse it.
-        let mut w_solvers: HashMap<i32, radical::Solver> = HashMap::new();
+        // Precompute lag templates + base solvers (XNOR clauses are boundary-independent).
+        // Clone base solver per boundary, then fill in boundary-specific PB constraints.
+        let z_tmpl = sat_z_middle::LagTemplate::new_z(n, k);
+        let w_tmpl = sat_z_middle::LagTemplate::new_w(m, k);
+
+        // W base solvers keyed by w_mid_sum (sum constraint + XNOR clauses, no boundary values)
+        let mut w_bases: HashMap<i32, radical::Solver> = HashMap::new();
+        // Z base solvers keyed by z_mid_sum
+        let mut z_bases: HashMap<i32, radical::Solver> = HashMap::new();
 
         // Process one boundary: SAT W → spectral → SAT Z → pair → Phase C
         let mut process_boundary = |z_bits: u32, w_bits: u32, xy_root: u32| {
@@ -3153,26 +3159,24 @@ fn run_mdd_sat_search(
                 let w_mid_sum = tuple.w - w_bnd_sum;
                 if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
 
-                // Build W boundary
+                // Build W boundary values
                 let mut w_boundary = vec![0i8; m];
                 for i in 0..k {
                     w_boundary[i] = if (w_bits >> i) & 1 == 1 { 1 } else { -1 };
                     w_boundary[m - k + i] = if (w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
                 }
 
-                // Reuse W solver (sum-only, keyed by w_mid_sum)
-                let w_solver = w_solvers.entry(w_mid_sum).or_insert_with(||
-                    sat_w_middle::build_w_middle_solver_sum_only(m, k, w_mid_sum)
+                // Clone W base solver (XNOR clauses pre-loaded) + fill boundary values
+                let w_base = w_bases.entry(w_mid_sum).or_insert_with(||
+                    w_tmpl.build_base_solver(middle_m, w_mid_sum)
                 );
+                let mut w_solver = w_base.clone();
+                sat_z_middle::fill_w_solver(&mut w_solver, &w_tmpl, m, &w_boundary);
+
                 let phases: Vec<bool> = (0..middle_m)
                     .map(|_| next_rng() & 1 == 1).collect();
                 w_solver.set_phase(&phases);
-                if w_solver.solve() != Some(true) {
-                    // Exhausted — rebuild solver (fresh, no blocking clauses)
-                    *w_solver = sat_w_middle::build_w_middle_solver_sum_only(m, k, w_mid_sum);
-                    w_solver.set_phase(&phases);
-                    if w_solver.solve() != Some(true) { continue; }
-                }
+                if w_solver.solve() != Some(true) { continue; }
                 stats.w_generated += 1;
 
                 let mut w_vals = w_boundary;
@@ -3184,17 +3188,19 @@ fn run_mdd_sat_search(
                 stats.w_spectral_ok += 1;
                 let w_seq = PackedSeq::from_values(&w_vals);
 
-                // Build Z boundary
+                // Build Z boundary values
                 let mut z_boundary = vec![0i8; n];
                 for i in 0..k {
                     z_boundary[i] = if (z_bits >> i) & 1 == 1 { 1 } else { -1 };
                     z_boundary[n - k + i] = if (z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
                 }
 
-                // SAT Z with autocorrelation constraints (knows full W)
-                let mut z_solver = sat_z_middle::build_z_middle_solver(
-                    n, m, k, &z_boundary, &w_vals, z_mid_sum,
+                // Clone Z base solver (XNOR clauses pre-loaded) + fill W-specific bounds
+                let z_base = z_bases.entry(z_mid_sum).or_insert_with(||
+                    z_tmpl.build_base_solver(middle_n, z_mid_sum)
                 );
+                let mut z_solver = z_base.clone();
+                sat_z_middle::fill_z_solver(&mut z_solver, &z_tmpl, n, m, &z_boundary, &w_vals);
                 let mut z_count = 0usize;
                 loop {
                     if found.load(AtomicOrdering::Relaxed) { break; }
