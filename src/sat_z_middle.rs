@@ -64,7 +64,6 @@ pub fn build_z_middle_solver(
         // Each pair (i, i+s): classify as (bnd,bnd), (bnd,mid), (mid,mid)
         let is_mid = |pos: usize| -> bool { pos >= k && pos < n - k };
 
-        let mut const_contrib: i32 = 0;
         // For PB: agree_count = number of pairs where z[i]==z[i+s]
         // N_Z(s) = 2*agree_count - (n-s)
         // So agree_count = (N_Z(s) + (n-s)) / 2
@@ -167,12 +166,8 @@ pub fn build_z_middle_solver(
             // Encode as PB: sum(all) ∈ [adj_lo, adj_hi]
 
             let mut all_lits = agree_lits.clone();
-            let base_var = middle_n as i32 + 1; // aux vars start after mid vars
-            // We need a unique range of aux vars per lag. Use a global counter.
-            // For simplicity, use var IDs starting from middle_n + lag_offset.
-            // This is fragile — better to track next_var.
-            // For now, use a high offset per lag.
-            let aux_base = (middle_n + 1 + s * n) as i32; // should be unique per lag
+            // Aux vars for XNOR encoding. Use unique range per lag.
+            let aux_base = (middle_n + 1 + s * n) as i32;
 
             for (qi, (&a, &b)) in quad_a.iter().zip(quad_b.iter()).enumerate() {
                 let aux = aux_base + qi as i32;
