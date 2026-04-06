@@ -428,9 +428,40 @@ impl Solver {
                 }
             }
             _ => {
+                // Reorder: move non-false literals to the front for 2WL.
+                // This handles incremental clause addition after a partial/full solve.
+                let mut lits = lits;
+                let mut num_true = 0usize;
+                let mut num_undef = 0usize;
+                // Partition: true/undef literals first, false last
+                let mut i = 0;
+                for j in 0..lits.len() {
+                    match self.lit_value(lits[j]) {
+                        LBool::True => { lits.swap(i, j); num_true += 1; i += 1; }
+                        LBool::Undef => { lits.swap(i, j); num_undef += 1; i += 1; }
+                        LBool::False => {}
+                    }
+                }
+                if num_true == 0 && num_undef == 0 {
+                    // All literals false: conflict at current level
+                    self.ok = false;
+                    return;
+                }
+                if num_true == 0 && num_undef == 1 {
+                    // Unit under current assignment: propagate
+                    let ci = self.clause_meta.len() as u32;
+                    let start = self.clause_lits.len() as u32;
+                    self.clause_lits.extend_from_slice(&lits);
+                    self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
+                    self.enqueue(lits[0], Reason::Clause(ci));
+                    if self.propagate().is_some() {
+                        self.ok = false;
+                    }
+                    return;
+                }
+                // At least two non-false literals: normal 2WL setup
                 let ci = self.clause_meta.len() as u32;
                 let start = self.clause_lits.len() as u32;
-                // Set up 2WL: watch the first two literals (blocker = the other watched lit)
                 self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
                 self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
                 self.clause_lits.extend_from_slice(&lits);
@@ -610,6 +641,13 @@ impl Solver {
     /// to level 0, so assumptions don't persist but learnt clauses do.
     pub fn solve_with_assumptions(&mut self, assumptions: &[Lit]) -> Option<bool> {
         if !self.ok { return Some(false); }
+
+        // Backtrack to level 0 before each solve to support incremental solving
+        // (e.g. adding blocking clauses between solves). The previous SAT result
+        // may have left a full assignment in place.
+        if self.decision_level() > 0 {
+            self.backtrack(0);
+        }
 
         // Pre-size reusable buffers for analysis and explanation
         if self.quad_pb_seen_buf.len() < self.num_vars {
