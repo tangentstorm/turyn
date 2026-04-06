@@ -167,6 +167,7 @@ enum Reason {
     Pb(u32),      // index into pb_constraints
     QuadPb(u32),  // index into quad_pb_constraints; bit 31 = is_upper flag
     Xor(u32),     // index into xor_constraints
+    Spectral,     // spectral power constraint violation
 }
 
 /// Trail entry: records an assignment.
@@ -175,6 +176,180 @@ struct TrailEntry {
     lit: Lit,
     level: u32,
     reason: Reason,
+}
+
+/// Spectral power constraint: |DFT(sequence)|² ≤ bound at every sampled frequency.
+/// Incrementally tracks DFT sums as variables are assigned.
+/// Variables 1..num_seq_vars represent ±1 sequence positions.
+#[derive(Clone)]
+pub struct SpectralConstraint {
+    /// Number of sequence variables (positions that the SAT solver controls).
+    pub num_seq_vars: usize,
+    /// Cosine table: cos_table[var_idx * num_freqs + freq_idx]
+    /// Precomputed: cos(2π * position_in_full_seq * ω_j / fft_size)
+    pub cos_table: Vec<f32>,
+    /// Sine table (same layout)
+    pub sin_table: Vec<f32>,
+    /// Number of sampled frequencies
+    pub num_freqs: usize,
+    /// Running DFT real parts per frequency (includes boundary contribution)
+    pub re: Vec<f64>,
+    /// Running DFT imaginary parts per frequency
+    pub im: Vec<f64>,
+    /// Boundary contribution to DFT (constant, precomputed)
+    pub re_boundary: Vec<f64>,
+    pub im_boundary: Vec<f64>,
+    /// Spectral power bound: |DFT(ω)|² ≤ bound for each ω
+    pub bound: f64,
+    /// Max possible magnitude reduction from unassigned vars, per frequency.
+    /// Updated incrementally on assign/unassign.
+    pub max_reduction: Vec<f64>,
+    /// Per-variable amplitude at each frequency: sqrt(cos² + sin²)
+    pub amplitudes: Vec<f32>,
+    /// Which variables have been assigned (for backtrack)
+    pub assigned: Vec<bool>,
+    /// The value assigned to each variable (+1 or -1), 0 if unassigned
+    pub values: Vec<i8>,
+}
+
+impl SpectralConstraint {
+    /// Create a new spectral constraint.
+    /// `seq_len`: total sequence length (including boundary)
+    /// `k`: boundary width
+    /// `boundary`: full sequence with boundary positions filled, middle = 0
+    /// `bound`: spectral power bound (|DFT(ω)|² ≤ bound)
+    /// `num_freqs`: number of frequency samples
+    pub fn new(
+        seq_len: usize,
+        k: usize,
+        boundary: &[i8],
+        bound: f64,
+        num_freqs: usize,
+    ) -> Self {
+        let middle_len = seq_len - 2 * k;
+        let pi2 = 2.0 * std::f64::consts::PI;
+
+        let mut cos_table = vec![0.0f32; middle_len * num_freqs];
+        let mut sin_table = vec![0.0f32; middle_len * num_freqs];
+        let mut re_boundary = vec![0.0f64; num_freqs];
+        let mut im_boundary = vec![0.0f64; num_freqs];
+
+        for fi in 0..num_freqs {
+            let omega = (fi as f64 + 1.0) / (num_freqs as f64 + 1.0) * std::f64::consts::PI;
+
+            // Boundary contribution (constant)
+            for pos in 0..seq_len {
+                if pos >= k && pos < seq_len - k { continue; } // middle
+                let val = boundary[pos] as f64;
+                re_boundary[fi] += val * (omega * pos as f64).cos();
+                im_boundary[fi] += val * (omega * pos as f64).sin();
+            }
+
+            // Middle variable cosine/sine tables
+            for vi in 0..middle_len {
+                let pos = k + vi; // position in full sequence
+                cos_table[vi * num_freqs + fi] = (omega * pos as f64).cos() as f32;
+                sin_table[vi * num_freqs + fi] = (omega * pos as f64).sin() as f32;
+            }
+        }
+
+        let mut sc = SpectralConstraint {
+            num_seq_vars: middle_len,
+            cos_table,
+            sin_table,
+            num_freqs,
+            re: re_boundary.clone(),
+            im: im_boundary.clone(),
+            re_boundary,
+            im_boundary,
+            bound,
+            max_reduction: vec![0.0; num_freqs],
+            amplitudes: vec![0.0f32; middle_len * num_freqs],
+            assigned: vec![false; middle_len],
+            values: vec![0i8; middle_len],
+        };
+
+        // Precompute amplitudes and initial max_reduction (all vars unassigned)
+        for vi in 0..middle_len {
+            for fi in 0..num_freqs {
+                let c = sc.cos_table[vi * num_freqs + fi] as f64;
+                let s = sc.sin_table[vi * num_freqs + fi] as f64;
+                let amp = (c * c + s * s).sqrt() as f32;
+                sc.amplitudes[vi * num_freqs + fi] = amp;
+                sc.max_reduction[fi] += amp as f64;
+            }
+        }
+
+        sc
+    }
+
+    /// Reset DFT sums to boundary-only state (for checkpoint/restore).
+    pub fn reset(&mut self) {
+        self.re.copy_from_slice(&self.re_boundary);
+        self.im.copy_from_slice(&self.im_boundary);
+        // Recompute max_reduction from all vars being unassigned
+        for fi in 0..self.num_freqs { self.max_reduction[fi] = 0.0; }
+        for vi in 0..self.num_seq_vars {
+            let base = vi * self.num_freqs;
+            for fi in 0..self.num_freqs {
+                self.max_reduction[fi] += self.amplitudes[base + fi] as f64;
+            }
+        }
+        for v in &mut self.assigned { *v = false; }
+        for v in &mut self.values { *v = 0; }
+    }
+
+    /// Assign a variable (0-indexed middle position) to val (+1 or -1).
+    /// Updates DFT sums incrementally.
+    #[inline]
+    pub fn assign(&mut self, var: usize, val: i8) {
+        debug_assert!(!self.assigned[var]);
+        self.assigned[var] = true;
+        self.values[var] = val;
+        let v = val as f64;
+        let base = var * self.num_freqs;
+        for fi in 0..self.num_freqs {
+            self.re[fi] += v * self.cos_table[base + fi] as f64;
+            self.im[fi] += v * self.sin_table[base + fi] as f64;
+            self.max_reduction[fi] -= self.amplitudes[base + fi] as f64;
+        }
+    }
+
+    /// Unassign a variable. Undoes DFT contribution.
+    #[inline]
+    pub fn unassign(&mut self, var: usize) {
+        debug_assert!(self.assigned[var]);
+        let v = self.values[var] as f64;
+        let base = var * self.num_freqs;
+        for fi in 0..self.num_freqs {
+            self.re[fi] -= v * self.cos_table[base + fi] as f64;
+            self.im[fi] -= v * self.sin_table[base + fi] as f64;
+            self.max_reduction[fi] += self.amplitudes[base + fi] as f64;
+        }
+        self.assigned[var] = false;
+        self.values[var] = 0;
+    }
+
+    /// Check if current partial assignment violates the spectral bound.
+    /// Returns the violating frequency index, or None if OK.
+    ///
+    /// For each frequency: current |DFT|² must not exceed bound even after
+    /// the remaining unassigned variables optimally reduce the magnitude.
+    /// Max reduction per var at freq fi: sqrt(cos² + sin²) = amplitude.
+    /// Total max reduction: sum of amplitudes of unassigned vars.
+    /// Conflict if: |DFT| - max_reduction > sqrt(bound) at any freq.
+    /// O(num_freqs) conflict check using precomputed max_reduction.
+    #[inline]
+    pub fn check_conflict(&self) -> Option<usize> {
+        let sqrt_bound = self.bound.sqrt();
+        for fi in 0..self.num_freqs {
+            let mag = (self.re[fi] * self.re[fi] + self.im[fi] * self.im[fi]).sqrt();
+            if mag - self.max_reduction[fi] > sqrt_bound {
+                return Some(fi);
+            }
+        }
+        None
+    }
 }
 
 /// Configuration flags for optional solver features.
@@ -292,6 +467,9 @@ pub struct Solver {
     /// When true, skip quad PB incremental updates during backtrack.
     /// Used when the caller will reset quad PB state externally.
     pub skip_backtrack_quad_pb: bool,
+
+    /// Optional spectral power constraint (for W/Z middle generation).
+    pub spectral: Option<SpectralConstraint>,
 }
 
 impl Solver {
@@ -367,6 +545,7 @@ impl Solver {
             conflict_limit: 0,
             ok: true,
             skip_backtrack_quad_pb: false,
+            spectral: None,
         }
     }
 
@@ -1325,6 +1504,11 @@ impl Solver {
         // We don't remove quad_pb constraints (those are also in base solver).
         // Learnt clauses from post-checkpoint solves are cleared by watch list rebuild.
 
+        // Reset spectral constraint to boundary-only state
+        if let Some(ref mut spec) = self.spectral {
+            spec.reset();
+        }
+
         self.conflicts = 0;
         self.restart_limit = 100;
         self.luby_index = 0;
@@ -1707,6 +1891,18 @@ impl Solver {
                         if self.lit_value(forced_lit) == LBool::Undef {
                             self.enqueue(forced_lit, Reason::Xor(xi));
                         }
+                    }
+                }
+            }
+            // Spectral constraint: incrementally update DFT and check bound
+            if let Some(ref mut spec) = self.spectral {
+                let v = var_of(lit);
+                if v < spec.num_seq_vars {
+                    let val: i8 = if lit > 0 { 1 } else { -1 };
+                    spec.assign(v, val);
+                    // Check for conflict
+                    if spec.check_conflict().is_some() {
+                        return Some(Reason::Spectral);
                     }
                 }
             }
@@ -2141,6 +2337,37 @@ impl Solver {
                     }
                     self.analyze_reason_buf = buf;
                 }
+                Reason::Spectral => {
+                    // Spectral reason: all assigned sequence variables contributed
+                    // to the DFT violation. Return them all as the reason.
+                    let mut buf = std::mem::take(&mut self.analyze_reason_buf);
+                    buf.clear();
+                    if let Some(ref spec) = self.spectral {
+                        for v in 0..spec.num_seq_vars {
+                            if spec.assigned[v] {
+                                let lit_v = (v + 1) as Lit;
+                                let neg_lit = if spec.values[v] > 0 { -lit_v } else { lit_v };
+                                buf.push(neg_lit);
+                            }
+                        }
+                    }
+                    if p != 0 { buf.push(p); }
+                    for idx in 0..buf.len() {
+                        let lit = buf[idx];
+                        if lit == p { continue; }
+                        let v = var_of(lit);
+                        if self.analyze_seen[v] { continue; }
+                        self.analyze_seen[v] = true;
+                        self.bump_activity(v);
+                        if self.level[v] == self.decision_level() {
+                            counter += 1;
+                        } else if self.level[v] > 0 {
+                            learnt.push(lit);
+                            bt_level = bt_level.max(self.level[v]);
+                        }
+                    }
+                    self.analyze_reason_buf = buf;
+                }
                 Reason::Decision => { unreachable!(); }
             }
 
@@ -2184,7 +2411,7 @@ impl Solver {
             let lit = learnt[i];
             let v = var_of(lit);
             match self.reason[v] {
-                Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) | Reason::Xor(_) => {
+                Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) | Reason::Xor(_) | Reason::Spectral => {
                     if self.lit_removable(v) { continue; }
                 }
                 Reason::Decision => {}
@@ -2283,6 +2510,24 @@ impl Solver {
                         }
                     }
                 }
+                Reason::Spectral => {
+                    // Spectral reason: all assigned sequence vars
+                    if let Some(ref spec) = self.spectral {
+                        for v in 0..spec.num_seq_vars {
+                            if !spec.assigned[v] { continue; }
+                            if v == cur || self.minimize_visited[v] { continue; }
+                            self.minimize_visited[v] = true;
+                            if self.level[v] == 0 { continue; }
+                            if self.analyze_seen[v] { continue; }
+                            let lv = self.level[v] as usize;
+                            if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { return false; }
+                            match self.reason[v] {
+                                Reason::Decision => return false,
+                                _ => { self.minimize_stack.push(v); }
+                            }
+                        }
+                    }
+                }
                 Reason::Decision => return false,
             }
         }
@@ -2298,6 +2543,12 @@ impl Solver {
             let v = var_of(entry.lit);
             self.phase[v] = entry.lit > 0;
             self.assigns[v] = LBool::Undef;
+            // Undo spectral constraint
+            if let Some(ref mut spec) = self.spectral {
+                if v < spec.num_seq_vars && spec.assigned[v] {
+                    spec.unassign(v);
+                }
+            }
             // Mark quad PB constraints involving this variable as stale.
             // Skip for level 0 when caller manages state externally (table path).
             if !(level == 0 && self.skip_backtrack_quad_pb) {

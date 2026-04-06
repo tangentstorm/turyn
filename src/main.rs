@@ -3142,7 +3142,7 @@ fn run_mdd_sat_search(
         let mut process_boundary = |z_bits: u32, w_bits: u32, xy_root: u32| {
             if found.load(AtomicOrdering::Relaxed) { return; }
             total_zw += 1;
-            if total_zw % 10_000 == 0 {
+            if total_zw % 100 == 0 {
                 eprintln!("  walked {}M boundaries, w_gen={} w_ok={} z_ok={} items={}",
                     total_zw / 1_000_000, stats.w_generated, stats.w_spectral_ok,
                     stats.z_spectral_ok, total_items);
@@ -3171,10 +3171,10 @@ fn run_mdd_sat_search(
                     w_tmpl.build_base_solver(middle_m, w_mid_sum)
                 );
                 let w_cp = w_solver.save_checkpoint();
-                // Spectral frequency constraints only (subsume per-lag bounds)
-                sat_z_middle::fill_w_spectral(
-                    w_solver, &w_tmpl, m, &w_boundary, individual_bound, 8,
-                );
+                // Native spectral constraint: tracks DFT incrementally during search
+                w_solver.spectral = Some(radical::SpectralConstraint::new(
+                    m, k, &w_boundary, individual_bound, theta.min(64),
+                ));
 
                 let phases: Vec<bool> = (0..middle_m)
                     .map(|_| next_rng() & 1 == 1).collect();
@@ -3187,6 +3187,7 @@ fn run_mdd_sat_search(
                         w_vals[k + i] = if w_solver.value(w_mid_vars[i]) == Some(true) { 1 } else { -1 };
                     }
                 }
+                w_solver.spectral = None; // detach before restore
                 w_solver.restore_checkpoint(w_cp);
                 if !w_sat { continue; }
 
