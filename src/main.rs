@@ -3198,152 +3198,125 @@ fn run_mdd_sat_search(
                 let w_mid_sum = tuple.w - w_bnd_sum;
                 if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
 
-                // W and Z middles only depend on (middle_m, w_mid_sum) and
-                // (middle_n, z_mid_sum) respectively, not on boundary bits.
-                // Generate them ONCE per (sum_group, tuple), then reuse across entries.
-                let w_r = ((w_mid_sum + middle_m as i32) / 2) as usize;
-                let w_total = binom(middle_m, w_r);
-                let use_sat_w = w_total > 10 * max_w as u128;
-
-                // Collect W middles (shared across all entries in this group)
-                let mut w_middles: Vec<Vec<i8>> = Vec::new();
-                if use_sat_w {
-                    let mut w_solver = sat_w_middle::build_w_middle_solver(m, k, w_mid_sum);
-                    let w_mid_vars: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
-                    let mut rng_state: u64 = (z_bnd_sum as u64)
-                        .wrapping_mul(0x9e3779b97f4a7c15)
-                        ^ (w_bnd_sum as u64) ^ 0x517cc1b727220a95;
-                    let mut next_rng = || -> u64 {
-                        rng_state ^= rng_state << 13;
-                        rng_state ^= rng_state >> 7;
-                        rng_state ^= rng_state << 17;
-                        rng_state
-                    };
-                    let mut w_count = 0usize;
-                    loop {
-                        if found.load(AtomicOrdering::Relaxed) { break; }
-                        if w_count >= max_w { break; }
-                        let phases: Vec<bool> = (0..middle_m)
-                            .map(|i| (next_rng() >> (i % 64)) & 1 == 1).collect();
-                        w_solver.set_phase(&phases);
-                        if w_solver.solve() != Some(true) { break; }
-                        let mid: Vec<i8> = (0..middle_m).map(|i| {
-                            if w_solver.value(w_mid_vars[i]) == Some(true) { 1 } else { -1 }
-                        }).collect();
-                        let block: Vec<i32> = w_mid_vars.iter().map(|&v| {
-                            if w_solver.value(v) == Some(true) { -v } else { v }
-                        }).collect();
-                        w_solver.add_clause(block);
-                        w_middles.push(mid);
-                        w_count += 1;
-                    }
-                } else {
-                    generate_sequences_permuted(middle_m, w_mid_sum, false, false, max_w, |w_mid| {
-                        if found.load(AtomicOrdering::Relaxed) { return false; }
-                        w_middles.push(w_mid.to_vec());
-                        true
-                    });
-                }
-                stats.w_generated += w_middles.len();
-
-                if w_middles.is_empty() { continue; }
-
-                // Group entries by (w_bits, z_bits): entries with same pair share
-                // both W and Z spectral filtering + pair checking.
-                // Only xy_root differs within each group.
-                let mut entries_by_wz: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
-                for entry in zw_entries {
-                    entries_by_wz.entry((entry.w_bits, entry.z_bits))
-                        .or_default().push(entry.xy_root);
-                }
-
+                // Streaming: iterate entries directly, one W + Z per entry.
+                // No grouping/dedup (entries are mostly unique at large k).
+                let mut w_solver = sat_w_middle::build_w_middle_solver(m, k, w_mid_sum);
+                let w_mid_vars: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
+                let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
+                let mut rng: u64 = (z_bnd_sum as u64)
+                    .wrapping_mul(0x9e3779b97f4a7c15)
+                    ^ (w_bnd_sum as u64) ^ 0x517cc1b727220a95;
+                let mut next_rng = || -> u64 {
+                    rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng
+                };
                 let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
                 let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
 
-                for (&(w_bits, z_bits), xy_roots) in &entries_by_wz {
+                for entry in zw_entries {
                     if found.load(AtomicOrdering::Relaxed) { break; }
 
-                    // Build W candidates ONCE per unique (w_bits, z_bits)
-                    let mut w_prefix = vec![0i8; k];
-                    let mut w_suffix = vec![0i8; k];
+                    // Build W: boundary prefix + SAT middle + boundary suffix
+                    let phases: Vec<bool> = (0..middle_m)
+                        .map(|_| next_rng() & 1 == 1).collect();
+                    w_solver.set_phase(&phases);
+                    if w_solver.solve() != Some(true) {
+                        // W solver exhausted — reset for next entry with new solver
+                        w_solver = sat_w_middle::build_w_middle_solver(m, k, w_mid_sum);
+                        let phases: Vec<bool> = (0..middle_m)
+                            .map(|_| next_rng() & 1 == 1).collect();
+                        w_solver.set_phase(&phases);
+                        if w_solver.solve() != Some(true) { break; }
+                    }
+                    stats.w_generated += 1;
+
+                    let mut w_vals = Vec::with_capacity(m);
                     for i in 0..k {
-                        w_prefix[i] = if (w_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        w_suffix[i] = if (w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                        w_vals.push(if (entry.w_bits >> i) & 1 == 1 { 1 } else { -1 });
                     }
-
-                    let mut w_candidates: Vec<SeqWithSpectrum> = Vec::new();
-                    for w_mid in &w_middles {
-                        let mut w_vals = Vec::with_capacity(m);
-                        w_vals.extend_from_slice(&w_prefix);
-                        w_vals.extend_from_slice(w_mid);
-                        w_vals.extend_from_slice(&w_suffix);
-                        if let Some(spectrum) = spectrum_if_ok(&w_vals, &spectral_w, individual_bound, &mut fft_buf_w) {
-                            stats.w_spectral_ok += 1;
-                            w_candidates.push(SeqWithSpectrum {
-                                seq: PackedSeq::from_values(&w_vals), spectrum, autocorr: None,
-                            });
-                        }
+                    for i in 0..middle_m {
+                        w_vals.push(if w_solver.value(w_mid_vars[i]) == Some(true) { 1 } else { -1 });
                     }
-                    if w_candidates.is_empty() { continue; }
-
-                    let w_index = SpectralIndex::build(&w_candidates);
-
-                    // Z generation + spectral pair check ONCE per unique (w_bits, z_bits)
-                    let mut z_prefix = vec![0i8; k];
-                    let mut z_suffix = vec![0i8; k];
                     for i in 0..k {
-                        z_prefix[i] = if (z_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        z_suffix[i] = if (z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                        w_vals.push(if (entry.w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 });
                     }
 
-                    let mut idx_buf = Vec::new();
-                    generate_sequences_permuted(middle_n, z_mid_sum, false, false, max_z, |z_mid| {
-                        if found.load(AtomicOrdering::Relaxed) { return false; }
+                    // Block this W for next iteration
+                    let w_block: Vec<i32> = w_mid_vars.iter().map(|&v| {
+                        if w_solver.value(v) == Some(true) { -v } else { v }
+                    }).collect();
+                    w_solver.add_clause(w_block);
+
+                    // Spectral filter W
+                    let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, individual_bound, &mut fft_buf_w) else { continue; };
+                    stats.w_spectral_ok += 1;
+                    let w_seq = PackedSeq::from_values(&w_vals);
+
+                    // Build Z boundary
+                    let mut z_boundary = vec![0i8; n];
+                    for i in 0..k {
+                        z_boundary[i] = if (entry.z_bits >> i) & 1 == 1 { 1 } else { -1 };
+                        z_boundary[n - k + i] = if (entry.z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                    }
+
+                    // SAT Z with autocorrelation constraints (knows full W)
+                    let mut z_solver = sat_z_middle::build_z_middle_solver(
+                        n, m, k, &z_boundary, &w_vals, z_mid_sum,
+                    );
+                    let mut z_count = 0usize;
+                    loop {
+                        if found.load(AtomicOrdering::Relaxed) { break; }
+                        if z_count >= max_z { break; }
+                        let z_phases: Vec<bool> = (0..middle_n)
+                            .map(|_| next_rng() & 1 == 1).collect();
+                        z_solver.set_phase(&z_phases);
+                        if z_solver.solve() != Some(true) { break; }
                         stats.z_generated += 1;
+                        z_count += 1;
+
                         let mut z_vals = Vec::with_capacity(n);
-                        z_vals.extend_from_slice(&z_prefix);
-                        z_vals.extend_from_slice(z_mid);
-                        z_vals.extend_from_slice(&z_suffix);
-                        let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, individual_bound, &mut fft_buf_z) else { return true; };
-                        stats.z_spectral_ok += 1;
-                        let z_seq = PackedSeq::from_values(&z_vals);
-
-                        w_index.candidates_for(&z_spectrum, pair_bound, &w_candidates, &mut idx_buf);
-                        for &wi in &idx_buf {
-                            let w = &w_candidates[wi];
-                            stats.candidate_pair_attempts += 1;
-                            if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
-                            stats.candidate_pair_spectral_ok += 1;
-
-                            let zw_autocorr = compute_zw_autocorr(problem, &z_seq, &w.seq);
-
-                            // Walk XY sub-MDD for EACH entry's xy_root
-                            for &xy_root in xy_roots {
-                                walk_xy_sub_mdd(
-                                    xy_root, 0, zw_depth, 0, 0,
-                                    &pos_order_clone, &mdd.nodes, max_bnd_sum,
-                                    middle_n as i32, tuple,
-                                    &mut |x_bits, y_bits| {
-                                        total_items += 1;
-                                        let _ = tx.send(SatWorkItem {
-                                            tuple,
-                                            x: SeqInput::Blank,
-                                            y: SeqInput::Blank,
-                                            z: SeqInput::Fixed(z_seq.clone()),
-                                            w: SeqInput::Fixed(w.seq.clone()),
-                                            zw_autocorr: Some(zw_autocorr.clone()),
-                                            priority: spectral_pair_max_power(&z_spectrum, &w.spectrum),
-                                            boundary: Some(BoundaryConfig {
-                                                k, x_bits, y_bits,
-                                                z_bits, w_bits,
-                                            }),
-                                        });
-                                    },
-                                );
-                            }
+                        z_vals.extend_from_slice(&z_boundary[..k]);
+                        for i in 0..middle_n {
+                            z_vals.push(if z_solver.value(z_mid_vars[i]) == Some(true) { 1 } else { -1 });
                         }
-                        true
-                    });
+                        z_vals.extend_from_slice(&z_boundary[n-k..]);
+
+                        let z_block: Vec<i32> = z_mid_vars.iter().map(|&v| {
+                            if z_solver.value(v) == Some(true) { -v } else { v }
+                        }).collect();
+                        z_solver.add_clause(z_block);
+
+                        let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, individual_bound, &mut fft_buf_z) else { continue; };
+                        stats.z_spectral_ok += 1;
+
+                        stats.candidate_pair_attempts += 1;
+                        if !spectral_pair_ok(&z_spectrum, &w_spectrum, pair_bound) { continue; }
+                        stats.candidate_pair_spectral_ok += 1;
+
+                        let z_seq = PackedSeq::from_values(&z_vals);
+                        let zw_autocorr = compute_zw_autocorr(problem, &z_seq, &w_seq);
+
+                        walk_xy_sub_mdd(
+                            entry.xy_root, 0, zw_depth, 0, 0,
+                            &pos_order_clone, &mdd.nodes, max_bnd_sum,
+                            middle_n as i32, tuple,
+                            &mut |x_bits, y_bits| {
+                                total_items += 1;
+                                let _ = tx.send(SatWorkItem {
+                                    tuple,
+                                    x: SeqInput::Blank,
+                                    y: SeqInput::Blank,
+                                    z: SeqInput::Fixed(z_seq.clone()),
+                                    w: SeqInput::Fixed(w_seq.clone()),
+                                    zw_autocorr: Some(zw_autocorr.clone()),
+                                    priority: spectral_pair_max_power(&z_spectrum, &w_spectrum),
+                                    boundary: Some(BoundaryConfig {
+                                        k, x_bits, y_bits,
+                                        z_bits: entry.z_bits, w_bits: entry.w_bits,
+                                    }),
+                                });
+                            },
+                        );
+                    }
                 }
             }
         }
