@@ -9,6 +9,7 @@ use std::time::Instant;
 use rustfft::{FftPlanner, num_complex::Complex};
 
 mod mdd;
+mod mdd_zw_first;
 
 #[derive(Clone, Copy, Debug)]
 struct Problem {
