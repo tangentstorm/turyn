@@ -493,9 +493,8 @@ impl ZwFirstMdd {
                         zw_memo_count, max_memo_entries,
                     );
                     if level == 1 {
-                        let zw_entries: usize = zw_memo.iter().map(|m| m.len()).sum();
                         eprint!("\r  ZW level 1 branch {}/4, {} nodes, zw_memo={}   ",
-                            branch + 1, nodes.len(), zw_entries);
+                            branch + 1, nodes.len(), *zw_memo_count);
                     }
                 }
 
@@ -526,13 +525,13 @@ impl ZwFirstMdd {
             // Cap total memo entries to prevent OOM at large k.
             // When over budget, evict the deepest (largest) level.
             if *zw_memo_count >= max_memo_entries {
-                // Find and clear the level with the most entries
-                let (max_lvl, max_cnt) = zw_memo.iter().enumerate()
+                // Evict the level with the most entries (typically deepest).
+                // Don't shrink_to_fit — keep capacity for refilling.
+                let (max_lvl, _) = zw_memo.iter().enumerate()
                     .max_by_key(|(_, m)| m.len()).unwrap();
-                if max_cnt.len() > 0 {
+                if zw_memo[max_lvl].len() > 0 {
                     *zw_memo_count -= zw_memo[max_lvl].len();
                     zw_memo[max_lvl].clear();
-                    zw_memo[max_lvl].shrink_to_fit();
                 }
             }
             zw_memo[level].insert(state_key, result);
