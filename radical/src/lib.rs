@@ -1288,6 +1288,49 @@ impl Solver {
         (t.var_a(), t.var_b(), t.neg_a(), t.neg_b())
     }
 
+    /// Save a checkpoint of the constraint database sizes.
+    /// After calling this, new clauses/PBs can be added and later undone
+    /// with `restore_checkpoint`. Cheap: just records 4 integers.
+    pub fn save_checkpoint(&self) -> (usize, usize, usize, usize) {
+        (self.clause_meta.len(), self.clause_lits.len(),
+         self.pb_constraints.len(), self.num_vars)
+    }
+
+    /// Restore the solver to a previous checkpoint, removing all clauses/PBs
+    /// added after the checkpoint. Backtracks, then truncates and rebuilds watches.
+    pub fn restore_checkpoint(&mut self, cp: (usize, usize, usize, usize)) {
+        let (n_clauses, n_lits, n_pbs, n_vars) = cp;
+        self.backtrack(0);
+
+        // Mark post-checkpoint clauses as deleted
+        for i in n_clauses..self.clause_meta.len() {
+            self.clause_meta[i].deleted = true;
+        }
+        // Truncate clause storage
+        self.clause_meta.truncate(n_clauses);
+        self.clause_lits.truncate(n_lits);
+
+        // Rebuild watch lists (cheaper than trying to surgically remove entries)
+        for wl in &mut self.watches {
+            wl.retain(|&(ci, _)| (ci as usize) < n_clauses);
+        }
+
+        // Remove post-checkpoint PB constraints
+        self.pb_constraints.truncate(n_pbs);
+        for wl in &mut self.pb_watches {
+            wl.retain(|&ci| (ci as usize) < n_pbs);
+        }
+
+        // Note: we don't remove variables (aux vars from XNOR are in base solver).
+        // We don't remove quad_pb constraints (those are also in base solver).
+        // Learnt clauses from post-checkpoint solves are cleared by watch list rebuild.
+
+        self.conflicts = 0;
+        self.restart_limit = 100;
+        self.luby_index = 0;
+        self.ok = true;
+    }
+
     /// Full reset to base state: unassign all variables, clear trail, reset conflicts.
     /// Keeps all constraints and learnt clauses intact.
     pub fn reset_to_base(&mut self) {

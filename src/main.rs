@@ -3142,7 +3142,7 @@ fn run_mdd_sat_search(
         let mut process_boundary = |z_bits: u32, w_bits: u32, xy_root: u32| {
             if found.load(AtomicOrdering::Relaxed) { return; }
             total_zw += 1;
-            if total_zw % 1_000_000 == 0 {
+            if total_zw % 100_000 == 0 {
                 eprintln!("  walked {}M boundaries, w_gen={} w_ok={} z_ok={} items={}",
                     total_zw / 1_000_000, stats.w_generated, stats.w_spectral_ok,
                     stats.z_spectral_ok, total_items);
@@ -3166,23 +3166,26 @@ fn run_mdd_sat_search(
                     w_boundary[m - k + i] = if (w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
                 }
 
-                // Clone W base solver (XNOR clauses pre-loaded) + fill boundary values
-                let w_base = w_bases.entry(w_mid_sum).or_insert_with(||
+                // Reuse W base solver: checkpoint → fill → solve → restore
+                let w_solver = w_bases.entry(w_mid_sum).or_insert_with(||
                     w_tmpl.build_base_solver(middle_m, w_mid_sum)
                 );
-                let mut w_solver = w_base.clone();
-                sat_z_middle::fill_w_solver(&mut w_solver, &w_tmpl, m, &w_boundary);
+                let w_cp = w_solver.save_checkpoint();
+                sat_z_middle::fill_w_solver(w_solver, &w_tmpl, m, &w_boundary);
 
                 let phases: Vec<bool> = (0..middle_m)
                     .map(|_| next_rng() & 1 == 1).collect();
                 w_solver.set_phase(&phases);
-                if w_solver.solve() != Some(true) { continue; }
-                stats.w_generated += 1;
-
+                let w_sat = w_solver.solve() == Some(true);
                 let mut w_vals = w_boundary;
-                for i in 0..middle_m {
-                    w_vals[k + i] = if w_solver.value(w_mid_vars[i]) == Some(true) { 1 } else { -1 };
+                if w_sat {
+                    stats.w_generated += 1;
+                    for i in 0..middle_m {
+                        w_vals[k + i] = if w_solver.value(w_mid_vars[i]) == Some(true) { 1 } else { -1 };
+                    }
                 }
+                w_solver.restore_checkpoint(w_cp);
+                if !w_sat { continue; }
 
                 let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, individual_bound, &mut fft_buf_w) else { continue; };
                 stats.w_spectral_ok += 1;
@@ -3195,12 +3198,12 @@ fn run_mdd_sat_search(
                     z_boundary[n - k + i] = if (z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
                 }
 
-                // Clone Z base solver (XNOR clauses pre-loaded) + fill W-specific bounds
-                let z_base = z_bases.entry(z_mid_sum).or_insert_with(||
+                // Reuse Z base solver: checkpoint → fill → enumerate → restore
+                let z_solver = z_bases.entry(z_mid_sum).or_insert_with(||
                     z_tmpl.build_base_solver(middle_n, z_mid_sum)
                 );
-                let mut z_solver = z_base.clone();
-                sat_z_middle::fill_z_solver(&mut z_solver, &z_tmpl, n, m, &z_boundary, &w_vals);
+                let z_cp = z_solver.save_checkpoint();
+                sat_z_middle::fill_z_solver(z_solver, &z_tmpl, n, m, &z_boundary, &w_vals);
                 let mut z_count = 0usize;
                 loop {
                     if found.load(AtomicOrdering::Relaxed) { break; }
@@ -3256,6 +3259,7 @@ fn run_mdd_sat_search(
                         },
                     );
                 }
+                z_solver.restore_checkpoint(z_cp);
             }
         };
 
