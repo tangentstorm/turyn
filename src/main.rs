@@ -4459,6 +4459,189 @@ fn main() {
             eprintln!("TT({}): {} tuples (x,y,z,w) satisfying x²+y²+2z²+2w²={}",
                 problem.n, tuples.len(), problem.target_energy());
             print_search_space(problem, &tuples);
+        } else if phase == "phase-b" && cfg.use_mdd {
+            // MDD-based Phase B: walk ZW boundaries, fill middles, spectral filter
+            let mdd_k = cfg.mdd_k.min((problem.n - 1) / 2);
+            let mut loaded_mdd: Option<mdd_reorder::Mdd4> = None;
+            for try_k in (1..=mdd_k).rev() {
+                let path = format!("mdd-{}.bin", try_k);
+                if let Some(m) = mdd_reorder::Mdd4::load(&path) {
+                    eprintln!("Loaded MDD from {} (k={}, {} nodes)", path, m.k, m.nodes.len());
+                    loaded_mdd = Some(m);
+                    break;
+                }
+            }
+            let reordered = match loaded_mdd {
+                Some(m) => m,
+                None => { eprintln!("No MDD file found. Run: target/release/gen_mdd {}", mdd_k); return; }
+            };
+            let k = reordered.k;
+            let middle_n = problem.n - 2 * k;
+            let middle_m = problem.m() - 2 * k;
+            let max_bnd_sum = (2 * k) as i32;
+            let zw_depth = 2 * k;
+            let pos_order: Vec<usize> = {
+                let mut v = Vec::with_capacity(2 * k);
+                for t in 0..k { v.push(t); v.push(2 * k - 1 - t); }
+                v
+            };
+
+            // Collect ZW boundaries grouped by sum
+            let mut zw_by_sum: HashMap<(i32, i32), Vec<(u32, u32, u32)>> = HashMap::new(); // (z_bits, w_bits, xy_root)
+            let mut total_zw = 0u64;
+            fn collect_zw(
+                nid: u32, level: usize, zw_depth: usize,
+                z_acc: u32, w_acc: u32,
+                pos_order: &[usize], nodes: &[[u32; 4]],
+                max_bnd_sum: i32,
+                zw_by_sum: &mut HashMap<(i32, i32), Vec<(u32, u32, u32)>>,
+                total_zw: &mut u64,
+            ) {
+                if nid == mdd_reorder::DEAD { return; }
+                if level == zw_depth {
+                    let z_sum = 2 * (z_acc.count_ones() as i32) - max_bnd_sum;
+                    let w_sum = 2 * (w_acc.count_ones() as i32) - max_bnd_sum;
+                    zw_by_sum.entry((z_sum, w_sum)).or_default().push((z_acc, w_acc, nid));
+                    *total_zw += 1;
+                    return;
+                }
+                if nid == mdd_reorder::LEAF {
+                    // Don't-care: enumerate all remaining
+                    collect_zw_leaf(level, zw_depth, z_acc, w_acc, pos_order, max_bnd_sum, zw_by_sum, total_zw);
+                    return;
+                }
+                let pos = pos_order[level];
+                for branch in 0u32..4 {
+                    let child = nodes[nid as usize][branch as usize];
+                    if child == mdd_reorder::DEAD { continue; }
+                    let z_val = (branch >> 0) & 1;
+                    let w_val = (branch >> 1) & 1;
+                    collect_zw(child, level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
+                        pos_order, nodes, max_bnd_sum, zw_by_sum, total_zw);
+                }
+            }
+            fn collect_zw_leaf(
+                level: usize, zw_depth: usize, z_acc: u32, w_acc: u32,
+                pos_order: &[usize], max_bnd_sum: i32,
+                zw_by_sum: &mut HashMap<(i32, i32), Vec<(u32, u32, u32)>>,
+                total_zw: &mut u64,
+            ) {
+                if level == zw_depth {
+                    let z_sum = 2 * (z_acc.count_ones() as i32) - max_bnd_sum;
+                    let w_sum = 2 * (w_acc.count_ones() as i32) - max_bnd_sum;
+                    zw_by_sum.entry((z_sum, w_sum)).or_default().push((z_acc, w_acc, mdd_reorder::LEAF));
+                    *total_zw += 1;
+                    return;
+                }
+                let pos = pos_order[level];
+                for branch in 0u32..4 {
+                    let z_val = (branch >> 0) & 1;
+                    let w_val = (branch >> 1) & 1;
+                    collect_zw_leaf(level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
+                        pos_order, max_bnd_sum, zw_by_sum, total_zw);
+                }
+            }
+
+            collect_zw(reordered.root, 0, zw_depth, 0, 0,
+                &pos_order, &reordered.nodes, max_bnd_sum, &mut zw_by_sum, &mut total_zw);
+            eprintln!("{} (z,w) boundaries in {} sum groups", total_zw, zw_by_sum.len());
+
+            let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
+            let spectral_w = SpectralFilter::new(problem.m(), cfg.theta_samples);
+            let individual_bound = problem.spectral_bound();
+            let pair_bound = cfg.max_spectral.unwrap_or(individual_bound);
+            let found = AtomicBool::new(false);
+
+            let mut grand_total_pairs = 0u64;
+            let mut grand_z_gen = 0u64;
+            let mut grand_w_gen = 0u64;
+            let mut grand_z_ok = 0u64;
+            let mut grand_w_ok = 0u64;
+            let mut boundaries_tried = 0u64;
+
+            for tuple in &tuples {
+                if found.load(AtomicOrdering::Relaxed) { break; }
+                let start = Instant::now();
+                let mut tuple_pairs = 0u64;
+
+                for (&(z_bnd_sum, w_bnd_sum), entries) in &zw_by_sum {
+                    let z_mid_sum = tuple.z - z_bnd_sum;
+                    if z_mid_sum.abs() > middle_n as i32 || (z_mid_sum + middle_n as i32) % 2 != 0 { continue; }
+                    let w_mid_sum = tuple.w - w_bnd_sum;
+                    if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
+
+                    for &(z_bits, w_bits, _xy_root) in entries {
+                        boundaries_tried += 1;
+                        if boundaries_tried % 100_000 == 0 {
+                            eprint!("\r  boundaries: {}K, pairs: {}", boundaries_tried / 1000, grand_total_pairs);
+                        }
+
+                        let mut w_prefix = vec![0i8; k];
+                        let mut w_suffix = vec![0i8; k];
+                        for i in 0..k {
+                            w_prefix[i] = if (w_bits >> i) & 1 == 1 { 1 } else { -1 };
+                            w_suffix[i] = if (w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                        }
+                        let mut z_prefix = vec![0i8; k];
+                        let mut z_suffix = vec![0i8; k];
+                        for i in 0..k {
+                            z_prefix[i] = if (z_bits >> i) & 1 == 1 { 1 } else { -1 };
+                            z_suffix[i] = if (z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                        }
+
+                        // Generate W middles
+                        let mut w_candidates: Vec<SeqWithSpectrum> = Vec::new();
+                        let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
+                        generate_sequences_permuted(middle_m, w_mid_sum, false, false, cfg.max_w, |w_mid| {
+                            grand_w_gen += 1;
+                            let mut w_vals = Vec::with_capacity(problem.m());
+                            w_vals.extend_from_slice(&w_prefix);
+                            w_vals.extend_from_slice(w_mid);
+                            w_vals.extend_from_slice(&w_suffix);
+                            if let Some(spectrum) = spectrum_if_ok(&w_vals, &spectral_w, individual_bound, &mut fft_buf_w) {
+                                grand_w_ok += 1;
+                                w_candidates.push(SeqWithSpectrum {
+                                    seq: PackedSeq::from_values(&w_vals),
+                                    spectrum,
+                                    autocorr: None,
+                                });
+                            }
+                            true
+                        });
+                        if w_candidates.is_empty() { continue; }
+
+                        let w_index = SpectralIndex::build(&w_candidates);
+
+                        // Generate Z middles, pair with W
+                        let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
+                        let mut idx_buf = Vec::new();
+                        generate_sequences_permuted(middle_n, z_mid_sum, false, false, cfg.max_z, |z_mid| {
+                            grand_z_gen += 1;
+                            let mut z_vals = Vec::with_capacity(problem.n);
+                            z_vals.extend_from_slice(&z_prefix);
+                            z_vals.extend_from_slice(z_mid);
+                            z_vals.extend_from_slice(&z_suffix);
+                            let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, individual_bound, &mut fft_buf_z) else { return true; };
+                            grand_z_ok += 1;
+
+                            w_index.candidates_for(&z_spectrum, pair_bound, &w_candidates, &mut idx_buf);
+                            for &wi in &idx_buf {
+                                let w = &w_candidates[wi];
+                                if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
+                                tuple_pairs += 1;
+                                grand_total_pairs += 1;
+                            }
+                            true
+                        });
+                    }
+                }
+                eprintln!("\r  {} {} {} {}: pairs={} ({:.1?})",
+                    tuple.x, tuple.y, tuple.z, tuple.w,
+                    tuple_pairs, start.elapsed());
+            }
+            eprintln!("\nTotal: {} pairs from {} boundaries (z={}/{} w={}/{})",
+                grand_total_pairs, boundaries_tried,
+                grand_z_ok, grand_z_gen, grand_w_ok, grand_w_gen);
         } else if phase == "phase-b" {
             let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
             let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
