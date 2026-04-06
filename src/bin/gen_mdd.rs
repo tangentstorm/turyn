@@ -14,6 +14,10 @@ fn main() {
         .unwrap_or(&default_out);
     let legacy = args.iter().any(|s| s == "--legacy");
     let sequential = args.iter().any(|s| s == "--sequential");
+    let parallel_depth: usize = args.iter()
+        .position(|s| s == "--depth")
+        .and_then(|i| args.get(i + 1)?.parse().ok())
+        .unwrap_or(0); // 0 = auto-detect from cores
 
     eprintln!("Building MDD for k={} (valid for all n >= {})", k, 2 * k);
 
@@ -33,8 +37,14 @@ fn main() {
             nodes: zw.nodes, root: zw.root, k: zw.k, depth: zw.total_depth,
         }
     } else {
-        eprintln!("Using parallel ZW-first builder ({} cores)...", rayon::current_num_threads());
-        let zw = turyn::mdd_zw_first::ZwFirstMdd::build_parallel(k);
+        let zw = if parallel_depth > 0 {
+            eprintln!("Using parallel ZW-first builder (depth={}, {} subtrees, {} cores)...",
+                parallel_depth, 4u32.pow(parallel_depth as u32), rayon::current_num_threads());
+            turyn::mdd_zw_first::ZwFirstMdd::build_parallel_depth(k, parallel_depth)
+        } else {
+            eprintln!("Using parallel ZW-first builder ({} cores)...", rayon::current_num_threads());
+            turyn::mdd_zw_first::ZwFirstMdd::build_parallel(k)
+        };
         turyn::mdd_reorder::Mdd4 {
             nodes: zw.nodes, root: zw.root, k: zw.k, depth: zw.total_depth,
         }

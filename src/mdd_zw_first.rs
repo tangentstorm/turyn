@@ -33,93 +33,121 @@ pub struct ZwFirstMdd {
 
 impl ZwFirstMdd {
     pub fn build(k: usize) -> Self {
-        Self::build_inner(k, None)
+        Self::build_inner(k, None, None)
     }
 
-    /// Build with parallel level-1 branches using rayon.
+    /// Build with parallel branches using rayon.
+    /// parallel_depth=1: 4 subtrees (level 1). parallel_depth=2: 16 subtrees (levels 1+2).
     pub fn build_parallel(k: usize) -> Self {
+        // Choose depth based on available cores
+        let ncores = rayon::current_num_threads();
+        let parallel_depth = if ncores >= 16 { 2 } else { 1 };
+        Self::build_parallel_depth(k, parallel_depth)
+    }
+
+    pub fn build_parallel_depth(k: usize, parallel_depth: usize) -> Self {
         use rayon::prelude::*;
 
         let start = std::time::Instant::now();
-        eprintln!("  Parallel build: spawning 4 level-1 branches...");
 
-        // Build each level-1 branch independently in parallel
-        let branch_results: Vec<Self> = (0u32..4).into_par_iter().map(|b| {
-            Self::build_inner(k, Some(b))
+        // Generate all branch combinations for the given depth.
+        // Level 0 has 1 branch (symmetry: 0b11). Levels 1..depth have 4 each.
+        // Total subtrees = 4^parallel_depth
+        let num_subtrees = 4u32.pow(parallel_depth as u32);
+        eprintln!("  Parallel build: {} subtrees (depth {}, {} cores)...",
+            num_subtrees, parallel_depth, rayon::current_num_threads());
+
+        // Each subtree is identified by a Vec of branch choices at levels 1..parallel_depth
+        let subtree_branches: Vec<Vec<u32>> = (0..num_subtrees).map(|idx| {
+            (0..parallel_depth).map(|d| (idx >> (d * 2)) & 3).collect()
         }).collect();
 
-        eprintln!("  Parallel build: all branches done in {:.1?}, merging...", start.elapsed());
+        // Build each subtree independently in parallel
+        let branch_results: Vec<(Self, Vec<u32>)> = subtree_branches.into_par_iter().map(|branches| {
+            let mdd = Self::build_inner(k, None, Some(&branches));
+            (mdd, branches)
+        }).collect();
 
-        // Merge: combine 4 independent MDDs into one.
-        // Each branch MDD has its own node array. We concatenate them (with ID remapping)
-        // and build a new root that combines all 4 branches.
+        eprintln!("  Parallel build: all subtrees done in {:.1?}, merging...", start.elapsed());
+
+        // Merge: combine independent subtree MDDs into one.
+        // Each subtree MDD has a path from root through the restricted levels.
+        // We extract the actual subtree root and build shared prefix levels.
 
         let mut merged_nodes: Vec<[u32; 4]> = Vec::new();
         merged_nodes.push([DEAD; 4]); // node 0 = DEAD sentinel
 
-        let mut branch_roots = [DEAD; 4];
-        let mut offsets = Vec::new();
+        // Extract subtree roots and copy nodes with ID remapping.
+        // Key: branch path (Vec<u32>) → remapped subtree root
+        let mut subtree_map: HashMap<Vec<u32>, u32> = HashMap::default();
 
-        for (bi, branch_mdd) in branch_results.iter().enumerate() {
+        for (mdd, branches) in &branch_results {
             let offset = merged_nodes.len() as u32;
-            offsets.push(offset);
 
-            // Copy nodes from this branch (skip node 0 = DEAD sentinel)
-            for node in &branch_mdd.nodes[1..] {
+            // Copy nodes (skip sentinel)
+            for node in &mdd.nodes[1..] {
                 let mut remapped = [DEAD; 4];
                 for j in 0..4 {
                     let c = node[j];
                     remapped[j] = if c == DEAD || c == LEAF { c }
-                                  else { c - 1 + offset }; // -1 because we skip sentinel
+                                  else { c - 1 + offset };
                 }
                 merged_nodes.push(remapped);
             }
 
-            // Remap branch root
-            let r = branch_mdd.root;
-            branch_roots[bi] = if r == DEAD || r == LEAF { r }
-                               else { r - 1 + offset };
-        }
-
-        // Now we need to reconstruct the level-0 and level-1 structure.
-        // Level 0: symmetry breaking means only branch 0b11 is valid.
-        // Level 1: the 4 branches we just computed.
-
-        // Create level-1 node with 4 branch roots
-        // Each branch_mdd was built with restriction: at level 1, only process branch b.
-        // The root of each branch_mdd is: level-0 node → level-1 node → branch subtree.
-        // We need to extract the subtree root (the child of the level-1 node for branch b).
-
-        // Actually, each branch MDD's root points to a level-0 node, which points to
-        // a level-1 node that has only 1 non-DEAD child (the restricted branch).
-        // We need to dig down 2 levels to get the actual subtree root.
-
-        let mut subtree_roots = [DEAD; 4];
-        for (bi, branch_mdd) in branch_results.iter().enumerate() {
-            let r = branch_mdd.root;
-            if r == DEAD || r == LEAF { continue; }
-            // Level 0 node: children[3] is the only non-DEAD (symmetry: branch 0b11)
-            let level0 = &branch_mdd.nodes[r as usize];
-            let level1_nid = level0[3]; // branch 0b11 at level 0
-            if level1_nid == DEAD || level1_nid == LEAF {
-                subtree_roots[bi] = level1_nid;
-                continue;
+            // Navigate from root through restricted levels to find subtree root
+            let mut nid = mdd.root;
+            if nid != DEAD && nid != LEAF {
+                // Level 0: symmetry breaking → branch 3 (0b11)
+                nid = mdd.nodes[nid as usize][3];
             }
-            // Level 1 node: children[bi] is the only non-DEAD (restricted branch)
-            let level1 = &branch_mdd.nodes[level1_nid as usize];
-            let subtree_nid = level1[bi];
-            // Remap this ID using the offset
-            subtree_roots[bi] = if subtree_nid == DEAD || subtree_nid == LEAF { subtree_nid }
-                                else { subtree_nid - 1 + offsets[bi] };
+            for &b in branches {
+                if nid == DEAD || nid == LEAF { break; }
+                nid = mdd.nodes[nid as usize][b as usize];
+            }
+            // Remap the subtree root
+            let remapped_root = if nid == DEAD || nid == LEAF { nid }
+                                else { nid - 1 + offset };
+            subtree_map.insert(branches.clone(), remapped_root);
         }
 
-        // Build level-1 node
-        let level1_nid = merged_nodes.len() as u32;
-        merged_nodes.push(subtree_roots);
+        // Build the shared prefix levels bottom-up.
+        // For depth=2: build level-2 nodes (4 children each from subtrees),
+        // then level-1 nodes, then level-0.
+        fn build_prefix_level(
+            depth: usize, max_depth: usize,
+            path: &mut Vec<u32>,
+            subtree_map: &HashMap<Vec<u32>, u32>,
+            nodes: &mut Vec<[u32; 4]>,
+        ) -> u32 {
+            if depth == max_depth {
+                // Leaf of prefix: look up subtree root
+                return *subtree_map.get(path).unwrap_or(&DEAD);
+            }
+            let mut children = [DEAD; 4];
+            for b in 0u32..4 {
+                path.push(b);
+                children[b as usize] = build_prefix_level(
+                    depth + 1, max_depth, path, subtree_map, nodes,
+                );
+                path.pop();
+            }
+            // Reduce
+            if children.iter().all(|&c| c == DEAD) { return DEAD; }
+            let first = children[0];
+            if children.iter().all(|&c| c == first) { return first; }
+            let nid = nodes.len() as u32;
+            nodes.push(children);
+            nid
+        }
 
-        // Build level-0 node (only branch 0b11 = index 3 is valid)
+        // Build level 1..parallel_depth nodes
+        let mut path = Vec::new();
+        let level1_root = build_prefix_level(0, parallel_depth, &mut path, &subtree_map, &mut merged_nodes);
+
+        // Build level-0 node (symmetry: only branch 3 = 0b11)
         let mut level0_children = [DEAD; 4];
-        level0_children[3] = level1_nid;
+        level0_children[3] = level1_root;
         let mut root = merged_nodes.len() as u32;
         merged_nodes.push(level0_children);
 
@@ -191,7 +219,7 @@ impl ZwFirstMdd {
         }
     }
 
-    fn build_inner(k: usize, restrict_level1: Option<u32>) -> Self {
+    fn build_inner(k: usize, restrict_level1: Option<u32>, restrict_branches: Option<&[u32]>) -> Self {
         let zw_depth = 2 * k;
         let total_depth = 4 * k;
 
@@ -361,6 +389,7 @@ impl ZwFirstMdd {
             k: usize,
             zw_depth: usize,
             restrict_level1: Option<u32>,
+            restrict_branches: Vec<(usize, u32)>, // (level, required_branch)
         }
 
         let ctx = Ctx {
@@ -383,6 +412,12 @@ impl ZwFirstMdd {
             k,
             zw_depth,
             restrict_level1,
+            restrict_branches: match restrict_branches {
+                Some(branches) => branches.iter().enumerate()
+                    .map(|(d, &b)| (d + 1, b)) // level 1, 2, ... (skip level 0 symmetry)
+                    .collect(),
+                None => Vec::new(),
+            },
         };
 
         let mut nodes: Vec<[u32; 4]> = Vec::new();
@@ -605,10 +640,15 @@ impl ZwFirstMdd {
                 // Symmetry breaking: z[0]=w[0]=+1
                 if new_pos == 0 && branch != 0b11 { continue; }
 
-                // For parallel builds: restrict to one level-1 branch
+                // For parallel builds: restrict to specific branches at specified levels
                 if let Some(target) = ctx.restrict_level1 {
                     if level == 1 && branch != target { continue; }
                 }
+                let mut skip = false;
+                for &(rlevel, rbranch) in &ctx.restrict_branches {
+                    if level == rlevel && branch != rbranch { skip = true; break; }
+                }
+                if skip { continue; }
 
                 current_vals[new_idx] = branch as u8;
 
@@ -706,11 +746,10 @@ impl ZwFirstMdd {
 
         // Budget memo: ~140 bytes/entry in FxHashMap.
         // When running as a parallel branch, use 1/4 of the budget.
-        let max_memo_entries: usize = if restrict_level1.is_some() {
-            12_500_000  // ~1.75GB per branch, 4 branches = ~7GB total
-        } else {
-            50_000_000  // ~7GB for sequential builds
-        };
+        let num_parallel = if restrict_branches.is_some() {
+            4u32.pow(restrict_branches.unwrap().len() as u32) as usize
+        } else if restrict_level1.is_some() { 4 } else { 1 };
+        let max_memo_entries: usize = 50_000_000 / num_parallel; // ~7GB total budget
         let per_level_cap: usize = max_memo_entries / (zw_depth + 1);
         let mut zw_memo_count: usize = 0;
         let mut sums = vec![0i8; k];
