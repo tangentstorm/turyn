@@ -1,4 +1,9 @@
 import Turyn.Basic
+import Mathlib.Algebra.BigOperators.Group.Finset.Basic
+import Mathlib.Algebra.BigOperators.Ring.Finset
+
+open Finset
+open BigOperators
 
 /-!
 # Hadamard Matrices and the Goethals-Seidel Construction
@@ -49,7 +54,7 @@ def IntMatrix.entry (m : IntMatrix) (i j : Nat) : Int :=
   (m.getD i []).getD j 0
 
 /-- Dot product of two integer lists. -/
-def dotProduct (a b : List Int) : Int :=
+def listDotProduct (a b : List Int) : Int :=
   ((a.zip b).map fun p => p.1 * p.2).foldl (· + ·) 0
 
 /-! ### Hadamard matrix predicate -/
@@ -67,7 +72,7 @@ def checkOrthogonality (m : IntMatrix) : Bool :=
   let n := m.dim
   (List.range n).all fun i =>
     (List.range n).all fun j =>
-      let dot := dotProduct (m.getD i []) (m.getD j [])
+      let dot := listDotProduct (m.getD i []) (m.getD j [])
       if i == j then dot == (n : Int) else dot == 0
 
 /-- Boolean predicate: is `m` a Hadamard matrix of order `n`? -/
@@ -110,7 +115,7 @@ def tSequences (x y z w : PmSeq) : PmSeq × PmSeq × PmSeq × PmSeq :=
 def periodicAutocorr (a : PmSeq) (s : Nat) : Int :=
   let m := a.length
   if m == 0 then 0
-  else rangeSum (fun i => a.getD i 0 * a.getD ((i + s) % m) 0) m
+  else ∑ i ∈ range m, a.getD i 0 * a.getD ((i + s) % m) 0
 
 /-- Combined periodic autocorrelation of four sequences. -/
 def combinedPeriodicAutocorr (a b c d : PmSeq) (s : Nat) : Int :=

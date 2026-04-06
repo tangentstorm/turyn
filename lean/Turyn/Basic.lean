@@ -1,3 +1,9 @@
+import Mathlib
+import Mathlib.Algebra.BigOperators.Intervals
+
+open Finset
+open BigOperators
+
 /-!
 # Turyn-Type Sequences: Core Definitions
 
@@ -22,54 +28,6 @@ def allPmOne (a : PmSeq) : Bool :=
 /-- Propositional version: every entry is 1 or −1. -/
 def AllPmOne (a : PmSeq) : Prop := ∀ v ∈ a, v = 1 ∨ v = -1
 
-/-! ### Helper: range sum (proof-friendly alternative to foldl) -/
-
-/-- Sum f(0) + f(1) + ... + f(n-1). Defined recursively for easy induction. -/
-def rangeSum (f : Nat → Int) : Nat → Int
-  | 0 => 0
-  | n + 1 => rangeSum f n + f n
-
-theorem rangeSum_zero (f : Nat → Int) : rangeSum f 0 = 0 := rfl
-
-theorem rangeSum_succ (f : Nat → Int) (n : Nat) :
-    rangeSum f (n + 1) = rangeSum f n + f n := rfl
-
-/-- If every value in range is zero, the sum is zero. -/
-theorem rangeSum_eq_zero (f : Nat → Int) (n : Nat)
-    (h : ∀ i : Nat, i < n → f i = 0) : rangeSum f n = 0 := by
-  induction n with
-  | zero => rfl
-  | succ k ih =>
-    simp [rangeSum_succ]
-    have h1 : rangeSum f k = 0 := ih (fun i hi => h i (Nat.lt_succ_of_lt hi))
-    have h2 : f k = 0 := h k (Nat.lt_succ_iff.mpr (Nat.le_refl k))
-    omega
-
-/-- Adding rangeSum distributes over addition of functions. -/
-theorem rangeSum_add (f g : Nat → Int) (n : Nat) :
-    rangeSum (fun i => f i + g i) n = rangeSum f n + rangeSum g n := by
-  induction n with
-  | zero => simp [rangeSum_zero]
-  | succ k ih => simp [rangeSum_succ, ih]; omega
-
-/-- Scalar multiplication distributes over rangeSum. -/
-theorem rangeSum_mul_left (c : Int) (f : Nat → Int) (n : Nat) :
-    rangeSum (fun i => c * f i) n = c * rangeSum f n := by
-  induction n with
-  | zero => simp [rangeSum_zero]
-  | succ k ih =>
-    simp [rangeSum_succ, ih]
-    rw [Int.mul_add]
-
-/-- rangeSum equals List.range foldl. -/
-theorem rangeSum_eq_foldl (f : Nat → Int) (n : Nat) :
-    rangeSum f n = (List.range n).foldl (fun acc i => acc + f i) 0 := by
-  induction n with
-  | zero => rfl
-  | succ k ih =>
-    rw [rangeSum_succ, List.range_succ, List.foldl_append]
-    simp [List.foldl, ih]
-
 /-! ### Aperiodic Autocorrelation -/
 
 /-- Aperiodic autocorrelation of sequence `a` at lag `s`:
@@ -77,7 +35,7 @@ theorem rangeSum_eq_foldl (f : Nat → Int) (n : Nat) :
     Returns 0 when `s ≥ |a|`. -/
 def aperiodicAutocorr (a : PmSeq) (s : Nat) : Int :=
   if s ≥ a.length then 0
-  else rangeSum (fun i => a.getD i 0 * a.getD (i + s) 0) (a.length - s)
+  else ∑ i ∈ range (a.length - s), a.getD i 0 * a.getD (i + s) 0
 
 /-- Combined weighted autocorrelation for the Turyn quadruple at lag `s`:
     C(s) = N_X(s) + N_Y(s) + 2·N_Z(s) + 2·N_W(s) -/
@@ -179,7 +137,7 @@ theorem IsTurynType.toProp {n : Nat} {x y z w : PmSeq}
 /-! ### Sum of a sequence -/
 
 /-- Sum of all entries in a sequence. -/
-def seqSum (a : PmSeq) : Int := a.foldl (· + ·) 0
+def seqSum (a : PmSeq) : Int := ∑ i ∈ range a.length, a.getD i 0
 
 /-! ### Convenience: structured Turyn quadruple with proofs -/
 

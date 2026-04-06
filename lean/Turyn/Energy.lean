@@ -1,4 +1,10 @@
 import Turyn.Basic
+import Mathlib.Algebra.BigOperators.Group.Finset.Basic
+import Mathlib.Algebra.BigOperators.Ring.Finset
+import Mathlib.Tactic.Ring
+
+open Finset
+open BigOperators
 
 /-!
 # Energy Identity for Turyn-Type Sequences
@@ -35,13 +41,13 @@ N_X(s) + N_Y(s) + 2·N_Z(s) + 2·N_W(s) = 0 for all s ≥ 1.
 
 /-- Total autocorrelation: sum of N_a(s) for s = 1, …, k−1. -/
 def totalAutocorr (a : PmSeq) : Int :=
-  rangeSum (fun i => aperiodicAutocorr a (i + 1)) (a.length - 1)
+  ∑ i ∈ range (a.length - 1), aperiodicAutocorr a (i + 1)
 
 /-! ### Weighted total autocorrelation -/
 
 /-- Weighted total autocorrelation for a TT quadruple. -/
 def weightedTotalAutocorr (x y z w : PmSeq) (n : Nat) : Int :=
-  rangeSum (fun i => combinedAutocorr x y z w (i + 1)) (n - 1)
+  ∑ i ∈ range (n - 1), combinedAutocorr x y z w (i + 1)
 
 /-- **Turyn vanishing (total):** The weighted total autocorrelation vanishes.
 
@@ -51,11 +57,7 @@ theorem turyn_vanishing_total {n : Nat} {x y z w : PmSeq}
     (h : IsTurynTypeProp n x y z w) :
     weightedTotalAutocorr x y z w n = 0 := by
   unfold weightedTotalAutocorr
-  apply rangeSum_eq_zero
-  intro i hi
-  apply h.vanishing
-  · omega
-  · omega
+  exact sum_eq_zero (fun i hi => h.vanishing (i + 1) (by omega) (by rw [mem_range] at hi; omega))
 
 /-! ### Sum-autocorrelation identity
 
@@ -68,30 +70,48 @@ Without Mathlib, it requires ~200 lines of manual `rangeSum` manipulation.
 We state it as an axiom and verify it computationally for all concrete instances.
 -/
 
-/-- The sum-autocorrelation identity for ±1 sequences:
-    (Σ aᵢ)² = |a| + 2 · Σ_{s≥1} N_a(s)
+theorem sum_w_ext {n : Nat} {w : PmSeq} (hwl : w.length = n - 1) :
+    ∑ i ∈ range (n - 1), aperiodicAutocorr w (i + 1) =
+    ∑ i ∈ range (n - 1 - 1), aperiodicAutocorr w (i + 1) := by
+  cases n with
+  | zero => rfl
+  | succ k =>
+    cases k with
+    | zero => rfl
+    | succ j =>
+      have hw : aperiodicAutocorr w (j + 1) = 0 := by
+        unfold aperiodicAutocorr
+        have hlen : j + 1 ≥ w.length := by omega
+        split
+        · rfl
+        · contradiction
+      have heq1 : j + 1 + 1 - 1 = j + 1 := by omega
+      rw [heq1]
+      rw [sum_range_succ]
+      have heq2 : j + 1 - 1 = j := by omega
+      rw [heq2, hw]
+      omega
 
-    Proof sketch (see module docstring):
-    - Expand (Σ aᵢ)² = Σᵢ Σⱼ aᵢaⱼ = Σᵢ aᵢ² + 2·Σ_{i<j} aᵢaⱼ
-    - Since aᵢ ∈ {±1}: Σᵢ aᵢ² = |a|
-    - Change of variables: Σ_{i<j} aᵢaⱼ = Σ_{s≥1} N_a(s)
-    - This is Parseval's identity in disguise.
-
-    Computational verification: `native_decide` confirms this for all
-    concrete instances in Examples.lean. -/
-axiom sum_sq_eq_len_add_two_totalAutocorr (a : PmSeq) (h : AllPmOne a) :
-    (seqSum a) ^ 2 = ↑(a.length) + 2 * totalAutocorr a
-
-/-! ### The Energy Identity -/
-
-/-- The weighted total autocorrelation decomposes as a sum of individual
-    total autocorrelations. -/
-axiom weightedTotalAutocorr_decompose {n : Nat} {x y z w : PmSeq}
+theorem weightedTotalAutocorr_decompose {n : Nat} {x y z w : PmSeq}
     (hxl : x.length = n) (hyl : y.length = n)
     (hzl : z.length = n) (hwl : w.length = n - 1) :
     weightedTotalAutocorr x y z w n =
-    totalAutocorr x + totalAutocorr y + 2 * totalAutocorr z + 2 * totalAutocorr w
+    totalAutocorr x + totalAutocorr y + 2 * totalAutocorr z + 2 * totalAutocorr w := by
+  unfold weightedTotalAutocorr totalAutocorr combinedAutocorr
+  simp only [sum_add_distrib, ← mul_sum]
+  rw [hxl, hyl, hzl]
+  have hw_ext := sum_w_ext hwl
+  rw [hw_ext]
+  rw [hwl]
 
+theorem sum_sq_eq_finset (a : PmSeq) (h : AllPmOne a) :
+    (∑ i ∈ range a.length, a.getD i 0) ^ 2 = (a.length : Int) + 2 * ∑ i ∈ range (a.length - 1), aperiodicAutocorr a (i + 1) := by
+  sorry
+
+theorem sum_sq_eq_len_add_two_totalAutocorr (a : PmSeq) (h : AllPmOne a) :
+    (seqSum a) ^ 2 = ↑(a.length) + 2 * totalAutocorr a := by
+  rw [seqSum, totalAutocorr]
+  exact sum_sq_eq_finset a h
 /-- **Energy identity:** For any TT(n), the sums satisfy
     x² + y² + 2z² + 2w² = 6n − 2. -/
 theorem energy_identity {n : Nat} {x y z w : PmSeq}
