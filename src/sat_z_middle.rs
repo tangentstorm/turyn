@@ -303,6 +303,111 @@ pub fn fill_w_solver(
     }
 }
 
+/// Add spectral frequency constraints to the W solver.
+/// For each sampled frequency ω, encodes:
+///   P(ω) = m + 2*Σ_s N_W(s)*cos(2πsω/m) ≤ spectral_bound
+/// as a weighted PB constraint on the agree literals.
+///
+/// Each agree literal (linear from bnd×mid, aux from mid×mid) contributes
+/// a weight of 2*cos(2πsω/m) at frequency ω for its lag s. The constant
+/// part from bnd×bnd pairs is folded into the threshold.
+///
+/// Integer scaling (SCALE=1000) converts float cosine weights to u32 coeffs.
+pub fn fill_w_spectral(
+    solver: &mut radical::Solver,
+    tmpl: &LagTemplate,
+    seq_len: usize,       // m (W length)
+    boundary: &[i8],
+    spectral_bound: f64,  // (6n-2)/2
+    num_freqs: usize,     // how many frequency constraints to add
+) {
+    let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
+    let m = seq_len;
+    let pi2 = 2.0 * std::f64::consts::PI;
+    const SCALE: f64 = 1000.0;
+
+    // Budget: P(ω) = m + 2*Σ_s N_W(s)*cos ≤ B
+    // => Σ_s N_W(s)*cos ≤ (B - m) / 2
+    // N_W(s) = 2*agree(s) - num_pairs(s)
+    // => 2*Σ_s agree(s)*cos - Σ_s num_pairs(s)*cos ≤ (B-m)/2
+    // => Σ_s agree(s)*cos ≤ ((B-m)/2 + Σ_s num_pairs(s)*cos) / 2
+    //
+    // Split agree(s) = agree_const(s) + variable_agree(s)
+    // => Σ_s variable_agree(s)*cos ≤ threshold - Σ_s agree_const(s)*cos
+
+    for fi in 0..num_freqs {
+        // Sample frequencies evenly in (0, 0.5) — avoid ω=0 (trivially loose)
+        let omega = (fi as f64 + 1.0) / (num_freqs as f64 + 1.0) * 0.5;
+
+        let mut const_weighted = 0.0f64;  // Σ agree_const(s) * cos(s,ω)
+        let mut baseline = 0.0f64;        // Σ num_pairs(s) * cos(s,ω)
+
+        // Collect (literal, float_weight) pairs for variable agree terms
+        let mut lit_weights: Vec<(i32, f64)> = Vec::new();
+
+        for (si, lag) in tmpl.lags.iter().enumerate() {
+            let s = si + 1;
+            let cos_val = (pi2 * s as f64 * omega / m as f64).cos();
+
+            baseline += lag.num_pairs as f64 * cos_val;
+
+            // bnd×bnd constant contribution
+            let mut agree_const = 0u32;
+            for &(i, j) in &lag.bnd_bnd {
+                if boundary[i] == boundary[j] { agree_const += 1; }
+            }
+            const_weighted += agree_const as f64 * cos_val;
+
+            // bnd×mid variable terms
+            for &(bnd_pos, mid_idx) in &lag.bnd_mid {
+                let lit = if boundary[bnd_pos] == 1 { mid_var(mid_idx) } else { -mid_var(mid_idx) };
+                lit_weights.push((lit, cos_val));
+            }
+
+            // mid×mid aux var terms
+            for (qi, _) in lag.mid_mid.iter().enumerate() {
+                lit_weights.push((lag.aux_base + qi as i32, cos_val));
+            }
+        }
+
+        if lit_weights.is_empty() { continue; }
+
+        // Threshold for variable part:
+        // Σ variable_agree * cos ≤ ((B-m)/2 + baseline) / 2 - const_weighted
+        let threshold = ((spectral_bound - m as f64) / 2.0 + baseline) / 2.0 - const_weighted;
+
+        // Convert "Σ w_i * x_i ≤ threshold" (w_i can be negative) to PB atleast.
+        // For positive w_i: contribute w_i when x_i=1, so negate lit for atleast.
+        // For negative w_i: contribute |w_i| when x_i=0, so keep lit for atleast.
+        // PB: Σ_{w>0} w*¬x + Σ_{w<0} |w|*x ≥ Σ_{w>0} w - threshold
+        let mut pb_lits: Vec<i32> = Vec::with_capacity(lit_weights.len());
+        let mut pb_coeffs: Vec<u32> = Vec::with_capacity(lit_weights.len());
+        let mut sum_positive = 0.0f64;
+
+        for &(lit, w) in &lit_weights {
+            let scaled_w = (w * SCALE).round();
+            if scaled_w.abs() < 1.0 { continue; } // skip near-zero weights
+
+            if scaled_w > 0.0 {
+                pb_lits.push(-lit);  // negate: count when x_i=0
+                pb_coeffs.push(scaled_w as u32);
+                sum_positive += scaled_w;
+            } else {
+                pb_lits.push(lit);
+                pb_coeffs.push((-scaled_w) as u32);
+            }
+        }
+
+        let bound = sum_positive - threshold * SCALE;
+        if bound <= 0.0 { continue; } // trivially satisfied
+        let bound = bound.ceil() as u32;
+
+        if !pb_lits.is_empty() {
+            solver.add_pb_atleast(&pb_lits, &pb_coeffs, bound);
+        }
+    }
+}
+
 /// Legacy: build Z middle solver from scratch (no template).
 /// Kept for the --phase-b --mdd path.
 pub fn build_z_middle_solver(
