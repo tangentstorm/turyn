@@ -4492,28 +4492,139 @@ fn main() {
                 v
             };
 
-            // Collect ZW boundaries grouped by (w_sum, z_sum) so we can iterate
-            // W boundaries first, then for each W find compatible z boundaries.
-            let mut zw_by_sum: HashMap<(i32, i32), Vec<(u32, u32, u32)>> = HashMap::new();
+            // Lazily walk MDD boundaries — no collect, no HashMap.
+            // For each boundary, check compatibility with each tuple inline.
+            let spectral_w = SpectralFilter::new(m, cfg.theta_samples);
+            let individual_bound = problem.spectral_bound();
+            let max_w_passing = cfg.max_w;
+
+            // Pre-compute required (z_mid_sum, w_mid_sum) per tuple for fast lookup
+            let mut tuple_pairs: Vec<u64> = vec![0; tuples.len()];
+            let mut grand_total_pairs = 0u64;
+            let mut grand_w_gen = 0u64;
+            let mut grand_w_ok = 0u64;
+            let mut sat_calls = 0u64;
+            let mut sat_solutions = 0u64;
+            let mut sat_unsats = 0u64;
             let mut total_zw = 0u64;
-            fn collect_zw(
+
+            // State for processing a single boundary across all tuples
+            struct WalkState<'a> {
+                tuples: &'a [SumTuple],
+                tuple_pairs: &'a mut [u64],
+                grand_total_pairs: &'a mut u64,
+                grand_w_gen: &'a mut u64,
+                grand_w_ok: &'a mut u64,
+                sat_calls: &'a mut u64,
+                sat_solutions: &'a mut u64,
+                sat_unsats: &'a mut u64,
+                total_zw: &'a mut u64,
+                spectral_w: &'a SpectralFilter,
+                individual_bound: f64,
+                max_w_passing: usize,
+                n: usize,
+                m: usize,
+                k: usize,
+                middle_n: usize,
+                middle_m: usize,
+                max_bnd_sum: i32,
+            }
+
+            fn process_boundary(z_bits: u32, w_bits: u32, _xy_root: u32, state: &mut WalkState) {
+                let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - state.max_bnd_sum;
+                let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - state.max_bnd_sum;
+                *state.total_zw += 1;
+                let k = state.k;
+                let n = state.n;
+                let m = state.m;
+                let middle_n = state.middle_n;
+                let middle_m = state.middle_m;
+
+                for (ti, tuple) in state.tuples.iter().enumerate() {
+                    let z_mid_sum = tuple.z - z_bnd_sum;
+                    if z_mid_sum.abs() > middle_n as i32 || (z_mid_sum + middle_n as i32) % 2 != 0 { continue; }
+                    let w_mid_sum = tuple.w - w_bnd_sum;
+                    if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
+
+                    let mut w_prefix = vec![0i8; k];
+                    let mut w_suffix = vec![0i8; k];
+                    for i in 0..k {
+                        w_prefix[i] = if (w_bits >> i) & 1 == 1 { 1 } else { -1 };
+                        w_suffix[i] = if (w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                    }
+                    let mut z_prefix = vec![0i8; k];
+                    let mut z_suffix = vec![0i8; k];
+                    for i in 0..k {
+                        z_prefix[i] = if (z_bits >> i) & 1 == 1 { 1 } else { -1 };
+                        z_suffix[i] = if (z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                    }
+
+                    let mut z_boundary = vec![0i8; n];
+                    for i in 0..k { z_boundary[i] = z_prefix[i]; z_boundary[n - k + i] = z_suffix[i]; }
+
+                    let mut w_passing = 0usize;
+                    let mut fft_buf_w = Vec::with_capacity(state.spectral_w.fft_size);
+                    generate_sequences_permuted(middle_m, w_mid_sum, false, false, usize::MAX, |w_mid| {
+                        *state.grand_w_gen += 1;
+                        let mut w_vals = Vec::with_capacity(m);
+                        w_vals.extend_from_slice(&w_prefix);
+                        w_vals.extend_from_slice(w_mid);
+                        w_vals.extend_from_slice(&w_suffix);
+                        let Some(_w_spectrum) = spectrum_if_ok(&w_vals, state.spectral_w, state.individual_bound, &mut fft_buf_w) else { return true; };
+                        *state.grand_w_ok += 1;
+                        w_passing += 1;
+
+                        let mut solver = sat_z_middle::build_z_middle_solver(
+                            n, m, k, &z_boundary, &w_vals, z_mid_sum,
+                        );
+                        let mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
+
+                        loop {
+                            *state.sat_calls += 1;
+                            let result = solver.solve();
+                            if result != Some(true) {
+                                *state.sat_unsats += 1;
+                                break;
+                            }
+                            *state.sat_solutions += 1;
+
+                            let mut z_vals = z_boundary.clone();
+                            for i in 0..middle_n {
+                                z_vals[k + i] = if solver.value(mid_vars[i]) == Some(true) { 1 } else { -1 };
+                            }
+
+                            state.tuple_pairs[ti] += 1;
+                            *state.grand_total_pairs += 1;
+
+                            let block: Vec<i32> = mid_vars.iter().map(|&v| {
+                                if solver.value(v) == Some(true) { -v } else { v }
+                            }).collect();
+                            solver.add_clause(block);
+                        }
+
+                        if w_passing % 100 == 0 && w_passing > 0 {
+                            eprint!("\r  w_ok: {}, sat: {}/{}/{}, pairs: {}",
+                                state.grand_w_ok, state.sat_solutions, state.sat_unsats, state.sat_calls, state.grand_total_pairs);
+                        }
+
+                        w_passing < state.max_w_passing
+                    });
+                }
+            }
+
+            fn walk_zw(
                 nid: u32, level: usize, zw_depth: usize,
                 z_acc: u32, w_acc: u32,
                 pos_order: &[usize], nodes: &[[u32; 4]],
-                max_bnd_sum: i32,
-                zw_by_sum: &mut HashMap<(i32, i32), Vec<(u32, u32, u32)>>,
-                total_zw: &mut u64,
+                state: &mut WalkState,
             ) {
                 if nid == mdd_reorder::DEAD { return; }
                 if level == zw_depth {
-                    let z_sum = 2 * (z_acc.count_ones() as i32) - max_bnd_sum;
-                    let w_sum = 2 * (w_acc.count_ones() as i32) - max_bnd_sum;
-                    zw_by_sum.entry((z_sum, w_sum)).or_default().push((z_acc, w_acc, nid));
-                    *total_zw += 1;
+                    process_boundary(z_acc, w_acc, nid, state);
                     return;
                 }
                 if nid == mdd_reorder::LEAF {
-                    collect_zw_leaf(level, zw_depth, z_acc, w_acc, pos_order, max_bnd_sum, zw_by_sum, total_zw);
+                    walk_zw_leaf(level, zw_depth, z_acc, w_acc, pos_order, state);
                     return;
                 }
                 let pos = pos_order[level];
@@ -4522,135 +4633,51 @@ fn main() {
                     if child == mdd_reorder::DEAD { continue; }
                     let z_val = (branch >> 0) & 1;
                     let w_val = (branch >> 1) & 1;
-                    collect_zw(child, level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
-                        pos_order, nodes, max_bnd_sum, zw_by_sum, total_zw);
+                    walk_zw(child, level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
+                        pos_order, nodes, state);
                 }
             }
-            fn collect_zw_leaf(
+            fn walk_zw_leaf(
                 level: usize, zw_depth: usize, z_acc: u32, w_acc: u32,
-                pos_order: &[usize], max_bnd_sum: i32,
-                zw_by_sum: &mut HashMap<(i32, i32), Vec<(u32, u32, u32)>>,
-                total_zw: &mut u64,
+                pos_order: &[usize], state: &mut WalkState,
             ) {
                 if level == zw_depth {
-                    let z_sum = 2 * (z_acc.count_ones() as i32) - max_bnd_sum;
-                    let w_sum = 2 * (w_acc.count_ones() as i32) - max_bnd_sum;
-                    zw_by_sum.entry((z_sum, w_sum)).or_default().push((z_acc, w_acc, mdd_reorder::LEAF));
-                    *total_zw += 1;
+                    process_boundary(z_acc, w_acc, mdd_reorder::LEAF, state);
                     return;
                 }
                 let pos = pos_order[level];
                 for branch in 0u32..4 {
                     let z_val = (branch >> 0) & 1;
                     let w_val = (branch >> 1) & 1;
-                    collect_zw_leaf(level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
-                        pos_order, max_bnd_sum, zw_by_sum, total_zw);
+                    walk_zw_leaf(level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
+                        pos_order, state);
                 }
             }
 
-            collect_zw(reordered.root, 0, zw_depth, 0, 0,
-                &pos_order, &reordered.nodes, max_bnd_sum, &mut zw_by_sum, &mut total_zw);
-            eprintln!("{} (z,w) boundaries in {} sum groups", total_zw, zw_by_sum.len());
-
-            let spectral_w = SpectralFilter::new(m, cfg.theta_samples);
-            let individual_bound = problem.spectral_bound();
-            let max_w_passing = cfg.max_w;
-
-            let mut grand_total_pairs = 0u64;
-            let mut grand_w_gen = 0u64;
-            let mut grand_w_ok = 0u64;
-            let mut sat_calls = 0u64;
-            let mut sat_solutions = 0u64;
-            let mut sat_unsats = 0u64;
-
-            for tuple in &tuples {
-                let start = Instant::now();
-                let mut tuple_pairs = 0u64;
-
-                // Group boundaries by w_sum for efficient W iteration
-                for (&(z_bnd_sum, w_bnd_sum), entries) in &zw_by_sum {
-                    let z_mid_sum = tuple.z - z_bnd_sum;
-                    if z_mid_sum.abs() > middle_n as i32 || (z_mid_sum + middle_n as i32) % 2 != 0 { continue; }
-                    let w_mid_sum = tuple.w - w_bnd_sum;
-                    if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
-
-                    // For each (z,w) boundary in this sum group
-                    for &(z_bits, w_bits, _xy_root) in entries {
-                        let mut w_prefix = vec![0i8; k];
-                        let mut w_suffix = vec![0i8; k];
-                        for i in 0..k {
-                            w_prefix[i] = if (w_bits >> i) & 1 == 1 { 1 } else { -1 };
-                            w_suffix[i] = if (w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                        }
-                        let mut z_prefix = vec![0i8; k];
-                        let mut z_suffix = vec![0i8; k];
-                        for i in 0..k {
-                            z_prefix[i] = if (z_bits >> i) & 1 == 1 { 1 } else { -1 };
-                            z_suffix[i] = if (z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                        }
-
-                        // Build full Z boundary values
-                        let mut z_boundary = vec![0i8; n];
-                        for i in 0..k { z_boundary[i] = z_prefix[i]; z_boundary[n - k + i] = z_suffix[i]; }
-
-                        // Enumerate W middles one at a time, spectral filter
-                        let mut w_passing = 0usize;
-                        let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
-                        generate_sequences_permuted(middle_m, w_mid_sum, false, false, usize::MAX, |w_mid| {
-                            grand_w_gen += 1;
-                            let mut w_vals = Vec::with_capacity(m);
-                            w_vals.extend_from_slice(&w_prefix);
-                            w_vals.extend_from_slice(w_mid);
-                            w_vals.extend_from_slice(&w_suffix);
-                            let Some(_w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, individual_bound, &mut fft_buf_w) else { return true; };
-                            grand_w_ok += 1;
-                            w_passing += 1;
-
-                            // Build Z-middle SAT solver with autocorrelation constraints
-                            let mut solver = sat_z_middle::build_z_middle_solver(
-                                n, m, k, &z_boundary, &w_vals, z_mid_sum,
-                            );
-                            let mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
-
-                            // Enumerate SAT solutions with blocking
-                            loop {
-                                sat_calls += 1;
-                                let result = solver.solve();
-                                if result != Some(true) {
-                                    sat_unsats += 1;
-                                    break;
-                                }
-                                sat_solutions += 1;
-
-                                // Extract full Z from SAT solution
-                                let mut z_vals = z_boundary.clone();
-                                for i in 0..middle_n {
-                                    z_vals[k + i] = if solver.value(mid_vars[i]) == Some(true) { 1 } else { -1 };
-                                }
-
-                                // Valid (Z, W) pair!
-                                tuple_pairs += 1;
-                                grand_total_pairs += 1;
-
-                                // Block this solution and try next
-                                let block: Vec<i32> = mid_vars.iter().map(|&v| {
-                                    if solver.value(v) == Some(true) { -v } else { v }
-                                }).collect();
-                                solver.add_clause(block);
-                            }
-
-                            if w_passing % 100 == 0 && w_passing > 0 {
-                                eprint!("\r  w_ok: {}, sat: {}/{}/{}, pairs: {}",
-                                    grand_w_ok, sat_solutions, sat_unsats, sat_calls, grand_total_pairs);
-                            }
-
-                            w_passing < max_w_passing
-                        });
-                    }
-                }
-                eprintln!("\r  {} {} {} {}: pairs={} w_ok={} sat={} sat/{} unsat/{} ({:.1?})",
-                    tuple.x, tuple.y, tuple.z, tuple.w,
-                    tuple_pairs, grand_w_ok, sat_solutions, sat_calls, sat_unsats, start.elapsed());
+            let start = Instant::now();
+            {
+                let mut state = WalkState {
+                    tuples: &tuples,
+                    tuple_pairs: &mut tuple_pairs,
+                    grand_total_pairs: &mut grand_total_pairs,
+                    grand_w_gen: &mut grand_w_gen,
+                    grand_w_ok: &mut grand_w_ok,
+                    sat_calls: &mut sat_calls,
+                    sat_solutions: &mut sat_solutions,
+                    sat_unsats: &mut sat_unsats,
+                    total_zw: &mut total_zw,
+                    spectral_w: &spectral_w,
+                    individual_bound,
+                    max_w_passing,
+                    n, m, k, middle_n, middle_m, max_bnd_sum,
+                };
+                walk_zw(reordered.root, 0, zw_depth, 0, 0,
+                    &pos_order, &reordered.nodes, &mut state);
+            }
+            eprintln!("{} (z,w) boundaries walked lazily ({:.1?})", total_zw, start.elapsed());
+            for (i, tuple) in tuples.iter().enumerate() {
+                eprintln!("  {} {} {} {}: pairs={}",
+                    tuple.x, tuple.y, tuple.z, tuple.w, tuple_pairs[i]);
             }
             eprintln!("\nTotal: {} pairs, w={}/{}, sat_solutions={} sat_calls={} unsat={}",
                 grand_total_pairs, grand_w_ok, grand_w_gen, sat_solutions, sat_calls, sat_unsats);
