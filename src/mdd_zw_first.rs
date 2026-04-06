@@ -120,8 +120,53 @@ impl ZwFirstMdd {
         // Build level-0 node (only branch 0b11 = index 3 is valid)
         let mut level0_children = [DEAD; 4];
         level0_children[3] = level1_nid;
-        let root = merged_nodes.len() as u32;
+        let mut root = merged_nodes.len() as u32;
         merged_nodes.push(level0_children);
+
+        // Dedup pass: merge identical nodes across branches.
+        // Bottom-up: walk nodes in reverse, hash each, and remap duplicates.
+        let before_dedup = merged_nodes.len();
+        {
+            let mut canon: HashMap<[u32; 4], u32> = HashMap::default();
+            let mut remap = vec![0u32; merged_nodes.len()];
+            remap[0] = DEAD; // sentinel
+
+            // Forward pass: identify canonical nodes
+            let mut new_nodes: Vec<[u32; 4]> = Vec::with_capacity(merged_nodes.len());
+            new_nodes.push([DEAD; 4]); // sentinel
+            for old_id in 1..merged_nodes.len() {
+                // Remap children first
+                let mut ch = merged_nodes[old_id];
+                for c in ch.iter_mut() {
+                    if *c != DEAD && *c != LEAF {
+                        *c = remap[*c as usize];
+                    }
+                }
+                // Check for reduction (all children same)
+                if ch.iter().all(|&c| c == DEAD) {
+                    remap[old_id] = DEAD;
+                } else {
+                    let first = ch[0];
+                    if ch.iter().all(|&c| c == first) {
+                        remap[old_id] = first;
+                    } else if let Some(&existing) = canon.get(&ch) {
+                        remap[old_id] = existing;
+                    } else {
+                        let new_id = new_nodes.len() as u32;
+                        new_nodes.push(ch);
+                        canon.insert(ch, new_id);
+                        remap[old_id] = new_id;
+                    }
+                }
+            }
+            // Remap root
+            root = if root == DEAD || root == LEAF { root } else { remap[root as usize] };
+            merged_nodes = new_nodes;
+        }
+
+        eprintln!("  Dedup: {} → {} nodes ({:.0}% reduction)",
+            before_dedup, merged_nodes.len(),
+            (1.0 - merged_nodes.len() as f64 / before_dedup as f64) * 100.0);
 
         let zw_depth = 2 * k;
         let total_depth = 4 * k;
@@ -131,7 +176,6 @@ impl ZwFirstMdd {
             pos_order.push(2 * k - 1 - t);
         }
 
-        let zw_memo_entries: usize = 0; // can't easily get from merged
         eprintln!("ZW-first MDD k={} (parallel): {} nodes, {:.1} MB, {:.1?}",
             k, merged_nodes.len(), merged_nodes.len() as f64 * 16.0 / 1_048_576.0,
             start.elapsed());
