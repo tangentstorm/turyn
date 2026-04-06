@@ -70,9 +70,27 @@ Try different orderings: linear, reverse, or constraint-density ordered.
 Use mmap'd files for the nodes Vec. OS manages paging transparently.
 
 ### 13. Port MDD to bex
-**Status**: bex cloned to /home/user/bex; not yet ported.
+**Status**: bex cloned to /home/user/bex; basic MDD module created.
 Bex has multi-threaded swarm reordering and concurrent data structures.
 Most useful for: parallel XY construction, reorder phase (if we go back to it).
+
+### 14. BFS-by-level construction
+**Status**: Prototype implemented (ZW half only).
+Two-pass approach: enumerate states top-down, build nodes bottom-up.
+Peak memory = max states per level (not total). For k=8: peak 2.1M vs 6.4M total.
+Needs: XY integration, disk spill for huge levels, parallelism per level.
+
+### 15. Deeper parallelism (16+ subtrees)
+**Status**: Implemented.
+build_parallel_depth() supports arbitrary depth: depth=1 (4 subtrees),
+depth=2 (16 subtrees for 16 cores), depth=3 (64 subtrees).
+Awaiting benchmark on 16-core machine.
+
+### 16. Arc consistency / constraint propagation
+**Status**: Considered, deferred.
+Precompute per-position domain restrictions before DFS/BFS.
+Complex to implement correctly and may not add much beyond range pruning.
+Forward checking during DFS would help but is hard to combine with memoization.
 
 ## Rejected Ideas
 
