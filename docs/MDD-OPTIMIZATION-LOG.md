@@ -38,3 +38,4 @@ Original baselines: k=7: 4.7s, k=8: 46.6s, k=9: OOM/timeout
 | 2026-04-06 | Hash-based unique table (u64 key) | Reduces unique table from ~80B/entry to ~20B/entry | ~5% speedup, major memory reduction |
 | 2026-04-06 | ZW-first with range pruning as default | Range pruning makes per-call XY memo viable; 4-way nodes = 4x less memory | k=8: 11.1→7.3s (-34%); k=9: 2m12→1m17 (-40%); k=10: OOM→21m33s! |
 | 2026-04-06 | Smart memo eviction (50M cap) | Clear deepest level when memo budget exceeded; keeps shallow-level cache warm | k=10: OOM→21m33s, peak 4.4GB RAM |
+| 2026-04-06 | Parallel level-1 branches (rayon) + post-merge dedup | 4 branches run independently, then dedup removes duplicates (40% reduction) | k=8: 7→3.9s; k=9: 79→47s; k=10: 21m33→10m30 (2x faster) |
