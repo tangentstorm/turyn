@@ -515,3 +515,37 @@ Periodically run subsumption + self-subsuming resolution on clause database. Dif
 Partition variables into communities (X-vars vs Y-vars, or by lag group). Bias VSIDS to prefer variables in same community as recent decisions.
 
 **Single commit:** At construction, assign each variable to community (X vs Y). Add community bonus to VSIDS: prefer same-community variables. Produces lower-LBD learnt clauses.
+
+## Phase B: SAT-based W middle generation (credit: Claude, April 2026)
+
+For large n (n≥40), brute-force W middle enumeration via `generate_sequences_permuted` is the Phase B bottleneck. At n=56 with k=9, W middle has 37 free positions with C(37,19)≈17.7B combinations for sum=1. Even with LCG-scattered sampling (max_w=200K), the spectral rejection rate is high and most samples are wasted. The fix: use SAT to generate W middles, streaming each one immediately to Z generation and Phase C.
+
+### W1. SAT solver for W middle with sum constraint
+
+Replace `generate_sequences_permuted` for W middles with a SAT solver encoding the cardinality constraint (exactly r of middle_m vars are +1, where r = (w_mid_sum + middle_m) / 2). Use `add_pb_eq` for the sum constraint. Enumerate solutions via blocking clauses (negate the found assignment). Spectral filter applied post-hoc.
+
+**Single commit:** Create `build_w_middle_solver()` in `sat_w_middle.rs`. Returns a `radical::Solver` with middle_m variables and one PB equality constraint. In `run_mdd_sat_search()`, replace the `generate_sequences_permuted` call for W with a solve loop: `solve() → extract → spectral filter → block → repeat`. Cap at max_w iterations.
+
+### W2. Streaming W→Z pipeline (no batch W collection)
+
+Instead of batch-generating all W candidates into a Vec, then building SpectralIndex, then batch-generating Z candidates — generate W one-at-a-time and immediately process each. For each spectrally-valid W, run Z generation (SAT or brute-force), spectral pair filter, and send valid (Z,W) pairs directly to Phase C. Eliminates the O(max_w) memory for W candidates and enables earlier Phase C results.
+
+**Single commit:** Restructure the inner loop of `run_mdd_sat_search()` per-boundary processing: W SAT loop → for each valid W → Z generation → pair check → send to channel. Remove `w_candidates` Vec and `SpectralIndex` from the MDD path.
+
+### W3. Random phase diversity in W SAT solver
+
+Between successive W SAT calls, randomize the solver's phase vector (initial variable polarities) using the existing `set_phase()` API. CDCL+VSIDS explores from the new starting point, combined with blocking clauses guarantees no repeats. This ensures diverse W candidates similar to the LCG scatter of `generate_sequences_permuted`.
+
+**Single commit:** Before each `w_solver.solve()`, generate a random bool vector of length middle_m and call `w_solver.set_phase(&random_phases)`. Use a deterministic PRNG seeded from the boundary bits for reproducibility.
+
+### W4. SAT-based Z middle generation in MDD path
+
+The `run_mdd_sat_search()` function currently uses `generate_sequences_permuted` for Z middles too (line 3247). Replace with `build_z_middle_solver()` (already exists in `sat_z_middle.rs`) which encodes sum + autocorrelation range constraints. The Z solver has tighter constraints than W because it knows the full W sequence, making SAT significantly faster than brute-force.
+
+**Single commit:** In `run_mdd_sat_search()`, replace the Z `generate_sequences_permuted` call with `build_z_middle_solver()`. For each valid W, build a Z solver, enumerate solutions via blocking clauses, spectral filter each, pair check, send to Phase C.
+
+### W5. W autocorrelation constraints in SAT (approximate spectral filter)
+
+Add per-lag W autocorrelation decomposition to the W SAT solver: boundary×boundary (constant), boundary×middle (linear PB terms), middle×middle (quad PB terms via XNOR aux or direct quad PB). Even with trivially-satisfied per-lag bounds, the quad PB variable interactions create CDCL conflicts that bias the solver toward lower-autocorrelation (hence lower-spectral-power) solutions. Expected to increase spectral pass rate.
+
+**Single commit:** In `build_w_middle_solver()`, for each lag s (1..m-1): decompose agree count into const + linear + quad terms. Add PB/quad PB constraints with bounds [adj_lo, adj_hi]. Benchmark spectral pass rate before/after.
