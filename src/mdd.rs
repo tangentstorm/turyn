@@ -76,6 +76,31 @@ impl BoundaryMdd {
             lag_check_at_level[lag_complete].push(li);
         }
 
+        // Compute max remaining contribution for each lag at each level (for range pruning).
+        // After processing level L, the remaining events for lag j contribute at most
+        // max_remaining[L][j] to the sum. If |sums[j]| > max_remaining[L][j], prune.
+        let mut max_remaining: Vec<Vec<i32>> = vec![vec![0i32; k]; depth + 1];
+        for (li, lag) in lags.iter().enumerate() {
+            for &(a, b) in &lag.pairs {
+                let complete = pos_to_level[a].max(pos_to_level[b]);
+                // is_xyzw=true: max contribution = |xa*xb + ya*yb + 2*za*zb| <= 4
+                for level in 0..=complete {
+                    max_remaining[level][li] += 4;
+                }
+            }
+            for &(a, b) in &lag.w_pairs {
+                let complete = pos_to_level[a].max(pos_to_level[b]);
+                // is_xyzw=false: max contribution = |2*wa*wb| = 2
+                for level in 0..=complete {
+                    max_remaining[level][li] += 2;
+                }
+            }
+        }
+        // max_remaining[level][lag] = max absolute sum that events at levels > level can contribute
+        // After processing level L, events at level L have already been applied,
+        // so the remaining budget is max_remaining[L+1][lag] (events at levels L+1..depth-1)
+        // We need: |sums[j]| <= max_remaining[level+1][j] to be feasible
+
         // Compute which positions' values are still needed at each level
         let mut last_use_level: Vec<usize> = vec![0; depth];
         for events in &events_at_level {
@@ -111,7 +136,9 @@ impl BoundaryMdd {
             lag_check_at_level: Vec<Vec<usize>>,
             active_at_level: Vec<Vec<usize>>,
             active_indices: Vec<HashMap<usize, usize>>,
+            max_remaining: Vec<Vec<i32>>,
             depth: usize,
+            k: usize,
         }
 
         let ctx = Ctx {
@@ -120,7 +147,9 @@ impl BoundaryMdd {
             lag_check_at_level,
             active_at_level,
             active_indices,
+            max_remaining,
             depth,
+            k,
         };
 
         let mut nodes: Vec<[u32; 16]> = Vec::new();
@@ -214,8 +243,19 @@ impl BoundaryMdd {
                 }
 
                 let mut ok = true;
+                // Exact check: completed lags must be zero
                 for &li in &ctx.lag_check_at_level[level] {
                     if sums[li] != 0 { ok = false; break; }
+                }
+                // Range check: partial sums must be achievable by remaining events
+                if ok && level + 1 < ctx.depth {
+                    for li in 0..ctx.k {
+                        let remaining = ctx.max_remaining[level + 1][li];
+                        if (sums[li] as i32).abs() > remaining {
+                            ok = false;
+                            break;
+                        }
+                    }
                 }
 
                 if ok {
