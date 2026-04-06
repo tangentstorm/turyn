@@ -1909,13 +1909,34 @@ impl Solver {
                     let val: i8 = if lit > 0 { 1 } else { -1 };
                     spec.assign(v, val);
                     if spec.check_conflict().is_some() {
-                        return Some(Reason::Spectral);
+                        // Build conflict clause from all assigned seq vars
+                        let num_sv = spec.num_seq_vars;
+                        let mut cl: Vec<Lit> = Vec::with_capacity(num_sv);
+                        for sv in 0..num_sv {
+                            if !spec.assigned[sv] { continue; }
+                            let sv_lit = (sv + 1) as Lit;
+                            cl.push(if spec.values[sv] > 0 { -sv_lit } else { sv_lit });
+                        }
+                        let ci = self.clause_meta.len() as u32;
+                        let cs = self.clause_lits.len();
+                        let cn = cl.len();
+                        for &l in &cl { self.clause_lits.push(l); }
+                        self.clause_meta.push(ClauseMeta {
+                            start: cs as u32, len: cn as u16,
+                            learnt: true, deleted: false, lbd: cn.min(255) as u8,
+                        });
+                        if cn >= 2 {
+                            self.watches[lit_index(cl[0])].push((ci, cl[1]));
+                            self.watches[lit_index(cl[1])].push((ci, cl[0]));
+                        }
+                        return Some(Reason::Clause(ci));
                     }
 
-                    // Unit propagation: check each unassigned seq var.
-                    // Only run when enough vars are assigned (propagation is weak early).
+                    // Unit propagation disabled (clause-based propagation causes
+                    // performance regression from clause DB bloat on restore).
+                    // Conflict detection above is sufficient.
                     let num_assigned = spec.assigned.iter().filter(|&&a| a).count();
-                    if num_assigned >= spec.num_seq_vars / 2 {
+                    if false && num_assigned >= spec.num_seq_vars / 2 {
                         let nf = spec.num_freqs;
                         let sqrt_bound = spec.bound.sqrt();
                         let num_sv = spec.num_seq_vars;
