@@ -128,8 +128,16 @@ impl BoundaryMdd {
 
         let mut unique: HashMap<(u8, [u32; 16]), u32> = HashMap::new();
 
-        type StateKey = (Vec<i8>, u64);
+        type StateKey = (u128, u64);
         let mut memo: Vec<HashMap<StateKey, u32>> = (0..=depth).map(|_| HashMap::new()).collect();
+
+        fn pack_sums(sums: &[i8]) -> u128 {
+            let mut packed = 0u128;
+            for (i, &s) in sums.iter().enumerate() {
+                packed |= ((s as u8 as u128) & 0xFF) << (i * 8);
+            }
+            packed
+        }
 
         fn pack_active(sign_cols: &[u8]) -> u64 {
             let mut packed = 0u64;
@@ -172,7 +180,7 @@ impl BoundaryMdd {
             let new_pos = ctx.pos_order[level];
             let new_idx = ctx.active_indices[level][&new_pos];
 
-            let state_key = (sums.clone(), pack_active(&current_active_vals));
+            let state_key = (pack_sums(sums), pack_active(&current_active_vals));
             if let Some(&cached) = memo[level].get(&state_key) {
                 return cached;
             }
@@ -183,7 +191,7 @@ impl BoundaryMdd {
 
                 current_active_vals[new_idx] = sign_col as u8;
 
-                let sums_backup: Vec<i8> = sums.clone();
+                let sums_backup = pack_sums(sums);
                 for &(pos_a, pos_b, lag_idx, is_xyzw) in &ctx.events_at_level[level] {
                     let idx_a = ctx.active_indices[level][&pos_a];
                     let idx_b = ctx.active_indices[level][&pos_b];
@@ -221,7 +229,10 @@ impl BoundaryMdd {
                     }
                 }
 
-                sums.copy_from_slice(&sums_backup);
+                // Restore sums from packed backup
+                for i in 0..sums.len() {
+                    sums[i] = ((sums_backup >> (i * 8)) & 0xFF) as i8;
+                }
             }
 
             let result = if children.iter().all(|&c| c == DEAD) {

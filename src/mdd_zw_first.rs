@@ -203,9 +203,18 @@ impl ZwFirstMdd {
 
         let mut unique: HashMap<(u8, [u32; 4]), u32> = HashMap::new();
 
-        type StateKey = (Vec<i8>, u64);
+        type StateKey = (u128, u64);
+        type XyStateKey = (u128, u64); // (packed_sums, packed_active) - cleared per zw_sums
         let mut zw_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::new()).collect();
-        let mut xy_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::new()).collect();
+        let mut xy_memo: Vec<HashMap<XyStateKey, u32>> = (0..=zw_depth).map(|_| HashMap::new()).collect();
+
+        fn pack_sums(sums: &[i8]) -> u128 {
+            let mut packed = 0u128;
+            for (i, &s) in sums.iter().enumerate() {
+                packed |= ((s as u8 as u128) & 0xFF) << (i * 8);
+            }
+            packed
+        }
 
         fn pack_active(vals: &[u8]) -> u64 {
             let mut packed = 0u64;
@@ -229,7 +238,7 @@ impl ZwFirstMdd {
             ctx: &Ctx,
             nodes: &mut Vec<[u32; 4]>,
             unique: &mut HashMap<(u8, [u32; 4]), u32>,
-            memo: &mut Vec<HashMap<StateKey, u32>>,
+            memo: &mut Vec<HashMap<XyStateKey, u32>>,
         ) -> u32 {
             if level == ctx.zw_depth {
                 // Check all lags: N_X + N_Y = -zw_sums
@@ -259,7 +268,7 @@ impl ZwFirstMdd {
             let new_pos = ctx.pos_order[level];
             let new_idx = ctx.xy_active_indices[level][&new_pos];
 
-            let state_key = (sums.clone(), pack_active(&current_vals));
+            let state_key = (pack_sums(sums), pack_active(&current_vals));
             if let Some(&cached) = memo[level].get(&state_key) {
                 return cached;
             }
@@ -277,7 +286,7 @@ impl ZwFirstMdd {
 
                 current_vals[new_idx] = branch as u8;
 
-                let sums_backup: Vec<i8> = sums.clone();
+                let sums_backup = pack_sums(sums);
 
                 // Process XY pair events at this level
                 for &(lag_idx, pos_a, pos_b) in &ctx.xy_events_at_level[level] {
@@ -305,7 +314,10 @@ impl ZwFirstMdd {
                     );
                 }
 
-                sums.copy_from_slice(&sums_backup);
+                // Restore sums from packed backup
+                for i in 0..sums.len() {
+                    sums[i] = ((sums_backup >> (i * 8)) & 0xFF) as i8;
+                }
             }
 
             let result = if children.iter().all(|&c| c == DEAD) {
@@ -339,11 +351,14 @@ impl ZwFirstMdd {
             nodes: &mut Vec<[u32; 4]>,
             unique: &mut HashMap<(u8, [u32; 4]), u32>,
             zw_memo: &mut Vec<HashMap<StateKey, u32>>,
-            xy_memo: &mut Vec<HashMap<StateKey, u32>>,
+            xy_memo: &mut Vec<HashMap<XyStateKey, u32>>,
         ) -> u32 {
             if level == ctx.zw_depth {
                 // ZW half done. Build XY sub-MDD for these zw_sums.
-                let zw_sums = sums.clone();
+                // Clear xy_memo for each distinct zw_sums to prevent memory explosion.
+                // Nodes are still shared via the `unique` table.
+                for m in xy_memo.iter_mut() { m.clear(); }
+                let zw_sums: Vec<i8> = sums.to_vec();
                 let mut xy_sums = vec![0i8; ctx.k];
                 let mut xy_active: Vec<u8> = Vec::new();
                 return build_xy(
@@ -372,7 +387,7 @@ impl ZwFirstMdd {
             let new_pos = ctx.pos_order[level];
             let new_idx = ctx.zw_active_indices[level][&new_pos];
 
-            let state_key = (sums.clone(), pack_active(&current_vals));
+            let state_key = (pack_sums(sums), pack_active(&current_vals));
             if let Some(&cached) = zw_memo[level].get(&state_key) {
                 return cached;
             }
@@ -387,7 +402,7 @@ impl ZwFirstMdd {
 
                 current_vals[new_idx] = branch as u8;
 
-                let sums_backup: Vec<i8> = sums.clone();
+                let sums_backup = pack_sums(sums);
 
                 // Process ZW pair events at this level
                 for &(lag_idx, pos_a, pos_b, is_z) in &ctx.zw_events_at_level[level] {
@@ -423,7 +438,10 @@ impl ZwFirstMdd {
                     );
                 }
 
-                sums.copy_from_slice(&sums_backup);
+                // Restore sums from packed backup
+                for i in 0..sums.len() {
+                    sums[i] = ((sums_backup >> (i * 8)) & 0xFF) as i8;
+                }
             }
 
             let result = if children.iter().all(|&c| c == DEAD) {

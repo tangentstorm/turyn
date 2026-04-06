@@ -284,6 +284,7 @@ pub fn reorder_zw_first(
 
     let mut pass = 0;
     let reorder_start = std::time::Instant::now();
+    let gc_threshold = 10_000_000; // GC when nodes exceed 10M
     loop {
         let mut swapped = false;
         for i in 0..total_levels - 1 {
@@ -300,14 +301,22 @@ pub fn reorder_zw_first(
             }
         }
         pass += 1;
-        eprintln!("\r  Reorder pass {}: {} swaps total, {} nodes, {:.1?}",
-            pass, swaps_done, mdd4.nodes.len(), reorder_start.elapsed());
+        // Periodic GC to keep memory bounded during reorder
+        if mdd4.nodes.len() > gc_threshold {
+            let before = mdd4.nodes.len();
+            gc_mdd(&mut mdd4);
+            eprintln!("\r  Reorder pass {}: {} swaps, GC {} → {} nodes, {:.1?}",
+                pass, swaps_done, before, mdd4.nodes.len(), reorder_start.elapsed());
+        } else {
+            eprintln!("\r  Reorder pass {}: {} swaps total, {} nodes, {:.1?}",
+                pass, swaps_done, mdd4.nodes.len(), reorder_start.elapsed());
+        }
         if !swapped { break; }
     }
 
-    eprintln!("  Reorder complete: {} swaps, {} nodes (before GC)", swaps_done, mdd4.nodes.len());
+    eprintln!("  Reorder complete: {} swaps, {} nodes (before final GC)", swaps_done, mdd4.nodes.len());
 
-    // Garbage-collect unreachable nodes left by in-place swaps
+    // Final garbage-collect
     gc_mdd(&mut mdd4);
     eprintln!("  After GC: {} nodes", mdd4.nodes.len());
 
