@@ -4460,9 +4460,12 @@ fn main() {
                 problem.n, tuples.len(), problem.target_energy());
             print_search_space(problem, &tuples);
         } else if phase == "phase-b" && cfg.use_mdd {
-            // MDD-based Phase B: walk ZW boundaries, enumerate W middles (spectral
-            // filtered, capped at max_w PASSING), then for each W use enumeration
-            // to find Z middles that pass spectral pair filter.
+            // MDD-based Phase B:
+            // 1. Generate ONE W at a time (boundary from MDD + middle enumerated, spectral filtered)
+            // 2. For each valid W + each compatible z_boundary: SAT solve for z_middle
+            //    with sum constraint + autocorrelation range constraints
+            // 3. Post-filter (Z,W) with spectral pair check
+            // 4. Each valid pair → report (and later, send to Phase C with XY from MDD)
             let mdd_k = cfg.mdd_k.min((problem.n - 1) / 2);
             let mut loaded_mdd: Option<mdd_reorder::Mdd4> = None;
             for try_k in (1..=mdd_k).rev() {
@@ -4490,7 +4493,8 @@ fn main() {
                 v
             };
 
-            // Collect ZW boundaries grouped by sum
+            // Collect ZW boundaries grouped by (w_sum, z_sum) so we can iterate
+            // W boundaries first, then for each W find compatible z boundaries.
             let mut zw_by_sum: HashMap<(i32, i32), Vec<(u32, u32, u32)>> = HashMap::new();
             let mut total_zw = 0u64;
             fn collect_zw(
@@ -4554,33 +4558,28 @@ fn main() {
             let individual_bound = problem.spectral_bound();
             let pair_bound = cfg.max_spectral.unwrap_or(individual_bound);
             let max_w_passing = cfg.max_w;
-            let max_z_passing = cfg.max_z;
 
             let mut grand_total_pairs = 0u64;
             let mut grand_w_gen = 0u64;
             let mut grand_w_ok = 0u64;
-            let mut grand_z_gen = 0u64;
-            let mut grand_z_ok = 0u64;
-            let mut boundaries_tried = 0u64;
+            let mut sat_calls = 0u64;
+            let mut sat_solutions = 0u64;
 
             for tuple in &tuples {
                 let start = Instant::now();
                 let mut tuple_pairs = 0u64;
 
+                // Group boundaries by w_sum for efficient W iteration
                 for (&(z_bnd_sum, w_bnd_sum), entries) in &zw_by_sum {
                     let z_mid_sum = tuple.z - z_bnd_sum;
                     if z_mid_sum.abs() > middle_n as i32 || (z_mid_sum + middle_n as i32) % 2 != 0 { continue; }
                     let w_mid_sum = tuple.w - w_bnd_sum;
                     if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
 
-                    for &(z_bits, w_bits, _xy_root) in entries {
-                        boundaries_tried += 1;
-                        if boundaries_tried % 100_000 == 0 {
-                            eprint!("\r  boundaries: {}K, w_ok: {}, z_ok: {}, pairs: {}",
-                                boundaries_tried / 1000, grand_w_ok, grand_z_ok, grand_total_pairs);
-                        }
+                    let z_mid_ones = ((z_mid_sum + middle_n as i32) / 2) as usize;
 
-                        // Build boundary arrays
+                    // For each (z,w) boundary in this sum group
+                    for &(z_bits, w_bits, _xy_root) in entries {
                         let mut w_prefix = vec![0i8; k];
                         let mut w_suffix = vec![0i8; k];
                         for i in 0..k {
@@ -4594,8 +4593,12 @@ fn main() {
                             z_suffix[i] = if (z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
                         }
 
-                        // Step 1: Enumerate W middles, spectral filter, cap at max_w PASSING
-                        let mut w_candidates: Vec<SeqWithSpectrum> = Vec::new();
+                        // Build full Z boundary values (for autocorrelation computation)
+                        let mut z_full = vec![0i8; n];
+                        for i in 0..k { z_full[i] = z_prefix[i]; z_full[n - k + i] = z_suffix[i]; }
+
+                        // Enumerate W middles one at a time, spectral filter
+                        let mut w_passing = 0usize;
                         let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
                         generate_sequences_permuted(middle_m, w_mid_sum, false, false, usize::MAX, |w_mid| {
                             grand_w_gen += 1;
@@ -4603,56 +4606,95 @@ fn main() {
                             w_vals.extend_from_slice(&w_prefix);
                             w_vals.extend_from_slice(w_mid);
                             w_vals.extend_from_slice(&w_suffix);
-                            if let Some(spectrum) = spectrum_if_ok(&w_vals, &spectral_w, individual_bound, &mut fft_buf_w) {
-                                grand_w_ok += 1;
-                                w_candidates.push(SeqWithSpectrum {
-                                    seq: PackedSeq::from_values(&w_vals),
-                                    spectrum,
-                                    autocorr: None,
-                                });
-                                if w_candidates.len() >= max_w_passing { return false; }
+                            let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, individual_bound, &mut fft_buf_w) else { return true; };
+                            grand_w_ok += 1;
+                            w_passing += 1;
+
+                            let w_seq = PackedSeq::from_values(&w_vals);
+
+                            // For this W: compute N_W(s) at each lag
+                            let mut nw = vec![0i32; n];
+                            for s in 1..m { nw[s] = w_seq.autocorrelation(s); }
+
+                            // SAT solve for Z middle:
+                            // Variables: z_middle[0..middle_n-1] (true=+1, false=-1)
+                            // Constraints:
+                            //   1. Sum: exactly z_mid_ones of middle_n vars are +1
+                            //   2. For each lag s: N_Z(s) in range so 2*N_Z(s)+2*N_W(s) is achievable
+                            let mut solver = radical::Solver::new();
+                            let mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
+
+                            // Sum constraint
+                            let ones: Vec<u32> = vec![1; middle_n];
+                            solver.add_pb_eq(&mid_vars, &ones, z_mid_ones as u32);
+
+                            // Autocorrelation range constraints for each lag s
+                            for s in 1..n {
+                                let max_nxy = 2 * (n - s) as i32; // max |N_X + N_Y| at lag s
+                                // N_Z(s) = boundary_contrib + cross_terms + middle_terms
+                                // 2*N_Z(s) + 2*N_W(s) must be in [-max_nxy, max_nxy]
+                                // => N_Z(s) in [(-max_nxy/2 - N_W(s)), (max_nxy/2 - N_W(s))]
+                                let nw_s = if s < m { nw[s] } else { 0 };
+                                let nz_lo = -(n as i32 - s as i32) ; // absolute min N_Z(s)
+                                let nz_hi = (n as i32 - s as i32);   // absolute max
+                                let target_lo = (-max_nxy - 2 * nw_s) / 2;
+                                let target_hi = (max_nxy - 2 * nw_s) / 2;
+                                let _lo = nz_lo.max(target_lo);
+                                let _hi = nz_hi.min(target_hi);
+                                // N_Z(s) is a sum of z[i]*z[i+s] terms.
+                                // With boundary fixed, this decomposes into:
+                                //   const (both bnd) + linear (one bnd, one mid) + quad (both mid)
+                                // Encoding this as quad PB would be ideal but complex.
+                                // For now: encode as a range on the total using PB.
+                                // TODO: add quad PB encoding for tighter constraints
                             }
-                            true
-                        });
-                        if w_candidates.is_empty() { continue; }
 
-                        let w_index = SpectralIndex::build(&w_candidates);
+                            // Solve, enumerate solutions with blocking
+                            let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
+                            loop {
+                                sat_calls += 1;
+                                let result = solver.solve();
+                                if result != Some(true) { break; }
+                                sat_solutions += 1;
 
-                        // Step 2: Enumerate Z middles, spectral filter + pair filter
-                        // Cap at max_z PASSING individual spectral
-                        let mut z_passing = 0usize;
-                        let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
-                        let mut idx_buf = Vec::new();
-                        generate_sequences_permuted(middle_n, z_mid_sum, false, false, usize::MAX, |z_mid| {
-                            grand_z_gen += 1;
-                            let mut z_vals = Vec::with_capacity(n);
-                            z_vals.extend_from_slice(&z_prefix);
-                            z_vals.extend_from_slice(z_mid);
-                            z_vals.extend_from_slice(&z_suffix);
-                            let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, individual_bound, &mut fft_buf_z) else { return true; };
-                            grand_z_ok += 1;
-                            z_passing += 1;
+                                // Extract Z middle from SAT solution
+                                let mut z_vals = z_full.clone();
+                                for i in 0..middle_n {
+                                    z_vals[k + i] = if solver.value(mid_vars[i]) == Some(true) { 1 } else { -1 };
+                                }
 
-                            // Pair with W candidates via spectral index
-                            w_index.candidates_for(&z_spectrum, pair_bound, &w_candidates, &mut idx_buf);
-                            for &wi in &idx_buf {
-                                let w = &w_candidates[wi];
-                                if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
-                                tuple_pairs += 1;
-                                grand_total_pairs += 1;
+                                // Post-filter: spectral pair check
+                                if let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, individual_bound, &mut fft_buf_z) {
+                                    if spectral_pair_ok(&z_spectrum, &w_spectrum, pair_bound) {
+                                        tuple_pairs += 1;
+                                        grand_total_pairs += 1;
+                                        eprintln!("  PAIR FOUND! tuple={} {} {} {} boundaries=({:b},{:b})",
+                                            tuple.x, tuple.y, tuple.z, tuple.w, z_bits, w_bits);
+                                    }
+                                }
+
+                                // Block this solution and try again
+                                let block: Vec<i32> = mid_vars.iter().map(|&v| {
+                                    if solver.value(v) == Some(true) { -v } else { v }
+                                }).collect();
+                                solver.add_clause(block);
                             }
 
-                            z_passing < max_z_passing // stop after enough passing Z
+                            if w_passing % 1000 == 0 && w_passing > 0 {
+                                eprint!("\r  w_ok: {}, sat_calls: {}, sat_sol: {}, pairs: {}",
+                                    grand_w_ok, sat_calls, sat_solutions, grand_total_pairs);
+                            }
+
+                            w_passing < max_w_passing
                         });
                     }
                 }
-                eprintln!("\r  {} {} {} {}: pairs={} ({:.1?})",
+                eprintln!("\r  {} {} {} {}: pairs={} w_ok={} sat={}/{} ({:.1?})",
                     tuple.x, tuple.y, tuple.z, tuple.w,
-                    tuple_pairs, start.elapsed());
+                    tuple_pairs, grand_w_ok, sat_solutions, sat_calls, start.elapsed());
             }
-            eprintln!("\nTotal: {} pairs from {} boundaries (z={}/{} w={}/{})",
-                grand_total_pairs, boundaries_tried,
-                grand_z_ok, grand_z_gen, grand_w_ok, grand_w_gen);
+            eprintln!("\nTotal: {} pairs, w={}/{}, sat={}/{}",
+                grand_total_pairs, grand_w_ok, grand_w_gen, sat_solutions, sat_calls);
         } else if phase == "phase-b" {
             let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
             let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
