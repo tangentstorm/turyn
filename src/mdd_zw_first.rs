@@ -223,12 +223,35 @@ impl ZwFirstMdd {
         let zw_depth = 2 * k;
         let total_depth = 4 * k;
 
-        // Bouncing position order (same for both halves)
+        // Position order (configurable via MDD_ORDER env var)
+        let order_name = std::env::var("MDD_ORDER").unwrap_or_else(|_| "bounce".to_string());
         let mut pos_order: Vec<usize> = Vec::with_capacity(2 * k);
-        for t in 0..k {
-            pos_order.push(t);
-            pos_order.push(2 * k - 1 - t);
-        }
+        match order_name.as_str() {
+            "linear" => {
+                for i in 0..2*k { pos_order.push(i); }
+            }
+            "reverse" => {
+                for i in (0..2*k).rev() { pos_order.push(i); }
+            }
+            "prefix_first" => {
+                for i in 0..k { pos_order.push(i); }
+                for i in (k..2*k).rev() { pos_order.push(i); }
+            }
+            "inner_out" => {
+                // Inner to outer (reverse bouncing)
+                for t in (0..k).rev() {
+                    pos_order.push(k - 1 - t);
+                    pos_order.push(k + t);
+                }
+            }
+            _ => {
+                // Default bouncing order (outer to inner)
+                for t in 0..k {
+                    pos_order.push(t);
+                    pos_order.push(2 * k - 1 - t);
+                }
+            }
+        };
 
         let mut pos_to_level: Vec<usize> = vec![0; 2 * k];
         for (level, &pos) in pos_order.iter().enumerate() {
