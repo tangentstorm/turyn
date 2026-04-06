@@ -956,7 +956,7 @@ fn stream_zw_candidates_to_channel(
     spectral_z: &SpectralFilter,
     stats: &mut SearchStats,
     found: &AtomicBool,
-    tx: &std::sync::mpsc::Sender<SatWorkItem>,
+    tx: &std::sync::mpsc::SyncSender<SatWorkItem>,
 ) {
     let individual_bound = problem.spectral_bound();
     let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
@@ -1820,7 +1820,7 @@ fn run_parallel_search<P>(
     use_quad_pb: bool,
 ) -> SearchReport
 where
-    P: FnOnce(std::sync::mpsc::Sender<SatWorkItem>, Arc<AtomicBool>) -> SearchStats
+    P: FnOnce(std::sync::mpsc::SyncSender<SatWorkItem>, Arc<AtomicBool>) -> SearchStats
         + Send + 'static,
 {
     let run_start = Instant::now();
@@ -1835,7 +1835,7 @@ where
     use std::collections::BinaryHeap;
 
     // Channels
-    let (producer_tx, producer_rx) = std::sync::mpsc::channel::<SatWorkItem>();
+    let (producer_tx, producer_rx) = std::sync::mpsc::sync_channel::<SatWorkItem>(1024);
     let (result_tx, result_rx) =
         std::sync::mpsc::channel::<Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>>();
     let mut worker_txs: Vec<std::sync::mpsc::SyncSender<Option<SatWorkItem>>> = Vec::new();
@@ -1948,8 +1948,9 @@ where
             break;
         }
 
-        // Drain producer channel (non-blocking)
-        loop {
+        // Drain producer channel (non-blocking, capped to limit queue growth)
+        let drain_limit = if pq.len() > 10_000 { 0 } else { 1_000 };
+        for _ in 0..drain_limit {
             match producer_rx.try_recv() {
                 Ok(item) => {
                     let priority = item.priority;
@@ -1960,6 +1961,16 @@ where
                     producer_done = true;
                     break;
                 }
+            }
+        }
+        // If PQ is empty and producer isn't done, do a blocking recv
+        if pq.is_empty() && !producer_done && idle_workers.is_empty() {
+            match producer_rx.recv() {
+                Ok(item) => {
+                    let priority = item.priority;
+                    pq.push(PqItem { priority, item });
+                }
+                Err(_) => { producer_done = true; }
             }
         }
 
@@ -3041,7 +3052,8 @@ fn sat_search(problem: Problem, tuple: SumTuple, boundary: Option<&BoundaryConfi
     }
 }
 
-/// MDD-based hybrid search: walk MDD for boundary 4-tuples, SAT solve middles.
+/// MDD-based hybrid search: walk reordered MDD for boundary 4-tuples,
+/// Phase B generates Z,W middles with spectral filtering, Phase C SAT-solves X,Y.
 fn run_mdd_sat_search(
     problem: Problem,
     tuples: &[SumTuple],
@@ -3052,92 +3064,302 @@ fn run_mdd_sat_search(
     let n = problem.n;
     let m = problem.m();
 
-    // Build MDD
-    let build_start = Instant::now();
-    if verbose { eprintln!("Building MDD k={}...", k); }
-    let boundary_mdd = Arc::new(mdd::BoundaryMdd::build(k));
-    if verbose {
-        eprintln!("MDD built in {:.1}s", build_start.elapsed().as_secs_f64());
+    // Load MDD from file, or find the best available one.
+    let max_k = (n - 1) / 2;
+    let try_k = k.min(max_k);
+
+    let mut loaded_mdd: Option<mdd_reorder::Mdd4> = None;
+    // Try requested k first, then scan downward for any available MDD
+    for try_k in (1..=try_k).rev() {
+        let path = format!("mdd-{}.bin", try_k);
+        if let Some(m) = mdd_reorder::Mdd4::load(&path) {
+            if verbose { eprintln!("Loaded MDD from {} (k={}, {} nodes, {:.1} MB)",
+                path, m.k, m.nodes.len(), m.nodes.len() as f64 * 16.0 / 1_048_576.0); }
+            loaded_mdd = Some(m);
+            break;
+        }
     }
 
-    let middle_n = (n as i32 - 2 * k as i32) as usize;
-    let middle_m = (m as i32 - 2 * k as i32) as usize;
+    let reordered = match loaded_mdd {
+        Some(m) => Arc::new(m),
+        None => {
+            eprintln!("No MDD file found (tried mdd-1.bin through mdd-{}.bin)", try_k);
+            eprintln!("Generate one with: cargo build --release --bin gen_mdd && target/release/gen_mdd {}", k);
+            std::process::exit(1);
+        }
+    };
+    let k = reordered.k; // may differ from requested if we loaded a smaller one
+
+    let middle_n = n - 2 * k;
+    let middle_m = m - 2 * k;
     let max_bnd_sum = (2 * k) as i32;
+    let zw_depth = 2 * k;
+    let pos_order: Vec<usize> = {
+        let mut v = Vec::with_capacity(2 * k);
+        for t in 0..k { v.push(t); v.push(2 * k - 1 - t); }
+        v
+    };
 
-    // Collect valid (z,w) boundaries from MDD, grouped by (z_sum, w_sum).
-    if verbose { eprintln!("Collecting (z,w) boundaries from MDD..."); }
-    let mut zw_by_sum: HashMap<(i32, i32), Vec<(u32, u32)>> = HashMap::new();
-    let mut zw_set = std::collections::HashSet::new();
-    boundary_mdd.walk_zw_unique(boundary_mdd.root, 0, 0, 0, &mut zw_set);
-    for &(z_bits, w_bits) in &zw_set {
-        let z_sum = 2 * (z_bits.count_ones() as i32) - max_bnd_sum;
-        let w_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
-        zw_by_sum.entry((z_sum, w_sum)).or_default().push((z_bits, w_bits));
+    // Collect (z,w) boundaries with their XY root nodes, grouped by (z_sum, w_sum).
+    if verbose { eprintln!("Walking MDD for (z,w) boundaries..."); }
+    struct ZwEntry { z_bits: u32, w_bits: u32, xy_root: u32 }
+    let mut zw_by_sum: HashMap<(i32, i32), Vec<ZwEntry>> = HashMap::new();
+    let mut total_zw = 0u64;
+
+    fn walk_zw_top(
+        nid: u32, level: usize, zw_depth: usize,
+        z_acc: u32, w_acc: u32,
+        pos_order: &[usize], nodes: &[[u32; 4]],
+        max_bnd_sum: i32,
+        zw_by_sum: &mut HashMap<(i32, i32), Vec<ZwEntry>>,
+        total_zw: &mut u64,
+    ) {
+        if nid == mdd_reorder::DEAD { return; }
+        if level == zw_depth {
+            let z_sum = 2 * (z_acc.count_ones() as i32) - max_bnd_sum;
+            let w_sum = 2 * (w_acc.count_ones() as i32) - max_bnd_sum;
+            zw_by_sum.entry((z_sum, w_sum)).or_default().push(
+                ZwEntry { z_bits: z_acc, w_bits: w_acc, xy_root: nid });
+            *total_zw += 1;
+            return;
+        }
+        if nid == mdd_reorder::LEAF {
+            // All remaining ZW levels are don't-care — enumerate
+            walk_zw_leaf(level, zw_depth, z_acc, w_acc, pos_order, max_bnd_sum, zw_by_sum, total_zw);
+            return;
+        }
+        let pos = pos_order[level];
+        for branch in 0u32..4 {
+            let child = nodes[nid as usize][branch as usize];
+            if child == mdd_reorder::DEAD { continue; }
+            let z_val = (branch >> 0) & 1;
+            let w_val = (branch >> 1) & 1;
+            walk_zw_top(child, level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
+                pos_order, nodes, max_bnd_sum, zw_by_sum, total_zw);
+        }
     }
-    let total_zw = zw_set.len();
-    drop(zw_set);
+
+    fn walk_zw_leaf(
+        level: usize, zw_depth: usize, z_acc: u32, w_acc: u32,
+        pos_order: &[usize], max_bnd_sum: i32,
+        zw_by_sum: &mut HashMap<(i32, i32), Vec<ZwEntry>>,
+        total_zw: &mut u64,
+    ) {
+        if level == zw_depth {
+            let z_sum = 2 * (z_acc.count_ones() as i32) - max_bnd_sum;
+            let w_sum = 2 * (w_acc.count_ones() as i32) - max_bnd_sum;
+            zw_by_sum.entry((z_sum, w_sum)).or_default().push(
+                ZwEntry { z_bits: z_acc, w_bits: w_acc, xy_root: mdd_reorder::LEAF });
+            *total_zw += 1;
+            return;
+        }
+        let pos = pos_order[level];
+        for branch in 0u32..4 {
+            let z_val = (branch >> 0) & 1;
+            let w_val = (branch >> 1) & 1;
+            walk_zw_leaf(level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
+                pos_order, max_bnd_sum, zw_by_sum, total_zw);
+        }
+    }
+
+    walk_zw_top(reordered.root, 0, zw_depth, 0, 0,
+        &pos_order, &reordered.nodes, max_bnd_sum, &mut zw_by_sum, &mut total_zw);
+
     if verbose {
-        eprintln!("  {} valid (z,w) boundaries in {} sum groups", total_zw, zw_by_sum.len());
+        eprintln!("  {} (z,w) boundaries in {} sum groups", total_zw, zw_by_sum.len());
     }
 
     let tuples = tuples.to_vec();
-    let mdd = Arc::clone(&boundary_mdd);
+    let mdd = Arc::clone(&reordered);
     let sat_secs = cfg.sat_secs;
+    let pos_order_clone = pos_order.clone();
+    let theta = cfg.theta_samples;
+    let max_w = cfg.max_w;
+    let max_z = cfg.max_z;
+    let max_spectral = cfg.max_spectral;
 
     run_parallel_search(problem, None, cfg.sat_config.clone(), move |tx, found| {
-        let stats = SearchStats::default();
-        let mut xy_buf: Vec<(u32, u32)> = Vec::new();
+        let mut stats = SearchStats::default();
+        let spectral_z = SpectralFilter::new(n, theta);
+        let spectral_w = SpectralFilter::new(m, theta);
+        let individual_bound = problem.spectral_bound();
+        let pair_bound = max_spectral.unwrap_or(individual_bound);
         let mut total_items: u64 = 0;
 
-        for (&(z_bnd_sum, w_bnd_sum), zw_pairs) in &zw_by_sum {
+        for (&(z_bnd_sum, w_bnd_sum), zw_entries) in &zw_by_sum {
             if found.load(AtomicOrdering::Relaxed) { break; }
 
-            for &(z_bits, w_bits) in zw_pairs {
+            for &tuple in &tuples {
                 if found.load(AtomicOrdering::Relaxed) { break; }
 
-                // Look up valid (x,y) boundaries — once per (z,w)
-                mdd.query_xy(z_bits, w_bits, &mut xy_buf);
-                if xy_buf.is_empty() { continue; }
+                // Check middle sum feasibility
+                let z_mid_sum = tuple.z - z_bnd_sum;
+                if z_mid_sum.abs() > middle_n as i32 || (z_mid_sum + middle_n as i32) % 2 != 0 { continue; }
+                let w_mid_sum = tuple.w - w_bnd_sum;
+                if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
 
-                for &tuple in &tuples {
+                for entry in zw_entries {
                     if found.load(AtomicOrdering::Relaxed) { break; }
 
-                    // Check Z,W middle sum feasibility
-                    let z_mid = tuple.z - z_bnd_sum;
-                    if z_mid.abs() > middle_n as i32 || (z_mid + middle_n as i32) % 2 != 0 { continue; }
-                    let w_mid = tuple.w - w_bnd_sum;
-                    if w_mid.abs() > middle_m as i32 || (w_mid + middle_m as i32) % 2 != 0 { continue; }
-
-                    for &(x_bits, y_bits) in &xy_buf {
-                        // Check X,Y middle sum feasibility
-                        let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
-                        let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
-                        let x_mid = tuple.x - x_bnd_sum;
-                        if x_mid.abs() > middle_n as i32 || (x_mid + middle_n as i32) % 2 != 0 { continue; }
-                        let y_mid = tuple.y - y_bnd_sum;
-                        if y_mid.abs() > middle_n as i32 || (y_mid + middle_n as i32) % 2 != 0 { continue; }
-
-                        total_items += 1;
-                        let _ = tx.send(SatWorkItem {
-                            tuple,
-                            x: SeqInput::Blank,
-                            y: SeqInput::Blank,
-                            z: SeqInput::Blank,
-                            w: SeqInput::Blank,
-                            zw_autocorr: None,
-                            priority: 0.0,
-                            boundary: Some(BoundaryConfig {
-                                k, x_bits, y_bits, z_bits, w_bits,
-                            }),
-                        });
+                    // Build W candidates: boundary from MDD + enumerate middles
+                    let mut w_prefix = vec![0i8; k];
+                    let mut w_suffix = vec![0i8; k];
+                    for i in 0..k {
+                        w_prefix[i] = if (entry.w_bits >> i) & 1 == 1 { 1 } else { -1 };
+                        w_suffix[i] = if (entry.w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
                     }
+
+                    let mut z_prefix = vec![0i8; k];
+                    let mut z_suffix = vec![0i8; k];
+                    for i in 0..k {
+                        z_prefix[i] = if (entry.z_bits >> i) & 1 == 1 { 1 } else { -1 };
+                        z_suffix[i] = if (entry.z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                    }
+
+                    // Enumerate W middles (shuffled for representative sampling), spectral filter
+                    let mut w_candidates: Vec<(PackedSeq, Vec<f64>)> = Vec::new();
+                    let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
+                    generate_sequences_permuted(middle_m, w_mid_sum, false, false, max_w, |w_mid| {
+                        if found.load(AtomicOrdering::Relaxed) { return false; }
+                        stats.w_generated += 1;
+                        // Build full W: prefix + middle + suffix
+                        let mut w_vals = Vec::with_capacity(m);
+                        w_vals.extend_from_slice(&w_prefix);
+                        w_vals.extend_from_slice(w_mid);
+                        w_vals.extend_from_slice(&w_suffix);
+                        if let Some(spectrum) = spectrum_if_ok(&w_vals, &spectral_w, individual_bound, &mut fft_buf_w) {
+                            stats.w_spectral_ok += 1;
+                            w_candidates.push((PackedSeq::from_values(&w_vals), spectrum));
+                        }
+                        true
+                    });
+
+                    if w_candidates.is_empty() { continue; }
+
+                    // Build spectral index on W candidates
+                    let w_specs: Vec<SeqWithSpectrum> = w_candidates.iter().map(|(seq, spec)| {
+                        SeqWithSpectrum { seq: seq.clone(), spectrum: spec.clone(), autocorr: None }
+                    }).collect();
+                    let w_index = SpectralIndex::build(&w_specs);
+
+                    // Enumerate Z middles (shuffled), spectral filter, pair with W
+                    let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
+                    let mut idx_buf = Vec::new();
+                    generate_sequences_permuted(middle_n, z_mid_sum, false, false, max_z, |z_mid| {
+                        if found.load(AtomicOrdering::Relaxed) { return false; }
+                        stats.z_generated += 1;
+                        // Build full Z: prefix + middle + suffix
+                        let mut z_vals = Vec::with_capacity(n);
+                        z_vals.extend_from_slice(&z_prefix);
+                        z_vals.extend_from_slice(z_mid);
+                        z_vals.extend_from_slice(&z_suffix);
+                        let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, individual_bound, &mut fft_buf_z) else { return true; };
+                        stats.z_spectral_ok += 1;
+                        let z_seq = PackedSeq::from_values(&z_vals);
+
+                        // Spectral pair filter via index
+                        w_index.candidates_for(&z_spectrum, pair_bound, &w_specs, &mut idx_buf);
+                        for &wi in &idx_buf {
+                            let w = &w_specs[wi];
+                            stats.candidate_pair_attempts += 1;
+                            if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
+                            stats.candidate_pair_spectral_ok += 1;
+
+                            // Valid (Z, W) pair! Walk XY sub-MDD for boundaries.
+                            let zw_autocorr = compute_zw_autocorr(problem, &z_seq, &w.seq);
+
+                            walk_xy_sub_mdd(
+                                entry.xy_root, 0, zw_depth, 0, 0,
+                                &pos_order_clone, &mdd.nodes, max_bnd_sum,
+                                middle_n as i32, tuple,
+                                &mut |x_bits, y_bits| {
+                                    total_items += 1;
+                                    let _ = tx.send(SatWorkItem {
+                                        tuple,
+                                        x: SeqInput::Blank,
+                                        y: SeqInput::Blank,
+                                        z: SeqInput::Fixed(z_seq.clone()),
+                                        w: SeqInput::Fixed(w.seq.clone()),
+                                        zw_autocorr: Some(zw_autocorr.clone()),
+                                        priority: spectral_pair_max_power(&z_spectrum, &w.spectrum),
+                                        boundary: Some(BoundaryConfig {
+                                            k, x_bits, y_bits,
+                                            z_bits: entry.z_bits, w_bits: entry.w_bits,
+                                        }),
+                                    });
+                                },
+                            );
+                        }
+                        true
+                    });
                 }
             }
         }
 
-        eprintln!("MDD Phase B: {} (z,w) boundaries, {} SAT items", total_zw, total_items);
+        eprintln!("MDD Phase B: {} (z,w) boundaries, {} SAT items, z_ok={} w_ok={} pairs={}",
+            total_zw, total_items, stats.z_spectral_ok, stats.w_spectral_ok, stats.candidate_pair_spectral_ok);
         stats
-    }, verbose, &format!("MDD k={}", k), sat_secs, cfg.quad_pb)
+    }, verbose, &format!("MDD hybrid k={}", k), sat_secs, cfg.quad_pb)
+}
+
+/// Walk the XY bottom half of the reordered MDD, emitting (x_bits, y_bits)
+/// that pass sum compatibility with the given tuple.
+fn walk_xy_sub_mdd<F: FnMut(u32, u32)>(
+    nid: u32, level: usize, xy_depth: usize,
+    x_acc: u32, y_acc: u32,
+    pos_order: &[usize], nodes: &[[u32; 4]],
+    max_bnd_sum: i32, middle_n: i32, tuple: SumTuple,
+    callback: &mut F,
+) {
+    if nid == mdd_reorder::DEAD { return; }
+    if level == xy_depth {
+        // Check sum compatibility
+        let x_bnd_sum = 2 * (x_acc.count_ones() as i32) - max_bnd_sum;
+        let y_bnd_sum = 2 * (y_acc.count_ones() as i32) - max_bnd_sum;
+        let x_mid = tuple.x - x_bnd_sum;
+        if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return; }
+        let y_mid = tuple.y - y_bnd_sum;
+        if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return; }
+        callback(x_acc, y_acc);
+        return;
+    }
+    if nid == mdd_reorder::LEAF {
+        walk_xy_leaf(level, xy_depth, x_acc, y_acc, pos_order, max_bnd_sum, middle_n, tuple, callback);
+        return;
+    }
+    let pos = pos_order[level];
+    for branch in 0u32..4 {
+        let child = nodes[nid as usize][branch as usize];
+        if child == mdd_reorder::DEAD { continue; }
+        let x_val = (branch >> 0) & 1;
+        let y_val = (branch >> 1) & 1;
+        walk_xy_sub_mdd(child, level + 1, xy_depth, x_acc | (x_val << pos), y_acc | (y_val << pos),
+            pos_order, nodes, max_bnd_sum, middle_n, tuple, callback);
+    }
+}
+
+fn walk_xy_leaf<F: FnMut(u32, u32)>(
+    level: usize, xy_depth: usize, x_acc: u32, y_acc: u32,
+    pos_order: &[usize], max_bnd_sum: i32, middle_n: i32, tuple: SumTuple,
+    callback: &mut F,
+) {
+    if level == xy_depth {
+        let x_bnd_sum = 2 * (x_acc.count_ones() as i32) - max_bnd_sum;
+        let y_bnd_sum = 2 * (y_acc.count_ones() as i32) - max_bnd_sum;
+        let x_mid = tuple.x - x_bnd_sum;
+        if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return; }
+        let y_mid = tuple.y - y_bnd_sum;
+        if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return; }
+        callback(x_acc, y_acc);
+        return;
+    }
+    let pos = pos_order[level];
+    for branch in 0u32..4 {
+        let x_val = (branch >> 0) & 1;
+        let y_val = (branch >> 1) & 1;
+        walk_xy_leaf(level + 1, xy_depth, x_acc | (x_val << pos), y_acc | (y_val << pos),
+            pos_order, max_bnd_sum, middle_n, tuple, callback);
+    }
 }
 
 fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
@@ -4279,6 +4501,11 @@ fn main() {
     } else if cfg.stochastic {
         let report = stochastic_search(cfg.problem, cfg.test_tuple.as_ref(), true, cfg.stochastic_seconds);
         println!("Stochastic search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
+    } else if cfg.use_mdd {
+        let tuples = phase_a_tuples(cfg.problem, cfg.test_tuple.as_ref());
+        let mdd_k = cfg.mdd_k.min((cfg.problem.n - 1) / 2);
+        let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, true, mdd_k);
+        println!("MDD hybrid search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     } else {
         // Default: hybrid search (Phase B → SAT X/Y). Use --sat or --stochastic to override.
         let report = run_hybrid_search(&cfg, true);

@@ -7,6 +7,7 @@
 /// Each ZW path arrives at a node that roots the XY sub-MDD.
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
 
 pub const DEAD: u32 = 0;
 pub const LEAF: u32 = u32::MAX;
@@ -14,7 +15,49 @@ pub const LEAF: u32 = u32::MAX;
 pub struct Mdd4 {
     pub nodes: Vec<[u32; 4]>,
     pub root: u32,
-    pub depth: usize, // total levels
+    pub k: usize,
+    pub depth: usize, // total levels = 4k
+}
+
+impl Mdd4 {
+    /// Save to binary file. Format: magic "MDD4", k (u32), root (u32), node_count (u32), node data.
+    pub fn save(&self, path: &str) -> std::io::Result<()> {
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        f.write_all(b"MDD4")?;
+        f.write_all(&(self.k as u32).to_le_bytes())?;
+        f.write_all(&self.root.to_le_bytes())?;
+        f.write_all(&(self.nodes.len() as u32).to_le_bytes())?;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self.nodes.as_ptr() as *const u8,
+                self.nodes.len() * 16,
+            )
+        };
+        f.write_all(bytes)?;
+        f.flush()?;
+        Ok(())
+    }
+
+    /// Load from binary file.
+    pub fn load(path: &str) -> Option<Self> {
+        let data = std::fs::read(path).ok()?;
+        if data.len() < 16 { return None; }
+        if &data[0..4] != b"MDD4" { return None; }
+        let k = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
+        let root = u32::from_le_bytes(data[8..12].try_into().ok()?);
+        let node_count = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
+        let expected = 16 + node_count * 16;
+        if data.len() < expected { return None; }
+        let mut nodes = vec![[0u32; 4]; node_count];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data[16..].as_ptr(),
+                nodes.as_mut_ptr() as *mut u8,
+                node_count * 16,
+            );
+        }
+        Some(Mdd4 { nodes, root, k, depth: 4 * k })
+    }
 }
 
 impl Mdd4 {
@@ -89,7 +132,7 @@ pub fn split_16_to_4(
     }
 
     let root = convert(root_16, 0, depth_16, nodes_16, &mut nodes_4, &mut unique, &mut memo);
-    Mdd4 { nodes: nodes_4, root, depth: depth_4 }
+    Mdd4 { nodes: nodes_4, root, k: depth_16 / 2, depth: depth_4 }
 }
 
 /// Swap two adjacent levels in a 4-way MDD.
