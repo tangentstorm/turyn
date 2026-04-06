@@ -3199,8 +3199,8 @@ fn run_mdd_sat_search(
                 if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
 
                 // Streaming: iterate entries directly, one W + Z per entry.
-                // No grouping/dedup (entries are mostly unique at large k).
-                let mut w_solver = sat_w_middle::build_w_middle_solver(m, k, w_mid_sum);
+                // W solver includes autocorrelation constraints (boundary-specific)
+                // which approximate the spectral filter, reducing rejected W's.
                 let w_mid_vars: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
                 let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
                 let mut rng: u64 = (z_bnd_sum as u64)
@@ -3215,36 +3215,27 @@ fn run_mdd_sat_search(
                 for entry in zw_entries {
                     if found.load(AtomicOrdering::Relaxed) { break; }
 
-                    // Build W: boundary prefix + SAT middle + boundary suffix
+                    // Build W boundary for this entry
+                    let mut w_boundary = vec![0i8; m];
+                    for i in 0..k {
+                        w_boundary[i] = if (entry.w_bits >> i) & 1 == 1 { 1 } else { -1 };
+                        w_boundary[m - k + i] = if (entry.w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                    }
+
+                    // W solver with autocorrelation constraints (boundary-aware)
+                    let mut w_solver = sat_w_middle::build_w_middle_solver(
+                        m, k, w_mid_sum, &w_boundary,
+                    );
                     let phases: Vec<bool> = (0..middle_m)
                         .map(|_| next_rng() & 1 == 1).collect();
                     w_solver.set_phase(&phases);
-                    if w_solver.solve() != Some(true) {
-                        // W solver exhausted — reset for next entry with new solver
-                        w_solver = sat_w_middle::build_w_middle_solver(m, k, w_mid_sum);
-                        let phases: Vec<bool> = (0..middle_m)
-                            .map(|_| next_rng() & 1 == 1).collect();
-                        w_solver.set_phase(&phases);
-                        if w_solver.solve() != Some(true) { break; }
-                    }
+                    if w_solver.solve() != Some(true) { continue; }
                     stats.w_generated += 1;
 
-                    let mut w_vals = Vec::with_capacity(m);
-                    for i in 0..k {
-                        w_vals.push(if (entry.w_bits >> i) & 1 == 1 { 1 } else { -1 });
-                    }
+                    let mut w_vals = w_boundary.clone();
                     for i in 0..middle_m {
-                        w_vals.push(if w_solver.value(w_mid_vars[i]) == Some(true) { 1 } else { -1 });
+                        w_vals[k + i] = if w_solver.value(w_mid_vars[i]) == Some(true) { 1 } else { -1 };
                     }
-                    for i in 0..k {
-                        w_vals.push(if (entry.w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 });
-                    }
-
-                    // Block this W for next iteration
-                    let w_block: Vec<i32> = w_mid_vars.iter().map(|&v| {
-                        if w_solver.value(v) == Some(true) { -v } else { v }
-                    }).collect();
-                    w_solver.add_clause(w_block);
 
                     // Spectral filter W
                     let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, individual_bound, &mut fft_buf_w) else { continue; };
@@ -4588,8 +4579,10 @@ fn main() {
                     let mut z_boundary = vec![0i8; n];
                     for i in 0..k { z_boundary[i] = z_prefix[i]; z_boundary[n - k + i] = z_suffix[i]; }
 
-                    // SAT-based W middle generation (replaces brute-force enumeration)
-                    let mut w_solver = sat_w_middle::build_w_middle_solver(m, k, w_mid_sum);
+                    // SAT-based W middle generation with autocorrelation constraints
+                    let mut w_boundary = vec![0i8; m];
+                    for i in 0..k { w_boundary[i] = w_prefix[i]; w_boundary[m - k + i] = w_suffix[i]; }
+                    let mut w_solver = sat_w_middle::build_w_middle_solver(m, k, w_mid_sum, &w_boundary);
                     let w_mid_vars: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
                     let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
                     let mut fft_buf_w = Vec::with_capacity(state.spectral_w.fft_size);
