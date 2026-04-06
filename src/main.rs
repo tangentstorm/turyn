@@ -8,6 +8,8 @@ use std::time::Instant;
 
 use rustfft::{FftPlanner, num_complex::Complex};
 
+mod mdd;
+
 #[derive(Clone, Copy, Debug)]
 struct Problem {
     n: usize,
@@ -259,6 +261,10 @@ struct SearchConfig {
     sat_secs: u64,
     /// Use quad PB encoding instead of totalizer in --sat cubed mode.
     quad_pb: bool,
+    /// Use MDD-based boundary enumeration instead of flat table.
+    use_mdd: bool,
+    /// MDD boundary width (default: 8).
+    mdd_k: usize,
 }
 
 impl Default for SearchConfig {
@@ -287,6 +293,8 @@ impl Default for SearchConfig {
             sat_config: radical::SolverConfig::default(),
             sat_secs: 0,
             quad_pb: true,
+            use_mdd: false,
+            mdd_k: 8,
         }
     }
 }
@@ -3027,6 +3035,107 @@ fn sat_search(problem: Problem, tuple: SumTuple, boundary: Option<&BoundaryConfi
     }
 }
 
+/// MDD-based boundary enumeration + SAT search.
+/// Walks the MDD to enumerate valid (z,w) boundaries, then for each,
+/// queries valid (x,y) boundaries and sends each 4-tuple as a SAT work item.
+fn run_mdd_sat_search(
+    problem: Problem,
+    tuples: &[SumTuple],
+    cfg: &SearchConfig,
+    verbose: bool,
+    k: usize,
+) -> SearchReport {
+    let n = problem.n;
+    let m = problem.m();
+
+    // Build MDD
+    let build_start = Instant::now();
+    if verbose { eprintln!("Building MDD k={}...", k); }
+    let boundary_mdd = Arc::new(mdd::BoundaryMdd::build(k));
+    if verbose {
+        eprintln!("MDD built in {:.1}s", build_start.elapsed().as_secs_f64());
+    }
+
+    let middle_n = n as i32 - 2 * k as i32;
+    let middle_m = m as i32 - 2 * k as i32;
+    let max_bnd_sum = (2 * k) as i32;
+
+    // Build ZW projection (4-way MDD of valid z,w boundaries)
+    let zw_proj = boundary_mdd.project_zw();
+    let zw_count = zw_proj.count_paths();
+    if verbose {
+        eprintln!("ZW projection: {} valid (z,w) boundaries", zw_count);
+    }
+
+    let tuples = tuples.to_vec();
+    let mdd = Arc::clone(&boundary_mdd);
+    let zw_proj = Arc::new(zw_proj);
+    let sat_secs = cfg.sat_secs;
+
+    run_parallel_search(problem, None, cfg.sat_config.clone(), move |tx, found| {
+        let stats = SearchStats::default();
+
+        let mut xy_buf: Vec<(u32, u32)> = Vec::new();
+        let mut total_zw: u64 = 0;
+        let mut total_items: u64 = 0;
+
+        // Walk ZW projection to enumerate valid (z,w) boundaries
+        zw_proj.enumerate(|z_bits, w_bits| {
+            if found.load(AtomicOrdering::Relaxed) { return; }
+            total_zw += 1;
+
+            let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - max_bnd_sum;
+            let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
+
+            // Query valid (x,y) for this (z,w) from the full MDD
+            mdd.query_xy(z_bits, w_bits, &mut xy_buf);
+            if xy_buf.is_empty() { return; }
+
+            for &tuple in &tuples {
+                if found.load(AtomicOrdering::Relaxed) { return; }
+
+                // Check middle sum feasibility for z, w
+                let z_mid = tuple.z - z_bnd_sum;
+                if z_mid.abs() > middle_n || (z_mid + middle_n) % 2 != 0 { continue; }
+                let w_mid = tuple.w - w_bnd_sum;
+                if w_mid.abs() > middle_m || (w_mid + middle_m) % 2 != 0 { continue; }
+
+                for &(x_bits, y_bits) in &xy_buf {
+                    if found.load(AtomicOrdering::Relaxed) { return; }
+
+                    let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
+                    let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
+                    let x_mid = tuple.x - x_bnd_sum;
+                    if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { continue; }
+                    let y_mid = tuple.y - y_bnd_sum;
+                    if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { continue; }
+
+                    total_items += 1;
+                    let _ = tx.send(SatWorkItem {
+                        tuple,
+                        x: SeqInput::Blank,
+                        y: SeqInput::Blank,
+                        z: SeqInput::Blank,
+                        w: SeqInput::Blank,
+                        zw_autocorr: None,
+                        priority: 0.0,
+                        boundary: Some(BoundaryConfig {
+                            k, x_bits, y_bits, z_bits, w_bits,
+                        }),
+                    });
+                }
+            }
+
+            if total_zw % 100_000 == 0 && total_zw > 0 {
+                eprintln!("  MDD walk: {} ZW boundaries, {} items sent", total_zw, total_items);
+            }
+        });
+
+        eprintln!("MDD walk complete: {} ZW boundaries, {} items sent", total_zw, total_items);
+        stats
+    }, verbose, &format!("MDD k={}", k), sat_secs, cfg.quad_pb)
+}
+
 fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let problem = cfg.problem;
     let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
@@ -3037,6 +3146,12 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
 
     let n = problem.n;
     let m = problem.m();
+
+    // MDD-based boundary enumeration (--mdd flag)
+    if cfg.use_mdd {
+        let mdd_k = cfg.mdd_k.min((n - 1) / 2);
+        return run_mdd_sat_search(problem, &tuples, cfg, verbose, mdd_k);
+    }
 
     // Try to load XY boundary table for larger k
     let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table-k7.bin".to_string());
@@ -4017,6 +4132,11 @@ fn parse_args() -> SearchConfig {
             cfg.quad_pb = true;
         } else if arg == "--no-quad-pb" {
             cfg.quad_pb = false;
+        } else if arg == "--mdd" {
+            cfg.use_mdd = true;
+        } else if let Some(v) = arg.strip_prefix("--mdd-k=") {
+            cfg.mdd_k = v.parse().unwrap_or(8);
+            cfg.use_mdd = true;
         } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
             cfg.dump_dimacs = Some(v.to_string());
         } else {
