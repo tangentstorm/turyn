@@ -704,8 +704,13 @@ impl ZwFirstMdd {
             result
         }
 
-        // Budget ~7GB for memo (actual overhead is ~140 bytes/entry in FxHashMap)
-        let max_memo_entries: usize = 50_000_000;
+        // Budget memo: ~140 bytes/entry in FxHashMap.
+        // When running as a parallel branch, use 1/4 of the budget.
+        let max_memo_entries: usize = if restrict_level1.is_some() {
+            12_500_000  // ~1.75GB per branch, 4 branches = ~7GB total
+        } else {
+            50_000_000  // ~7GB for sequential builds
+        };
         let per_level_cap: usize = max_memo_entries / (zw_depth + 1);
         let mut zw_memo_count: usize = 0;
         let mut sums = vec![0i8; k];
