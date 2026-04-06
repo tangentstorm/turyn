@@ -3100,75 +3100,8 @@ fn run_mdd_sat_search(
         v
     };
 
-    // Collect (z,w) boundaries with their XY root nodes, grouped by (z_sum, w_sum).
-    if verbose { eprintln!("Walking MDD for (z,w) boundaries..."); }
-    struct ZwEntry { z_bits: u32, w_bits: u32, xy_root: u32 }
-    let mut zw_by_sum: HashMap<(i32, i32), Vec<ZwEntry>> = HashMap::new();
-    let mut total_zw = 0u64;
-
-    fn walk_zw_top(
-        nid: u32, level: usize, zw_depth: usize,
-        z_acc: u32, w_acc: u32,
-        pos_order: &[usize], nodes: &[[u32; 4]],
-        max_bnd_sum: i32,
-        zw_by_sum: &mut HashMap<(i32, i32), Vec<ZwEntry>>,
-        total_zw: &mut u64,
-    ) {
-        if nid == mdd_reorder::DEAD { return; }
-        if level == zw_depth {
-            let z_sum = 2 * (z_acc.count_ones() as i32) - max_bnd_sum;
-            let w_sum = 2 * (w_acc.count_ones() as i32) - max_bnd_sum;
-            zw_by_sum.entry((z_sum, w_sum)).or_default().push(
-                ZwEntry { z_bits: z_acc, w_bits: w_acc, xy_root: nid });
-            *total_zw += 1;
-            return;
-        }
-        if nid == mdd_reorder::LEAF {
-            // All remaining ZW levels are don't-care — enumerate
-            walk_zw_leaf(level, zw_depth, z_acc, w_acc, pos_order, max_bnd_sum, zw_by_sum, total_zw);
-            return;
-        }
-        let pos = pos_order[level];
-        for branch in 0u32..4 {
-            let child = nodes[nid as usize][branch as usize];
-            if child == mdd_reorder::DEAD { continue; }
-            let z_val = (branch >> 0) & 1;
-            let w_val = (branch >> 1) & 1;
-            walk_zw_top(child, level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
-                pos_order, nodes, max_bnd_sum, zw_by_sum, total_zw);
-        }
-    }
-
-    fn walk_zw_leaf(
-        level: usize, zw_depth: usize, z_acc: u32, w_acc: u32,
-        pos_order: &[usize], max_bnd_sum: i32,
-        zw_by_sum: &mut HashMap<(i32, i32), Vec<ZwEntry>>,
-        total_zw: &mut u64,
-    ) {
-        if level == zw_depth {
-            let z_sum = 2 * (z_acc.count_ones() as i32) - max_bnd_sum;
-            let w_sum = 2 * (w_acc.count_ones() as i32) - max_bnd_sum;
-            zw_by_sum.entry((z_sum, w_sum)).or_default().push(
-                ZwEntry { z_bits: z_acc, w_bits: w_acc, xy_root: mdd_reorder::LEAF });
-            *total_zw += 1;
-            return;
-        }
-        let pos = pos_order[level];
-        for branch in 0u32..4 {
-            let z_val = (branch >> 0) & 1;
-            let w_val = (branch >> 1) & 1;
-            walk_zw_leaf(level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
-                pos_order, max_bnd_sum, zw_by_sum, total_zw);
-        }
-    }
-
-    walk_zw_top(reordered.root, 0, zw_depth, 0, 0,
-        &pos_order, &reordered.nodes, max_bnd_sum, &mut zw_by_sum, &mut total_zw);
-
-    if verbose {
-        eprintln!("  {} (z,w) boundaries in {} sum groups", total_zw, zw_by_sum.len());
-    }
-
+    // Walk MDD lazily inside producer closure — no HashMap, no collection.
+    // Process each boundary inline: SAT W → spectral → SAT Z → pair → Phase C.
     let tuples = tuples.to_vec();
     let mdd = Arc::clone(&reordered);
     let sat_secs = cfg.sat_secs;
@@ -3185,134 +3118,191 @@ fn run_mdd_sat_search(
         let individual_bound = problem.spectral_bound();
         let pair_bound = max_spectral.unwrap_or(individual_bound);
         let mut total_items: u64 = 0;
+        let mut total_zw: u64 = 0;
+        let w_mid_vars: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
+        let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
+        let mut rng: u64 = 0x517cc1b727220a95;
+        let mut next_rng = || -> u64 {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng
+        };
+        let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
+        let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
 
-        for (&(z_bnd_sum, w_bnd_sum), zw_entries) in &zw_by_sum {
-            if found.load(AtomicOrdering::Relaxed) { break; }
+        // Pre-build W solvers per feasible w_mid_sum (one per unique sum).
+        // The sum-only solver doesn't depend on boundary bits, so we reuse it.
+        let mut w_solvers: HashMap<i32, radical::Solver> = HashMap::new();
+
+        // Process one boundary: SAT W → spectral → SAT Z → pair → Phase C
+        let mut process_boundary = |z_bits: u32, w_bits: u32, xy_root: u32| {
+            if found.load(AtomicOrdering::Relaxed) { return; }
+            total_zw += 1;
+            if total_zw % 1_000_000 == 0 {
+                eprintln!("  walked {}M boundaries, w_gen={} w_ok={} z_ok={} items={}",
+                    total_zw / 1_000_000, stats.w_generated, stats.w_spectral_ok,
+                    stats.z_spectral_ok, total_items);
+            }
+
+            let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - max_bnd_sum;
+            let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
 
             for &tuple in &tuples {
-                if found.load(AtomicOrdering::Relaxed) { break; }
+                if found.load(AtomicOrdering::Relaxed) { return; }
 
-                // Check middle sum feasibility
                 let z_mid_sum = tuple.z - z_bnd_sum;
                 if z_mid_sum.abs() > middle_n as i32 || (z_mid_sum + middle_n as i32) % 2 != 0 { continue; }
                 let w_mid_sum = tuple.w - w_bnd_sum;
                 if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
 
-                // Streaming: iterate entries directly, one W + Z per entry.
-                // W solver includes autocorrelation constraints (boundary-specific)
-                // which approximate the spectral filter, reducing rejected W's.
-                let w_mid_vars: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
-                let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
-                let mut rng: u64 = (z_bnd_sum as u64)
-                    .wrapping_mul(0x9e3779b97f4a7c15)
-                    ^ (w_bnd_sum as u64) ^ 0x517cc1b727220a95;
-                let mut next_rng = || -> u64 {
-                    rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng
-                };
-                let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
-                let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
+                // Build W boundary
+                let mut w_boundary = vec![0i8; m];
+                for i in 0..k {
+                    w_boundary[i] = if (w_bits >> i) & 1 == 1 { 1 } else { -1 };
+                    w_boundary[m - k + i] = if (w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                }
 
-                for entry in zw_entries {
-                    if found.load(AtomicOrdering::Relaxed) { break; }
-
-                    // Build W boundary for this entry
-                    let mut w_boundary = vec![0i8; m];
-                    for i in 0..k {
-                        w_boundary[i] = if (entry.w_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        w_boundary[m - k + i] = if (entry.w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                    }
-
-                    // W solver with autocorrelation constraints (boundary-aware)
-                    let mut w_solver = sat_w_middle::build_w_middle_solver(
-                        m, k, w_mid_sum, &w_boundary,
-                    );
-                    let phases: Vec<bool> = (0..middle_m)
-                        .map(|_| next_rng() & 1 == 1).collect();
+                // Reuse W solver (sum-only, keyed by w_mid_sum)
+                let w_solver = w_solvers.entry(w_mid_sum).or_insert_with(||
+                    sat_w_middle::build_w_middle_solver_sum_only(m, k, w_mid_sum)
+                );
+                let phases: Vec<bool> = (0..middle_m)
+                    .map(|_| next_rng() & 1 == 1).collect();
+                w_solver.set_phase(&phases);
+                if w_solver.solve() != Some(true) {
+                    // Exhausted — rebuild solver (fresh, no blocking clauses)
+                    *w_solver = sat_w_middle::build_w_middle_solver_sum_only(m, k, w_mid_sum);
                     w_solver.set_phase(&phases);
                     if w_solver.solve() != Some(true) { continue; }
-                    stats.w_generated += 1;
-
-                    let mut w_vals = w_boundary.clone();
-                    for i in 0..middle_m {
-                        w_vals[k + i] = if w_solver.value(w_mid_vars[i]) == Some(true) { 1 } else { -1 };
-                    }
-
-                    // Spectral filter W
-                    let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, individual_bound, &mut fft_buf_w) else { continue; };
-                    stats.w_spectral_ok += 1;
-                    let w_seq = PackedSeq::from_values(&w_vals);
-
-                    // Build Z boundary
-                    let mut z_boundary = vec![0i8; n];
-                    for i in 0..k {
-                        z_boundary[i] = if (entry.z_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        z_boundary[n - k + i] = if (entry.z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                    }
-
-                    // SAT Z with autocorrelation constraints (knows full W)
-                    let mut z_solver = sat_z_middle::build_z_middle_solver(
-                        n, m, k, &z_boundary, &w_vals, z_mid_sum,
-                    );
-                    let mut z_count = 0usize;
-                    loop {
-                        if found.load(AtomicOrdering::Relaxed) { break; }
-                        if z_count >= max_z { break; }
-                        let z_phases: Vec<bool> = (0..middle_n)
-                            .map(|_| next_rng() & 1 == 1).collect();
-                        z_solver.set_phase(&z_phases);
-                        if z_solver.solve() != Some(true) { break; }
-                        stats.z_generated += 1;
-                        z_count += 1;
-
-                        let mut z_vals = Vec::with_capacity(n);
-                        z_vals.extend_from_slice(&z_boundary[..k]);
-                        for i in 0..middle_n {
-                            z_vals.push(if z_solver.value(z_mid_vars[i]) == Some(true) { 1 } else { -1 });
-                        }
-                        z_vals.extend_from_slice(&z_boundary[n-k..]);
-
-                        let z_block: Vec<i32> = z_mid_vars.iter().map(|&v| {
-                            if z_solver.value(v) == Some(true) { -v } else { v }
-                        }).collect();
-                        z_solver.add_clause(z_block);
-
-                        let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, individual_bound, &mut fft_buf_z) else { continue; };
-                        stats.z_spectral_ok += 1;
-
-                        stats.candidate_pair_attempts += 1;
-                        if !spectral_pair_ok(&z_spectrum, &w_spectrum, pair_bound) { continue; }
-                        stats.candidate_pair_spectral_ok += 1;
-
-                        let z_seq = PackedSeq::from_values(&z_vals);
-                        let zw_autocorr = compute_zw_autocorr(problem, &z_seq, &w_seq);
-
-                        walk_xy_sub_mdd(
-                            entry.xy_root, 0, zw_depth, 0, 0,
-                            &pos_order_clone, &mdd.nodes, max_bnd_sum,
-                            middle_n as i32, tuple,
-                            &mut |x_bits, y_bits| {
-                                total_items += 1;
-                                let _ = tx.send(SatWorkItem {
-                                    tuple,
-                                    x: SeqInput::Blank,
-                                    y: SeqInput::Blank,
-                                    z: SeqInput::Fixed(z_seq.clone()),
-                                    w: SeqInput::Fixed(w_seq.clone()),
-                                    zw_autocorr: Some(zw_autocorr.clone()),
-                                    priority: spectral_pair_max_power(&z_spectrum, &w_spectrum),
-                                    boundary: Some(BoundaryConfig {
-                                        k, x_bits, y_bits,
-                                        z_bits: entry.z_bits, w_bits: entry.w_bits,
-                                    }),
-                                });
-                            },
-                        );
-                    }
                 }
+                stats.w_generated += 1;
+
+                let mut w_vals = w_boundary;
+                for i in 0..middle_m {
+                    w_vals[k + i] = if w_solver.value(w_mid_vars[i]) == Some(true) { 1 } else { -1 };
+                }
+
+                let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, individual_bound, &mut fft_buf_w) else { continue; };
+                stats.w_spectral_ok += 1;
+                let w_seq = PackedSeq::from_values(&w_vals);
+
+                // Build Z boundary
+                let mut z_boundary = vec![0i8; n];
+                for i in 0..k {
+                    z_boundary[i] = if (z_bits >> i) & 1 == 1 { 1 } else { -1 };
+                    z_boundary[n - k + i] = if (z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                }
+
+                // SAT Z with autocorrelation constraints (knows full W)
+                let mut z_solver = sat_z_middle::build_z_middle_solver(
+                    n, m, k, &z_boundary, &w_vals, z_mid_sum,
+                );
+                let mut z_count = 0usize;
+                loop {
+                    if found.load(AtomicOrdering::Relaxed) { break; }
+                    if z_count >= max_z { break; }
+                    let z_phases: Vec<bool> = (0..middle_n)
+                        .map(|_| next_rng() & 1 == 1).collect();
+                    z_solver.set_phase(&z_phases);
+                    if z_solver.solve() != Some(true) { break; }
+                    stats.z_generated += 1;
+                    z_count += 1;
+
+                    let mut z_vals = Vec::with_capacity(n);
+                    z_vals.extend_from_slice(&z_boundary[..k]);
+                    for i in 0..middle_n {
+                        z_vals.push(if z_solver.value(z_mid_vars[i]) == Some(true) { 1 } else { -1 });
+                    }
+                    z_vals.extend_from_slice(&z_boundary[n-k..]);
+
+                    let z_block: Vec<i32> = z_mid_vars.iter().map(|&v| {
+                        if z_solver.value(v) == Some(true) { -v } else { v }
+                    }).collect();
+                    z_solver.add_clause(z_block);
+
+                    let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, individual_bound, &mut fft_buf_z) else { continue; };
+                    stats.z_spectral_ok += 1;
+
+                    stats.candidate_pair_attempts += 1;
+                    if !spectral_pair_ok(&z_spectrum, &w_spectrum, pair_bound) { continue; }
+                    stats.candidate_pair_spectral_ok += 1;
+
+                    let z_seq = PackedSeq::from_values(&z_vals);
+                    let zw_autocorr = compute_zw_autocorr(problem, &z_seq, &w_seq);
+
+                    walk_xy_sub_mdd(
+                        xy_root, 0, zw_depth, 0, 0,
+                        &pos_order_clone, &mdd.nodes, max_bnd_sum,
+                        middle_n as i32, tuple,
+                        &mut |x_bits, y_bits| {
+                            total_items += 1;
+                            let _ = tx.send(SatWorkItem {
+                                tuple,
+                                x: SeqInput::Blank,
+                                y: SeqInput::Blank,
+                                z: SeqInput::Fixed(z_seq.clone()),
+                                w: SeqInput::Fixed(w_seq.clone()),
+                                zw_autocorr: Some(zw_autocorr.clone()),
+                                priority: spectral_pair_max_power(&z_spectrum, &w_spectrum),
+                                boundary: Some(BoundaryConfig {
+                                    k, x_bits, y_bits,
+                                    z_bits, w_bits,
+                                }),
+                            });
+                        },
+                    );
+                }
+            }
+        };
+
+        // Lazy MDD walk — process each boundary inline, no collection.
+        fn walk_zw_lazy(
+            nid: u32, level: usize, zw_depth: usize,
+            z_acc: u32, w_acc: u32,
+            pos_order: &[usize], nodes: &[[u32; 4]],
+            cb: &mut dyn FnMut(u32, u32, u32),
+        ) {
+            if nid == mdd_reorder::DEAD { return; }
+            if level == zw_depth {
+                cb(z_acc, w_acc, nid);
+                return;
+            }
+            if nid == mdd_reorder::LEAF {
+                walk_zw_lazy_leaf(level, zw_depth, z_acc, w_acc, pos_order, cb);
+                return;
+            }
+            let pos = pos_order[level];
+            for branch in 0u32..4 {
+                let child = nodes[nid as usize][branch as usize];
+                if child == mdd_reorder::DEAD { continue; }
+                let z_val = (branch >> 0) & 1;
+                let w_val = (branch >> 1) & 1;
+                walk_zw_lazy(child, level + 1, zw_depth,
+                    z_acc | (z_val << pos), w_acc | (w_val << pos),
+                    pos_order, nodes, cb);
+            }
+        }
+        fn walk_zw_lazy_leaf(
+            level: usize, zw_depth: usize, z_acc: u32, w_acc: u32,
+            pos_order: &[usize],
+            cb: &mut dyn FnMut(u32, u32, u32),
+        ) {
+            if level == zw_depth {
+                cb(z_acc, w_acc, mdd_reorder::LEAF);
+                return;
+            }
+            let pos = pos_order[level];
+            for branch in 0u32..4 {
+                let z_val = (branch >> 0) & 1;
+                let w_val = (branch >> 1) & 1;
+                walk_zw_lazy_leaf(level + 1, zw_depth,
+                    z_acc | (z_val << pos), w_acc | (w_val << pos),
+                    pos_order, cb);
             }
         }
 
-        eprintln!("MDD Phase B: {} (z,w) boundaries, {} SAT items, z_ok={} w_ok={} pairs={}",
+        walk_zw_lazy(mdd.root, 0, zw_depth, 0, 0,
+            &pos_order_clone, &mdd.nodes, &mut process_boundary);
+
+        eprintln!("MDD Phase B: {} boundaries walked, {} SAT items, z_ok={} w_ok={} pairs={}",
             total_zw, total_items, stats.z_spectral_ok, stats.w_spectral_ok, stats.candidate_pair_spectral_ok);
         stats
     }, verbose, &format!("MDD hybrid k={}", k), sat_secs, cfg.quad_pb)
