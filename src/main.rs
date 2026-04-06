@@ -3039,9 +3039,9 @@ fn sat_search(problem: Problem, tuple: SumTuple, boundary: Option<&BoundaryConfi
     }
 }
 
-/// MDD-based boundary enumeration + SAT search.
-/// Walks the MDD to enumerate valid (z,w) boundaries, then for each,
-/// queries valid (x,y) boundaries and sends each 4-tuple as a SAT work item.
+/// MDD-based hybrid search: Phase B enumerates (z,w) boundaries from MDD,
+/// generates Z,W middle candidates, looks up (x,y) boundaries from MDD,
+/// then Phase C SAT-solves X,Y middles.
 fn run_mdd_sat_search(
     problem: Problem,
     tuples: &[SumTuple],
@@ -3060,84 +3060,129 @@ fn run_mdd_sat_search(
         eprintln!("MDD built in {:.1}s", build_start.elapsed().as_secs_f64());
     }
 
-    let middle_n = n as i32 - 2 * k as i32;
-    let middle_m = m as i32 - 2 * k as i32;
+    let middle_n = (n as i32 - 2 * k as i32) as usize;
+    let middle_m = (m as i32 - 2 * k as i32) as usize;
     let max_bnd_sum = (2 * k) as i32;
 
-    // Build ZW projection (4-way MDD of valid z,w boundaries)
-    let zw_proj = boundary_mdd.project_zw();
-    let zw_count = zw_proj.count_paths();
+    // Phase B: collect valid (z,w) boundaries from MDD, grouped by (z_sum, w_sum).
+    if verbose { eprintln!("Collecting (z,w) boundaries from MDD..."); }
+    let mut zw_by_sum: HashMap<(i32, i32), Vec<(u32, u32)>> = HashMap::new();
+    let mut zw_visited = std::collections::HashSet::new();
+    boundary_mdd.walk_zw_unique(boundary_mdd.root, 0, 0, 0, &mut zw_visited);
+    for &(z_bits, w_bits) in &zw_visited {
+        let z_sum = 2 * (z_bits.count_ones() as i32) - max_bnd_sum;
+        let w_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
+        zw_by_sum.entry((z_sum, w_sum)).or_default().push((z_bits, w_bits));
+    }
+    let total_zw = zw_visited.len();
+    drop(zw_visited);
     if verbose {
-        eprintln!("ZW projection: {} valid (z,w) boundaries", zw_count);
+        eprintln!("  {} valid (z,w) boundaries in {} sum groups", total_zw, zw_by_sum.len());
     }
 
     let tuples = tuples.to_vec();
     let mdd = Arc::clone(&boundary_mdd);
-    let zw_proj = Arc::new(zw_proj);
     let sat_secs = cfg.sat_secs;
 
     run_parallel_search(problem, None, cfg.sat_config.clone(), move |tx, found| {
         let stats = SearchStats::default();
-
         let mut xy_buf: Vec<(u32, u32)> = Vec::new();
-        let mut total_zw: u64 = 0;
         let mut total_items: u64 = 0;
 
-        // Walk ZW projection to enumerate valid (z,w) boundaries
-        zw_proj.enumerate(|z_bits, w_bits| {
-            if found.load(AtomicOrdering::Relaxed) { return; }
-            total_zw += 1;
+        for &tuple in &tuples {
+            if found.load(AtomicOrdering::Relaxed) { break; }
 
-            let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - max_bnd_sum;
-            let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
+            // For each (z_sum, w_sum) group compatible with this tuple
+            for (&(z_bnd_sum, w_bnd_sum), zw_pairs) in &zw_by_sum {
+                if found.load(AtomicOrdering::Relaxed) { break; }
 
-            // Query valid (x,y) for this (z,w) from the full MDD
-            mdd.query_xy(z_bits, w_bits, &mut xy_buf);
-            if xy_buf.is_empty() { return; }
+                // Check Z,W middle feasibility
+                let z_mid_sum = tuple.z - z_bnd_sum;
+                if z_mid_sum.abs() > middle_n as i32 || (z_mid_sum + middle_n as i32) % 2 != 0 { continue; }
+                let w_mid_sum = tuple.w - w_bnd_sum;
+                if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
 
-            for &tuple in &tuples {
-                if found.load(AtomicOrdering::Relaxed) { return; }
+                // Generate Z,W middle candidates for this sum
+                // For now: enumerate all ±1 sequences with the right sum.
+                // At k=8, n=26: middle is 10 positions, C(10,k) sequences.
+                let z_mid_ones = ((z_mid_sum + middle_n as i32) / 2) as usize;
+                let w_mid_ones = ((w_mid_sum + middle_m as i32) / 2) as usize;
+                let z_mid_count = binom(middle_n, z_mid_ones);
+                let w_mid_count = binom(middle_m, w_mid_ones);
 
-                // Check middle sum feasibility for z, w
-                let z_mid = tuple.z - z_bnd_sum;
-                if z_mid.abs() > middle_n || (z_mid + middle_n) % 2 != 0 { continue; }
-                let w_mid = tuple.w - w_bnd_sum;
-                if w_mid.abs() > middle_m || (w_mid + middle_m) % 2 != 0 { continue; }
+                // Skip if middle enumeration is too large
+                if z_mid_count > 50_000 || w_mid_count > 50_000 { continue; }
 
-                for &(x_bits, y_bits) in &xy_buf {
-                    if found.load(AtomicOrdering::Relaxed) { return; }
+                for &(z_bits, w_bits) in zw_pairs {
+                    if found.load(AtomicOrdering::Relaxed) { break; }
 
-                    let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
-                    let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
-                    let x_mid = tuple.x - x_bnd_sum;
-                    if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { continue; }
-                    let y_mid = tuple.y - y_bnd_sum;
-                    if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { continue; }
+                    // Look up valid (x,y) boundaries from MDD — once per (z,w) boundary
+                    mdd.query_xy(z_bits, w_bits, &mut xy_buf);
+                    if xy_buf.is_empty() { continue; }
 
-                    total_items += 1;
-                    let _ = tx.send(SatWorkItem {
-                        tuple,
-                        x: SeqInput::Blank,
-                        y: SeqInput::Blank,
-                        z: SeqInput::Blank,
-                        w: SeqInput::Blank,
-                        zw_autocorr: None,
-                        priority: 0.0,
-                        boundary: Some(BoundaryConfig {
-                            k, x_bits, y_bits, z_bits, w_bits,
-                        }),
+                    // Filter (x,y) by sum compatibility
+                    let compatible_xy: Vec<(u32, u32)> = xy_buf.iter().copied().filter(|&(x_bits, y_bits)| {
+                        let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
+                        let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
+                        let x_mid = tuple.x - x_bnd_sum;
+                        let y_mid = tuple.y - y_bnd_sum;
+                        x_mid.abs() <= middle_n as i32 && (x_mid + middle_n as i32) % 2 == 0
+                            && y_mid.abs() <= middle_n as i32 && (y_mid + middle_n as i32) % 2 == 0
+                    }).collect();
+                    if compatible_xy.is_empty() { continue; }
+
+                    // Enumerate Z middles
+                    generate_sequences_with_sum_visit(middle_n, z_mid_sum, false, false, usize::MAX, |z_mid| {
+                        if found.load(AtomicOrdering::Relaxed) { return false; }
+
+                        // Build full Z sequence: boundary prefix + middle + boundary suffix
+                        let mut z_vals = vec![0i8; n];
+                        for i in 0..k {
+                            z_vals[i] = if (z_bits >> i) & 1 == 1 { 1 } else { -1 };
+                            z_vals[n - k + i] = if (z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                        }
+                        for i in 0..middle_n { z_vals[k + i] = z_mid[i]; }
+                        let z_seq = PackedSeq::from_values(&z_vals);
+
+                        // Enumerate W middles
+                        generate_sequences_with_sum_visit(middle_m, w_mid_sum, false, false, usize::MAX, |w_mid| {
+                            if found.load(AtomicOrdering::Relaxed) { return false; }
+
+                            let mut w_vals = vec![0i8; m];
+                            for i in 0..k {
+                                w_vals[i] = if (w_bits >> i) & 1 == 1 { 1 } else { -1 };
+                                w_vals[m - k + i] = if (w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                            }
+                            for i in 0..middle_m { w_vals[k + i] = w_mid[i]; }
+                            let w_seq = PackedSeq::from_values(&w_vals);
+
+                            // Send one work item per (x,y) boundary
+                            for &(x_bits, y_bits) in &compatible_xy {
+                                total_items += 1;
+                                let _ = tx.send(SatWorkItem {
+                                    tuple,
+                                    x: SeqInput::Blank,
+                                    y: SeqInput::Blank,
+                                    z: SeqInput::Fixed(z_seq.clone()),
+                                    w: SeqInput::Fixed(w_seq.clone()),
+                                    zw_autocorr: None,
+                                    priority: 0.0,
+                                    boundary: Some(BoundaryConfig {
+                                        k, x_bits, y_bits, z_bits, w_bits,
+                                    }),
+                                });
+                            }
+                            true
+                        });
+                        true
                     });
                 }
             }
+        }
 
-            if total_zw % 100_000 == 0 && total_zw > 0 {
-                eprintln!("  MDD walk: {} ZW boundaries, {} items sent", total_zw, total_items);
-            }
-        });
-
-        eprintln!("MDD walk complete: {} ZW boundaries, {} items sent", total_zw, total_items);
+        eprintln!("MDD Phase B complete: {} (z,w) boundaries, {} items sent", total_zw, total_items);
         stats
-    }, verbose, &format!("MDD k={}", k), sat_secs, cfg.quad_pb)
+    }, verbose, &format!("MDD hybrid k={}", k), sat_secs, cfg.quad_pb)
 }
 
 fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {

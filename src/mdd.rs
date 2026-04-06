@@ -294,6 +294,7 @@ impl BoundaryMdd {
         }
     }
 
+    #[allow(dead_code)]
     /// Build a 4-way ZW projection: for each 16-way node, OR together the
     /// (x,y) children for each (z,w) branch. The result is a 4-way MDD where
     /// every path is a valid (z,w) boundary (has at least one valid x,y).
@@ -406,6 +407,7 @@ impl BoundaryMdd {
     }
 }
 
+#[allow(dead_code)]
 /// OR two 4-way MDD nodes: result has a branch if either input has it.
 fn or_4way(
     a: u32, b: u32, level: u8,
@@ -437,6 +439,7 @@ fn or_4way(
 }
 
 /// 4-way ZW projection MDD. Each path is a valid (z,w) boundary.
+#[allow(dead_code)]
 pub struct ZwProjection {
     pub nodes: Vec<[u32; 4]>,
     pub root: u32,
@@ -444,6 +447,7 @@ pub struct ZwProjection {
     pub pos_order: Vec<usize>,
 }
 
+#[allow(dead_code)]
 impl ZwProjection {
     /// Enumerate all valid (z_bits, w_bits) boundary pairs.
     pub fn enumerate<F: FnMut(u32, u32)>(&self, mut callback: F) {
@@ -510,6 +514,48 @@ impl ZwProjection {
 impl BoundaryMdd {
     /// Enumerate all valid (z,w,x,y) boundary 4-tuples.
     /// More efficient than enumerate_zw + query_xy because it walks once.
+    /// Walk the MDD collecting all unique (z_bits, w_bits) that have any valid (x,y).
+    /// At each level, try all 4 (z,w) choices. For each, check if any (x,y) child
+    /// is non-DEAD. If so, collect unique child nodes and recurse.
+    /// Dedup at leaf via HashSet.
+    pub fn walk_zw_unique(
+        &self, nid: u32, level: usize, z_acc: u32, w_acc: u32,
+        out: &mut std::collections::HashSet<(u32, u32)>,
+    ) {
+        if nid == DEAD { return; }
+        if level == 2 * self.k {
+            if nid == LEAF {
+                out.insert((z_acc, w_acc));
+            }
+            return;
+        }
+
+        let pos = self.pos_order[level];
+        for zw in 0u32..4 {
+            let z_val = (zw >> 0) & 1;
+            let w_val = (zw >> 1) & 1;
+            let zw_sign = (z_val << 2) | (w_val << 3);
+
+            // Collect unique non-DEAD child nodes across all (x,y) branches
+            let mut child_set: Vec<u32> = Vec::with_capacity(4);
+            for xy in 0u32..4 {
+                let sign_col = xy | zw_sign;
+                let child = self.nodes[nid as usize][sign_col as usize];
+                if child != DEAD && !child_set.contains(&child) {
+                    child_set.push(child);
+                }
+            }
+            if child_set.is_empty() { continue; }
+
+            let new_z = z_acc | (z_val << pos);
+            let new_w = w_acc | (w_val << pos);
+
+            for &child in &child_set {
+                self.walk_zw_unique(child, level + 1, new_z, new_w, out);
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn enumerate_all<F: FnMut(u32, u32, u32, u32)>(&self, mut callback: F) {
         self.walk_all(self.root, 0, 0, 0, 0, 0, &mut callback);
