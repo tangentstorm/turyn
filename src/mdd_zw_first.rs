@@ -227,7 +227,14 @@ impl ZwFirstMdd {
         let mut nodes: Vec<[u32; 4]> = Vec::new();
         nodes.push([DEAD; 4]); // node 0 = DEAD
 
-        let mut unique: HashMap<(u8, [u32; 4]), u32> = HashMap::default();
+        fn hash_node4(level: u8, children: &[u32; 4]) -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut h = rustc_hash::FxHasher::default();
+            level.hash(&mut h);
+            for &c in children { c.hash(&mut h); }
+            h.finish()
+        }
+        let mut unique: HashMap<u64, u32> = HashMap::default();
 
         type StateKey = (u128, u64);
         type XyStateKey = (u128, u64); // (packed_sums, packed_active) - cleared per zw_sums
@@ -263,7 +270,7 @@ impl ZwFirstMdd {
             zw_sums: &[i8],  // target: sums[li] must equal -zw_sums[li] at end
             ctx: &Ctx,
             nodes: &mut Vec<[u32; 4]>,
-            unique: &mut HashMap<(u8, [u32; 4]), u32>,
+            unique: &mut HashMap<u64, u32>,
             memo: &mut Vec<HashMap<XyStateKey, u32>>,
         ) -> u32 {
             if level == ctx.zw_depth {
@@ -361,7 +368,7 @@ impl ZwFirstMdd {
                 if children.iter().all(|&c| c == first) {
                     first
                 } else {
-                    let key = (unique_level, children);
+                    let key = hash_node4(unique_level, &children);
                     if let Some(&nid) = unique.get(&key) { nid }
                     else {
                         let nid = nodes.len() as u32;
@@ -383,7 +390,7 @@ impl ZwFirstMdd {
             active_bits: &mut Vec<u8>,
             ctx: &Ctx,
             nodes: &mut Vec<[u32; 4]>,
-            unique: &mut HashMap<(u8, [u32; 4]), u32>,
+            unique: &mut HashMap<u64, u32>,
             zw_memo: &mut Vec<HashMap<StateKey, u32>>,
             xy_memo: &mut Vec<HashMap<XyStateKey, u32>>,
         ) -> u32 {
@@ -482,6 +489,11 @@ impl ZwFirstMdd {
                         level + 1, sums, &mut current_vals,
                         ctx, nodes, unique, zw_memo, xy_memo,
                     );
+                    if level == 1 {
+                        let zw_entries: usize = zw_memo.iter().map(|m| m.len()).sum();
+                        eprint!("\r  ZW level 1 branch {}/4, {} nodes, zw_memo={}   ",
+                            branch + 1, nodes.len(), zw_entries);
+                    }
                 }
 
                 // Restore sums from packed backup
@@ -497,7 +509,7 @@ impl ZwFirstMdd {
                 if children.iter().all(|&c| c == first) {
                     first
                 } else {
-                    let key = (level as u8, children);
+                    let key = hash_node4(level as u8, &children);
                     if let Some(&nid) = unique.get(&key) { nid }
                     else {
                         let nid = nodes.len() as u32;
