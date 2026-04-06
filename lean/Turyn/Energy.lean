@@ -70,6 +70,59 @@ Without Mathlib, it requires ~200 lines of manual `rangeSum` manipulation.
 We state it as an axiom and verify it computationally for all concrete instances.
 -/
 
+theorem sum_sq_expand (n : Nat) (a : Nat → Int) :
+    (∑ i ∈ range n, a i) ^ 2 = (∑ i ∈ range n, a i ^ 2) + 2 * ∑ s ∈ range (n - 1), ∑ i ∈ range (n - 1 - s), a i * a (i + s + 1) := by
+  induction n with
+  | zero =>
+    simp
+  | succ k ih =>
+    rw [sum_range_succ, add_sq, ih, sum_range_succ (fun i => a i ^ 2)]
+    have h1 : ∑ s ∈ range k, ∑ i ∈ range (k - s), a i * a (i + s + 1) =
+              ∑ s ∈ range (k - 1), ∑ i ∈ range (k - 1 - s), a i * a (i + s + 1) +
+              ∑ i ∈ range k, a i * a k := by
+      cases k with
+      | zero => rfl
+      | succ j =>
+        have heq : j + 1 - 1 = j := by omega
+        rw [heq, sum_range_succ]
+        have h_inner : ∀ s ∈ range j, ∑ i ∈ range (j + 1 - s), a i * a (i + s + 1) =
+                       ∑ i ∈ range (j - s), a i * a (i + s + 1) + a (j - s) * a (j + 1) := by
+          intro s hs
+          have hs_lt : s < j := mem_range.mp hs
+          have eq_inner : j + 1 - s = j - s + 1 := by omega
+          rw [eq_inner, sum_range_succ]
+          have eq_idx : j - s + s + 1 = j + 1 := by omega
+          rw [eq_idx]
+        rw [sum_congr rfl h_inner, sum_add_distrib]
+        have h_tail : ∑ i ∈ range (j + 1 - j), a i * a (i + j + 1) = a 0 * a (j + 1) := by
+          have : j + 1 - j = 1 := by omega
+          rw [this, sum_range_succ, sum_range_zero, zero_add]
+          have : 0 + j + 1 = j + 1 := by omega
+          rw [this]
+        rw [h_tail]
+        have h_sum_rev : (∑ s ∈ range j, a (j - s) * a (j + 1)) + a 0 * a (j + 1) = ∑ i ∈ range (j + 1), a i * a (j + 1) := by
+          have h0 : a 0 = a (j - j) := by rw [Nat.sub_self]
+          rw [h0]
+          have hlhs : (∑ s ∈ range j, a (j - s) * a (j + 1)) + a (j - j) * a (j + 1) = ∑ s ∈ range (j + 1), a (j - s) * a (j + 1) := by
+            exact (sum_range_succ (fun s => a (j - s) * a (j + 1)) j).symm
+          rw [hlhs]
+          have hrefl := sum_range_reflect (fun s => a s * a (j + 1)) (j + 1)
+          have h_idx : ∀ s ∈ range (j + 1), a (j - s) * a (j + 1) = a (j + 1 - 1 - s) * a (j + 1) := by
+            intro s _
+            have hj : j - s = j + 1 - 1 - s := by omega
+            rw [hj]
+          rw [sum_congr rfl h_idx]
+          exact hrefl
+        rw [add_assoc, h_sum_rev]
+    have hk_minus : k + 1 - 1 = k := by omega
+    rw [hk_minus, h1]
+    have h_final : (2 * ∑ i ∈ range k, a i) * a k = 2 * ∑ i ∈ range k, a i * a k := by
+      calc
+        (2 * ∑ i ∈ range k, a i) * a k = 2 * ((∑ i ∈ range k, a i) * a k) := by ring
+        _ = 2 * ∑ i ∈ range k, a i * a k := by rw [sum_mul]
+    rw [h_final]
+    ring
+
 theorem sum_w_ext {n : Nat} {w : PmSeq} (hwl : w.length = n - 1) :
     ∑ i ∈ range (n - 1), aperiodicAutocorr w (i + 1) =
     ∑ i ∈ range (n - 1 - 1), aperiodicAutocorr w (i + 1) := by
@@ -106,7 +159,38 @@ theorem weightedTotalAutocorr_decompose {n : Nat} {x y z w : PmSeq}
 
 theorem sum_sq_eq_finset (a : PmSeq) (h : AllPmOne a) :
     (∑ i ∈ range a.length, a.getD i 0) ^ 2 = (a.length : Int) + 2 * ∑ i ∈ range (a.length - 1), aperiodicAutocorr a (i + 1) := by
-  sorry
+  have h_sq : ∀ i ∈ range a.length, (a.getD i 0) ^ 2 = 1 := by
+    intro i hi
+    have hi_lt : i < a.length := mem_range.mp hi
+    have eq_get : a.getD i 0 = a[i] := by
+      rw [List.getD_eq_getElem?_getD, List.getElem?_eq_getElem hi_lt]
+      rfl
+    rw [eq_get]
+    have hall := h (a[i]) (List.getElem_mem hi_lt)
+    rcases hall with h1 | hm1
+    · rw [h1]; rfl
+    · rw [hm1]; rfl
+  have h_diag : ∑ i ∈ range a.length, (a.getD i 0) ^ 2 = (a.length : Int) := by
+    rw [sum_congr rfl h_sq, sum_const, card_range, nsmul_one]
+  rw [sum_sq_expand a.length (fun i => a.getD i 0)]
+  rw [h_diag]
+  have h_cross : ∀ s ∈ range (a.length - 1),
+      ∑ i ∈ range (a.length - 1 - s), a.getD i 0 * a.getD (i + s + 1) 0 =
+      aperiodicAutocorr a (s + 1) := by
+    intro s hs
+    have hs_lt : s < a.length - 1 := mem_range.mp hs
+    unfold aperiodicAutocorr
+    split
+    · next h_if =>
+      omega
+    · next =>
+      have eq_sum : a.length - (s + 1) = a.length - 1 - s := by omega
+      rw [eq_sum]
+      apply sum_congr rfl
+      intro i _
+      have eq_idx : i + s + 1 = i + (s + 1) := by omega
+      rw [eq_idx]
+  rw [sum_congr rfl h_cross]
 
 theorem sum_sq_eq_len_add_two_totalAutocorr (a : PmSeq) (h : AllPmOne a) :
     (seqSum a) ^ 2 = ↑(a.length) + 2 * totalAutocorr a := by
