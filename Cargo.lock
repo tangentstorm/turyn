@@ -116,6 +116,15 @@ name = "radical"
 version = "0.1.0"
 
 [[package]]
+name = "redb"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67f7f231ea7b1172b7ac00ccf96b1250f0fb5a16d5585836aa4ebc997df7cbde"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -163,6 +172,7 @@ version = "0.1.0"
 dependencies = [
  "cadical",
  "radical",
+ "redb",
  "rustc-hash",
  "rustfft",
 ]

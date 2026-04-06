@@ -393,6 +393,8 @@ impl ZwFirstMdd {
             unique: &mut HashMap<u64, u32>,
             zw_memo: &mut Vec<HashMap<StateKey, u32>>,
             xy_memo: &mut Vec<HashMap<XyStateKey, u32>>,
+            zw_memo_count: &mut usize,
+            max_memo_entries: usize,
         ) -> u32 {
             if level == ctx.zw_depth {
                 // ZW half done. Build XY sub-MDD for these zw_sums.
@@ -488,6 +490,7 @@ impl ZwFirstMdd {
                     children[branch as usize] = build_zw(
                         level + 1, sums, &mut current_vals,
                         ctx, nodes, unique, zw_memo, xy_memo,
+                        zw_memo_count, max_memo_entries,
                     );
                     if level == 1 {
                         let zw_entries: usize = zw_memo.iter().map(|m| m.len()).sum();
@@ -520,15 +523,23 @@ impl ZwFirstMdd {
                 }
             };
 
-            zw_memo[level].insert(state_key, result);
+            // Cap total memo entries to prevent OOM at large k.
+            if *zw_memo_count < max_memo_entries {
+                zw_memo[level].insert(state_key, result);
+                *zw_memo_count += 1;
+            }
             result
         }
 
+        // ~3.2GB budget for memo at 32 bytes/entry
+        let max_memo_entries: usize = 100_000_000;
+        let mut zw_memo_count: usize = 0;
         let mut sums = vec![0i8; k];
         let mut active_bits: Vec<u8> = Vec::new();
         let root = build_zw(
             0, &mut sums, &mut active_bits,
             &ctx, &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo,
+            &mut zw_memo_count, max_memo_entries,
         );
 
         let zw_memo_entries: usize = zw_memo.iter().map(|m| m.len()).sum();

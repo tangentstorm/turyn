@@ -3,87 +3,85 @@
 Ideas for pushing gen_mdd to higher k values. The bottleneck is memory:
 the memoization HashMap and node storage grow exponentially with k.
 
-## Current baselines (2026-04-06)
+## Current state (2026-04-06)
 
-| k | Build time | 16-way nodes | Total time |
-|---|-----------|-------------|------------|
-| 7 | ~4s | 168K (10 MB) | 4.7s |
-| 8 | ~40s | 1.6M (100 MB) | 46.6s |
-| 9 | >2min | >2.8M (timeout) | OOM/timeout |
+| k | ZW-first time | Nodes | Memory |
+|---|--------------|-------|--------|
+| 7 | 0.3s | 69K | 1 MB |
+| 8 | 7.3s | 433K | 6.6 MB |
+| 9 | 1m17s | 2.6M | 40 MB |
+| 10 | ~15min (est) | ~26M | ~400 MB |
 
-Scaling: ~10x per k step in both time and memory.
+Original baselines (before optimization):
+k=7: 4.7s, k=8: 46.6s, k=9: OOM/timeout
+
+## Implemented
+
+### 1. Pack sums into u128 instead of Vec<i8>
+**Status**: Implemented. ~3% speedup, eliminates heap allocs in hot path.
+
+### 2. Switch gen_mdd to use ZW-first builder (default)
+**Status**: Implemented. 4-way nodes (16 bytes) vs 16-way (64 bytes) = 4x less memory.
+Per-call XY memo clearing prevents XY memo explosion.
+
+### 3. Partial-lag range pruning (both builders)
+**Status**: Implemented. **-40% build time.** Prunes branches where partial sums
+exceed remaining event budget.
+
+### 4. FxHashMap for all memo/unique tables
+**Status**: Implemented. **-53% build time.** FxHash ~4x faster than SipHash for u128/u64 keys.
+
+### 5. Hash-based unique table (u64 key)
+**Status**: Implemented. Reduces unique table from ~80B/entry to ~20B/entry.
+
+### 6. Periodic GC during reorder
+**Status**: Implemented. 3x peak memory reduction during reorder phase.
 
 ## Untested Ideas
 
-### 1. Pack sums into u64/u128 instead of Vec<i8>
-**Status**: Untested
-The memo StateKey is `(Vec<i8>, u64)`. Every memo check clones a heap-allocated Vec.
-For k <= 8, pack 8 x i8 into one u64. For k <= 16, use u128. Eliminates all heap
-allocation in the hot path.
+### 7. Disk-backed memo with redb
+**Status**: redb dependency added; not yet implemented.
+Move the zw_memo HashMap to disk using redb. For k=11, zw_memo needs ~50GB
+in memory. On disk, it would be manageable. Trades speed for memory.
 
-### 2. Switch gen_mdd to use ZW-first builder
-**Status**: Untested
-The current gen_mdd uses the 16-way interleaved builder (mdd.rs) then reorders.
-The ZW-first builder (mdd_zw_first.rs) builds directly as 4-way, which should
-have dramatically smaller memo tables (4^L states vs 16^L).
+### 8. Level-by-level BFS construction
+**Status**: Untested.
+Instead of DFS (all levels in memory), process one level at a time.
+States at level L generate states at level L+1. Only 2 levels in memory.
+Enables streaming to disk.
 
-### 3. Tighter interval pruning at every level
-**Status**: Untested
-Currently, lag constraints are only checked at "completion" levels. But we can
-compute range bounds on partial sums at every level and prune branches whose
-partial sums are already out of achievable range.
+### 9. Bounded/LRU memo cache
+**Status**: Untested.
+Cap memo at N entries (e.g., 100M = ~3GB). When full, evict old entries.
+Trades re-computation for memory. Risk: thrashing if working set > cache.
 
-### 4. Disk-backed memo with redb or sled
-**Status**: Untested
-Move the memo HashMap to disk using an embedded key-value store (redb, sled,
-or rocksdb). Trades speed for virtually unlimited memory.
+### 10. Parallel XY sub-MDD construction
+**Status**: Untested.
+In ZW-first builder, each build_xy call for a different zw_sums is independent.
+Use rayon/threads to process them in parallel. Could speed up XY phase ~4x.
 
-### 5. Level-by-level BFS construction
-**Status**: Untested
-Instead of DFS (which keeps all levels in memory), process one level at a time.
-Enumerate all reachable states at level L, write to disk, then process level L+1.
-Only two levels need to be in memory at once.
-
-### 6. Compress memo keys further
-**Status**: Untested
-The packed_active u64 uses 4 bits per position (16-way) or 2 bits (4-way).
-For the ZW-first builder, pack more tightly. Also consider hashing the full
-state to a u128 and using that as the key (with collision detection).
-
-### 7. Clear completed level memos during DFS
-**Status**: Untested
-After all branches at level 0 complete, memo[0] is never needed again.
-Similarly for subsequent levels. Track which levels are "closed" and free
-their memo entries. Won't help peak usage but reduces sustained memory.
-
-### 8. Memory-mapped node storage
-**Status**: Untested
-Use mmap'd files for the nodes Vec instead of heap allocation. The OS
-manages paging to/from disk transparently.
-
-### 9. Parallel construction with rayon
-**Status**: Untested
-The 16 (or 4) branches at each level are independent. Use rayon to process
-them in parallel with thread-local memo tables, then merge.
-
-### 10. Better variable ordering
-**Status**: Untested
+### 11. Better variable ordering
+**Status**: Untested.
 The bouncing order (0, 2k-1, 1, 2k-2, ...) may not minimize state space.
-Try different orderings: linear, reverse, or dynamically chosen based on
-constraint density.
+Try different orderings: linear, reverse, or constraint-density ordered.
 
-### 11. Partial-lag range pruning
-**Status**: Untested
-Before a lag is fully complete, we know partial contributions. If the partial
-sum is already outside [-remaining_max, +remaining_max], prune immediately.
-This is more aggressive than checking only at completion.
+### 12. Memory-mapped node storage
+**Status**: Untested.
+Use mmap'd files for the nodes Vec. OS manages paging transparently.
 
-### 12. Port MDD to bex
-**Status**: Untested
-The bex library has multi-threaded swarm reordering. Port MDD node types to
-bex and use its infrastructure for the reorder phase. Won't help construction
-but could dramatically speed up reordering at large k.
+### 13. Port MDD to bex
+**Status**: bex cloned to /home/user/bex; not yet ported.
+Bex has multi-threaded swarm reordering and concurrent data structures.
+Most useful for: parallel XY construction, reorder phase (if we go back to it).
 
 ## Rejected Ideas
 
-(none yet)
+### 7 (old). Clear completed level memos during DFS
+**Status**: Rejected.
+Analysis shows DFS memo entries are needed across all levels simultaneously.
+Can't clear a level's memo until the entire build completes. Useless.
+
+### XY memo with zw_sums in key (shared across calls)
+**Status**: Rejected (OOM).
+Including zw_sums in the XY memo key causes 30M+ entries for k=8.
+Per-call clearing with range pruning is much better.
