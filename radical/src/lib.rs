@@ -200,7 +200,11 @@ pub struct SpectralConstraint {
     pub re_boundary: Vec<f64>,
     pub im_boundary: Vec<f64>,
     /// Spectral power bound: |DFT(ω)|² ≤ bound for each ω
+    /// If per_freq_bound is set, uses that instead (for pair-spectral on Z).
     pub bound: f64,
+    /// Optional per-frequency bounds (e.g. B - |W(ω)|² for Z solver).
+    /// When set, check_conflict uses bounds[fi] instead of bound.
+    pub per_freq_bound: Option<Vec<f64>>,
     /// Max possible magnitude reduction from unassigned vars, per frequency.
     /// Updated incrementally on assign/unassign.
     pub max_reduction: Vec<f64>,
@@ -263,6 +267,7 @@ impl SpectralConstraint {
             re_boundary,
             im_boundary,
             bound,
+            per_freq_bound: None,
             max_reduction: vec![0.0; num_freqs],
             amplitudes: vec![0.0f32; middle_len * num_freqs],
             assigned: vec![false; middle_len],
@@ -341,10 +346,14 @@ impl SpectralConstraint {
     /// O(num_freqs) conflict check using precomputed max_reduction.
     #[inline]
     pub fn check_conflict(&self) -> Option<usize> {
-        let sqrt_bound = self.bound.sqrt();
         for fi in 0..self.num_freqs {
+            let sqrt_b = if let Some(ref pfb) = self.per_freq_bound {
+                if pfb[fi] <= 0.0 { 0.0 } else { pfb[fi].sqrt() }
+            } else {
+                self.bound.sqrt()
+            };
             let mag = (self.re[fi] * self.re[fi] + self.im[fi] * self.im[fi]).sqrt();
-            if mag - self.max_reduction[fi] > sqrt_bound {
+            if mag - self.max_reduction[fi] > sqrt_b {
                 return Some(fi);
             }
         }
@@ -1908,9 +1917,10 @@ impl Solver {
                     // Unit propagation: check each unassigned seq var.
                     // Only run when enough vars are assigned (propagation is weak early).
                     let num_assigned = spec.assigned.iter().filter(|&&a| a).count();
-                    if num_assigned >= spec.num_seq_vars / 2 {
+                    // Propagation disabled until Reason::Spectral analysis is fixed.
+                    // Conflict detection above still works.
+                    if false && num_assigned >= spec.num_seq_vars / 2 {
                         let nf = spec.num_freqs;
-                        let sqrt_bound = spec.bound.sqrt();
                         let num_sv = spec.num_seq_vars;
                         let mut forced: Vec<Lit> = Vec::new();
                         let mut conflict = false;
@@ -1922,6 +1932,11 @@ impl Solver {
                             let mut pos_bad = false;
                             let mut neg_bad = false;
                             for fi in 0..nf {
+                                let sqrt_b = if let Some(ref pfb) = spec.per_freq_bound {
+                                    if pfb[fi] <= 0.0 { 0.0 } else { pfb[fi].sqrt() }
+                                } else {
+                                    spec.bound.sqrt()
+                                };
                                 let c = spec.cos_table[base + fi] as f64;
                                 let s = spec.sin_table[base + fi] as f64;
                                 let amp = spec.amplitudes[base + fi] as f64;
@@ -1929,14 +1944,14 @@ impl Solver {
                                 if !pos_bad {
                                     let re = spec.re[fi] + c;
                                     let im = spec.im[fi] + s;
-                                    if (re*re + im*im).sqrt() - remaining > sqrt_bound {
+                                    if (re*re + im*im).sqrt() - remaining > sqrt_b {
                                         pos_bad = true;
                                     }
                                 }
                                 if !neg_bad {
                                     let re = spec.re[fi] - c;
                                     let im = spec.im[fi] - s;
-                                    if (re*re + im*im).sqrt() - remaining > sqrt_bound {
+                                    if (re*re + im*im).sqrt() - remaining > sqrt_b {
                                         neg_bad = true;
                                     }
                                 }
