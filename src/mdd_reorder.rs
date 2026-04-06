@@ -293,7 +293,22 @@ pub fn reorder_zw_first(
         labels.push(false); // xy level
     }
 
+    // Count total swaps needed for progress reporting
+    let total_swaps_needed: usize = {
+        let mut tmp = labels.clone();
+        let mut count = 0;
+        loop {
+            let mut any = false;
+            for i in 0..tmp.len() - 1 {
+                if !tmp[i] && tmp[i + 1] { tmp.swap(i, i + 1); count += 1; any = true; }
+            }
+            if !any { break; }
+        }
+        count
+    };
+
     let mut pass = 0;
+    let reorder_start = std::time::Instant::now();
     loop {
         let mut swapped = false;
         for i in 0..total_levels - 1 {
@@ -303,10 +318,15 @@ pub fn reorder_zw_first(
                 labels.swap(i, i + 1);
                 swaps_done += 1;
                 swapped = true;
+                if total_swaps_needed >= 10 {
+                    eprint!("\r  Reorder: swap {}/{}, {} nodes, {:.1?}   ",
+                        swaps_done, total_swaps_needed, mdd4.nodes.len(), reorder_start.elapsed());
+                }
             }
         }
         pass += 1;
-        eprintln!("  Reorder pass {}: {} swaps total, {} nodes", pass, swaps_done, mdd4.nodes.len());
+        eprintln!("\r  Reorder pass {}: {} swaps total, {} nodes, {:.1?}",
+            pass, swaps_done, mdd4.nodes.len(), reorder_start.elapsed());
         if !swapped { break; }
     }
 
