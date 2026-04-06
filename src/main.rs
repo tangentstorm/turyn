@@ -3248,17 +3248,22 @@ fn run_mdd_sat_search(
 
                 if w_middles.is_empty() { continue; }
 
-                // Group entries by w_bits: entries with same w_bits share W candidates
-                // (same prefix/suffix → same spectral filter results).
-                let mut entries_by_w: HashMap<u32, Vec<&ZwEntry>> = HashMap::new();
+                // Group entries by (w_bits, z_bits): entries with same pair share
+                // both W and Z spectral filtering + pair checking.
+                // Only xy_root differs within each group.
+                let mut entries_by_wz: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
                 for entry in zw_entries {
-                    entries_by_w.entry(entry.w_bits).or_default().push(entry);
+                    entries_by_wz.entry((entry.w_bits, entry.z_bits))
+                        .or_default().push(entry.xy_root);
                 }
 
-                for (&w_bits, sub_entries) in &entries_by_w {
+                let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
+                let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
+
+                for (&(w_bits, z_bits), xy_roots) in &entries_by_wz {
                     if found.load(AtomicOrdering::Relaxed) { break; }
 
-                    // Build W candidates ONCE per unique w_bits
+                    // Build W candidates ONCE per unique (w_bits, z_bits)
                     let mut w_prefix = vec![0i8; k];
                     let mut w_suffix = vec![0i8; k];
                     for i in 0..k {
@@ -3267,7 +3272,6 @@ fn run_mdd_sat_search(
                     }
 
                     let mut w_candidates: Vec<SeqWithSpectrum> = Vec::new();
-                    let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
                     for w_mid in &w_middles {
                         let mut w_vals = Vec::with_capacity(m);
                         w_vals.extend_from_slice(&w_prefix);
@@ -3284,40 +3288,39 @@ fn run_mdd_sat_search(
 
                     let w_index = SpectralIndex::build(&w_candidates);
 
-                    // Per-entry within this w_bits group: only z_bits and xy_root differ
-                    for entry in sub_entries {
-                        if found.load(AtomicOrdering::Relaxed) { break; }
+                    // Z generation + spectral pair check ONCE per unique (w_bits, z_bits)
+                    let mut z_prefix = vec![0i8; k];
+                    let mut z_suffix = vec![0i8; k];
+                    for i in 0..k {
+                        z_prefix[i] = if (z_bits >> i) & 1 == 1 { 1 } else { -1 };
+                        z_suffix[i] = if (z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                    }
 
-                        let mut z_prefix = vec![0i8; k];
-                        let mut z_suffix = vec![0i8; k];
-                        for i in 0..k {
-                            z_prefix[i] = if (entry.z_bits >> i) & 1 == 1 { 1 } else { -1 };
-                            z_suffix[i] = if (entry.z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                        }
+                    let mut idx_buf = Vec::new();
+                    generate_sequences_permuted(middle_n, z_mid_sum, false, false, max_z, |z_mid| {
+                        if found.load(AtomicOrdering::Relaxed) { return false; }
+                        stats.z_generated += 1;
+                        let mut z_vals = Vec::with_capacity(n);
+                        z_vals.extend_from_slice(&z_prefix);
+                        z_vals.extend_from_slice(z_mid);
+                        z_vals.extend_from_slice(&z_suffix);
+                        let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, individual_bound, &mut fft_buf_z) else { return true; };
+                        stats.z_spectral_ok += 1;
+                        let z_seq = PackedSeq::from_values(&z_vals);
 
-                        let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
-                        let mut idx_buf = Vec::new();
-                        generate_sequences_permuted(middle_n, z_mid_sum, false, false, max_z, |z_mid| {
-                            if found.load(AtomicOrdering::Relaxed) { return false; }
-                            stats.z_generated += 1;
-                            let mut z_vals = Vec::with_capacity(n);
-                            z_vals.extend_from_slice(&z_prefix);
-                            z_vals.extend_from_slice(z_mid);
-                            z_vals.extend_from_slice(&z_suffix);
-                            let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, individual_bound, &mut fft_buf_z) else { return true; };
-                            stats.z_spectral_ok += 1;
-                            let z_seq = PackedSeq::from_values(&z_vals);
+                        w_index.candidates_for(&z_spectrum, pair_bound, &w_candidates, &mut idx_buf);
+                        for &wi in &idx_buf {
+                            let w = &w_candidates[wi];
+                            stats.candidate_pair_attempts += 1;
+                            if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
+                            stats.candidate_pair_spectral_ok += 1;
 
-                            w_index.candidates_for(&z_spectrum, pair_bound, &w_candidates, &mut idx_buf);
-                            for &wi in &idx_buf {
-                                let w = &w_candidates[wi];
-                                stats.candidate_pair_attempts += 1;
-                                if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
-                                stats.candidate_pair_spectral_ok += 1;
+                            let zw_autocorr = compute_zw_autocorr(problem, &z_seq, &w.seq);
 
-                                let zw_autocorr = compute_zw_autocorr(problem, &z_seq, &w.seq);
+                            // Walk XY sub-MDD for EACH entry's xy_root
+                            for &xy_root in xy_roots {
                                 walk_xy_sub_mdd(
-                                    entry.xy_root, 0, zw_depth, 0, 0,
+                                    xy_root, 0, zw_depth, 0, 0,
                                     &pos_order_clone, &mdd.nodes, max_bnd_sum,
                                     middle_n as i32, tuple,
                                     &mut |x_bits, y_bits| {
@@ -3332,15 +3335,15 @@ fn run_mdd_sat_search(
                                             priority: spectral_pair_max_power(&z_spectrum, &w.spectrum),
                                             boundary: Some(BoundaryConfig {
                                                 k, x_bits, y_bits,
-                                                z_bits: entry.z_bits, w_bits: entry.w_bits,
+                                                z_bits, w_bits,
                                             }),
                                         });
                                     },
                                 );
                             }
-                            true
-                        });
-                    }
+                        }
+                        true
+                    });
                 }
             }
         }
