@@ -1894,15 +1894,65 @@ impl Solver {
                     }
                 }
             }
-            // Spectral constraint: incrementally update DFT and check bound
-            if let Some(ref mut spec) = self.spectral {
+            // Spectral constraint: incrementally update DFT, check conflict, propagate
+            if self.spectral.is_some() {
                 let v = var_of(lit);
+                let spec = self.spectral.as_mut().unwrap();
                 if v < spec.num_seq_vars {
                     let val: i8 = if lit > 0 { 1 } else { -1 };
                     spec.assign(v, val);
-                    // Check for conflict
                     if spec.check_conflict().is_some() {
                         return Some(Reason::Spectral);
+                    }
+
+                    // Unit propagation: check each unassigned seq var.
+                    // Only run when enough vars are assigned (propagation is weak early).
+                    let num_assigned = spec.assigned.iter().filter(|&&a| a).count();
+                    if num_assigned >= spec.num_seq_vars / 2 {
+                        let nf = spec.num_freqs;
+                        let sqrt_bound = spec.bound.sqrt();
+                        let num_sv = spec.num_seq_vars;
+                        let mut forced: Vec<Lit> = Vec::new();
+                        let mut conflict = false;
+
+                        for u in 0..num_sv {
+                            if spec.assigned[u] { continue; }
+                            if self.assigns[u] != LBool::Undef { continue; }
+                            let base = u * nf;
+                            let mut pos_bad = false;
+                            let mut neg_bad = false;
+                            for fi in 0..nf {
+                                let c = spec.cos_table[base + fi] as f64;
+                                let s = spec.sin_table[base + fi] as f64;
+                                let amp = spec.amplitudes[base + fi] as f64;
+                                let remaining = spec.max_reduction[fi] - amp;
+                                if !pos_bad {
+                                    let re = spec.re[fi] + c;
+                                    let im = spec.im[fi] + s;
+                                    if (re*re + im*im).sqrt() - remaining > sqrt_bound {
+                                        pos_bad = true;
+                                    }
+                                }
+                                if !neg_bad {
+                                    let re = spec.re[fi] - c;
+                                    let im = spec.im[fi] - s;
+                                    if (re*re + im*im).sqrt() - remaining > sqrt_bound {
+                                        neg_bad = true;
+                                    }
+                                }
+                                if pos_bad && neg_bad { break; }
+                            }
+                            if pos_bad && neg_bad { conflict = true; break; }
+                            if pos_bad { forced.push(-((u + 1) as Lit)); }
+                            else if neg_bad { forced.push((u + 1) as Lit); }
+                        }
+
+                        if conflict { return Some(Reason::Spectral); }
+                        for flit in forced {
+                            if self.lit_value(flit) == LBool::Undef {
+                                self.enqueue(flit, Reason::Spectral);
+                            }
+                        }
                     }
                 }
             }

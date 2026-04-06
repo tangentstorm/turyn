@@ -3142,7 +3142,7 @@ fn run_mdd_sat_search(
         let mut process_boundary = |z_bits: u32, w_bits: u32, xy_root: u32| {
             if found.load(AtomicOrdering::Relaxed) { return; }
             total_zw += 1;
-            if total_zw % 100 == 0 {
+            if total_zw % 100_000 == 0 {
                 eprintln!("  walked {}M boundaries, w_gen={} w_ok={} z_ok={} items={}",
                     total_zw / 1_000_000, stats.w_generated, stats.w_spectral_ok,
                     stats.z_spectral_ok, total_items);
@@ -3171,10 +3171,14 @@ fn run_mdd_sat_search(
                     w_tmpl.build_base_solver(middle_m, w_mid_sum)
                 );
                 let w_cp = w_solver.save_checkpoint();
-                // Native spectral constraint: tracks DFT incrementally during search
-                w_solver.spectral = Some(radical::SpectralConstraint::new(
-                    m, k, &w_boundary, individual_bound, theta.min(64),
-                ));
+                // Per-lag autocorrelation PB constraints (boundary-specific)
+                sat_z_middle::fill_w_solver(w_solver, &w_tmpl, m, &w_boundary);
+                // Native spectral constraint for large middles
+                if middle_m >= 8 {
+                    w_solver.spectral = Some(radical::SpectralConstraint::new(
+                        m, k, &w_boundary, individual_bound, 16,
+                    ));
+                }
 
                 let phases: Vec<bool> = (0..middle_m)
                     .map(|_| next_rng() & 1 == 1).collect();
