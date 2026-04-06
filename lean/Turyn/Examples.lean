@@ -1,3 +1,7 @@
+import Turyn.Basic
+import Turyn.Energy
+import Turyn.Hadamard
+
 /-!
 # Verified Turyn-Type Sequences
 
@@ -7,38 +11,22 @@ check to native code and runs it, producing a kernel-level proof.
 ## How to add your own verified solution
 
 ```lean
--- 1. Define your sequences
-def myX : Seq := [1, -1, 1, ...]
-def myY : Seq := [1, 1, -1, ...]
-def myZ : Seq := [1, -1, -1, ...]
-def myW : Seq := [-1, 1, 1, ...]
+def myX : PmSeq := [1, -1, 1, ...]
+def myY : PmSeq := [1, 1, -1, ...]
+def myZ : PmSeq := [1, -1, -1, ...]
+def myW : PmSeq := [-1, 1, 1, ...]
 
--- 2. Prove it is a valid TT(n)
 theorem my_solution_is_turyn : IsTurynType n myX myY myZ myW := by
   native_decide
-
--- 3. (Optional) Verify the energy identity
-theorem my_solution_energy : checkEnergy n myX myY myZ myW = true := by
-  native_decide
-
--- 4. (Optional) Conclude a Hadamard matrix exists
-theorem my_hadamard :
-    ∃ H : IntMatrix, IsHadamard H (hadamardOrder n) := by
-  exact ⟨goethalsSeidel ..., turyn_gives_hadamard_tseq n myX myY myZ myW
-          my_solution_is_turyn⟩
 ```
 -/
 
-import Turyn.Basic
-import Turyn.Energy
-import Turyn.Hadamard
-
 /-! ## TT(6): A small example -/
 
-def tt6X : Seq := [-1, -1, -1, -1, 1, -1]
-def tt6Y : Seq := [-1, -1, -1, 1, -1, -1]
-def tt6Z : Seq := [-1, -1, 1, -1, 1, 1]
-def tt6W : Seq := [-1, 1, 1, 1, -1]
+def tt6X : PmSeq := [-1, -1, -1, -1, 1, -1]
+def tt6Y : PmSeq := [-1, -1, -1, 1, -1, -1]
+def tt6Z : PmSeq := [-1, -1, 1, -1, 1, 1]
+def tt6W : PmSeq := [-1, 1, 1, 1, -1]
 
 /-- TT(6) is a valid Turyn-type sequence.
     Verified by compiling the Boolean check to native code. -/
@@ -60,22 +48,22 @@ the smallest order for which no Hadamard matrix was previously known.
 Reference: Kharaghani, H. & Tayfeh-Rezaie, B. (2005).
 "A Hadamard matrix of order 428." *J. Combin. Des.* 13(6), 435–440. -/
 
-def kh05X : Seq := [
+def kh05X : PmSeq := [
   1, 1, 1, -1, -1, -1, -1, 1, 1, -1, 1, -1,
   1, -1, -1, -1, -1, -1, 1, 1, 1, 1, -1, 1,
   1, -1, 1, 1, 1, 1, -1, -1, -1, -1, 1, -1]
 
-def kh05Y : Seq := [
+def kh05Y : PmSeq := [
   1, -1, 1, 1, 1, 1, 1, -1, -1, 1, -1, 1,
   -1, -1, 1, -1, -1, 1, 1, -1, -1, 1, 1, 1,
   1, -1, 1, 1, 1, 1, -1, -1, -1, 1, 1, -1]
 
-def kh05Z : Seq := [
+def kh05Z : PmSeq := [
   1, -1, 1, 1, 1, 1, 1, -1, 1, -1, -1, 1,
   1, 1, 1, -1, 1, 1, 1, -1, 1, 1, -1, -1,
   1, 1, 1, -1, 1, -1, -1, 1, -1, -1, -1, 1]
 
-def kh05W : Seq := [
+def kh05W : PmSeq := [
   1, 1, 1, -1, 1, -1, -1, -1, -1, -1, 1, 1,
   -1, -1, 1, -1, 1, 1, 1, -1, -1, 1, -1, 1,
   -1, 1, 1, 1, -1, 1, 1, 1, 1, -1, 1]
@@ -103,42 +91,37 @@ theorem kh05_hadamard_order : hadamardOrder 36 = 428 := by native_decide
 
 /-- **Existence of Hadamard matrix of order 428.**
 
-    By the Goethals-Seidel construction with T-sequence doubling,
+    By the base-sequence → T-sequence → Goethals-Seidel pipeline,
     the verified TT(36) above implies the existence of a Hadamard matrix
     of order 4(3·36 − 1) = 428.
 
-    The `sorry` here stands for the pipeline proof (T-sequence interleaving →
-    Goethals-Seidel array construction → orthogonality verification).
-    The TT(36) verification itself (`kharaghani_2005_tt36`) is fully checked. -/
+    The TT(36) verification itself is fully machine-checked.
+    The pipeline from TT to Hadamard (which is a standard result in
+    combinatorial design theory) is stated as axioms in Hadamard.lean. -/
 theorem hadamard_428_exists :
-    ∃ (x y z w : Seq),
+    ∃ (x y z w : PmSeq),
       IsTurynType 36 x y z w ∧ hadamardOrder 36 = 428 := by
   exact ⟨kh05X, kh05Y, kh05Z, kh05W, kharaghani_2005_tt36, kh05_hadamard_order⟩
 
 /-! ## Template for publishing your own results
 
-Use this pattern to formally verify any TT(n) solution found by the solver:
-
 ```lean
--- Replace with your sequences
-def myX : Seq := [1, -1, ...]
-def myY : Seq := [1, 1, ...]
-def myZ : Seq := [-1, 1, ...]
-def myW : Seq := [1, -1, ...]
+import Turyn.Basic
+import Turyn.Energy
+import Turyn.Hadamard
 
--- The proof obligation: Lean verifies this at compile time
-theorem my_tt_valid : IsTurynType <n> myX myY myZ myW := by native_decide
+def myX : PmSeq := [1, -1, ...]
+def myY : PmSeq := [1, 1, ...]
+def myZ : PmSeq := [-1, 1, ...]
+def myW : PmSeq := [1, -1, ...]
 
--- Energy identity (bonus: independent cross-check)
-theorem my_energy : checkEnergy <n> myX myY myZ myW = true := by native_decide
+-- Lean verifies at compile time
+theorem my_tt_valid : IsTurynType N myX myY myZ myW := by native_decide
+theorem my_energy : checkEnergy N myX myY myZ myW = true := by native_decide
 
--- State the Hadamard consequence
-theorem my_hadamard_order : hadamardOrder <n> = <4*(3*n - 1)> := by native_decide
-
--- Conclude
 theorem my_hadamard_exists :
-    ∃ (x y z w : Seq),
-      IsTurynType <n> x y z w ∧ hadamardOrder <n> = <order> :=
-  ⟨myX, myY, myZ, myW, my_tt_valid, my_hadamard_order⟩
+    ∃ (x y z w : PmSeq),
+      IsTurynType N x y z w ∧ hadamardOrder N = ORDER :=
+  ⟨myX, myY, myZ, myW, my_tt_valid, by native_decide⟩
 ```
 -/
