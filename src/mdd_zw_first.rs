@@ -524,15 +524,24 @@ impl ZwFirstMdd {
             };
 
             // Cap total memo entries to prevent OOM at large k.
-            if *zw_memo_count < max_memo_entries {
-                zw_memo[level].insert(state_key, result);
-                *zw_memo_count += 1;
+            // When over budget, evict the deepest (largest) level.
+            if *zw_memo_count >= max_memo_entries {
+                // Find and clear the level with the most entries
+                let (max_lvl, max_cnt) = zw_memo.iter().enumerate()
+                    .max_by_key(|(_, m)| m.len()).unwrap();
+                if max_cnt.len() > 0 {
+                    *zw_memo_count -= zw_memo[max_lvl].len();
+                    zw_memo[max_lvl].clear();
+                    zw_memo[max_lvl].shrink_to_fit();
+                }
             }
+            zw_memo[level].insert(state_key, result);
+            *zw_memo_count += 1;
             result
         }
 
-        // ~3.2GB budget for memo at 32 bytes/entry
-        let max_memo_entries: usize = 100_000_000;
+        // Budget ~7GB for memo (actual overhead is ~140 bytes/entry in FxHashMap)
+        let max_memo_entries: usize = 50_000_000;
         let mut zw_memo_count: usize = 0;
         let mut sums = vec![0i8; k];
         let mut active_bits: Vec<u8> = Vec::new();
