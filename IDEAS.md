@@ -520,29 +520,33 @@ Partition variables into communities (X-vars vs Y-vars, or by lag group). Bias V
 
 For large n (n≥40), brute-force W middle enumeration via `generate_sequences_permuted` is the Phase B bottleneck. At n=56 with k=9, W middle has 37 free positions with C(37,19)≈17.7B combinations for sum=1. Even with LCG-scattered sampling (max_w=200K), the spectral rejection rate is high and most samples are wasted. The fix: use SAT to generate W middles, streaming each one immediately to Z generation and Phase C.
 
-### W1. SAT solver for W middle with sum constraint
+### W1. SAT solver for W middle with sum constraint — **Implemented**
 
-Replace `generate_sequences_permuted` for W middles with a SAT solver encoding the cardinality constraint (exactly r of middle_m vars are +1, where r = (w_mid_sum + middle_m) / 2). Use `add_pb_eq` for the sum constraint. Enumerate solutions via blocking clauses (negate the found assignment). Spectral filter applied post-hoc.
+Replace `generate_sequences_permuted` for W middles with a SAT solver encoding the cardinality constraint. Adaptive threshold: use SAT when C(middle_m, r) > 10 × max_w, brute-force DFS otherwise. SAT-based generation uses random phase initialization (xorshift64) for diversity and blocking clauses for uniqueness.
 
-**Single commit:** Create `build_w_middle_solver()` in `sat_w_middle.rs`. Returns a `radical::Solver` with middle_m variables and one PB equality constraint. In `run_mdd_sat_search()`, replace the `generate_sequences_permuted` call for W with a solve loop: `solve() → extract → spectral filter → block → repeat`. Cap at max_w iterations.
+**Result:** Implemented in `sat_w_middle.rs` + `run_mdd_sat_search()`. At n≥42 k=8, SAT activates (C(25,12)=5.2M > 2M threshold). For n=56 k=8, space is 69B — brute-force would need to sample <0.0003% via LCG scatter. SAT generates max_w solutions directly. No regression on small-n benchmarks (n=18 k=8: 49.7ms → 45.0ms). **Accepted.**
 
-### W2. Streaming W→Z pipeline (no batch W collection)
+### W2. Streaming W→Z pipeline — **Tried, rejected**
 
-Instead of batch-generating all W candidates into a Vec, then building SpectralIndex, then batch-generating Z candidates — generate W one-at-a-time and immediately process each. For each spectrally-valid W, run Z generation (SAT or brute-force), spectral pair filter, and send valid (Z,W) pairs directly to Phase C. Eliminates the O(max_w) memory for W candidates and enables earlier Phase C results.
+Streaming each W directly to Z SAT solver (sat_z_middle) instead of batch+SpectralIndex approach.
 
-**Single commit:** Restructure the inner loop of `run_mdd_sat_search()` per-boundary processing: W SAT loop → for each valid W → Z generation → pair check → send to channel. Remove `w_candidates` Vec and `SpectralIndex` from the MDD path.
+**Result:** The per-W Z SAT solver's autocorrelation constraints are W-specific, severely limiting Z diversity. SpectralIndex pairing across multiple W candidates finds far more (Z,W) pairs. n=24 k=4: streaming found 0 SAT items vs baseline ~190K. **Rejected** — batch W + SpectralIndex + brute-force Z is superior.
 
-### W3. Random phase diversity in W SAT solver
+### W3. Random phase diversity in W SAT solver — **Implemented** (with W1)
 
-Between successive W SAT calls, randomize the solver's phase vector (initial variable polarities) using the existing `set_phase()` API. CDCL+VSIDS explores from the new starting point, combined with blocking clauses guarantees no repeats. This ensures diverse W candidates similar to the LCG scatter of `generate_sequences_permuted`.
+xorshift64 PRNG seeded from (z_bnd_sum, w_bnd_sum) provides deterministic but diverse phase initialization. Combined with blocking clauses, ensures unique and varied W candidates.
 
-**Single commit:** Before each `w_solver.solve()`, generate a random bool vector of length middle_m and call `w_solver.set_phase(&random_phases)`. Use a deterministic PRNG seeded from the boundary bits for reproducibility.
+### W4. SAT-based Z middle generation in MDD path — **Rejected**
 
-### W4. SAT-based Z middle generation in MDD path
+Replaced brute-force Z with sat_z_middle in run_mdd_sat_search(). Z SAT solver's tight autocorrelation constraints (given fixed W) produce few Z candidates that also pass spectral pair filter. Brute-force Z with SpectralIndex covers more of the Z space and pairs better.
 
-The `run_mdd_sat_search()` function currently uses `generate_sequences_permuted` for Z middles too (line 3247). Replace with `build_z_middle_solver()` (already exists in `sat_z_middle.rs`) which encodes sum + autocorrelation range constraints. The Z solver has tighter constraints than W because it knows the full W sequence, making SAT significantly faster than brute-force.
+**Result:** n=24 k=4: 0 SAT items dispatched (vs 190K with brute-force). The SpectralIndex approach tests many Z×W combinations; SAT limits Z to one W at a time. **Rejected.**
 
-**Single commit:** In `run_mdd_sat_search()`, replace the Z `generate_sequences_permuted` call with `build_z_middle_solver()`. For each valid W, build a Z solver, enumerate solutions via blocking clauses, spectral filter each, pair check, send to Phase C.
+### W6. Hoist W generation out of per-boundary loop — **Implemented**
+
+W middles depend only on (middle_m, w_mid_sum), not boundary bits. Generate ONCE per (sum_group, tuple) and reuse across all entries. Each entry still does per-boundary spectral filtering (different prefix/suffix). Eliminates redundant W generation for groups with many entries.
+
+**Result:** n=18 k=4: 45.3ms → 43.9ms. n=24 k=4: ~70s → ~63s. **Accepted.**
 
 ### W5. W autocorrelation constraints in SAT (approximate spectral filter)
 
