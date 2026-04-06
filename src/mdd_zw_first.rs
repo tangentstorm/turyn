@@ -12,7 +12,7 @@
 /// Each path through the top half arrives at a node that roots the sub-MDD of valid (x,y)
 /// pairs for that (z,w) boundary. This gives us the (z,w) → [(x,y)] mapping for free.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 pub const DEAD: u32 = 0;
 pub const LEAF: u32 = u32::MAX;
@@ -33,15 +33,225 @@ pub struct ZwFirstMdd {
 
 impl ZwFirstMdd {
     pub fn build(k: usize) -> Self {
+        Self::build_inner(k, None, None)
+    }
+
+    /// Build with parallel branches using rayon.
+    /// parallel_depth=1: 4 subtrees (level 1). parallel_depth=2: 16 subtrees (levels 1+2).
+    pub fn build_parallel(k: usize) -> Self {
+        // Choose depth based on available cores
+        let ncores = rayon::current_num_threads();
+        let parallel_depth = if ncores >= 16 { 2 } else { 1 };
+        Self::build_parallel_depth(k, parallel_depth)
+    }
+
+    pub fn build_parallel_depth(k: usize, parallel_depth: usize) -> Self {
+        use rayon::prelude::*;
+
+        let start = std::time::Instant::now();
+
+        // Generate all branch combinations for the given depth.
+        // Level 0 has 1 branch (symmetry: 0b11). Levels 1..depth have 4 each.
+        // Total subtrees = 4^parallel_depth
+        let num_subtrees = 4u32.pow(parallel_depth as u32);
+        eprintln!("  Parallel build: {} subtrees (depth {}, {} cores)...",
+            num_subtrees, parallel_depth, rayon::current_num_threads());
+
+        // Each subtree is identified by a Vec of branch choices at levels 1..parallel_depth
+        let subtree_branches: Vec<Vec<u32>> = (0..num_subtrees).map(|idx| {
+            (0..parallel_depth).map(|d| (idx >> (d * 2)) & 3).collect()
+        }).collect();
+
+        // Build each subtree independently in parallel
+        let branch_results: Vec<(Self, Vec<u32>)> = subtree_branches.into_par_iter().map(|branches| {
+            let mdd = Self::build_inner(k, None, Some(&branches));
+            (mdd, branches)
+        }).collect();
+
+        eprintln!("  Parallel build: all subtrees done in {:.1?}, merging...", start.elapsed());
+
+        // Merge: combine independent subtree MDDs into one.
+        // Each subtree MDD has a path from root through the restricted levels.
+        // We extract the actual subtree root and build shared prefix levels.
+
+        let mut merged_nodes: Vec<[u32; 4]> = Vec::new();
+        merged_nodes.push([DEAD; 4]); // node 0 = DEAD sentinel
+
+        // Extract subtree roots and copy nodes with ID remapping.
+        // Key: branch path (Vec<u32>) → remapped subtree root
+        let mut subtree_map: HashMap<Vec<u32>, u32> = HashMap::default();
+
+        for (mdd, branches) in &branch_results {
+            let offset = merged_nodes.len() as u32;
+
+            // Copy nodes (skip sentinel)
+            for node in &mdd.nodes[1..] {
+                let mut remapped = [DEAD; 4];
+                for j in 0..4 {
+                    let c = node[j];
+                    remapped[j] = if c == DEAD || c == LEAF { c }
+                                  else { c - 1 + offset };
+                }
+                merged_nodes.push(remapped);
+            }
+
+            // Navigate from root through restricted levels to find subtree root
+            let mut nid = mdd.root;
+            if nid != DEAD && nid != LEAF {
+                // Level 0: symmetry breaking → branch 3 (0b11)
+                nid = mdd.nodes[nid as usize][3];
+            }
+            for &b in branches {
+                if nid == DEAD || nid == LEAF { break; }
+                nid = mdd.nodes[nid as usize][b as usize];
+            }
+            // Remap the subtree root
+            let remapped_root = if nid == DEAD || nid == LEAF { nid }
+                                else { nid - 1 + offset };
+            subtree_map.insert(branches.clone(), remapped_root);
+        }
+
+        // Build the shared prefix levels bottom-up.
+        // For depth=2: build level-2 nodes (4 children each from subtrees),
+        // then level-1 nodes, then level-0.
+        fn build_prefix_level(
+            depth: usize, max_depth: usize,
+            path: &mut Vec<u32>,
+            subtree_map: &HashMap<Vec<u32>, u32>,
+            nodes: &mut Vec<[u32; 4]>,
+        ) -> u32 {
+            if depth == max_depth {
+                // Leaf of prefix: look up subtree root
+                return *subtree_map.get(path).unwrap_or(&DEAD);
+            }
+            let mut children = [DEAD; 4];
+            for b in 0u32..4 {
+                path.push(b);
+                children[b as usize] = build_prefix_level(
+                    depth + 1, max_depth, path, subtree_map, nodes,
+                );
+                path.pop();
+            }
+            // Reduce
+            if children.iter().all(|&c| c == DEAD) { return DEAD; }
+            let first = children[0];
+            if children.iter().all(|&c| c == first) { return first; }
+            let nid = nodes.len() as u32;
+            nodes.push(children);
+            nid
+        }
+
+        // Build level 1..parallel_depth nodes
+        let mut path = Vec::new();
+        let level1_root = build_prefix_level(0, parallel_depth, &mut path, &subtree_map, &mut merged_nodes);
+
+        // Build level-0 node (symmetry: only branch 3 = 0b11)
+        let mut level0_children = [DEAD; 4];
+        level0_children[3] = level1_root;
+        let mut root = merged_nodes.len() as u32;
+        merged_nodes.push(level0_children);
+
+        // Dedup pass: merge identical nodes across branches.
+        // Bottom-up: walk nodes in reverse, hash each, and remap duplicates.
+        let before_dedup = merged_nodes.len();
+        {
+            let mut canon: HashMap<[u32; 4], u32> = HashMap::default();
+            let mut remap = vec![0u32; merged_nodes.len()];
+            remap[0] = DEAD; // sentinel
+
+            // Forward pass: identify canonical nodes
+            let mut new_nodes: Vec<[u32; 4]> = Vec::with_capacity(merged_nodes.len());
+            new_nodes.push([DEAD; 4]); // sentinel
+            for old_id in 1..merged_nodes.len() {
+                // Remap children first
+                let mut ch = merged_nodes[old_id];
+                for c in ch.iter_mut() {
+                    if *c != DEAD && *c != LEAF {
+                        *c = remap[*c as usize];
+                    }
+                }
+                // Check for reduction (all children same)
+                if ch.iter().all(|&c| c == DEAD) {
+                    remap[old_id] = DEAD;
+                } else {
+                    let first = ch[0];
+                    if ch.iter().all(|&c| c == first) {
+                        remap[old_id] = first;
+                    } else if let Some(&existing) = canon.get(&ch) {
+                        remap[old_id] = existing;
+                    } else {
+                        let new_id = new_nodes.len() as u32;
+                        new_nodes.push(ch);
+                        canon.insert(ch, new_id);
+                        remap[old_id] = new_id;
+                    }
+                }
+            }
+            // Remap root
+            root = if root == DEAD || root == LEAF { root } else { remap[root as usize] };
+            merged_nodes = new_nodes;
+        }
+
+        eprintln!("  Dedup: {} → {} nodes ({:.0}% reduction)",
+            before_dedup, merged_nodes.len(),
+            (1.0 - merged_nodes.len() as f64 / before_dedup as f64) * 100.0);
+
         let zw_depth = 2 * k;
         let total_depth = 4 * k;
-
-        // Bouncing position order (same for both halves)
         let mut pos_order: Vec<usize> = Vec::with_capacity(2 * k);
         for t in 0..k {
             pos_order.push(t);
             pos_order.push(2 * k - 1 - t);
         }
+
+        eprintln!("ZW-first MDD k={} (parallel): {} nodes, {:.1} MB, {:.1?}",
+            k, merged_nodes.len(), merged_nodes.len() as f64 * 16.0 / 1_048_576.0,
+            start.elapsed());
+
+        ZwFirstMdd {
+            nodes: merged_nodes,
+            root,
+            k,
+            zw_pos_order: pos_order.clone(),
+            xy_pos_order: pos_order,
+            zw_depth,
+            total_depth,
+        }
+    }
+
+    fn build_inner(k: usize, restrict_level1: Option<u32>, restrict_branches: Option<&[u32]>) -> Self {
+        let zw_depth = 2 * k;
+        let total_depth = 4 * k;
+
+        // Position order (configurable via MDD_ORDER env var)
+        let order_name = std::env::var("MDD_ORDER").unwrap_or_else(|_| "bounce".to_string());
+        let mut pos_order: Vec<usize> = Vec::with_capacity(2 * k);
+        match order_name.as_str() {
+            "linear" => {
+                for i in 0..2*k { pos_order.push(i); }
+            }
+            "reverse" => {
+                for i in (0..2*k).rev() { pos_order.push(i); }
+            }
+            "prefix_first" => {
+                for i in 0..k { pos_order.push(i); }
+                for i in (k..2*k).rev() { pos_order.push(i); }
+            }
+            "inner_out" => {
+                // Inner to outer (reverse bouncing)
+                for t in (0..k).rev() {
+                    pos_order.push(k - 1 - t);
+                    pos_order.push(k + t);
+                }
+            }
+            _ => {
+                // Default bouncing order (outer to inner)
+                for t in 0..k {
+                    pos_order.push(t);
+                    pos_order.push(2 * k - 1 - t);
+                }
+            }
+        };
 
         let mut pos_to_level: Vec<usize> = vec![0; 2 * k];
         for (level, &pos) in pos_order.iter().enumerate() {
@@ -117,6 +327,28 @@ impl ZwFirstMdd {
             xy_max_abs.push(2 * lag.xy_pairs.len() as i32);
         }
 
+        // Max remaining contribution per lag for range pruning
+        // ZW events: |2*za*zb| = 2 or |2*wa*wb| = 2
+        let mut zw_max_remaining: Vec<Vec<i32>> = vec![vec![0i32; k]; zw_depth + 1];
+        for (li, lag) in lags.iter().enumerate() {
+            for &(a, b) in &lag.z_pairs {
+                let complete = pos_to_level[a].max(pos_to_level[b]);
+                for level in 0..=complete { zw_max_remaining[level][li] += 2; }
+            }
+            for &(a, b) in &lag.w_pairs {
+                let complete = pos_to_level[a].max(pos_to_level[b]);
+                for level in 0..=complete { zw_max_remaining[level][li] += 2; }
+            }
+        }
+        // XY events: |xa*xb + ya*yb| <= 2
+        let mut xy_max_remaining: Vec<Vec<i32>> = vec![vec![0i32; k]; zw_depth + 1];
+        for (li, lag) in lags.iter().enumerate() {
+            for &(a, b) in &lag.xy_pairs {
+                let complete = pos_to_level[a].max(pos_to_level[b]);
+                for level in 0..=complete { xy_max_remaining[level][li] += 2; }
+            }
+        }
+
         // Active position tracking for z,w half
         let mut zw_last_use: Vec<usize> = vec![0; 2 * k];
         for (level, events) in zw_events_at_level.iter().enumerate() {
@@ -171,12 +403,16 @@ impl ZwFirstMdd {
             zw_lag_check_at_level: Vec<Vec<usize>>,
             xy_lag_check_at_level: Vec<Vec<usize>>,
             xy_max_abs: Vec<i32>,
+            zw_max_remaining: Vec<Vec<i32>>,
+            xy_max_remaining: Vec<Vec<i32>>,
             zw_active_at_level: Vec<Vec<usize>>,
             zw_active_indices: Vec<HashMap<usize, usize>>,
             xy_active_at_level: Vec<Vec<usize>>,
             xy_active_indices: Vec<HashMap<usize, usize>>,
             k: usize,
             zw_depth: usize,
+            restrict_level1: Option<u32>,
+            restrict_branches: Vec<(usize, u32)>, // (level, required_branch)
         }
 
         let ctx = Ctx {
@@ -190,22 +426,47 @@ impl ZwFirstMdd {
             zw_lag_check_at_level,
             xy_lag_check_at_level,
             xy_max_abs,
+            zw_max_remaining,
+            xy_max_remaining,
             zw_active_at_level,
             zw_active_indices,
             xy_active_at_level,
             xy_active_indices,
             k,
             zw_depth,
+            restrict_level1,
+            restrict_branches: match restrict_branches {
+                Some(branches) => branches.iter().enumerate()
+                    .map(|(d, &b)| (d + 1, b)) // level 1, 2, ... (skip level 0 symmetry)
+                    .collect(),
+                None => Vec::new(),
+            },
         };
 
         let mut nodes: Vec<[u32; 4]> = Vec::new();
         nodes.push([DEAD; 4]); // node 0 = DEAD
 
-        let mut unique: HashMap<(u8, [u32; 4]), u32> = HashMap::new();
+        fn hash_node4(level: u8, children: &[u32; 4]) -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut h = rustc_hash::FxHasher::default();
+            level.hash(&mut h);
+            for &c in children { c.hash(&mut h); }
+            h.finish()
+        }
+        let mut unique: HashMap<u64, u32> = HashMap::default();
 
-        type StateKey = (Vec<i8>, u64);
-        let mut zw_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::new()).collect();
-        let mut xy_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::new()).collect();
+        type StateKey = (u128, u64);
+        type XyStateKey = (u128, u64); // (packed_sums, packed_active) - cleared per zw_sums
+        let mut zw_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
+        let mut xy_memo: Vec<HashMap<XyStateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
+
+        fn pack_sums(sums: &[i8]) -> u128 {
+            let mut packed = 0u128;
+            for (i, &s) in sums.iter().enumerate() {
+                packed |= ((s as u8 as u128) & 0xFF) << (i * 8);
+            }
+            packed
+        }
 
         fn pack_active(vals: &[u8]) -> u64 {
             let mut packed = 0u64;
@@ -228,8 +489,8 @@ impl ZwFirstMdd {
             zw_sums: &[i8],  // target: sums[li] must equal -zw_sums[li] at end
             ctx: &Ctx,
             nodes: &mut Vec<[u32; 4]>,
-            unique: &mut HashMap<(u8, [u32; 4]), u32>,
-            memo: &mut Vec<HashMap<StateKey, u32>>,
+            unique: &mut HashMap<u64, u32>,
+            memo: &mut Vec<HashMap<XyStateKey, u32>>,
         ) -> u32 {
             if level == ctx.zw_depth {
                 // Check all lags: N_X + N_Y = -zw_sums
@@ -259,7 +520,7 @@ impl ZwFirstMdd {
             let new_pos = ctx.pos_order[level];
             let new_idx = ctx.xy_active_indices[level][&new_pos];
 
-            let state_key = (sums.clone(), pack_active(&current_vals));
+            let state_key = (pack_sums(sums), pack_active(&current_vals));
             if let Some(&cached) = memo[level].get(&state_key) {
                 return cached;
             }
@@ -277,7 +538,7 @@ impl ZwFirstMdd {
 
                 current_vals[new_idx] = branch as u8;
 
-                let sums_backup: Vec<i8> = sums.clone();
+                let sums_backup = pack_sums(sums);
 
                 // Process XY pair events at this level
                 for &(lag_idx, pos_a, pos_b) in &ctx.xy_events_at_level[level] {
@@ -297,6 +558,14 @@ impl ZwFirstMdd {
                 for &li in &ctx.xy_lag_check_at_level[level] {
                     if sums[li] != -zw_sums[li] { ok = false; break; }
                 }
+                // Range check: can remaining XY events bring sums to -zw_sums?
+                if ok && level + 1 < ctx.zw_depth {
+                    for li in 0..ctx.k {
+                        let gap = (sums[li] as i32) - (-(zw_sums[li] as i32));
+                        let remaining = ctx.xy_max_remaining[level + 1][li];
+                        if gap.abs() > remaining { ok = false; break; }
+                    }
+                }
 
                 if ok {
                     children[branch as usize] = build_xy(
@@ -305,7 +574,10 @@ impl ZwFirstMdd {
                     );
                 }
 
-                sums.copy_from_slice(&sums_backup);
+                // Restore sums from packed backup
+                for i in 0..sums.len() {
+                    sums[i] = ((sums_backup >> (i * 8)) & 0xFF) as i8;
+                }
             }
 
             let result = if children.iter().all(|&c| c == DEAD) {
@@ -315,7 +587,7 @@ impl ZwFirstMdd {
                 if children.iter().all(|&c| c == first) {
                     first
                 } else {
-                    let key = (unique_level, children);
+                    let key = hash_node4(unique_level, &children);
                     if let Some(&nid) = unique.get(&key) { nid }
                     else {
                         let nid = nodes.len() as u32;
@@ -337,13 +609,19 @@ impl ZwFirstMdd {
             active_bits: &mut Vec<u8>,
             ctx: &Ctx,
             nodes: &mut Vec<[u32; 4]>,
-            unique: &mut HashMap<(u8, [u32; 4]), u32>,
+            unique: &mut HashMap<u64, u32>,
             zw_memo: &mut Vec<HashMap<StateKey, u32>>,
-            xy_memo: &mut Vec<HashMap<StateKey, u32>>,
+            xy_memo: &mut Vec<HashMap<XyStateKey, u32>>,
+            zw_memo_count: &mut usize,
+            max_memo_entries: usize,
+            per_level_cap: usize,
         ) -> u32 {
             if level == ctx.zw_depth {
                 // ZW half done. Build XY sub-MDD for these zw_sums.
-                let zw_sums = sums.clone();
+                // Clear xy_memo for each distinct zw_sums to prevent memory explosion.
+                // Nodes are still shared via the `unique` table.
+                for m in xy_memo.iter_mut() { m.clear(); }
+                let zw_sums: Vec<i8> = sums.to_vec();
                 let mut xy_sums = vec![0i8; ctx.k];
                 let mut xy_active: Vec<u8> = Vec::new();
                 return build_xy(
@@ -372,7 +650,7 @@ impl ZwFirstMdd {
             let new_pos = ctx.pos_order[level];
             let new_idx = ctx.zw_active_indices[level][&new_pos];
 
-            let state_key = (sums.clone(), pack_active(&current_vals));
+            let state_key = (pack_sums(sums), pack_active(&current_vals));
             if let Some(&cached) = zw_memo[level].get(&state_key) {
                 return cached;
             }
@@ -385,9 +663,19 @@ impl ZwFirstMdd {
                 // Symmetry breaking: z[0]=w[0]=+1
                 if new_pos == 0 && branch != 0b11 { continue; }
 
+                // For parallel builds: restrict to specific branches at specified levels
+                if let Some(target) = ctx.restrict_level1 {
+                    if level == 1 && branch != target { continue; }
+                }
+                let mut skip = false;
+                for &(rlevel, rbranch) in &ctx.restrict_branches {
+                    if level == rlevel && branch != rbranch { skip = true; break; }
+                }
+                if skip { continue; }
+
                 current_vals[new_idx] = branch as u8;
 
-                let sums_backup: Vec<i8> = sums.clone();
+                let sums_backup = pack_sums(sums);
 
                 // Process ZW pair events at this level
                 for &(lag_idx, pos_a, pos_b, is_z) in &ctx.zw_events_at_level[level] {
@@ -415,15 +703,35 @@ impl ZwFirstMdd {
                     if zw_val.abs() > max_xy { ok = false; break; }
                     if (zw_val + max_xy) % 2 != 0 { ok = false; break; }
                 }
+                // Range check: can remaining ZW events keep sums achievable?
+                if ok && level + 1 < ctx.zw_depth {
+                    for li in 0..ctx.k {
+                        let zw_val = sums[li] as i32;
+                        let zw_remaining = ctx.zw_max_remaining[level + 1][li];
+                        let max_xy = ctx.xy_max_abs[li];
+                        // After all ZW events: zw_val + remaining_zw in [-max_zw_total, +max_zw_total]
+                        // Need: |final_zw_val| <= max_xy and right parity
+                        // Quick check: if |zw_val| - zw_remaining > max_xy, impossible
+                        if (zw_val.abs() - zw_remaining) > max_xy { ok = false; break; }
+                    }
+                }
 
                 if ok {
                     children[branch as usize] = build_zw(
                         level + 1, sums, &mut current_vals,
                         ctx, nodes, unique, zw_memo, xy_memo,
+                        zw_memo_count, max_memo_entries, per_level_cap,
                     );
+                    if level == 1 {
+                        eprint!("\r  ZW level 1 branch {}/4, {} nodes, zw_memo={}   ",
+                            branch + 1, nodes.len(), *zw_memo_count);
+                    }
                 }
 
-                sums.copy_from_slice(&sums_backup);
+                // Restore sums from packed backup
+                for i in 0..sums.len() {
+                    sums[i] = ((sums_backup >> (i * 8)) & 0xFF) as i8;
+                }
             }
 
             let result = if children.iter().all(|&c| c == DEAD) {
@@ -433,7 +741,7 @@ impl ZwFirstMdd {
                 if children.iter().all(|&c| c == first) {
                     first
                 } else {
-                    let key = (level as u8, children);
+                    let key = hash_node4(level as u8, &children);
                     if let Some(&nid) = unique.get(&key) { nid }
                     else {
                         let nid = nodes.len() as u32;
@@ -444,15 +752,35 @@ impl ZwFirstMdd {
                 }
             };
 
+            // Cap total memo entries to prevent OOM at large k.
+            // When over budget, evict the level with the most entries (typically deepest).
+            if *zw_memo_count >= max_memo_entries {
+                let (max_lvl, _) = zw_memo.iter().enumerate()
+                    .max_by_key(|(_, m)| m.len()).unwrap();
+                if zw_memo[max_lvl].len() > 0 {
+                    *zw_memo_count -= zw_memo[max_lvl].len();
+                    zw_memo[max_lvl].clear();
+                }
+            }
             zw_memo[level].insert(state_key, result);
+            *zw_memo_count += 1;
             result
         }
 
+        // Budget memo: ~140 bytes/entry in FxHashMap.
+        // When running as a parallel branch, use 1/4 of the budget.
+        let num_parallel = if restrict_branches.is_some() {
+            4u32.pow(restrict_branches.unwrap().len() as u32) as usize
+        } else if restrict_level1.is_some() { 4 } else { 1 };
+        let max_memo_entries: usize = 50_000_000 / num_parallel; // ~7GB total budget
+        let per_level_cap: usize = max_memo_entries / (zw_depth + 1);
+        let mut zw_memo_count: usize = 0;
         let mut sums = vec![0i8; k];
         let mut active_bits: Vec<u8> = Vec::new();
         let root = build_zw(
             0, &mut sums, &mut active_bits,
             &ctx, &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo,
+            &mut zw_memo_count, max_memo_entries, per_level_cap,
         );
 
         let zw_memo_entries: usize = zw_memo.iter().map(|m| m.len()).sum();
@@ -549,7 +877,7 @@ impl ZwFirstMdd {
 
     /// Count paths through XY sub-MDD from a given root.
     pub fn count_xy_paths(&self, xy_root: u32) -> u128 {
-        let mut memo: HashMap<u32, u128> = HashMap::new();
+        let mut memo: HashMap<u32, u128> = HashMap::default();
         self.count_xy_rec(xy_root, 0, &mut memo)
     }
 
