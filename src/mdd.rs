@@ -510,6 +510,7 @@ impl ZwProjection {
 impl BoundaryMdd {
     /// Enumerate all valid (z,w,x,y) boundary 4-tuples.
     /// More efficient than enumerate_zw + query_xy because it walks once.
+    #[allow(dead_code)]
     pub fn enumerate_all<F: FnMut(u32, u32, u32, u32)>(&self, mut callback: F) {
         self.walk_all(self.root, 0, 0, 0, 0, 0, &mut callback);
     }

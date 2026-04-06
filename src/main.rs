@@ -662,25 +662,29 @@ fn generate_sequences_with_sum_visit<F: FnMut(&[i8]) -> bool>(
 }
 
 /// Print search space statistics for a set of tuples.
-/// For each tuple, shows C(n, (n+s)/2) for each sequence — the number of
-/// {+1,-1} strings of the given length with the given sum.
+/// For each tuple, shows k!n (J notation for binomial) for each sequence —
+/// the number of {+1,-1} strings of the given length with the given sum.
 fn print_search_space(problem: Problem, tuples: &[SumTuple]) {
     let n = problem.n;
     let m = problem.m();
     let mut grand_total: f64 = 0.0;
     for t in tuples {
-        let cx = binom(n, ((t.x + n as i32) / 2) as usize);
-        let cy = binom(n, ((t.y + n as i32) / 2) as usize);
-        let cz = binom(n, ((t.z + n as i32) / 2) as usize);
-        let cw = binom(m, ((t.w + m as i32) / 2) as usize);
+        let kx = ((t.x + n as i32) / 2) as usize;
+        let ky = ((t.y + n as i32) / 2) as usize;
+        let kz = ((t.z + n as i32) / 2) as usize;
+        let kw = ((t.w + m as i32) / 2) as usize;
+        let cx = binom(n, kx);
+        let cy = binom(n, ky);
+        let cz = binom(n, kz);
+        let cw = binom(m, kw);
         let prod = cx as f64 * cy as f64 * cz as f64 * cw as f64;
         grand_total += prod;
-        eprintln!("  ({:>2},{:>2},{:>2},{:>2})  X:C({},{})={:.3e}  Y:C({},{})={:.3e}  Z:C({},{})={:.3e}  W:C({},{})={:.3e}  total {:.3e}",
+        eprintln!("  {:>2} {:>2} {:>2} {:>2}   X:{}!{}={:.3e}  Y:{}!{}={:.3e}  Z:{}!{}={:.3e}  W:{}!{}={:.3e}  total {:.3e}",
             t.x, t.y, t.z, t.w,
-            n, (t.x + n as i32) / 2, cx as f64,
-            n, (t.y + n as i32) / 2, cy as f64,
-            n, (t.z + n as i32) / 2, cz as f64,
-            m, (t.w + m as i32) / 2, cw as f64,
+            kx, n, cx as f64,
+            ky, n, cy as f64,
+            kz, n, cz as f64,
+            kw, m, cw as f64,
             prod);
     }
     eprintln!("  Brute-force search space (all tuples): {:.3e}", grand_total);
@@ -3975,7 +3979,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
             let z_gen = stats.z_generated - before.0;
             let z_ok = stats.z_spectral_ok - before.1;
             let pairs = stats.candidate_pair_spectral_ok - before.2;
-            eprintln!("  tuple {}/{} (sums {},{},{},{}): z_gen={} z_ok={} w={} pairs={}",
+            eprintln!("  tuple {}/{} (sums {} {} {} {}): z_gen={} z_ok={} w={} pairs={}",
                 idx+1, tuples.len(), tuple.x, tuple.y, tuple.z, tuple.w,
                 z_gen, z_ok, w_candidates.len(), pairs);
         }
@@ -4230,11 +4234,8 @@ fn main() {
     tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
 
         if phase == "phase-a" {
-            println!("TT({}): {} tuples (x,y,z,w) satisfying x²+y²+2z²+2w²={}",
+            eprintln!("TT({}): {} tuples (x,y,z,w) satisfying x²+y²+2z²+2w²={}",
                 problem.n, tuples.len(), problem.target_energy());
-            for t in &tuples {
-                println!("  ({},{},{},{})", t.x, t.y, t.z, t.w);
-            }
             print_search_space(problem, &tuples);
         } else if phase == "phase-b" {
             let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
@@ -4243,7 +4244,7 @@ fn main() {
                 let mut stats = SearchStats::default();
                 let start = Instant::now();
                 let candidates = build_zw_candidates(problem, *tuple, &cfg, &spectral_z, &spectral_w, &mut stats, &AtomicBool::new(false));
-                println!("({},{},{},{}): z={}/{} w={}/{} pairs={} ({:.3?})",
+                println!("{} {} {} {}: z={}/{} w={}/{} pairs={} ({:.3?})",
                     tuple.x, tuple.y, tuple.z, tuple.w,
                     stats.z_spectral_ok, stats.z_generated,
                     stats.w_spectral_ok, stats.w_generated,
@@ -4358,6 +4359,8 @@ mod tests {
             sat_config: radical::SolverConfig::default(),
             sat_secs: 0,
             quad_pb: true,
+            use_mdd: false,
+            mdd_k: 8,
         };
         let report = run_hybrid_search(&cfg, false);
         assert!(report.found_solution, "n=4 hybrid should find solution");
