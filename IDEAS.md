@@ -548,6 +548,12 @@ W middles depend only on (middle_m, w_mid_sum), not boundary bits. Generate ONCE
 
 **Result:** n=18 k=4: 45.3ms → 43.9ms. n=24 k=4: ~70s → ~63s. **Accepted.**
 
+### W7. Group boundary entries by (w_bits, z_bits) — **Implemented**
+
+Entries with identical (w_bits, z_bits) share BOTH W and Z spectral filtering + pair checking. Only the XY sub-MDD walk differs per entry. Combined with W6 (hoisted W generation), this eliminates ALL redundant FFT work.
+
+**Result:** n=24 k=4: ~70s → ~10-18s (cumulative **75-85% speedup** from W1+W6+W7). At n=56 k=8, 128M boundaries reduce to fewer unique (w_bits, z_bits) pairs, expected dramatic FFT savings. **Accepted.**
+
 ### W5. W autocorrelation constraints in SAT (approximate spectral filter)
 
 Add per-lag W autocorrelation decomposition to the W SAT solver: boundary×boundary (constant), boundary×middle (linear PB terms), middle×middle (quad PB terms via XNOR aux or direct quad PB). Even with trivially-satisfied per-lag bounds, the quad PB variable interactions create CDCL conflicts that bias the solver toward lower-autocorrelation (hence lower-spectral-power) solutions. Expected to increase spectral pass rate.
