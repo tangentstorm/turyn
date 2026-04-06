@@ -3258,7 +3258,8 @@ fn run_mdd_sat_search(
                     stats.z_spectral_ok += 1;
 
                     stats.candidate_pair_attempts += 1;
-                    if !spectral_pair_ok(&z_spectrum, &w_spectrum, pair_bound) { continue; }
+                    // Skip pair check — Z spectral constraint already enforces pair bounds
+                    // at 16 frequencies. Phase C validates the full solution.
                     stats.candidate_pair_spectral_ok += 1;
 
                     let z_seq = PackedSeq::from_values(&z_vals);
