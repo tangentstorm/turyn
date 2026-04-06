@@ -9,7 +9,7 @@
 ///   u32::MAX   = LEAF (valid terminal)
 ///   other      = index into nodes[]
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 pub const DEAD: u32 = 0;
 pub const LEAF: u32 = u32::MAX;
@@ -155,10 +155,10 @@ impl BoundaryMdd {
         let mut nodes: Vec<[u32; 16]> = Vec::new();
         nodes.push([DEAD; 16]); // node 0 = DEAD
 
-        let mut unique: HashMap<(u8, [u32; 16]), u32> = HashMap::new();
+        let mut unique: HashMap<(u8, [u32; 16]), u32> = HashMap::default();
 
         type StateKey = (u128, u64);
-        let mut memo: Vec<HashMap<StateKey, u32>> = (0..=depth).map(|_| HashMap::new()).collect();
+        let mut memo: Vec<HashMap<StateKey, u32>> = (0..=depth).map(|_| HashMap::default()).collect();
 
         fn pack_sums(sums: &[i8]) -> u128 {
             let mut packed = 0u128;
@@ -357,8 +357,8 @@ impl BoundaryMdd {
         let mut nodes_4: Vec<[u32; 4]> = Vec::new();
         nodes_4.push([DEAD; 4]); // node 0 = DEAD
 
-        let mut unique_4: HashMap<(u8, [u32; 4]), u32> = HashMap::new();
-        let mut memo: HashMap<u32, u32> = HashMap::new();
+        let mut unique_4: HashMap<(u8, [u32; 4]), u32> = HashMap::default();
+        let mut memo: HashMap<u32, u32> = HashMap::default();
 
         let root = Self::project_node(
             self.root, 0, &self.nodes, self.k,
@@ -552,7 +552,7 @@ impl ZwProjection {
 
     /// Count total valid (z,w) pairs.
     pub fn count_paths(&self) -> u128 {
-        let mut memo: HashMap<u32, u128> = HashMap::new();
+        let mut memo: HashMap<u32, u128> = HashMap::default();
         fn count(nid: u32, nodes: &[[u32; 4]], memo: &mut HashMap<u32, u128>) -> u128 {
             if nid == DEAD { return 0; }
             if nid == LEAF { return 1; }

@@ -12,7 +12,7 @@
 /// Each path through the top half arrives at a node that roots the sub-MDD of valid (x,y)
 /// pairs for that (z,w) boundary. This gives us the (z,w) → [(x,y)] mapping for free.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 pub const DEAD: u32 = 0;
 pub const LEAF: u32 = u32::MAX;
@@ -201,12 +201,12 @@ impl ZwFirstMdd {
         let mut nodes: Vec<[u32; 4]> = Vec::new();
         nodes.push([DEAD; 4]); // node 0 = DEAD
 
-        let mut unique: HashMap<(u8, [u32; 4]), u32> = HashMap::new();
+        let mut unique: HashMap<(u8, [u32; 4]), u32> = HashMap::default();
 
         type StateKey = (u128, u64);
         type XyStateKey = (u128, u64); // (packed_sums, packed_active) - cleared per zw_sums
-        let mut zw_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::new()).collect();
-        let mut xy_memo: Vec<HashMap<XyStateKey, u32>> = (0..=zw_depth).map(|_| HashMap::new()).collect();
+        let mut zw_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
+        let mut xy_memo: Vec<HashMap<XyStateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
 
         fn pack_sums(sums: &[i8]) -> u128 {
             let mut packed = 0u128;
@@ -567,7 +567,7 @@ impl ZwFirstMdd {
 
     /// Count paths through XY sub-MDD from a given root.
     pub fn count_xy_paths(&self, xy_root: u32) -> u128 {
-        let mut memo: HashMap<u32, u128> = HashMap::new();
+        let mut memo: HashMap<u32, u128> = HashMap::default();
         self.count_xy_rec(xy_root, 0, &mut memo)
     }
 

@@ -30,3 +30,4 @@ time target/release/gen_mdd 10 /dev/null
 | | (baseline) | | k=7: 4.7s, k=8: 46.6s, k=9: >120s |
 | 2026-04-06 | Pack sums u128 + periodic GC in reorder | Eliminates Vec<i8> heap allocs; GC reduces reorder peak memory 3x | k=8: 46.6→39.5s (-15%); k=9: timeout→7m56s (works!) |
 | 2026-04-06 | Partial lag range pruning | Prunes branches where partial sums exceed remaining event budget | k=8: 39.5→25.4s (-36%); k=9: 7m56→4m43 (-40%) |
+| 2026-04-06 | FxHashMap (rustc-hash) for all memo/unique tables | FxHash ~4x faster than SipHash for u128/u64 keys | k=8: 25.4→11.1s (-56%); k=9: 4m43→2m12 (-53%) |

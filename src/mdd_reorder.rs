@@ -6,7 +6,7 @@
 /// Result: depth 4k, first 2k levels branch on (z,w), last 2k on (x,y).
 /// Each ZW path arrives at a node that roots the XY sub-MDD.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 use std::io::Write;
 
 pub const DEAD: u32 = 0;
@@ -91,8 +91,8 @@ pub fn split_16_to_4(
     let depth_4 = depth_16 * 2;
     let mut nodes_4: Vec<[u32; 4]> = Vec::new();
     nodes_4.push([DEAD; 4]); // node 0 = DEAD
-    let mut unique: HashMap<(u16, [u32; 4]), u32> = HashMap::new();
-    let mut memo: HashMap<u32, u32> = HashMap::new();
+    let mut unique: HashMap<(u16, [u32; 4]), u32> = HashMap::default();
+    let mut memo: HashMap<u32, u32> = HashMap::default();
 
     fn convert(
         nid_16: u32,
@@ -170,7 +170,7 @@ fn swap_adjacent_inplace(mdd: &mut Mdd4, level: u16) {
     //
     // After:  node branches on var_{L+1}, children branch on var_L
     //   node[j] = new_inner_j, new_inner_j[i] = D[i][j]
-    let mut inner_unique: HashMap<[u32; 4], u32> = HashMap::with_capacity(at_level.len() * 2);
+    let mut inner_unique: HashMap<[u32; 4], u32> = HashMap::default();
 
     for &nid in &at_level {
         let ch = mdd.nodes[nid as usize];
