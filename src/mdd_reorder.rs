@@ -323,6 +323,166 @@ pub fn reorder_zw_first(
     mdd4
 }
 
+/// Split a 4-way MDD into a 2-way MDD (encoded in [u32;4] with ch[2]=ch[3]=DEAD).
+/// Each 4-way level becomes two 2-way levels: bit0 first, then bit1.
+/// (z,w) node → z-level then w-level; (x,y) node → x-level then y-level.
+/// Depth doubles: 4k → 8k.
+pub fn split_4_to_2(mdd4: &Mdd4) -> Mdd4 {
+    let depth_old = mdd4.depth;
+    let depth_new = depth_old * 2;
+    let mut nodes: Vec<[u32; 4]> = Vec::new();
+    nodes.push([DEAD; 4]); // node 0 = DEAD
+    let mut unique: HashMap<(u16, [u32; 4]), u32> = HashMap::default();
+    let mut memo: HashMap<u32, u32> = HashMap::default();
+
+    fn convert(
+        nid: u32,
+        level: usize,
+        depth: usize,
+        old_nodes: &[[u32; 4]],
+        nodes: &mut Vec<[u32; 4]>,
+        unique: &mut HashMap<(u16, [u32; 4]), u32>,
+        memo: &mut HashMap<u32, u32>,
+    ) -> u32 {
+        if nid == DEAD { return DEAD; }
+        if nid == LEAF { return LEAF; }
+        if let Some(&cached) = memo.get(&nid) { return cached; }
+
+        let level_bit0 = (level * 2) as u16;
+        let level_bit1 = level_bit0 + 1;
+        let ch4 = &old_nodes[nid as usize];
+
+        // For each bit0 value, create a bit1 sub-node
+        let mut bit0_children = [DEAD; 4]; // only [0] and [1] used
+        for b0 in 0u32..2 {
+            let mut bit1_children = [DEAD; 4]; // only [0] and [1] used
+            for b1 in 0u32..2 {
+                let orig_branch = b0 | (b1 << 1); // bit0=b0, bit1=b1
+                let child = ch4[orig_branch as usize];
+                bit1_children[b1 as usize] = convert(
+                    child, level + 1, depth,
+                    old_nodes, nodes, unique, memo,
+                );
+            }
+            bit0_children[b0 as usize] = Mdd4::make_node(nodes, unique, level_bit1, bit1_children);
+        }
+        let result = Mdd4::make_node(nodes, unique, level_bit0, bit0_children);
+        memo.insert(nid, result);
+        result
+    }
+
+    let root = convert(mdd4.root, 0, depth_old, &mdd4.nodes, &mut nodes, &mut unique, &mut memo);
+    Mdd4 { nodes, root, k: mdd4.k, depth: depth_new }
+}
+
+/// Reorder a ZW-first Mdd4 so each variable gets its own contiguous layer.
+/// Input:  4k levels of 4-way: [zw_0..zw_{2k-1}, xy_0..xy_{2k-1}]
+/// Step 1: Split 4-way → 2-way: [z0,w0,z1,w1,..., x0,y0,x1,y1,...]  (8k levels)
+/// Step 2: Bubble sort within each half to group variables:
+///         [z0,z1,...,w0,w1,..., x0,x1,...,y0,y1,...]
+pub fn reorder_4_layers(mdd4: &Mdd4) -> Mdd4 {
+    eprintln!("Splitting 4-way → 2-way ({} → {} levels)...", mdd4.depth, mdd4.depth * 2);
+    let mut mdd2 = split_4_to_2(mdd4);
+    eprintln!("  Split: {} nodes", mdd2.nodes.len());
+
+    let k = mdd2.k;
+    let zw_half = 4 * k; // 2k original levels × 2 = 4k binary levels for ZW
+    let total = 8 * k;
+
+    // Labels: within each half, alternating bit0/bit1
+    // ZW half: z0,w0,z1,w1,... → want z0,z1,...,w0,w1,...
+    // XY half: x0,y0,x1,y1,... → want x0,x1,...,y0,y1,...
+    // true = "first variable" (z or x), false = "second variable" (w or y)
+    let mut labels: Vec<bool> = Vec::with_capacity(total);
+    for _ in 0..2*k {
+        labels.push(true);  // z (or x)
+        labels.push(false); // w (or y)
+    }
+    // labels applies to both halves identically
+
+    // Count total swaps needed
+    let total_swaps_needed: usize = {
+        let mut tmp = labels[..zw_half].to_vec();
+        let mut count = 0;
+        loop {
+            let mut any = false;
+            for i in 0..tmp.len() - 1 {
+                if !tmp[i] && tmp[i + 1] { tmp.swap(i, i + 1); count += 1; any = true; }
+            }
+            if !any { break; }
+        }
+        count * 2 // same for both halves
+    };
+
+    let mut swaps_done = 0;
+    let reorder_start = std::time::Instant::now();
+    let gc_threshold = 10_000_000;
+
+    // Reorder ZW half (levels 0..zw_half)
+    eprintln!("  Reordering ZW half (z,w separation)...");
+    let mut zw_labels = labels[..zw_half].to_vec();
+    loop {
+        let mut swapped = false;
+        for i in 0..zw_half - 1 {
+            if !zw_labels[i] && zw_labels[i + 1] {
+                swap_adjacent_inplace(&mut mdd2, i as u16);
+                zw_labels.swap(i, i + 1);
+                swaps_done += 1;
+                swapped = true;
+                if total_swaps_needed >= 10 {
+                    eprint!("\r  Reorder: swap {}/{}, {} nodes, {:.1?}   ",
+                        swaps_done, total_swaps_needed, mdd2.nodes.len(), reorder_start.elapsed());
+                }
+            }
+        }
+        if mdd2.nodes.len() > gc_threshold {
+            let before = mdd2.nodes.len();
+            gc_mdd(&mut mdd2);
+            eprintln!("\r  ZW reorder: GC {} → {} nodes, {:.1?}",
+                before, mdd2.nodes.len(), reorder_start.elapsed());
+        }
+        if !swapped { break; }
+    }
+    eprintln!("\r  ZW half done: {} swaps, {} nodes, {:.1?}",
+        swaps_done, mdd2.nodes.len(), reorder_start.elapsed());
+
+    // Reorder XY half (levels zw_half..total)
+    eprintln!("  Reordering XY half (x,y separation)...");
+    let mut xy_labels = labels[..zw_half].to_vec(); // same pattern
+    loop {
+        let mut swapped = false;
+        for i in 0..zw_half - 1 {
+            let level = zw_half + i;
+            if !xy_labels[i] && xy_labels[i + 1] {
+                swap_adjacent_inplace(&mut mdd2, level as u16);
+                xy_labels.swap(i, i + 1);
+                swaps_done += 1;
+                swapped = true;
+                if total_swaps_needed >= 10 {
+                    eprint!("\r  Reorder: swap {}/{}, {} nodes, {:.1?}   ",
+                        swaps_done, total_swaps_needed, mdd2.nodes.len(), reorder_start.elapsed());
+                }
+            }
+        }
+        if mdd2.nodes.len() > gc_threshold {
+            let before = mdd2.nodes.len();
+            gc_mdd(&mut mdd2);
+            eprintln!("\r  XY reorder: GC {} → {} nodes, {:.1?}",
+                before, mdd2.nodes.len(), reorder_start.elapsed());
+        }
+        if !swapped { break; }
+    }
+    eprintln!("\r  XY half done: {} swaps, {} nodes, {:.1?}",
+        swaps_done, mdd2.nodes.len(), reorder_start.elapsed());
+
+    // Final GC
+    gc_mdd(&mut mdd2);
+    eprintln!("  4-layer reorder complete: {} nodes after GC, {:.1?}",
+        mdd2.nodes.len(), reorder_start.elapsed());
+
+    mdd2
+}
+
 /// Remove unreachable nodes and compact the node array.
 fn gc_mdd(mdd: &mut Mdd4) {
     let n = mdd.nodes.len();

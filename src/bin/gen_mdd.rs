@@ -14,6 +14,7 @@ fn main() {
         .unwrap_or(&default_out);
     let legacy = args.iter().any(|s| s == "--legacy");
     let sequential = args.iter().any(|s| s == "--sequential");
+    let four_layer = args.iter().any(|s| s == "--4layer");
     let parallel_depth: usize = args.iter()
         .position(|s| s == "--depth")
         .and_then(|i| args.get(i + 1)?.parse().ok())
@@ -55,6 +56,20 @@ fn main() {
     let size_bytes = 16 + node_count * 16;
     eprintln!("Built in {:.1}s: {} nodes, {:.1} MB",
         elapsed, node_count, size_bytes as f64 / 1_048_576.0);
+
+    if four_layer {
+        eprintln!("\n--- 4-layer experiment: separating z,w,x,y into distinct layers ---");
+        let four = turyn::mdd_reorder::reorder_4_layers(&reordered);
+        let n4 = four.nodes.len();
+        let s4 = 16 + n4 * 16;
+        eprintln!("4-layer result: {} nodes, {:.1} MB (vs {} nodes / {:.1} MB for 2-layer)",
+            n4, s4 as f64 / 1_048_576.0, node_count, size_bytes as f64 / 1_048_576.0);
+        if n4 < node_count {
+            eprintln!("  → SMALLER by {:.1}%", (1.0 - n4 as f64 / node_count as f64) * 100.0);
+        } else {
+            eprintln!("  → LARGER by {:.1}%", (n4 as f64 / node_count as f64 - 1.0) * 100.0);
+        }
+    }
 
     reordered.save(outfile).expect("Failed to write MDD file");
     let file_size = std::fs::metadata(outfile).map(|m| m.len()).unwrap_or(0);
