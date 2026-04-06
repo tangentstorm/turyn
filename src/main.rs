@@ -4534,6 +4534,11 @@ fn main() {
                 let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - state.max_bnd_sum;
                 let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - state.max_bnd_sum;
                 *state.total_zw += 1;
+                if *state.total_zw <= 5 || *state.total_zw % 100_000 == 0 {
+                    eprint!("\r  walked {} boundaries, pairs={}, w={}/{}   ",
+                        *state.total_zw, *state.grand_total_pairs,
+                        *state.grand_w_ok, *state.grand_w_gen);
+                }
                 let k = state.k;
                 let n = state.n;
                 let m = state.m;
