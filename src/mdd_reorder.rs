@@ -7,7 +7,7 @@
 /// Each ZW path arrives at a node that roots the XY sub-MDD.
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 
 pub const DEAD: u32 = 0;
 pub const LEAF: u32 = u32::MAX;
@@ -255,7 +255,6 @@ pub fn reorder_zw_first(
     // etc.
 
     let mut unique: HashMap<(u16, [u32; 4]), u32> = HashMap::new();
-    let total_swaps = k * (k - 1); // rough estimate
     let mut swaps_done = 0;
 
     // For each xy level (originally at positions 1, 3, 5, ..., 2k-1),

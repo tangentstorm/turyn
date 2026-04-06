@@ -8,10 +8,8 @@ use std::time::Instant;
 
 use rustfft::{FftPlanner, num_complex::Complex};
 
-mod mdd;
-mod mdd_reorder;
-mod mdd_zw_first;
-mod sat_z_middle;
+use turyn::mdd_reorder;
+use turyn::sat_z_middle;
 
 #[derive(Clone, Copy, Debug)]
 struct Problem {
@@ -4555,9 +4553,7 @@ fn main() {
             eprintln!("{} (z,w) boundaries in {} sum groups", total_zw, zw_by_sum.len());
 
             let spectral_w = SpectralFilter::new(m, cfg.theta_samples);
-            let spectral_z = SpectralFilter::new(n, cfg.theta_samples);
             let individual_bound = problem.spectral_bound();
-            let pair_bound = cfg.max_spectral.unwrap_or(individual_bound);
             let max_w_passing = cfg.max_w;
 
             let mut grand_total_pairs = 0u64;
@@ -4577,8 +4573,6 @@ fn main() {
                     if z_mid_sum.abs() > middle_n as i32 || (z_mid_sum + middle_n as i32) % 2 != 0 { continue; }
                     let w_mid_sum = tuple.w - w_bnd_sum;
                     if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
-
-                    let z_mid_ones = ((z_mid_sum + middle_n as i32) / 2) as usize;
 
                     // For each (z,w) boundary in this sum group
                     for &(z_bits, w_bits, _xy_root) in entries {

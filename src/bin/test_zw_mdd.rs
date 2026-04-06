@@ -1,20 +1,12 @@
 /// Test ZW-first MDD via reordering from interleaved 16-way MDD.
-#[path = "../mdd.rs"]
-mod mdd;
-#[path = "../mdd_reorder.rs"]
-mod mdd_reorder;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let k: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
 
-    // Build interleaved 16-way MDD
-    let interleaved = mdd::BoundaryMdd::build(k);
+    let interleaved = turyn::mdd::BoundaryMdd::build(k);
+    let reordered = turyn::mdd_reorder::reorder_zw_first(&interleaved.nodes, interleaved.root, k);
 
-    // Reorder to ZW-first
-    let reordered = mdd_reorder::reorder_zw_first(&interleaved.nodes, interleaved.root, k);
-
-    // Walk the ZW top half (first 2k levels)
     let zw_depth = 2 * k;
     let pos_order = interleaved.pos_order.clone();
 
@@ -24,10 +16,9 @@ fn main() {
 
     fn count_xy(nid: u32, level: usize, depth: usize, nodes: &[[u32; 4]],
                 memo: &mut std::collections::HashMap<u32, u128>) -> u128 {
-        if nid == mdd_reorder::DEAD { return 0; }
-        if nid == mdd_reorder::LEAF {
-            let remaining = depth - level;
-            return 4u128.pow(remaining as u32);
+        if nid == turyn::mdd_reorder::DEAD { return 0; }
+        if nid == turyn::mdd_reorder::LEAF {
+            return 4u128.pow((depth - level) as u32);
         }
         if let Some(&c) = memo.get(&nid) { return c; }
         let total: u128 = nodes[nid as usize].iter()
@@ -39,24 +30,22 @@ fn main() {
     fn walk_zw<F: FnMut(u32, u32, u32)>(
         nid: u32, level: usize, zw_depth: usize,
         z_acc: u32, w_acc: u32,
-        pos_order: &[usize],
-        nodes: &[[u32; 4]],
+        pos_order: &[usize], nodes: &[[u32; 4]],
         callback: &mut F,
     ) {
-        if nid == mdd_reorder::DEAD { return; }
+        if nid == turyn::mdd_reorder::DEAD { return; }
         if level == zw_depth {
             callback(z_acc, w_acc, nid);
             return;
         }
-        if nid == mdd_reorder::LEAF {
-            // All remaining zw levels are don't-care — enumerate all
+        if nid == turyn::mdd_reorder::LEAF {
             walk_zw_leaf(level, zw_depth, z_acc, w_acc, pos_order, callback);
             return;
         }
         let pos = pos_order[level];
         for branch in 0u32..4 {
             let child = nodes[nid as usize][branch as usize];
-            if child == mdd_reorder::DEAD { continue; }
+            if child == turyn::mdd_reorder::DEAD { continue; }
             let z_val = (branch >> 0) & 1;
             let w_val = (branch >> 1) & 1;
             walk_zw(child, level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
@@ -69,7 +58,7 @@ fn main() {
         pos_order: &[usize], callback: &mut F,
     ) {
         if level == zw_depth {
-            callback(z_acc, w_acc, mdd_reorder::LEAF);
+            callback(z_acc, w_acc, turyn::mdd_reorder::LEAF);
             return;
         }
         let pos = pos_order[level];
