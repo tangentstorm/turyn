@@ -215,6 +215,10 @@ impl BoundaryMdd {
                         level + 1, sums, &mut current_active_vals,
                         ctx, nodes, unique, memo,
                     );
+                    if level == 1 {
+                        eprint!("\r  Building: level 1 branch {}/16, {} nodes so far   ",
+                            sign_col + 1, nodes.len());
+                    }
                 }
 
                 sums.copy_from_slice(&sums_backup);
@@ -249,7 +253,7 @@ impl BoundaryMdd {
             &ctx, &mut nodes, &mut unique, &mut memo,
         );
 
-        eprintln!("MDD k={}: {} nodes, {:.1} MB",
+        eprintln!("\rMDD k={}: {} nodes, {:.1} MB                          ",
             k, nodes.len(), nodes.len() as f64 * 64.0 / 1_048_576.0);
 
         BoundaryMdd { nodes, root, k, pos_order }
