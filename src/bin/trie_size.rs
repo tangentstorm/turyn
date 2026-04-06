@@ -359,6 +359,23 @@ fn main() {
         }
     }
 
+    // Per-node path counts (reuse for depth breakdown + twig analysis)
+    let mut path_counts: HashMap<u32, u128> = HashMap::new();
+    fn count_paths_memo(nid: u32, nodes: &[[u32; 16]], memo: &mut HashMap<u32, u128>) -> u128 {
+        if nid == DEAD { return 0; }
+        if nid == LEAF { return 1; }
+        if let Some(&c) = memo.get(&nid) { return c; }
+        let total: u128 = nodes[nid as usize].iter()
+            .map(|&child| count_paths_memo(child, nodes, memo)).sum();
+        memo.insert(nid, total);
+        total
+    }
+    count_paths_memo(root, &nodes, &mut path_counts);
+
+    // Count paths arriving AT each node (fan-in), by BFS from root
+    let mut paths_to: HashMap<u32, u128> = HashMap::new();
+    paths_to.insert(root, 1);
+
     // BFS depth breakdown
     eprintln!("\n  Depth breakdown:");
     let mut current_level_nodes: Vec<u32> = vec![root];
@@ -367,15 +384,47 @@ fn main() {
         let mut next = std::collections::HashSet::new();
         for &nid in &current_level_nodes {
             if nid == DEAD || nid == LEAF { continue; }
-            if (nid as usize) < nodes.len() {
-                for &child in &nodes[nid as usize] {
-                    if child != DEAD { next.insert(child); }
+            if (nid as usize) >= nodes.len() { continue; }
+            let fan_in = *paths_to.get(&nid).unwrap_or(&0);
+            for &child in &nodes[nid as usize] {
+                if child != DEAD {
+                    *paths_to.entry(child).or_insert(0) += fan_in;
+                    next.insert(child);
                 }
             }
         }
         current_level_nodes = next.into_iter().collect();
     }
     eprintln!("    depth {:2} (leaf): {}", depth, current_level_nodes.len());
+
+    // Twig analysis: nodes at depth-1 (one level above leaf)
+    // Re-do BFS to find twig nodes
+    let mut twig_nodes: Vec<u32> = Vec::new();
+    let mut level_set: Vec<u32> = vec![root];
+    for d in 0..depth - 1 {
+        let mut next = std::collections::HashSet::new();
+        for &nid in &level_set {
+            if nid == DEAD || nid == LEAF { continue; }
+            if (nid as usize) < nodes.len() {
+                for &child in &nodes[nid as usize] {
+                    if child != DEAD { next.insert(child); }
+                }
+            }
+        }
+        level_set = next.into_iter().collect();
+    }
+    twig_nodes = level_set.clone();
+    twig_nodes.sort();
+
+    eprintln!("\n  Twig nodes (depth {}, 1 above leaf):", depth - 1);
+    for &nid in &twig_nodes {
+        if nid == DEAD || nid == LEAF { continue; }
+        let paths_through = path_counts.get(&nid).copied().unwrap_or(0);
+        let arriving = paths_to.get(&nid).copied().unwrap_or(0);
+        let live_children = nodes[nid as usize].iter().filter(|&&c| c == LEAF).count();
+        eprintln!("    node {:6}: {} paths arriving, {} live branches (of 16), {} paths through",
+            nid, arriving, live_children, paths_through);
+    }
 }
 
 fn count_paths(root: u32, nodes: &[[u32; 16]]) -> u128 {
