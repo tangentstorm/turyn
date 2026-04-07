@@ -17,6 +17,32 @@ use rustc_hash::FxHashMap as HashMap;
 pub const DEAD: u32 = 0;
 pub const LEAF: u32 = u32::MAX;
 
+pub type StateKey = (u128, u64);
+
+pub fn pack_sums(sums: &[i8]) -> u128 {
+    let mut packed = 0u128;
+    for (i, &s) in sums.iter().enumerate() {
+        packed |= ((s as u8 as u128) & 0xFF) << (i * 8);
+    }
+    packed
+}
+
+pub fn pack_active(vals: &[u8]) -> u64 {
+    let mut packed = 0u64;
+    for (i, &v) in vals.iter().enumerate() {
+        packed |= (v as u64) << (i * 2);
+    }
+    packed
+}
+
+pub fn hash_node4(level: u8, children: &[u32; 4]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    level.hash(&mut h);
+    for &c in children { c.hash(&mut h); }
+    h.finish()
+}
+
 /// Per-level profiling counters for MDD build.
 pub struct BuildStats {
     /// Per ZW level: (calls, memo_hits, pruned, xy_builds)
@@ -630,39 +656,10 @@ impl ZwFirstMdd {
         let mut nodes: Vec<[u32; 4]> = Vec::new();
         nodes.push([DEAD; 4]); // node 0 = DEAD
 
-        fn hash_node4(level: u8, children: &[u32; 4]) -> u64 {
-            use std::hash::{Hash, Hasher};
-            let mut h = rustc_hash::FxHasher::default();
-            level.hash(&mut h);
-            for &c in children { c.hash(&mut h); }
-            h.finish()
-        }
         let mut unique: HashMap<u64, u32> = HashMap::default();
 
-        type StateKey = (u128, u64);
-        type XyStateKey = (u128, u64); // (packed_sums, packed_active) - cleared per zw_sums
         let mut zw_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
-        let mut xy_memo: Vec<HashMap<XyStateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
-
-        fn pack_sums(sums: &[i8]) -> u128 {
-            let mut packed = 0u128;
-            for (i, &s) in sums.iter().enumerate() {
-                packed |= ((s as u8 as u128) & 0xFF) << (i * 8);
-            }
-            packed
-        }
-
-        fn pack_active(vals: &[u8]) -> u64 {
-            let mut packed = 0u64;
-            for (i, &v) in vals.iter().enumerate() {
-                packed |= (v as u64) << (i * 2); // 2 bits per position (4-way)
-            }
-            packed
-        }
-
-        fn bnd_val(bits: u32, pos: usize) -> i32 {
-            if (bits >> pos) & 1 == 1 { 1 } else { -1 }
-        }
+        let mut xy_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
 
         // Build XY bottom half: given zw_sums (the target for each lag),
         // build a 4-way MDD for (x,y) that satisfies N_X(s)+N_Y(s) = -zw_sums[s].
@@ -674,7 +671,7 @@ impl ZwFirstMdd {
             ctx: &Ctx,
             nodes: &mut Vec<[u32; 4]>,
             unique: &mut HashMap<u64, u32>,
-            memo: &mut Vec<HashMap<XyStateKey, u32>>,
+            memo: &mut Vec<HashMap<StateKey, u32>>,
             stats: &mut BuildStats,
         ) -> u32 {
             stats.xy_level_stats[level].0 += 1;
@@ -792,7 +789,7 @@ impl ZwFirstMdd {
             nodes: &mut Vec<[u32; 4]>,
             unique: &mut HashMap<u64, u32>,
             zw_memo: &mut Vec<HashMap<StateKey, u32>>,
-            xy_memo: &mut Vec<HashMap<XyStateKey, u32>>,
+            xy_memo: &mut Vec<HashMap<StateKey, u32>>,
             xy_cache: &mut HashMap<u128, u32>,
             zw_memo_count: &mut usize,
             max_memo_entries: usize,
@@ -1253,34 +1250,8 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
 
     let mut nodes: Vec<[u32; 4]> = Vec::new();
     nodes.push([DEAD; 4]); // sentinel
-
-    fn hash_node4(level: u8, children: &[u32; 4]) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = rustc_hash::FxHasher::default();
-        level.hash(&mut h);
-        for &c in children { c.hash(&mut h); }
-        h.finish()
-    }
     let mut unique: HashMap<u64, u32> = HashMap::default();
-
-    type StateKey = (u128, u64);
     let mut memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
-
-    fn pack_sums(sums: &[i8]) -> u128 {
-        let mut packed = 0u128;
-        for (i, &s) in sums.iter().enumerate() {
-            packed |= ((s as u8 as u128) & 0xFF) << (i * 8);
-        }
-        packed
-    }
-
-    fn pack_active(vals: &[u8]) -> u64 {
-        let mut packed = 0u64;
-        for (i, &v) in vals.iter().enumerate() {
-            packed |= (v as u64) << (i * 2);
-        }
-        packed
-    }
 
     struct XyCtx {
         pos_order: Vec<usize>,
@@ -1312,7 +1283,7 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
         ctx: &XyCtx,
         nodes: &mut Vec<[u32; 4]>,
         unique: &mut HashMap<u64, u32>,
-        memo: &mut Vec<HashMap<(u128, u64), u32>>,
+        memo: &mut Vec<HashMap<StateKey, u32>>,
     ) -> u32 {
         if level == ctx.zw_depth {
             for li in 0..ctx.k {
@@ -1833,29 +1804,9 @@ pub fn build_extension(
     // DFS builder: ZW half (levels 0..ext_depth) then XY half (levels ext_depth..2*ext_depth)
     let mut nodes: Vec<[u32; 4]> = Vec::new();
     nodes.push([DEAD; 4]);
-
-    fn hash_node4(level: u8, children: &[u32; 4]) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = rustc_hash::FxHasher::default();
-        level.hash(&mut h);
-        for &c in children { c.hash(&mut h); }
-        h.finish()
-    }
     let mut unique: HashMap<u64, u32> = HashMap::default();
-    type EStateKey = (u128, u64);
-    let mut zw_memo: Vec<HashMap<EStateKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
-    let mut xy_memo: Vec<HashMap<EStateKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
-
-    fn pack_s(sums: &[i8]) -> u128 {
-        let mut p = 0u128;
-        for (i, &s) in sums.iter().enumerate() { p |= ((s as u8 as u128) & 0xFF) << (i * 8); }
-        p
-    }
-    fn pack_a(vals: &[u8]) -> u64 {
-        let mut p = 0u64;
-        for (i, &v) in vals.iter().enumerate() { p |= (v as u64) << (i * 2); }
-        p
-    }
+    let mut zw_memo: Vec<HashMap<StateKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
+    let mut xy_memo: Vec<HashMap<StateKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
 
     // XY half DFS
     fn build_xy_ext(
@@ -1865,7 +1816,7 @@ pub fn build_extension(
         events: &[Vec<(usize, usize, usize, [i8; 16])>],
         lag_check: &[Vec<usize>], max_remaining: &[Vec<i32>],
         nodes: &mut Vec<[u32; 4]>, unique: &mut HashMap<u64, u32>,
-        memo: &mut Vec<HashMap<EStateKey, u32>>,
+        memo: &mut Vec<HashMap<StateKey, u32>>,
     ) -> u32 {
         if level == ext_depth {
             for li in 0..target_k { if sums[li] != 0 { return DEAD; } }
@@ -1881,7 +1832,7 @@ pub fn build_extension(
             }
         }
         let new_idx = active_indices[level][pos_order[level]];
-        let sk = (pack_s(sums), pack_a(&cv[..n_active]));
+        let sk = (pack_sums(sums), pack_active(&cv[..n_active]));
         if let Some(&c) = memo[level].get(&sk) { return c; }
 
         let mut children = [DEAD; 4];
@@ -1933,8 +1884,8 @@ pub fn build_extension(
         xy_events: &[Vec<(usize, usize, usize, [i8; 16])>],
         xy_lag_check: &[Vec<usize>], xy_max_remaining_arr: &[Vec<i32>],
         nodes: &mut Vec<[u32; 4]>, unique: &mut HashMap<u64, u32>,
-        zw_memo: &mut Vec<HashMap<EStateKey, u32>>,
-        xy_memo: &mut Vec<HashMap<EStateKey, u32>>,
+        zw_memo: &mut Vec<HashMap<StateKey, u32>>,
+        xy_memo: &mut Vec<HashMap<StateKey, u32>>,
     ) -> u32 {
         if level == ext_depth {
             // ZW done. Check XY feasibility, then build XY half.
@@ -1961,7 +1912,7 @@ pub fn build_extension(
             }
         }
         let new_idx = active_indices[level][pos_order[level]];
-        let sk = (pack_s(sums), pack_a(&cv[..n_active]));
+        let sk = (pack_sums(sums), pack_active(&cv[..n_active]));
         if let Some(&c) = zw_memo[level].get(&sk) { return c; }
 
         let mut children = [DEAD; 4];
