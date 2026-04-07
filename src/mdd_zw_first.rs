@@ -876,11 +876,15 @@ impl ZwFirstMdd {
         }
 
         // Budget memo: ~140 bytes/entry in FxHashMap.
-        // When running as a parallel branch, use 1/4 of the budget.
+        // When running as a parallel branch, use 1/N of the budget.
         let num_parallel = if restrict_branches.is_some() {
             4u32.pow(restrict_branches.unwrap().len() as u32) as usize
         } else if restrict_level1.is_some() { 4 } else { 1 };
-        let max_memo_entries: usize = 50_000_000 / num_parallel; // ~7GB total budget
+        // Default 80M entries (~11GB). Override with MDD_MEMO_CAP env var.
+        let total_memo_cap: usize = std::env::var("MDD_MEMO_CAP")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or(80_000_000);
+        let max_memo_entries: usize = total_memo_cap / num_parallel;
         let per_level_cap: usize = max_memo_entries / (zw_depth + 1);
         let mut zw_memo_count: usize = 0;
         let mut xy_cache: HashMap<u128, u32> = HashMap::default();
