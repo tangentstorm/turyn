@@ -630,51 +630,40 @@ impl ZwFirstMdd {
                 }).collect()
             }).collect();
 
-        struct Ctx {
-            pos_order: Vec<usize>,
-            zw_events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>>,
-            zw_lag_check_at_level: Vec<Vec<usize>>,
-            xy_max_abs: Vec<i32>,
-            zw_max_remaining: Vec<Vec<i32>>,
-            zw_active_at_level: Vec<Vec<usize>>,
-            zw_active_indices: Vec<Vec<usize>>,
-            xy_ctx: XyBuildCtx,
-            k: usize,
-            zw_depth: usize,
-            restrict_level1: Option<u32>,
-            restrict_branches: Vec<(usize, u32)>,
-            zw_only: bool,
+        let mut all_restrict: Vec<(usize, u32)> = match restrict_branches {
+            Some(branches) => branches.iter().enumerate()
+                .map(|(d, &b)| (d + 1, b))
+                .collect(),
+            None => Vec::new(),
+        };
+        if let Some(target) = restrict_level1 {
+            all_restrict.push((1, target));
         }
 
-        let ctx = Ctx {
+        let zw_ctx = ZwBuildCtx {
             pos_order: pos_order.clone(),
-            zw_events_at_level: zw_resolved_events,
-            zw_lag_check_at_level,
+            events: zw_resolved_events,
+            lag_check: zw_lag_check_at_level,
+            max_remaining: zw_max_remaining,
+            active_at_level: zw_active_at_level,
+            active_indices: zw_active_indices,
             xy_max_abs,
-            zw_max_remaining,
-            zw_active_at_level,
-            zw_active_indices,
-            xy_ctx: XyBuildCtx {
-                pos_order: pos_order.clone(),
-                events: xy_resolved_events,
-                lag_check: xy_lag_check_at_level,
-                max_remaining: xy_max_remaining,
-                active_at_level: xy_active_at_level,
-                active_indices: xy_active_indices,
-                k,
-                depth: zw_depth,
-                symmetry_break: true,
-            },
             k,
-            zw_depth,
-            restrict_level1,
-            restrict_branches: match restrict_branches {
-                Some(branches) => branches.iter().enumerate()
-                    .map(|(d, &b)| (d + 1, b)) // level 1, 2, ... (skip level 0 symmetry)
-                    .collect(),
-                None => Vec::new(),
-            },
+            depth: zw_depth,
+            symmetry_break: true,
+            restrict_branches: all_restrict,
             zw_only,
+        };
+        let xy_ctx = XyBuildCtx {
+            pos_order: pos_order.clone(),
+            events: xy_resolved_events,
+            lag_check: xy_lag_check_at_level,
+            max_remaining: xy_max_remaining,
+            active_at_level: xy_active_at_level,
+            active_indices: xy_active_indices,
+            k,
+            depth: zw_depth,
+            symmetry_break: true,
         };
 
         let mut nodes: Vec<[u32; 4]> = Vec::new();
@@ -685,176 +674,7 @@ impl ZwFirstMdd {
         let mut zw_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
         let mut xy_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
 
-        // Build ZW top half: branch on (z,w), at bottom connect to XY sub-MDD.
-        fn build_zw(
-            level: usize,  // 0..2k within zw half
-            sums: &mut Vec<i8>,  // partial 2*N_Z + 2*N_W at each lag
-            active_bits: &[u8],
-            ctx: &Ctx,
-            nodes: &mut Vec<[u32; 4]>,
-            unique: &mut HashMap<u64, u32>,
-            zw_memo: &mut Vec<HashMap<StateKey, u32>>,
-            xy_memo: &mut Vec<HashMap<StateKey, u32>>,
-            xy_cache: &mut HashMap<u128, u32>,
-            zw_memo_count: &mut usize,
-            max_memo_entries: usize,
-            per_level_cap: usize,
-            stats: &mut BuildStats,
-            status: &mut StatusLine,
-        ) -> u32 {
-            stats.zw_level_stats[level].0 += 1;
-            status.tick(nodes.len(), *zw_memo_count, xy_cache.len());
-
-            if level == ctx.zw_depth {
-                // ZW half done.
-                stats.zw_level_stats[level].3 += 1;
-
-                if ctx.zw_only {
-                    // ZW-only mode: check if any (x,y) can satisfy the constraint.
-                    // Range + parity check: for each lag, |zw_val| <= max_xy and right parity.
-                    for li in 0..ctx.k {
-                        let zw_val = sums[li] as i32;
-                        let max_xy = ctx.xy_max_abs[li];
-                        if zw_val.abs() > max_xy { return DEAD; }
-                        if (zw_val + max_xy) % 2 != 0 { return DEAD; }
-                    }
-                    return LEAF;
-                }
-
-                // Build XY sub-MDD for these zw_sums.
-                // Check XY cache: same zw_sums → same XY sub-MDD root
-                let sums_key = pack_sums(sums);
-                if let Some(&cached_root) = xy_cache.get(&sums_key) {
-                    return cached_root;
-                }
-
-                stats.xy_build_count += 1;
-                let xy_start = std::time::Instant::now();
-                // Clear xy_memo for each distinct zw_sums to prevent memory explosion.
-                // Nodes are still shared via the `unique` table.
-                for m in xy_memo.iter_mut() { m.clear(); }
-                let zw_sums: Vec<i8> = sums.to_vec();
-                let mut xy_sums = vec![0i8; ctx.k];
-                let target: Vec<i8> = zw_sums.iter().map(|&s| -s).collect();
-                let result = build_xy_dfs(
-                    0, &mut xy_sums, &[], &target,
-                    &ctx.xy_ctx, nodes, unique, xy_memo,
-                );
-                stats.xy_build_ns += xy_start.elapsed().as_nanos() as u64;
-                xy_cache.insert(sums_key, result);
-                return result;
-            }
-
-            let active = &ctx.zw_active_at_level[level];
-            let n_active = active.len();
-            let mut current_vals = [0u8; 32];
-            if level > 0 {
-                let prev_indices = &ctx.zw_active_indices[level - 1];
-                for (i, &pos) in active.iter().enumerate() {
-                    if pos != ctx.pos_order[level] {
-                        let pi = prev_indices[pos];
-                        if pi != usize::MAX {
-                            current_vals[i] = active_bits[pi];
-                        }
-                    }
-                }
-            }
-
-            let new_pos = ctx.pos_order[level];
-            let new_idx = ctx.zw_active_indices[level][new_pos];
-
-            let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
-            if let Some(&cached) = zw_memo[level].get(&state_key) {
-                stats.zw_level_stats[level].1 += 1;
-                return cached;
-            }
-
-            let mut children = [DEAD; 4];
-            for branch in 0u32..4 {
-                let z_val = (branch >> 0) & 1;
-                let w_val = (branch >> 1) & 1;
-
-                // Symmetry breaking: z[0]=w[0]=+1
-                if new_pos == 0 && branch != 0b11 { continue; }
-
-                // For parallel builds: restrict to specific branches at specified levels
-                if let Some(target) = ctx.restrict_level1 {
-                    if level == 1 && branch != target { continue; }
-                }
-                let mut skip = false;
-                for &(rlevel, rbranch) in &ctx.restrict_branches {
-                    if level == rlevel && branch != rbranch { skip = true; break; }
-                }
-                if skip { continue; }
-
-                current_vals[new_idx] = branch as u8;
-
-                // Process ZW pair events at this level (pre-resolved indices + delta table)
-                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.zw_events_at_level[level] {
-                    let bits_a = current_vals[idx_a] as usize;
-                    let bits_b = current_vals[idx_b] as usize;
-                    sums[lag_idx] += delta[bits_a * 4 + bits_b];
-                }
-
-                // At ZW lag checkpoints: range+parity prune
-                let mut ok = true;
-                for &li in &ctx.zw_lag_check_at_level[level] {
-                    let zw_val = sums[li] as i32;
-                    // Need N_X + N_Y = -zw_val, which must be in [-max, +max] with right parity
-                    let max_xy = ctx.xy_max_abs[li];
-                    if zw_val.abs() > max_xy { ok = false; break; }
-                    if (zw_val + max_xy) % 2 != 0 { ok = false; break; }
-                }
-                // Range check: can remaining ZW events keep sums achievable?
-                if ok && level + 1 < ctx.zw_depth {
-                    for li in 0..ctx.k {
-                        let zw_val = sums[li] as i32;
-                        let zw_remaining = ctx.zw_max_remaining[level + 1][li];
-                        let max_xy = ctx.xy_max_abs[li];
-                        if (zw_val.abs() - zw_remaining) > max_xy { ok = false; break; }
-                    }
-                }
-
-                if ok {
-                    children[branch as usize] = build_zw(
-                        level + 1, sums, &current_vals[..n_active],
-                        ctx, nodes, unique, zw_memo, xy_memo, xy_cache,
-                        zw_memo_count, max_memo_entries, per_level_cap,
-                        stats, status,
-                    );
-                    if level == 1 {
-                        eprint!("\r  ZW level 1 branch {}/4, {} nodes, zw_memo={}   ",
-                            branch + 1, nodes.len(), *zw_memo_count);
-                    }
-                } else {
-                    stats.zw_level_stats[level].2 += 1;
-                }
-
-                // Restore sums by subtracting deltas (avoids pack/unpack overhead)
-                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.zw_events_at_level[level] {
-                    let bits_a = current_vals[idx_a] as usize;
-                    let bits_b = current_vals[idx_b] as usize;
-                    sums[lag_idx] -= delta[bits_a * 4 + bits_b];
-                }
-            }
-
-            let result = reduce_node(level as u8, children, nodes, unique);
-
-            // Cap total memo entries to prevent OOM at large k.
-            // When over budget, evict the level with the most entries (typically deepest).
-            if *zw_memo_count >= max_memo_entries {
-                stats.zw_memo_evictions += 1;
-                let (max_lvl, _) = zw_memo.iter().enumerate()
-                    .max_by_key(|(_, m)| m.len()).unwrap();
-                if zw_memo[max_lvl].len() > 0 {
-                    *zw_memo_count -= zw_memo[max_lvl].len();
-                    zw_memo[max_lvl].clear();
-                }
-            }
-            zw_memo[level].insert(state_key, result);
-            *zw_memo_count += 1;
-            result
-        }
+        // (build_zw is now the module-level build_zw_dfs)
 
         // Budget memo: ~140 bytes/entry in FxHashMap.
         // When running as a parallel branch, use 1/N of the budget.
@@ -890,12 +710,11 @@ impl ZwFirstMdd {
         let mut xy_cache: HashMap<u128, u32> = HashMap::default();
 
         let mut sums = vec![0i8; k];
-        let mut status = StatusLine::new(k);
-        let root = build_zw(
+        let root = build_zw_dfs(
             0, &mut sums, &[],
-            &ctx, &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo, &mut xy_cache,
-            &mut zw_memo_count, max_memo_entries, per_level_cap,
-            &mut stats, &mut status,
+            &zw_ctx, &xy_ctx,
+            &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo, &mut xy_cache,
+            max_memo_entries, &mut zw_memo_count,
         );
         eprintln!(); // newline after status line
 
@@ -1047,6 +866,7 @@ pub struct ZwBuildCtx {
     pub depth: usize,
     pub symmetry_break: bool,
     pub restrict_branches: Vec<(usize, u32)>,
+    pub zw_only: bool,
 }
 
 /// DFS builder for ZW half. At the boundary, delegates to build_xy_dfs.
@@ -1061,24 +881,32 @@ pub fn build_zw_dfs(
     unique: &mut HashMap<u64, u32>,
     zw_memo: &mut Vec<HashMap<StateKey, u32>>,
     xy_memo: &mut Vec<HashMap<StateKey, u32>>,
+    xy_cache: &mut HashMap<u128, u32>,
     max_memo_entries: usize,
     zw_memo_count: &mut usize,
 ) -> u32 {
     if level == ctx.depth {
-        // ZW done. Check XY feasibility, then build XY half.
+        // ZW done. Check XY feasibility.
         for li in 0..ctx.k {
             let zw_val = sums[li] as i32;
             if zw_val.abs() > ctx.xy_max_abs[li] { return DEAD; }
             if (zw_val + ctx.xy_max_abs[li]) % 2 != 0 { return DEAD; }
         }
+        if ctx.zw_only { return LEAF; }
+
+        // Check XY cache: same zw_sums → same XY sub-MDD root
+        let sums_key = pack_sums(sums);
+        if let Some(&cached) = xy_cache.get(&sums_key) { return cached; }
+
         for m in xy_memo.iter_mut() { m.clear(); }
-        // XY must contribute -sums[li] to reach zero total
         let target: Vec<i8> = sums.iter().map(|&s| -s).collect();
         let mut xy_sums = vec![0i8; ctx.k];
-        return build_xy_dfs(
+        let result = build_xy_dfs(
             0, &mut xy_sums, &[], &target,
             xy_ctx, nodes, unique, xy_memo,
         );
+        xy_cache.insert(sums_key, result);
+        return result;
     }
 
     let active = &ctx.active_at_level[level];
@@ -1139,7 +967,7 @@ pub fn build_zw_dfs(
             children[branch as usize] = build_zw_dfs(
                 level + 1, sums, &current_vals[..n_active],
                 ctx, xy_ctx,
-                nodes, unique, zw_memo, xy_memo,
+                nodes, unique, zw_memo, xy_memo, xy_cache,
                 max_memo_entries, zw_memo_count,
             );
         }
@@ -1776,6 +1604,7 @@ pub fn build_extension(
         depth: ext_depth,
         symmetry_break: false,
         restrict_branches: Vec::new(),
+        zw_only: false,
     };
     let ext_xy_ctx = XyBuildCtx {
         pos_order,
@@ -1790,10 +1619,11 @@ pub fn build_extension(
     };
     let mut sums = initial_sums;
     let mut zw_memo_count = 0usize;
+    let mut xy_cache: HashMap<u128, u32> = HashMap::default();
     let root = build_zw_dfs(
         0, &mut sums, &[],
         &ext_zw_ctx, &ext_xy_ctx,
-        &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo,
+        &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo, &mut xy_cache,
         0, &mut zw_memo_count,
     );
 
