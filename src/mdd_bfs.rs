@@ -77,8 +77,8 @@ struct BfsCtx {
     k: usize,
     zw_depth: usize,
     pos_order: Vec<usize>,
-    /// Per-level: Vec of (lag_idx, pos_a, pos_b, is_z)
-    events_at_level: Vec<Vec<(usize, usize, usize, bool)>>,
+    /// Per-level: Vec of (lag_idx, idx_a, idx_b, delta_table)
+    events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>>,
     lag_check_at_level: Vec<Vec<usize>>,
     xy_max_abs: Vec<i32>,
     max_remaining: Vec<Vec<i32>>,
@@ -116,7 +116,8 @@ impl BfsCtx {
             w_pairs_per_lag.push(wp);
         }
 
-        let mut events_at_level: Vec<Vec<(usize, usize, usize, bool)>> =
+        // Raw events (before index resolution)
+        let mut raw_events: Vec<Vec<(usize, usize, usize, bool)>> =
             (0..zw_depth).map(|_| Vec::new()).collect();
         let mut lag_check_at_level: Vec<Vec<usize>> =
             (0..=zw_depth).map(|_| Vec::new()).collect();
@@ -125,12 +126,12 @@ impl BfsCtx {
             let mut complete = 0;
             for &(a, b) in zp {
                 let c = pos_to_level[a].max(pos_to_level[b]);
-                events_at_level[c].push((li, a, b, true));
+                raw_events[c].push((li, a, b, true));
                 complete = complete.max(c);
             }
             for &(a, b) in wp {
                 let c = pos_to_level[a].max(pos_to_level[b]);
-                events_at_level[c].push((li, a, b, false));
+                raw_events[c].push((li, a, b, false));
                 complete = complete.max(c);
             }
             lag_check_at_level[complete].push(li);
@@ -153,7 +154,7 @@ impl BfsCtx {
         }
 
         let mut last_use: Vec<usize> = vec![0; 2 * k];
-        for (level, events) in events_at_level.iter().enumerate() {
+        for (level, events) in raw_events.iter().enumerate() {
             for &(_, a, b, _) in events {
                 last_use[a] = last_use[a].max(level);
                 last_use[b] = last_use[b].max(level);
@@ -184,6 +185,34 @@ impl BfsCtx {
                 flat
             })
             .collect();
+
+        // Pre-resolve events: replace (pos_a, pos_b) with (idx_a, idx_b) + delta table
+        fn make_delta(is_z: bool) -> [i8; 16] {
+            let mut table = [0i8; 16];
+            for a in 0u32..4 {
+                for b in 0u32..4 {
+                    let val = if is_z {
+                        let za = if a & 1 == 1 { 1i32 } else { -1 };
+                        let zb = if b & 1 == 1 { 1i32 } else { -1 };
+                        2 * za * zb
+                    } else {
+                        let wa = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
+                        let wb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
+                        2 * wa * wb
+                    };
+                    table[(a * 4 + b) as usize] = val as i8;
+                }
+            }
+            table
+        }
+        let events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>> =
+            raw_events.iter().enumerate().map(|(level, evs)| {
+                evs.iter().map(|&(li, pos_a, pos_b, is_z)| {
+                    let idx_a = active_indices[level][pos_a];
+                    let idx_b = active_indices[level][pos_b];
+                    (li, idx_a, idx_b, make_delta(is_z))
+                }).collect()
+            }).collect();
 
         BfsCtx {
             k,
@@ -240,22 +269,12 @@ impl BfsCtx {
             }
             current_vals[new_idx] = branch as u8;
 
-            // Compute new sums from base (avoid re-unpacking per branch)
+            // Compute new sums from base using delta tables
             let mut sums = base_sums;
-            for &(lag_idx, pos_a, pos_b, is_z) in &self.events_at_level[level] {
-                let idx_a = self.active_indices[level][pos_a];
-                let idx_b = self.active_indices[level][pos_b];
-                let bits_a = current_vals[idx_a] as u32;
-                let bits_b = current_vals[idx_b] as u32;
-                if is_z {
-                    let za = if bits_a & 1 == 1 { 1i32 } else { -1 };
-                    let zb = if bits_b & 1 == 1 { 1i32 } else { -1 };
-                    sums[lag_idx] += (2 * za * zb) as i8;
-                } else {
-                    let wa = if (bits_a >> 1) & 1 == 1 { 1i32 } else { -1 };
-                    let wb = if (bits_b >> 1) & 1 == 1 { 1i32 } else { -1 };
-                    sums[lag_idx] += (2 * wa * wb) as i8;
-                }
+            for &(lag_idx, idx_a, idx_b, ref delta) in &self.events_at_level[level] {
+                let bits_a = current_vals[idx_a] as usize;
+                let bits_b = current_vals[idx_b] as usize;
+                sums[lag_idx] += delta[bits_a * 4 + bits_b];
             }
 
             // Pruning checks
@@ -396,44 +415,66 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
         start.elapsed(), max_states, total_states);
 
     // ===== Build XY sub-MDDs for distinct boundary zw_sums =====
-    eprintln!("Building XY sub-MDDs for {} boundary states...", current_keys.len());
-    let xy_start = std::time::Instant::now();
+    let zw_only = std::env::var("MDD_ZW_ONLY").is_ok();
 
     let mut nodes: Vec<[u32; 4]> = Vec::new();
     nodes.push([DEAD; 4]); // sentinel node 0
     let mut unique: HashMap<u64, u32> = HashMap::default();
-    let mut xy_cache: HashMap<u128, u32> = HashMap::default();
 
-    let distinct_sums: Vec<u128> = {
-        let mut set: HashMap<u128, ()> = HashMap::default();
+    let boundary_nids: Vec<u32> = if zw_only {
+        // ZW-only: all valid boundary states → LEAF
+        eprintln!("ZW-only mode: {} boundary states → LEAF", current_keys.len());
+        let mut nids = Vec::with_capacity(current_keys.len());
+        for &(sums_packed, _) in &current_keys {
+            let sums = unpack_sums(sums_packed, k);
+            let mut ok = true;
+            for li in 0..k {
+                let zw_val = sums[li] as i32;
+                let max_xy = ctx.xy_max_abs[li];
+                if zw_val.abs() > max_xy { ok = false; break; }
+                if (zw_val + max_xy) % 2 != 0 { ok = false; break; }
+            }
+            nids.push(if ok { LEAF } else { DEAD });
+        }
+        nids
+    } else {
+        eprintln!("Building XY sub-MDDs for {} boundary states...", current_keys.len());
+        let xy_start = std::time::Instant::now();
+
+        let mut xy_cache: HashMap<u128, u32> = HashMap::default();
+
+        let distinct_sums: Vec<u128> = {
+            let mut set: HashMap<u128, ()> = HashMap::default();
+            for &(sums, _) in &current_keys {
+                set.entry(sums).or_insert(());
+            }
+            set.into_keys().collect()
+        };
+        eprintln!("  {} distinct zw_sums from {} boundary states", distinct_sums.len(), current_keys.len());
+
+        for (i, &sums_packed) in distinct_sums.iter().enumerate() {
+            if i % 100000 == 0 && i > 0 {
+                eprint!("\r  XY build {}/{} ({:.1?})   ", i, distinct_sums.len(), xy_start.elapsed());
+            }
+            let zw_sums = unpack_sums(sums_packed, k);
+            let root = build_xy_dfs(
+                &zw_sums, k, zw_depth,
+                &ctx.pos_order, &ctx.active_at_level, &ctx.active_indices,
+                &ctx.xy_max_abs,
+                &mut nodes, &mut unique,
+            );
+            xy_cache.insert(sums_packed, root);
+        }
+        eprintln!("\r  XY builds done: {} sub-MDDs in {:.1?}, {} total nodes",
+            distinct_sums.len(), xy_start.elapsed(), nodes.len());
+
+        // Map boundary states to XY root node IDs
+        let mut nids = Vec::with_capacity(current_keys.len());
         for &(sums, _) in &current_keys {
-            set.entry(sums).or_insert(());
+            nids.push(xy_cache[&sums]);
         }
-        set.into_keys().collect()
+        nids
     };
-    eprintln!("  {} distinct zw_sums from {} boundary states", distinct_sums.len(), current_keys.len());
-
-    for (i, &sums_packed) in distinct_sums.iter().enumerate() {
-        if i % 100000 == 0 && i > 0 {
-            eprint!("\r  XY build {}/{} ({:.1?})   ", i, distinct_sums.len(), xy_start.elapsed());
-        }
-        let zw_sums = unpack_sums(sums_packed, k);
-        let root = build_xy_dfs(
-            &zw_sums, k, zw_depth,
-            &ctx.pos_order, &ctx.active_at_level, &ctx.active_indices,
-            &ctx.xy_max_abs,
-            &mut nodes, &mut unique,
-        );
-        xy_cache.insert(sums_packed, root);
-    }
-    eprintln!("\r  XY builds done: {} sub-MDDs in {:.1?}, {} total nodes",
-        distinct_sums.len(), xy_start.elapsed(), nodes.len());
-
-    // Map boundary states to XY root node IDs (indexed by position in current_keys)
-    let mut boundary_nids: Vec<u32> = Vec::with_capacity(current_keys.len());
-    for &(sums, _) in &current_keys {
-        boundary_nids.push(xy_cache[&sums]);
-    }
 
     // ===== Pass 2: bottom-up, build ZW nodes using stored children =====
     eprintln!("BFS Pass 2: building ZW nodes bottom-up...");
