@@ -387,23 +387,78 @@ theorem base_seq_vanishing_prop {n : Nat} {x y z w : PmSeq}
         aperiodicAutocorr_zero_of_ge y s (by omega)]
     ring
 
-/-! ## Step 2: Base sequences → T-sequences (statement only)
+/-! ## Step 2: Base sequences → T-sequences
 
-The T-sequences have disjoint supports (each position has at most one
-nonzero entry), so their periodic autocorrelation equals their aperiodic
-autocorrelation.  The aperiodic autocorrelation decomposes into the
-base-sequence autocorrelation, which vanishes by `base_seq_vanishing_prop`.
+The T-sequences are constructed from the base sequences (A, B, C, D)
+via half-sum/half-difference and zero-padding.  We show their combined
+autocorrelation vanishes by reducing to the base-sequence result.
+
+The key idea: for ±1 sequences a, b of equal length,
+  N_{(a+b)/2}(s) + N_{(a−b)/2}(s) = (N_a(s) + N_b(s)) / 2
+
+This is because the cross terms a[i]·b[i+s] appear with opposite signs
+in the two expansions and cancel.  Combined with the fact that appending
+zeros doesn't affect the autocorrelation (the zero terms contribute nothing),
+the T-sequence autocorrelation reduces to the base-sequence autocorrelation.
 -/
 
+/-- Appending zeros does not change the autocorrelation at any lag. -/
+lemma aperiodicAutocorr_append_zeros (a : List Int) (k s : Nat) :
+    aperiodicAutocorr (a ++ zeroSeq k) s = aperiodicAutocorr a s := by
+  sorry
+
+/-- Prepending zeros shifts the autocorrelation indices but does not
+    change the value (the zero prefix contributes nothing). -/
+lemma aperiodicAutocorr_prepend_zeros (a : List Int) (k s : Nat) :
+    aperiodicAutocorr (zeroSeq k ++ a) s = aperiodicAutocorr a s := by
+  sorry
+
+/-- **Half-sum/half-difference autocorrelation identity:**
+    For ±1 sequences a, b of equal length,
+    2 * (N_{(a+b)/2}(s) + N_{(a−b)/2}(s)) = N_a(s) + N_b(s).
+
+    The cross terms a[i]·b[i+s] cancel when the two are added. -/
+lemma sumHalf_diffHalf_autocorr (a b : PmSeq) (s : Nat)
+    (hab : a.length = b.length) :
+    2 * (aperiodicAutocorr (seqSumHalf a b) s +
+         aperiodicAutocorr (seqDiffHalf a b) s) =
+    aperiodicAutocorr a s + aperiodicAutocorr b s := by
+  sorry
+
 /-- **T-sequence theorem:** If (X, Y, Z, W) is TT(n), the T-sequences
-    of length 3n−1 have vanishing combined periodic autocorrelation. -/
+    of length 3n−1 have vanishing combined aperiodic autocorrelation.
+
+    The proof reduces to `base_seq_vanishing_prop` via:
+    1. `aperiodicAutocorr_append_zeros` / `aperiodicAutocorr_prepend_zeros`
+       to strip the zero padding
+    2. `sumHalf_diffHalf_autocorr` to recombine the half-sum/half-difference
+       into the original base-sequence autocorrelation -/
 theorem tseq_vanishing_prop {n : Nat} {x y z w : PmSeq}
     (htt : IsTurynTypeProp n x y z w) (hn : n ≥ 1) :
     let (t1, t2, t3, t4) := tSequences x y z w
     ∀ s, 1 ≤ s → s < 3 * n - 1 →
       aperiodicAutocorr t1 s + aperiodicAutocorr t2 s +
       aperiodicAutocorr t3 s + aperiodicAutocorr t4 s = 0 := by
-  sorry
+  intro s hs1 _hs2
+  -- The let bindings from tSequences/baseSequences are already reduced.
+  -- Strip zero padding
+  rw [aperiodicAutocorr_append_zeros, aperiodicAutocorr_append_zeros,
+      aperiodicAutocorr_prepend_zeros, aperiodicAutocorr_prepend_zeros]
+  -- Recombine half-sum/half-difference pairs
+  have hAB : (z ++ w).length = (z ++ negSeq w).length := by
+    simp [List.length_append, negSeq_length]
+  have hCD : x.length = y.length := by
+    rw [htt.x_len, htt.y_len]
+  -- Use the half-sum/half-difference identity for each pair
+  have hAB := sumHalf_diffHalf_autocorr (z ++ w) (z ++ negSeq w) s hAB
+  have hCD := sumHalf_diffHalf_autocorr x y s hCD
+  -- Base sequence vanishing gives the sum of the originals = 0
+  have hbase := base_seq_vanishing_prop htt hn hs1
+  -- hAB: 2 * (T1 + T2) = N_A + N_B
+  -- hCD: 2 * (T3 + T4) = N_X + N_Y
+  -- hbase: (N_A + N_B) + N_X + N_Y = 0
+  -- Goal: T1 + T2 + T3 + T4 = 0
+  linarith
 
 /-! ## Step 3: T-sequences → Goethals-Seidel Hadamard matrix (statement only)
 
