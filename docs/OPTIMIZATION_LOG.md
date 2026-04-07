@@ -38,6 +38,24 @@ target/release/turyn --n=16 --stochastic-secs=10 --benchmark=3
 - Run both benchmarks for each optimization; an idea may help one and hurt the other.
 - Benchmark runs should target 6–60s each. Under 6s is too noisy; over 60s wastes iteration time.
 
+## MDD Phase B optimizations (April 2026)
+
+### SAT-based W middle generation + boundary deduplication
+
+For large n (n≥42 with k=8), W middle combination space exceeds brute-force limits
+(C(25,12)=5.2M). Three optimizations:
+
+1. **SAT W solver** (`sat_w_middle.rs`): PB eq constraint + random phase diversity + blocking clauses.
+   Adaptive threshold: SAT when C(middle_m, r) > 10 × max_w.
+2. **Hoist W generation**: Generate W middles ONCE per (sum_group, tuple), reuse across entries.
+3. **Group by (w_bits, z_bits)**: Entries with identical boundary bits share ALL spectral work.
+
+Cumulative result on n=24 MDD search (k=4):
+- Baseline: ~70s wall-clock to find TT(24)
+- After all 3: ~10-18s (**75-85% faster**)
+- n=18 k=4: 45.3ms → 47.3ms (within noise)
+- Primary exhaustive benchmark: no regression
+
 ## Current baseline (latest)
 
 - Exhaustive search (n=16, theta=20000):

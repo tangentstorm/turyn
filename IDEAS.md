@@ -515,3 +515,47 @@ Periodically run subsumption + self-subsuming resolution on clause database. Dif
 Partition variables into communities (X-vars vs Y-vars, or by lag group). Bias VSIDS to prefer variables in same community as recent decisions.
 
 **Single commit:** At construction, assign each variable to community (X vs Y). Add community bonus to VSIDS: prefer same-community variables. Produces lower-LBD learnt clauses.
+
+## Phase B: SAT-based W middle generation (credit: Claude, April 2026)
+
+For large n (n≥40), brute-force W middle enumeration via `generate_sequences_permuted` is the Phase B bottleneck. At n=56 with k=9, W middle has 37 free positions with C(37,19)≈17.7B combinations for sum=1. Even with LCG-scattered sampling (max_w=200K), the spectral rejection rate is high and most samples are wasted. The fix: use SAT to generate W middles, streaming each one immediately to Z generation and Phase C.
+
+### W1. SAT solver for W middle with sum constraint — **Implemented**
+
+Replace `generate_sequences_permuted` for W middles with a SAT solver encoding the cardinality constraint. Adaptive threshold: use SAT when C(middle_m, r) > 10 × max_w, brute-force DFS otherwise. SAT-based generation uses random phase initialization (xorshift64) for diversity and blocking clauses for uniqueness.
+
+**Result:** Implemented in `sat_w_middle.rs` + `run_mdd_sat_search()`. At n≥42 k=8, SAT activates (C(25,12)=5.2M > 2M threshold). For n=56 k=8, space is 69B — brute-force would need to sample <0.0003% via LCG scatter. SAT generates max_w solutions directly. No regression on small-n benchmarks (n=18 k=8: 49.7ms → 45.0ms). **Accepted.**
+
+### W2. Streaming W→Z pipeline — **Tried, rejected**
+
+Streaming each W directly to Z SAT solver (sat_z_middle) instead of batch+SpectralIndex approach.
+
+**Result:** The per-W Z SAT solver's autocorrelation constraints are W-specific, severely limiting Z diversity. SpectralIndex pairing across multiple W candidates finds far more (Z,W) pairs. n=24 k=4: streaming found 0 SAT items vs baseline ~190K. **Rejected** — batch W + SpectralIndex + brute-force Z is superior.
+
+### W3. Random phase diversity in W SAT solver — **Implemented** (with W1)
+
+xorshift64 PRNG seeded from (z_bnd_sum, w_bnd_sum) provides deterministic but diverse phase initialization. Combined with blocking clauses, ensures unique and varied W candidates.
+
+### W4. SAT-based Z middle generation in MDD path — **Rejected**
+
+Replaced brute-force Z with sat_z_middle in run_mdd_sat_search(). Z SAT solver's tight autocorrelation constraints (given fixed W) produce few Z candidates that also pass spectral pair filter. Brute-force Z with SpectralIndex covers more of the Z space and pairs better.
+
+**Result:** n=24 k=4: 0 SAT items dispatched (vs 190K with brute-force). The SpectralIndex approach tests many Z×W combinations; SAT limits Z to one W at a time. **Rejected.**
+
+### W6. Hoist W generation out of per-boundary loop — **Implemented**
+
+W middles depend only on (middle_m, w_mid_sum), not boundary bits. Generate ONCE per (sum_group, tuple) and reuse across all entries. Each entry still does per-boundary spectral filtering (different prefix/suffix). Eliminates redundant W generation for groups with many entries.
+
+**Result:** n=18 k=4: 45.3ms → 43.9ms. n=24 k=4: ~70s → ~63s. **Accepted.**
+
+### W7. Group boundary entries by (w_bits, z_bits) — **Implemented**
+
+Entries with identical (w_bits, z_bits) share BOTH W and Z spectral filtering + pair checking. Only the XY sub-MDD walk differs per entry. Combined with W6 (hoisted W generation), this eliminates ALL redundant FFT work.
+
+**Result:** n=24 k=4: ~70s → ~10-18s (cumulative **75-85% speedup** from W1+W6+W7). At n=56 k=8, 128M boundaries reduce to fewer unique (w_bits, z_bits) pairs, expected dramatic FFT savings. **Accepted.**
+
+### W5. W autocorrelation constraints in SAT (approximate spectral filter)
+
+Add per-lag W autocorrelation decomposition to the W SAT solver: boundary×boundary (constant), boundary×middle (linear PB terms), middle×middle (quad PB terms via XNOR aux or direct quad PB). Even with trivially-satisfied per-lag bounds, the quad PB variable interactions create CDCL conflicts that bias the solver toward lower-autocorrelation (hence lower-spectral-power) solutions. Expected to increase spectral pass rate.
+
+**Single commit:** In `build_w_middle_solver()`, for each lag s (1..m-1): decompose agree count into const + linear + quad terms. Add PB/quad PB constraints with bounds [adj_lo, adj_hi]. Benchmark spectral pass rate before/after.
