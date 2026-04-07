@@ -10,6 +10,7 @@
 /// Disk: O(total_states * 24 bytes) for level files.
 
 use rustc_hash::FxHashMap as HashMap;
+use rayon::prelude::*;
 use crate::mdd_reorder::Mdd4;
 
 pub const DEAD: u32 = 0;
@@ -203,9 +204,9 @@ impl BfsCtx {
         unpack_active(key.1, n_active)
     }
 
-    /// Expand a state at `level` to produce child states at `level + 1`.
-    /// Returns Vec of (branch, child_state_key) for valid children.
-    fn expand_state(&self, key: StateKey, level: usize) -> Vec<(u32, StateKey)> {
+    /// Expand a state at `level`, calling `callback(branch, child_key)` for each valid child.
+    #[inline]
+    fn expand_state_cb<F: FnMut(u32, StateKey)>(&self, key: StateKey, level: usize, mut callback: F) {
         let pos = self.pos_order[level];
         let active = &self.active_at_level[level];
         let n_active = active.len();
@@ -214,19 +215,24 @@ impl BfsCtx {
         let mut current_vals = [0u8; 32];
         if level > 0 {
             let prev_indices = &self.active_indices[level - 1];
-            let prev_active = unpack_active(key.1, self.active_at_level[level - 1].len());
+            // Inline unpack_active: extract 2-bit values from packed u64
+            let packed_active = key.1;
             for (i, &p) in active.iter().enumerate() {
                 if p != pos {
                     let pi = prev_indices[p];
                     if pi != usize::MAX {
-                        current_vals[i] = prev_active[pi];
+                        current_vals[i] = ((packed_active >> (pi * 2)) & 3) as u8;
                     }
                 }
             }
         }
 
+        // Inline unpack_sums into fixed array
         let sums_packed = key.0;
-        let mut results = Vec::new();
+        let mut base_sums = [0i8; 16];
+        for i in 0..self.k {
+            base_sums[i] = ((sums_packed >> (i * 8)) & 0xFF) as i8;
+        }
 
         for branch in 0u32..4 {
             if pos == 0 && branch != 0b11 {
@@ -234,8 +240,8 @@ impl BfsCtx {
             }
             current_vals[new_idx] = branch as u8;
 
-            // Compute new sums
-            let mut sums = unpack_sums(sums_packed, self.k);
+            // Compute new sums from base (avoid re-unpacking per branch)
+            let mut sums = base_sums;
             for &(lag_idx, pos_a, pos_b, is_z) in &self.events_at_level[level] {
                 let idx_a = self.active_indices[level][pos_a];
                 let idx_b = self.active_indices[level][pos_b];
@@ -279,12 +285,19 @@ impl BfsCtx {
             }
 
             if ok {
-                let new_sums = pack_sums(&sums);
+                let new_sums = pack_sums(&sums[..self.k]);
                 let new_active = pack_active(&current_vals[..n_active]);
-                results.push((branch, (new_sums, new_active)));
+                callback(branch, (new_sums, new_active));
             }
         }
+    }
 
+    /// Expand a state at `level` to produce child states at `level + 1`.
+    fn expand_state(&self, key: StateKey, level: usize) -> Vec<(u32, StateKey)> {
+        let mut results = Vec::new();
+        self.expand_state_cb(key, level, |branch, child_key| {
+            results.push((branch, child_key));
+        });
         results
     }
 }
@@ -346,9 +359,7 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
     let mut level_key_counts: Vec<usize> = vec![1];
 
     for level in 0..zw_depth {
-        // Build key→index map for next level
         let mut next_key_to_idx: HashMap<StateKey, u32> = HashMap::default();
-        // For each parent, store [u32; 4] child indices into next level
         let mut parent_children: Vec<[u32; 4]> = Vec::with_capacity(current_keys.len());
 
         for &key in &current_keys {
