@@ -17,6 +17,75 @@ use rustc_hash::FxHashMap as HashMap;
 pub const DEAD: u32 = 0;
 pub const LEAF: u32 = u32::MAX;
 
+/// Per-level profiling counters for MDD build.
+pub struct BuildStats {
+    /// Per ZW level: (calls, memo_hits, pruned, xy_builds)
+    pub zw_level_stats: Vec<(u64, u64, u64, u64)>,
+    /// Per XY level: (calls, memo_hits, pruned)
+    pub xy_level_stats: Vec<(u64, u64, u64)>,
+    /// Total time in XY sub-MDD builds (nanoseconds)
+    pub xy_build_ns: u64,
+    /// Number of distinct zw_sums that triggered XY builds
+    pub xy_build_count: u64,
+    /// Number of ZW memo evictions
+    pub zw_memo_evictions: u64,
+}
+
+impl BuildStats {
+    fn new(k: usize) -> Self {
+        let zw_depth = 2 * k;
+        BuildStats {
+            zw_level_stats: vec![(0, 0, 0, 0); zw_depth + 1],
+            xy_level_stats: vec![(0, 0, 0); zw_depth + 1],
+            xy_build_ns: 0,
+            xy_build_count: 0,
+            zw_memo_evictions: 0,
+        }
+    }
+
+    pub fn report(&self, k: usize) {
+        let zw_depth = 2 * k;
+        eprintln!("\n=== MDD Build Profile (k={}) ===", k);
+        eprintln!("ZW levels (depth={}):", zw_depth);
+        eprintln!("  {:>5} {:>12} {:>12} {:>12} {:>10}", "Level", "Calls", "MemoHits", "Pruned", "XYBuilds");
+        for (i, &(calls, hits, pruned, xy)) in self.zw_level_stats.iter().enumerate() {
+            if calls > 0 {
+                let hit_pct = if calls > 0 { 100.0 * hits as f64 / calls as f64 } else { 0.0 };
+                eprintln!("  {:>5} {:>12} {:>12} ({:>5.1}%) {:>12} {:>10}",
+                    i, calls, hits, hit_pct, pruned, xy);
+            }
+        }
+        let total_zw_calls: u64 = self.zw_level_stats.iter().map(|s| s.0).sum();
+        let total_zw_hits: u64 = self.zw_level_stats.iter().map(|s| s.1).sum();
+        let total_zw_pruned: u64 = self.zw_level_stats.iter().map(|s| s.2).sum();
+        eprintln!("  Total: {} calls, {} hits ({:.1}%), {} pruned",
+            total_zw_calls, total_zw_hits,
+            if total_zw_calls > 0 { 100.0 * total_zw_hits as f64 / total_zw_calls as f64 } else { 0.0 },
+            total_zw_pruned);
+
+        eprintln!("\nXY levels:");
+        eprintln!("  {:>5} {:>12} {:>12} {:>12}", "Level", "Calls", "MemoHits", "Pruned");
+        for (i, &(calls, hits, pruned)) in self.xy_level_stats.iter().enumerate() {
+            if calls > 0 {
+                let hit_pct = if calls > 0 { 100.0 * hits as f64 / calls as f64 } else { 0.0 };
+                eprintln!("  {:>5} {:>12} {:>12} ({:>5.1}%) {:>12}",
+                    i, calls, hits, hit_pct, pruned);
+            }
+        }
+        let total_xy_calls: u64 = self.xy_level_stats.iter().map(|s| s.0).sum();
+        let total_xy_hits: u64 = self.xy_level_stats.iter().map(|s| s.1).sum();
+        let total_xy_pruned: u64 = self.xy_level_stats.iter().map(|s| s.2).sum();
+        eprintln!("  Total: {} calls, {} hits ({:.1}%), {} pruned",
+            total_xy_calls, total_xy_hits,
+            if total_xy_calls > 0 { 100.0 * total_xy_hits as f64 / total_xy_calls as f64 } else { 0.0 },
+            total_xy_pruned);
+
+        eprintln!("\nXY sub-MDD builds: {} (total {:.3}s)",
+            self.xy_build_count, self.xy_build_ns as f64 / 1e9);
+        eprintln!("ZW memo evictions: {}", self.zw_memo_evictions);
+    }
+}
+
 pub struct ZwFirstMdd {
     pub nodes: Vec<[u32; 4]>,
     pub root: u32,
@@ -33,6 +102,15 @@ pub struct ZwFirstMdd {
 
 impl ZwFirstMdd {
     pub fn build(k: usize) -> Self {
+        let (mdd, stats) = Self::build_inner(k, None, None);
+        if std::env::var("MDD_PROFILE").is_ok() {
+            stats.report(k);
+        }
+        mdd
+    }
+
+    /// Build with profiling, returning stats.
+    pub fn build_with_stats(k: usize) -> (Self, BuildStats) {
         Self::build_inner(k, None, None)
     }
 
@@ -64,7 +142,7 @@ impl ZwFirstMdd {
 
         // Build each subtree independently in parallel
         let branch_results: Vec<(Self, Vec<u32>)> = subtree_branches.into_par_iter().map(|branches| {
-            let mdd = Self::build_inner(k, None, Some(&branches));
+            let (mdd, _stats) = Self::build_inner(k, None, Some(&branches));
             (mdd, branches)
         }).collect();
 
@@ -219,7 +297,8 @@ impl ZwFirstMdd {
         }
     }
 
-    fn build_inner(k: usize, restrict_level1: Option<u32>, restrict_branches: Option<&[u32]>) -> Self {
+    fn build_inner(k: usize, restrict_level1: Option<u32>, restrict_branches: Option<&[u32]>) -> (Self, BuildStats) {
+        let mut stats = BuildStats::new(k);
         let zw_depth = 2 * k;
         let total_depth = 4 * k;
 
@@ -491,7 +570,9 @@ impl ZwFirstMdd {
             nodes: &mut Vec<[u32; 4]>,
             unique: &mut HashMap<u64, u32>,
             memo: &mut Vec<HashMap<XyStateKey, u32>>,
+            stats: &mut BuildStats,
         ) -> u32 {
+            stats.xy_level_stats[level].0 += 1;
             if level == ctx.zw_depth {
                 // Check all lags: N_X + N_Y = -zw_sums
                 for li in 0..ctx.k {
@@ -522,6 +603,7 @@ impl ZwFirstMdd {
 
             let state_key = (pack_sums(sums), pack_active(&current_vals));
             if let Some(&cached) = memo[level].get(&state_key) {
+                stats.xy_level_stats[level].1 += 1;
                 return cached;
             }
 
@@ -570,8 +652,10 @@ impl ZwFirstMdd {
                 if ok {
                     children[branch as usize] = build_xy(
                         level + 1, sums, &mut current_vals, zw_sums,
-                        ctx, nodes, unique, memo,
+                        ctx, nodes, unique, memo, stats,
                     );
+                } else {
+                    stats.xy_level_stats[level].2 += 1;
                 }
 
                 // Restore sums from packed backup
@@ -615,19 +699,27 @@ impl ZwFirstMdd {
             zw_memo_count: &mut usize,
             max_memo_entries: usize,
             per_level_cap: usize,
+            stats: &mut BuildStats,
         ) -> u32 {
+            stats.zw_level_stats[level].0 += 1;
+
             if level == ctx.zw_depth {
                 // ZW half done. Build XY sub-MDD for these zw_sums.
+                stats.zw_level_stats[level].3 += 1;
+                stats.xy_build_count += 1;
+                let xy_start = std::time::Instant::now();
                 // Clear xy_memo for each distinct zw_sums to prevent memory explosion.
                 // Nodes are still shared via the `unique` table.
                 for m in xy_memo.iter_mut() { m.clear(); }
                 let zw_sums: Vec<i8> = sums.to_vec();
                 let mut xy_sums = vec![0i8; ctx.k];
                 let mut xy_active: Vec<u8> = Vec::new();
-                return build_xy(
+                let result = build_xy(
                     0, &mut xy_sums, &mut xy_active, &zw_sums,
-                    ctx, nodes, unique, xy_memo,
+                    ctx, nodes, unique, xy_memo, stats,
                 );
+                stats.xy_build_ns += xy_start.elapsed().as_nanos() as u64;
+                return result;
             }
 
             let active = &ctx.zw_active_at_level[level];
@@ -652,6 +744,7 @@ impl ZwFirstMdd {
 
             let state_key = (pack_sums(sums), pack_active(&current_vals));
             if let Some(&cached) = zw_memo[level].get(&state_key) {
+                stats.zw_level_stats[level].1 += 1;
                 return cached;
             }
 
@@ -721,11 +814,14 @@ impl ZwFirstMdd {
                         level + 1, sums, &mut current_vals,
                         ctx, nodes, unique, zw_memo, xy_memo,
                         zw_memo_count, max_memo_entries, per_level_cap,
+                        stats,
                     );
                     if level == 1 {
                         eprint!("\r  ZW level 1 branch {}/4, {} nodes, zw_memo={}   ",
                             branch + 1, nodes.len(), *zw_memo_count);
                     }
+                } else {
+                    stats.zw_level_stats[level].2 += 1;
                 }
 
                 // Restore sums from packed backup
@@ -755,6 +851,7 @@ impl ZwFirstMdd {
             // Cap total memo entries to prevent OOM at large k.
             // When over budget, evict the level with the most entries (typically deepest).
             if *zw_memo_count >= max_memo_entries {
+                stats.zw_memo_evictions += 1;
                 let (max_lvl, _) = zw_memo.iter().enumerate()
                     .max_by_key(|(_, m)| m.len()).unwrap();
                 if zw_memo[max_lvl].len() > 0 {
@@ -781,6 +878,7 @@ impl ZwFirstMdd {
             0, &mut sums, &mut active_bits,
             &ctx, &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo,
             &mut zw_memo_count, max_memo_entries, per_level_cap,
+            &mut stats,
         );
 
         let zw_memo_entries: usize = zw_memo.iter().map(|m| m.len()).sum();
@@ -789,7 +887,15 @@ impl ZwFirstMdd {
             k, nodes.len(), nodes.len() as f64 * 16.0 / 1_048_576.0,
             zw_memo_entries, xy_memo_entries);
 
-        ZwFirstMdd {
+        // Report per-level memo sizes
+        eprintln!("  ZW memo per level:");
+        for (i, m) in zw_memo.iter().enumerate() {
+            if m.len() > 0 {
+                eprintln!("    level {}: {} entries", i, m.len());
+            }
+        }
+
+        (ZwFirstMdd {
             nodes,
             root,
             k,
@@ -797,7 +903,7 @@ impl ZwFirstMdd {
             xy_pos_order: pos_order,
             zw_depth,
             total_depth: total_depth,
-        }
+        }, stats)
     }
 
     /// Walk the ZW top half, collecting (z_bits, w_bits, xy_root_node) triples.
