@@ -1065,6 +1065,15 @@ impl Gf2Row {
     }
 }
 
+/// Compute the XY agree target for a given lag `s`:
+/// target_raw = 2*(n-s) - zw_autocorr[s], target = target_raw/2.
+/// Returns None if the target is infeasible (negative or wrong parity).
+fn xy_agree_target(n: usize, s: usize, zw_autocorr: &[i32]) -> Option<usize> {
+    let target_raw = 2 * (n - s) as i32 - zw_autocorr[s];
+    if target_raw < 0 || target_raw % 2 != 0 { return None; }
+    Some((target_raw / 2) as usize)
+}
+
 /// Returns None if a contradiction is detected (UNSAT), otherwise equalities.
 fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Option<Vec<(i32, i32, bool)>> {
     let num_vars = 2 * n;
@@ -1118,9 +1127,7 @@ fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Option<Vec<(i32
     // Process lags where ALL or NO pairs agree.
     // Also process lags where X and Y halves have separate extreme targets.
     for s in 1..n {
-        let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-        if target_raw < 0 || target_raw % 2 != 0 { continue; }
-        let target = (target_raw / 2) as usize;
+        let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { continue; };
         let x_pairs = n - s;
         let y_pairs = n - s;
         let max_pairs = x_pairs + y_pairs;
@@ -1161,9 +1168,7 @@ fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Option<Vec<(i32
     {
         let mut rows: Vec<Gf2Row> = Vec::new();
         for s in 1..n {
-            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-            if target_raw < 0 || target_raw % 2 != 0 { continue; }
-            let target = (target_raw / 2) as usize;
+            let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { continue; };
             let k = 2 * (n - s); // total pairs (X + Y)
 
             // Build GF(2) equation: for each pair (i, i+s), x_i and x_{i+s} each
@@ -1410,9 +1415,7 @@ impl SatXYTemplate {
     fn is_feasible(&self, candidate: &CandidateZW) -> bool {
         let n = self.n;
         for s in 1..n {
-            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-            if target_raw < 0 || target_raw % 2 != 0 { return false; }
-            let target = (target_raw / 2) as usize;
+            let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { return false; };
             let max_pairs = 2 * (n - s);
             if target > max_pairs { return false; }
         }
@@ -1450,8 +1453,7 @@ impl SatXYTemplate {
 
         // Add quadratic PB constraints for each lag's agree target
         for s in 1..n {
-            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-            let target = (target_raw / 2) as usize;
+            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
             let lp = &self.lag_pairs[s];
             let ones: Vec<u32> = vec![1; lp.lits_a.len()];
             solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
@@ -1463,9 +1465,7 @@ impl SatXYTemplate {
         // Each variable v appears in the XOR with multiplicity = (# pairs containing v) mod 2.
         if solver.config.xor_propagation && n >= 8 {
             for s in 1..n {
-                let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-                if target_raw < 0 || target_raw % 2 != 0 { continue; }
-                let target = (target_raw / 2) as usize;
+                let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { continue; };
                 let k = 2 * (n - s);
                 let parity = ((target + k) % 2) == 1;
 
@@ -1545,8 +1545,7 @@ impl SatXYTemplate {
         }
 
         for s in 1..n {
-            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-            let target = (target_raw / 2) as usize;
+            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
             let lp = &self.lag_pairs[s];
             let ones: Vec<u32> = vec![1; lp.lits_a.len()];
             solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
@@ -1554,9 +1553,7 @@ impl SatXYTemplate {
 
         if solver.config.xor_propagation && n >= 8 {
             for s in 1..n {
-                let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-                if target_raw < 0 || target_raw % 2 != 0 { continue; }
-                let target = (target_raw / 2) as usize;
+                let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { continue; };
                 let k = 2 * (n - s);
                 let parity = ((target + k) % 2) == 1;
                 let mut in_xor = vec![false; 2 * n];
@@ -3905,8 +3902,7 @@ impl XYBoundaryTable {
             else { solver.add_clause([-a, -b]); solver.add_clause([a, b]); }
         }
         for s in 1..n {
-            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-            let target = (target_raw / 2) as usize;
+            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
             let lp = &template.lag_pairs[s];
             let ones: Vec<u32> = vec![1; lp.lits_a.len()];
             solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
