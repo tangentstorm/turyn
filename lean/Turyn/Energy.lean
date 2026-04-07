@@ -61,13 +61,12 @@ theorem turyn_vanishing_total {n : Nat} {x y z w : PmSeq}
 
 /-! ### Sum-autocorrelation identity
 
-This is the key algebraic identity connecting sequence sums to autocorrelations.
-The full proof requires decomposing (Σ aᵢ)² as a double sum, splitting into
-diagonal (= length) and off-diagonal (= 2 × total autocorrelation) parts.
+This is the key algebraic identity connecting sequence sums to autocorrelations:
 
-With Mathlib's `Finset.sum` and `ring`, this is straightforward.
-Without Mathlib, it requires ~200 lines of manual `rangeSum` manipulation.
-We state it as an axiom and verify it computationally for all concrete instances.
+    (Σ aᵢ)² = k + 2 · Σ_{s=1}^{k-1} N_a(s)
+
+The proof decomposes (Σ aᵢ)² as a double sum, splitting into diagonal
+(= length, since aᵢ² = 1) and off-diagonal (= 2 × total autocorrelation) parts.
 -/
 
 theorem sum_sq_expand (n : Nat) (a : Nat → Int) :
@@ -196,6 +195,7 @@ theorem sum_sq_eq_len_add_two_totalAutocorr (a : PmSeq) (h : AllPmOne a) :
     (seqSum a) ^ 2 = ↑(a.length) + 2 * totalAutocorr a := by
   rw [seqSum, totalAutocorr]
   exact sum_sq_eq_finset a h
+
 /-- **Energy identity:** For any TT(n), the sums satisfy
     x² + y² + 2z² + 2w² = 6n − 2. -/
 theorem energy_identity {n : Nat} {x y z w : PmSeq}

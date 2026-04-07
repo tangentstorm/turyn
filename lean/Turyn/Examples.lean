@@ -95,9 +95,10 @@ theorem kh05_hadamard_order : hadamardOrder 36 = 428 := by native_decide
     the verified TT(36) above implies the existence of a Hadamard matrix
     of order 4(3·36 − 1) = 428.
 
-    The TT(36) verification itself is fully machine-checked.
-    The pipeline from TT to Hadamard uses the KTR2005 construction
-    defined in Hadamard.lean (with sorry placeholders for general proofs). -/
+    The TT(36) verification is fully machine-checked.  The pipeline from
+    TT to Hadamard is defined in `Hadamard.lean`: Step 1 (TT → base sequences)
+    is fully proved; Steps 2–3 (T-sequences → Goethals-Seidel) have statements
+    but proofs are still in progress. -/
 theorem hadamard_428_exists :
     ∃ (x y z w : PmSeq),
       IsTurynType 36 x y z w ∧ hadamardOrder 36 = 428 := by
