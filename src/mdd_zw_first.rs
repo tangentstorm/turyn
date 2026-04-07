@@ -1631,61 +1631,19 @@ pub fn build_extension(
     let mut xy_memo: Vec<HashMap<StateKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
 
     // XY half DFS
-    fn build_xy_ext(
-        level: usize, sums: &mut [i8], active_bits: &[u8], target_k: usize,
-        ext_depth: usize, pos_order: &[usize],
-        active_at_level: &[Vec<usize>], active_indices: &[Vec<usize>],
-        events: &[Vec<(usize, usize, usize, [i8; 16])>],
-        lag_check: &[Vec<usize>], max_remaining: &[Vec<i32>],
-        nodes: &mut Vec<[u32; 4]>, unique: &mut HashMap<u64, u32>,
-        memo: &mut Vec<HashMap<StateKey, u32>>,
-    ) -> u32 {
-        if level == ext_depth {
-            for li in 0..target_k { if sums[li] != 0 { return DEAD; } }
-            return LEAF;
-        }
-        let active = &active_at_level[level];
-        let n_active = active.len();
-        let mut cv = [0u8; 32];
-        if level > 0 {
-            let pi = &active_indices[level - 1];
-            for (i, &pos) in active.iter().enumerate() {
-                if pos != pos_order[level] { let p = pi[pos]; if p != usize::MAX { cv[i] = active_bits[p]; } }
-            }
-        }
-        let new_idx = active_indices[level][pos_order[level]];
-        let sk = (pack_sums(sums), pack_active(&cv[..n_active]));
-        if let Some(&c) = memo[level].get(&sk) { return c; }
-
-        let mut children = [DEAD; 4];
-        for branch in 0u32..4 {
-            // No symmetry breaking in extension — base already handles it
-            cv[new_idx] = branch as u8;
-            for &(li, ia, ib, ref d) in &events[level] {
-                sums[li] += d[cv[ia] as usize * 4 + cv[ib] as usize];
-            }
-            let mut ok = true;
-            for &li in &lag_check[level] { if sums[li] != 0 { ok = false; break; } }
-            if ok && level + 1 < ext_depth {
-                for li in 0..target_k {
-                    if (sums[li] as i32).abs() > max_remaining[level+1][li] { ok = false; break; }
-                }
-            }
-            if ok {
-                children[branch as usize] = build_xy_ext(
-                    level+1, sums, &cv[..n_active], target_k, ext_depth, pos_order,
-                    active_at_level, active_indices, events, lag_check, max_remaining,
-                    nodes, unique, memo,
-                );
-            }
-            for &(li, ia, ib, ref d) in &events[level] {
-                sums[li] -= d[cv[ia] as usize * 4 + cv[ib] as usize];
-            }
-        }
-        let result = reduce_node((ext_depth + level) as u8, children, nodes, unique);
-        memo[level].insert(sk, result);
-        result
-    }
+    // Build XY build context for extension
+    let ext_xy_ctx = XyBuildCtx {
+        pos_order: pos_order.clone(),
+        events: xy_resolved,
+        lag_check: xy_lag_check_at_level,
+        max_remaining: xy_max_remaining,
+        active_at_level: active_at_level.clone(),
+        active_indices: active_indices.clone(),
+        k: target_k,
+        depth: ext_depth,
+        symmetry_break: false,
+    };
+    let target_zero = vec![0i8; target_k];
 
     // ZW half DFS
     fn build_zw_ext(
@@ -1694,8 +1652,7 @@ pub fn build_extension(
         active_at_level: &[Vec<usize>], active_indices: &[Vec<usize>],
         zw_events: &[Vec<(usize, usize, usize, [i8; 16])>],
         zw_lag_check: &[Vec<usize>], zw_max_remaining: &[Vec<i32>],
-        xy_events: &[Vec<(usize, usize, usize, [i8; 16])>],
-        xy_lag_check: &[Vec<usize>], xy_max_remaining_arr: &[Vec<i32>],
+        xy_ctx: &XyBuildCtx, target_zero: &[i8],
         nodes: &mut Vec<[u32; 4]>, unique: &mut HashMap<u64, u32>,
         zw_memo: &mut Vec<HashMap<StateKey, u32>>,
         xy_memo: &mut Vec<HashMap<StateKey, u32>>,
@@ -1707,12 +1664,10 @@ pub fn build_extension(
                 if zw_val.abs() > xy_max_abs[li] { return DEAD; }
                 if (zw_val + xy_max_abs[li]) % 2 != 0 { return DEAD; }
             }
-            // Build XY sub-MDD. Target: sums[li] must reach 0 after XY events.
             for m in xy_memo.iter_mut() { m.clear(); }
-            return build_xy_ext(
-                0, sums, &[], target_k, ext_depth, pos_order,
-                active_at_level, active_indices, xy_events, xy_lag_check, xy_max_remaining_arr,
-                nodes, unique, xy_memo,
+            return build_xy_dfs(
+                0, sums, &[], target_zero,
+                xy_ctx, nodes, unique, xy_memo,
             );
         }
         let active = &active_at_level[level];
@@ -1751,7 +1706,7 @@ pub fn build_extension(
                 children[branch as usize] = build_zw_ext(
                     level+1, sums, &cv[..n_active], target_k, ext_depth, pos_order, xy_max_abs,
                     active_at_level, active_indices, zw_events, zw_lag_check, zw_max_remaining,
-                    xy_events, xy_lag_check, xy_max_remaining_arr,
+                    xy_ctx, target_zero,
                     nodes, unique, zw_memo, xy_memo,
                 );
             }
@@ -1769,7 +1724,7 @@ pub fn build_extension(
         0, &mut sums, &[], target_k, ext_depth, &pos_order, &xy_max_abs,
         &active_at_level, &active_indices,
         &zw_resolved, &lag_check_at_level, &max_remaining,
-        &xy_resolved, &xy_lag_check_at_level, &xy_max_remaining,
+        &ext_xy_ctx, &target_zero,
         &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo,
     );
 
