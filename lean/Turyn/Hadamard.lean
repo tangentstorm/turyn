@@ -19,29 +19,30 @@ constructs a Hadamard matrix of order **4(3n − 1)**.
 ### Step 1: TT(n) → Base sequences BS(2n−1, 2n−1, n, n)
 
 Given TT(n) = (X, Y, Z, W) with |X| = |Y| = |Z| = n and |W| = n − 1,
-form base sequences by **concatenation** (Theorem 1 of [KTR2005]):
-
-    A = Z ++ W           (length 2n − 1)
-    B = Z ++ (−W)         (length 2n − 1)
-    C = X                 (length n)
-    D = Y                 (length n)
-
+form base sequences A = Z++W, B = Z++(−W), C = X, D = Y.
 These satisfy N_A(s) + N_B(s) + N_C(s) + N_D(s) = 0 for all s ≥ 1.
+
+**Status:** Fully proved (`base_seq_vanishing_prop`).
 
 ### Step 2: Base sequences → T-sequences of length 3n − 1
 
-    T₁ = (A+B)/2 ++ 0_n     = Z ++ 0_n          (length 3n − 1)
-    T₂ = (A−B)/2 ++ 0_n     = 0_n ++ W ++ 0_n   (length 3n − 1)
-    T₃ = 0_{2n−1} ++ (C+D)/2                     (length 3n − 1)
-    T₄ = 0_{2n−1} ++ (C−D)/2                     (length 3n − 1)
+Pad with zeros to get four equal-length sequences with disjoint supports:
 
-These are {0, ±1} T-sequences with disjoint supports.
+    T₁ = Z ++ 0_n,  T₂ = 0_n ++ W ++ 0_n,
+    T₃ = 0_{2n−1} ++ (X+Y)/2,  T₄ = 0_{2n−1} ++ (X−Y)/2
+
+Disjoint supports ensure periodic autocorrelation = aperiodic, which
+decomposes into the base-sequence autocorrelation (vanishes by Step 1).
+
+**Status:** Statement only (`tseq_vanishing_prop`).
 
 ### Step 3: T-sequences → Goethals-Seidel Hadamard matrix of order 4(3n − 1)
 
-The T-sequences are used as first rows of circulant matrices in the
-Goethals-Seidel array, producing a Hadamard matrix of order 4m = 4(3n − 1).
-For TT(36): 4(3·36 − 1) = 4 · 107 = **428**.
+Plug T-sequences into circulant matrices in the 4×4 block array.
+For circulant C_a, (C_a · C_aᵀ)_{i,j} = periodic autocorrelation at lag i−j.
+The block structure ensures H · Hᵀ = m · I.
+
+**Status:** Statement only (`goethals_seidel_is_hadamard`).
 -/
 
 /-! ### Matrix representation -/
@@ -207,17 +208,22 @@ def goethalsSeidel (a b c d : List Int) : IntMatrix :=
     | 3 => negRow (applyR rowD) ++ negRow (applyR rowC) ++ applyR rowB ++ rowA
     | _ => []
 
-/-! ### Construction theorems -/
-
 /-- The Hadamard order from a TT(n) via the KTR2005 pipeline. -/
 def hadamardOrder (n : Nat) : Nat := 4 * (3 * n - 1)
 
-/-! ### Propositional versions of the construction theorems
+/-! ## Step 1: TT(n) → Base sequences (fully proved)
 
-The three `sorry` proofs above are stated over boolean predicates, which makes
-them awkward to prove. Here we give propositional versions and prove the
-high-level structure, reducing everything to a single combinatorial lemma
-about the autocorrelation of concatenated sequences.
+The proof builds up from three lemmas:
+
+1. `negSeq_getD` — indexing into a negated sequence negates the value
+2. `pointwise_cancel` — at each index, the Z++W and Z++(-W) products
+   combine to either 2× the within-part product or 0 (cross terms cancel)
+3. `concat_neg_autocorr_sum` — summing over all indices:
+   N_{Z++W}(s) + N_{Z++(-W)}(s) = 2·N_Z(s) + 2·N_W(s)
+
+These combine in `base_seq_vanishing_prop` to show that the base sequence
+autocorrelation vanishes, using the Turyn vanishing condition for small lags
+and the trivial bound for large lags.
 -/
 
 /-- negSeq preserves length. -/
@@ -226,50 +232,45 @@ theorem negSeq_length (a : PmSeq) : (negSeq a).length = a.length :=
   List.length_map _
 
 /-- Aperiodic autocorrelation vanishes when the lag meets or exceeds
-    the sequence length (immediate from the definition). -/
+    the sequence length. -/
 lemma aperiodicAutocorr_zero_of_ge (a : PmSeq) (s : Nat) (h : s ≥ a.length) :
     aperiodicAutocorr a s = 0 := by
   unfold aperiodicAutocorr; exact if_pos h
 
-/-! ### Cross-term cancellation -/
-
-/-- negSeq getD: indexing into a negated sequence negates the value. -/
+/-- Indexing into a negated sequence negates the value. -/
 lemma negSeq_getD (w : PmSeq) (i : Nat) :
     (negSeq w).getD i 0 = w.getD i 0 * (-1) := by
   simp only [negSeq, List.getD_eq_getElem?_getD, List.getElem?_map]
   cases w[i]? <;> simp
 
 /-- **Pointwise cross-term cancellation:** at each index i, the sum of the
-    products from Z++W and Z++(-W) equals either 2·(z-part product),
-    2·(w-part product), or 0 (cross term). -/
+    products from Z++W and Z++(-W) gives 2× the within-part product
+    (when both indices fall in the same part) or 0 (cross term). -/
 private lemma pointwise_cancel (z w : PmSeq) (s i : Nat) :
     (z ++ w).getD i 0 * (z ++ w).getD (i + s) 0 +
     (z ++ negSeq w).getD i 0 * (z ++ negSeq w).getD (i + s) 0 =
     if i + s < z.length then
       2 * (z.getD i 0 * z.getD (i + s) 0)
     else if i < z.length then
-      0  -- cross term cancels
+      0
     else
       2 * (w.getD (i - z.length) 0 * w.getD (i + s - z.length) 0) := by
   by_cases his : i + s < z.length
-  · -- Both i and i+s index into z
-    have hi : i < z.length := by omega
+  · have hi : i < z.length := by omega
     simp only [his, ↓reduceIte]
     rw [List.getD_append _ _ _ _ hi, List.getD_append _ _ _ _ his,
         List.getD_append _ _ _ _ hi, List.getD_append _ _ _ _ his]
     ring
   · simp only [his, ↓reduceIte]
     by_cases hi : i < z.length
-    · -- Cross term: i in z, i+s in w
-      simp only [hi, ↓reduceIte]
+    · simp only [hi, ↓reduceIte]
       rw [List.getD_append _ _ _ _ hi,
           List.getD_append_right _ _ _ _ (by omega),
           List.getD_append _ _ _ _ hi,
           List.getD_append_right _ _ _ _ (by omega)]
       rw [negSeq_getD]
       ring
-    · -- Both indices in w-part
-      simp only [hi, ↓reduceIte]
+    · simp only [hi, ↓reduceIte]
       rw [List.getD_append_right _ _ _ _ (by omega),
           List.getD_append_right _ _ _ _ (by omega),
           List.getD_append_right _ _ _ _ (by omega),
@@ -277,18 +278,16 @@ private lemma pointwise_cancel (z w : PmSeq) (s i : Nat) :
       rw [negSeq_getD, negSeq_getD]
       ring
 
-/-- When i ≥ a.length, `a.getD i 0 = 0`. -/
+/-- Out-of-range `getD` returns the default. -/
 private lemma getD_zero_of_ge (a : List Int) (i : Nat) (h : a.length ≤ i) :
     a.getD i 0 = 0 := List.getD_eq_default _ _ h
 
-/-- Decomposition of autocorrelation of a concatenation:
-    N_{a++b}(s) = N_a(s) + (cross terms) + (shifted N_b(s))
+/-- **Cross-term cancellation:**
+    N_{Z++W}(s) + N_{Z++(-W)}(s) = 2·N_Z(s) + 2·N_W(s).
 
-    where "cross terms" = ∑ over indices i with i < |a| ≤ i+s,
-    and "shifted N_b(s)" = ∑ i ∈ [|a|, |a|+|b|-s), a++b[i] * a++b[i+s].
-
-    We prove this for `a ++ b` and `a ++ negSeq b` simultaneously,
-    showing their sum kills the cross terms. -/
+    The sum over index pairs splits into within-Z terms, within-W terms,
+    and cross terms.  Adding the Z++W and Z++(-W) versions doubles the
+    within-part contributions and kills the cross terms. -/
 lemma concat_neg_autocorr_sum (z w : PmSeq) (s : Nat) :
     aperiodicAutocorr (z ++ w) s + aperiodicAutocorr (z ++ negSeq w) s =
     2 * aperiodicAutocorr z s + 2 * aperiodicAutocorr w s := by
@@ -296,37 +295,32 @@ lemma concat_neg_autocorr_sum (z w : PmSeq) (s : Nat) :
   unfold aperiodicAutocorr
   simp only [List.length_append, hnw]
   set nz := z.length; set nw := w.length
-  -- Case: s ≥ nz + nw — everything is 0
   by_cases hszw : nz + nw ≤ s
-  · simp only [show s ≥ nz + nw from hszw, ↓reduceIte,
+  · -- s ≥ |z| + |w|: all autocorrelations are 0
+    simp only [show s ≥ nz + nw from hszw, ↓reduceIte,
                show s ≥ nz from by omega, show s ≥ nw from by omega]; ring
   · simp only [show ¬(nz + nw ≤ s) from by omega, ↓reduceIte]
-    -- Combine the two LHS sums pointwise
+    -- Combine the two sums pointwise using pointwise_cancel
     rw [← Finset.sum_add_distrib]
     conv_lhs => arg 2; ext i; rw [pointwise_cancel z w s i]
-    -- LHS is now ∑ i in range(nz+nw-s), (3-way if-then-else).
-    -- Split into: {i+s < nz} part + {i ≥ nz} part (cross terms = 0).
-    -- The condition tree is: if i+s < nz then ... else if i < nz then 0 else ...
+    -- Split the 3-way if-then-else sum using Finset.sum_ite
     rw [Finset.sum_ite]
     simp only [Finset.sum_ite, Finset.sum_const_zero, zero_add]
-    -- LHS: (∑ filtered z-part) + (∑ filtered w-part)
-    -- RHS: 2 * (∑ z-autocorr) + 2 * (∑ w-autocorr)
-    -- Handle sub-cases for z and w autocorrelation being 0
     by_cases hsz : nz ≤ s
-    · -- s ≥ nz: autocorr z = 0, filter for i+s < nz is empty
+    · -- s ≥ nz: z-autocorrelation is 0, z-filter is empty
       simp only [hsz, ↓reduceIte]
       have hfilt_empty : (range (nz + nw - s)).filter (fun i => i + s < nz) = ∅ := by
         ext x; simp [Finset.mem_filter, Finset.mem_range]; omega
       rw [hfilt_empty, Finset.sum_empty, zero_add]
-      -- w-part: need to show the filtered sum = 2 * autocorr w
       by_cases hsw : nw ≤ s
-      · simp only [hsw, ↓reduceIte]
+      · -- Both z and w autocorrelations are 0
+        simp only [hsw, ↓reduceIte]
         have hfilt_empty2 : ((range (nz + nw - s)).filter (fun i => ¬(i + s < nz))).filter
             (fun i => ¬(↑i < nz)) = ∅ := by
           ext x; simp [Finset.mem_filter, Finset.mem_range]; omega
         rw [hfilt_empty2, Finset.sum_empty]; ring
-      · simp only [hsw, ↓reduceIte]
-        -- Filtered set = Ico nz (nz+nw-s), reindex to range(nw-s)
+      · -- Only w-autocorrelation survives
+        simp only [hsw, ↓reduceIte]
         have hfilt_eq : ((range (nz + nw - s)).filter (fun i => ¬(i + s < nz))).filter
             (fun i => ¬(↑i < nz)) = Finset.Ico nz (nz + nw - s) := by
           ext x; simp [Finset.mem_filter, Finset.mem_range, Finset.mem_Ico, not_lt]; omega
@@ -339,11 +333,11 @@ lemma concat_neg_autocorr_sum (z w : PmSeq) (s : Nat) :
         have h1 : nz + i - z.length = i := by omega
         have h2 : nz + i + s - z.length = i + s := by omega
         simp only [h1, h2]
-    · -- s < nz
+    · -- s < nz: both z and w parts contribute
       simp only [hsz, ↓reduceIte]
-      -- z-part filter = range(nz - s)
       congr 1
-      · rw [Finset.mul_sum]
+      · -- z-part: filter {i+s < nz} of range(nz+nw-s) = range(nz-s)
+        rw [Finset.mul_sum]
         apply Finset.sum_congr
         · ext x; simp [Finset.mem_filter, Finset.mem_range]; omega
         · intro i _; ring
@@ -354,7 +348,8 @@ lemma concat_neg_autocorr_sum (z w : PmSeq) (s : Nat) :
               (fun i => ¬(↑i < nz)) = ∅ := by
             ext x; simp [Finset.mem_filter, Finset.mem_range]; omega
           rw [hfilt_empty2, Finset.sum_empty]; ring
-        · simp only [hsw, ↓reduceIte]
+        · -- Reindex the w-part from Ico nz (nz+nw-s) to range(nw-s)
+          simp only [hsw, ↓reduceIte]
           rw [Finset.mul_sum]
           have hfilt_eq : ((range (nz + nw - s)).filter (fun i => ¬(i + s < nz))).filter
               (fun i => ¬(↑i < nz)) = Finset.Ico nz (nz + nw - s) := by
@@ -363,22 +358,14 @@ lemma concat_neg_autocorr_sum (z w : PmSeq) (s : Nat) :
           have hrange : nz + nw - s - nz = nw - s := by omega
           apply Finset.sum_congr (by rw [hrange])
           intro i _
-          -- nz + i - z.length = i and nz + i + s - z.length = i + s
-          -- since nz = z.length by definition
           show 2 * (w.getD (nz + i - z.length) 0 * w.getD (nz + i + s - z.length) 0) =
                2 * (w.getD i 0 * w.getD (i + s) 0)
           congr 1; congr 1 <;> (congr 1; omega)
 
-/-! ### Step 1: TT(n) → Base sequences -/
-
-/-- **Base sequence theorem (propositional, KTR2005 Theorem 1):**
+/-- **Base sequence theorem (KTR2005, Theorem 1):**
     If (X, Y, Z, W) is TT(n) with n ≥ 1, the base sequences
     A = Z++W, B = Z++(-W), C = X, D = Y satisfy
-        N_A(s) + N_B(s) + N_C(s) + N_D(s) = 0   for 1 ≤ s < 2n−1.
-
-    • For s < n: cross-term cancellation gives N_A + N_B = 2·N_Z + 2·N_W.
-      Adding N_X + N_Y recovers the Turyn vanishing condition.
-    • For s ≥ n: every autocorrelation is individually zero (lag ≥ length). -/
+        N_A(s) + N_B(s) + N_C(s) + N_D(s) = 0   for all s ≥ 1. -/
 theorem base_seq_vanishing_prop {n : Nat} {x y z w : PmSeq}
     (htt : IsTurynTypeProp n x y z w) (hn : n ≥ 1)
     {s : Nat} (hs1 : 1 ≤ s) :
@@ -390,7 +377,7 @@ theorem base_seq_vanishing_prop {n : Nat} {x y z w : PmSeq}
     have hvan := htt.vanishing s hs1 hsn
     unfold combinedAutocorr at hvan
     linarith
-  · -- s ≥ n: each autocorrelation vanishes (lag ≥ sequence length)
+  · -- s ≥ n: each autocorrelation vanishes individually (lag ≥ length)
     simp only [not_lt] at hsn
     have hxl := htt.x_len; have hyl := htt.y_len
     have hzl := htt.z_len; have hwl := htt.w_len
@@ -400,21 +387,37 @@ theorem base_seq_vanishing_prop {n : Nat} {x y z w : PmSeq}
         aperiodicAutocorr_zero_of_ge y s (by omega)]
     ring
 
-/-! ### Steps 2 & 3 (proof sketches)
+/-! ## Step 2: Base sequences → T-sequences (statement only)
 
-**Step 2 (T-sequence vanishing):** The T-sequences have disjoint supports
-(each position has at most one nonzero entry), so their periodic
-autocorrelation equals their nonperiodic autocorrelation — there are no
-wraparound contributions.  The nonperiodic autocorrelation decomposes
-into the base-sequence autocorrelation, which vanishes by
-`base_seq_vanishing_prop`.
-
-**Step 3 (Goethals-Seidel):**  For a circulant matrix C_a with first row a,
-the (i,j) entry of C_a · C_aᵀ is the periodic autocorrelation of a at lag
-i − j.  The 4×4 block structure of the Goethals-Seidel array ensures
-that the diagonal blocks sum to m · I (from the lag-0 autocorrelation =
-weight of each T-sequence) and the off-diagonal blocks cancel to 0
-(from the vanishing periodic autocorrelation plus the sign pattern
-inherited from the quaternion / Williamson array).
+The T-sequences have disjoint supports (each position has at most one
+nonzero entry), so their periodic autocorrelation equals their aperiodic
+autocorrelation.  The aperiodic autocorrelation decomposes into the
+base-sequence autocorrelation, which vanishes by `base_seq_vanishing_prop`.
 -/
 
+/-- **T-sequence theorem:** If (X, Y, Z, W) is TT(n), the T-sequences
+    of length 3n−1 have vanishing combined periodic autocorrelation. -/
+theorem tseq_vanishing_prop {n : Nat} {x y z w : PmSeq}
+    (htt : IsTurynTypeProp n x y z w) (hn : n ≥ 1) :
+    let (t1, t2, t3, t4) := tSequences x y z w
+    ∀ s, 1 ≤ s → s < 3 * n - 1 →
+      aperiodicAutocorr t1 s + aperiodicAutocorr t2 s +
+      aperiodicAutocorr t3 s + aperiodicAutocorr t4 s = 0 := by
+  sorry
+
+/-! ## Step 3: T-sequences → Goethals-Seidel Hadamard matrix (statement only)
+
+For circulant matrix C_a with first row a, the (i,j) entry of C_a · C_aᵀ is
+the periodic autocorrelation of a at lag i − j.  The 4×4 Goethals-Seidel
+block structure ensures H · Hᵀ = m · I when the four sequences have
+vanishing combined periodic autocorrelation.
+-/
+
+/-- **Goethals-Seidel theorem:** If four equal-length sequences have vanishing
+    combined periodic autocorrelation, the Goethals-Seidel array is a
+    Hadamard matrix of order 4m. -/
+theorem goethals_seidel_is_hadamard (a b c d : List Int)
+    (hlen : a.length = b.length ∧ b.length = c.length ∧ c.length = d.length)
+    (hvanish : checkTSeqProperty a b c d = true) :
+    IsHadamard (goethalsSeidel a b c d) (4 * a.length) := by
+  sorry
