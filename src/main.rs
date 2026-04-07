@@ -154,6 +154,24 @@ impl PackedSeq {
     }
 }
 
+/// Extract a ±1 sequence from a SAT solver's assignment.
+fn extract_seq(solver: &radical::Solver, var_fn: impl Fn(usize) -> i32, len: usize) -> PackedSeq {
+    PackedSeq::from_values(&extract_vals(solver, var_fn, len))
+}
+
+/// Extract ±1 values from a SAT solver's assignment.
+fn extract_vals(solver: &radical::Solver, var_fn: impl Fn(usize) -> i32, len: usize) -> Vec<i8> {
+    (0..len).map(|i| if solver.value(var_fn(i)) == Some(true) { 1 } else { -1 }).collect()
+}
+
+/// Expand packed boundary bits into ±1 prefix and suffix arrays.
+/// Low k bits → prefix, next k bits → suffix.
+fn expand_boundary_bits(bits: u32, k: usize) -> (Vec<i8>, Vec<i8>) {
+    let prefix: Vec<i8> = (0..k).map(|i| if (bits >> i) & 1 == 1 { 1 } else { -1 }).collect();
+    let suffix: Vec<i8> = (0..k).map(|i| if (bits >> (k + i)) & 1 == 1 { 1 } else { -1 }).collect();
+    (prefix, suffix)
+}
+
 /// Format a sequence as a colorized +/- string for terminal display.
 /// '+' gets black text on light gray background, '-' gets white text on dark gray.
 /// Copies as plain +/- from most terminals.
@@ -887,6 +905,42 @@ impl SpectralIndex {
 /// Streaming Z×W pairing with spectral index for fast candidate lookup.
 /// For each spectrally-valid Z, uses the index to find W candidates that pass
 /// the top-4 tightest frequency constraints, then full-checks only those.
+/// Calls `emit` for each valid pair; `emit` returns true to continue.
+fn for_each_zw_pair(
+    problem: Problem,
+    z_sum: i32,
+    w_candidates: &[SeqWithSpectrum],
+    w_index: &SpectralIndex,
+    cfg: &SearchConfig,
+    spectral_z: &SpectralFilter,
+    stats: &mut SearchStats,
+    found: &AtomicBool,
+    mut emit: impl FnMut(&PackedSeq, &PackedSeq, Vec<i32>, &[f64], &[f64]) -> bool,
+) {
+    let individual_bound = problem.spectral_bound();
+    let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
+    let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
+    let mut idx_buf = Vec::new();
+    generate_sequences_permuted(problem.n, z_sum, true, true, cfg.max_z, |values| {
+        if found.load(AtomicOrdering::Relaxed) { return false; }
+        stats.z_generated += 1;
+        let Some(z_spectrum) =
+            spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf) else { return true; };
+        stats.z_spectral_ok += 1;
+        let z_seq = PackedSeq::from_values(values);
+        w_index.candidates_for(&z_spectrum, pair_bound, w_candidates, &mut idx_buf);
+        for &wi in &idx_buf {
+            let w = &w_candidates[wi];
+            stats.candidate_pair_attempts += 1;
+            if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
+            stats.candidate_pair_spectral_ok += 1;
+            let zw = compute_zw_autocorr(problem, &z_seq, &w.seq);
+            if !emit(&z_seq, &w.seq, zw, &z_spectrum, &w.spectrum) { return false; }
+        }
+        true
+    });
+}
+
 fn stream_zw_candidates(
     problem: Problem,
     z_sum: i32,
@@ -897,50 +951,12 @@ fn stream_zw_candidates(
     stats: &mut SearchStats,
     found: &AtomicBool,
 ) -> Vec<CandidateZW> {
-    let individual_bound = problem.spectral_bound();
-    let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
     let mut out = Vec::new();
-    let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
-    let mut idx_buf = Vec::new();
-    generate_sequences_permuted(problem.n, z_sum, true, true, cfg.max_z, |values| {
-        if found.load(AtomicOrdering::Relaxed) { return false; }
-        stats.z_generated += 1;
-        let Some(z_spectrum) =
-            spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf) else { return true; };
-        stats.z_spectral_ok += 1;
-        let z_seq = PackedSeq::from_values(values);
-        let mut z_auto: Option<Vec<i32>> = None;
-        w_index.candidates_for(&z_spectrum, pair_bound, w_candidates, &mut idx_buf);
-        for &wi in &idx_buf {
-            let w = &w_candidates[wi];
-            stats.candidate_pair_attempts += 1;
-            if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
-            stats.candidate_pair_spectral_ok += 1;
-            let z_auto = z_auto.get_or_insert_with(|| {
-                let mut a = vec![0i32; problem.n];
-                for s in 1..problem.n { a[s] = z_seq.autocorrelation(s); }
-                a
-            });
-            let w_auto = w.autocorr.as_ref().cloned()
-                .unwrap_or_else(|| {
-                    let mut a = vec![0i32; problem.m()];
-                    for s in 1..problem.m() { a[s] = w.seq.autocorrelation(s); }
-                    a
-                });
-            let mut zw = vec![0; problem.n];
-            for (s, slot) in zw.iter_mut().enumerate().skip(1) {
-                let nz = z_auto[s];
-                let nw = if s < problem.m() { w_auto[s] } else { 0 };
-                *slot = 2 * nz + 2 * nw;
-            }
-            out.push(CandidateZW {
-                z: z_seq.clone(),
-                w: w.seq.clone(),
-                zw_autocorr: zw,
-            });
-        }
-        true
-    });
+    for_each_zw_pair(problem, z_sum, w_candidates, w_index, cfg, spectral_z, stats, found,
+        |z_seq, w_seq, zw, _, _| {
+            out.push(CandidateZW { z: z_seq.clone(), w: w_seq.clone(), zw_autocorr: zw });
+            true
+        });
     out
 }
 
@@ -957,57 +973,23 @@ fn stream_zw_candidates_to_channel(
     found: &AtomicBool,
     tx: &std::sync::mpsc::SyncSender<SatWorkItem>,
 ) {
-    let individual_bound = problem.spectral_bound();
-    let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
-    let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
     let mut seen = std::collections::HashSet::new();
-    let mut idx_buf = Vec::new();
-    generate_sequences_permuted(problem.n, tuple.z, true, true, cfg.max_z, |values| {
-        if found.load(AtomicOrdering::Relaxed) { return false; }
-        stats.z_generated += 1;
-        let Some(z_spectrum) =
-            spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf) else { return true; };
-        stats.z_spectral_ok += 1;
-        let z_seq = PackedSeq::from_values(values);
-        let mut z_auto: Option<Vec<i32>> = None;
-        w_index.candidates_for(&z_spectrum, pair_bound, w_candidates, &mut idx_buf);
-        for &wi in &idx_buf {
-            let w = &w_candidates[wi];
-            stats.candidate_pair_attempts += 1;
-            if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
-            let max_power = spectral_pair_max_power(&z_spectrum, &w.spectrum);
-            stats.candidate_pair_spectral_ok += 1;
-            let z_auto = z_auto.get_or_insert_with(|| {
-                let mut a = vec![0i32; problem.n];
-                for s in 1..problem.n { a[s] = z_seq.autocorrelation(s); }
-                a
-            });
-            let w_auto = w.autocorr.as_ref().cloned()
-                .unwrap_or_else(|| {
-                    let mut a = vec![0i32; problem.m()];
-                    for s in 1..problem.m() { a[s] = w.seq.autocorrelation(s); }
-                    a
-                });
-            let mut zw = vec![0; problem.n];
-            for (s, slot) in zw.iter_mut().enumerate().skip(1) {
-                let nz = z_auto[s];
-                let nw = if s < problem.m() { w_auto[s] } else { 0 };
-                *slot = 2 * nz + 2 * nw;
-            }
+    for_each_zw_pair(problem, tuple.z, w_candidates, w_index, cfg, spectral_z, stats, found,
+        |z_seq, w_seq, zw, z_spectrum, w_spectrum| {
+            let max_power = spectral_pair_max_power(z_spectrum, w_spectrum);
             if seen.insert(zw.clone()) {
                 let _ = tx.send(SatWorkItem {
                     tuple,
                     x: SeqInput::Blank, y: SeqInput::Blank,
                     z: SeqInput::Fixed(z_seq.clone()),
-                    w: SeqInput::Fixed(w.seq.clone()),
+                    w: SeqInput::Fixed(w_seq.clone()),
                     zw_autocorr: Some(zw),
                     priority: max_power,
                     boundary: None,
                 });
             }
-        }
-        true
-    });
+            true
+        });
 }
 
 fn build_zw_candidates(
@@ -1099,6 +1081,15 @@ impl Gf2Row {
     }
 }
 
+/// Compute the XY agree target for a given lag `s`:
+/// target_raw = 2*(n-s) - zw_autocorr[s], target = target_raw/2.
+/// Returns None if the target is infeasible (negative or wrong parity).
+fn xy_agree_target(n: usize, s: usize, zw_autocorr: &[i32]) -> Option<usize> {
+    let target_raw = 2 * (n - s) as i32 - zw_autocorr[s];
+    if target_raw < 0 || target_raw % 2 != 0 { return None; }
+    Some((target_raw / 2) as usize)
+}
+
 /// Returns None if a contradiction is detected (UNSAT), otherwise equalities.
 fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Option<Vec<(i32, i32, bool)>> {
     let num_vars = 2 * n;
@@ -1152,9 +1143,7 @@ fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Option<Vec<(i32
     // Process lags where ALL or NO pairs agree.
     // Also process lags where X and Y halves have separate extreme targets.
     for s in 1..n {
-        let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-        if target_raw < 0 || target_raw % 2 != 0 { continue; }
-        let target = (target_raw / 2) as usize;
+        let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { continue; };
         let x_pairs = n - s;
         let y_pairs = n - s;
         let max_pairs = x_pairs + y_pairs;
@@ -1195,9 +1184,7 @@ fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Option<Vec<(i32
     {
         let mut rows: Vec<Gf2Row> = Vec::new();
         for s in 1..n {
-            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-            if target_raw < 0 || target_raw % 2 != 0 { continue; }
-            let target = (target_raw / 2) as usize;
+            let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { continue; };
             let k = 2 * (n - s); // total pairs (X + Y)
 
             // Build GF(2) equation: for each pair (i, i+s), x_i and x_{i+s} each
@@ -1444,34 +1431,22 @@ impl SatXYTemplate {
     fn is_feasible(&self, candidate: &CandidateZW) -> bool {
         let n = self.n;
         for s in 1..n {
-            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-            if target_raw < 0 || target_raw % 2 != 0 { return false; }
-            let target = (target_raw / 2) as usize;
+            let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { return false; };
             let max_pairs = 2 * (n - s);
             if target > max_pairs { return false; }
         }
         true
     }
 
-    /// Solve for X/Y given a specific Z/W candidate.
-    /// Clones the template and adds PB constraints for per-lag agree targets.
-    /// Returns (result, was_limited): result is Some if SAT, None if UNSAT/UNKNOWN.
-    /// was_limited=true means we hit the conflict limit (UNKNOWN).
-    fn solve_for_limited(&self, candidate: &CandidateZW, conflict_limit: u64) -> (Option<(PackedSeq, PackedSeq)>, bool) {
-        if !self.is_feasible(candidate) { return (None, false); }
+    /// Clone the template solver and add per-candidate constraints:
+    /// GJ equalities, quad PB per lag, and XOR parity constraints.
+    /// Returns None if infeasible or GJ detects a contradiction.
+    fn prepare_candidate_solver(&self, candidate: &CandidateZW) -> Option<radical::Solver> {
+        if !self.is_feasible(candidate) { return None; }
         let n = self.n;
-        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
-        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
-
-        // GJ-derived equalities from extreme-target lags (before clone — cheap)
-        let Some(equalities) = gj_candidate_equalities(n, candidate) else {
-            return (None, false); // GJ detected contradiction → UNSAT
-        };
+        let Some(equalities) = gj_candidate_equalities(n, candidate) else { return None; };
 
         let mut solver = self.solver.clone();
-        if conflict_limit > 0 {
-            solver.set_conflict_limit(conflict_limit);
-        }
         for &(a, b, equal) in &equalities {
             if equal {
                 solver.add_clause([-a, b]);
@@ -1484,113 +1459,16 @@ impl SatXYTemplate {
 
         // Add quadratic PB constraints for each lag's agree target
         for s in 1..n {
-            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-            let target = (target_raw / 2) as usize;
+            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
             let lp = &self.lag_pairs[s];
             let ones: Vec<u32> = vec![1; lp.lits_a.len()];
             solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
         }
 
         // GF(2) XOR constraints: parity of agree count at each lag.
-        // For lag s with agree target T and k = 2*(n-s) pairs:
-        //   XOR of {x[i] ⊕ x[i+s] for i in 0..n-s} ⊕ {y[i] ⊕ y[i+s] for i in 0..n-s} = (T+k) mod 2
-        // Each variable v appears in the XOR with multiplicity = (# pairs containing v) mod 2.
         if solver.config.xor_propagation && n >= 8 {
             for s in 1..n {
-                let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-                if target_raw < 0 || target_raw % 2 != 0 { continue; }
-                let target = (target_raw / 2) as usize;
-                let k = 2 * (n - s);
-                let parity = ((target + k) % 2) == 1;
-
-                // Build variable list: each var appears with multiplicity = # pairs it's in, mod 2
-                let mut in_xor = vec![false; 2 * n];
-                // X pairs: (i, i+s) for i in 0..n-s
-                for i in 0..(n - s) {
-                    in_xor[i] ^= true;
-                    in_xor[i + s] ^= true;
-                }
-                // Y pairs: (n+i, n+i+s) for i in 0..n-s
-                for i in 0..(n - s) {
-                    in_xor[n + i] ^= true;
-                    in_xor[n + i + s] ^= true;
-                }
-                let vars: Vec<i32> = in_xor.iter().enumerate()
-                    .filter(|&(_, &v)| v)
-                    .map(|(i, _)| (i + 1) as i32)  // 1-based
-                    .collect();
-                if !vars.is_empty() {
-                    solver.add_xor(&vars, parity);
-                }
-            }
-        }
-
-        match solver.solve() {
-            Some(true) => {
-                let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                (Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y))), false)
-            }
-            Some(false) => (None, false),  // definite UNSAT
-            None => (None, true),  // hit conflict limit (UNKNOWN)
-        }
-    }
-
-    fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
-        self.solve_for_limited(candidate, 0).0
-    }
-
-    /// Solve with warm-start: inject saved clauses/phases before solving,
-    /// extract learnt clauses/phases after solving.
-    fn solve_for_warm(
-        &self,
-        candidate: &CandidateZW,
-        warm: &mut WarmStartState,
-    ) -> Option<(PackedSeq, PackedSeq)> {
-        if !self.is_feasible(candidate) { return None; }
-        let n = self.n;
-        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
-        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
-
-        let Some(equalities) = gj_candidate_equalities(n, candidate) else {
-            return None;
-        };
-
-        let mut solver = self.solver.clone();
-
-        // Inject warm-start data
-        if warm.inject_clauses && !warm.clauses.is_empty() {
-            solver.inject_clauses(&warm.clauses, 2);
-        }
-        if warm.inject_phase {
-            if let Some(ref ph) = warm.phase {
-                solver.set_phase(ph);
-            }
-        }
-
-        for &(a, b, equal) in &equalities {
-            if equal {
-                solver.add_clause([-a, b]);
-                solver.add_clause([a, -b]);
-            } else {
-                solver.add_clause([-a, -b]);
-                solver.add_clause([a, b]);
-            }
-        }
-
-        for s in 1..n {
-            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-            let target = (target_raw / 2) as usize;
-            let lp = &self.lag_pairs[s];
-            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
-            solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
-        }
-
-        if solver.config.xor_propagation && n >= 8 {
-            for s in 1..n {
-                let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-                if target_raw < 0 || target_raw % 2 != 0 { continue; }
-                let target = (target_raw / 2) as usize;
+                let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { continue; };
                 let k = 2 * (n - s);
                 let parity = ((target + k) % 2) == 1;
                 let mut in_xor = vec![false; 2 * n];
@@ -1612,6 +1490,59 @@ impl SatXYTemplate {
             }
         }
 
+        Some(solver)
+    }
+
+    /// Extract X/Y solution from a solved SAT solver.
+    fn extract_xy(&self, solver: &radical::Solver) -> (PackedSeq, PackedSeq) {
+        let n = self.n;
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        (extract_seq(solver, x_var, n), extract_seq(solver, y_var, n))
+    }
+
+    /// Solve for X/Y given a specific Z/W candidate.
+    /// Returns (result, was_limited): result is Some if SAT, None if UNSAT/UNKNOWN.
+    /// was_limited=true means we hit the conflict limit (UNKNOWN).
+    fn solve_for_limited(&self, candidate: &CandidateZW, conflict_limit: u64) -> (Option<(PackedSeq, PackedSeq)>, bool) {
+        let Some(mut solver) = self.prepare_candidate_solver(candidate) else {
+            return (None, false);
+        };
+        if conflict_limit > 0 {
+            solver.set_conflict_limit(conflict_limit);
+        }
+        match solver.solve() {
+            Some(true) => (Some(self.extract_xy(&solver)), false),
+            Some(false) => (None, false),
+            None => (None, true),
+        }
+    }
+
+    fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
+        self.solve_for_limited(candidate, 0).0
+    }
+
+    /// Solve with warm-start: inject saved clauses/phases before solving,
+    /// extract learnt clauses/phases after solving.
+    fn solve_for_warm(
+        &self,
+        candidate: &CandidateZW,
+        warm: &mut WarmStartState,
+    ) -> Option<(PackedSeq, PackedSeq)> {
+        let Some(mut solver) = self.prepare_candidate_solver(candidate) else {
+            return None;
+        };
+
+        // Inject warm-start data
+        if warm.inject_clauses && !warm.clauses.is_empty() {
+            solver.inject_clauses(&warm.clauses, 2);
+        }
+        if warm.inject_phase {
+            if let Some(ref ph) = warm.phase {
+                solver.set_phase(ph);
+            }
+        }
+
         let result = solver.solve();
 
         // Extract warm-start data for next solve
@@ -1624,11 +1555,7 @@ impl SatXYTemplate {
         warm.phase = Some(solver.get_phase());
 
         match result {
-            Some(true) => {
-                let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)))
-            }
+            Some(true) => Some(self.extract_xy(&solver)),
             _ => None,
         }
     }
@@ -1764,12 +1691,9 @@ fn solve_work_item(
                 let m = problem.m();
                 match solver.solve() {
                     Some(true) => {
-                        let x = PackedSeq::from_values(&(0..n).map(|i|
-                            if solver.value(enc.x_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
-                        let y = PackedSeq::from_values(&(0..n).map(|i|
-                            if solver.value(enc.y_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
-                        let w = PackedSeq::from_values(&(0..m).map(|i|
-                            if solver.value(enc.w_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                        let x = extract_seq(&solver, |i| enc.x_var(i), n);
+                        let y = extract_seq(&solver, |i| enc.y_var(i), n);
+                        let w = extract_seq(&solver, |i| enc.w_var(i), m);
                         Some((x, y, z.clone(), w))
                     }
                     _ => None,
@@ -2120,29 +2044,9 @@ fn sat_solve_xyw(
             w_agree_lits.push(enc.encode_xnor(&mut solver, w_var(i), w_var(i + k)));
         }
 
-        let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
-        let w_ctr = enc.build_counter(&mut solver, &w_agree_lits);
-
-        let mut selectors = Vec::new();
-        for c_w in 0..=w_agree_lits.len() {
-            let rem = target as isize - 2 * c_w as isize;
-            if rem < 0 || rem as usize > xy_lits.len() { continue; }
-            let c_xy = rem as usize;
-            let sel = enc.fresh();
-            if c_xy > 0 {
-                if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 { solver.add_clause([-sel, xy_ctr[c_xy]]); }
-                else { solver.add_clause([-sel]); continue; }
-            }
-            if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 { solver.add_clause([-sel, -xy_ctr[c_xy + 1]]); }
-            if c_w > 0 {
-                if c_w < w_ctr.len() && w_ctr[c_w] != 0 { solver.add_clause([-sel, w_ctr[c_w]]); }
-                else { solver.add_clause([-sel]); continue; }
-            }
-            if c_w + 1 < w_ctr.len() && w_ctr[c_w + 1] != 0 { solver.add_clause([-sel, -w_ctr[c_w + 1]]); }
-            selectors.push(sel);
+        if !enc.encode_weighted_agree_eq(&mut solver, &xy_lits, &w_agree_lits, target) {
+            return None;
         }
-        if selectors.is_empty() { return None; }
-        solver.add_clause(selectors.iter().copied());
     }
 
     if verbose {
@@ -2151,10 +2055,10 @@ fn sat_solve_xyw(
 
     match solver.solve() {
         Some(true) => {
-            let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            let w: Vec<i8> = (0..m).map(|i| if solver.value(w_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y), PackedSeq::from_values(&w)))
+            let x = extract_seq(&solver, x_var, n);
+            let y = extract_seq(&solver, y_var, n);
+            let w = extract_seq(&solver, w_var, m);
+            Some((x, y, w))
         }
         _ => None,
     }
@@ -2775,6 +2679,62 @@ impl SatEncoder {
             solver.add_clause([-ctr[target + 1]]);
         }
     }
+
+    /// Encode `xy_count + 2 * zw_count = target` using selectors over two
+    /// totalizer counters. Returns false if no valid split exists (infeasible).
+    fn encode_weighted_agree_eq(
+        &mut self,
+        solver: &mut impl SatSolver,
+        xy_lits: &[i32],
+        zw_lits: &[i32],
+        target: usize,
+    ) -> bool {
+        let xy_ctr = self.build_counter(solver, xy_lits);
+        let zw_ctr = self.build_counter(solver, zw_lits);
+
+        let mut selectors = Vec::new();
+        for c_zw in 0..=zw_lits.len() {
+            let rem = target as isize - 2 * c_zw as isize;
+            if rem < 0 || rem as usize > xy_lits.len() { continue; }
+            let c_xy = rem as usize;
+
+            let sel = self.fresh();
+
+            if c_xy > 0 {
+                if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
+                    solver.add_clause([-sel, xy_ctr[c_xy]]);
+                } else {
+                    solver.add_clause([-sel]);
+                    continue;
+                }
+            }
+            if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
+                solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
+            }
+
+            if c_zw > 0 {
+                if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
+                    solver.add_clause([-sel, zw_ctr[c_zw]]);
+                } else {
+                    solver.add_clause([-sel]);
+                    continue;
+                }
+            }
+            if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
+                solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
+            }
+
+            selectors.push(sel);
+        }
+
+        if selectors.is_empty() {
+            solver.add_clause([]);
+            false
+        } else {
+            solver.add_clause(selectors.iter().copied());
+            true
+        }
+    }
 }
 
 /// Build the full SAT encoding for a given problem and sum-tuple.
@@ -2829,49 +2789,7 @@ fn sat_encode(problem: Problem, tuple: SumTuple) -> (SatEncoder, radical::Solver
             zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
         }
 
-        let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
-        let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
-
-        let mut selectors = Vec::new();
-        for c_zw in 0..=zw_lits.len() {
-            let rem = target as isize - 2 * c_zw as isize;
-            if rem < 0 || rem as usize > xy_lits.len() { continue; }
-            let c_xy = rem as usize;
-
-            let sel = enc.fresh();
-
-            if c_xy > 0 {
-                if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
-                    solver.add_clause([-sel, xy_ctr[c_xy]]);
-                } else {
-                    solver.add_clause([-sel]);
-                    continue;
-                }
-            }
-            if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
-                solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
-            }
-
-            if c_zw > 0 {
-                if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
-                    solver.add_clause([-sel, zw_ctr[c_zw]]);
-                } else {
-                    solver.add_clause([-sel]);
-                    continue;
-                }
-            }
-            if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
-                solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
-            }
-
-            selectors.push(sel);
-        }
-
-        if selectors.is_empty() {
-            solver.add_clause([]);
-        } else {
-            solver.add_clause(selectors.iter().copied());
-        }
+        enc.encode_weighted_agree_eq(&mut solver, &xy_lits, &zw_lits, target);
     }
 
     (enc, solver)
@@ -3034,10 +2952,10 @@ fn sat_search(problem: Problem, tuple: SumTuple, boundary: Option<&BoundaryConfi
     }
     match result {
         Some(true) => {
-            let x: Vec<i8> = (0..n).map(|i| if solver.value(enc.x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            let y: Vec<i8> = (0..n).map(|i| if solver.value(enc.y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            let z: Vec<i8> = (0..n).map(|i| if solver.value(enc.z_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            let w: Vec<i8> = (0..m).map(|i| if solver.value(enc.w_var(i)) == Some(true) { 1 } else { -1 }).collect();
+            let x = extract_vals(&solver, |i| enc.x_var(i), n);
+            let y = extract_vals(&solver, |i| enc.y_var(i), n);
+            let z = extract_vals(&solver, |i| enc.z_var(i), n);
+            let w = extract_vals(&solver, |i| enc.w_var(i), m);
             Some((x, y, z, w))
         }
         Some(false) => {
@@ -3049,6 +2967,72 @@ fn sat_search(problem: Problem, tuple: SumTuple, boundary: Option<&BoundaryConfi
             None
         }
     }
+}
+
+/// Generic 4-way MDD walker. Walks from `nid` at `level` down to `depth`,
+/// accumulating two bit-packed values (a_acc, b_acc) for branches (low bit, high bit).
+/// Calls `emit(a_acc, b_acc, terminal_nid)` at terminal depth.
+/// When a LEAF sentinel is reached before depth, enumerates all remaining branches.
+fn walk_mdd_4way(
+    nid: u32, level: usize, depth: usize,
+    a_acc: u32, b_acc: u32,
+    pos_order: &[usize], nodes: &[[u32; 4]],
+    emit: &mut impl FnMut(u32, u32, u32),
+) {
+    if nid == mdd_reorder::DEAD { return; }
+    if level == depth {
+        emit(a_acc, b_acc, nid);
+        return;
+    }
+    if nid == mdd_reorder::LEAF {
+        walk_mdd_4way_leaf(level, depth, a_acc, b_acc, pos_order, emit);
+        return;
+    }
+    let pos = pos_order[level];
+    for branch in 0u32..4 {
+        let child = nodes[nid as usize][branch as usize];
+        if child == mdd_reorder::DEAD { continue; }
+        let a_val = (branch >> 0) & 1;
+        let b_val = (branch >> 1) & 1;
+        walk_mdd_4way(child, level + 1, depth,
+            a_acc | (a_val << pos), b_acc | (b_val << pos),
+            pos_order, nodes, emit);
+    }
+}
+
+fn walk_mdd_4way_leaf(
+    level: usize, depth: usize,
+    a_acc: u32, b_acc: u32,
+    pos_order: &[usize],
+    emit: &mut impl FnMut(u32, u32, u32),
+) {
+    if level == depth {
+        emit(a_acc, b_acc, mdd_reorder::LEAF);
+        return;
+    }
+    let pos = pos_order[level];
+    for branch in 0u32..4 {
+        let a_val = (branch >> 0) & 1;
+        let b_val = (branch >> 1) & 1;
+        walk_mdd_4way_leaf(level + 1, depth,
+            a_acc | (a_val << pos), b_acc | (b_val << pos),
+            pos_order, emit);
+    }
+}
+
+/// Try to load the best available MDD file, scanning from max_k down to 1.
+fn load_best_mdd(max_k: usize, verbose: bool) -> Option<mdd_reorder::Mdd4> {
+    for try_k in (1..=max_k).rev() {
+        let path = format!("mdd-{}.bin", try_k);
+        if let Some(m) = mdd_reorder::Mdd4::load(&path) {
+            if verbose {
+                eprintln!("Loaded MDD from {} (k={}, {} nodes, {:.1} MB)",
+                    path, m.k, m.nodes.len(), m.nodes.len() as f64 * 16.0 / 1_048_576.0);
+            }
+            return Some(m);
+        }
+    }
+    None
 }
 
 /// MDD-based hybrid search: walk reordered MDD for boundary 4-tuples,
@@ -3064,22 +3048,8 @@ fn run_mdd_sat_search(
     let m = problem.m();
 
     // Load MDD from file, or find the best available one.
-    let max_k = (n - 1) / 2;
-    let try_k = k.min(max_k);
-
-    let mut loaded_mdd: Option<mdd_reorder::Mdd4> = None;
-    // Try requested k first, then scan downward for any available MDD
-    for try_k in (1..=try_k).rev() {
-        let path = format!("mdd-{}.bin", try_k);
-        if let Some(m) = mdd_reorder::Mdd4::load(&path) {
-            if verbose { eprintln!("Loaded MDD from {} (k={}, {} nodes, {:.1} MB)",
-                path, m.k, m.nodes.len(), m.nodes.len() as f64 * 16.0 / 1_048_576.0); }
-            loaded_mdd = Some(m);
-            break;
-        }
-    }
-
-    let reordered = match loaded_mdd {
+    let try_k = k.min((n - 1) / 2);
+    let reordered = match load_best_mdd(try_k, verbose) {
         Some(m) => Arc::new(m),
         None => {
             eprintln!("No MDD file found (tried mdd-1.bin through mdd-{}.bin)", try_k);
@@ -3105,64 +3075,15 @@ fn run_mdd_sat_search(
     let mut zw_by_sum: HashMap<(i32, i32), Vec<ZwEntry>> = HashMap::new();
     let mut total_zw = 0u64;
 
-    fn walk_zw_top(
-        nid: u32, level: usize, zw_depth: usize,
-        z_acc: u32, w_acc: u32,
-        pos_order: &[usize], nodes: &[[u32; 4]],
-        max_bnd_sum: i32,
-        zw_by_sum: &mut HashMap<(i32, i32), Vec<ZwEntry>>,
-        total_zw: &mut u64,
-    ) {
-        if nid == mdd_reorder::DEAD { return; }
-        if level == zw_depth {
+    walk_mdd_4way(reordered.root, 0, zw_depth, 0, 0,
+        &pos_order, &reordered.nodes,
+        &mut |z_acc, w_acc, xy_root| {
             let z_sum = 2 * (z_acc.count_ones() as i32) - max_bnd_sum;
             let w_sum = 2 * (w_acc.count_ones() as i32) - max_bnd_sum;
             zw_by_sum.entry((z_sum, w_sum)).or_default().push(
-                ZwEntry { z_bits: z_acc, w_bits: w_acc, xy_root: nid });
-            *total_zw += 1;
-            return;
-        }
-        if nid == mdd_reorder::LEAF {
-            // All remaining ZW levels are don't-care — enumerate
-            walk_zw_leaf(level, zw_depth, z_acc, w_acc, pos_order, max_bnd_sum, zw_by_sum, total_zw);
-            return;
-        }
-        let pos = pos_order[level];
-        for branch in 0u32..4 {
-            let child = nodes[nid as usize][branch as usize];
-            if child == mdd_reorder::DEAD { continue; }
-            let z_val = (branch >> 0) & 1;
-            let w_val = (branch >> 1) & 1;
-            walk_zw_top(child, level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
-                pos_order, nodes, max_bnd_sum, zw_by_sum, total_zw);
-        }
-    }
-
-    fn walk_zw_leaf(
-        level: usize, zw_depth: usize, z_acc: u32, w_acc: u32,
-        pos_order: &[usize], max_bnd_sum: i32,
-        zw_by_sum: &mut HashMap<(i32, i32), Vec<ZwEntry>>,
-        total_zw: &mut u64,
-    ) {
-        if level == zw_depth {
-            let z_sum = 2 * (z_acc.count_ones() as i32) - max_bnd_sum;
-            let w_sum = 2 * (w_acc.count_ones() as i32) - max_bnd_sum;
-            zw_by_sum.entry((z_sum, w_sum)).or_default().push(
-                ZwEntry { z_bits: z_acc, w_bits: w_acc, xy_root: mdd_reorder::LEAF });
-            *total_zw += 1;
-            return;
-        }
-        let pos = pos_order[level];
-        for branch in 0u32..4 {
-            let z_val = (branch >> 0) & 1;
-            let w_val = (branch >> 1) & 1;
-            walk_zw_leaf(level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
-                pos_order, max_bnd_sum, zw_by_sum, total_zw);
-        }
-    }
-
-    walk_zw_top(reordered.root, 0, zw_depth, 0, 0,
-        &pos_order, &reordered.nodes, max_bnd_sum, &mut zw_by_sum, &mut total_zw);
+                ZwEntry { z_bits: z_acc, w_bits: w_acc, xy_root });
+            total_zw += 1;
+        });
 
     if verbose {
         eprintln!("  {} (z,w) boundaries in {} sum groups", total_zw, zw_by_sum.len());
@@ -3201,19 +3122,8 @@ fn run_mdd_sat_search(
                     if found.load(AtomicOrdering::Relaxed) { break; }
 
                     // Build W candidates: boundary from MDD + enumerate middles
-                    let mut w_prefix = vec![0i8; k];
-                    let mut w_suffix = vec![0i8; k];
-                    for i in 0..k {
-                        w_prefix[i] = if (entry.w_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        w_suffix[i] = if (entry.w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                    }
-
-                    let mut z_prefix = vec![0i8; k];
-                    let mut z_suffix = vec![0i8; k];
-                    for i in 0..k {
-                        z_prefix[i] = if (entry.z_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        z_suffix[i] = if (entry.z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                    }
+                    let (w_prefix, w_suffix) = expand_boundary_bits(entry.w_bits, k);
+                    let (z_prefix, z_suffix) = expand_boundary_bits(entry.z_bits, k);
 
                     // Enumerate W middles (shuffled for representative sampling), spectral filter
                     let mut w_candidates: Vec<(PackedSeq, Vec<f64>)> = Vec::new();
@@ -3310,55 +3220,16 @@ fn walk_xy_sub_mdd<F: FnMut(u32, u32)>(
     max_bnd_sum: i32, middle_n: i32, tuple: SumTuple,
     callback: &mut F,
 ) {
-    if nid == mdd_reorder::DEAD { return; }
-    if level == xy_depth {
-        // Check sum compatibility
-        let x_bnd_sum = 2 * (x_acc.count_ones() as i32) - max_bnd_sum;
-        let y_bnd_sum = 2 * (y_acc.count_ones() as i32) - max_bnd_sum;
-        let x_mid = tuple.x - x_bnd_sum;
-        if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return; }
-        let y_mid = tuple.y - y_bnd_sum;
-        if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return; }
-        callback(x_acc, y_acc);
-        return;
-    }
-    if nid == mdd_reorder::LEAF {
-        walk_xy_leaf(level, xy_depth, x_acc, y_acc, pos_order, max_bnd_sum, middle_n, tuple, callback);
-        return;
-    }
-    let pos = pos_order[level];
-    for branch in 0u32..4 {
-        let child = nodes[nid as usize][branch as usize];
-        if child == mdd_reorder::DEAD { continue; }
-        let x_val = (branch >> 0) & 1;
-        let y_val = (branch >> 1) & 1;
-        walk_xy_sub_mdd(child, level + 1, xy_depth, x_acc | (x_val << pos), y_acc | (y_val << pos),
-            pos_order, nodes, max_bnd_sum, middle_n, tuple, callback);
-    }
-}
-
-fn walk_xy_leaf<F: FnMut(u32, u32)>(
-    level: usize, xy_depth: usize, x_acc: u32, y_acc: u32,
-    pos_order: &[usize], max_bnd_sum: i32, middle_n: i32, tuple: SumTuple,
-    callback: &mut F,
-) {
-    if level == xy_depth {
-        let x_bnd_sum = 2 * (x_acc.count_ones() as i32) - max_bnd_sum;
-        let y_bnd_sum = 2 * (y_acc.count_ones() as i32) - max_bnd_sum;
-        let x_mid = tuple.x - x_bnd_sum;
-        if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return; }
-        let y_mid = tuple.y - y_bnd_sum;
-        if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return; }
-        callback(x_acc, y_acc);
-        return;
-    }
-    let pos = pos_order[level];
-    for branch in 0u32..4 {
-        let x_val = (branch >> 0) & 1;
-        let y_val = (branch >> 1) & 1;
-        walk_xy_leaf(level + 1, xy_depth, x_acc | (x_val << pos), y_acc | (y_val << pos),
-            pos_order, max_bnd_sum, middle_n, tuple, callback);
-    }
+    walk_mdd_4way(nid, level, xy_depth, x_acc, y_acc, pos_order, nodes,
+        &mut |x_bits, y_bits, _nid| {
+            let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
+            let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
+            let x_mid = tuple.x - x_bnd_sum;
+            if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return; }
+            let y_mid = tuple.y - y_bnd_sum;
+            if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return; }
+            callback(x_bits, y_bits);
+        });
 }
 
 fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
@@ -3721,14 +3592,10 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                             solver.copy_phase_into(&mut warm_phase);
 
                                             if result == Some(true) {
-                                                let x = PackedSeq::from_values(&(0..n).map(|i|
-                                                    if solver.value(enc.x_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
-                                                let y = PackedSeq::from_values(&(0..n).map(|i|
-                                                    if solver.value(enc.y_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
-                                                let z = PackedSeq::from_values(&(0..n).map(|i|
-                                                    if solver.value(enc.z_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
-                                                let w = PackedSeq::from_values(&(0..m).map(|i|
-                                                    if solver.value(enc.w_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                                                let x = extract_seq(&solver, |i| enc.x_var(i), n);
+                                                let y = extract_seq(&solver, |i| enc.y_var(i), n);
+                                                let z = extract_seq(&solver, |i| enc.z_var(i), n);
+                                                let w = extract_seq(&solver, |i| enc.w_var(i), m);
                                                 solver.reset(); // backtrack for next solve
 
                                                 if verify_tt(problem, &x, &y, &z, &w) {
@@ -3939,8 +3806,7 @@ impl XYBoundaryTable {
             else { solver.add_clause([-a, -b]); solver.add_clause([a, b]); }
         }
         for s in 1..n {
-            let target_raw = 2 * (n - s) as i32 - candidate.zw_autocorr[s];
-            let target = (target_raw / 2) as usize;
+            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
             let lp = &template.lag_pairs[s];
             let ones: Vec<u32> = vec![1; lp.lits_a.len()];
             solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
@@ -4046,12 +3912,10 @@ impl XYBoundaryTable {
 
                     // Expand bits only for entries passing all filters
                     let mut xv = [0i8; 64]; let mut yv = [0i8; 64];
-                    for i in 0..k {
-                        xv[i] = if (x_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        xv[n-k+i] = if (x_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
-                        yv[i] = if (y_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        yv[n-k+i] = if (y_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
-                    }
+                    let (xp, xs) = expand_boundary_bits(x_bits, k);
+                    let (yp, ys) = expand_boundary_bits(y_bits, k);
+                    xv[..k].copy_from_slice(&xp); xv[n-k..n].copy_from_slice(&xs);
+                    yv[..k].copy_from_slice(&yp); yv[n-k..n].copy_from_slice(&ys);
                     // Build boundary value lookup
                     let mut bnd_vals = [0i8; 128];
                     for i in 0..k { bnd_vals[i] = xv[i]; bnd_vals[n-k+i] = xv[n-k+i]; }
@@ -4102,9 +3966,9 @@ impl XYBoundaryTable {
 
                     match solver.solve_with_assumptions(&assumptions) {
                         Some(true) => {
-                            let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                            let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                            return Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)));
+                            let x = extract_seq(&solver, x_var, n);
+                            let y = extract_seq(&solver, y_var, n);
+                            return Some((x, y));
                         }
                         _ => {
                             configs_tested += 1;
@@ -4420,13 +4284,7 @@ fn main() {
         let p = Problem::new(n);
         let zs = z.sum();
         let ws = w.sum();
-        // Compute ZW autocorrelation
-        let mut zw_autocorr = vec![0i32; n];
-        for s in 1..n {
-            let nz = z.autocorrelation(s);
-            let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
-            zw_autocorr[s] = 2 * nz + 2 * nw;
-        }
+        let zw_autocorr = compute_zw_autocorr(p, &z, &w);
         let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr };
         // Try all sum tuples that match this Z/W
         let mut tuples = phase_a_tuples(p, cfg.test_tuple.as_ref());
@@ -4466,16 +4324,7 @@ fn main() {
             // 3. Post-filter (Z,W) with spectral pair check
             // 4. Each valid pair → report (and later, send to Phase C with XY from MDD)
             let mdd_k = cfg.mdd_k.min((problem.n - 1) / 2);
-            let mut loaded_mdd: Option<mdd_reorder::Mdd4> = None;
-            for try_k in (1..=mdd_k).rev() {
-                let path = format!("mdd-{}.bin", try_k);
-                if let Some(m) = mdd_reorder::Mdd4::load(&path) {
-                    eprintln!("Loaded MDD from {} (k={}, {} nodes)", path, m.k, m.nodes.len());
-                    loaded_mdd = Some(m);
-                    break;
-                }
-            }
-            let reordered = match loaded_mdd {
+            let reordered = match load_best_mdd(mdd_k, true) {
                 Some(m) => m,
                 None => { eprintln!("No MDD file found. Run: target/release/gen_mdd {}", mdd_k); return; }
             };
@@ -4546,18 +4395,8 @@ fn main() {
                     let w_mid_sum = tuple.w - w_bnd_sum;
                     if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
 
-                    let mut w_prefix = vec![0i8; k];
-                    let mut w_suffix = vec![0i8; k];
-                    for i in 0..k {
-                        w_prefix[i] = if (w_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        w_suffix[i] = if (w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                    }
-                    let mut z_prefix = vec![0i8; k];
-                    let mut z_suffix = vec![0i8; k];
-                    for i in 0..k {
-                        z_prefix[i] = if (z_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        z_suffix[i] = if (z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                    }
+                    let (w_prefix, w_suffix) = expand_boundary_bits(w_bits, k);
+                    let (z_prefix, z_suffix) = expand_boundary_bits(z_bits, k);
 
                     let mut z_boundary = vec![0i8; n];
                     for i in 0..k { z_boundary[i] = z_prefix[i]; z_boundary[n - k + i] = z_suffix[i]; }
@@ -4612,48 +4451,6 @@ fn main() {
                 }
             }
 
-            fn walk_zw(
-                nid: u32, level: usize, zw_depth: usize,
-                z_acc: u32, w_acc: u32,
-                pos_order: &[usize], nodes: &[[u32; 4]],
-                state: &mut WalkState,
-            ) {
-                if nid == mdd_reorder::DEAD { return; }
-                if level == zw_depth {
-                    process_boundary(z_acc, w_acc, nid, state);
-                    return;
-                }
-                if nid == mdd_reorder::LEAF {
-                    walk_zw_leaf(level, zw_depth, z_acc, w_acc, pos_order, state);
-                    return;
-                }
-                let pos = pos_order[level];
-                for branch in 0u32..4 {
-                    let child = nodes[nid as usize][branch as usize];
-                    if child == mdd_reorder::DEAD { continue; }
-                    let z_val = (branch >> 0) & 1;
-                    let w_val = (branch >> 1) & 1;
-                    walk_zw(child, level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
-                        pos_order, nodes, state);
-                }
-            }
-            fn walk_zw_leaf(
-                level: usize, zw_depth: usize, z_acc: u32, w_acc: u32,
-                pos_order: &[usize], state: &mut WalkState,
-            ) {
-                if level == zw_depth {
-                    process_boundary(z_acc, w_acc, mdd_reorder::LEAF, state);
-                    return;
-                }
-                let pos = pos_order[level];
-                for branch in 0u32..4 {
-                    let z_val = (branch >> 0) & 1;
-                    let w_val = (branch >> 1) & 1;
-                    walk_zw_leaf(level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
-                        pos_order, state);
-                }
-            }
-
             let start = Instant::now();
             {
                 let mut state = WalkState {
@@ -4671,8 +4468,11 @@ fn main() {
                     max_w_passing,
                     n, m, k, middle_n, middle_m, max_bnd_sum,
                 };
-                walk_zw(reordered.root, 0, zw_depth, 0, 0,
-                    &pos_order, &reordered.nodes, &mut state);
+                walk_mdd_4way(reordered.root, 0, zw_depth, 0, 0,
+                    &pos_order, &reordered.nodes,
+                    &mut |z_acc, w_acc, _nid| {
+                        process_boundary(z_acc, w_acc, _nid, &mut state);
+                    });
             }
             eprintln!("{} (z,w) boundaries walked lazily ({:.1?})", total_zw, start.elapsed());
             for (i, tuple) in tuples.iter().enumerate() {
@@ -5029,6 +4829,33 @@ mod tests {
         // Free SAT search for n=36 XY (~7K vars) needs radical optimizations.
     }
 
+    /// Encode autocorrelation constraints for all four sequences using
+    /// XNOR + weighted agree selectors. Shared by sat_encode and tests.
+    fn encode_autocorr_xnor(n: usize, m: usize, enc: &mut SatEncoder, solver: &mut radical::Solver) {
+        for k in 1..n {
+            let w_overlap = if k < m { m - k } else { 0 };
+            let target = 2 * (n - k) + w_overlap;
+
+            let mut xy_lits = Vec::new();
+            for i in 0..(n - k) {
+                xy_lits.push(enc.encode_xnor(solver, enc.x_var(i), enc.x_var(i + k)));
+            }
+            for i in 0..(n - k) {
+                xy_lits.push(enc.encode_xnor(solver, enc.y_var(i), enc.y_var(i + k)));
+            }
+
+            let mut zw_lits = Vec::new();
+            for i in 0..(n - k) {
+                zw_lits.push(enc.encode_xnor(solver, enc.z_var(i), enc.z_var(i + k)));
+            }
+            for i in 0..w_overlap {
+                zw_lits.push(enc.encode_xnor(solver, enc.w_var(i), enc.w_var(i + k)));
+            }
+
+            enc.encode_weighted_agree_eq(solver, &xy_lits, &zw_lits, target);
+        }
+    }
+
     #[test]
     fn sat_autocorr_only_n4() {
         // Test: just autocorrelation constraints (no sums, no symmetry breaking)
@@ -5037,55 +4864,7 @@ mod tests {
         let mut enc = SatEncoder::new(n);
         let mut solver: radical::Solver = Default::default();
 
-        for k in 1..n {
-            let w_overlap = if k < m { m - k } else { 0 };
-            let target = 2 * (n - k) + w_overlap;
-
-            let mut xy_lits = Vec::new();
-            for i in 0..(n - k) {
-                xy_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
-            }
-            for i in 0..(n - k) {
-                xy_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
-            }
-            let mut zw_lits = Vec::new();
-            for i in 0..(n - k) {
-                zw_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
-            }
-            for i in 0..w_overlap {
-                zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
-            }
-
-            let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
-            let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
-
-            let mut selectors = Vec::new();
-            for c_zw in 0..=zw_lits.len() {
-                let rem = target as isize - 2 * c_zw as isize;
-                if rem < 0 || rem as usize > xy_lits.len() { continue; }
-                let c_xy = rem as usize;
-                let sel = enc.fresh();
-                if c_xy > 0 {
-                    if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
-                        solver.add_clause([-sel, xy_ctr[c_xy]]);
-                    } else { solver.add_clause([-sel]); continue; }
-                }
-                if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
-                    solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
-                }
-                if c_zw > 0 {
-                    if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
-                        solver.add_clause([-sel, zw_ctr[c_zw]]);
-                    } else { solver.add_clause([-sel]); continue; }
-                }
-                if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
-                    solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
-                }
-                selectors.push(sel);
-            }
-            assert!(!selectors.is_empty(), "lag {} has no valid splits", k);
-            solver.add_clause(selectors.iter().copied());
-        }
+        encode_autocorr_xnor(n, m, &mut enc, &mut solver);
 
         let result = solver.solve();
         assert_eq!(result, Some(true), "autocorr-only n=4 should be SAT");
@@ -5136,53 +4915,8 @@ mod tests {
         for i in 0..n { solver.add_clause([if z[i] == 1 { enc.z_var(i) } else { -enc.z_var(i) }]); }
         for i in 0..m { solver.add_clause([if w[i] == 1 { enc.w_var(i) } else { -enc.w_var(i) }]); }
 
-        // Add autocorrelation constraints (same as sat_autocorr_only_n4)
-        for k in 1..n {
-            let w_overlap = if k < m { m - k } else { 0 };
-            let target = 2 * (n - k) + w_overlap;
-            let mut xy_lits = Vec::new();
-            for i in 0..(n - k) {
-                xy_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
-            }
-            for i in 0..(n - k) {
-                xy_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
-            }
-            let mut zw_lits = Vec::new();
-            for i in 0..(n - k) {
-                zw_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
-            }
-            for i in 0..w_overlap {
-                zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
-            }
-            let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
-            let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
-            let mut selectors = Vec::new();
-            for c_zw in 0..=zw_lits.len() {
-                let rem = target as isize - 2 * c_zw as isize;
-                if rem < 0 || rem as usize > xy_lits.len() { continue; }
-                let c_xy = rem as usize;
-                let sel = enc.fresh();
-                if c_xy > 0 {
-                    if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
-                        solver.add_clause([-sel, xy_ctr[c_xy]]);
-                    } else { solver.add_clause([-sel]); continue; }
-                }
-                if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
-                    solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
-                }
-                if c_zw > 0 {
-                    if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
-                        solver.add_clause([-sel, zw_ctr[c_zw]]);
-                    } else { solver.add_clause([-sel]); continue; }
-                }
-                if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
-                    solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
-                }
-                selectors.push(sel);
-            }
-            assert!(!selectors.is_empty(), "lag {} no valid splits (target={})", k, target);
-            solver.add_clause(selectors.iter().copied());
-        }
+        // Add autocorrelation constraints
+        encode_autocorr_xnor(n, m, &mut enc, &mut solver);
 
         let result = solver.solve();
         assert_eq!(result, Some(true), "hardcoded TT(4) solution should be consistent with encoding");
@@ -5227,93 +4961,7 @@ mod tests {
         // Step 1: Build the FULL encoding (matching sat_search exactly) plus
         // hardcode the known solution. Check if SAT.
         {
-            let mut enc = SatEncoder::new(n);
-            let mut solver: radical::Solver = Default::default();
-
-            // Symmetry breaking: x[0]=+1
-            solver.add_clause([enc.x_var(0)]);
-
-            // Sum constraints
-            let x_pos = ((tuple.x + n as i32) / 2) as usize;
-            let y_pos = ((tuple.y + n as i32) / 2) as usize;
-            let z_pos = ((tuple.z + n as i32) / 2) as usize;
-            let w_pos = ((tuple.w + m as i32) / 2) as usize;
-
-            let x_lits: Vec<i32> = (0..n).map(|i| enc.x_var(i)).collect();
-            let y_lits: Vec<i32> = (0..n).map(|i| enc.y_var(i)).collect();
-            let z_lits: Vec<i32> = (0..n).map(|i| enc.z_var(i)).collect();
-            let w_lits: Vec<i32> = (0..m).map(|i| enc.w_var(i)).collect();
-
-            enc.encode_cardinality_eq(&mut solver, &x_lits, x_pos);
-            enc.encode_cardinality_eq(&mut solver, &y_lits, y_pos);
-            enc.encode_cardinality_eq(&mut solver, &z_lits, z_pos);
-            enc.encode_cardinality_eq(&mut solver, &w_lits, w_pos);
-
-            // Autocorrelation constraints (same as sat_search)
-            for k in 1..n {
-                let w_overlap = if k < m { m - k } else { 0 };
-                let target = 2 * (n - k) + w_overlap;
-
-                let mut xy_lits = Vec::new();
-                for i in 0..(n - k) {
-                    xy_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
-                }
-                for i in 0..(n - k) {
-                    xy_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
-                }
-
-                let mut zw_lits = Vec::new();
-                for i in 0..(n - k) {
-                    zw_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
-                }
-                for i in 0..w_overlap {
-                    zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
-                }
-
-                let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
-                let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
-
-                let mut selectors = Vec::new();
-                for c_zw in 0..=zw_lits.len() {
-                    let rem = target as isize - 2 * c_zw as isize;
-                    if rem < 0 || rem as usize > xy_lits.len() { continue; }
-                    let c_xy = rem as usize;
-
-                    let sel = enc.fresh();
-
-                    if c_xy > 0 {
-                        if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
-                            solver.add_clause([-sel, xy_ctr[c_xy]]);
-                        } else {
-                            solver.add_clause([-sel]);
-                            continue;
-                        }
-                    }
-                    if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
-                        solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
-                    }
-
-                    if c_zw > 0 {
-                        if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
-                            solver.add_clause([-sel, zw_ctr[c_zw]]);
-                        } else {
-                            solver.add_clause([-sel]);
-                            continue;
-                        }
-                    }
-                    if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
-                        solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
-                    }
-
-                    selectors.push(sel);
-                }
-
-                if selectors.is_empty() {
-                    solver.add_clause([]);
-                } else {
-                    solver.add_clause(selectors.iter().copied());
-                }
-            }
+            let (enc, mut solver) = sat_encode(Problem::new(n), tuple);
 
             // Hardcode the known solution as unit clauses
             for i in 0..n {
@@ -5381,49 +5029,7 @@ mod tests {
                     zw_lits_k.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
                 }
 
-                let xy_ctr = enc.build_counter(&mut solver, &xy_lits_k);
-                let zw_ctr = enc.build_counter(&mut solver, &zw_lits_k);
-
-                let mut selectors = Vec::new();
-                for c_zw in 0..=zw_lits_k.len() {
-                    let rem = target as isize - 2 * c_zw as isize;
-                    if rem < 0 || rem as usize > xy_lits_k.len() { continue; }
-                    let c_xy = rem as usize;
-
-                    let sel = enc.fresh();
-
-                    if c_xy > 0 {
-                        if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
-                            solver.add_clause([-sel, xy_ctr[c_xy]]);
-                        } else {
-                            solver.add_clause([-sel]);
-                            continue;
-                        }
-                    }
-                    if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
-                        solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
-                    }
-
-                    if c_zw > 0 {
-                        if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
-                            solver.add_clause([-sel, zw_ctr[c_zw]]);
-                        } else {
-                            solver.add_clause([-sel]);
-                            continue;
-                        }
-                    }
-                    if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
-                        solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
-                    }
-
-                    selectors.push(sel);
-                }
-
-                if selectors.is_empty() {
-                    solver.add_clause([]);
-                } else {
-                    solver.add_clause(selectors.iter().copied());
-                }
+                enc.encode_weighted_agree_eq(&mut solver, &xy_lits_k, &zw_lits_k, target);
             }
 
             // Hardcode the known solution
