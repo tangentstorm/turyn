@@ -13,6 +13,7 @@
 /// pairs for that (z,w) boundary. This gives us the (z,w) → [(x,y)] mapping for free.
 
 use rustc_hash::FxHashMap as HashMap;
+// dashmap available for future shared parallel builds
 
 pub const DEAD: u32 = 0;
 pub const LEAF: u32 = u32::MAX;
