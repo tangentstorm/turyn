@@ -2975,6 +2975,57 @@ fn sat_search(problem: Problem, tuple: SumTuple, boundary: Option<&BoundaryConfi
     }
 }
 
+/// Generic 4-way MDD walker. Walks from `nid` at `level` down to `depth`,
+/// accumulating two bit-packed values (a_acc, b_acc) for branches (low bit, high bit).
+/// Calls `emit(a_acc, b_acc, terminal_nid)` at terminal depth.
+/// When a LEAF sentinel is reached before depth, enumerates all remaining branches.
+fn walk_mdd_4way(
+    nid: u32, level: usize, depth: usize,
+    a_acc: u32, b_acc: u32,
+    pos_order: &[usize], nodes: &[[u32; 4]],
+    emit: &mut impl FnMut(u32, u32, u32),
+) {
+    if nid == mdd_reorder::DEAD { return; }
+    if level == depth {
+        emit(a_acc, b_acc, nid);
+        return;
+    }
+    if nid == mdd_reorder::LEAF {
+        walk_mdd_4way_leaf(level, depth, a_acc, b_acc, pos_order, emit);
+        return;
+    }
+    let pos = pos_order[level];
+    for branch in 0u32..4 {
+        let child = nodes[nid as usize][branch as usize];
+        if child == mdd_reorder::DEAD { continue; }
+        let a_val = (branch >> 0) & 1;
+        let b_val = (branch >> 1) & 1;
+        walk_mdd_4way(child, level + 1, depth,
+            a_acc | (a_val << pos), b_acc | (b_val << pos),
+            pos_order, nodes, emit);
+    }
+}
+
+fn walk_mdd_4way_leaf(
+    level: usize, depth: usize,
+    a_acc: u32, b_acc: u32,
+    pos_order: &[usize],
+    emit: &mut impl FnMut(u32, u32, u32),
+) {
+    if level == depth {
+        emit(a_acc, b_acc, mdd_reorder::LEAF);
+        return;
+    }
+    let pos = pos_order[level];
+    for branch in 0u32..4 {
+        let a_val = (branch >> 0) & 1;
+        let b_val = (branch >> 1) & 1;
+        walk_mdd_4way_leaf(level + 1, depth,
+            a_acc | (a_val << pos), b_acc | (b_val << pos),
+            pos_order, emit);
+    }
+}
+
 /// Try to load the best available MDD file, scanning from max_k down to 1.
 fn load_best_mdd(max_k: usize, verbose: bool) -> Option<mdd_reorder::Mdd4> {
     for try_k in (1..=max_k).rev() {
@@ -3030,64 +3081,15 @@ fn run_mdd_sat_search(
     let mut zw_by_sum: HashMap<(i32, i32), Vec<ZwEntry>> = HashMap::new();
     let mut total_zw = 0u64;
 
-    fn walk_zw_top(
-        nid: u32, level: usize, zw_depth: usize,
-        z_acc: u32, w_acc: u32,
-        pos_order: &[usize], nodes: &[[u32; 4]],
-        max_bnd_sum: i32,
-        zw_by_sum: &mut HashMap<(i32, i32), Vec<ZwEntry>>,
-        total_zw: &mut u64,
-    ) {
-        if nid == mdd_reorder::DEAD { return; }
-        if level == zw_depth {
+    walk_mdd_4way(reordered.root, 0, zw_depth, 0, 0,
+        &pos_order, &reordered.nodes,
+        &mut |z_acc, w_acc, xy_root| {
             let z_sum = 2 * (z_acc.count_ones() as i32) - max_bnd_sum;
             let w_sum = 2 * (w_acc.count_ones() as i32) - max_bnd_sum;
             zw_by_sum.entry((z_sum, w_sum)).or_default().push(
-                ZwEntry { z_bits: z_acc, w_bits: w_acc, xy_root: nid });
-            *total_zw += 1;
-            return;
-        }
-        if nid == mdd_reorder::LEAF {
-            // All remaining ZW levels are don't-care — enumerate
-            walk_zw_leaf(level, zw_depth, z_acc, w_acc, pos_order, max_bnd_sum, zw_by_sum, total_zw);
-            return;
-        }
-        let pos = pos_order[level];
-        for branch in 0u32..4 {
-            let child = nodes[nid as usize][branch as usize];
-            if child == mdd_reorder::DEAD { continue; }
-            let z_val = (branch >> 0) & 1;
-            let w_val = (branch >> 1) & 1;
-            walk_zw_top(child, level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
-                pos_order, nodes, max_bnd_sum, zw_by_sum, total_zw);
-        }
-    }
-
-    fn walk_zw_leaf(
-        level: usize, zw_depth: usize, z_acc: u32, w_acc: u32,
-        pos_order: &[usize], max_bnd_sum: i32,
-        zw_by_sum: &mut HashMap<(i32, i32), Vec<ZwEntry>>,
-        total_zw: &mut u64,
-    ) {
-        if level == zw_depth {
-            let z_sum = 2 * (z_acc.count_ones() as i32) - max_bnd_sum;
-            let w_sum = 2 * (w_acc.count_ones() as i32) - max_bnd_sum;
-            zw_by_sum.entry((z_sum, w_sum)).or_default().push(
-                ZwEntry { z_bits: z_acc, w_bits: w_acc, xy_root: mdd_reorder::LEAF });
-            *total_zw += 1;
-            return;
-        }
-        let pos = pos_order[level];
-        for branch in 0u32..4 {
-            let z_val = (branch >> 0) & 1;
-            let w_val = (branch >> 1) & 1;
-            walk_zw_leaf(level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
-                pos_order, max_bnd_sum, zw_by_sum, total_zw);
-        }
-    }
-
-    walk_zw_top(reordered.root, 0, zw_depth, 0, 0,
-        &pos_order, &reordered.nodes, max_bnd_sum, &mut zw_by_sum, &mut total_zw);
+                ZwEntry { z_bits: z_acc, w_bits: w_acc, xy_root });
+            total_zw += 1;
+        });
 
     if verbose {
         eprintln!("  {} (z,w) boundaries in {} sum groups", total_zw, zw_by_sum.len());
@@ -3224,55 +3226,16 @@ fn walk_xy_sub_mdd<F: FnMut(u32, u32)>(
     max_bnd_sum: i32, middle_n: i32, tuple: SumTuple,
     callback: &mut F,
 ) {
-    if nid == mdd_reorder::DEAD { return; }
-    if level == xy_depth {
-        // Check sum compatibility
-        let x_bnd_sum = 2 * (x_acc.count_ones() as i32) - max_bnd_sum;
-        let y_bnd_sum = 2 * (y_acc.count_ones() as i32) - max_bnd_sum;
-        let x_mid = tuple.x - x_bnd_sum;
-        if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return; }
-        let y_mid = tuple.y - y_bnd_sum;
-        if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return; }
-        callback(x_acc, y_acc);
-        return;
-    }
-    if nid == mdd_reorder::LEAF {
-        walk_xy_leaf(level, xy_depth, x_acc, y_acc, pos_order, max_bnd_sum, middle_n, tuple, callback);
-        return;
-    }
-    let pos = pos_order[level];
-    for branch in 0u32..4 {
-        let child = nodes[nid as usize][branch as usize];
-        if child == mdd_reorder::DEAD { continue; }
-        let x_val = (branch >> 0) & 1;
-        let y_val = (branch >> 1) & 1;
-        walk_xy_sub_mdd(child, level + 1, xy_depth, x_acc | (x_val << pos), y_acc | (y_val << pos),
-            pos_order, nodes, max_bnd_sum, middle_n, tuple, callback);
-    }
-}
-
-fn walk_xy_leaf<F: FnMut(u32, u32)>(
-    level: usize, xy_depth: usize, x_acc: u32, y_acc: u32,
-    pos_order: &[usize], max_bnd_sum: i32, middle_n: i32, tuple: SumTuple,
-    callback: &mut F,
-) {
-    if level == xy_depth {
-        let x_bnd_sum = 2 * (x_acc.count_ones() as i32) - max_bnd_sum;
-        let y_bnd_sum = 2 * (y_acc.count_ones() as i32) - max_bnd_sum;
-        let x_mid = tuple.x - x_bnd_sum;
-        if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return; }
-        let y_mid = tuple.y - y_bnd_sum;
-        if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return; }
-        callback(x_acc, y_acc);
-        return;
-    }
-    let pos = pos_order[level];
-    for branch in 0u32..4 {
-        let x_val = (branch >> 0) & 1;
-        let y_val = (branch >> 1) & 1;
-        walk_xy_leaf(level + 1, xy_depth, x_acc | (x_val << pos), y_acc | (y_val << pos),
-            pos_order, max_bnd_sum, middle_n, tuple, callback);
-    }
+    walk_mdd_4way(nid, level, xy_depth, x_acc, y_acc, pos_order, nodes,
+        &mut |x_bits, y_bits, _nid| {
+            let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
+            let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
+            let x_mid = tuple.x - x_bnd_sum;
+            if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return; }
+            let y_mid = tuple.y - y_bnd_sum;
+            if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return; }
+            callback(x_bits, y_bits);
+        });
 }
 
 fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
@@ -4494,48 +4457,6 @@ fn main() {
                 }
             }
 
-            fn walk_zw(
-                nid: u32, level: usize, zw_depth: usize,
-                z_acc: u32, w_acc: u32,
-                pos_order: &[usize], nodes: &[[u32; 4]],
-                state: &mut WalkState,
-            ) {
-                if nid == mdd_reorder::DEAD { return; }
-                if level == zw_depth {
-                    process_boundary(z_acc, w_acc, nid, state);
-                    return;
-                }
-                if nid == mdd_reorder::LEAF {
-                    walk_zw_leaf(level, zw_depth, z_acc, w_acc, pos_order, state);
-                    return;
-                }
-                let pos = pos_order[level];
-                for branch in 0u32..4 {
-                    let child = nodes[nid as usize][branch as usize];
-                    if child == mdd_reorder::DEAD { continue; }
-                    let z_val = (branch >> 0) & 1;
-                    let w_val = (branch >> 1) & 1;
-                    walk_zw(child, level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
-                        pos_order, nodes, state);
-                }
-            }
-            fn walk_zw_leaf(
-                level: usize, zw_depth: usize, z_acc: u32, w_acc: u32,
-                pos_order: &[usize], state: &mut WalkState,
-            ) {
-                if level == zw_depth {
-                    process_boundary(z_acc, w_acc, mdd_reorder::LEAF, state);
-                    return;
-                }
-                let pos = pos_order[level];
-                for branch in 0u32..4 {
-                    let z_val = (branch >> 0) & 1;
-                    let w_val = (branch >> 1) & 1;
-                    walk_zw_leaf(level + 1, zw_depth, z_acc | (z_val << pos), w_acc | (w_val << pos),
-                        pos_order, state);
-                }
-            }
-
             let start = Instant::now();
             {
                 let mut state = WalkState {
@@ -4553,8 +4474,11 @@ fn main() {
                     max_w_passing,
                     n, m, k, middle_n, middle_m, max_bnd_sum,
                 };
-                walk_zw(reordered.root, 0, zw_depth, 0, 0,
-                    &pos_order, &reordered.nodes, &mut state);
+                walk_mdd_4way(reordered.root, 0, zw_depth, 0, 0,
+                    &pos_order, &reordered.nodes,
+                    &mut |z_acc, w_acc, _nid| {
+                        process_boundary(z_acc, w_acc, _nid, &mut state);
+                    });
             }
             eprintln!("{} (z,w) boundaries walked lazily ({:.1?})", total_zw, start.elapsed());
             for (i, tuple) in tuples.iter().enumerate() {
