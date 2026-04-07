@@ -3155,9 +3155,8 @@ fn run_mdd_sat_search(
                 let mut w_vals = w_boundary;
                 if w_sat {
                     stats.w_generated += 1;
-                    for i in 0..middle_m {
-                        w_vals[k + i] = if w_solver.value(w_mid_vars[i]) == Some(true) { 1 } else { -1 };
-                    }
+                    let w_mid = extract_vals(w_solver, |i| w_mid_vars[i], middle_m);
+                    w_vals[k..k+middle_m].copy_from_slice(&w_mid);
                 }
                 w_solver.spectral = None; // detach before restore
                 w_solver.restore_checkpoint(w_cp);
@@ -3209,11 +3208,10 @@ fn run_mdd_sat_search(
                     stats.z_generated += 1;
                     z_count += 1;
 
+                    let z_mid = extract_vals(z_solver, |i| z_mid_vars[i], middle_n);
                     let mut z_vals = Vec::with_capacity(n);
                     z_vals.extend_from_slice(&z_boundary[..k]);
-                    for i in 0..middle_n {
-                        z_vals.push(if z_solver.value(z_mid_vars[i]) == Some(true) { 1 } else { -1 });
-                    }
+                    z_vals.extend_from_slice(&z_mid);
                     z_vals.extend_from_slice(&z_boundary[n-k..]);
 
                     let z_block: Vec<i32> = z_mid_vars.iter().map(|&v| {
@@ -4489,11 +4487,10 @@ fn main() {
                         *state.grand_w_gen += 1;
 
                         // Extract W middle
+                        let w_mid = extract_vals(&w_solver, |i| w_mid_vars[i], middle_m);
                         let mut w_vals = Vec::with_capacity(m);
                         w_vals.extend_from_slice(&w_prefix);
-                        for i in 0..middle_m {
-                            w_vals.push(if w_solver.value(w_mid_vars[i]) == Some(true) { 1 } else { -1 });
-                        }
+                        w_vals.extend_from_slice(&w_mid);
                         w_vals.extend_from_slice(&w_suffix);
 
                         // Block this W
