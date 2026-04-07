@@ -935,11 +935,13 @@ pub fn build_zw_dfs(
     let mut children = [DEAD; 4];
     for branch in 0u32..4 {
         if ctx.symmetry_break && new_pos == 0 && branch != 0b11 { continue; }
-        let mut skip = false;
-        for &(rlevel, rbranch) in &ctx.restrict_branches {
-            if level == rlevel && branch != rbranch { skip = true; break; }
+        if !ctx.restrict_branches.is_empty() {
+            let mut skip = false;
+            for &(rlevel, rbranch) in &ctx.restrict_branches {
+                if level == rlevel && branch != rbranch { skip = true; break; }
+            }
+            if skip { continue; }
         }
-        if skip { continue; }
 
         current_vals[new_idx] = branch as u8;
 
