@@ -94,9 +94,11 @@ Forward checking during DFS would help but is hard to combine with memoization.
 
 ## New Ideas (2026-04-07 profiling round)
 
-Profiling k=9 sequential: 93.8s total, 70.3s (75%) in XY builds.
-5.3M XY sub-MDD builds, XY memo hit rate only 8% (cleared per ZW boundary).
-ZW memo hit rate 65%. Goal: make k=15 feasible.
+Profiling k=9 sequential (with xy_cache): 27.5s total, 10.8s (39%) in XY builds.
+61M ZW calls (64.8% memo hit), 62M XY calls (8% memo hit, 163M pruned).
+1.37M distinct XY builds out of 5.3M ZW boundaries (74.3% xy_cache hit).
+ZW levels 14-17 dominate (48.7M/61M calls).
+Baselines: k=8: 0.8s, k=9: 9.6s, k=10: 144s. Goal: make k=15 feasible.
 
 ### 17. Full BFS-by-level construction (replace DFS)
 **Status**: Untested.
@@ -158,6 +160,36 @@ keyed by packed zw_sums (u128). k=9 seq: 93.8→37.8s; k=9 par: 40→28.1s.
 Group ZW boundaries by compatible zw_sums patterns. Build XY sub-MDDs
 in batches, keeping the XY memo warm across the batch. Increases XY memo
 hit rate from 8% to potentially 50%+.
+
+### 27. Incremental MDD extension (compositional build)
+**Status**: Untested.
+Build a small k MDD (e.g. k=7, 0.3s), then for each surviving ZW boundary,
+extend it by N more positions. The boundary zw_sums become initial conditions
+for a deeper search. Only explores reachable state space — avoids building
+the full k=15 monolith. Compose: k=7+3+3+2 = k=15.
+
+### 28. Precomputed event delta tables
+**Status**: Untested.
+The inner loop computes `za*zb` and `wa*wb` products using bit extraction
+and conditionals. Replace with a precomputed `delta[bits_a][bits_b]` lookup
+table per event. Eliminates branches from the hottest loop.
+
+### 29. Stack-based DFS (eliminate recursion overhead)
+**Status**: Untested.
+Replace recursive build_zw/build_xy with an explicit stack. Reduces function
+call overhead, enables better memory layout, and allows mid-traversal
+checkpointing for pause/resume on long builds.
+
+### 30. Parallel dedup during merge
+**Status**: Untested.
+The post-parallel-merge dedup pass is single-threaded. Use rayon to parallelize
+the canonicalization pass, or use DashMap for the canon table.
+
+### 31. Better ZW memo eviction (hit-rate-aware)
+**Status**: Untested.
+Current eviction clears the largest level. Instead, track hit rates per level
+and evict the level with the lowest hit rate. Keeps high-value cache entries
+warm. Expected to help at k>=11 where evictions are frequent.
 
 ## Rejected Ideas
 

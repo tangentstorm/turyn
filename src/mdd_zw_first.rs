@@ -13,7 +13,6 @@
 /// pairs for that (z,w) boundary. This gives us the (z,w) → [(x,y)] mapping for free.
 
 use rustc_hash::FxHashMap as HashMap;
-// dashmap available for future shared parallel builds
 
 pub const DEAD: u32 = 0;
 pub const LEAF: u32 = u32::MAX;
@@ -84,6 +83,36 @@ impl BuildStats {
         eprintln!("\nXY sub-MDD builds: {} (total {:.3}s)",
             self.xy_build_count, self.xy_build_ns as f64 / 1e9);
         eprintln!("ZW memo evictions: {}", self.zw_memo_evictions);
+    }
+}
+
+/// Lightweight status reporter. Checks wall time every N calls
+/// and prints a one-line update every ~10 seconds.
+struct StatusLine {
+    call_count: u64,
+    start: std::time::Instant,
+    last_print: std::time::Instant,
+    k: usize,
+}
+
+impl StatusLine {
+    fn new(k: usize) -> Self {
+        let now = std::time::Instant::now();
+        StatusLine { call_count: 0, start: now, last_print: now, k }
+    }
+
+    #[inline]
+    fn tick(&mut self, nodes: usize, zw_memo_count: usize, xy_cache_len: usize) {
+        self.call_count += 1;
+        // Check time every 500K calls (~1ns amortized cost of the branch)
+        if self.call_count & 0x7_FFFF == 0 {
+            let now = std::time::Instant::now();
+            if now.duration_since(self.last_print).as_secs() >= 10 {
+                self.last_print = now;
+                eprint!("\r  [k={} {:.0?}] {} nodes, zw_memo={}, xy_cache={}   ",
+                    self.k, now.duration_since(self.start), nodes, zw_memo_count, xy_cache_len);
+            }
+        }
     }
 }
 
@@ -483,10 +512,64 @@ impl ZwFirstMdd {
             }).collect();
 
         // Build context
+        // Precomputed delta tables: delta[bits_a * 4 + bits_b] for each event
+        // Z event: 2 * sign(bits_a & 1) * sign(bits_b & 1)
+        // W event: 2 * sign((bits_a>>1) & 1) * sign((bits_b>>1) & 1)
+        // XY event: sign(xa) * sign(xb) + sign(ya) * sign(yb)
+        fn make_zw_delta(is_z: bool) -> [i8; 16] {
+            let mut table = [0i8; 16];
+            for a in 0u32..4 {
+                for b in 0u32..4 {
+                    let val = if is_z {
+                        let za = if a & 1 == 1 { 1i32 } else { -1 };
+                        let zb = if b & 1 == 1 { 1i32 } else { -1 };
+                        2 * za * zb
+                    } else {
+                        let wa = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
+                        let wb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
+                        2 * wa * wb
+                    };
+                    table[(a * 4 + b) as usize] = val as i8;
+                }
+            }
+            table
+        }
+        fn make_xy_delta() -> [i8; 16] {
+            let mut table = [0i8; 16];
+            for a in 0u32..4 {
+                for b in 0u32..4 {
+                    let xa = if a & 1 == 1 { 1i32 } else { -1 };
+                    let xb = if b & 1 == 1 { 1i32 } else { -1 };
+                    let ya = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
+                    let yb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
+                    table[(a * 4 + b) as usize] = (xa * xb + ya * yb) as i8;
+                }
+            }
+            table
+        }
+
+        // Pre-resolve active indices into events: (lag_idx, idx_a, idx_b, delta_table)
+        let zw_resolved_events: Vec<Vec<(usize, usize, usize, [i8; 16])>> =
+            zw_events_at_level.iter().enumerate().map(|(level, evs)| {
+                evs.iter().map(|(li, ev)| {
+                    let idx_a = zw_active_indices[level][ev.pos_a];
+                    let idx_b = zw_active_indices[level][ev.pos_b];
+                    (*li, idx_a, idx_b, make_zw_delta(ev.is_z))
+                }).collect()
+            }).collect();
+        let xy_resolved_events: Vec<Vec<(usize, usize, usize, [i8; 16])>> =
+            xy_events_at_level.iter().enumerate().map(|(level, evs)| {
+                evs.iter().map(|(li, ev)| {
+                    let idx_a = xy_active_indices[level][ev.pos_a];
+                    let idx_b = xy_active_indices[level][ev.pos_b];
+                    (*li, idx_a, idx_b, make_xy_delta())
+                }).collect()
+            }).collect();
+
         struct Ctx {
             pos_order: Vec<usize>,
-            zw_events_at_level: Vec<Vec<(usize, usize, usize, bool)>>, // (lag_idx, pos_a, pos_b, is_z)
-            xy_events_at_level: Vec<Vec<(usize, usize, usize)>>,
+            zw_events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>>, // (lag_idx, idx_a, idx_b, delta_table)
+            xy_events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>>,
             zw_lag_check_at_level: Vec<Vec<usize>>,
             xy_lag_check_at_level: Vec<Vec<usize>>,
             xy_max_abs: Vec<i32>,
@@ -504,12 +587,8 @@ impl ZwFirstMdd {
 
         let ctx = Ctx {
             pos_order: pos_order.clone(),
-            zw_events_at_level: zw_events_at_level.iter().map(|evs|
-                evs.iter().map(|(li, ev)| (*li, ev.pos_a, ev.pos_b, ev.is_z)).collect()
-            ).collect(),
-            xy_events_at_level: xy_events_at_level.iter().map(|evs|
-                evs.iter().map(|(li, ev)| (*li, ev.pos_a, ev.pos_b)).collect()
-            ).collect(),
+            zw_events_at_level: zw_resolved_events,
+            xy_events_at_level: xy_resolved_events,
             zw_lag_check_at_level,
             xy_lag_check_at_level,
             xy_max_abs,
@@ -628,17 +707,11 @@ impl ZwFirstMdd {
 
                 let sums_backup = pack_sums(sums);
 
-                // Process XY pair events at this level
-                for &(lag_idx, pos_a, pos_b) in &ctx.xy_events_at_level[level] {
-                    let idx_a = ctx.xy_active_indices[level][pos_a];
-                    let idx_b = ctx.xy_active_indices[level][pos_b];
-                    let bits_a = current_vals[idx_a] as u32;
-                    let bits_b = current_vals[idx_b] as u32;
-                    let xa = if (bits_a >> 0) & 1 == 1 { 1i32 } else { -1 };
-                    let xb = if (bits_b >> 0) & 1 == 1 { 1i32 } else { -1 };
-                    let ya = if (bits_a >> 1) & 1 == 1 { 1i32 } else { -1 };
-                    let yb = if (bits_b >> 1) & 1 == 1 { 1i32 } else { -1 };
-                    sums[lag_idx] += (xa * xb + ya * yb) as i8;
+                // Process XY pair events at this level (pre-resolved indices + delta table)
+                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.xy_events_at_level[level] {
+                    let bits_a = current_vals[idx_a] as usize;
+                    let bits_b = current_vals[idx_b] as usize;
+                    sums[lag_idx] += delta[bits_a * 4 + bits_b];
                 }
 
                 // Check completed lags
@@ -707,8 +780,10 @@ impl ZwFirstMdd {
             max_memo_entries: usize,
             per_level_cap: usize,
             stats: &mut BuildStats,
+            status: &mut StatusLine,
         ) -> u32 {
             stats.zw_level_stats[level].0 += 1;
+            status.tick(nodes.len(), *zw_memo_count, xy_cache.len());
 
             if level == ctx.zw_depth {
                 // ZW half done. Build XY sub-MDD for these zw_sums.
@@ -782,21 +857,11 @@ impl ZwFirstMdd {
 
                 let sums_backup = pack_sums(sums);
 
-                // Process ZW pair events at this level
-                for &(lag_idx, pos_a, pos_b, is_z) in &ctx.zw_events_at_level[level] {
-                    let idx_a = ctx.zw_active_indices[level][pos_a];
-                    let idx_b = ctx.zw_active_indices[level][pos_b];
-                    let bits_a = current_vals[idx_a] as u32;
-                    let bits_b = current_vals[idx_b] as u32;
-                    if is_z {
-                        let za = if (bits_a >> 0) & 1 == 1 { 1i32 } else { -1 };
-                        let zb = if (bits_b >> 0) & 1 == 1 { 1i32 } else { -1 };
-                        sums[lag_idx] += (2 * za * zb) as i8;
-                    } else {
-                        let wa = if (bits_a >> 1) & 1 == 1 { 1i32 } else { -1 };
-                        let wb = if (bits_b >> 1) & 1 == 1 { 1i32 } else { -1 };
-                        sums[lag_idx] += (2 * wa * wb) as i8;
-                    }
+                // Process ZW pair events at this level (pre-resolved indices + delta table)
+                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.zw_events_at_level[level] {
+                    let bits_a = current_vals[idx_a] as usize;
+                    let bits_b = current_vals[idx_b] as usize;
+                    sums[lag_idx] += delta[bits_a * 4 + bits_b];
                 }
 
                 // At ZW lag checkpoints: range+parity prune
@@ -826,7 +891,7 @@ impl ZwFirstMdd {
                         level + 1, sums, &current_vals[..n_active],
                         ctx, nodes, unique, zw_memo, xy_memo, xy_cache,
                         zw_memo_count, max_memo_entries, per_level_cap,
-                        stats,
+                        stats, status,
                     );
                     if level == 1 {
                         eprint!("\r  ZW level 1 branch {}/4, {} nodes, zw_memo={}   ",
@@ -908,13 +973,16 @@ impl ZwFirstMdd {
         let per_level_cap: usize = max_memo_entries / (zw_depth + 1);
         let mut zw_memo_count: usize = 0;
         let mut xy_cache: HashMap<u128, u32> = HashMap::default();
+
         let mut sums = vec![0i8; k];
+        let mut status = StatusLine::new(k);
         let root = build_zw(
             0, &mut sums, &[],
             &ctx, &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo, &mut xy_cache,
             &mut zw_memo_count, max_memo_entries, per_level_cap,
-            &mut stats,
+            &mut stats, &mut status,
         );
+        eprintln!(); // newline after status line
 
         let zw_memo_entries: usize = zw_memo.iter().map(|m| m.len()).sum();
         let xy_memo_entries: usize = xy_memo.iter().map(|m| m.len()).sum();
@@ -924,11 +992,13 @@ impl ZwFirstMdd {
             zw_memo_entries, xy_memo_entries, xy_cache.len(), zw_boundary_calls,
             if zw_boundary_calls > 0 { 100.0 * (1.0 - xy_cache.len() as f64 / zw_boundary_calls as f64) } else { 0.0 });
 
-        // Report per-level memo sizes
-        eprintln!("  ZW memo per level:");
-        for (i, m) in zw_memo.iter().enumerate() {
-            if m.len() > 0 {
-                eprintln!("    level {}: {} entries", i, m.len());
+        // Report per-level memo sizes (only when profiling)
+        if std::env::var("MDD_PROFILE").is_ok() {
+            eprintln!("  ZW memo per level:");
+            for (i, m) in zw_memo.iter().enumerate() {
+                if m.len() > 0 {
+                    eprintln!("    level {}: {} entries", i, m.len());
+                }
             }
         }
 
