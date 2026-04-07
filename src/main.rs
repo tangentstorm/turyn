@@ -154,6 +154,16 @@ impl PackedSeq {
     }
 }
 
+/// Extract a ±1 sequence from a SAT solver's assignment.
+fn extract_seq(solver: &radical::Solver, var_fn: impl Fn(usize) -> i32, len: usize) -> PackedSeq {
+    PackedSeq::from_values(&extract_vals(solver, var_fn, len))
+}
+
+/// Extract ±1 values from a SAT solver's assignment.
+fn extract_vals(solver: &radical::Solver, var_fn: impl Fn(usize) -> i32, len: usize) -> Vec<i8> {
+    (0..len).map(|i| if solver.value(var_fn(i)) == Some(true) { 1 } else { -1 }).collect()
+}
+
 /// Format a sequence as a colorized +/- string for terminal display.
 /// '+' gets black text on light gray background, '-' gets white text on dark gray.
 /// Copies as plain +/- from most terminals.
@@ -1493,9 +1503,9 @@ impl SatXYTemplate {
 
         match solver.solve() {
             Some(true) => {
-                let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                (Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y))), false)
+                let x = extract_seq(&solver, x_var, n);
+                let y = extract_seq(&solver, y_var, n);
+                (Some((x, y)), false)
             }
             Some(false) => (None, false),  // definite UNSAT
             None => (None, true),  // hit conflict limit (UNKNOWN)
@@ -1588,9 +1598,9 @@ impl SatXYTemplate {
 
         match result {
             Some(true) => {
-                let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)))
+                let x = extract_seq(&solver, x_var, n);
+                let y = extract_seq(&solver, y_var, n);
+                Some((x, y))
             }
             _ => None,
         }
@@ -1727,12 +1737,9 @@ fn solve_work_item(
                 let m = problem.m();
                 match solver.solve() {
                     Some(true) => {
-                        let x = PackedSeq::from_values(&(0..n).map(|i|
-                            if solver.value(enc.x_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
-                        let y = PackedSeq::from_values(&(0..n).map(|i|
-                            if solver.value(enc.y_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
-                        let w = PackedSeq::from_values(&(0..m).map(|i|
-                            if solver.value(enc.w_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                        let x = extract_seq(&solver, |i| enc.x_var(i), n);
+                        let y = extract_seq(&solver, |i| enc.y_var(i), n);
+                        let w = extract_seq(&solver, |i| enc.w_var(i), m);
                         Some((x, y, z.clone(), w))
                     }
                     _ => None,
@@ -2114,10 +2121,10 @@ fn sat_solve_xyw(
 
     match solver.solve() {
         Some(true) => {
-            let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            let w: Vec<i8> = (0..m).map(|i| if solver.value(w_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y), PackedSeq::from_values(&w)))
+            let x = extract_seq(&solver, x_var, n);
+            let y = extract_seq(&solver, y_var, n);
+            let w = extract_seq(&solver, w_var, m);
+            Some((x, y, w))
         }
         _ => None,
     }
@@ -2997,10 +3004,10 @@ fn sat_search(problem: Problem, tuple: SumTuple, boundary: Option<&BoundaryConfi
     }
     match result {
         Some(true) => {
-            let x: Vec<i8> = (0..n).map(|i| if solver.value(enc.x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            let y: Vec<i8> = (0..n).map(|i| if solver.value(enc.y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            let z: Vec<i8> = (0..n).map(|i| if solver.value(enc.z_var(i)) == Some(true) { 1 } else { -1 }).collect();
-            let w: Vec<i8> = (0..m).map(|i| if solver.value(enc.w_var(i)) == Some(true) { 1 } else { -1 }).collect();
+            let x = extract_vals(&solver, |i| enc.x_var(i), n);
+            let y = extract_vals(&solver, |i| enc.y_var(i), n);
+            let z = extract_vals(&solver, |i| enc.z_var(i), n);
+            let w = extract_vals(&solver, |i| enc.w_var(i), m);
             Some((x, y, z, w))
         }
         Some(false) => {
@@ -3684,14 +3691,10 @@ fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                                             solver.copy_phase_into(&mut warm_phase);
 
                                             if result == Some(true) {
-                                                let x = PackedSeq::from_values(&(0..n).map(|i|
-                                                    if solver.value(enc.x_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
-                                                let y = PackedSeq::from_values(&(0..n).map(|i|
-                                                    if solver.value(enc.y_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
-                                                let z = PackedSeq::from_values(&(0..n).map(|i|
-                                                    if solver.value(enc.z_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
-                                                let w = PackedSeq::from_values(&(0..m).map(|i|
-                                                    if solver.value(enc.w_var(i)) == Some(true) { 1i8 } else { -1 }).collect::<Vec<_>>());
+                                                let x = extract_seq(&solver, |i| enc.x_var(i), n);
+                                                let y = extract_seq(&solver, |i| enc.y_var(i), n);
+                                                let z = extract_seq(&solver, |i| enc.z_var(i), n);
+                                                let w = extract_seq(&solver, |i| enc.w_var(i), m);
                                                 solver.reset(); // backtrack for next solve
 
                                                 if verify_tt(problem, &x, &y, &z, &w) {
@@ -4064,9 +4067,9 @@ impl XYBoundaryTable {
 
                     match solver.solve_with_assumptions(&assumptions) {
                         Some(true) => {
-                            let x: Vec<i8> = (0..n).map(|i| if solver.value(x_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                            let y: Vec<i8> = (0..n).map(|i| if solver.value(y_var(i)) == Some(true) { 1 } else { -1 }).collect();
-                            return Some((PackedSeq::from_values(&x), PackedSeq::from_values(&y)));
+                            let x = extract_seq(&solver, x_var, n);
+                            let y = extract_seq(&solver, y_var, n);
+                            return Some((x, y));
                         }
                         _ => {
                             configs_tested += 1;
