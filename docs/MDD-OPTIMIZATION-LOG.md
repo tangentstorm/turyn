@@ -17,13 +17,13 @@ time target/release/gen_mdd 10 /dev/null
 
 ## Current baseline (ZW-first builder, all optimizations, parallel)
 
-| k | Time (par) | Time (seq) | Nodes | File size |
-|---|-----------|-----------|-------|-----------|
-| 7 | 0.3s | 0.3s | 69K | 1.0 MB |
-| 8 | 1.6s | 2.5s | 433K | 6.6 MB |
-| 9 | 10.2s | 28s | 2.6M | 39.6 MB |
-| 10 | 191s | ~12min | 17.2M | 262 MB |
-| 11 | ~30min (est) | ~2h (est) | ~170M (est) | ~2.6 GB (est) |
+| k | Full (par) | ZW-only (par) | Full Nodes | ZW-only Nodes | Full Size | ZW-only Size |
+|---|-----------|--------------|-----------|--------------|----------|-------------|
+| 7 | 0.3s | 0.1s | 69K | ~5K | 1.0 MB | ~0.1 MB |
+| 8 | 0.8s | 0.3s | 433K | ~30K | 6.6 MB | ~0.5 MB |
+| 9 | 7.1s | 3.0s | 2.6M | 175K | 39.6 MB | 2.7 MB |
+| 10 | 104s | 50s | 17.2M | 803K | 262 MB | 12.2 MB |
+| 11 | ~2h (est) | TBD | ~170M (est) | TBD | ~2.6 GB | TBD |
 
 Original baselines: k=7: 4.7s, k=8: 46.6s, k=9: OOM/timeout
 
@@ -43,3 +43,6 @@ Original baselines: k=7: 4.7s, k=8: 46.6s, k=9: OOM/timeout
 | 2026-04-07 | Flat Vec<usize> active_indices + stack arrays | Replace HashMap→flat array for pos→index lookup; [u8;32] stack arrays | k=9 seq: 37.8→28s (-26%); k=9 par: 28.1→10.2s (-64%) |
 | 2026-04-07 | BFS builder with optimized Pass 2 | Complete ZW+XY BFS builder; stores children indices to avoid re-expansion | BFS k=9: 144→57s; DFS still faster for k≤10 |
 | 2026-04-07 | Configurable memo cap (default 80M) | MDD_MEMO_CAP env var; default increased from 50M to 80M | k=10 par: 191s (was ~10min before all opts); k=11 seq: in progress |
+| 2026-04-07 | Pre-resolve event indices + delta lookup tables | Precompute active index lookups and 4x4 delta tables at build time | k=10: 144→128s (-11%) |
+| 2026-04-07 | Delta-subtract restore (no pack/unpack) | Subtract same deltas instead of packing to u128 and unpacking | k=9: 9.6→6.8s (-29%); k=10: 128→104s (-19%) |
+| 2026-04-07 | ZW-only mode (--zw-only) | Skip XY sub-MDD building; LEAF at ZW boundary with range check | k=9: 7.4→3.0s (2.5x); k=10: 103→50s (2x); file 15-21x smaller |

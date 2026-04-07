@@ -17,6 +17,133 @@ use rustc_hash::FxHashMap as HashMap;
 pub const DEAD: u32 = 0;
 pub const LEAF: u32 = u32::MAX;
 
+pub type StateKey = (u128, u64);
+
+pub fn pack_sums(sums: &[i8]) -> u128 {
+    let mut packed = 0u128;
+    for (i, &s) in sums.iter().enumerate() {
+        packed |= ((s as u8 as u128) & 0xFF) << (i * 8);
+    }
+    packed
+}
+
+pub fn pack_active(vals: &[u8]) -> u64 {
+    let mut packed = 0u64;
+    for (i, &v) in vals.iter().enumerate() {
+        packed |= (v as u64) << (i * 2);
+    }
+    packed
+}
+
+pub fn hash_node4(level: u8, children: &[u32; 4]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = rustc_hash::FxHasher::default();
+    level.hash(&mut h);
+    for &c in children { c.hash(&mut h); }
+    h.finish()
+}
+
+/// Compute active position tracking for a sequence of levels.
+/// `position_pairs[level]` gives the (pos_a, pos_b) pairs that complete at that level.
+/// Returns (active_at_level, active_indices) where active_indices is a flat Vec<usize>
+/// with active_indices[level][pos] = index in active set (usize::MAX if absent).
+pub fn compute_active_tracking(
+    depth: usize,
+    n_positions: usize,
+    pos_order: &[usize],
+    position_pairs: &[Vec<(usize, usize)>],
+) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    let mut last_use: Vec<usize> = vec![0; n_positions];
+    for (level, pairs) in position_pairs.iter().enumerate() {
+        for &(a, b) in pairs {
+            last_use[a] = last_use[a].max(level);
+            last_use[b] = last_use[b].max(level);
+        }
+    }
+    let mut active_at_level: Vec<Vec<usize>> = vec![Vec::new(); depth + 1];
+    for d in 0..depth {
+        let mut active: Vec<usize> = if d > 0 {
+            active_at_level[d - 1].iter()
+                .filter(|&&p| last_use[p] >= d)
+                .copied().collect()
+        } else { Vec::new() };
+        active.push(pos_order[d]);
+        active.sort();
+        active_at_level[d] = active;
+    }
+    let active_indices: Vec<Vec<usize>> = active_at_level.iter()
+        .map(|active| {
+            let mut flat = vec![usize::MAX; n_positions];
+            for (i, &p) in active.iter().enumerate() { flat[p] = i; }
+            flat
+        }).collect();
+    (active_at_level, active_indices)
+}
+
+/// Delta table for Z or W events: delta[bits_a * 4 + bits_b].
+/// Z (is_z=true): 2 * sign(bit0_a) * sign(bit0_b)
+/// W (is_z=false): 2 * sign(bit1_a) * sign(bit1_b)
+pub fn make_zw_delta(is_z: bool) -> [i8; 16] {
+    let mut table = [0i8; 16];
+    for a in 0u32..4 {
+        for b in 0u32..4 {
+            let val = if is_z {
+                let za = if a & 1 == 1 { 1i32 } else { -1 };
+                let zb = if b & 1 == 1 { 1i32 } else { -1 };
+                2 * za * zb
+            } else {
+                let wa = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
+                let wb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
+                2 * wa * wb
+            };
+            table[(a * 4 + b) as usize] = val as i8;
+        }
+    }
+    table
+}
+
+/// Reduce a 4-way node: return DEAD if all dead, collapse if all same,
+/// otherwise dedup via hash-based unique table.
+#[inline]
+pub fn reduce_node(
+    level: u8,
+    children: [u32; 4],
+    nodes: &mut Vec<[u32; 4]>,
+    unique: &mut HashMap<u64, u32>,
+) -> u32 {
+    if children.iter().all(|&c| c == DEAD) {
+        return DEAD;
+    }
+    let first = children[0];
+    if children.iter().all(|&c| c == first) {
+        return first;
+    }
+    let key = hash_node4(level, &children);
+    if let Some(&nid) = unique.get(&key) {
+        nid
+    } else {
+        let nid = nodes.len() as u32;
+        nodes.push(children);
+        unique.insert(key, nid);
+        nid
+    }
+}
+
+/// Delta table for XY events: xa*xb + ya*yb.
+pub fn make_xy_delta() -> [i8; 16] {
+    let mut table = [0i8; 16];
+    for a in 0u32..4 {
+        for b in 0u32..4 {
+            let xa = if a & 1 == 1 { 1i32 } else { -1 };
+            let xb = if b & 1 == 1 { 1i32 } else { -1 };
+            let ya = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
+            let yb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
+            table[(a * 4 + b) as usize] = (xa * xb + ya * yb) as i8;
+        }
+    }
+    table
+}
+
 /// Per-level profiling counters for MDD build.
 pub struct BuildStats {
     /// Per ZW level: (calls, memo_hits, pruned, xy_builds)
@@ -142,6 +269,17 @@ impl ZwFirstMdd {
     /// Build with profiling, returning stats.
     pub fn build_with_stats(k: usize) -> (Self, BuildStats) {
         Self::build_inner(k, None, None)
+    }
+
+    /// Build ZW-only MDD (no XY sub-MDDs). Much faster and smaller.
+    /// At the ZW boundary, valid states become LEAF instead of building
+    /// an XY sub-MDD. Use build_xy_for_boundary() at runtime to get XY.
+    pub fn build_zw_only(k: usize) -> Self {
+        let (mdd, stats) = Self::build_inner_opts(k, None, None, true);
+        if std::env::var("MDD_PROFILE").is_ok() {
+            stats.report(k);
+        }
+        mdd
     }
 
     /// Build with parallel branches using rayon.
@@ -328,6 +466,11 @@ impl ZwFirstMdd {
     }
 
     fn build_inner(k: usize, restrict_level1: Option<u32>, restrict_branches: Option<&[u32]>) -> (Self, BuildStats) {
+        let zw_only = std::env::var("MDD_ZW_ONLY").is_ok();
+        Self::build_inner_opts(k, restrict_level1, restrict_branches, zw_only)
+    }
+
+    fn build_inner_opts(k: usize, restrict_level1: Option<u32>, restrict_branches: Option<&[u32]>, zw_only: bool) -> (Self, BuildStats) {
         let mut stats = BuildStats::new(k);
         let zw_depth = 2 * k;
         let total_depth = 4 * k;
@@ -459,94 +602,15 @@ impl ZwFirstMdd {
         }
 
         // Active position tracking for z,w half
-        let mut zw_last_use: Vec<usize> = vec![0; 2 * k];
-        for (level, events) in zw_events_at_level.iter().enumerate() {
-            for (_, ev) in events {
-                zw_last_use[ev.pos_a] = zw_last_use[ev.pos_a].max(level);
-                zw_last_use[ev.pos_b] = zw_last_use[ev.pos_b].max(level);
-            }
-        }
-        let mut zw_active_at_level: Vec<Vec<usize>> = vec![Vec::new(); zw_depth + 1];
-        for d in 0..zw_depth {
-            let mut active: Vec<usize> = if d > 0 {
-                zw_active_at_level[d - 1].iter()
-                    .filter(|&&p| zw_last_use[p] >= d)
-                    .copied().collect()
-            } else { Vec::new() };
-            active.push(pos_order[d]);
-            active.sort();
-            zw_active_at_level[d] = active;
-        }
-        // Flat array for position→index lookup (avoids HashMap in hot path)
-        let zw_active_indices: Vec<Vec<usize>> = zw_active_at_level.iter()
-            .map(|active| {
-                let mut flat = vec![usize::MAX; 2 * k];
-                for (i, &p) in active.iter().enumerate() { flat[p] = i; }
-                flat
-            }).collect();
+        let zw_pairs: Vec<Vec<(usize, usize)>> = zw_events_at_level.iter()
+            .map(|evs| evs.iter().map(|(_, ev)| (ev.pos_a, ev.pos_b)).collect()).collect();
+        let (zw_active_at_level, zw_active_indices) =
+            compute_active_tracking(zw_depth, 2 * k, &pos_order, &zw_pairs);
 
-        // Active position tracking for x,y half
-        let mut xy_last_use: Vec<usize> = vec![0; 2 * k];
-        for (level, events) in xy_events_at_level.iter().enumerate() {
-            for (_, ev) in events {
-                xy_last_use[ev.pos_a] = xy_last_use[ev.pos_a].max(level);
-                xy_last_use[ev.pos_b] = xy_last_use[ev.pos_b].max(level);
-            }
-        }
-        let mut xy_active_at_level: Vec<Vec<usize>> = vec![Vec::new(); zw_depth + 1];
-        for d in 0..zw_depth {
-            let mut active: Vec<usize> = if d > 0 {
-                xy_active_at_level[d - 1].iter()
-                    .filter(|&&p| xy_last_use[p] >= d)
-                    .copied().collect()
-            } else { Vec::new() };
-            active.push(pos_order[d]);
-            active.sort();
-            xy_active_at_level[d] = active;
-        }
-        let xy_active_indices: Vec<Vec<usize>> = xy_active_at_level.iter()
-            .map(|active| {
-                let mut flat = vec![usize::MAX; 2 * k];
-                for (i, &p) in active.iter().enumerate() { flat[p] = i; }
-                flat
-            }).collect();
-
-        // Build context
-        // Precomputed delta tables: delta[bits_a * 4 + bits_b] for each event
-        // Z event: 2 * sign(bits_a & 1) * sign(bits_b & 1)
-        // W event: 2 * sign((bits_a>>1) & 1) * sign((bits_b>>1) & 1)
-        // XY event: sign(xa) * sign(xb) + sign(ya) * sign(yb)
-        fn make_zw_delta(is_z: bool) -> [i8; 16] {
-            let mut table = [0i8; 16];
-            for a in 0u32..4 {
-                for b in 0u32..4 {
-                    let val = if is_z {
-                        let za = if a & 1 == 1 { 1i32 } else { -1 };
-                        let zb = if b & 1 == 1 { 1i32 } else { -1 };
-                        2 * za * zb
-                    } else {
-                        let wa = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
-                        let wb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
-                        2 * wa * wb
-                    };
-                    table[(a * 4 + b) as usize] = val as i8;
-                }
-            }
-            table
-        }
-        fn make_xy_delta() -> [i8; 16] {
-            let mut table = [0i8; 16];
-            for a in 0u32..4 {
-                for b in 0u32..4 {
-                    let xa = if a & 1 == 1 { 1i32 } else { -1 };
-                    let xb = if b & 1 == 1 { 1i32 } else { -1 };
-                    let ya = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
-                    let yb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
-                    table[(a * 4 + b) as usize] = (xa * xb + ya * yb) as i8;
-                }
-            }
-            table
-        }
+        let xy_pairs: Vec<Vec<(usize, usize)>> = xy_events_at_level.iter()
+            .map(|evs| evs.iter().map(|(_, ev)| (ev.pos_a, ev.pos_b)).collect()).collect();
+        let (xy_active_at_level, xy_active_indices) =
+            compute_active_tracking(zw_depth, 2 * k, &pos_order, &xy_pairs);
 
         // Pre-resolve active indices into events: (lag_idx, idx_a, idx_b, delta_table)
         let zw_resolved_events: Vec<Vec<(usize, usize, usize, [i8; 16])>> =
@@ -566,377 +630,51 @@ impl ZwFirstMdd {
                 }).collect()
             }).collect();
 
-        struct Ctx {
-            pos_order: Vec<usize>,
-            zw_events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>>, // (lag_idx, idx_a, idx_b, delta_table)
-            xy_events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>>,
-            zw_lag_check_at_level: Vec<Vec<usize>>,
-            xy_lag_check_at_level: Vec<Vec<usize>>,
-            xy_max_abs: Vec<i32>,
-            zw_max_remaining: Vec<Vec<i32>>,
-            xy_max_remaining: Vec<Vec<i32>>,
-            zw_active_at_level: Vec<Vec<usize>>,
-            zw_active_indices: Vec<Vec<usize>>,  // flat array: pos → index
-            xy_active_at_level: Vec<Vec<usize>>,
-            xy_active_indices: Vec<Vec<usize>>,  // flat array: pos → index
-            k: usize,
-            zw_depth: usize,
-            restrict_level1: Option<u32>,
-            restrict_branches: Vec<(usize, u32)>, // (level, required_branch)
+        let mut all_restrict: Vec<(usize, u32)> = match restrict_branches {
+            Some(branches) => branches.iter().enumerate()
+                .map(|(d, &b)| (d + 1, b))
+                .collect(),
+            None => Vec::new(),
+        };
+        if let Some(target) = restrict_level1 {
+            all_restrict.push((1, target));
         }
 
-        let ctx = Ctx {
+        let zw_ctx = ZwBuildCtx {
             pos_order: pos_order.clone(),
-            zw_events_at_level: zw_resolved_events,
-            xy_events_at_level: xy_resolved_events,
-            zw_lag_check_at_level,
-            xy_lag_check_at_level,
+            events: zw_resolved_events,
+            lag_check: zw_lag_check_at_level,
+            max_remaining: zw_max_remaining,
+            active_at_level: zw_active_at_level,
+            active_indices: zw_active_indices,
             xy_max_abs,
-            zw_max_remaining,
-            xy_max_remaining,
-            zw_active_at_level,
-            zw_active_indices,
-            xy_active_at_level,
-            xy_active_indices,
             k,
-            zw_depth,
-            restrict_level1,
-            restrict_branches: match restrict_branches {
-                Some(branches) => branches.iter().enumerate()
-                    .map(|(d, &b)| (d + 1, b)) // level 1, 2, ... (skip level 0 symmetry)
-                    .collect(),
-                None => Vec::new(),
-            },
+            depth: zw_depth,
+            symmetry_break: true,
+            restrict_branches: all_restrict,
+            zw_only,
+        };
+        let xy_ctx = XyBuildCtx {
+            pos_order: pos_order.clone(),
+            events: xy_resolved_events,
+            lag_check: xy_lag_check_at_level,
+            max_remaining: xy_max_remaining,
+            active_at_level: xy_active_at_level,
+            active_indices: xy_active_indices,
+            k,
+            depth: zw_depth,
+            symmetry_break: true,
         };
 
         let mut nodes: Vec<[u32; 4]> = Vec::new();
         nodes.push([DEAD; 4]); // node 0 = DEAD
 
-        fn hash_node4(level: u8, children: &[u32; 4]) -> u64 {
-            use std::hash::{Hash, Hasher};
-            let mut h = rustc_hash::FxHasher::default();
-            level.hash(&mut h);
-            for &c in children { c.hash(&mut h); }
-            h.finish()
-        }
         let mut unique: HashMap<u64, u32> = HashMap::default();
 
-        type StateKey = (u128, u64);
-        type XyStateKey = (u128, u64); // (packed_sums, packed_active) - cleared per zw_sums
         let mut zw_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
-        let mut xy_memo: Vec<HashMap<XyStateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
+        let mut xy_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
 
-        fn pack_sums(sums: &[i8]) -> u128 {
-            let mut packed = 0u128;
-            for (i, &s) in sums.iter().enumerate() {
-                packed |= ((s as u8 as u128) & 0xFF) << (i * 8);
-            }
-            packed
-        }
-
-        fn pack_active(vals: &[u8]) -> u64 {
-            let mut packed = 0u64;
-            for (i, &v) in vals.iter().enumerate() {
-                packed |= (v as u64) << (i * 2); // 2 bits per position (4-way)
-            }
-            packed
-        }
-
-        fn bnd_val(bits: u32, pos: usize) -> i32 {
-            if (bits >> pos) & 1 == 1 { 1 } else { -1 }
-        }
-
-        // Build XY bottom half: given zw_sums (the target for each lag),
-        // build a 4-way MDD for (x,y) that satisfies N_X(s)+N_Y(s) = -zw_sums[s].
-        fn build_xy(
-            level: usize,  // 0..2k within xy half
-            sums: &mut Vec<i8>,  // partial N_X + N_Y at each lag
-            active_bits: &[u8],
-            zw_sums: &[i8],  // target: sums[li] must equal -zw_sums[li] at end
-            ctx: &Ctx,
-            nodes: &mut Vec<[u32; 4]>,
-            unique: &mut HashMap<u64, u32>,
-            memo: &mut Vec<HashMap<XyStateKey, u32>>,
-            stats: &mut BuildStats,
-        ) -> u32 {
-            stats.xy_level_stats[level].0 += 1;
-            if level == ctx.zw_depth {
-                // Check all lags: N_X + N_Y = -zw_sums
-                for li in 0..ctx.k {
-                    if sums[li] != -zw_sums[li] { return DEAD; }
-                }
-                return LEAF;
-            }
-
-            let active = &ctx.xy_active_at_level[level];
-            let n_active = active.len();
-            let mut current_vals = [0u8; 32];
-            if level > 0 {
-                let prev_indices = &ctx.xy_active_indices[level - 1];
-                for (i, &pos) in active.iter().enumerate() {
-                    if pos != ctx.pos_order[level] {
-                        let pi = prev_indices[pos];
-                        if pi != usize::MAX {
-                            current_vals[i] = active_bits[pi];
-                        }
-                    }
-                }
-            }
-
-            let new_pos = ctx.pos_order[level];
-            let new_idx = ctx.xy_active_indices[level][new_pos];
-
-            let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
-            if let Some(&cached) = memo[level].get(&state_key) {
-                stats.xy_level_stats[level].1 += 1;
-                return cached;
-            }
-
-            // Use level offset for unique table to avoid collisions with zw half
-            let unique_level = (ctx.zw_depth + level) as u8;
-
-            let mut children = [DEAD; 4];
-            for branch in 0u32..4 {
-                let x_val = (branch >> 0) & 1;
-                let y_val = (branch >> 1) & 1;
-
-                // Symmetry breaking: x[0]=y[0]=+1
-                if new_pos == 0 && branch != 0b11 { continue; }
-
-                current_vals[new_idx] = branch as u8;
-
-                // Process XY pair events at this level (pre-resolved indices + delta table)
-                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.xy_events_at_level[level] {
-                    let bits_a = current_vals[idx_a] as usize;
-                    let bits_b = current_vals[idx_b] as usize;
-                    sums[lag_idx] += delta[bits_a * 4 + bits_b];
-                }
-
-                // Check completed lags
-                let mut ok = true;
-                for &li in &ctx.xy_lag_check_at_level[level] {
-                    if sums[li] != -zw_sums[li] { ok = false; break; }
-                }
-                // Range check: can remaining XY events bring sums to -zw_sums?
-                if ok && level + 1 < ctx.zw_depth {
-                    for li in 0..ctx.k {
-                        let gap = (sums[li] as i32) - (-(zw_sums[li] as i32));
-                        let remaining = ctx.xy_max_remaining[level + 1][li];
-                        if gap.abs() > remaining { ok = false; break; }
-                    }
-                }
-
-                if ok {
-                    children[branch as usize] = build_xy(
-                        level + 1, sums, &current_vals[..n_active], zw_sums,
-                        ctx, nodes, unique, memo, stats,
-                    );
-                } else {
-                    stats.xy_level_stats[level].2 += 1;
-                }
-
-                // Restore sums by subtracting deltas
-                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.xy_events_at_level[level] {
-                    let bits_a = current_vals[idx_a] as usize;
-                    let bits_b = current_vals[idx_b] as usize;
-                    sums[lag_idx] -= delta[bits_a * 4 + bits_b];
-                }
-            }
-
-            let result = if children.iter().all(|&c| c == DEAD) {
-                DEAD
-            } else {
-                let first = children[0];
-                if children.iter().all(|&c| c == first) {
-                    first
-                } else {
-                    let key = hash_node4(unique_level, &children);
-                    if let Some(&nid) = unique.get(&key) { nid }
-                    else {
-                        let nid = nodes.len() as u32;
-                        nodes.push(children);
-                        unique.insert(key, nid);
-                        nid
-                    }
-                }
-            };
-
-            memo[level].insert(state_key, result);
-            result
-        }
-
-        // Build ZW top half: branch on (z,w), at bottom connect to XY sub-MDD.
-        fn build_zw(
-            level: usize,  // 0..2k within zw half
-            sums: &mut Vec<i8>,  // partial 2*N_Z + 2*N_W at each lag
-            active_bits: &[u8],
-            ctx: &Ctx,
-            nodes: &mut Vec<[u32; 4]>,
-            unique: &mut HashMap<u64, u32>,
-            zw_memo: &mut Vec<HashMap<StateKey, u32>>,
-            xy_memo: &mut Vec<HashMap<XyStateKey, u32>>,
-            xy_cache: &mut HashMap<u128, u32>,
-            zw_memo_count: &mut usize,
-            max_memo_entries: usize,
-            per_level_cap: usize,
-            stats: &mut BuildStats,
-            status: &mut StatusLine,
-        ) -> u32 {
-            stats.zw_level_stats[level].0 += 1;
-            status.tick(nodes.len(), *zw_memo_count, xy_cache.len());
-
-            if level == ctx.zw_depth {
-                // ZW half done. Build XY sub-MDD for these zw_sums.
-                stats.zw_level_stats[level].3 += 1;
-
-                // Check XY cache: same zw_sums → same XY sub-MDD root
-                let sums_key = pack_sums(sums);
-                if let Some(&cached_root) = xy_cache.get(&sums_key) {
-                    return cached_root;
-                }
-
-                stats.xy_build_count += 1;
-                let xy_start = std::time::Instant::now();
-                // Clear xy_memo for each distinct zw_sums to prevent memory explosion.
-                // Nodes are still shared via the `unique` table.
-                for m in xy_memo.iter_mut() { m.clear(); }
-                let zw_sums: Vec<i8> = sums.to_vec();
-                let mut xy_sums = vec![0i8; ctx.k];
-                let result = build_xy(
-                    0, &mut xy_sums, &[], &zw_sums,
-                    ctx, nodes, unique, xy_memo, stats,
-                );
-                stats.xy_build_ns += xy_start.elapsed().as_nanos() as u64;
-                xy_cache.insert(sums_key, result);
-                return result;
-            }
-
-            let active = &ctx.zw_active_at_level[level];
-            let n_active = active.len();
-            let mut current_vals = [0u8; 32];
-            if level > 0 {
-                let prev_indices = &ctx.zw_active_indices[level - 1];
-                for (i, &pos) in active.iter().enumerate() {
-                    if pos != ctx.pos_order[level] {
-                        let pi = prev_indices[pos];
-                        if pi != usize::MAX {
-                            current_vals[i] = active_bits[pi];
-                        }
-                    }
-                }
-            }
-
-            let new_pos = ctx.pos_order[level];
-            let new_idx = ctx.zw_active_indices[level][new_pos];
-
-            let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
-            if let Some(&cached) = zw_memo[level].get(&state_key) {
-                stats.zw_level_stats[level].1 += 1;
-                return cached;
-            }
-
-            let mut children = [DEAD; 4];
-            for branch in 0u32..4 {
-                let z_val = (branch >> 0) & 1;
-                let w_val = (branch >> 1) & 1;
-
-                // Symmetry breaking: z[0]=w[0]=+1
-                if new_pos == 0 && branch != 0b11 { continue; }
-
-                // For parallel builds: restrict to specific branches at specified levels
-                if let Some(target) = ctx.restrict_level1 {
-                    if level == 1 && branch != target { continue; }
-                }
-                let mut skip = false;
-                for &(rlevel, rbranch) in &ctx.restrict_branches {
-                    if level == rlevel && branch != rbranch { skip = true; break; }
-                }
-                if skip { continue; }
-
-                current_vals[new_idx] = branch as u8;
-
-                // Process ZW pair events at this level (pre-resolved indices + delta table)
-                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.zw_events_at_level[level] {
-                    let bits_a = current_vals[idx_a] as usize;
-                    let bits_b = current_vals[idx_b] as usize;
-                    sums[lag_idx] += delta[bits_a * 4 + bits_b];
-                }
-
-                // At ZW lag checkpoints: range+parity prune
-                let mut ok = true;
-                for &li in &ctx.zw_lag_check_at_level[level] {
-                    let zw_val = sums[li] as i32;
-                    // Need N_X + N_Y = -zw_val, which must be in [-max, +max] with right parity
-                    let max_xy = ctx.xy_max_abs[li];
-                    if zw_val.abs() > max_xy { ok = false; break; }
-                    if (zw_val + max_xy) % 2 != 0 { ok = false; break; }
-                }
-                // Range check: can remaining ZW events keep sums achievable?
-                if ok && level + 1 < ctx.zw_depth {
-                    for li in 0..ctx.k {
-                        let zw_val = sums[li] as i32;
-                        let zw_remaining = ctx.zw_max_remaining[level + 1][li];
-                        let max_xy = ctx.xy_max_abs[li];
-                        if (zw_val.abs() - zw_remaining) > max_xy { ok = false; break; }
-                    }
-                }
-
-                if ok {
-                    children[branch as usize] = build_zw(
-                        level + 1, sums, &current_vals[..n_active],
-                        ctx, nodes, unique, zw_memo, xy_memo, xy_cache,
-                        zw_memo_count, max_memo_entries, per_level_cap,
-                        stats, status,
-                    );
-                    if level == 1 {
-                        eprint!("\r  ZW level 1 branch {}/4, {} nodes, zw_memo={}   ",
-                            branch + 1, nodes.len(), *zw_memo_count);
-                    }
-                } else {
-                    stats.zw_level_stats[level].2 += 1;
-                }
-
-                // Restore sums by subtracting deltas (avoids pack/unpack overhead)
-                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.zw_events_at_level[level] {
-                    let bits_a = current_vals[idx_a] as usize;
-                    let bits_b = current_vals[idx_b] as usize;
-                    sums[lag_idx] -= delta[bits_a * 4 + bits_b];
-                }
-            }
-
-            let result = if children.iter().all(|&c| c == DEAD) {
-                DEAD
-            } else {
-                let first = children[0];
-                if children.iter().all(|&c| c == first) {
-                    first
-                } else {
-                    let key = hash_node4(level as u8, &children);
-                    if let Some(&nid) = unique.get(&key) { nid }
-                    else {
-                        let nid = nodes.len() as u32;
-                        nodes.push(children);
-                        unique.insert(key, nid);
-                        nid
-                    }
-                }
-            };
-
-            // Cap total memo entries to prevent OOM at large k.
-            // When over budget, evict the level with the most entries (typically deepest).
-            if *zw_memo_count >= max_memo_entries {
-                stats.zw_memo_evictions += 1;
-                let (max_lvl, _) = zw_memo.iter().enumerate()
-                    .max_by_key(|(_, m)| m.len()).unwrap();
-                if zw_memo[max_lvl].len() > 0 {
-                    *zw_memo_count -= zw_memo[max_lvl].len();
-                    zw_memo[max_lvl].clear();
-                }
-            }
-            zw_memo[level].insert(state_key, result);
-            *zw_memo_count += 1;
-            result
-        }
+        // (build_zw is now the module-level build_zw_dfs)
 
         // Budget memo: ~140 bytes/entry in FxHashMap.
         // When running as a parallel branch, use 1/N of the budget.
@@ -972,12 +710,11 @@ impl ZwFirstMdd {
         let mut xy_cache: HashMap<u128, u32> = HashMap::default();
 
         let mut sums = vec![0i8; k];
-        let mut status = StatusLine::new(k);
-        let root = build_zw(
+        let root = build_zw_dfs(
             0, &mut sums, &[],
-            &ctx, &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo, &mut xy_cache,
-            &mut zw_memo_count, max_memo_entries, per_level_cap,
-            &mut stats, &mut status,
+            &zw_ctx, &xy_ctx,
+            &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo, &mut xy_cache,
+            max_memo_entries, &mut zw_memo_count,
         );
         eprintln!(); // newline after status line
 
@@ -1116,6 +853,247 @@ impl ZwFirstMdd {
 /// This is the key API for runtime MDD extension: the main turyn program
 /// can walk a prebuilt k=K MDD, extract zw_sums at each boundary, and
 /// call this to build the XY constraint for that specific boundary.
+/// Context for ZW half DFS builder.
+pub struct ZwBuildCtx {
+    pub pos_order: Vec<usize>,
+    pub events: Vec<Vec<(usize, usize, usize, [i8; 16])>>,
+    pub lag_check: Vec<Vec<usize>>,
+    pub max_remaining: Vec<Vec<i32>>,
+    pub active_at_level: Vec<Vec<usize>>,
+    pub active_indices: Vec<Vec<usize>>,
+    pub xy_max_abs: Vec<i32>,
+    pub k: usize,
+    pub depth: usize,
+    pub symmetry_break: bool,
+    pub restrict_branches: Vec<(usize, u32)>,
+    pub zw_only: bool,
+}
+
+/// DFS builder for ZW half. At the boundary, delegates to build_xy_dfs.
+/// Returns the root node ID.
+pub fn build_zw_dfs(
+    level: usize,
+    sums: &mut [i8],
+    active_bits: &[u8],
+    ctx: &ZwBuildCtx,
+    xy_ctx: &XyBuildCtx,
+    nodes: &mut Vec<[u32; 4]>,
+    unique: &mut HashMap<u64, u32>,
+    zw_memo: &mut Vec<HashMap<StateKey, u32>>,
+    xy_memo: &mut Vec<HashMap<StateKey, u32>>,
+    xy_cache: &mut HashMap<u128, u32>,
+    max_memo_entries: usize,
+    zw_memo_count: &mut usize,
+) -> u32 {
+    if level == ctx.depth {
+        // ZW done. Check XY feasibility.
+        for li in 0..ctx.k {
+            let zw_val = sums[li] as i32;
+            if zw_val.abs() > ctx.xy_max_abs[li] { return DEAD; }
+            if (zw_val + ctx.xy_max_abs[li]) % 2 != 0 { return DEAD; }
+        }
+        if ctx.zw_only { return LEAF; }
+
+        // Check XY cache: same zw_sums → same XY sub-MDD root
+        let sums_key = pack_sums(sums);
+        if let Some(&cached) = xy_cache.get(&sums_key) { return cached; }
+
+        for m in xy_memo.iter_mut() { m.clear(); }
+        let target: Vec<i8> = sums.iter().map(|&s| -s).collect();
+        let mut xy_sums = vec![0i8; ctx.k];
+        let result = build_xy_dfs(
+            0, &mut xy_sums, &[], &target,
+            xy_ctx, nodes, unique, xy_memo,
+        );
+        xy_cache.insert(sums_key, result);
+        return result;
+    }
+
+    let active = &ctx.active_at_level[level];
+    let n_active = active.len();
+    let mut current_vals = [0u8; 32];
+    if level > 0 {
+        let prev_indices = &ctx.active_indices[level - 1];
+        for (i, &pos) in active.iter().enumerate() {
+            if pos != ctx.pos_order[level] {
+                let pi = prev_indices[pos];
+                if pi != usize::MAX {
+                    current_vals[i] = active_bits[pi];
+                }
+            }
+        }
+    }
+
+    let new_pos = ctx.pos_order[level];
+    let new_idx = ctx.active_indices[level][new_pos];
+
+    let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
+    if let Some(&cached) = zw_memo[level].get(&state_key) {
+        return cached;
+    }
+
+    let mut children = [DEAD; 4];
+    for branch in 0u32..4 {
+        if ctx.symmetry_break && new_pos == 0 && branch != 0b11 { continue; }
+        if !ctx.restrict_branches.is_empty() {
+            let mut skip = false;
+            for &(rlevel, rbranch) in &ctx.restrict_branches {
+                if level == rlevel && branch != rbranch { skip = true; break; }
+            }
+            if skip { continue; }
+        }
+
+        current_vals[new_idx] = branch as u8;
+
+        for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.events[level] {
+            let bits_a = current_vals[idx_a] as usize;
+            let bits_b = current_vals[idx_b] as usize;
+            sums[lag_idx] += delta[bits_a * 4 + bits_b];
+        }
+
+        let mut ok = true;
+        for &li in &ctx.lag_check[level] {
+            let zw_val = sums[li] as i32;
+            if zw_val.abs() > ctx.xy_max_abs[li] { ok = false; break; }
+            if (zw_val + ctx.xy_max_abs[li]) % 2 != 0 { ok = false; break; }
+        }
+        if ok && level + 1 < ctx.depth {
+            for li in 0..ctx.k {
+                let zw_val = sums[li] as i32;
+                let zw_remaining = ctx.max_remaining[level + 1][li];
+                if (zw_val.abs() - zw_remaining) > ctx.xy_max_abs[li] { ok = false; break; }
+            }
+        }
+
+        if ok {
+            children[branch as usize] = build_zw_dfs(
+                level + 1, sums, &current_vals[..n_active],
+                ctx, xy_ctx,
+                nodes, unique, zw_memo, xy_memo, xy_cache,
+                max_memo_entries, zw_memo_count,
+            );
+        }
+
+        for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.events[level] {
+            let bits_a = current_vals[idx_a] as usize;
+            let bits_b = current_vals[idx_b] as usize;
+            sums[lag_idx] -= delta[bits_a * 4 + bits_b];
+        }
+    }
+
+    let result = reduce_node(level as u8, children, nodes, unique);
+
+    // Memo eviction when over budget
+    if max_memo_entries > 0 && *zw_memo_count >= max_memo_entries {
+        let (max_lvl, _) = zw_memo.iter().enumerate()
+            .max_by_key(|(_, m)| m.len()).unwrap();
+        if zw_memo[max_lvl].len() > 0 {
+            *zw_memo_count -= zw_memo[max_lvl].len();
+            zw_memo[max_lvl].clear();
+        }
+    }
+    zw_memo[level].insert(state_key, result);
+    *zw_memo_count += 1;
+    result
+}
+
+/// Context for XY sub-MDD DFS builder.
+pub struct XyBuildCtx {
+    pub pos_order: Vec<usize>,
+    pub events: Vec<Vec<(usize, usize, usize, [i8; 16])>>,
+    pub lag_check: Vec<Vec<usize>>,
+    pub max_remaining: Vec<Vec<i32>>,
+    pub active_at_level: Vec<Vec<usize>>,
+    pub active_indices: Vec<Vec<usize>>,
+    pub k: usize,
+    pub depth: usize,
+    pub symmetry_break: bool,
+}
+
+/// DFS builder for XY sub-MDD. Builds the 4-way MDD for (x,y) assignments
+/// that make sums reach target_sums at each lag.
+pub fn build_xy_dfs(
+    level: usize,
+    sums: &mut [i8],
+    active_bits: &[u8],
+    target_sums: &[i8],
+    ctx: &XyBuildCtx,
+    nodes: &mut Vec<[u32; 4]>,
+    unique: &mut HashMap<u64, u32>,
+    memo: &mut Vec<HashMap<StateKey, u32>>,
+) -> u32 {
+    if level == ctx.depth {
+        for li in 0..ctx.k {
+            if sums[li] != target_sums[li] { return DEAD; }
+        }
+        return LEAF;
+    }
+
+    let active = &ctx.active_at_level[level];
+    let n_active = active.len();
+    let mut current_vals = [0u8; 32];
+    if level > 0 {
+        let prev_indices = &ctx.active_indices[level - 1];
+        for (i, &pos) in active.iter().enumerate() {
+            if pos != ctx.pos_order[level] {
+                let pi = prev_indices[pos];
+                if pi != usize::MAX {
+                    current_vals[i] = active_bits[pi];
+                }
+            }
+        }
+    }
+
+    let new_pos = ctx.pos_order[level];
+    let new_idx = ctx.active_indices[level][new_pos];
+
+    let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
+    if let Some(&cached) = memo[level].get(&state_key) {
+        return cached;
+    }
+
+    let mut children = [DEAD; 4];
+    for branch in 0u32..4 {
+        if ctx.symmetry_break && new_pos == 0 && branch != 0b11 { continue; }
+        current_vals[new_idx] = branch as u8;
+
+        for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.events[level] {
+            let bits_a = current_vals[idx_a] as usize;
+            let bits_b = current_vals[idx_b] as usize;
+            sums[lag_idx] += delta[bits_a * 4 + bits_b];
+        }
+
+        let mut ok = true;
+        for &li in &ctx.lag_check[level] {
+            if sums[li] != target_sums[li] { ok = false; break; }
+        }
+        if ok && level + 1 < ctx.depth {
+            for li in 0..ctx.k {
+                let gap = (sums[li] as i32) - (target_sums[li] as i32);
+                let remaining = ctx.max_remaining[level + 1][li];
+                if gap.abs() > remaining { ok = false; break; }
+            }
+        }
+
+        if ok {
+            children[branch as usize] = build_xy_dfs(
+                level + 1, sums, &current_vals[..n_active], target_sums,
+                ctx, nodes, unique, memo,
+            );
+        }
+
+        for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.events[level] {
+            let bits_a = current_vals[idx_a] as usize;
+            let bits_b = current_vals[idx_b] as usize;
+            sums[lag_idx] -= delta[bits_a * 4 + bits_b];
+        }
+    }
+
+    let result = reduce_node(level as u8, children, nodes, unique);
+    memo[level].insert(state_key, result);
+    result
+}
+
 pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
     assert_eq!(zw_sums.len(), k, "zw_sums must have k={} elements", k);
 
@@ -1172,31 +1150,10 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
         }
     }
 
-    // Active position tracking
-    let mut xy_last_use: Vec<usize> = vec![0; 2 * k];
-    for (level, events) in xy_events_at_level.iter().enumerate() {
-        for (_, ev) in events {
-            xy_last_use[ev.pos_a] = xy_last_use[ev.pos_a].max(level);
-            xy_last_use[ev.pos_b] = xy_last_use[ev.pos_b].max(level);
-        }
-    }
-    let mut xy_active_at_level: Vec<Vec<usize>> = vec![Vec::new(); zw_depth + 1];
-    for d in 0..zw_depth {
-        let mut active: Vec<usize> = if d > 0 {
-            xy_active_at_level[d - 1].iter()
-                .filter(|&&p| xy_last_use[p] >= d)
-                .copied().collect()
-        } else { Vec::new() };
-        active.push(pos_order[d]);
-        active.sort();
-        xy_active_at_level[d] = active;
-    }
-    let xy_active_indices: Vec<Vec<usize>> = xy_active_at_level.iter()
-        .map(|active| {
-            let mut flat = vec![usize::MAX; 2 * k];
-            for (i, &p) in active.iter().enumerate() { flat[p] = i; }
-            flat
-        }).collect();
+    let xy_pairs_for_active: Vec<Vec<(usize, usize)>> = xy_events_at_level.iter()
+        .map(|evs| evs.iter().map(|(_, ev)| (ev.pos_a, ev.pos_b)).collect()).collect();
+    let (xy_active_at_level, xy_active_indices) =
+        compute_active_tracking(zw_depth, 2 * k, &pos_order, &xy_pairs_for_active);
 
     // Precompute delta table
     let mut xy_delta = [0i8; 16];
@@ -1222,47 +1179,10 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
 
     let mut nodes: Vec<[u32; 4]> = Vec::new();
     nodes.push([DEAD; 4]); // sentinel
-
-    fn hash_node4(level: u8, children: &[u32; 4]) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = rustc_hash::FxHasher::default();
-        level.hash(&mut h);
-        for &c in children { c.hash(&mut h); }
-        h.finish()
-    }
     let mut unique: HashMap<u64, u32> = HashMap::default();
-
-    type StateKey = (u128, u64);
     let mut memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
 
-    fn pack_sums(sums: &[i8]) -> u128 {
-        let mut packed = 0u128;
-        for (i, &s) in sums.iter().enumerate() {
-            packed |= ((s as u8 as u128) & 0xFF) << (i * 8);
-        }
-        packed
-    }
-
-    fn pack_active(vals: &[u8]) -> u64 {
-        let mut packed = 0u64;
-        for (i, &v) in vals.iter().enumerate() {
-            packed |= (v as u64) << (i * 2);
-        }
-        packed
-    }
-
-    struct XyCtx {
-        pos_order: Vec<usize>,
-        events: Vec<Vec<(usize, usize, usize, [i8; 16])>>,
-        lag_check: Vec<Vec<usize>>,
-        max_remaining: Vec<Vec<i32>>,
-        active_at_level: Vec<Vec<usize>>,
-        active_indices: Vec<Vec<usize>>,
-        k: usize,
-        zw_depth: usize,
-    }
-
-    let ctx = XyCtx {
+    let ctx = XyBuildCtx {
         pos_order,
         events: resolved_events,
         lag_check: xy_lag_check_at_level,
@@ -1270,112 +1190,14 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
         active_at_level: xy_active_at_level,
         active_indices: xy_active_indices,
         k,
-        zw_depth,
+        depth: zw_depth,
+        symmetry_break: true,
     };
 
-    fn build(
-        level: usize,
-        sums: &mut [i8],
-        active_bits: &[u8],
-        zw_sums: &[i8],
-        ctx: &XyCtx,
-        nodes: &mut Vec<[u32; 4]>,
-        unique: &mut HashMap<u64, u32>,
-        memo: &mut Vec<HashMap<(u128, u64), u32>>,
-    ) -> u32 {
-        if level == ctx.zw_depth {
-            for li in 0..ctx.k {
-                if sums[li] != -zw_sums[li] { return DEAD; }
-            }
-            return LEAF;
-        }
-
-        let active = &ctx.active_at_level[level];
-        let n_active = active.len();
-        let mut current_vals = [0u8; 32];
-        if level > 0 {
-            let prev_indices = &ctx.active_indices[level - 1];
-            for (i, &pos) in active.iter().enumerate() {
-                if pos != ctx.pos_order[level] {
-                    let pi = prev_indices[pos];
-                    if pi != usize::MAX {
-                        current_vals[i] = active_bits[pi];
-                    }
-                }
-            }
-        }
-
-        let new_pos = ctx.pos_order[level];
-        let new_idx = ctx.active_indices[level][new_pos];
-
-        let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
-        if let Some(&cached) = memo[level].get(&state_key) {
-            return cached;
-        }
-
-        let mut children = [DEAD; 4];
-        for branch in 0u32..4 {
-            if new_pos == 0 && branch != 0b11 { continue; }
-            current_vals[new_idx] = branch as u8;
-
-            for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.events[level] {
-                let bits_a = current_vals[idx_a] as usize;
-                let bits_b = current_vals[idx_b] as usize;
-                sums[lag_idx] += delta[bits_a * 4 + bits_b];
-            }
-
-            let mut ok = true;
-            for &li in &ctx.lag_check[level] {
-                if sums[li] != -zw_sums[li] { ok = false; break; }
-            }
-            if ok && level + 1 < ctx.zw_depth {
-                for li in 0..ctx.k {
-                    let gap = (sums[li] as i32) - (-(zw_sums[li] as i32));
-                    let remaining = ctx.max_remaining[level + 1][li];
-                    if gap.abs() > remaining { ok = false; break; }
-                }
-            }
-
-            if ok {
-                children[branch as usize] = build(
-                    level + 1, sums, &current_vals[..n_active], zw_sums,
-                    ctx, nodes, unique, memo,
-                );
-            }
-
-            // Restore sums
-            for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.events[level] {
-                let bits_a = current_vals[idx_a] as usize;
-                let bits_b = current_vals[idx_b] as usize;
-                sums[lag_idx] -= delta[bits_a * 4 + bits_b];
-            }
-        }
-
-        let result = if children.iter().all(|&c| c == DEAD) {
-            DEAD
-        } else {
-            let first = children[0];
-            if children.iter().all(|&c| c == first) {
-                first
-            } else {
-                let key = hash_node4(level as u8, &children);
-                if let Some(&nid) = unique.get(&key) { nid }
-                else {
-                    let nid = nodes.len() as u32;
-                    nodes.push(children);
-                    unique.insert(key, nid);
-                    nid
-                }
-            }
-        };
-
-        memo[level].insert(state_key, result);
-        result
-    }
-
+    let target: Vec<i8> = zw_sums.iter().map(|&s| -s).collect();
     let mut sums = vec![0i8; k];
-    let root = build(
-        0, &mut sums, &[], zw_sums,
+    let root = build_xy_dfs(
+        0, &mut sums, &[], &target,
         &ctx, &mut nodes, &mut unique, &mut memo,
     );
 
@@ -1641,22 +1463,175 @@ pub fn build_extension(
         }
     }
 
-    // TODO: The full DFS builder for extension positions goes here.
-    // For now, this sets up the event structure. The actual DFS is structurally
-    // identical to build_inner but operates on extension positions only,
-    // with 16-way branching (z,w,x,y per position) and initial_sums as starting state.
-    //
-    // Each level assigns (z[pos], w[pos], x[pos], y[pos]) at an extension position.
-    // Events update sums based on both new×new and old×new interactions.
+    // Build XY events separately (for the second half of the extension).
+    // XY pairs: (i, target_k+i+j) for X and Y, using new positions.
+    let mut xy_events_at_level: Vec<Vec<ExtEvent>> = (0..ext_depth).map(|_| Vec::new()).collect();
+    let mut xy_lag_check_at_level: Vec<Vec<usize>> = (0..=ext_depth).map(|_| Vec::new()).collect();
+    let mut xy_max_remaining: Vec<Vec<i32>> = vec![vec![0i32; target_k]; ext_depth + 1];
 
-    // Placeholder: return empty MDD
-    // TODO: implement the actual DFS/BFS builder
-    let nodes = vec![[DEAD; 4]];
-    let root = DEAD;
+    for j in 0..target_k {
+        let mut max_complete_level: Option<usize> = None;
 
-    eprintln!("build_extension: base_k={}, target_k={}, extra={}, {} initial_sums, {} events",
-        base_k, target_k, extra, initial_sums.len(),
-        events_at_level.iter().map(|e| e.len()).sum::<usize>());
+        // X/Y pairs: (i, target_k + i + j)
+        for i in 0..target_k.saturating_sub(j) {
+            let actual_a = i;
+            let actual_b = target_k + i + j;
+            if actual_b >= 2 * target_k { continue; }
+
+            let a_is_new = actual_a >= base_k && actual_a < target_k;
+            let b_is_new = actual_b >= target_k + base_k;
+
+            if !a_is_new && !b_is_new { continue; }
+
+            let ext_a = if a_is_new { Some(actual_a - base_k) } else { None };
+            let ext_b = if b_is_new { Some(extra + (actual_b - target_k - base_k)) } else { None };
+
+            let complete_level = match (ext_a, ext_b) {
+                (Some(ea), Some(eb)) => pos_to_level[ea].max(pos_to_level[eb]),
+                (Some(ea), None) => pos_to_level[ea],
+                (None, Some(eb)) => pos_to_level[eb],
+                (None, None) => unreachable!(),
+            };
+
+            let event = match (ext_a, ext_b) {
+                (Some(ea), Some(eb)) => ExtEvent {
+                    lag: j,
+                    kind: ExtEventKind::NewNew { ext_a: ea, ext_b: eb, is_z: true }, // is_z used as "is_x" here
+                },
+                (Some(en), None) => {
+                    let xb = if (x_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                    let yb = if (y_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                    ExtEvent { lag: j, kind: ExtEventKind::OldNew {
+                        ext_new: en, old_sign_z: xb, old_sign_w: yb, old_sign_x: 0, old_sign_y: 0,
+                    }}
+                },
+                (None, Some(en)) => {
+                    let xa = if (x_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                    let ya = if (y_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                    ExtEvent { lag: j, kind: ExtEventKind::OldNew {
+                        ext_new: en, old_sign_z: xa, old_sign_w: ya, old_sign_x: 0, old_sign_y: 0,
+                    }}
+                },
+                _ => unreachable!(),
+            };
+
+            for lv in 0..=complete_level { xy_max_remaining[lv][j] += 2; }
+            xy_events_at_level[complete_level].push(event);
+            max_complete_level = Some(max_complete_level.map_or(complete_level, |c: usize| c.max(complete_level)));
+        }
+
+        if let Some(cl) = max_complete_level {
+            xy_lag_check_at_level[cl].push(j);
+        }
+    }
+
+    // Compute total XY max achievable for range pruning at ZW boundary
+    let xy_max_abs: Vec<i32> = (0..target_k).map(|j| xy_max_remaining[0][j]).collect();
+
+    // Extract position pairs from events for active tracking
+    fn ext_event_pairs(evs: &[ExtEvent]) -> Vec<(usize, usize)> {
+        evs.iter().map(|ev| match &ev.kind {
+            ExtEventKind::NewNew { ext_a, ext_b, .. } => (*ext_a, *ext_b),
+            ExtEventKind::OldNew { ext_new, .. } => (*ext_new, *ext_new),
+        }).collect()
+    }
+    // Combine ZW and XY event pairs (both use same position space)
+    let combined_pairs: Vec<Vec<(usize, usize)>> = (0..ext_depth).map(|l| {
+        let mut pairs = ext_event_pairs(&events_at_level[l]);
+        pairs.extend(ext_event_pairs(&xy_events_at_level[l]));
+        pairs
+    }).collect();
+    let (active_at_level, active_indices) =
+        compute_active_tracking(ext_depth, ext_depth, &pos_order, &combined_pairs);
+
+    // Resolve ZW events into delta tables
+    let zw_resolved: Vec<Vec<(usize, usize, usize, [i8; 16])>> = events_at_level.iter().enumerate().map(|(level, evs)| {
+        evs.iter().map(|ev| {
+            match &ev.kind {
+                ExtEventKind::NewNew { ext_a, ext_b, is_z } => {
+                    (ev.lag, active_indices[level][*ext_a], active_indices[level][*ext_b], make_zw_delta(*is_z))
+                }
+                ExtEventKind::OldNew { ext_new, old_sign_z, old_sign_w, .. } => {
+                    let idx = active_indices[level][*ext_new];
+                    let mut delta = [0i8; 16];
+                    for a in 0u32..4 { for b in 0u32..4 {
+                        let nz = if a&1==1 {1i32} else {-1};
+                        let nw = if (a>>1)&1==1 {1i32} else {-1};
+                        delta[(a*4+b) as usize] = (2*(*old_sign_z as i32)*nz + 2*(*old_sign_w as i32)*nw) as i8;
+                    }}
+                    (ev.lag, idx, idx, delta)
+                }
+            }
+        }).collect()
+    }).collect();
+
+    let xy_resolved: Vec<Vec<(usize, usize, usize, [i8; 16])>> = xy_events_at_level.iter().enumerate().map(|(level, evs)| {
+        evs.iter().map(|ev| {
+            match &ev.kind {
+                ExtEventKind::NewNew { ext_a, ext_b, .. } => {
+                    (ev.lag, active_indices[level][*ext_a], active_indices[level][*ext_b], make_xy_delta())
+                }
+                ExtEventKind::OldNew { ext_new, old_sign_z: old_x, old_sign_w: old_y, .. } => {
+                    // old_sign_z/w are repurposed as old_x/old_y for XY events
+                    let idx = active_indices[level][*ext_new];
+                    let mut delta = [0i8; 16];
+                    for a in 0u32..4 { for b in 0u32..4 {
+                        let nx = if a&1==1 {1i32} else {-1};
+                        let ny = if (a>>1)&1==1 {1i32} else {-1};
+                        delta[(a*4+b) as usize] = ((*old_x as i32)*nx + (*old_y as i32)*ny) as i8;
+                    }}
+                    (ev.lag, idx, idx, delta)
+                }
+            }
+        }).collect()
+    }).collect();
+
+    // DFS builder: ZW half (levels 0..ext_depth) then XY half (levels ext_depth..2*ext_depth)
+    let mut nodes: Vec<[u32; 4]> = Vec::new();
+    nodes.push([DEAD; 4]);
+    let mut unique: HashMap<u64, u32> = HashMap::default();
+    let mut zw_memo: Vec<HashMap<StateKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
+    let mut xy_memo: Vec<HashMap<StateKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
+
+    // XY half DFS
+    let ext_zw_ctx = ZwBuildCtx {
+        pos_order: pos_order.clone(),
+        events: zw_resolved,
+        lag_check: lag_check_at_level,
+        max_remaining,
+        active_at_level: active_at_level.clone(),
+        active_indices: active_indices.clone(),
+        xy_max_abs,
+        k: target_k,
+        depth: ext_depth,
+        symmetry_break: false,
+        restrict_branches: Vec::new(),
+        zw_only: false,
+    };
+    let ext_xy_ctx = XyBuildCtx {
+        pos_order,
+        events: xy_resolved,
+        lag_check: xy_lag_check_at_level,
+        max_remaining: xy_max_remaining,
+        active_at_level,
+        active_indices,
+        k: target_k,
+        depth: ext_depth,
+        symmetry_break: false,
+    };
+    let mut sums = initial_sums;
+    let mut zw_memo_count = 0usize;
+    let mut xy_cache: HashMap<u128, u32> = HashMap::default();
+    let root = build_zw_dfs(
+        0, &mut sums, &[],
+        &ext_zw_ctx, &ext_xy_ctx,
+        &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo, &mut xy_cache,
+        0, &mut zw_memo_count,
+    );
+
+    eprintln!("build_extension: base_k={}, target_k={}, extra={}, {} nodes, root={}",
+        base_k, target_k, extra, nodes.len(),
+        if root == DEAD { "DEAD".to_string() } else if root == LEAF { "LEAF".to_string() } else { root.to_string() });
 
     (nodes, root)
 }

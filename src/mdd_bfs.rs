@@ -12,31 +12,14 @@
 use rustc_hash::FxHashMap as HashMap;
 use rayon::prelude::*;
 use crate::mdd_reorder::Mdd4;
-
-pub const DEAD: u32 = 0;
-pub const LEAF: u32 = u32::MAX;
-
-/// Packed state key: (u128 sums, u64 active) = 24 bytes.
-type StateKey = (u128, u64);
-
-fn pack_sums(sums: &[i8]) -> u128 {
-    let mut packed = 0u128;
-    for (i, &s) in sums.iter().enumerate() {
-        packed |= ((s as u8 as u128) & 0xFF) << (i * 8);
-    }
-    packed
-}
+use crate::mdd_zw_first::{
+    DEAD, LEAF, StateKey,
+    pack_sums, pack_active, make_zw_delta,
+    compute_active_tracking,
+};
 
 fn unpack_sums(packed: u128, k: usize) -> Vec<i8> {
     (0..k).map(|i| ((packed >> (i * 8)) & 0xFF) as i8).collect()
-}
-
-fn pack_active(vals: &[u8]) -> u64 {
-    let mut packed = 0u64;
-    for (i, &v) in vals.iter().enumerate() {
-        packed |= (v as u64) << (i * 2);
-    }
-    packed
 }
 
 fn unpack_active(packed: u64, n: usize) -> Vec<u8> {
@@ -77,8 +60,8 @@ struct BfsCtx {
     k: usize,
     zw_depth: usize,
     pos_order: Vec<usize>,
-    /// Per-level: Vec of (lag_idx, pos_a, pos_b, is_z)
-    events_at_level: Vec<Vec<(usize, usize, usize, bool)>>,
+    /// Per-level: Vec of (lag_idx, idx_a, idx_b, delta_table)
+    events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>>,
     lag_check_at_level: Vec<Vec<usize>>,
     xy_max_abs: Vec<i32>,
     max_remaining: Vec<Vec<i32>>,
@@ -116,7 +99,8 @@ impl BfsCtx {
             w_pairs_per_lag.push(wp);
         }
 
-        let mut events_at_level: Vec<Vec<(usize, usize, usize, bool)>> =
+        // Raw events (before index resolution)
+        let mut raw_events: Vec<Vec<(usize, usize, usize, bool)>> =
             (0..zw_depth).map(|_| Vec::new()).collect();
         let mut lag_check_at_level: Vec<Vec<usize>> =
             (0..=zw_depth).map(|_| Vec::new()).collect();
@@ -125,12 +109,12 @@ impl BfsCtx {
             let mut complete = 0;
             for &(a, b) in zp {
                 let c = pos_to_level[a].max(pos_to_level[b]);
-                events_at_level[c].push((li, a, b, true));
+                raw_events[c].push((li, a, b, true));
                 complete = complete.max(c);
             }
             for &(a, b) in wp {
                 let c = pos_to_level[a].max(pos_to_level[b]);
-                events_at_level[c].push((li, a, b, false));
+                raw_events[c].push((li, a, b, false));
                 complete = complete.max(c);
             }
             lag_check_at_level[complete].push(li);
@@ -152,38 +136,20 @@ impl BfsCtx {
             }
         }
 
-        let mut last_use: Vec<usize> = vec![0; 2 * k];
-        for (level, events) in events_at_level.iter().enumerate() {
-            for &(_, a, b, _) in events {
-                last_use[a] = last_use[a].max(level);
-                last_use[b] = last_use[b].max(level);
-            }
-        }
-        let mut active_at_level: Vec<Vec<usize>> = vec![Vec::new(); zw_depth + 1];
-        for d in 0..zw_depth {
-            let mut active: Vec<usize> = if d > 0 {
-                active_at_level[d - 1]
-                    .iter()
-                    .filter(|&&p| last_use[p] >= d)
-                    .copied()
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            active.push(pos_order[d]);
-            active.sort();
-            active_at_level[d] = active;
-        }
-        let active_indices: Vec<Vec<usize>> = active_at_level
-            .iter()
-            .map(|active| {
-                let mut flat = vec![usize::MAX; 2 * k];
-                for (i, &p) in active.iter().enumerate() {
-                    flat[p] = i;
-                }
-                flat
-            })
-            .collect();
+        let pairs: Vec<Vec<(usize, usize)>> = raw_events.iter()
+            .map(|evs| evs.iter().map(|&(_, a, b, _)| (a, b)).collect()).collect();
+        let (active_at_level, active_indices) =
+            compute_active_tracking(zw_depth, 2 * k, &pos_order, &pairs);
+
+        // Pre-resolve events with delta tables
+        let events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>> =
+            raw_events.iter().enumerate().map(|(level, evs)| {
+                evs.iter().map(|&(li, pos_a, pos_b, is_z)| {
+                    let idx_a = active_indices[level][pos_a];
+                    let idx_b = active_indices[level][pos_b];
+                    (li, idx_a, idx_b, make_zw_delta(is_z))
+                }).collect()
+            }).collect();
 
         BfsCtx {
             k,
@@ -240,22 +206,12 @@ impl BfsCtx {
             }
             current_vals[new_idx] = branch as u8;
 
-            // Compute new sums from base (avoid re-unpacking per branch)
+            // Compute new sums from base using delta tables
             let mut sums = base_sums;
-            for &(lag_idx, pos_a, pos_b, is_z) in &self.events_at_level[level] {
-                let idx_a = self.active_indices[level][pos_a];
-                let idx_b = self.active_indices[level][pos_b];
-                let bits_a = current_vals[idx_a] as u32;
-                let bits_b = current_vals[idx_b] as u32;
-                if is_z {
-                    let za = if bits_a & 1 == 1 { 1i32 } else { -1 };
-                    let zb = if bits_b & 1 == 1 { 1i32 } else { -1 };
-                    sums[lag_idx] += (2 * za * zb) as i8;
-                } else {
-                    let wa = if (bits_a >> 1) & 1 == 1 { 1i32 } else { -1 };
-                    let wb = if (bits_b >> 1) & 1 == 1 { 1i32 } else { -1 };
-                    sums[lag_idx] += (2 * wa * wb) as i8;
-                }
+            for &(lag_idx, idx_a, idx_b, ref delta) in &self.events_at_level[level] {
+                let bits_a = current_vals[idx_a] as usize;
+                let bits_b = current_vals[idx_b] as usize;
+                sums[lag_idx] += delta[bits_a * 4 + bits_b];
             }
 
             // Pruning checks
@@ -359,25 +315,98 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
     let mut level_key_counts: Vec<usize> = vec![1];
 
     for level in 0..zw_depth {
-        let mut next_key_to_idx: HashMap<StateKey, u32> = HashMap::default();
-        let mut parent_children: Vec<[u32; 4]> = Vec::with_capacity(current_keys.len());
+        let n_parents = current_keys.len();
+        // Estimate if we need memory-efficient mode (sorted Vec vs HashMap)
+        // HashMap: ~80 bytes/entry. Sorted Vec: ~24 bytes/entry.
+        // Use sorted mode when states would exceed ~50M entries
+        let use_sorted = n_parents > 5_000_000;
 
-        for &key in &current_keys {
-            let expanded = ctx.expand_state(key, level);
-            let mut ch = [NO_CHILD; 4];
-            for (branch, child_key) in expanded {
-                let next_len = next_key_to_idx.len() as u32;
-                let idx = *next_key_to_idx.entry(child_key).or_insert(next_len);
-                ch[branch as usize] = idx;
+        let (next_keys, parent_children) = if use_sorted {
+            // Two-pass sorted dedup: lower peak memory for large levels.
+            // Write parent keys to disk so we can free them during child collection.
+            let parent_path = format!("{}/parent_keys_{}.bin", tmp_dir, level);
+            write_keys(&parent_path, &current_keys).expect("write parent keys");
+
+            // Pass 1: Chunked expansion + sort + merge to control peak memory.
+            // Process parents in chunks, sort each chunk's children, then merge.
+            let chunk_size = 2_000_000; // ~2M parents per chunk
+            let n_chunks = (n_parents + chunk_size - 1) / chunk_size;
+            let mut all_child_keys: Vec<StateKey> = Vec::new();
+
+            for chunk_idx in 0..n_chunks {
+                let start_idx = chunk_idx * chunk_size;
+                let end_idx = (start_idx + chunk_size).min(n_parents);
+                let chunk = &current_keys[start_idx..end_idx];
+
+                let mut chunk_children: Vec<StateKey> = Vec::with_capacity(chunk.len() * 3);
+                for &key in chunk {
+                    ctx.expand_state_cb(key, level, |_branch, child_key| {
+                        chunk_children.push(child_key);
+                    });
+                }
+                chunk_children.sort_unstable();
+                chunk_children.dedup();
+
+                // Merge with accumulated results
+                if all_child_keys.is_empty() {
+                    all_child_keys = chunk_children;
+                } else {
+                    // Merge two sorted deduped arrays
+                    let mut merged = Vec::with_capacity(all_child_keys.len() + chunk_children.len());
+                    let mut i = 0;
+                    let mut j = 0;
+                    while i < all_child_keys.len() && j < chunk_children.len() {
+                        match all_child_keys[i].cmp(&chunk_children[j]) {
+                            std::cmp::Ordering::Less => { merged.push(all_child_keys[i]); i += 1; }
+                            std::cmp::Ordering::Greater => { merged.push(chunk_children[j]); j += 1; }
+                            std::cmp::Ordering::Equal => { merged.push(all_child_keys[i]); i += 1; j += 1; }
+                        }
+                    }
+                    merged.extend_from_slice(&all_child_keys[i..]);
+                    merged.extend_from_slice(&chunk_children[j..]);
+                    all_child_keys = merged;
+                }
             }
-            parent_children.push(ch);
-        }
+            drop(current_keys);
+            current_keys = Vec::new();
+            all_child_keys.shrink_to_fit();
+            // Now all_child_keys is sorted+unique, index = position
 
-        // Build next level's key list in index order
-        let mut next_keys = vec![(0u128, 0u64); next_key_to_idx.len()];
-        for (&key, &idx) in &next_key_to_idx {
-            next_keys[idx as usize] = key;
-        }
+            // Pass 2: re-read parents from disk, re-expand to get child indices
+            let parent_keys = read_keys(&parent_path).expect("read parent keys");
+            let _ = std::fs::remove_file(&parent_path);
+            let mut parent_children: Vec<[u32; 4]> = Vec::with_capacity(parent_keys.len());
+            for &key in &parent_keys {
+                let mut ch = [NO_CHILD; 4];
+                ctx.expand_state_cb(key, level, |branch, child_key| {
+                    let idx = all_child_keys.binary_search(&child_key).unwrap() as u32;
+                    ch[branch as usize] = idx;
+                });
+                parent_children.push(ch);
+            }
+            drop(parent_keys);
+            (all_child_keys, parent_children)
+        } else {
+            // HashMap dedup: faster for small levels
+            let mut next_key_to_idx: HashMap<StateKey, u32> = HashMap::default();
+            let mut parent_children: Vec<[u32; 4]> = Vec::with_capacity(n_parents);
+
+            for &key in &current_keys {
+                let mut ch = [NO_CHILD; 4];
+                ctx.expand_state_cb(key, level, |branch, child_key| {
+                    let next_len = next_key_to_idx.len() as u32;
+                    let idx = *next_key_to_idx.entry(child_key).or_insert(next_len);
+                    ch[branch as usize] = idx;
+                });
+                parent_children.push(ch);
+            }
+
+            let mut next_keys = vec![(0u128, 0u64); next_key_to_idx.len()];
+            for (&key, &idx) in &next_key_to_idx {
+                next_keys[idx as usize] = key;
+            }
+            (next_keys, parent_children)
+        };
 
         // Write parent children to disk (for pass 2)
         let path = format!("{}/children_{}.bin", tmp_dir, level);
@@ -385,7 +414,7 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
 
         let count = next_keys.len();
         eprint!("\r  Level {}/{}: {} → {} states ({:.1?})   ",
-            level + 1, zw_depth, current_keys.len(), count, start.elapsed());
+            level + 1, zw_depth, n_parents, count, start.elapsed());
         level_key_counts.push(count);
         current_keys = next_keys;
     }
@@ -396,44 +425,66 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
         start.elapsed(), max_states, total_states);
 
     // ===== Build XY sub-MDDs for distinct boundary zw_sums =====
-    eprintln!("Building XY sub-MDDs for {} boundary states...", current_keys.len());
-    let xy_start = std::time::Instant::now();
+    let zw_only = std::env::var("MDD_ZW_ONLY").is_ok();
 
     let mut nodes: Vec<[u32; 4]> = Vec::new();
     nodes.push([DEAD; 4]); // sentinel node 0
     let mut unique: HashMap<u64, u32> = HashMap::default();
-    let mut xy_cache: HashMap<u128, u32> = HashMap::default();
 
-    let distinct_sums: Vec<u128> = {
-        let mut set: HashMap<u128, ()> = HashMap::default();
+    let boundary_nids: Vec<u32> = if zw_only {
+        // ZW-only: all valid boundary states → LEAF
+        eprintln!("ZW-only mode: {} boundary states → LEAF", current_keys.len());
+        let mut nids = Vec::with_capacity(current_keys.len());
+        for &(sums_packed, _) in &current_keys {
+            let sums = unpack_sums(sums_packed, k);
+            let mut ok = true;
+            for li in 0..k {
+                let zw_val = sums[li] as i32;
+                let max_xy = ctx.xy_max_abs[li];
+                if zw_val.abs() > max_xy { ok = false; break; }
+                if (zw_val + max_xy) % 2 != 0 { ok = false; break; }
+            }
+            nids.push(if ok { LEAF } else { DEAD });
+        }
+        nids
+    } else {
+        eprintln!("Building XY sub-MDDs for {} boundary states...", current_keys.len());
+        let xy_start = std::time::Instant::now();
+
+        let mut xy_cache: HashMap<u128, u32> = HashMap::default();
+
+        let distinct_sums: Vec<u128> = {
+            let mut set: HashMap<u128, ()> = HashMap::default();
+            for &(sums, _) in &current_keys {
+                set.entry(sums).or_insert(());
+            }
+            set.into_keys().collect()
+        };
+        eprintln!("  {} distinct zw_sums from {} boundary states", distinct_sums.len(), current_keys.len());
+
+        for (i, &sums_packed) in distinct_sums.iter().enumerate() {
+            if i % 100000 == 0 && i > 0 {
+                eprint!("\r  XY build {}/{} ({:.1?})   ", i, distinct_sums.len(), xy_start.elapsed());
+            }
+            let zw_sums = unpack_sums(sums_packed, k);
+            let root = build_xy_dfs(
+                &zw_sums, k, zw_depth,
+                &ctx.pos_order, &ctx.active_at_level, &ctx.active_indices,
+                &ctx.xy_max_abs,
+                &mut nodes, &mut unique,
+            );
+            xy_cache.insert(sums_packed, root);
+        }
+        eprintln!("\r  XY builds done: {} sub-MDDs in {:.1?}, {} total nodes",
+            distinct_sums.len(), xy_start.elapsed(), nodes.len());
+
+        // Map boundary states to XY root node IDs
+        let mut nids = Vec::with_capacity(current_keys.len());
         for &(sums, _) in &current_keys {
-            set.entry(sums).or_insert(());
+            nids.push(xy_cache[&sums]);
         }
-        set.into_keys().collect()
+        nids
     };
-    eprintln!("  {} distinct zw_sums from {} boundary states", distinct_sums.len(), current_keys.len());
-
-    for (i, &sums_packed) in distinct_sums.iter().enumerate() {
-        if i % 100000 == 0 && i > 0 {
-            eprint!("\r  XY build {}/{} ({:.1?})   ", i, distinct_sums.len(), xy_start.elapsed());
-        }
-        let zw_sums = unpack_sums(sums_packed, k);
-        let root = build_xy_dfs(
-            &zw_sums, k, zw_depth,
-            &ctx.pos_order, &ctx.active_at_level, &ctx.active_indices,
-            &ctx.xy_max_abs,
-            &mut nodes, &mut unique,
-        );
-        xy_cache.insert(sums_packed, root);
-    }
-    eprintln!("\r  XY builds done: {} sub-MDDs in {:.1?}, {} total nodes",
-        distinct_sums.len(), xy_start.elapsed(), nodes.len());
-
-    // Map boundary states to XY root node IDs (indexed by position in current_keys)
-    let mut boundary_nids: Vec<u32> = Vec::with_capacity(current_keys.len());
-    for &(sums, _) in &current_keys {
-        boundary_nids.push(xy_cache[&sums]);
-    }
 
     // ===== Pass 2: bottom-up, build ZW nodes using stored children =====
     eprintln!("BFS Pass 2: building ZW nodes bottom-up...");
