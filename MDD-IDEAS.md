@@ -118,11 +118,11 @@ range checks after every event: if any lag's partial sum is already
 impossible given remaining budget, prune immediately. May cut 10-30% of
 branches in the XY half where pruning is weakest.
 
-### 20. Inline fixed-size state arrays
-**Status**: Untested.
-Replace Vec<i8> sums and Vec<u8> active_bits with fixed-size arrays
-(e.g., [i8; 32] and [u8; 32]). Eliminates heap allocation on every
-recursive call. Should give 5-15% speedup in hot path.
+### 20. Inline fixed-size state arrays + flat index lookup
+**Status**: Implemented. Flat indices: **-18% to -37% speedup.**
+Stack arrays for current_vals: marginal (~1-5%, in noise).
+Replaced HashMap active_indices with Vec<usize> flat arrays — major win.
+Stack [u8; 32] current_vals replaces Vec<u8> — minor improvement.
 
 ### 21. Better variable ordering for BFS
 **Status**: Untested.
