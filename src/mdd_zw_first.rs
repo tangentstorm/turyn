@@ -65,6 +65,33 @@ pub fn make_zw_delta(is_z: bool) -> [i8; 16] {
     table
 }
 
+/// Reduce a 4-way node: return DEAD if all dead, collapse if all same,
+/// otherwise dedup via hash-based unique table.
+#[inline]
+pub fn reduce_node(
+    level: u8,
+    children: [u32; 4],
+    nodes: &mut Vec<[u32; 4]>,
+    unique: &mut HashMap<u64, u32>,
+) -> u32 {
+    if children.iter().all(|&c| c == DEAD) {
+        return DEAD;
+    }
+    let first = children[0];
+    if children.iter().all(|&c| c == first) {
+        return first;
+    }
+    let key = hash_node4(level, &children);
+    if let Some(&nid) = unique.get(&key) {
+        nid
+    } else {
+        let nid = nodes.len() as u32;
+        nodes.push(children);
+        unique.insert(key, nid);
+        nid
+    }
+}
+
 /// Delta table for XY events: xa*xb + ya*yb.
 pub fn make_xy_delta() -> [i8; 16] {
     let mut table = [0i8; 16];
@@ -758,23 +785,7 @@ impl ZwFirstMdd {
                 }
             }
 
-            let result = if children.iter().all(|&c| c == DEAD) {
-                DEAD
-            } else {
-                let first = children[0];
-                if children.iter().all(|&c| c == first) {
-                    first
-                } else {
-                    let key = hash_node4(unique_level, &children);
-                    if let Some(&nid) = unique.get(&key) { nid }
-                    else {
-                        let nid = nodes.len() as u32;
-                        nodes.push(children);
-                        unique.insert(key, nid);
-                        nid
-                    }
-                }
-            };
+            let result = reduce_node(unique_level, children, nodes, unique);
 
             memo[level].insert(state_key, result);
             result
@@ -932,23 +943,7 @@ impl ZwFirstMdd {
                 }
             }
 
-            let result = if children.iter().all(|&c| c == DEAD) {
-                DEAD
-            } else {
-                let first = children[0];
-                if children.iter().all(|&c| c == first) {
-                    first
-                } else {
-                    let key = hash_node4(level as u8, &children);
-                    if let Some(&nid) = unique.get(&key) { nid }
-                    else {
-                        let nid = nodes.len() as u32;
-                        nodes.push(children);
-                        unique.insert(key, nid);
-                        nid
-                    }
-                }
-            };
+            let result = reduce_node(level as u8, children, nodes, unique);
 
             // Cap total memo entries to prevent OOM at large k.
             // When over budget, evict the level with the most entries (typically deepest).
@@ -1353,23 +1348,7 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
             }
         }
 
-        let result = if children.iter().all(|&c| c == DEAD) {
-            DEAD
-        } else {
-            let first = children[0];
-            if children.iter().all(|&c| c == first) {
-                first
-            } else {
-                let key = hash_node4(level as u8, &children);
-                if let Some(&nid) = unique.get(&key) { nid }
-                else {
-                    let nid = nodes.len() as u32;
-                    nodes.push(children);
-                    unique.insert(key, nid);
-                    nid
-                }
-            }
-        };
+        let result = reduce_node(level as u8, children, nodes, unique);
 
         memo[level].insert(state_key, result);
         result
@@ -1841,16 +1820,7 @@ pub fn build_extension(
                 sums[li] -= d[cv[ia] as usize * 4 + cv[ib] as usize];
             }
         }
-        let result = if children.iter().all(|&c| c == DEAD) { DEAD }
-        else {
-            let first = children[0];
-            if children.iter().all(|&c| c == first) { first }
-            else {
-                let key = hash_node4((ext_depth + level) as u8, &children);
-                if let Some(&nid) = unique.get(&key) { nid }
-                else { let nid = nodes.len() as u32; nodes.push(children); unique.insert(key, nid); nid }
-            }
-        };
+        let result = reduce_node((ext_depth + level) as u8, children, nodes, unique);
         memo[level].insert(sk, result);
         result
     }
@@ -1927,16 +1897,7 @@ pub fn build_extension(
                 sums[li] -= d[cv[ia] as usize * 4 + cv[ib] as usize];
             }
         }
-        let result = if children.iter().all(|&c| c == DEAD) { DEAD }
-        else {
-            let first = children[0];
-            if children.iter().all(|&c| c == first) { first }
-            else {
-                let key = hash_node4(level as u8, &children);
-                if let Some(&nid) = unique.get(&key) { nid }
-                else { let nid = nodes.len() as u32; nodes.push(children); unique.insert(key, nid); nid }
-            }
-        };
+        let result = reduce_node(level as u8, children, nodes, unique);
         zw_memo[level].insert(sk, result);
         result
     }
