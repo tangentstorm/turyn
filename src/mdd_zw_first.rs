@@ -1672,22 +1672,355 @@ pub fn build_extension(
         }
     }
 
-    // TODO: The full DFS builder for extension positions goes here.
-    // For now, this sets up the event structure. The actual DFS is structurally
-    // identical to build_inner but operates on extension positions only,
-    // with 16-way branching (z,w,x,y per position) and initial_sums as starting state.
-    //
-    // Each level assigns (z[pos], w[pos], x[pos], y[pos]) at an extension position.
-    // Events update sums based on both new×new and old×new interactions.
+    // Build XY events separately (for the second half of the extension).
+    // XY pairs: (i, target_k+i+j) for X and Y, using new positions.
+    let mut xy_events_at_level: Vec<Vec<ExtEvent>> = (0..ext_depth).map(|_| Vec::new()).collect();
+    let mut xy_lag_check_at_level: Vec<Vec<usize>> = (0..=ext_depth).map(|_| Vec::new()).collect();
+    let mut xy_max_remaining: Vec<Vec<i32>> = vec![vec![0i32; target_k]; ext_depth + 1];
 
-    // Placeholder: return empty MDD
-    // TODO: implement the actual DFS/BFS builder
-    let nodes = vec![[DEAD; 4]];
-    let root = DEAD;
+    for j in 0..target_k {
+        let mut max_complete_level: Option<usize> = None;
 
-    eprintln!("build_extension: base_k={}, target_k={}, extra={}, {} initial_sums, {} events",
-        base_k, target_k, extra, initial_sums.len(),
-        events_at_level.iter().map(|e| e.len()).sum::<usize>());
+        // X/Y pairs: (i, target_k + i + j)
+        for i in 0..target_k.saturating_sub(j) {
+            let actual_a = i;
+            let actual_b = target_k + i + j;
+            if actual_b >= 2 * target_k { continue; }
+
+            let a_is_new = actual_a >= base_k && actual_a < target_k;
+            let b_is_new = actual_b >= target_k + base_k;
+
+            if !a_is_new && !b_is_new { continue; }
+
+            let ext_a = if a_is_new { Some(actual_a - base_k) } else { None };
+            let ext_b = if b_is_new { Some(extra + (actual_b - target_k - base_k)) } else { None };
+
+            let complete_level = match (ext_a, ext_b) {
+                (Some(ea), Some(eb)) => pos_to_level[ea].max(pos_to_level[eb]),
+                (Some(ea), None) => pos_to_level[ea],
+                (None, Some(eb)) => pos_to_level[eb],
+                (None, None) => unreachable!(),
+            };
+
+            let event = match (ext_a, ext_b) {
+                (Some(ea), Some(eb)) => ExtEvent {
+                    lag: j,
+                    kind: ExtEventKind::NewNew { ext_a: ea, ext_b: eb, is_z: true }, // is_z used as "is_x" here
+                },
+                (Some(en), None) => {
+                    let xb = if (x_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                    let yb = if (y_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                    ExtEvent { lag: j, kind: ExtEventKind::OldNew {
+                        ext_new: en, old_sign_z: xb, old_sign_w: yb, old_sign_x: 0, old_sign_y: 0,
+                    }}
+                },
+                (None, Some(en)) => {
+                    let xa = if (x_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                    let ya = if (y_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                    ExtEvent { lag: j, kind: ExtEventKind::OldNew {
+                        ext_new: en, old_sign_z: xa, old_sign_w: ya, old_sign_x: 0, old_sign_y: 0,
+                    }}
+                },
+                _ => unreachable!(),
+            };
+
+            for lv in 0..=complete_level { xy_max_remaining[lv][j] += 2; }
+            xy_events_at_level[complete_level].push(event);
+            max_complete_level = Some(max_complete_level.map_or(complete_level, |c: usize| c.max(complete_level)));
+        }
+
+        if let Some(cl) = max_complete_level {
+            xy_lag_check_at_level[cl].push(j);
+        }
+    }
+
+    // Compute total XY max achievable for range pruning at ZW boundary
+    let xy_max_abs: Vec<i32> = (0..target_k).map(|j| xy_max_remaining[0][j]).collect();
+
+    // Active position tracking (same for both ZW and XY halves — same positions)
+    let mut last_use: Vec<usize> = vec![0; ext_depth];
+    for (level, evs) in events_at_level.iter().chain(xy_events_at_level.iter()).enumerate() {
+        let l = level % ext_depth; // events_at_level and xy_events_at_level use same position indices
+        for ev in evs {
+            match &ev.kind {
+                ExtEventKind::NewNew { ext_a, ext_b, .. } => {
+                    last_use[*ext_a] = last_use[*ext_a].max(l);
+                    last_use[*ext_b] = last_use[*ext_b].max(l);
+                }
+                ExtEventKind::OldNew { ext_new, .. } => {
+                    last_use[*ext_new] = last_use[*ext_new].max(l);
+                }
+            }
+        }
+    }
+    let mut active_at_level: Vec<Vec<usize>> = vec![Vec::new(); ext_depth + 1];
+    for d in 0..ext_depth {
+        let mut active: Vec<usize> = if d > 0 {
+            active_at_level[d - 1].iter().filter(|&&p| last_use[p] >= d).copied().collect()
+        } else { Vec::new() };
+        active.push(pos_order[d]);
+        active.sort();
+        active_at_level[d] = active;
+    }
+    let active_indices: Vec<Vec<usize>> = active_at_level.iter()
+        .map(|active| {
+            let mut flat = vec![usize::MAX; ext_depth];
+            for (i, &p) in active.iter().enumerate() { flat[p] = i; }
+            flat
+        }).collect();
+
+    // Resolve ZW events into delta tables
+    fn make_zw_delta(is_z: bool) -> [i8; 16] {
+        let mut t = [0i8; 16];
+        for a in 0u32..4 { for b in 0u32..4 {
+            t[(a*4+b) as usize] = if is_z {
+                let za = if a&1==1 {1i32} else {-1}; let zb = if b&1==1 {1} else {-1}; (2*za*zb) as i8
+            } else {
+                let wa = if (a>>1)&1==1 {1i32} else {-1}; let wb = if (b>>1)&1==1 {1} else {-1}; (2*wa*wb) as i8
+            };
+        }} t
+    }
+    fn make_xy_delta() -> [i8; 16] {
+        let mut t = [0i8; 16];
+        for a in 0u32..4 { for b in 0u32..4 {
+            let xa = if a&1==1 {1i32} else {-1}; let xb = if b&1==1 {1} else {-1};
+            let ya = if (a>>1)&1==1 {1i32} else {-1}; let yb = if (b>>1)&1==1 {1} else {-1};
+            t[(a*4+b) as usize] = (xa*xb + ya*yb) as i8;
+        }} t
+    }
+
+    let zw_resolved: Vec<Vec<(usize, usize, usize, [i8; 16])>> = events_at_level.iter().enumerate().map(|(level, evs)| {
+        evs.iter().map(|ev| {
+            match &ev.kind {
+                ExtEventKind::NewNew { ext_a, ext_b, is_z } => {
+                    (ev.lag, active_indices[level][*ext_a], active_indices[level][*ext_b], make_zw_delta(*is_z))
+                }
+                ExtEventKind::OldNew { ext_new, old_sign_z, old_sign_w, .. } => {
+                    let idx = active_indices[level][*ext_new];
+                    let mut delta = [0i8; 16];
+                    for a in 0u32..4 { for b in 0u32..4 {
+                        let nz = if a&1==1 {1i32} else {-1};
+                        let nw = if (a>>1)&1==1 {1i32} else {-1};
+                        delta[(a*4+b) as usize] = (2*(*old_sign_z as i32)*nz + 2*(*old_sign_w as i32)*nw) as i8;
+                    }}
+                    (ev.lag, idx, idx, delta)
+                }
+            }
+        }).collect()
+    }).collect();
+
+    let xy_resolved: Vec<Vec<(usize, usize, usize, [i8; 16])>> = xy_events_at_level.iter().enumerate().map(|(level, evs)| {
+        evs.iter().map(|ev| {
+            match &ev.kind {
+                ExtEventKind::NewNew { ext_a, ext_b, .. } => {
+                    (ev.lag, active_indices[level][*ext_a], active_indices[level][*ext_b], make_xy_delta())
+                }
+                ExtEventKind::OldNew { ext_new, old_sign_z: old_x, old_sign_w: old_y, .. } => {
+                    // old_sign_z/w are repurposed as old_x/old_y for XY events
+                    let idx = active_indices[level][*ext_new];
+                    let mut delta = [0i8; 16];
+                    for a in 0u32..4 { for b in 0u32..4 {
+                        let nx = if a&1==1 {1i32} else {-1};
+                        let ny = if (a>>1)&1==1 {1i32} else {-1};
+                        delta[(a*4+b) as usize] = ((*old_x as i32)*nx + (*old_y as i32)*ny) as i8;
+                    }}
+                    (ev.lag, idx, idx, delta)
+                }
+            }
+        }).collect()
+    }).collect();
+
+    // DFS builder: ZW half (levels 0..ext_depth) then XY half (levels ext_depth..2*ext_depth)
+    let mut nodes: Vec<[u32; 4]> = Vec::new();
+    nodes.push([DEAD; 4]);
+
+    fn hash_node4(level: u8, children: &[u32; 4]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        level.hash(&mut h);
+        for &c in children { c.hash(&mut h); }
+        h.finish()
+    }
+    let mut unique: HashMap<u64, u32> = HashMap::default();
+    type EStateKey = (u128, u64);
+    let mut zw_memo: Vec<HashMap<EStateKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
+    let mut xy_memo: Vec<HashMap<EStateKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
+
+    fn pack_s(sums: &[i8]) -> u128 {
+        let mut p = 0u128;
+        for (i, &s) in sums.iter().enumerate() { p |= ((s as u8 as u128) & 0xFF) << (i * 8); }
+        p
+    }
+    fn pack_a(vals: &[u8]) -> u64 {
+        let mut p = 0u64;
+        for (i, &v) in vals.iter().enumerate() { p |= (v as u64) << (i * 2); }
+        p
+    }
+
+    // XY half DFS
+    fn build_xy_ext(
+        level: usize, sums: &mut [i8], active_bits: &[u8], target_k: usize,
+        ext_depth: usize, pos_order: &[usize],
+        active_at_level: &[Vec<usize>], active_indices: &[Vec<usize>],
+        events: &[Vec<(usize, usize, usize, [i8; 16])>],
+        lag_check: &[Vec<usize>], max_remaining: &[Vec<i32>],
+        nodes: &mut Vec<[u32; 4]>, unique: &mut HashMap<u64, u32>,
+        memo: &mut Vec<HashMap<EStateKey, u32>>,
+    ) -> u32 {
+        if level == ext_depth {
+            for li in 0..target_k { if sums[li] != 0 { return DEAD; } }
+            return LEAF;
+        }
+        let active = &active_at_level[level];
+        let n_active = active.len();
+        let mut cv = [0u8; 32];
+        if level > 0 {
+            let pi = &active_indices[level - 1];
+            for (i, &pos) in active.iter().enumerate() {
+                if pos != pos_order[level] { let p = pi[pos]; if p != usize::MAX { cv[i] = active_bits[p]; } }
+            }
+        }
+        let new_idx = active_indices[level][pos_order[level]];
+        let sk = (pack_s(sums), pack_a(&cv[..n_active]));
+        if let Some(&c) = memo[level].get(&sk) { return c; }
+
+        let mut children = [DEAD; 4];
+        for branch in 0u32..4 {
+            // No symmetry breaking in extension — base already handles it
+            cv[new_idx] = branch as u8;
+            for &(li, ia, ib, ref d) in &events[level] {
+                sums[li] += d[cv[ia] as usize * 4 + cv[ib] as usize];
+            }
+            let mut ok = true;
+            for &li in &lag_check[level] { if sums[li] != 0 { ok = false; break; } }
+            if ok && level + 1 < ext_depth {
+                for li in 0..target_k {
+                    if (sums[li] as i32).abs() > max_remaining[level+1][li] { ok = false; break; }
+                }
+            }
+            if ok {
+                children[branch as usize] = build_xy_ext(
+                    level+1, sums, &cv[..n_active], target_k, ext_depth, pos_order,
+                    active_at_level, active_indices, events, lag_check, max_remaining,
+                    nodes, unique, memo,
+                );
+            }
+            for &(li, ia, ib, ref d) in &events[level] {
+                sums[li] -= d[cv[ia] as usize * 4 + cv[ib] as usize];
+            }
+        }
+        let result = if children.iter().all(|&c| c == DEAD) { DEAD }
+        else {
+            let first = children[0];
+            if children.iter().all(|&c| c == first) { first }
+            else {
+                let key = hash_node4((ext_depth + level) as u8, &children);
+                if let Some(&nid) = unique.get(&key) { nid }
+                else { let nid = nodes.len() as u32; nodes.push(children); unique.insert(key, nid); nid }
+            }
+        };
+        memo[level].insert(sk, result);
+        result
+    }
+
+    // ZW half DFS
+    fn build_zw_ext(
+        level: usize, sums: &mut [i8], active_bits: &[u8], target_k: usize,
+        ext_depth: usize, pos_order: &[usize], xy_max_abs: &[i32],
+        active_at_level: &[Vec<usize>], active_indices: &[Vec<usize>],
+        zw_events: &[Vec<(usize, usize, usize, [i8; 16])>],
+        zw_lag_check: &[Vec<usize>], zw_max_remaining: &[Vec<i32>],
+        xy_events: &[Vec<(usize, usize, usize, [i8; 16])>],
+        xy_lag_check: &[Vec<usize>], xy_max_remaining_arr: &[Vec<i32>],
+        nodes: &mut Vec<[u32; 4]>, unique: &mut HashMap<u64, u32>,
+        zw_memo: &mut Vec<HashMap<EStateKey, u32>>,
+        xy_memo: &mut Vec<HashMap<EStateKey, u32>>,
+    ) -> u32 {
+        if level == ext_depth {
+            // ZW done. Check XY feasibility, then build XY half.
+            for li in 0..target_k {
+                let zw_val = sums[li] as i32;
+                if zw_val.abs() > xy_max_abs[li] { return DEAD; }
+                if (zw_val + xy_max_abs[li]) % 2 != 0 { return DEAD; }
+            }
+            // Build XY sub-MDD. Target: sums[li] must reach 0 after XY events.
+            for m in xy_memo.iter_mut() { m.clear(); }
+            return build_xy_ext(
+                0, sums, &[], target_k, ext_depth, pos_order,
+                active_at_level, active_indices, xy_events, xy_lag_check, xy_max_remaining_arr,
+                nodes, unique, xy_memo,
+            );
+        }
+        let active = &active_at_level[level];
+        let n_active = active.len();
+        let mut cv = [0u8; 32];
+        if level > 0 {
+            let pi = &active_indices[level - 1];
+            for (i, &pos) in active.iter().enumerate() {
+                if pos != pos_order[level] { let p = pi[pos]; if p != usize::MAX { cv[i] = active_bits[p]; } }
+            }
+        }
+        let new_idx = active_indices[level][pos_order[level]];
+        let sk = (pack_s(sums), pack_a(&cv[..n_active]));
+        if let Some(&c) = zw_memo[level].get(&sk) { return c; }
+
+        let mut children = [DEAD; 4];
+        for branch in 0u32..4 {
+            // No symmetry breaking in extension — base already handles it
+            cv[new_idx] = branch as u8;
+            for &(li, ia, ib, ref d) in &zw_events[level] {
+                sums[li] += d[cv[ia] as usize * 4 + cv[ib] as usize];
+            }
+            let mut ok = true;
+            for &li in &zw_lag_check[level] {
+                let v = sums[li] as i32;
+                if v.abs() > xy_max_abs[li] { ok = false; break; }
+            }
+            if ok && level + 1 < ext_depth {
+                for li in 0..target_k {
+                    let v = sums[li] as i32;
+                    let rem = zw_max_remaining[level+1][li];
+                    if (v.abs() - rem) > xy_max_abs[li] { ok = false; break; }
+                }
+            }
+            if ok {
+                children[branch as usize] = build_zw_ext(
+                    level+1, sums, &cv[..n_active], target_k, ext_depth, pos_order, xy_max_abs,
+                    active_at_level, active_indices, zw_events, zw_lag_check, zw_max_remaining,
+                    xy_events, xy_lag_check, xy_max_remaining_arr,
+                    nodes, unique, zw_memo, xy_memo,
+                );
+            }
+            for &(li, ia, ib, ref d) in &zw_events[level] {
+                sums[li] -= d[cv[ia] as usize * 4 + cv[ib] as usize];
+            }
+        }
+        let result = if children.iter().all(|&c| c == DEAD) { DEAD }
+        else {
+            let first = children[0];
+            if children.iter().all(|&c| c == first) { first }
+            else {
+                let key = hash_node4(level as u8, &children);
+                if let Some(&nid) = unique.get(&key) { nid }
+                else { let nid = nodes.len() as u32; nodes.push(children); unique.insert(key, nid); nid }
+            }
+        };
+        zw_memo[level].insert(sk, result);
+        result
+    }
+
+    let mut sums = initial_sums;
+    let root = build_zw_ext(
+        0, &mut sums, &[], target_k, ext_depth, &pos_order, &xy_max_abs,
+        &active_at_level, &active_indices,
+        &zw_resolved, &lag_check_at_level, &max_remaining,
+        &xy_resolved, &xy_lag_check_at_level, &xy_max_remaining,
+        &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo,
+    );
+
+    eprintln!("build_extension: base_k={}, target_k={}, extra={}, {} nodes, root={}",
+        base_k, target_k, extra, nodes.len(),
+        if root == DEAD { "DEAD".to_string() } else if root == LEAF { "LEAF".to_string() } else { root.to_string() });
 
     (nodes, root)
 }
