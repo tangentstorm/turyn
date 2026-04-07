@@ -91,13 +91,13 @@ theorem kh05_hadamard_order : hadamardOrder 36 = 428 := by native_decide
 
 /-- **Existence of Hadamard matrix of order 428.**
 
-    By the base-sequence → T-sequence → Goethals-Seidel pipeline,
+    By the base-sequence → T-sequence → Goethals-Seidel pipeline (KTR2005),
     the verified TT(36) above implies the existence of a Hadamard matrix
     of order 4(3·36 − 1) = 428.
 
     The TT(36) verification itself is fully machine-checked.
-    The pipeline from TT to Hadamard (which is a standard result in
-    combinatorial design theory) is stated as axioms in Hadamard.lean. -/
+    The pipeline from TT to Hadamard uses the KTR2005 construction
+    defined in Hadamard.lean (with sorry placeholders for general proofs). -/
 theorem hadamard_428_exists :
     ∃ (x y z w : PmSeq),
       IsTurynType 36 x y z w ∧ hadamardOrder 36 = 428 := by
