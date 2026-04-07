@@ -55,19 +55,39 @@ fn main() {
         if i >= sample_size { break; }
         tested += 1;
 
-        // Count target configs that have this base prefix
-        // A target config (tz, tw, tx, ty) matches if bits 0..2*base_k match (z,w,x,y)
-        let base_mask = (1u32 << (2 * base_k)) - 1;
+        // Count target configs that match the base boundary.
+        // Old prefix positions 0..base_k-1 stay the same in both layouts.
+        // Old suffix positions base_k..2*base_k-1 (in base layout) map to
+        // target_k..target_k+base_k-1 (in target layout).
+        // So we need to check: target prefix bits 0..base_k-1 match base prefix,
+        // AND target suffix bits target_k..target_k+base_k-1 match base suffix.
+        let extra = target_k - base_k;
         let expected_count = target_configs.iter().filter(|&&(tz, tw, tx, ty)| {
-            (tz & base_mask) == z && (tw & base_mask) == w &&
-            (tx & base_mask) == x && (ty & base_mask) == y
+            // Check prefix: positions 0..base_k-1
+            for p in 0..base_k {
+                if ((tz >> p) & 1) != ((z >> p) & 1) { return false; }
+                if ((tw >> p) & 1) != ((w >> p) & 1) { return false; }
+                if ((tx >> p) & 1) != ((x >> p) & 1) { return false; }
+                if ((ty >> p) & 1) != ((y >> p) & 1) { return false; }
+            }
+            // Check suffix: base pos base_k+m → target pos target_k+m
+            for m in 0..base_k {
+                let base_pos = base_k + m;
+                let target_pos = target_k + m;
+                if ((tz >> target_pos) & 1) != ((z >> base_pos) & 1) { return false; }
+                if ((tw >> target_pos) & 1) != ((w >> base_pos) & 1) { return false; }
+                if ((tx >> target_pos) & 1) != ((x >> base_pos) & 1) { return false; }
+                if ((ty >> target_pos) & 1) != ((y >> base_pos) & 1) { return false; }
+            }
+            true
         }).count();
 
         // Build extension MDD
         let (ext_nodes, ext_root) = mdd_zw_first::build_extension(base_k, target_k, z, w, x, y);
 
         // Count paths in extension MDD
-        let ext_count = count_paths(ext_root, 0, 2 * (target_k - base_k), &ext_nodes);
+        // Extension MDD has 4*extra total levels (2*extra ZW + 2*extra XY)
+        let ext_count = count_paths(ext_root, 0, 4 * (target_k - base_k), &ext_nodes);
 
         if ext_count as usize == expected_count {
             passed += 1;
