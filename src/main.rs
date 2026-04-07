@@ -2975,6 +2975,21 @@ fn sat_search(problem: Problem, tuple: SumTuple, boundary: Option<&BoundaryConfi
     }
 }
 
+/// Try to load the best available MDD file, scanning from max_k down to 1.
+fn load_best_mdd(max_k: usize, verbose: bool) -> Option<mdd_reorder::Mdd4> {
+    for try_k in (1..=max_k).rev() {
+        let path = format!("mdd-{}.bin", try_k);
+        if let Some(m) = mdd_reorder::Mdd4::load(&path) {
+            if verbose {
+                eprintln!("Loaded MDD from {} (k={}, {} nodes, {:.1} MB)",
+                    path, m.k, m.nodes.len(), m.nodes.len() as f64 * 16.0 / 1_048_576.0);
+            }
+            return Some(m);
+        }
+    }
+    None
+}
+
 /// MDD-based hybrid search: walk reordered MDD for boundary 4-tuples,
 /// Phase B generates Z,W middles with spectral filtering, Phase C SAT-solves X,Y.
 fn run_mdd_sat_search(
@@ -2988,22 +3003,8 @@ fn run_mdd_sat_search(
     let m = problem.m();
 
     // Load MDD from file, or find the best available one.
-    let max_k = (n - 1) / 2;
-    let try_k = k.min(max_k);
-
-    let mut loaded_mdd: Option<mdd_reorder::Mdd4> = None;
-    // Try requested k first, then scan downward for any available MDD
-    for try_k in (1..=try_k).rev() {
-        let path = format!("mdd-{}.bin", try_k);
-        if let Some(m) = mdd_reorder::Mdd4::load(&path) {
-            if verbose { eprintln!("Loaded MDD from {} (k={}, {} nodes, {:.1} MB)",
-                path, m.k, m.nodes.len(), m.nodes.len() as f64 * 16.0 / 1_048_576.0); }
-            loaded_mdd = Some(m);
-            break;
-        }
-    }
-
-    let reordered = match loaded_mdd {
+    let try_k = k.min((n - 1) / 2);
+    let reordered = match load_best_mdd(try_k, verbose) {
         Some(m) => Arc::new(m),
         None => {
             eprintln!("No MDD file found (tried mdd-1.bin through mdd-{}.bin)", try_k);
@@ -4366,16 +4367,7 @@ fn main() {
             // 3. Post-filter (Z,W) with spectral pair check
             // 4. Each valid pair → report (and later, send to Phase C with XY from MDD)
             let mdd_k = cfg.mdd_k.min((problem.n - 1) / 2);
-            let mut loaded_mdd: Option<mdd_reorder::Mdd4> = None;
-            for try_k in (1..=mdd_k).rev() {
-                let path = format!("mdd-{}.bin", try_k);
-                if let Some(m) = mdd_reorder::Mdd4::load(&path) {
-                    eprintln!("Loaded MDD from {} (k={}, {} nodes)", path, m.k, m.nodes.len());
-                    loaded_mdd = Some(m);
-                    break;
-                }
-            }
-            let reordered = match loaded_mdd {
+            let reordered = match load_best_mdd(mdd_k, true) {
                 Some(m) => m,
                 None => { eprintln!("No MDD file found. Run: target/release/gen_mdd {}", mdd_k); return; }
             };
