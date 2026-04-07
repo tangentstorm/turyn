@@ -2044,29 +2044,9 @@ fn sat_solve_xyw(
             w_agree_lits.push(enc.encode_xnor(&mut solver, w_var(i), w_var(i + k)));
         }
 
-        let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
-        let w_ctr = enc.build_counter(&mut solver, &w_agree_lits);
-
-        let mut selectors = Vec::new();
-        for c_w in 0..=w_agree_lits.len() {
-            let rem = target as isize - 2 * c_w as isize;
-            if rem < 0 || rem as usize > xy_lits.len() { continue; }
-            let c_xy = rem as usize;
-            let sel = enc.fresh();
-            if c_xy > 0 {
-                if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 { solver.add_clause([-sel, xy_ctr[c_xy]]); }
-                else { solver.add_clause([-sel]); continue; }
-            }
-            if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 { solver.add_clause([-sel, -xy_ctr[c_xy + 1]]); }
-            if c_w > 0 {
-                if c_w < w_ctr.len() && w_ctr[c_w] != 0 { solver.add_clause([-sel, w_ctr[c_w]]); }
-                else { solver.add_clause([-sel]); continue; }
-            }
-            if c_w + 1 < w_ctr.len() && w_ctr[c_w + 1] != 0 { solver.add_clause([-sel, -w_ctr[c_w + 1]]); }
-            selectors.push(sel);
+        if !enc.encode_weighted_agree_eq(&mut solver, &xy_lits, &w_agree_lits, target) {
+            return None;
         }
-        if selectors.is_empty() { return None; }
-        solver.add_clause(selectors.iter().copied());
     }
 
     if verbose {
@@ -2699,6 +2679,62 @@ impl SatEncoder {
             solver.add_clause([-ctr[target + 1]]);
         }
     }
+
+    /// Encode `xy_count + 2 * zw_count = target` using selectors over two
+    /// totalizer counters. Returns false if no valid split exists (infeasible).
+    fn encode_weighted_agree_eq(
+        &mut self,
+        solver: &mut impl SatSolver,
+        xy_lits: &[i32],
+        zw_lits: &[i32],
+        target: usize,
+    ) -> bool {
+        let xy_ctr = self.build_counter(solver, xy_lits);
+        let zw_ctr = self.build_counter(solver, zw_lits);
+
+        let mut selectors = Vec::new();
+        for c_zw in 0..=zw_lits.len() {
+            let rem = target as isize - 2 * c_zw as isize;
+            if rem < 0 || rem as usize > xy_lits.len() { continue; }
+            let c_xy = rem as usize;
+
+            let sel = self.fresh();
+
+            if c_xy > 0 {
+                if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
+                    solver.add_clause([-sel, xy_ctr[c_xy]]);
+                } else {
+                    solver.add_clause([-sel]);
+                    continue;
+                }
+            }
+            if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
+                solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
+            }
+
+            if c_zw > 0 {
+                if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
+                    solver.add_clause([-sel, zw_ctr[c_zw]]);
+                } else {
+                    solver.add_clause([-sel]);
+                    continue;
+                }
+            }
+            if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
+                solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
+            }
+
+            selectors.push(sel);
+        }
+
+        if selectors.is_empty() {
+            solver.add_clause([]);
+            false
+        } else {
+            solver.add_clause(selectors.iter().copied());
+            true
+        }
+    }
 }
 
 /// Build the full SAT encoding for a given problem and sum-tuple.
@@ -2753,49 +2789,7 @@ fn sat_encode(problem: Problem, tuple: SumTuple) -> (SatEncoder, radical::Solver
             zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
         }
 
-        let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
-        let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
-
-        let mut selectors = Vec::new();
-        for c_zw in 0..=zw_lits.len() {
-            let rem = target as isize - 2 * c_zw as isize;
-            if rem < 0 || rem as usize > xy_lits.len() { continue; }
-            let c_xy = rem as usize;
-
-            let sel = enc.fresh();
-
-            if c_xy > 0 {
-                if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
-                    solver.add_clause([-sel, xy_ctr[c_xy]]);
-                } else {
-                    solver.add_clause([-sel]);
-                    continue;
-                }
-            }
-            if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
-                solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
-            }
-
-            if c_zw > 0 {
-                if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
-                    solver.add_clause([-sel, zw_ctr[c_zw]]);
-                } else {
-                    solver.add_clause([-sel]);
-                    continue;
-                }
-            }
-            if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
-                solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
-            }
-
-            selectors.push(sel);
-        }
-
-        if selectors.is_empty() {
-            solver.add_clause([]);
-        } else {
-            solver.add_clause(selectors.iter().copied());
-        }
+        enc.encode_weighted_agree_eq(&mut solver, &xy_lits, &zw_lits, target);
     }
 
     (enc, solver)
@@ -4835,6 +4829,33 @@ mod tests {
         // Free SAT search for n=36 XY (~7K vars) needs radical optimizations.
     }
 
+    /// Encode autocorrelation constraints for all four sequences using
+    /// XNOR + weighted agree selectors. Shared by sat_encode and tests.
+    fn encode_autocorr_xnor(n: usize, m: usize, enc: &mut SatEncoder, solver: &mut radical::Solver) {
+        for k in 1..n {
+            let w_overlap = if k < m { m - k } else { 0 };
+            let target = 2 * (n - k) + w_overlap;
+
+            let mut xy_lits = Vec::new();
+            for i in 0..(n - k) {
+                xy_lits.push(enc.encode_xnor(solver, enc.x_var(i), enc.x_var(i + k)));
+            }
+            for i in 0..(n - k) {
+                xy_lits.push(enc.encode_xnor(solver, enc.y_var(i), enc.y_var(i + k)));
+            }
+
+            let mut zw_lits = Vec::new();
+            for i in 0..(n - k) {
+                zw_lits.push(enc.encode_xnor(solver, enc.z_var(i), enc.z_var(i + k)));
+            }
+            for i in 0..w_overlap {
+                zw_lits.push(enc.encode_xnor(solver, enc.w_var(i), enc.w_var(i + k)));
+            }
+
+            enc.encode_weighted_agree_eq(solver, &xy_lits, &zw_lits, target);
+        }
+    }
+
     #[test]
     fn sat_autocorr_only_n4() {
         // Test: just autocorrelation constraints (no sums, no symmetry breaking)
@@ -4843,55 +4864,7 @@ mod tests {
         let mut enc = SatEncoder::new(n);
         let mut solver: radical::Solver = Default::default();
 
-        for k in 1..n {
-            let w_overlap = if k < m { m - k } else { 0 };
-            let target = 2 * (n - k) + w_overlap;
-
-            let mut xy_lits = Vec::new();
-            for i in 0..(n - k) {
-                xy_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
-            }
-            for i in 0..(n - k) {
-                xy_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
-            }
-            let mut zw_lits = Vec::new();
-            for i in 0..(n - k) {
-                zw_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
-            }
-            for i in 0..w_overlap {
-                zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
-            }
-
-            let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
-            let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
-
-            let mut selectors = Vec::new();
-            for c_zw in 0..=zw_lits.len() {
-                let rem = target as isize - 2 * c_zw as isize;
-                if rem < 0 || rem as usize > xy_lits.len() { continue; }
-                let c_xy = rem as usize;
-                let sel = enc.fresh();
-                if c_xy > 0 {
-                    if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
-                        solver.add_clause([-sel, xy_ctr[c_xy]]);
-                    } else { solver.add_clause([-sel]); continue; }
-                }
-                if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
-                    solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
-                }
-                if c_zw > 0 {
-                    if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
-                        solver.add_clause([-sel, zw_ctr[c_zw]]);
-                    } else { solver.add_clause([-sel]); continue; }
-                }
-                if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
-                    solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
-                }
-                selectors.push(sel);
-            }
-            assert!(!selectors.is_empty(), "lag {} has no valid splits", k);
-            solver.add_clause(selectors.iter().copied());
-        }
+        encode_autocorr_xnor(n, m, &mut enc, &mut solver);
 
         let result = solver.solve();
         assert_eq!(result, Some(true), "autocorr-only n=4 should be SAT");
@@ -4942,53 +4915,8 @@ mod tests {
         for i in 0..n { solver.add_clause([if z[i] == 1 { enc.z_var(i) } else { -enc.z_var(i) }]); }
         for i in 0..m { solver.add_clause([if w[i] == 1 { enc.w_var(i) } else { -enc.w_var(i) }]); }
 
-        // Add autocorrelation constraints (same as sat_autocorr_only_n4)
-        for k in 1..n {
-            let w_overlap = if k < m { m - k } else { 0 };
-            let target = 2 * (n - k) + w_overlap;
-            let mut xy_lits = Vec::new();
-            for i in 0..(n - k) {
-                xy_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
-            }
-            for i in 0..(n - k) {
-                xy_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
-            }
-            let mut zw_lits = Vec::new();
-            for i in 0..(n - k) {
-                zw_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
-            }
-            for i in 0..w_overlap {
-                zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
-            }
-            let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
-            let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
-            let mut selectors = Vec::new();
-            for c_zw in 0..=zw_lits.len() {
-                let rem = target as isize - 2 * c_zw as isize;
-                if rem < 0 || rem as usize > xy_lits.len() { continue; }
-                let c_xy = rem as usize;
-                let sel = enc.fresh();
-                if c_xy > 0 {
-                    if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
-                        solver.add_clause([-sel, xy_ctr[c_xy]]);
-                    } else { solver.add_clause([-sel]); continue; }
-                }
-                if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
-                    solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
-                }
-                if c_zw > 0 {
-                    if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
-                        solver.add_clause([-sel, zw_ctr[c_zw]]);
-                    } else { solver.add_clause([-sel]); continue; }
-                }
-                if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
-                    solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
-                }
-                selectors.push(sel);
-            }
-            assert!(!selectors.is_empty(), "lag {} no valid splits (target={})", k, target);
-            solver.add_clause(selectors.iter().copied());
-        }
+        // Add autocorrelation constraints
+        encode_autocorr_xnor(n, m, &mut enc, &mut solver);
 
         let result = solver.solve();
         assert_eq!(result, Some(true), "hardcoded TT(4) solution should be consistent with encoding");
@@ -5033,93 +4961,7 @@ mod tests {
         // Step 1: Build the FULL encoding (matching sat_search exactly) plus
         // hardcode the known solution. Check if SAT.
         {
-            let mut enc = SatEncoder::new(n);
-            let mut solver: radical::Solver = Default::default();
-
-            // Symmetry breaking: x[0]=+1
-            solver.add_clause([enc.x_var(0)]);
-
-            // Sum constraints
-            let x_pos = ((tuple.x + n as i32) / 2) as usize;
-            let y_pos = ((tuple.y + n as i32) / 2) as usize;
-            let z_pos = ((tuple.z + n as i32) / 2) as usize;
-            let w_pos = ((tuple.w + m as i32) / 2) as usize;
-
-            let x_lits: Vec<i32> = (0..n).map(|i| enc.x_var(i)).collect();
-            let y_lits: Vec<i32> = (0..n).map(|i| enc.y_var(i)).collect();
-            let z_lits: Vec<i32> = (0..n).map(|i| enc.z_var(i)).collect();
-            let w_lits: Vec<i32> = (0..m).map(|i| enc.w_var(i)).collect();
-
-            enc.encode_cardinality_eq(&mut solver, &x_lits, x_pos);
-            enc.encode_cardinality_eq(&mut solver, &y_lits, y_pos);
-            enc.encode_cardinality_eq(&mut solver, &z_lits, z_pos);
-            enc.encode_cardinality_eq(&mut solver, &w_lits, w_pos);
-
-            // Autocorrelation constraints (same as sat_search)
-            for k in 1..n {
-                let w_overlap = if k < m { m - k } else { 0 };
-                let target = 2 * (n - k) + w_overlap;
-
-                let mut xy_lits = Vec::new();
-                for i in 0..(n - k) {
-                    xy_lits.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
-                }
-                for i in 0..(n - k) {
-                    xy_lits.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
-                }
-
-                let mut zw_lits = Vec::new();
-                for i in 0..(n - k) {
-                    zw_lits.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
-                }
-                for i in 0..w_overlap {
-                    zw_lits.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
-                }
-
-                let xy_ctr = enc.build_counter(&mut solver, &xy_lits);
-                let zw_ctr = enc.build_counter(&mut solver, &zw_lits);
-
-                let mut selectors = Vec::new();
-                for c_zw in 0..=zw_lits.len() {
-                    let rem = target as isize - 2 * c_zw as isize;
-                    if rem < 0 || rem as usize > xy_lits.len() { continue; }
-                    let c_xy = rem as usize;
-
-                    let sel = enc.fresh();
-
-                    if c_xy > 0 {
-                        if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
-                            solver.add_clause([-sel, xy_ctr[c_xy]]);
-                        } else {
-                            solver.add_clause([-sel]);
-                            continue;
-                        }
-                    }
-                    if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
-                        solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
-                    }
-
-                    if c_zw > 0 {
-                        if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
-                            solver.add_clause([-sel, zw_ctr[c_zw]]);
-                        } else {
-                            solver.add_clause([-sel]);
-                            continue;
-                        }
-                    }
-                    if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
-                        solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
-                    }
-
-                    selectors.push(sel);
-                }
-
-                if selectors.is_empty() {
-                    solver.add_clause([]);
-                } else {
-                    solver.add_clause(selectors.iter().copied());
-                }
-            }
+            let (enc, mut solver) = sat_encode(Problem::new(n), tuple);
 
             // Hardcode the known solution as unit clauses
             for i in 0..n {
@@ -5187,49 +5029,7 @@ mod tests {
                     zw_lits_k.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
                 }
 
-                let xy_ctr = enc.build_counter(&mut solver, &xy_lits_k);
-                let zw_ctr = enc.build_counter(&mut solver, &zw_lits_k);
-
-                let mut selectors = Vec::new();
-                for c_zw in 0..=zw_lits_k.len() {
-                    let rem = target as isize - 2 * c_zw as isize;
-                    if rem < 0 || rem as usize > xy_lits_k.len() { continue; }
-                    let c_xy = rem as usize;
-
-                    let sel = enc.fresh();
-
-                    if c_xy > 0 {
-                        if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
-                            solver.add_clause([-sel, xy_ctr[c_xy]]);
-                        } else {
-                            solver.add_clause([-sel]);
-                            continue;
-                        }
-                    }
-                    if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
-                        solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
-                    }
-
-                    if c_zw > 0 {
-                        if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
-                            solver.add_clause([-sel, zw_ctr[c_zw]]);
-                        } else {
-                            solver.add_clause([-sel]);
-                            continue;
-                        }
-                    }
-                    if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
-                        solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
-                    }
-
-                    selectors.push(sel);
-                }
-
-                if selectors.is_empty() {
-                    solver.add_clause([]);
-                } else {
-                    solver.add_clause(selectors.iter().copied());
-                }
+                enc.encode_weighted_agree_eq(&mut solver, &xy_lits_k, &zw_lits_k, target);
             }
 
             // Hardcode the known solution
