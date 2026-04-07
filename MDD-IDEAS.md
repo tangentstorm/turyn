@@ -92,6 +92,105 @@ Precompute per-position domain restrictions before DFS/BFS.
 Complex to implement correctly and may not add much beyond range pruning.
 Forward checking during DFS would help but is hard to combine with memoization.
 
+## New Ideas (2026-04-07 profiling round)
+
+Profiling k=9 sequential (with xy_cache): 27.5s total, 10.8s (39%) in XY builds.
+61M ZW calls (64.8% memo hit), 62M XY calls (8% memo hit, 163M pruned).
+1.37M distinct XY builds out of 5.3M ZW boundaries (74.3% xy_cache hit).
+ZW levels 14-17 dominate (48.7M/61M calls).
+Baselines: k=8: 0.8s, k=9: 9.6s, k=10: 144s. Goal: make k=15 feasible.
+
+### 17. Full BFS-by-level construction (replace DFS)
+**Status**: Untested.
+Process one level at a time: expand all states at level L to get level L+1.
+Natural dedup via HashMap key. Peak memory = max(states per level).
+Two passes: enumerate states top-down, build nodes bottom-up.
+Enables disk spill for huge levels. This is the path to k=15.
+
+### 18. ZW-only BFS + batch XY builds
+**Status**: Untested.
+BFS the ZW half only (2k levels). Collect all distinct zw_sums at the
+boundary. Then batch-build XY sub-MDDs, sharing node storage. Avoids
+5.3M separate XY rebuilds — many zw_sums may share XY sub-MDD structure.
+
+### 19. Tighter per-event pruning
+**Status**: Untested.
+Currently range pruning only fires at lag checkpoints. Add lightweight
+range checks after every event: if any lag's partial sum is already
+impossible given remaining budget, prune immediately. May cut 10-30% of
+branches in the XY half where pruning is weakest.
+
+### 20. Inline fixed-size state arrays + flat index lookup
+**Status**: Implemented. Flat indices: **-18% to -37% speedup.**
+Stack arrays for current_vals: marginal (~1-5%, in noise).
+Replaced HashMap active_indices with Vec<usize> flat arrays — major win.
+Stack [u8; 32] current_vals replaces Vec<u8> — minor improvement.
+
+### 21. Better variable ordering for BFS
+**Status**: Untested.
+Try orderings that minimize peak states per level in BFS. Candidates:
+constraint-density ordering (most-constrained-first), or reverse bounce.
+Can dramatically reduce peak memory and total states enumerated.
+
+### 22. Compressed node storage (file size)
+**Status**: Untested.
+Delta-encode or LZ4-compress the node array before writing. The 4-way
+children arrays have lots of DEAD entries and sequential IDs. Could cut
+file size 50-80% for easier transfer between machines.
+
+### 23. Parallel BFS level expansion
+**Status**: Untested.
+Parallelize state expansion within each BFS level using rayon.
+Each state's 4 children are independent. Shard the HashMap by key prefix.
+Expected 3-4x speedup on 4 cores.
+
+### 24. Streaming two-level BFS with disk spill
+**Status**: Untested.
+In BFS, only keep the current and next level in RAM. Write completed
+levels to disk (redb or raw file). Read back during bottom-up node build.
+Reduces peak memory from O(total_states) to O(max_states_per_level).
+
+### 25. XY sub-MDD caching by zw_sums signature
+**Status**: Implemented. **-60% build time.**
+74% of ZW boundary visits have duplicate sums. Cache XY sub-MDD roots
+keyed by packed zw_sums (u128). k=9 seq: 93.8→37.8s; k=9 par: 40→28.1s.
+
+### 26. Batch XY builds with shared memo
+**Status**: Untested.
+Group ZW boundaries by compatible zw_sums patterns. Build XY sub-MDDs
+in batches, keeping the XY memo warm across the batch. Increases XY memo
+hit rate from 8% to potentially 50%+.
+
+### 27. Incremental MDD extension (compositional build)
+**Status**: Untested.
+Build a small k MDD (e.g. k=7, 0.3s), then for each surviving ZW boundary,
+extend it by N more positions. The boundary zw_sums become initial conditions
+for a deeper search. Only explores reachable state space — avoids building
+the full k=15 monolith. Compose: k=7+3+3+2 = k=15.
+
+### 28. Precomputed event delta tables
+**Status**: Untested.
+The inner loop computes `za*zb` and `wa*wb` products using bit extraction
+and conditionals. Replace with a precomputed `delta[bits_a][bits_b]` lookup
+table per event. Eliminates branches from the hottest loop.
+
+### 29. Stack-based DFS (eliminate recursion overhead)
+**Status**: Untested.
+Replace recursive build_zw/build_xy with an explicit stack. Reduces function
+call overhead, enables better memory layout, and allows mid-traversal
+checkpointing for pause/resume on long builds.
+
+### 30. Parallel dedup during merge
+**Status**: Untested.
+The post-parallel-merge dedup pass is single-threaded. Use rayon to parallelize
+the canonicalization pass, or use DashMap for the canon table.
+
+### 31. Better ZW memo eviction (hit-rate-aware)
+**Status**: Untested.
+Current eviction clears the largest level. Instead, track hit rates per level
+and evict the level with the lowest hit rate. Keeps high-value cache entries
+warm. Expected to help at k>=11 where evictions are frequent.
+
 ## Rejected Ideas
 
 ### 7 (old). Clear completed level memos during DFS

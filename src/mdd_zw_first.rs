@@ -17,6 +17,105 @@ use rustc_hash::FxHashMap as HashMap;
 pub const DEAD: u32 = 0;
 pub const LEAF: u32 = u32::MAX;
 
+/// Per-level profiling counters for MDD build.
+pub struct BuildStats {
+    /// Per ZW level: (calls, memo_hits, pruned, xy_builds)
+    pub zw_level_stats: Vec<(u64, u64, u64, u64)>,
+    /// Per XY level: (calls, memo_hits, pruned)
+    pub xy_level_stats: Vec<(u64, u64, u64)>,
+    /// Total time in XY sub-MDD builds (nanoseconds)
+    pub xy_build_ns: u64,
+    /// Number of distinct zw_sums that triggered XY builds
+    pub xy_build_count: u64,
+    /// Number of ZW memo evictions
+    pub zw_memo_evictions: u64,
+}
+
+impl BuildStats {
+    fn new(k: usize) -> Self {
+        let zw_depth = 2 * k;
+        BuildStats {
+            zw_level_stats: vec![(0, 0, 0, 0); zw_depth + 1],
+            xy_level_stats: vec![(0, 0, 0); zw_depth + 1],
+            xy_build_ns: 0,
+            xy_build_count: 0,
+            zw_memo_evictions: 0,
+        }
+    }
+
+    pub fn report(&self, k: usize) {
+        let zw_depth = 2 * k;
+        eprintln!("\n=== MDD Build Profile (k={}) ===", k);
+        eprintln!("ZW levels (depth={}):", zw_depth);
+        eprintln!("  {:>5} {:>12} {:>12} {:>12} {:>10}", "Level", "Calls", "MemoHits", "Pruned", "XYBuilds");
+        for (i, &(calls, hits, pruned, xy)) in self.zw_level_stats.iter().enumerate() {
+            if calls > 0 {
+                let hit_pct = if calls > 0 { 100.0 * hits as f64 / calls as f64 } else { 0.0 };
+                eprintln!("  {:>5} {:>12} {:>12} ({:>5.1}%) {:>12} {:>10}",
+                    i, calls, hits, hit_pct, pruned, xy);
+            }
+        }
+        let total_zw_calls: u64 = self.zw_level_stats.iter().map(|s| s.0).sum();
+        let total_zw_hits: u64 = self.zw_level_stats.iter().map(|s| s.1).sum();
+        let total_zw_pruned: u64 = self.zw_level_stats.iter().map(|s| s.2).sum();
+        eprintln!("  Total: {} calls, {} hits ({:.1}%), {} pruned",
+            total_zw_calls, total_zw_hits,
+            if total_zw_calls > 0 { 100.0 * total_zw_hits as f64 / total_zw_calls as f64 } else { 0.0 },
+            total_zw_pruned);
+
+        eprintln!("\nXY levels:");
+        eprintln!("  {:>5} {:>12} {:>12} {:>12}", "Level", "Calls", "MemoHits", "Pruned");
+        for (i, &(calls, hits, pruned)) in self.xy_level_stats.iter().enumerate() {
+            if calls > 0 {
+                let hit_pct = if calls > 0 { 100.0 * hits as f64 / calls as f64 } else { 0.0 };
+                eprintln!("  {:>5} {:>12} {:>12} ({:>5.1}%) {:>12}",
+                    i, calls, hits, hit_pct, pruned);
+            }
+        }
+        let total_xy_calls: u64 = self.xy_level_stats.iter().map(|s| s.0).sum();
+        let total_xy_hits: u64 = self.xy_level_stats.iter().map(|s| s.1).sum();
+        let total_xy_pruned: u64 = self.xy_level_stats.iter().map(|s| s.2).sum();
+        eprintln!("  Total: {} calls, {} hits ({:.1}%), {} pruned",
+            total_xy_calls, total_xy_hits,
+            if total_xy_calls > 0 { 100.0 * total_xy_hits as f64 / total_xy_calls as f64 } else { 0.0 },
+            total_xy_pruned);
+
+        eprintln!("\nXY sub-MDD builds: {} (total {:.3}s)",
+            self.xy_build_count, self.xy_build_ns as f64 / 1e9);
+        eprintln!("ZW memo evictions: {}", self.zw_memo_evictions);
+    }
+}
+
+/// Lightweight status reporter. Checks wall time every N calls
+/// and prints a one-line update every ~10 seconds.
+struct StatusLine {
+    call_count: u64,
+    start: std::time::Instant,
+    last_print: std::time::Instant,
+    k: usize,
+}
+
+impl StatusLine {
+    fn new(k: usize) -> Self {
+        let now = std::time::Instant::now();
+        StatusLine { call_count: 0, start: now, last_print: now, k }
+    }
+
+    #[inline]
+    fn tick(&mut self, nodes: usize, zw_memo_count: usize, xy_cache_len: usize) {
+        self.call_count += 1;
+        // Check time every 500K calls (~1ns amortized cost of the branch)
+        if self.call_count & 0x7_FFFF == 0 {
+            let now = std::time::Instant::now();
+            if now.duration_since(self.last_print).as_secs() >= 10 {
+                self.last_print = now;
+                eprint!("\r  [k={} {:.0?}] {} nodes, zw_memo={}, xy_cache={}   ",
+                    self.k, now.duration_since(self.start), nodes, zw_memo_count, xy_cache_len);
+            }
+        }
+    }
+}
+
 pub struct ZwFirstMdd {
     pub nodes: Vec<[u32; 4]>,
     pub root: u32,
@@ -33,6 +132,15 @@ pub struct ZwFirstMdd {
 
 impl ZwFirstMdd {
     pub fn build(k: usize) -> Self {
+        let (mdd, stats) = Self::build_inner(k, None, None);
+        if std::env::var("MDD_PROFILE").is_ok() {
+            stats.report(k);
+        }
+        mdd
+    }
+
+    /// Build with profiling, returning stats.
+    pub fn build_with_stats(k: usize) -> (Self, BuildStats) {
         Self::build_inner(k, None, None)
     }
 
@@ -64,7 +172,7 @@ impl ZwFirstMdd {
 
         // Build each subtree independently in parallel
         let branch_results: Vec<(Self, Vec<u32>)> = subtree_branches.into_par_iter().map(|branches| {
-            let mdd = Self::build_inner(k, None, Some(&branches));
+            let (mdd, _stats) = Self::build_inner(k, None, Some(&branches));
             (mdd, branches)
         }).collect();
 
@@ -219,7 +327,8 @@ impl ZwFirstMdd {
         }
     }
 
-    fn build_inner(k: usize, restrict_level1: Option<u32>, restrict_branches: Option<&[u32]>) -> Self {
+    fn build_inner(k: usize, restrict_level1: Option<u32>, restrict_branches: Option<&[u32]>) -> (Self, BuildStats) {
+        let mut stats = BuildStats::new(k);
         let zw_depth = 2 * k;
         let total_depth = 4 * k;
 
@@ -368,9 +477,13 @@ impl ZwFirstMdd {
             active.sort();
             zw_active_at_level[d] = active;
         }
-        let zw_active_indices: Vec<HashMap<usize, usize>> = zw_active_at_level.iter()
-            .map(|active| active.iter().enumerate().map(|(i, &p)| (p, i)).collect())
-            .collect();
+        // Flat array for position→index lookup (avoids HashMap in hot path)
+        let zw_active_indices: Vec<Vec<usize>> = zw_active_at_level.iter()
+            .map(|active| {
+                let mut flat = vec![usize::MAX; 2 * k];
+                for (i, &p) in active.iter().enumerate() { flat[p] = i; }
+                flat
+            }).collect();
 
         // Active position tracking for x,y half
         let mut xy_last_use: Vec<usize> = vec![0; 2 * k];
@@ -391,24 +504,81 @@ impl ZwFirstMdd {
             active.sort();
             xy_active_at_level[d] = active;
         }
-        let xy_active_indices: Vec<HashMap<usize, usize>> = xy_active_at_level.iter()
-            .map(|active| active.iter().enumerate().map(|(i, &p)| (p, i)).collect())
-            .collect();
+        let xy_active_indices: Vec<Vec<usize>> = xy_active_at_level.iter()
+            .map(|active| {
+                let mut flat = vec![usize::MAX; 2 * k];
+                for (i, &p) in active.iter().enumerate() { flat[p] = i; }
+                flat
+            }).collect();
 
         // Build context
+        // Precomputed delta tables: delta[bits_a * 4 + bits_b] for each event
+        // Z event: 2 * sign(bits_a & 1) * sign(bits_b & 1)
+        // W event: 2 * sign((bits_a>>1) & 1) * sign((bits_b>>1) & 1)
+        // XY event: sign(xa) * sign(xb) + sign(ya) * sign(yb)
+        fn make_zw_delta(is_z: bool) -> [i8; 16] {
+            let mut table = [0i8; 16];
+            for a in 0u32..4 {
+                for b in 0u32..4 {
+                    let val = if is_z {
+                        let za = if a & 1 == 1 { 1i32 } else { -1 };
+                        let zb = if b & 1 == 1 { 1i32 } else { -1 };
+                        2 * za * zb
+                    } else {
+                        let wa = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
+                        let wb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
+                        2 * wa * wb
+                    };
+                    table[(a * 4 + b) as usize] = val as i8;
+                }
+            }
+            table
+        }
+        fn make_xy_delta() -> [i8; 16] {
+            let mut table = [0i8; 16];
+            for a in 0u32..4 {
+                for b in 0u32..4 {
+                    let xa = if a & 1 == 1 { 1i32 } else { -1 };
+                    let xb = if b & 1 == 1 { 1i32 } else { -1 };
+                    let ya = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
+                    let yb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
+                    table[(a * 4 + b) as usize] = (xa * xb + ya * yb) as i8;
+                }
+            }
+            table
+        }
+
+        // Pre-resolve active indices into events: (lag_idx, idx_a, idx_b, delta_table)
+        let zw_resolved_events: Vec<Vec<(usize, usize, usize, [i8; 16])>> =
+            zw_events_at_level.iter().enumerate().map(|(level, evs)| {
+                evs.iter().map(|(li, ev)| {
+                    let idx_a = zw_active_indices[level][ev.pos_a];
+                    let idx_b = zw_active_indices[level][ev.pos_b];
+                    (*li, idx_a, idx_b, make_zw_delta(ev.is_z))
+                }).collect()
+            }).collect();
+        let xy_resolved_events: Vec<Vec<(usize, usize, usize, [i8; 16])>> =
+            xy_events_at_level.iter().enumerate().map(|(level, evs)| {
+                evs.iter().map(|(li, ev)| {
+                    let idx_a = xy_active_indices[level][ev.pos_a];
+                    let idx_b = xy_active_indices[level][ev.pos_b];
+                    (*li, idx_a, idx_b, make_xy_delta())
+                }).collect()
+            }).collect();
+
         struct Ctx {
             pos_order: Vec<usize>,
-            zw_events_at_level: Vec<Vec<(usize, usize, usize, bool)>>, // (lag_idx, pos_a, pos_b, is_z)
-            xy_events_at_level: Vec<Vec<(usize, usize, usize)>>,
+            zw_events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>>, // (lag_idx, idx_a, idx_b, delta_table)
+            xy_events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>>,
             zw_lag_check_at_level: Vec<Vec<usize>>,
             xy_lag_check_at_level: Vec<Vec<usize>>,
             xy_max_abs: Vec<i32>,
             zw_max_remaining: Vec<Vec<i32>>,
             xy_max_remaining: Vec<Vec<i32>>,
             zw_active_at_level: Vec<Vec<usize>>,
-            zw_active_indices: Vec<HashMap<usize, usize>>,
+            zw_active_indices: Vec<Vec<usize>>,  // flat array: pos → index
             xy_active_at_level: Vec<Vec<usize>>,
-            xy_active_indices: Vec<HashMap<usize, usize>>,
+            xy_active_indices: Vec<Vec<usize>>,  // flat array: pos → index
             k: usize,
             zw_depth: usize,
             restrict_level1: Option<u32>,
@@ -417,12 +587,8 @@ impl ZwFirstMdd {
 
         let ctx = Ctx {
             pos_order: pos_order.clone(),
-            zw_events_at_level: zw_events_at_level.iter().map(|evs|
-                evs.iter().map(|(li, ev)| (*li, ev.pos_a, ev.pos_b, ev.is_z)).collect()
-            ).collect(),
-            xy_events_at_level: xy_events_at_level.iter().map(|evs|
-                evs.iter().map(|(li, ev)| (*li, ev.pos_a, ev.pos_b)).collect()
-            ).collect(),
+            zw_events_at_level: zw_resolved_events,
+            xy_events_at_level: xy_resolved_events,
             zw_lag_check_at_level,
             xy_lag_check_at_level,
             xy_max_abs,
@@ -485,13 +651,15 @@ impl ZwFirstMdd {
         fn build_xy(
             level: usize,  // 0..2k within xy half
             sums: &mut Vec<i8>,  // partial N_X + N_Y at each lag
-            active_bits: &mut Vec<u8>,
+            active_bits: &[u8],
             zw_sums: &[i8],  // target: sums[li] must equal -zw_sums[li] at end
             ctx: &Ctx,
             nodes: &mut Vec<[u32; 4]>,
             unique: &mut HashMap<u64, u32>,
             memo: &mut Vec<HashMap<XyStateKey, u32>>,
+            stats: &mut BuildStats,
         ) -> u32 {
+            stats.xy_level_stats[level].0 += 1;
             if level == ctx.zw_depth {
                 // Check all lags: N_X + N_Y = -zw_sums
                 for li in 0..ctx.k {
@@ -501,27 +669,26 @@ impl ZwFirstMdd {
             }
 
             let active = &ctx.xy_active_at_level[level];
-            let mut current_vals: Vec<u8> = Vec::with_capacity(active.len());
+            let n_active = active.len();
+            let mut current_vals = [0u8; 32];
             if level > 0 {
                 let prev_indices = &ctx.xy_active_indices[level - 1];
-                for &pos in active {
-                    if pos == ctx.pos_order[level] {
-                        current_vals.push(0);
-                    } else if let Some(&pi) = prev_indices.get(&pos) {
-                        current_vals.push(active_bits[pi]);
-                    } else {
-                        current_vals.push(0);
+                for (i, &pos) in active.iter().enumerate() {
+                    if pos != ctx.pos_order[level] {
+                        let pi = prev_indices[pos];
+                        if pi != usize::MAX {
+                            current_vals[i] = active_bits[pi];
+                        }
                     }
                 }
-            } else {
-                current_vals.resize(active.len(), 0);
             }
 
             let new_pos = ctx.pos_order[level];
-            let new_idx = ctx.xy_active_indices[level][&new_pos];
+            let new_idx = ctx.xy_active_indices[level][new_pos];
 
-            let state_key = (pack_sums(sums), pack_active(&current_vals));
+            let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
             if let Some(&cached) = memo[level].get(&state_key) {
+                stats.xy_level_stats[level].1 += 1;
                 return cached;
             }
 
@@ -538,19 +705,11 @@ impl ZwFirstMdd {
 
                 current_vals[new_idx] = branch as u8;
 
-                let sums_backup = pack_sums(sums);
-
-                // Process XY pair events at this level
-                for &(lag_idx, pos_a, pos_b) in &ctx.xy_events_at_level[level] {
-                    let idx_a = ctx.xy_active_indices[level][&pos_a];
-                    let idx_b = ctx.xy_active_indices[level][&pos_b];
-                    let bits_a = current_vals[idx_a] as u32;
-                    let bits_b = current_vals[idx_b] as u32;
-                    let xa = if (bits_a >> 0) & 1 == 1 { 1i32 } else { -1 };
-                    let xb = if (bits_b >> 0) & 1 == 1 { 1i32 } else { -1 };
-                    let ya = if (bits_a >> 1) & 1 == 1 { 1i32 } else { -1 };
-                    let yb = if (bits_b >> 1) & 1 == 1 { 1i32 } else { -1 };
-                    sums[lag_idx] += (xa * xb + ya * yb) as i8;
+                // Process XY pair events at this level (pre-resolved indices + delta table)
+                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.xy_events_at_level[level] {
+                    let bits_a = current_vals[idx_a] as usize;
+                    let bits_b = current_vals[idx_b] as usize;
+                    sums[lag_idx] += delta[bits_a * 4 + bits_b];
                 }
 
                 // Check completed lags
@@ -569,14 +728,18 @@ impl ZwFirstMdd {
 
                 if ok {
                     children[branch as usize] = build_xy(
-                        level + 1, sums, &mut current_vals, zw_sums,
-                        ctx, nodes, unique, memo,
+                        level + 1, sums, &current_vals[..n_active], zw_sums,
+                        ctx, nodes, unique, memo, stats,
                     );
+                } else {
+                    stats.xy_level_stats[level].2 += 1;
                 }
 
-                // Restore sums from packed backup
-                for i in 0..sums.len() {
-                    sums[i] = ((sums_backup >> (i * 8)) & 0xFF) as i8;
+                // Restore sums by subtracting deltas
+                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.xy_events_at_level[level] {
+                    let bits_a = current_vals[idx_a] as usize;
+                    let bits_b = current_vals[idx_b] as usize;
+                    sums[lag_idx] -= delta[bits_a * 4 + bits_b];
                 }
             }
 
@@ -606,52 +769,69 @@ impl ZwFirstMdd {
         fn build_zw(
             level: usize,  // 0..2k within zw half
             sums: &mut Vec<i8>,  // partial 2*N_Z + 2*N_W at each lag
-            active_bits: &mut Vec<u8>,
+            active_bits: &[u8],
             ctx: &Ctx,
             nodes: &mut Vec<[u32; 4]>,
             unique: &mut HashMap<u64, u32>,
             zw_memo: &mut Vec<HashMap<StateKey, u32>>,
             xy_memo: &mut Vec<HashMap<XyStateKey, u32>>,
+            xy_cache: &mut HashMap<u128, u32>,
             zw_memo_count: &mut usize,
             max_memo_entries: usize,
             per_level_cap: usize,
+            stats: &mut BuildStats,
+            status: &mut StatusLine,
         ) -> u32 {
+            stats.zw_level_stats[level].0 += 1;
+            status.tick(nodes.len(), *zw_memo_count, xy_cache.len());
+
             if level == ctx.zw_depth {
                 // ZW half done. Build XY sub-MDD for these zw_sums.
+                stats.zw_level_stats[level].3 += 1;
+
+                // Check XY cache: same zw_sums → same XY sub-MDD root
+                let sums_key = pack_sums(sums);
+                if let Some(&cached_root) = xy_cache.get(&sums_key) {
+                    return cached_root;
+                }
+
+                stats.xy_build_count += 1;
+                let xy_start = std::time::Instant::now();
                 // Clear xy_memo for each distinct zw_sums to prevent memory explosion.
                 // Nodes are still shared via the `unique` table.
                 for m in xy_memo.iter_mut() { m.clear(); }
                 let zw_sums: Vec<i8> = sums.to_vec();
                 let mut xy_sums = vec![0i8; ctx.k];
-                let mut xy_active: Vec<u8> = Vec::new();
-                return build_xy(
-                    0, &mut xy_sums, &mut xy_active, &zw_sums,
-                    ctx, nodes, unique, xy_memo,
+                let result = build_xy(
+                    0, &mut xy_sums, &[], &zw_sums,
+                    ctx, nodes, unique, xy_memo, stats,
                 );
+                stats.xy_build_ns += xy_start.elapsed().as_nanos() as u64;
+                xy_cache.insert(sums_key, result);
+                return result;
             }
 
             let active = &ctx.zw_active_at_level[level];
-            let mut current_vals: Vec<u8> = Vec::with_capacity(active.len());
+            let n_active = active.len();
+            let mut current_vals = [0u8; 32];
             if level > 0 {
                 let prev_indices = &ctx.zw_active_indices[level - 1];
-                for &pos in active {
-                    if pos == ctx.pos_order[level] {
-                        current_vals.push(0);
-                    } else if let Some(&pi) = prev_indices.get(&pos) {
-                        current_vals.push(active_bits[pi]);
-                    } else {
-                        current_vals.push(0);
+                for (i, &pos) in active.iter().enumerate() {
+                    if pos != ctx.pos_order[level] {
+                        let pi = prev_indices[pos];
+                        if pi != usize::MAX {
+                            current_vals[i] = active_bits[pi];
+                        }
                     }
                 }
-            } else {
-                current_vals.resize(active.len(), 0);
             }
 
             let new_pos = ctx.pos_order[level];
-            let new_idx = ctx.zw_active_indices[level][&new_pos];
+            let new_idx = ctx.zw_active_indices[level][new_pos];
 
-            let state_key = (pack_sums(sums), pack_active(&current_vals));
+            let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
             if let Some(&cached) = zw_memo[level].get(&state_key) {
+                stats.zw_level_stats[level].1 += 1;
                 return cached;
             }
 
@@ -675,23 +855,11 @@ impl ZwFirstMdd {
 
                 current_vals[new_idx] = branch as u8;
 
-                let sums_backup = pack_sums(sums);
-
-                // Process ZW pair events at this level
-                for &(lag_idx, pos_a, pos_b, is_z) in &ctx.zw_events_at_level[level] {
-                    let idx_a = ctx.zw_active_indices[level][&pos_a];
-                    let idx_b = ctx.zw_active_indices[level][&pos_b];
-                    let bits_a = current_vals[idx_a] as u32;
-                    let bits_b = current_vals[idx_b] as u32;
-                    if is_z {
-                        let za = if (bits_a >> 0) & 1 == 1 { 1i32 } else { -1 };
-                        let zb = if (bits_b >> 0) & 1 == 1 { 1i32 } else { -1 };
-                        sums[lag_idx] += (2 * za * zb) as i8;
-                    } else {
-                        let wa = if (bits_a >> 1) & 1 == 1 { 1i32 } else { -1 };
-                        let wb = if (bits_b >> 1) & 1 == 1 { 1i32 } else { -1 };
-                        sums[lag_idx] += (2 * wa * wb) as i8;
-                    }
+                // Process ZW pair events at this level (pre-resolved indices + delta table)
+                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.zw_events_at_level[level] {
+                    let bits_a = current_vals[idx_a] as usize;
+                    let bits_b = current_vals[idx_b] as usize;
+                    sums[lag_idx] += delta[bits_a * 4 + bits_b];
                 }
 
                 // At ZW lag checkpoints: range+parity prune
@@ -709,28 +877,30 @@ impl ZwFirstMdd {
                         let zw_val = sums[li] as i32;
                         let zw_remaining = ctx.zw_max_remaining[level + 1][li];
                         let max_xy = ctx.xy_max_abs[li];
-                        // After all ZW events: zw_val + remaining_zw in [-max_zw_total, +max_zw_total]
-                        // Need: |final_zw_val| <= max_xy and right parity
-                        // Quick check: if |zw_val| - zw_remaining > max_xy, impossible
                         if (zw_val.abs() - zw_remaining) > max_xy { ok = false; break; }
                     }
                 }
 
                 if ok {
                     children[branch as usize] = build_zw(
-                        level + 1, sums, &mut current_vals,
-                        ctx, nodes, unique, zw_memo, xy_memo,
+                        level + 1, sums, &current_vals[..n_active],
+                        ctx, nodes, unique, zw_memo, xy_memo, xy_cache,
                         zw_memo_count, max_memo_entries, per_level_cap,
+                        stats, status,
                     );
                     if level == 1 {
                         eprint!("\r  ZW level 1 branch {}/4, {} nodes, zw_memo={}   ",
                             branch + 1, nodes.len(), *zw_memo_count);
                     }
+                } else {
+                    stats.zw_level_stats[level].2 += 1;
                 }
 
-                // Restore sums from packed backup
-                for i in 0..sums.len() {
-                    sums[i] = ((sums_backup >> (i * 8)) & 0xFF) as i8;
+                // Restore sums by subtracting deltas (avoids pack/unpack overhead)
+                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.zw_events_at_level[level] {
+                    let bits_a = current_vals[idx_a] as usize;
+                    let bits_b = current_vals[idx_b] as usize;
+                    sums[lag_idx] -= delta[bits_a * 4 + bits_b];
                 }
             }
 
@@ -755,6 +925,7 @@ impl ZwFirstMdd {
             // Cap total memo entries to prevent OOM at large k.
             // When over budget, evict the level with the most entries (typically deepest).
             if *zw_memo_count >= max_memo_entries {
+                stats.zw_memo_evictions += 1;
                 let (max_lvl, _) = zw_memo.iter().enumerate()
                     .max_by_key(|(_, m)| m.len()).unwrap();
                 if zw_memo[max_lvl].len() > 0 {
@@ -768,28 +939,67 @@ impl ZwFirstMdd {
         }
 
         // Budget memo: ~140 bytes/entry in FxHashMap.
-        // When running as a parallel branch, use 1/4 of the budget.
+        // When running as a parallel branch, use 1/N of the budget.
         let num_parallel = if restrict_branches.is_some() {
             4u32.pow(restrict_branches.unwrap().len() as u32) as usize
         } else if restrict_level1.is_some() { 4 } else { 1 };
-        let max_memo_entries: usize = 50_000_000 / num_parallel; // ~7GB total budget
+        // Auto-detect: use ~50% of available RAM for memo, leave rest for nodes/etc.
+        // Default ~80M entries. Override with MDD_MEMO_CAP env var.
+        let auto_cap = {
+            let total_bytes = std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("MemTotal:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .map(|kb| kb * 1024)
+                })
+                .unwrap_or(16 * 1024 * 1024 * 1024); // fallback 16GB
+            // Use 40% of total RAM for memo (140 bytes/entry)
+            // Leave 60% for nodes, unique table, xy_cache, OS, etc.
+            let memo_budget = total_bytes * 2 / 5;
+            (memo_budget / 140).min(200_000_000) // cap at 200M entries
+        };
+        let total_memo_cap: usize = std::env::var("MDD_MEMO_CAP")
+            .ok().and_then(|s| s.parse().ok())
+            .unwrap_or(auto_cap);
+        eprintln!("  Memo budget: {} entries ({:.1} GB) across {} parallel tasks",
+            total_memo_cap, total_memo_cap as f64 * 140.0 / 1e9, num_parallel);
+        let max_memo_entries: usize = total_memo_cap / num_parallel;
         let per_level_cap: usize = max_memo_entries / (zw_depth + 1);
         let mut zw_memo_count: usize = 0;
+        let mut xy_cache: HashMap<u128, u32> = HashMap::default();
+
         let mut sums = vec![0i8; k];
-        let mut active_bits: Vec<u8> = Vec::new();
+        let mut status = StatusLine::new(k);
         let root = build_zw(
-            0, &mut sums, &mut active_bits,
-            &ctx, &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo,
+            0, &mut sums, &[],
+            &ctx, &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo, &mut xy_cache,
             &mut zw_memo_count, max_memo_entries, per_level_cap,
+            &mut stats, &mut status,
         );
+        eprintln!(); // newline after status line
 
         let zw_memo_entries: usize = zw_memo.iter().map(|m| m.len()).sum();
         let xy_memo_entries: usize = xy_memo.iter().map(|m| m.len()).sum();
-        eprintln!("ZW-first MDD k={}: {} nodes, {:.1} MB (zw_memo={}, xy_memo={})",
+        let zw_boundary_calls: u64 = stats.zw_level_stats[zw_depth].3;
+        eprintln!("ZW-first MDD k={}: {} nodes, {:.1} MB (zw_memo={}, xy_memo={}, xy_cache={}/{} = {:.1}% hit)",
             k, nodes.len(), nodes.len() as f64 * 16.0 / 1_048_576.0,
-            zw_memo_entries, xy_memo_entries);
+            zw_memo_entries, xy_memo_entries, xy_cache.len(), zw_boundary_calls,
+            if zw_boundary_calls > 0 { 100.0 * (1.0 - xy_cache.len() as f64 / zw_boundary_calls as f64) } else { 0.0 });
 
-        ZwFirstMdd {
+        // Report per-level memo sizes (only when profiling)
+        if std::env::var("MDD_PROFILE").is_ok() {
+            eprintln!("  ZW memo per level:");
+            for (i, m) in zw_memo.iter().enumerate() {
+                if m.len() > 0 {
+                    eprintln!("    level {}: {} entries", i, m.len());
+                }
+            }
+        }
+
+        (ZwFirstMdd {
             nodes,
             root,
             k,
@@ -797,7 +1007,7 @@ impl ZwFirstMdd {
             xy_pos_order: pos_order,
             zw_depth,
             total_depth: total_depth,
-        }
+        }, stats)
     }
 
     /// Walk the ZW top half, collecting (z_bits, w_bits, xy_root_node) triples.
@@ -894,4 +1104,559 @@ impl ZwFirstMdd {
         memo.insert(nid, total);
         total
     }
+}
+
+/// Build a standalone XY sub-MDD for a given ZW boundary.
+///
+/// `zw_sums` are the partial autocorrelation sums from the ZW half.
+/// The XY sub-MDD encodes all (x,y) boundary configurations that satisfy
+/// N_X(s) + N_Y(s) = -zw_sums[s] for each lag s.
+///
+/// Returns (nodes, root) where nodes are 4-way children arrays.
+/// This is the key API for runtime MDD extension: the main turyn program
+/// can walk a prebuilt k=K MDD, extract zw_sums at each boundary, and
+/// call this to build the XY constraint for that specific boundary.
+pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
+    assert_eq!(zw_sums.len(), k, "zw_sums must have k={} elements", k);
+
+    let zw_depth = 2 * k;
+
+    // Position order (bouncing)
+    let mut pos_order: Vec<usize> = Vec::with_capacity(2 * k);
+    for t in 0..k {
+        pos_order.push(t);
+        pos_order.push(2 * k - 1 - t);
+    }
+    let mut pos_to_level: Vec<usize> = vec![0; 2 * k];
+    for (level, &pos) in pos_order.iter().enumerate() {
+        pos_to_level[pos] = level;
+    }
+
+    // XY lag pairs
+    struct LagPairs {
+        xy_pairs: Vec<(usize, usize)>,
+    }
+    let mut lags: Vec<LagPairs> = Vec::new();
+    for j in 0..k {
+        let xy_pairs: Vec<(usize, usize)> = (0..k - j)
+            .map(|i| (i, k + i + j)).collect();
+        lags.push(LagPairs { xy_pairs });
+    }
+
+    // XY events at each level
+    struct LagEvent {
+        pos_a: usize,
+        pos_b: usize,
+    }
+    let mut xy_events_at_level: Vec<Vec<(usize, LagEvent)>> =
+        (0..zw_depth).map(|_| Vec::new()).collect();
+    let mut xy_lag_check_at_level: Vec<Vec<usize>> =
+        (0..=zw_depth).map(|_| Vec::new()).collect();
+
+    for (li, lag) in lags.iter().enumerate() {
+        let mut xy_complete = 0usize;
+        for &(a, b) in &lag.xy_pairs {
+            let complete = pos_to_level[a].max(pos_to_level[b]);
+            xy_events_at_level[complete].push((li, LagEvent { pos_a: a, pos_b: b }));
+            xy_complete = xy_complete.max(complete);
+        }
+        xy_lag_check_at_level[xy_complete].push(li);
+    }
+
+    // Max remaining for range pruning
+    let mut xy_max_remaining: Vec<Vec<i32>> = vec![vec![0i32; k]; zw_depth + 1];
+    for (li, lag) in lags.iter().enumerate() {
+        for &(a, b) in &lag.xy_pairs {
+            let complete = pos_to_level[a].max(pos_to_level[b]);
+            for level in 0..=complete { xy_max_remaining[level][li] += 2; }
+        }
+    }
+
+    // Active position tracking
+    let mut xy_last_use: Vec<usize> = vec![0; 2 * k];
+    for (level, events) in xy_events_at_level.iter().enumerate() {
+        for (_, ev) in events {
+            xy_last_use[ev.pos_a] = xy_last_use[ev.pos_a].max(level);
+            xy_last_use[ev.pos_b] = xy_last_use[ev.pos_b].max(level);
+        }
+    }
+    let mut xy_active_at_level: Vec<Vec<usize>> = vec![Vec::new(); zw_depth + 1];
+    for d in 0..zw_depth {
+        let mut active: Vec<usize> = if d > 0 {
+            xy_active_at_level[d - 1].iter()
+                .filter(|&&p| xy_last_use[p] >= d)
+                .copied().collect()
+        } else { Vec::new() };
+        active.push(pos_order[d]);
+        active.sort();
+        xy_active_at_level[d] = active;
+    }
+    let xy_active_indices: Vec<Vec<usize>> = xy_active_at_level.iter()
+        .map(|active| {
+            let mut flat = vec![usize::MAX; 2 * k];
+            for (i, &p) in active.iter().enumerate() { flat[p] = i; }
+            flat
+        }).collect();
+
+    // Precompute delta table
+    let mut xy_delta = [0i8; 16];
+    for a in 0u32..4 {
+        for b in 0u32..4 {
+            let xa = if a & 1 == 1 { 1i32 } else { -1 };
+            let xb = if b & 1 == 1 { 1i32 } else { -1 };
+            let ya = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
+            let yb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
+            xy_delta[(a * 4 + b) as usize] = (xa * xb + ya * yb) as i8;
+        }
+    }
+
+    // Pre-resolve events
+    let resolved_events: Vec<Vec<(usize, usize, usize, [i8; 16])>> =
+        xy_events_at_level.iter().enumerate().map(|(level, evs)| {
+            evs.iter().map(|(li, ev)| {
+                let idx_a = xy_active_indices[level][ev.pos_a];
+                let idx_b = xy_active_indices[level][ev.pos_b];
+                (*li, idx_a, idx_b, xy_delta)
+            }).collect()
+        }).collect();
+
+    let mut nodes: Vec<[u32; 4]> = Vec::new();
+    nodes.push([DEAD; 4]); // sentinel
+
+    fn hash_node4(level: u8, children: &[u32; 4]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = rustc_hash::FxHasher::default();
+        level.hash(&mut h);
+        for &c in children { c.hash(&mut h); }
+        h.finish()
+    }
+    let mut unique: HashMap<u64, u32> = HashMap::default();
+
+    type StateKey = (u128, u64);
+    let mut memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
+
+    fn pack_sums(sums: &[i8]) -> u128 {
+        let mut packed = 0u128;
+        for (i, &s) in sums.iter().enumerate() {
+            packed |= ((s as u8 as u128) & 0xFF) << (i * 8);
+        }
+        packed
+    }
+
+    fn pack_active(vals: &[u8]) -> u64 {
+        let mut packed = 0u64;
+        for (i, &v) in vals.iter().enumerate() {
+            packed |= (v as u64) << (i * 2);
+        }
+        packed
+    }
+
+    struct XyCtx {
+        pos_order: Vec<usize>,
+        events: Vec<Vec<(usize, usize, usize, [i8; 16])>>,
+        lag_check: Vec<Vec<usize>>,
+        max_remaining: Vec<Vec<i32>>,
+        active_at_level: Vec<Vec<usize>>,
+        active_indices: Vec<Vec<usize>>,
+        k: usize,
+        zw_depth: usize,
+    }
+
+    let ctx = XyCtx {
+        pos_order,
+        events: resolved_events,
+        lag_check: xy_lag_check_at_level,
+        max_remaining: xy_max_remaining,
+        active_at_level: xy_active_at_level,
+        active_indices: xy_active_indices,
+        k,
+        zw_depth,
+    };
+
+    fn build(
+        level: usize,
+        sums: &mut [i8],
+        active_bits: &[u8],
+        zw_sums: &[i8],
+        ctx: &XyCtx,
+        nodes: &mut Vec<[u32; 4]>,
+        unique: &mut HashMap<u64, u32>,
+        memo: &mut Vec<HashMap<(u128, u64), u32>>,
+    ) -> u32 {
+        if level == ctx.zw_depth {
+            for li in 0..ctx.k {
+                if sums[li] != -zw_sums[li] { return DEAD; }
+            }
+            return LEAF;
+        }
+
+        let active = &ctx.active_at_level[level];
+        let n_active = active.len();
+        let mut current_vals = [0u8; 32];
+        if level > 0 {
+            let prev_indices = &ctx.active_indices[level - 1];
+            for (i, &pos) in active.iter().enumerate() {
+                if pos != ctx.pos_order[level] {
+                    let pi = prev_indices[pos];
+                    if pi != usize::MAX {
+                        current_vals[i] = active_bits[pi];
+                    }
+                }
+            }
+        }
+
+        let new_pos = ctx.pos_order[level];
+        let new_idx = ctx.active_indices[level][new_pos];
+
+        let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
+        if let Some(&cached) = memo[level].get(&state_key) {
+            return cached;
+        }
+
+        let mut children = [DEAD; 4];
+        for branch in 0u32..4 {
+            if new_pos == 0 && branch != 0b11 { continue; }
+            current_vals[new_idx] = branch as u8;
+
+            for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.events[level] {
+                let bits_a = current_vals[idx_a] as usize;
+                let bits_b = current_vals[idx_b] as usize;
+                sums[lag_idx] += delta[bits_a * 4 + bits_b];
+            }
+
+            let mut ok = true;
+            for &li in &ctx.lag_check[level] {
+                if sums[li] != -zw_sums[li] { ok = false; break; }
+            }
+            if ok && level + 1 < ctx.zw_depth {
+                for li in 0..ctx.k {
+                    let gap = (sums[li] as i32) - (-(zw_sums[li] as i32));
+                    let remaining = ctx.max_remaining[level + 1][li];
+                    if gap.abs() > remaining { ok = false; break; }
+                }
+            }
+
+            if ok {
+                children[branch as usize] = build(
+                    level + 1, sums, &current_vals[..n_active], zw_sums,
+                    ctx, nodes, unique, memo,
+                );
+            }
+
+            // Restore sums
+            for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.events[level] {
+                let bits_a = current_vals[idx_a] as usize;
+                let bits_b = current_vals[idx_b] as usize;
+                sums[lag_idx] -= delta[bits_a * 4 + bits_b];
+            }
+        }
+
+        let result = if children.iter().all(|&c| c == DEAD) {
+            DEAD
+        } else {
+            let first = children[0];
+            if children.iter().all(|&c| c == first) {
+                first
+            } else {
+                let key = hash_node4(level as u8, &children);
+                if let Some(&nid) = unique.get(&key) { nid }
+                else {
+                    let nid = nodes.len() as u32;
+                    nodes.push(children);
+                    unique.insert(key, nid);
+                    nid
+                }
+            }
+        };
+
+        memo[level].insert(state_key, result);
+        result
+    }
+
+    let mut sums = vec![0i8; k];
+    let root = build(
+        0, &mut sums, &[], zw_sums,
+        &ctx, &mut nodes, &mut unique, &mut memo,
+    );
+
+    (nodes, root)
+}
+
+/// Build an MDD that extends a k=base_k boundary to k=target_k.
+///
+/// Given concrete boundary values (z_bits, w_bits, x_bits, y_bits) from a
+/// base_k-sized MDD, this builds an MDD over the *extension* positions only
+/// (positions base_k..target_k-1 in the "short" halves and their corresponding
+/// "long" counterparts).
+///
+/// The lag structure: lag j pairs position i with position (k + i + j) for Z/X,
+/// and position i with position (k + i + j + 1) for W/Y. When extending from
+/// base_k to target_k, we get three kinds of autocorrelation terms:
+///   1. Old×Old: fully determined by the base boundary bits (frozen, becomes initial sums)
+///   2. Old×New: one factor is known, the other is a new variable (cross-terms)
+///   3. New×New: both factors are new variables
+///
+/// The extension MDD branches on the new positions and tracks partial sums that
+/// include contributions from cross-terms (using the known old bit values) and
+/// new×new terms. At the end, all sums must be zero.
+///
+/// Returns a ZwFirstMdd over the extension positions.
+pub fn build_extension(
+    base_k: usize,
+    target_k: usize,
+    z_bits: u32,
+    w_bits: u32,
+    x_bits: u32,
+    y_bits: u32,
+) -> (Vec<[u32; 4]>, u32) {
+    assert!(target_k > base_k, "target_k must be > base_k");
+    let extra = target_k - base_k;
+
+    // Compute initial sums from old×old pairs (these are fixed)
+    let mut initial_sums = vec![0i8; target_k];
+    for j in 0..target_k {
+        let mut sum = 0i32;
+
+        // Z old×old pairs: lag j, positions (i, base_k + i + j)
+        // Only pairs where BOTH positions are in 0..2*base_k
+        for i in 0..base_k {
+            let pos_b = base_k + i + j;
+            if pos_b < 2 * base_k {
+                let za = if (z_bits >> i) & 1 == 1 { 1 } else { -1i32 };
+                let zb = if (z_bits >> pos_b) & 1 == 1 { 1 } else { -1i32 };
+                sum += 2 * za * zb;
+            }
+        }
+        // W old×old pairs: lag j, positions (i, base_k + i + j + 1)
+        if j < target_k - 1 {
+            for i in 0..base_k {
+                let pos_b = base_k + i + j + 1;
+                if pos_b < 2 * base_k {
+                    let wa = if (w_bits >> i) & 1 == 1 { 1 } else { -1i32 };
+                    let wb = if (w_bits >> pos_b) & 1 == 1 { 1 } else { -1i32 };
+                    sum += 2 * wa * wb;
+                }
+            }
+        }
+        // X old×old pairs
+        for i in 0..base_k {
+            let pos_b = base_k + i + j;
+            if pos_b < 2 * base_k {
+                let xa = if (x_bits >> i) & 1 == 1 { 1 } else { -1i32 };
+                let xb = if (x_bits >> pos_b) & 1 == 1 { 1 } else { -1i32 };
+                sum += xa * xb;
+            }
+        }
+        // Y old×old pairs
+        for i in 0..base_k {
+            let pos_b = base_k + i + j;
+            if pos_b < 2 * base_k {
+                let ya = if (y_bits >> i) & 1 == 1 { 1 } else { -1i32 };
+                let yb = if (y_bits >> pos_b) & 1 == 1 { 1 } else { -1i32 };
+                sum += ya * yb;
+            }
+        }
+
+        initial_sums[j] = sum as i8;
+    }
+
+    // Now build an MDD for the extension positions.
+    // The extension has 2*extra positions per sequence (extra "short" + extra "long").
+    // We interleave all 4 sequences: each level assigns (z,w,x,y) at a new position.
+    // But to match the ZW-first structure, we do ZW first, then XY.
+
+    let ext_depth = 2 * extra;  // positions per half-sequence
+
+    // Position mapping: extension position p maps to actual position (base_k + p)
+    // in the full sequence. The "short" half uses positions 0..extra-1,
+    // the "long" half uses positions extra..2*extra-1.
+
+    // Build position order (bouncing within extension)
+    let mut pos_order: Vec<usize> = Vec::with_capacity(ext_depth);
+    for t in 0..extra {
+        pos_order.push(t);
+        pos_order.push(2 * extra - 1 - t);
+    }
+    let mut pos_to_level: Vec<usize> = vec![0; ext_depth];
+    for (level, &pos) in pos_order.iter().enumerate() {
+        pos_to_level[pos] = level;
+    }
+
+    // Events: for each lag j, determine which pairs involve extension positions.
+    // A pair (i, base_k+i+j) where i or base_k+i+j is in the extension range.
+    //
+    // Extension positions in the full sequence:
+    //   Short half: base_k..base_k+extra-1  (ext pos 0..extra-1)
+    //   Long half:  base_k+extra..2*target_k-1  (ext pos extra..2*extra-1)
+    //
+    // Actually: the full sequence has 2*target_k positions. Positions 0..target_k-1
+    // are "short", positions target_k..2*target_k-1 are "long".
+    // Old positions: 0..base_k-1 (short) and target_k..target_k+base_k-1 (long)
+    // New positions: base_k..target_k-1 (short) and target_k+base_k..2*target_k-1 (long)
+    //
+    // In the extension MDD, we number new positions 0..2*extra-1:
+    //   0..extra-1 = actual positions base_k..target_k-1 (new short)
+    //   extra..2*extra-1 = actual positions target_k+base_k..2*target_k-1 (new long)
+
+    // For each lag j, collect events involving at least one new position.
+    // Each event: which ext positions are involved, and if one is old, what's the known value.
+    struct ExtEvent {
+        lag: usize,
+        // If both positions are new: ext_a and ext_b are extension positions
+        // If one is old: ext_new is the extension position, old_sign is the known ±1 value
+        kind: ExtEventKind,
+    }
+    enum ExtEventKind {
+        // Both positions are new extension positions
+        NewNew { ext_a: usize, ext_b: usize, is_z: bool },
+        // One position is old (known sign), one is new
+        OldNew { ext_new: usize, old_sign_z: i8, old_sign_w: i8, old_sign_x: i8, old_sign_y: i8 },
+    }
+
+    let mut events_at_level: Vec<Vec<ExtEvent>> = (0..ext_depth).map(|_| Vec::new()).collect();
+    let mut lag_check_at_level: Vec<Vec<usize>> = (0..=ext_depth).map(|_| Vec::new()).collect();
+    let mut max_remaining: Vec<Vec<i32>> = vec![vec![0i32; target_k]; ext_depth + 1];
+
+    for j in 0..target_k {
+        let mut max_complete_level: Option<usize> = None;
+
+        // Z/X pairs: (i, target_k + i + j) for i in 0..target_k-j
+        for i in 0..target_k.saturating_sub(j) {
+            let actual_a = i;
+            let actual_b = target_k + i + j;
+            if actual_b >= 2 * target_k { continue; }
+
+            let a_is_new = actual_a >= base_k && actual_a < target_k;
+            let b_is_new = actual_b >= target_k + base_k;
+
+            if !a_is_new && !b_is_new {
+                continue; // old×old: already in initial_sums
+            }
+
+            let ext_a = if a_is_new { Some(actual_a - base_k) } else { None };
+            let ext_b = if b_is_new { Some(extra + (actual_b - target_k - base_k)) } else { None };
+
+            // Determine when this event completes (both positions assigned)
+            let complete_level = match (ext_a, ext_b) {
+                (Some(ea), Some(eb)) => pos_to_level[ea].max(pos_to_level[eb]),
+                (Some(ea), None) => pos_to_level[ea],
+                (None, Some(eb)) => pos_to_level[eb],
+                (None, None) => unreachable!(),
+            };
+
+            let event = match (ext_a, ext_b) {
+                (Some(ea), Some(eb)) => ExtEvent {
+                    lag: j,
+                    kind: ExtEventKind::NewNew { ext_a: ea, ext_b: eb, is_z: true },
+                },
+                (Some(en), None) => {
+                    // b is old position
+                    let zb = if (z_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                    let xb = if (x_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                    ExtEvent {
+                        lag: j,
+                        kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: zb, old_sign_w: 0, old_sign_x: xb, old_sign_y: 0 },
+                    }
+                },
+                (None, Some(en)) => {
+                    // a is old position
+                    let za = if (z_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                    let xa = if (x_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                    ExtEvent {
+                        lag: j,
+                        kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: za, old_sign_w: 0, old_sign_x: xa, old_sign_y: 0 },
+                    }
+                },
+                _ => unreachable!(),
+            };
+
+            // Track max contribution for pruning
+            for lv in 0..=complete_level {
+                max_remaining[lv][j] += 4; // max |delta| per event (2 for Z + 2 for X)
+            }
+
+            events_at_level[complete_level].push(event);
+            max_complete_level = Some(max_complete_level.map_or(complete_level, |c: usize| c.max(complete_level)));
+        }
+
+        // W/Y pairs: (i, target_k + i + j + 1) for i in 0..target_k-j-1
+        if j < target_k - 1 {
+            for i in 0..target_k - j - 1 {
+                let actual_a = i;
+                let actual_b = target_k + i + j + 1;
+                if actual_b >= 2 * target_k { continue; }
+
+                let a_is_new = actual_a >= base_k && actual_a < target_k;
+                let b_is_new = actual_b >= target_k + base_k;
+
+                if !a_is_new && !b_is_new {
+                    continue; // old×old
+                }
+
+                let ext_a = if a_is_new { Some(actual_a - base_k) } else { None };
+                let ext_b = if b_is_new { Some(extra + (actual_b - target_k - base_k)) } else { None };
+
+                let complete_level = match (ext_a, ext_b) {
+                    (Some(ea), Some(eb)) => pos_to_level[ea].max(pos_to_level[eb]),
+                    (Some(ea), None) => pos_to_level[ea],
+                    (None, Some(eb)) => pos_to_level[eb],
+                    (None, None) => unreachable!(),
+                };
+
+                let event = match (ext_a, ext_b) {
+                    (Some(ea), Some(eb)) => ExtEvent {
+                        lag: j,
+                        kind: ExtEventKind::NewNew { ext_a: ea, ext_b: eb, is_z: false },
+                    },
+                    (Some(en), None) => {
+                        let wb = if (w_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                        let yb = if (y_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                        ExtEvent {
+                            lag: j,
+                            kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: 0, old_sign_w: wb, old_sign_x: 0, old_sign_y: yb },
+                        }
+                    },
+                    (None, Some(en)) => {
+                        let wa = if (w_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                        let ya = if (y_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                        ExtEvent {
+                            lag: j,
+                            kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: 0, old_sign_w: wa, old_sign_x: 0, old_sign_y: ya },
+                        }
+                    },
+                    _ => unreachable!(),
+                };
+
+                for lv in 0..=complete_level {
+                    max_remaining[lv][j] += 4;
+                }
+
+                events_at_level[complete_level].push(event);
+                max_complete_level = Some(max_complete_level.map_or(complete_level, |c: usize| c.max(complete_level)));
+            }
+        }
+
+        if let Some(cl) = max_complete_level {
+            lag_check_at_level[cl].push(j);
+        }
+    }
+
+    // TODO: The full DFS builder for extension positions goes here.
+    // For now, this sets up the event structure. The actual DFS is structurally
+    // identical to build_inner but operates on extension positions only,
+    // with 16-way branching (z,w,x,y per position) and initial_sums as starting state.
+    //
+    // Each level assigns (z[pos], w[pos], x[pos], y[pos]) at an extension position.
+    // Events update sums based on both new×new and old×new interactions.
+
+    // Placeholder: return empty MDD
+    // TODO: implement the actual DFS/BFS builder
+    let nodes = vec![[DEAD; 4]];
+    let root = DEAD;
+
+    eprintln!("build_extension: base_k={}, target_k={}, extra={}, {} initial_sums, {} events",
+        base_k, target_k, extra, initial_sums.len(),
+        events_at_level.iter().map(|e| e.len()).sum::<usize>());
+
+    (nodes, root)
 }
