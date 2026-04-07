@@ -164,6 +164,14 @@ fn extract_vals(solver: &radical::Solver, var_fn: impl Fn(usize) -> i32, len: us
     (0..len).map(|i| if solver.value(var_fn(i)) == Some(true) { 1 } else { -1 }).collect()
 }
 
+/// Expand packed boundary bits into ±1 prefix and suffix arrays.
+/// Low k bits → prefix, next k bits → suffix.
+fn expand_boundary_bits(bits: u32, k: usize) -> (Vec<i8>, Vec<i8>) {
+    let prefix: Vec<i8> = (0..k).map(|i| if (bits >> i) & 1 == 1 { 1 } else { -1 }).collect();
+    let suffix: Vec<i8> = (0..k).map(|i| if (bits >> (k + i)) & 1 == 1 { 1 } else { -1 }).collect();
+    (prefix, suffix)
+}
+
 /// Format a sequence as a colorized +/- string for terminal display.
 /// '+' gets black text on light gray background, '-' gets white text on dark gray.
 /// Copies as plain +/- from most terminals.
@@ -3171,19 +3179,8 @@ fn run_mdd_sat_search(
                     if found.load(AtomicOrdering::Relaxed) { break; }
 
                     // Build W candidates: boundary from MDD + enumerate middles
-                    let mut w_prefix = vec![0i8; k];
-                    let mut w_suffix = vec![0i8; k];
-                    for i in 0..k {
-                        w_prefix[i] = if (entry.w_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        w_suffix[i] = if (entry.w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                    }
-
-                    let mut z_prefix = vec![0i8; k];
-                    let mut z_suffix = vec![0i8; k];
-                    for i in 0..k {
-                        z_prefix[i] = if (entry.z_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        z_suffix[i] = if (entry.z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                    }
+                    let (w_prefix, w_suffix) = expand_boundary_bits(entry.w_bits, k);
+                    let (z_prefix, z_suffix) = expand_boundary_bits(entry.z_bits, k);
 
                     // Enumerate W middles (shuffled for representative sampling), spectral filter
                     let mut w_candidates: Vec<(PackedSeq, Vec<f64>)> = Vec::new();
@@ -4011,12 +4008,10 @@ impl XYBoundaryTable {
 
                     // Expand bits only for entries passing all filters
                     let mut xv = [0i8; 64]; let mut yv = [0i8; 64];
-                    for i in 0..k {
-                        xv[i] = if (x_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        xv[n-k+i] = if (x_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
-                        yv[i] = if (y_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        yv[n-k+i] = if (y_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
-                    }
+                    let (xp, xs) = expand_boundary_bits(x_bits, k);
+                    let (yp, ys) = expand_boundary_bits(y_bits, k);
+                    xv[..k].copy_from_slice(&xp); xv[n-k..n].copy_from_slice(&xs);
+                    yv[..k].copy_from_slice(&yp); yv[n-k..n].copy_from_slice(&ys);
                     // Build boundary value lookup
                     let mut bnd_vals = [0i8; 128];
                     for i in 0..k { bnd_vals[i] = xv[i]; bnd_vals[n-k+i] = xv[n-k+i]; }
@@ -4505,18 +4500,8 @@ fn main() {
                     let w_mid_sum = tuple.w - w_bnd_sum;
                     if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
 
-                    let mut w_prefix = vec![0i8; k];
-                    let mut w_suffix = vec![0i8; k];
-                    for i in 0..k {
-                        w_prefix[i] = if (w_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        w_suffix[i] = if (w_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                    }
-                    let mut z_prefix = vec![0i8; k];
-                    let mut z_suffix = vec![0i8; k];
-                    for i in 0..k {
-                        z_prefix[i] = if (z_bits >> i) & 1 == 1 { 1 } else { -1 };
-                        z_suffix[i] = if (z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                    }
+                    let (w_prefix, w_suffix) = expand_boundary_bits(w_bits, k);
+                    let (z_prefix, z_suffix) = expand_boundary_bits(z_bits, k);
 
                     let mut z_boundary = vec![0i8; n];
                     for i in 0..k { z_boundary[i] = z_prefix[i]; z_boundary[n - k + i] = z_suffix[i]; }
