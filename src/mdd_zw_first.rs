@@ -447,9 +447,13 @@ impl ZwFirstMdd {
             active.sort();
             zw_active_at_level[d] = active;
         }
-        let zw_active_indices: Vec<HashMap<usize, usize>> = zw_active_at_level.iter()
-            .map(|active| active.iter().enumerate().map(|(i, &p)| (p, i)).collect())
-            .collect();
+        // Flat array for position→index lookup (avoids HashMap in hot path)
+        let zw_active_indices: Vec<Vec<usize>> = zw_active_at_level.iter()
+            .map(|active| {
+                let mut flat = vec![usize::MAX; 2 * k];
+                for (i, &p) in active.iter().enumerate() { flat[p] = i; }
+                flat
+            }).collect();
 
         // Active position tracking for x,y half
         let mut xy_last_use: Vec<usize> = vec![0; 2 * k];
@@ -470,9 +474,12 @@ impl ZwFirstMdd {
             active.sort();
             xy_active_at_level[d] = active;
         }
-        let xy_active_indices: Vec<HashMap<usize, usize>> = xy_active_at_level.iter()
-            .map(|active| active.iter().enumerate().map(|(i, &p)| (p, i)).collect())
-            .collect();
+        let xy_active_indices: Vec<Vec<usize>> = xy_active_at_level.iter()
+            .map(|active| {
+                let mut flat = vec![usize::MAX; 2 * k];
+                for (i, &p) in active.iter().enumerate() { flat[p] = i; }
+                flat
+            }).collect();
 
         // Build context
         struct Ctx {
@@ -485,9 +492,9 @@ impl ZwFirstMdd {
             zw_max_remaining: Vec<Vec<i32>>,
             xy_max_remaining: Vec<Vec<i32>>,
             zw_active_at_level: Vec<Vec<usize>>,
-            zw_active_indices: Vec<HashMap<usize, usize>>,
+            zw_active_indices: Vec<Vec<usize>>,  // flat array: pos → index
             xy_active_at_level: Vec<Vec<usize>>,
-            xy_active_indices: Vec<HashMap<usize, usize>>,
+            xy_active_indices: Vec<Vec<usize>>,  // flat array: pos → index
             k: usize,
             zw_depth: usize,
             restrict_level1: Option<u32>,
@@ -588,10 +595,13 @@ impl ZwFirstMdd {
                 for &pos in active {
                     if pos == ctx.pos_order[level] {
                         current_vals.push(0);
-                    } else if let Some(&pi) = prev_indices.get(&pos) {
-                        current_vals.push(active_bits[pi]);
                     } else {
-                        current_vals.push(0);
+                        let pi = prev_indices[pos];
+                        if pi != usize::MAX {
+                            current_vals.push(active_bits[pi]);
+                        } else {
+                            current_vals.push(0);
+                        }
                     }
                 }
             } else {
@@ -599,7 +609,7 @@ impl ZwFirstMdd {
             }
 
             let new_pos = ctx.pos_order[level];
-            let new_idx = ctx.xy_active_indices[level][&new_pos];
+            let new_idx = ctx.xy_active_indices[level][new_pos];
 
             let state_key = (pack_sums(sums), pack_active(&current_vals));
             if let Some(&cached) = memo[level].get(&state_key) {
@@ -624,8 +634,8 @@ impl ZwFirstMdd {
 
                 // Process XY pair events at this level
                 for &(lag_idx, pos_a, pos_b) in &ctx.xy_events_at_level[level] {
-                    let idx_a = ctx.xy_active_indices[level][&pos_a];
-                    let idx_b = ctx.xy_active_indices[level][&pos_b];
+                    let idx_a = ctx.xy_active_indices[level][pos_a];
+                    let idx_b = ctx.xy_active_indices[level][pos_b];
                     let bits_a = current_vals[idx_a] as u32;
                     let bits_b = current_vals[idx_b] as u32;
                     let xa = if (bits_a >> 0) & 1 == 1 { 1i32 } else { -1 };
@@ -738,10 +748,13 @@ impl ZwFirstMdd {
                 for &pos in active {
                     if pos == ctx.pos_order[level] {
                         current_vals.push(0);
-                    } else if let Some(&pi) = prev_indices.get(&pos) {
-                        current_vals.push(active_bits[pi]);
                     } else {
-                        current_vals.push(0);
+                        let pi = prev_indices[pos];
+                        if pi != usize::MAX {
+                            current_vals.push(active_bits[pi]);
+                        } else {
+                            current_vals.push(0);
+                        }
                     }
                 }
             } else {
@@ -749,7 +762,7 @@ impl ZwFirstMdd {
             }
 
             let new_pos = ctx.pos_order[level];
-            let new_idx = ctx.zw_active_indices[level][&new_pos];
+            let new_idx = ctx.zw_active_indices[level][new_pos];
 
             let state_key = (pack_sums(sums), pack_active(&current_vals));
             if let Some(&cached) = zw_memo[level].get(&state_key) {
@@ -781,8 +794,8 @@ impl ZwFirstMdd {
 
                 // Process ZW pair events at this level
                 for &(lag_idx, pos_a, pos_b, is_z) in &ctx.zw_events_at_level[level] {
-                    let idx_a = ctx.zw_active_indices[level][&pos_a];
-                    let idx_b = ctx.zw_active_indices[level][&pos_b];
+                    let idx_a = ctx.zw_active_indices[level][pos_a];
+                    let idx_b = ctx.zw_active_indices[level][pos_b];
                     let bits_a = current_vals[idx_a] as u32;
                     let bits_b = current_vals[idx_b] as u32;
                     if is_z {
