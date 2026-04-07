@@ -378,26 +378,98 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
     let mut level_key_counts: Vec<usize> = vec![1];
 
     for level in 0..zw_depth {
-        // Use HashMap for dedup (back to original approach, but with parallel expansion)
-        let mut next_key_to_idx: HashMap<StateKey, u32> = HashMap::default();
-        let mut parent_children: Vec<[u32; 4]> = Vec::with_capacity(current_keys.len());
+        let n_parents = current_keys.len();
+        // Estimate if we need memory-efficient mode (sorted Vec vs HashMap)
+        // HashMap: ~80 bytes/entry. Sorted Vec: ~24 bytes/entry.
+        // Use sorted mode when states would exceed ~50M entries
+        let use_sorted = n_parents > 5_000_000;
 
-        for &key in &current_keys {
-            let mut ch = [NO_CHILD; 4];
-            ctx.expand_state_cb(key, level, |branch, child_key| {
-                let next_len = next_key_to_idx.len() as u32;
-                let idx = *next_key_to_idx.entry(child_key).or_insert(next_len);
-                ch[branch as usize] = idx;
-            });
-            parent_children.push(ch);
-        }
+        let (next_keys, parent_children) = if use_sorted {
+            // Two-pass sorted dedup: lower peak memory for large levels.
+            // Write parent keys to disk so we can free them during child collection.
+            let parent_path = format!("{}/parent_keys_{}.bin", tmp_dir, level);
+            write_keys(&parent_path, &current_keys).expect("write parent keys");
 
-        // Build next level's key list in index order
-        let mut next_keys = vec![(0u128, 0u64); next_key_to_idx.len()];
-        for (&key, &idx) in &next_key_to_idx {
-            next_keys[idx as usize] = key;
-        }
-        drop(next_key_to_idx); // free HashMap before allocating next level
+            // Pass 1: Chunked expansion + sort + merge to control peak memory.
+            // Process parents in chunks, sort each chunk's children, then merge.
+            let chunk_size = 2_000_000; // ~2M parents per chunk
+            let n_chunks = (n_parents + chunk_size - 1) / chunk_size;
+            let mut all_child_keys: Vec<StateKey> = Vec::new();
+
+            for chunk_idx in 0..n_chunks {
+                let start_idx = chunk_idx * chunk_size;
+                let end_idx = (start_idx + chunk_size).min(n_parents);
+                let chunk = &current_keys[start_idx..end_idx];
+
+                let mut chunk_children: Vec<StateKey> = Vec::with_capacity(chunk.len() * 3);
+                for &key in chunk {
+                    ctx.expand_state_cb(key, level, |_branch, child_key| {
+                        chunk_children.push(child_key);
+                    });
+                }
+                chunk_children.sort_unstable();
+                chunk_children.dedup();
+
+                // Merge with accumulated results
+                if all_child_keys.is_empty() {
+                    all_child_keys = chunk_children;
+                } else {
+                    // Merge two sorted deduped arrays
+                    let mut merged = Vec::with_capacity(all_child_keys.len() + chunk_children.len());
+                    let mut i = 0;
+                    let mut j = 0;
+                    while i < all_child_keys.len() && j < chunk_children.len() {
+                        match all_child_keys[i].cmp(&chunk_children[j]) {
+                            std::cmp::Ordering::Less => { merged.push(all_child_keys[i]); i += 1; }
+                            std::cmp::Ordering::Greater => { merged.push(chunk_children[j]); j += 1; }
+                            std::cmp::Ordering::Equal => { merged.push(all_child_keys[i]); i += 1; j += 1; }
+                        }
+                    }
+                    merged.extend_from_slice(&all_child_keys[i..]);
+                    merged.extend_from_slice(&chunk_children[j..]);
+                    all_child_keys = merged;
+                }
+            }
+            drop(current_keys);
+            current_keys = Vec::new();
+            all_child_keys.shrink_to_fit();
+            // Now all_child_keys is sorted+unique, index = position
+
+            // Pass 2: re-read parents from disk, re-expand to get child indices
+            let parent_keys = read_keys(&parent_path).expect("read parent keys");
+            let _ = std::fs::remove_file(&parent_path);
+            let mut parent_children: Vec<[u32; 4]> = Vec::with_capacity(parent_keys.len());
+            for &key in &parent_keys {
+                let mut ch = [NO_CHILD; 4];
+                ctx.expand_state_cb(key, level, |branch, child_key| {
+                    let idx = all_child_keys.binary_search(&child_key).unwrap() as u32;
+                    ch[branch as usize] = idx;
+                });
+                parent_children.push(ch);
+            }
+            drop(parent_keys);
+            (all_child_keys, parent_children)
+        } else {
+            // HashMap dedup: faster for small levels
+            let mut next_key_to_idx: HashMap<StateKey, u32> = HashMap::default();
+            let mut parent_children: Vec<[u32; 4]> = Vec::with_capacity(n_parents);
+
+            for &key in &current_keys {
+                let mut ch = [NO_CHILD; 4];
+                ctx.expand_state_cb(key, level, |branch, child_key| {
+                    let next_len = next_key_to_idx.len() as u32;
+                    let idx = *next_key_to_idx.entry(child_key).or_insert(next_len);
+                    ch[branch as usize] = idx;
+                });
+                parent_children.push(ch);
+            }
+
+            let mut next_keys = vec![(0u128, 0u64); next_key_to_idx.len()];
+            for (&key, &idx) in &next_key_to_idx {
+                next_keys[idx as usize] = key;
+            }
+            (next_keys, parent_children)
+        };
 
         // Write parent children to disk (for pass 2)
         let path = format!("{}/children_{}.bin", tmp_dir, level);
@@ -405,7 +477,7 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
 
         let count = next_keys.len();
         eprint!("\r  Level {}/{}: {} → {} states ({:.1?})   ",
-            level + 1, zw_depth, current_keys.len(), count, start.elapsed());
+            level + 1, zw_depth, n_parents, count, start.elapsed());
         level_key_counts.push(count);
         current_keys = next_keys;
     }
