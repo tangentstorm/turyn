@@ -43,6 +43,43 @@ pub fn hash_node4(level: u8, children: &[u32; 4]) -> u64 {
     h.finish()
 }
 
+/// Delta table for Z or W events: delta[bits_a * 4 + bits_b].
+/// Z (is_z=true): 2 * sign(bit0_a) * sign(bit0_b)
+/// W (is_z=false): 2 * sign(bit1_a) * sign(bit1_b)
+pub fn make_zw_delta(is_z: bool) -> [i8; 16] {
+    let mut table = [0i8; 16];
+    for a in 0u32..4 {
+        for b in 0u32..4 {
+            let val = if is_z {
+                let za = if a & 1 == 1 { 1i32 } else { -1 };
+                let zb = if b & 1 == 1 { 1i32 } else { -1 };
+                2 * za * zb
+            } else {
+                let wa = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
+                let wb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
+                2 * wa * wb
+            };
+            table[(a * 4 + b) as usize] = val as i8;
+        }
+    }
+    table
+}
+
+/// Delta table for XY events: xa*xb + ya*yb.
+pub fn make_xy_delta() -> [i8; 16] {
+    let mut table = [0i8; 16];
+    for a in 0u32..4 {
+        for b in 0u32..4 {
+            let xa = if a & 1 == 1 { 1i32 } else { -1 };
+            let xb = if b & 1 == 1 { 1i32 } else { -1 };
+            let ya = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
+            let yb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
+            table[(a * 4 + b) as usize] = (xa * xb + ya * yb) as i8;
+        }
+    }
+    table
+}
+
 /// Per-level profiling counters for MDD build.
 pub struct BuildStats {
     /// Per ZW level: (calls, memo_hits, pruned, xy_builds)
@@ -552,43 +589,6 @@ impl ZwFirstMdd {
                 for (i, &p) in active.iter().enumerate() { flat[p] = i; }
                 flat
             }).collect();
-
-        // Build context
-        // Precomputed delta tables: delta[bits_a * 4 + bits_b] for each event
-        // Z event: 2 * sign(bits_a & 1) * sign(bits_b & 1)
-        // W event: 2 * sign((bits_a>>1) & 1) * sign((bits_b>>1) & 1)
-        // XY event: sign(xa) * sign(xb) + sign(ya) * sign(yb)
-        fn make_zw_delta(is_z: bool) -> [i8; 16] {
-            let mut table = [0i8; 16];
-            for a in 0u32..4 {
-                for b in 0u32..4 {
-                    let val = if is_z {
-                        let za = if a & 1 == 1 { 1i32 } else { -1 };
-                        let zb = if b & 1 == 1 { 1i32 } else { -1 };
-                        2 * za * zb
-                    } else {
-                        let wa = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
-                        let wb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
-                        2 * wa * wb
-                    };
-                    table[(a * 4 + b) as usize] = val as i8;
-                }
-            }
-            table
-        }
-        fn make_xy_delta() -> [i8; 16] {
-            let mut table = [0i8; 16];
-            for a in 0u32..4 {
-                for b in 0u32..4 {
-                    let xa = if a & 1 == 1 { 1i32 } else { -1 };
-                    let xb = if b & 1 == 1 { 1i32 } else { -1 };
-                    let ya = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
-                    let yb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
-                    table[(a * 4 + b) as usize] = (xa * xb + ya * yb) as i8;
-                }
-            }
-            table
-        }
 
         // Pre-resolve active indices into events: (lag_idx, idx_a, idx_b, delta_table)
         let zw_resolved_events: Vec<Vec<(usize, usize, usize, [i8; 16])>> =
@@ -1741,25 +1741,6 @@ pub fn build_extension(
         }).collect();
 
     // Resolve ZW events into delta tables
-    fn make_zw_delta(is_z: bool) -> [i8; 16] {
-        let mut t = [0i8; 16];
-        for a in 0u32..4 { for b in 0u32..4 {
-            t[(a*4+b) as usize] = if is_z {
-                let za = if a&1==1 {1i32} else {-1}; let zb = if b&1==1 {1} else {-1}; (2*za*zb) as i8
-            } else {
-                let wa = if (a>>1)&1==1 {1i32} else {-1}; let wb = if (b>>1)&1==1 {1} else {-1}; (2*wa*wb) as i8
-            };
-        }} t
-    }
-    fn make_xy_delta() -> [i8; 16] {
-        let mut t = [0i8; 16];
-        for a in 0u32..4 { for b in 0u32..4 {
-            let xa = if a&1==1 {1i32} else {-1}; let xb = if b&1==1 {1} else {-1};
-            let ya = if (a>>1)&1==1 {1i32} else {-1}; let yb = if (b>>1)&1==1 {1} else {-1};
-            t[(a*4+b) as usize] = (xa*xb + ya*yb) as i8;
-        }} t
-    }
-
     let zw_resolved: Vec<Vec<(usize, usize, usize, [i8; 16])>> = events_at_level.iter().enumerate().map(|(level, evs)| {
         evs.iter().map(|ev| {
             match &ev.kind {
