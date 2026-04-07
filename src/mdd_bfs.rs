@@ -12,31 +12,14 @@
 use rustc_hash::FxHashMap as HashMap;
 use rayon::prelude::*;
 use crate::mdd_reorder::Mdd4;
-
-pub const DEAD: u32 = 0;
-pub const LEAF: u32 = u32::MAX;
-
-/// Packed state key: (u128 sums, u64 active) = 24 bytes.
-type StateKey = (u128, u64);
-
-fn pack_sums(sums: &[i8]) -> u128 {
-    let mut packed = 0u128;
-    for (i, &s) in sums.iter().enumerate() {
-        packed |= ((s as u8 as u128) & 0xFF) << (i * 8);
-    }
-    packed
-}
+use crate::mdd_zw_first::{
+    DEAD, LEAF, StateKey,
+    pack_sums, pack_active, make_zw_delta,
+    compute_active_tracking,
+};
 
 fn unpack_sums(packed: u128, k: usize) -> Vec<i8> {
     (0..k).map(|i| ((packed >> (i * 8)) & 0xFF) as i8).collect()
-}
-
-fn pack_active(vals: &[u8]) -> u64 {
-    let mut packed = 0u64;
-    for (i, &v) in vals.iter().enumerate() {
-        packed |= (v as u64) << (i * 2);
-    }
-    packed
 }
 
 fn unpack_active(packed: u64, n: usize) -> Vec<u8> {
@@ -153,64 +136,18 @@ impl BfsCtx {
             }
         }
 
-        let mut last_use: Vec<usize> = vec![0; 2 * k];
-        for (level, events) in raw_events.iter().enumerate() {
-            for &(_, a, b, _) in events {
-                last_use[a] = last_use[a].max(level);
-                last_use[b] = last_use[b].max(level);
-            }
-        }
-        let mut active_at_level: Vec<Vec<usize>> = vec![Vec::new(); zw_depth + 1];
-        for d in 0..zw_depth {
-            let mut active: Vec<usize> = if d > 0 {
-                active_at_level[d - 1]
-                    .iter()
-                    .filter(|&&p| last_use[p] >= d)
-                    .copied()
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            active.push(pos_order[d]);
-            active.sort();
-            active_at_level[d] = active;
-        }
-        let active_indices: Vec<Vec<usize>> = active_at_level
-            .iter()
-            .map(|active| {
-                let mut flat = vec![usize::MAX; 2 * k];
-                for (i, &p) in active.iter().enumerate() {
-                    flat[p] = i;
-                }
-                flat
-            })
-            .collect();
+        let pairs: Vec<Vec<(usize, usize)>> = raw_events.iter()
+            .map(|evs| evs.iter().map(|&(_, a, b, _)| (a, b)).collect()).collect();
+        let (active_at_level, active_indices) =
+            compute_active_tracking(zw_depth, 2 * k, &pos_order, &pairs);
 
-        // Pre-resolve events: replace (pos_a, pos_b) with (idx_a, idx_b) + delta table
-        fn make_delta(is_z: bool) -> [i8; 16] {
-            let mut table = [0i8; 16];
-            for a in 0u32..4 {
-                for b in 0u32..4 {
-                    let val = if is_z {
-                        let za = if a & 1 == 1 { 1i32 } else { -1 };
-                        let zb = if b & 1 == 1 { 1i32 } else { -1 };
-                        2 * za * zb
-                    } else {
-                        let wa = if (a >> 1) & 1 == 1 { 1i32 } else { -1 };
-                        let wb = if (b >> 1) & 1 == 1 { 1i32 } else { -1 };
-                        2 * wa * wb
-                    };
-                    table[(a * 4 + b) as usize] = val as i8;
-                }
-            }
-            table
-        }
+        // Pre-resolve events with delta tables
         let events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>> =
             raw_events.iter().enumerate().map(|(level, evs)| {
                 evs.iter().map(|&(li, pos_a, pos_b, is_z)| {
                     let idx_a = active_indices[level][pos_a];
                     let idx_b = active_indices[level][pos_b];
-                    (li, idx_a, idx_b, make_delta(is_z))
+                    (li, idx_a, idx_b, make_zw_delta(is_z))
                 }).collect()
             }).collect();
 
