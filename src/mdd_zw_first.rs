@@ -43,6 +43,43 @@ pub fn hash_node4(level: u8, children: &[u32; 4]) -> u64 {
     h.finish()
 }
 
+/// Compute active position tracking for a sequence of levels.
+/// `position_pairs[level]` gives the (pos_a, pos_b) pairs that complete at that level.
+/// Returns (active_at_level, active_indices) where active_indices is a flat Vec<usize>
+/// with active_indices[level][pos] = index in active set (usize::MAX if absent).
+pub fn compute_active_tracking(
+    depth: usize,
+    n_positions: usize,
+    pos_order: &[usize],
+    position_pairs: &[Vec<(usize, usize)>],
+) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+    let mut last_use: Vec<usize> = vec![0; n_positions];
+    for (level, pairs) in position_pairs.iter().enumerate() {
+        for &(a, b) in pairs {
+            last_use[a] = last_use[a].max(level);
+            last_use[b] = last_use[b].max(level);
+        }
+    }
+    let mut active_at_level: Vec<Vec<usize>> = vec![Vec::new(); depth + 1];
+    for d in 0..depth {
+        let mut active: Vec<usize> = if d > 0 {
+            active_at_level[d - 1].iter()
+                .filter(|&&p| last_use[p] >= d)
+                .copied().collect()
+        } else { Vec::new() };
+        active.push(pos_order[d]);
+        active.sort();
+        active_at_level[d] = active;
+    }
+    let active_indices: Vec<Vec<usize>> = active_at_level.iter()
+        .map(|active| {
+            let mut flat = vec![usize::MAX; n_positions];
+            for (i, &p) in active.iter().enumerate() { flat[p] = i; }
+            flat
+        }).collect();
+    (active_at_level, active_indices)
+}
+
 /// Delta table for Z or W events: delta[bits_a * 4 + bits_b].
 /// Z (is_z=true): 2 * sign(bit0_a) * sign(bit0_b)
 /// W (is_z=false): 2 * sign(bit1_a) * sign(bit1_b)
@@ -565,57 +602,15 @@ impl ZwFirstMdd {
         }
 
         // Active position tracking for z,w half
-        let mut zw_last_use: Vec<usize> = vec![0; 2 * k];
-        for (level, events) in zw_events_at_level.iter().enumerate() {
-            for (_, ev) in events {
-                zw_last_use[ev.pos_a] = zw_last_use[ev.pos_a].max(level);
-                zw_last_use[ev.pos_b] = zw_last_use[ev.pos_b].max(level);
-            }
-        }
-        let mut zw_active_at_level: Vec<Vec<usize>> = vec![Vec::new(); zw_depth + 1];
-        for d in 0..zw_depth {
-            let mut active: Vec<usize> = if d > 0 {
-                zw_active_at_level[d - 1].iter()
-                    .filter(|&&p| zw_last_use[p] >= d)
-                    .copied().collect()
-            } else { Vec::new() };
-            active.push(pos_order[d]);
-            active.sort();
-            zw_active_at_level[d] = active;
-        }
-        // Flat array for position→index lookup (avoids HashMap in hot path)
-        let zw_active_indices: Vec<Vec<usize>> = zw_active_at_level.iter()
-            .map(|active| {
-                let mut flat = vec![usize::MAX; 2 * k];
-                for (i, &p) in active.iter().enumerate() { flat[p] = i; }
-                flat
-            }).collect();
+        let zw_pairs: Vec<Vec<(usize, usize)>> = zw_events_at_level.iter()
+            .map(|evs| evs.iter().map(|(_, ev)| (ev.pos_a, ev.pos_b)).collect()).collect();
+        let (zw_active_at_level, zw_active_indices) =
+            compute_active_tracking(zw_depth, 2 * k, &pos_order, &zw_pairs);
 
-        // Active position tracking for x,y half
-        let mut xy_last_use: Vec<usize> = vec![0; 2 * k];
-        for (level, events) in xy_events_at_level.iter().enumerate() {
-            for (_, ev) in events {
-                xy_last_use[ev.pos_a] = xy_last_use[ev.pos_a].max(level);
-                xy_last_use[ev.pos_b] = xy_last_use[ev.pos_b].max(level);
-            }
-        }
-        let mut xy_active_at_level: Vec<Vec<usize>> = vec![Vec::new(); zw_depth + 1];
-        for d in 0..zw_depth {
-            let mut active: Vec<usize> = if d > 0 {
-                xy_active_at_level[d - 1].iter()
-                    .filter(|&&p| xy_last_use[p] >= d)
-                    .copied().collect()
-            } else { Vec::new() };
-            active.push(pos_order[d]);
-            active.sort();
-            xy_active_at_level[d] = active;
-        }
-        let xy_active_indices: Vec<Vec<usize>> = xy_active_at_level.iter()
-            .map(|active| {
-                let mut flat = vec![usize::MAX; 2 * k];
-                for (i, &p) in active.iter().enumerate() { flat[p] = i; }
-                flat
-            }).collect();
+        let xy_pairs: Vec<Vec<(usize, usize)>> = xy_events_at_level.iter()
+            .map(|evs| evs.iter().map(|(_, ev)| (ev.pos_a, ev.pos_b)).collect()).collect();
+        let (xy_active_at_level, xy_active_indices) =
+            compute_active_tracking(zw_depth, 2 * k, &pos_order, &xy_pairs);
 
         // Pre-resolve active indices into events: (lag_idx, idx_a, idx_b, delta_table)
         let zw_resolved_events: Vec<Vec<(usize, usize, usize, [i8; 16])>> =
@@ -1195,31 +1190,10 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
         }
     }
 
-    // Active position tracking
-    let mut xy_last_use: Vec<usize> = vec![0; 2 * k];
-    for (level, events) in xy_events_at_level.iter().enumerate() {
-        for (_, ev) in events {
-            xy_last_use[ev.pos_a] = xy_last_use[ev.pos_a].max(level);
-            xy_last_use[ev.pos_b] = xy_last_use[ev.pos_b].max(level);
-        }
-    }
-    let mut xy_active_at_level: Vec<Vec<usize>> = vec![Vec::new(); zw_depth + 1];
-    for d in 0..zw_depth {
-        let mut active: Vec<usize> = if d > 0 {
-            xy_active_at_level[d - 1].iter()
-                .filter(|&&p| xy_last_use[p] >= d)
-                .copied().collect()
-        } else { Vec::new() };
-        active.push(pos_order[d]);
-        active.sort();
-        xy_active_at_level[d] = active;
-    }
-    let xy_active_indices: Vec<Vec<usize>> = xy_active_at_level.iter()
-        .map(|active| {
-            let mut flat = vec![usize::MAX; 2 * k];
-            for (i, &p) in active.iter().enumerate() { flat[p] = i; }
-            flat
-        }).collect();
+    let xy_pairs_for_active: Vec<Vec<(usize, usize)>> = xy_events_at_level.iter()
+        .map(|evs| evs.iter().map(|(_, ev)| (ev.pos_a, ev.pos_b)).collect()).collect();
+    let (xy_active_at_level, xy_active_indices) =
+        compute_active_tracking(zw_depth, 2 * k, &pos_order, &xy_pairs_for_active);
 
     // Precompute delta table
     let mut xy_delta = [0i8; 16];
@@ -1687,37 +1661,21 @@ pub fn build_extension(
     // Compute total XY max achievable for range pruning at ZW boundary
     let xy_max_abs: Vec<i32> = (0..target_k).map(|j| xy_max_remaining[0][j]).collect();
 
-    // Active position tracking (same for both ZW and XY halves — same positions)
-    let mut last_use: Vec<usize> = vec![0; ext_depth];
-    for (level, evs) in events_at_level.iter().chain(xy_events_at_level.iter()).enumerate() {
-        let l = level % ext_depth; // events_at_level and xy_events_at_level use same position indices
-        for ev in evs {
-            match &ev.kind {
-                ExtEventKind::NewNew { ext_a, ext_b, .. } => {
-                    last_use[*ext_a] = last_use[*ext_a].max(l);
-                    last_use[*ext_b] = last_use[*ext_b].max(l);
-                }
-                ExtEventKind::OldNew { ext_new, .. } => {
-                    last_use[*ext_new] = last_use[*ext_new].max(l);
-                }
-            }
-        }
+    // Extract position pairs from events for active tracking
+    fn ext_event_pairs(evs: &[ExtEvent]) -> Vec<(usize, usize)> {
+        evs.iter().map(|ev| match &ev.kind {
+            ExtEventKind::NewNew { ext_a, ext_b, .. } => (*ext_a, *ext_b),
+            ExtEventKind::OldNew { ext_new, .. } => (*ext_new, *ext_new),
+        }).collect()
     }
-    let mut active_at_level: Vec<Vec<usize>> = vec![Vec::new(); ext_depth + 1];
-    for d in 0..ext_depth {
-        let mut active: Vec<usize> = if d > 0 {
-            active_at_level[d - 1].iter().filter(|&&p| last_use[p] >= d).copied().collect()
-        } else { Vec::new() };
-        active.push(pos_order[d]);
-        active.sort();
-        active_at_level[d] = active;
-    }
-    let active_indices: Vec<Vec<usize>> = active_at_level.iter()
-        .map(|active| {
-            let mut flat = vec![usize::MAX; ext_depth];
-            for (i, &p) in active.iter().enumerate() { flat[p] = i; }
-            flat
-        }).collect();
+    // Combine ZW and XY event pairs (both use same position space)
+    let combined_pairs: Vec<Vec<(usize, usize)>> = (0..ext_depth).map(|l| {
+        let mut pairs = ext_event_pairs(&events_at_level[l]);
+        pairs.extend(ext_event_pairs(&xy_events_at_level[l]));
+        pairs
+    }).collect();
+    let (active_at_level, active_indices) =
+        compute_active_tracking(ext_depth, ext_depth, &pos_order, &combined_pairs);
 
     // Resolve ZW events into delta tables
     let zw_resolved: Vec<Vec<(usize, usize, usize, [i8; 16])>> = events_at_level.iter().enumerate().map(|(level, evs)| {
