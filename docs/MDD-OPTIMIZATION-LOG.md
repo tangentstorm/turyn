@@ -20,10 +20,10 @@ time target/release/gen_mdd 10 /dev/null
 | k | Time (par) | Time (seq) | Nodes | File size |
 |---|-----------|-----------|-------|-----------|
 | 7 | 0.3s | 0.3s | 69K | 1.0 MB |
-| 8 | 1.6s | 3.1s | 433K | 6.6 MB |
-| 9 | 28.1s | 37.8s | 2.6M | 39.6 MB |
-| 10 | ~7min | ~15min | 17.2M | 262 MB |
-| 11 | ~2h (est) | ~5h (est) | ~170M (est) | ~2.6 GB (est) |
+| 8 | 1.6s | 2.5s | 433K | 6.6 MB |
+| 9 | 10.2s | 28s | 2.6M | 39.6 MB |
+| 10 | 191s | ~12min | 17.2M | 262 MB |
+| 11 | ~30min (est) | ~2h (est) | ~170M (est) | ~2.6 GB (est) |
 
 Original baselines: k=7: 4.7s, k=8: 46.6s, k=9: OOM/timeout
 
@@ -41,3 +41,5 @@ Original baselines: k=7: 4.7s, k=8: 46.6s, k=9: OOM/timeout
 | 2026-04-06 | Parallel level-1 branches (rayon) + post-merge dedup | 4 branches run independently, then dedup removes duplicates (40% reduction) | k=8: 7→3.9s; k=9: 79→47s; k=10: 21m33→10m30 (2x faster) |
 | 2026-04-07 | XY sub-MDD caching by zw_sums (u128 key) | 74% of ZW boundary visits have duplicate sums; skip rebuilding XY sub-MDD | k=8 seq: 7.7→3.1s (-60%); k=9 seq: 93.8→37.8s (-60%); k=9 par: 40→28.1s (-30%) |
 | 2026-04-07 | Flat Vec<usize> active_indices + stack arrays | Replace HashMap→flat array for pos→index lookup; [u8;32] stack arrays | k=9 seq: 37.8→28s (-26%); k=9 par: 28.1→10.2s (-64%) |
+| 2026-04-07 | BFS builder with optimized Pass 2 | Complete ZW+XY BFS builder; stores children indices to avoid re-expansion | BFS k=9: 144→57s; DFS still faster for k≤10 |
+| 2026-04-07 | Configurable memo cap (default 80M) | MDD_MEMO_CAP env var; default increased from 50M to 80M | k=10 par: 191s (was ~10min before all opts); k=11 seq: in progress |
