@@ -1438,25 +1438,15 @@ impl SatXYTemplate {
         true
     }
 
-    /// Solve for X/Y given a specific Z/W candidate.
-    /// Clones the template and adds PB constraints for per-lag agree targets.
-    /// Returns (result, was_limited): result is Some if SAT, None if UNSAT/UNKNOWN.
-    /// was_limited=true means we hit the conflict limit (UNKNOWN).
-    fn solve_for_limited(&self, candidate: &CandidateZW, conflict_limit: u64) -> (Option<(PackedSeq, PackedSeq)>, bool) {
-        if !self.is_feasible(candidate) { return (None, false); }
+    /// Clone the template solver and add per-candidate constraints:
+    /// GJ equalities, quad PB per lag, and XOR parity constraints.
+    /// Returns None if infeasible or GJ detects a contradiction.
+    fn prepare_candidate_solver(&self, candidate: &CandidateZW) -> Option<radical::Solver> {
+        if !self.is_feasible(candidate) { return None; }
         let n = self.n;
-        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
-        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
-
-        // GJ-derived equalities from extreme-target lags (before clone — cheap)
-        let Some(equalities) = gj_candidate_equalities(n, candidate) else {
-            return (None, false); // GJ detected contradiction → UNSAT
-        };
+        let Some(equalities) = gj_candidate_equalities(n, candidate) else { return None; };
 
         let mut solver = self.solver.clone();
-        if conflict_limit > 0 {
-            solver.set_conflict_limit(conflict_limit);
-        }
         for &(a, b, equal) in &equalities {
             if equal {
                 solver.add_clause([-a, b]);
@@ -1476,97 +1466,6 @@ impl SatXYTemplate {
         }
 
         // GF(2) XOR constraints: parity of agree count at each lag.
-        // For lag s with agree target T and k = 2*(n-s) pairs:
-        //   XOR of {x[i] ⊕ x[i+s] for i in 0..n-s} ⊕ {y[i] ⊕ y[i+s] for i in 0..n-s} = (T+k) mod 2
-        // Each variable v appears in the XOR with multiplicity = (# pairs containing v) mod 2.
-        if solver.config.xor_propagation && n >= 8 {
-            for s in 1..n {
-                let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { continue; };
-                let k = 2 * (n - s);
-                let parity = ((target + k) % 2) == 1;
-
-                // Build variable list: each var appears with multiplicity = # pairs it's in, mod 2
-                let mut in_xor = vec![false; 2 * n];
-                // X pairs: (i, i+s) for i in 0..n-s
-                for i in 0..(n - s) {
-                    in_xor[i] ^= true;
-                    in_xor[i + s] ^= true;
-                }
-                // Y pairs: (n+i, n+i+s) for i in 0..n-s
-                for i in 0..(n - s) {
-                    in_xor[n + i] ^= true;
-                    in_xor[n + i + s] ^= true;
-                }
-                let vars: Vec<i32> = in_xor.iter().enumerate()
-                    .filter(|&(_, &v)| v)
-                    .map(|(i, _)| (i + 1) as i32)  // 1-based
-                    .collect();
-                if !vars.is_empty() {
-                    solver.add_xor(&vars, parity);
-                }
-            }
-        }
-
-        match solver.solve() {
-            Some(true) => {
-                let x = extract_seq(&solver, x_var, n);
-                let y = extract_seq(&solver, y_var, n);
-                (Some((x, y)), false)
-            }
-            Some(false) => (None, false),  // definite UNSAT
-            None => (None, true),  // hit conflict limit (UNKNOWN)
-        }
-    }
-
-    fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
-        self.solve_for_limited(candidate, 0).0
-    }
-
-    /// Solve with warm-start: inject saved clauses/phases before solving,
-    /// extract learnt clauses/phases after solving.
-    fn solve_for_warm(
-        &self,
-        candidate: &CandidateZW,
-        warm: &mut WarmStartState,
-    ) -> Option<(PackedSeq, PackedSeq)> {
-        if !self.is_feasible(candidate) { return None; }
-        let n = self.n;
-        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
-        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
-
-        let Some(equalities) = gj_candidate_equalities(n, candidate) else {
-            return None;
-        };
-
-        let mut solver = self.solver.clone();
-
-        // Inject warm-start data
-        if warm.inject_clauses && !warm.clauses.is_empty() {
-            solver.inject_clauses(&warm.clauses, 2);
-        }
-        if warm.inject_phase {
-            if let Some(ref ph) = warm.phase {
-                solver.set_phase(ph);
-            }
-        }
-
-        for &(a, b, equal) in &equalities {
-            if equal {
-                solver.add_clause([-a, b]);
-                solver.add_clause([a, -b]);
-            } else {
-                solver.add_clause([-a, -b]);
-                solver.add_clause([a, b]);
-            }
-        }
-
-        for s in 1..n {
-            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
-            let lp = &self.lag_pairs[s];
-            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
-            solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
-        }
-
         if solver.config.xor_propagation && n >= 8 {
             for s in 1..n {
                 let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { continue; };
@@ -1591,6 +1490,59 @@ impl SatXYTemplate {
             }
         }
 
+        Some(solver)
+    }
+
+    /// Extract X/Y solution from a solved SAT solver.
+    fn extract_xy(&self, solver: &radical::Solver) -> (PackedSeq, PackedSeq) {
+        let n = self.n;
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        (extract_seq(solver, x_var, n), extract_seq(solver, y_var, n))
+    }
+
+    /// Solve for X/Y given a specific Z/W candidate.
+    /// Returns (result, was_limited): result is Some if SAT, None if UNSAT/UNKNOWN.
+    /// was_limited=true means we hit the conflict limit (UNKNOWN).
+    fn solve_for_limited(&self, candidate: &CandidateZW, conflict_limit: u64) -> (Option<(PackedSeq, PackedSeq)>, bool) {
+        let Some(mut solver) = self.prepare_candidate_solver(candidate) else {
+            return (None, false);
+        };
+        if conflict_limit > 0 {
+            solver.set_conflict_limit(conflict_limit);
+        }
+        match solver.solve() {
+            Some(true) => (Some(self.extract_xy(&solver)), false),
+            Some(false) => (None, false),
+            None => (None, true),
+        }
+    }
+
+    fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
+        self.solve_for_limited(candidate, 0).0
+    }
+
+    /// Solve with warm-start: inject saved clauses/phases before solving,
+    /// extract learnt clauses/phases after solving.
+    fn solve_for_warm(
+        &self,
+        candidate: &CandidateZW,
+        warm: &mut WarmStartState,
+    ) -> Option<(PackedSeq, PackedSeq)> {
+        let Some(mut solver) = self.prepare_candidate_solver(candidate) else {
+            return None;
+        };
+
+        // Inject warm-start data
+        if warm.inject_clauses && !warm.clauses.is_empty() {
+            solver.inject_clauses(&warm.clauses, 2);
+        }
+        if warm.inject_phase {
+            if let Some(ref ph) = warm.phase {
+                solver.set_phase(ph);
+            }
+        }
+
         let result = solver.solve();
 
         // Extract warm-start data for next solve
@@ -1603,11 +1555,7 @@ impl SatXYTemplate {
         warm.phase = Some(solver.get_phase());
 
         match result {
-            Some(true) => {
-                let x = extract_seq(&solver, x_var, n);
-                let y = extract_seq(&solver, y_var, n);
-                Some((x, y))
-            }
+            Some(true) => Some(self.extract_xy(&solver)),
             _ => None,
         }
     }
