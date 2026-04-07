@@ -1211,8 +1211,8 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
 /// (positions base_k..target_k-1 in the "short" halves and their corresponding
 /// "long" counterparts).
 ///
-/// The lag structure: lag j pairs position i with position (k + i + j) for Z/X,
-/// and position i with position (k + i + j + 1) for W/Y. When extending from
+/// The lag structure: lag j pairs position i with position (k + i + j) for Z/X/Y,
+/// and position i with position (k + i + j + 1) for W alone. When extending from
 /// base_k to target_k, we get three kinds of autocorrelation terms:
 ///   1. Old×Old: fully determined by the base boundary bits (frozen, becomes initial sums)
 ///   2. Old×New: one factor is known, the other is a new variable (cross-terms)
@@ -1234,48 +1234,45 @@ pub fn build_extension(
     assert!(target_k > base_k, "target_k must be > base_k");
     let extra = target_k - base_k;
 
-    // Compute initial sums from old×old pairs (these are fixed)
+    // Compute initial sums from old×old pairs (these are fixed).
+    //
+    // Target encoding: short=0..target_k-1, long=target_k..2*target_k-1.
+    // Old positions: short 0..base_k-1, long target_k+extra..2*target_k-1.
+    // New positions: short base_k..target_k-1, long target_k..target_k+extra-1.
+    //
+    // For target lag j, Z/X/Y pairs are (i, target_k+i+j). Old×old requires
+    // i < base_k AND i+j >= extra (so the long position is old, not new).
+    // Base-encoding bit for old long target pos target_k+i+j: base_k + (i+j - extra).
+    //
+    // For W pairs at (i, target_k+i+j+1): old×old requires i < base_k AND i+j+1 >= extra.
     let mut initial_sums = vec![0i8; target_k];
     for j in 0..target_k {
         let mut sum = 0i32;
 
-        // Z old×old pairs: lag j, positions (i, base_k + i + j)
-        // Only pairs where BOTH positions are in 0..2*base_k
+        // Z/X/Y old×old pairs: (i, target_k+i+j) where i < base_k AND i+j >= extra
         for i in 0..base_k {
-            let pos_b = base_k + i + j;
-            if pos_b < 2 * base_k {
-                let za = if (z_bits >> i) & 1 == 1 { 1 } else { -1i32 };
-                let zb = if (z_bits >> pos_b) & 1 == 1 { 1 } else { -1i32 };
-                sum += 2 * za * zb;
-            }
+            if i + j < extra { continue; } // long position is new
+            if i + j >= target_k { continue; } // out of range
+            let bit_b = base_k + (i + j - extra);
+            let za = if (z_bits >> i) & 1 == 1 { 1 } else { -1i32 };
+            let zb = if (z_bits >> bit_b) & 1 == 1 { 1 } else { -1i32 };
+            sum += 2 * za * zb;
+            let xa = if (x_bits >> i) & 1 == 1 { 1 } else { -1i32 };
+            let xb = if (x_bits >> bit_b) & 1 == 1 { 1 } else { -1i32 };
+            sum += xa * xb;
+            let ya = if (y_bits >> i) & 1 == 1 { 1 } else { -1i32 };
+            let yb = if (y_bits >> bit_b) & 1 == 1 { 1 } else { -1i32 };
+            sum += ya * yb;
         }
-        // W old×old pairs: lag j, positions (i, base_k + i + j + 1)
+        // W old×old pairs: (i, target_k+i+j+1) where i < base_k AND i+j+1 >= extra
         if j < target_k - 1 {
             for i in 0..base_k {
-                let pos_b = base_k + i + j + 1;
-                if pos_b < 2 * base_k {
-                    let wa = if (w_bits >> i) & 1 == 1 { 1 } else { -1i32 };
-                    let wb = if (w_bits >> pos_b) & 1 == 1 { 1 } else { -1i32 };
-                    sum += 2 * wa * wb;
-                }
-            }
-        }
-        // X old×old pairs
-        for i in 0..base_k {
-            let pos_b = base_k + i + j;
-            if pos_b < 2 * base_k {
-                let xa = if (x_bits >> i) & 1 == 1 { 1 } else { -1i32 };
-                let xb = if (x_bits >> pos_b) & 1 == 1 { 1 } else { -1i32 };
-                sum += xa * xb;
-            }
-        }
-        // Y old×old pairs
-        for i in 0..base_k {
-            let pos_b = base_k + i + j;
-            if pos_b < 2 * base_k {
-                let ya = if (y_bits >> i) & 1 == 1 { 1 } else { -1i32 };
-                let yb = if (y_bits >> pos_b) & 1 == 1 { 1 } else { -1i32 };
-                sum += ya * yb;
+                if i + j + 1 < extra { continue; }
+                if i + j + 1 >= target_k { continue; }
+                let bit_b = base_k + (i + j + 1 - extra);
+                let wa = if (w_bits >> i) & 1 == 1 { 1 } else { -1i32 };
+                let wb = if (w_bits >> bit_b) & 1 == 1 { 1 } else { -1i32 };
+                sum += 2 * wa * wb;
             }
         }
 
@@ -1304,24 +1301,26 @@ pub fn build_extension(
         pos_to_level[pos] = level;
     }
 
-    // Events: for each lag j, determine which pairs involve extension positions.
-    // A pair (i, base_k+i+j) where i or base_k+i+j is in the extension range.
+    // Position classification for events.
     //
-    // Extension positions in the full sequence:
-    //   Short half: base_k..base_k+extra-1  (ext pos 0..extra-1)
-    //   Long half:  base_k+extra..2*target_k-1  (ext pos extra..2*extra-1)
+    // Target encoding: short=0..target_k-1, long=target_k..2*target_k-1.
+    // Old short: 0..base_k-1.  New short: base_k..target_k-1.
+    // New long: target_k..target_k+extra-1.  Old long: target_k+extra..2*target_k-1.
     //
-    // Actually: the full sequence has 2*target_k positions. Positions 0..target_k-1
-    // are "short", positions target_k..2*target_k-1 are "long".
-    // Old positions: 0..base_k-1 (short) and target_k..target_k+base_k-1 (long)
-    // New positions: base_k..target_k-1 (short) and target_k+base_k..2*target_k-1 (long)
-    //
-    // In the extension MDD, we number new positions 0..2*extra-1:
-    //   0..extra-1 = actual positions base_k..target_k-1 (new short)
-    //   extra..2*extra-1 = actual positions target_k+base_k..2*target_k-1 (new long)
+    // Extension numbering: ext 0..extra-1 = new short, ext extra..2*extra-1 = new long.
 
-    // For each lag j, collect events involving at least one new position.
-    // Each event: which ext positions are involved, and if one is old, what's the known value.
+    // Classify target position: Some(ext_idx) if new, None if old.
+    let classify = |pos: usize| -> Option<usize> {
+        if pos < base_k { None }
+        else if pos < target_k { Some(pos - base_k) }
+        else if pos < target_k + extra { Some(extra + (pos - target_k)) }
+        else { None }
+    };
+    // Convert old target position to base-encoding bit index.
+    let to_base_bit = |pos: usize| -> usize {
+        if pos < base_k { pos } else { base_k + (pos - target_k - extra) }
+    };
+
     struct ExtEvent {
         lag: usize,
         // If both positions are new: ext_a and ext_b are extension positions
@@ -1342,23 +1341,16 @@ pub fn build_extension(
     for j in 0..target_k {
         let mut max_complete_level: Option<usize> = None;
 
-        // Z/X pairs: (i, target_k + i + j) for i in 0..target_k-j
+        // Z pairs: (i, target_k + i + j) for i in 0..target_k-j
         for i in 0..target_k.saturating_sub(j) {
-            let actual_a = i;
-            let actual_b = target_k + i + j;
-            if actual_b >= 2 * target_k { continue; }
+            let pos_a = i;
+            let pos_b = target_k + i + j;
+            if pos_b >= 2 * target_k { continue; }
 
-            let a_is_new = actual_a >= base_k && actual_a < target_k;
-            let b_is_new = actual_b >= target_k + base_k;
+            let ext_a = classify(pos_a);
+            let ext_b = classify(pos_b);
+            if ext_a.is_none() && ext_b.is_none() { continue; }
 
-            if !a_is_new && !b_is_new {
-                continue; // old×old: already in initial_sums
-            }
-
-            let ext_a = if a_is_new { Some(actual_a - base_k) } else { None };
-            let ext_b = if b_is_new { Some(extra + (actual_b - target_k - base_k)) } else { None };
-
-            // Determine when this event completes (both positions assigned)
             let complete_level = match (ext_a, ext_b) {
                 (Some(ea), Some(eb)) => pos_to_level[ea].max(pos_to_level[eb]),
                 (Some(ea), None) => pos_to_level[ea],
@@ -1372,51 +1364,42 @@ pub fn build_extension(
                     kind: ExtEventKind::NewNew { ext_a: ea, ext_b: eb, is_z: true },
                 },
                 (Some(en), None) => {
-                    // b is old position
-                    let zb = if (z_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
-                    let xb = if (x_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                    let bb = to_base_bit(pos_b);
+                    let zb = if (z_bits >> bb) & 1 == 1 { 1i8 } else { -1 };
                     ExtEvent {
                         lag: j,
-                        kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: zb, old_sign_w: 0, old_sign_x: xb, old_sign_y: 0 },
+                        kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: zb, old_sign_w: 0, old_sign_x: 0, old_sign_y: 0 },
                     }
                 },
                 (None, Some(en)) => {
-                    // a is old position
-                    let za = if (z_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
-                    let xa = if (x_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                    let ba = to_base_bit(pos_a);
+                    let za = if (z_bits >> ba) & 1 == 1 { 1i8 } else { -1 };
                     ExtEvent {
                         lag: j,
-                        kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: za, old_sign_w: 0, old_sign_x: xa, old_sign_y: 0 },
+                        kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: za, old_sign_w: 0, old_sign_x: 0, old_sign_y: 0 },
                     }
                 },
                 _ => unreachable!(),
             };
 
-            // Track max contribution for pruning
             for lv in 0..=complete_level {
-                max_remaining[lv][j] += 4; // max |delta| per event (2 for Z + 2 for X)
+                max_remaining[lv][j] += 2; // max |2*za*zb| = 2
             }
 
             events_at_level[complete_level].push(event);
             max_complete_level = Some(max_complete_level.map_or(complete_level, |c: usize| c.max(complete_level)));
         }
 
-        // W/Y pairs: (i, target_k + i + j + 1) for i in 0..target_k-j-1
+        // W-only pairs: (i, target_k + i + j + 1) for i in 0..target_k-j-1
         if j < target_k - 1 {
             for i in 0..target_k - j - 1 {
-                let actual_a = i;
-                let actual_b = target_k + i + j + 1;
-                if actual_b >= 2 * target_k { continue; }
+                let pos_a = i;
+                let pos_b = target_k + i + j + 1;
+                if pos_b >= 2 * target_k { continue; }
 
-                let a_is_new = actual_a >= base_k && actual_a < target_k;
-                let b_is_new = actual_b >= target_k + base_k;
-
-                if !a_is_new && !b_is_new {
-                    continue; // old×old
-                }
-
-                let ext_a = if a_is_new { Some(actual_a - base_k) } else { None };
-                let ext_b = if b_is_new { Some(extra + (actual_b - target_k - base_k)) } else { None };
+                let ext_a = classify(pos_a);
+                let ext_b = classify(pos_b);
+                if ext_a.is_none() && ext_b.is_none() { continue; }
 
                 let complete_level = match (ext_a, ext_b) {
                     (Some(ea), Some(eb)) => pos_to_level[ea].max(pos_to_level[eb]),
@@ -1431,26 +1414,26 @@ pub fn build_extension(
                         kind: ExtEventKind::NewNew { ext_a: ea, ext_b: eb, is_z: false },
                     },
                     (Some(en), None) => {
-                        let wb = if (w_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
-                        let yb = if (y_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                        let bb = to_base_bit(pos_b);
+                        let wb = if (w_bits >> bb) & 1 == 1 { 1i8 } else { -1 };
                         ExtEvent {
                             lag: j,
-                            kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: 0, old_sign_w: wb, old_sign_x: 0, old_sign_y: yb },
+                            kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: 0, old_sign_w: wb, old_sign_x: 0, old_sign_y: 0 },
                         }
                     },
                     (None, Some(en)) => {
-                        let wa = if (w_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
-                        let ya = if (y_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                        let ba = to_base_bit(pos_a);
+                        let wa = if (w_bits >> ba) & 1 == 1 { 1i8 } else { -1 };
                         ExtEvent {
                             lag: j,
-                            kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: 0, old_sign_w: wa, old_sign_x: 0, old_sign_y: ya },
+                            kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: 0, old_sign_w: wa, old_sign_x: 0, old_sign_y: 0 },
                         }
                     },
                     _ => unreachable!(),
                 };
 
                 for lv in 0..=complete_level {
-                    max_remaining[lv][j] += 4;
+                    max_remaining[lv][j] += 2; // max |2*wa*wb| = 2
                 }
 
                 events_at_level[complete_level].push(event);
@@ -1464,7 +1447,7 @@ pub fn build_extension(
     }
 
     // Build XY events separately (for the second half of the extension).
-    // XY pairs: (i, target_k+i+j) for X and Y, using new positions.
+    // XY pairs: (i, target_k+i+j) for X and Y (same positions as Z).
     let mut xy_events_at_level: Vec<Vec<ExtEvent>> = (0..ext_depth).map(|_| Vec::new()).collect();
     let mut xy_lag_check_at_level: Vec<Vec<usize>> = (0..=ext_depth).map(|_| Vec::new()).collect();
     let mut xy_max_remaining: Vec<Vec<i32>> = vec![vec![0i32; target_k]; ext_depth + 1];
@@ -1472,19 +1455,15 @@ pub fn build_extension(
     for j in 0..target_k {
         let mut max_complete_level: Option<usize> = None;
 
-        // X/Y pairs: (i, target_k + i + j)
+        // X/Y pairs: (i, target_k + i + j) — same positions as Z
         for i in 0..target_k.saturating_sub(j) {
-            let actual_a = i;
-            let actual_b = target_k + i + j;
-            if actual_b >= 2 * target_k { continue; }
+            let pos_a = i;
+            let pos_b = target_k + i + j;
+            if pos_b >= 2 * target_k { continue; }
 
-            let a_is_new = actual_a >= base_k && actual_a < target_k;
-            let b_is_new = actual_b >= target_k + base_k;
-
-            if !a_is_new && !b_is_new { continue; }
-
-            let ext_a = if a_is_new { Some(actual_a - base_k) } else { None };
-            let ext_b = if b_is_new { Some(extra + (actual_b - target_k - base_k)) } else { None };
+            let ext_a = classify(pos_a);
+            let ext_b = classify(pos_b);
+            if ext_a.is_none() && ext_b.is_none() { continue; }
 
             let complete_level = match (ext_a, ext_b) {
                 (Some(ea), Some(eb)) => pos_to_level[ea].max(pos_to_level[eb]),
@@ -1499,15 +1478,17 @@ pub fn build_extension(
                     kind: ExtEventKind::NewNew { ext_a: ea, ext_b: eb, is_z: true }, // is_z used as "is_x" here
                 },
                 (Some(en), None) => {
-                    let xb = if (x_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
-                    let yb = if (y_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                    let bb = to_base_bit(pos_b);
+                    let xb = if (x_bits >> bb) & 1 == 1 { 1i8 } else { -1 };
+                    let yb = if (y_bits >> bb) & 1 == 1 { 1i8 } else { -1 };
                     ExtEvent { lag: j, kind: ExtEventKind::OldNew {
                         ext_new: en, old_sign_z: xb, old_sign_w: yb, old_sign_x: 0, old_sign_y: 0,
                     }}
                 },
                 (None, Some(en)) => {
-                    let xa = if (x_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
-                    let ya = if (y_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                    let ba = to_base_bit(pos_a);
+                    let xa = if (x_bits >> ba) & 1 == 1 { 1i8 } else { -1 };
+                    let ya = if (y_bits >> ba) & 1 == 1 { 1i8 } else { -1 };
                     ExtEvent { lag: j, kind: ExtEventKind::OldNew {
                         ext_new: en, old_sign_z: xa, old_sign_w: ya, old_sign_x: 0, old_sign_y: 0,
                     }}
