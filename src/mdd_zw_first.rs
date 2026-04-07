@@ -1034,6 +1034,139 @@ impl ZwFirstMdd {
 /// This is the key API for runtime MDD extension: the main turyn program
 /// can walk a prebuilt k=K MDD, extract zw_sums at each boundary, and
 /// call this to build the XY constraint for that specific boundary.
+/// Context for ZW half DFS builder.
+pub struct ZwBuildCtx {
+    pub pos_order: Vec<usize>,
+    pub events: Vec<Vec<(usize, usize, usize, [i8; 16])>>,
+    pub lag_check: Vec<Vec<usize>>,
+    pub max_remaining: Vec<Vec<i32>>,
+    pub active_at_level: Vec<Vec<usize>>,
+    pub active_indices: Vec<Vec<usize>>,
+    pub xy_max_abs: Vec<i32>,
+    pub k: usize,
+    pub depth: usize,
+    pub symmetry_break: bool,
+    pub restrict_branches: Vec<(usize, u32)>,
+}
+
+/// DFS builder for ZW half. At the boundary, delegates to build_xy_dfs.
+/// Returns the root node ID.
+pub fn build_zw_dfs(
+    level: usize,
+    sums: &mut [i8],
+    active_bits: &[u8],
+    ctx: &ZwBuildCtx,
+    xy_ctx: &XyBuildCtx,
+    nodes: &mut Vec<[u32; 4]>,
+    unique: &mut HashMap<u64, u32>,
+    zw_memo: &mut Vec<HashMap<StateKey, u32>>,
+    xy_memo: &mut Vec<HashMap<StateKey, u32>>,
+    max_memo_entries: usize,
+    zw_memo_count: &mut usize,
+) -> u32 {
+    if level == ctx.depth {
+        // ZW done. Check XY feasibility, then build XY half.
+        for li in 0..ctx.k {
+            let zw_val = sums[li] as i32;
+            if zw_val.abs() > ctx.xy_max_abs[li] { return DEAD; }
+            if (zw_val + ctx.xy_max_abs[li]) % 2 != 0 { return DEAD; }
+        }
+        for m in xy_memo.iter_mut() { m.clear(); }
+        // XY must contribute -sums[li] to reach zero total
+        let target: Vec<i8> = sums.iter().map(|&s| -s).collect();
+        let mut xy_sums = vec![0i8; ctx.k];
+        return build_xy_dfs(
+            0, &mut xy_sums, &[], &target,
+            xy_ctx, nodes, unique, xy_memo,
+        );
+    }
+
+    let active = &ctx.active_at_level[level];
+    let n_active = active.len();
+    let mut current_vals = [0u8; 32];
+    if level > 0 {
+        let prev_indices = &ctx.active_indices[level - 1];
+        for (i, &pos) in active.iter().enumerate() {
+            if pos != ctx.pos_order[level] {
+                let pi = prev_indices[pos];
+                if pi != usize::MAX {
+                    current_vals[i] = active_bits[pi];
+                }
+            }
+        }
+    }
+
+    let new_pos = ctx.pos_order[level];
+    let new_idx = ctx.active_indices[level][new_pos];
+
+    let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
+    if let Some(&cached) = zw_memo[level].get(&state_key) {
+        return cached;
+    }
+
+    let mut children = [DEAD; 4];
+    for branch in 0u32..4 {
+        if ctx.symmetry_break && new_pos == 0 && branch != 0b11 { continue; }
+        let mut skip = false;
+        for &(rlevel, rbranch) in &ctx.restrict_branches {
+            if level == rlevel && branch != rbranch { skip = true; break; }
+        }
+        if skip { continue; }
+
+        current_vals[new_idx] = branch as u8;
+
+        for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.events[level] {
+            let bits_a = current_vals[idx_a] as usize;
+            let bits_b = current_vals[idx_b] as usize;
+            sums[lag_idx] += delta[bits_a * 4 + bits_b];
+        }
+
+        let mut ok = true;
+        for &li in &ctx.lag_check[level] {
+            let zw_val = sums[li] as i32;
+            if zw_val.abs() > ctx.xy_max_abs[li] { ok = false; break; }
+            if (zw_val + ctx.xy_max_abs[li]) % 2 != 0 { ok = false; break; }
+        }
+        if ok && level + 1 < ctx.depth {
+            for li in 0..ctx.k {
+                let zw_val = sums[li] as i32;
+                let zw_remaining = ctx.max_remaining[level + 1][li];
+                if (zw_val.abs() - zw_remaining) > ctx.xy_max_abs[li] { ok = false; break; }
+            }
+        }
+
+        if ok {
+            children[branch as usize] = build_zw_dfs(
+                level + 1, sums, &current_vals[..n_active],
+                ctx, xy_ctx,
+                nodes, unique, zw_memo, xy_memo,
+                max_memo_entries, zw_memo_count,
+            );
+        }
+
+        for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.events[level] {
+            let bits_a = current_vals[idx_a] as usize;
+            let bits_b = current_vals[idx_b] as usize;
+            sums[lag_idx] -= delta[bits_a * 4 + bits_b];
+        }
+    }
+
+    let result = reduce_node(level as u8, children, nodes, unique);
+
+    // Memo eviction when over budget
+    if max_memo_entries > 0 && *zw_memo_count >= max_memo_entries {
+        let (max_lvl, _) = zw_memo.iter().enumerate()
+            .max_by_key(|(_, m)| m.len()).unwrap();
+        if zw_memo[max_lvl].len() > 0 {
+            *zw_memo_count -= zw_memo[max_lvl].len();
+            zw_memo[max_lvl].clear();
+        }
+    }
+    zw_memo[level].insert(state_key, result);
+    *zw_memo_count += 1;
+    result
+}
+
 /// Context for XY sub-MDD DFS builder.
 pub struct XyBuildCtx {
     pub pos_order: Vec<usize>,
@@ -1631,101 +1764,37 @@ pub fn build_extension(
     let mut xy_memo: Vec<HashMap<StateKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
 
     // XY half DFS
-    // Build XY build context for extension
-    let ext_xy_ctx = XyBuildCtx {
+    let ext_zw_ctx = ZwBuildCtx {
         pos_order: pos_order.clone(),
+        events: zw_resolved,
+        lag_check: lag_check_at_level,
+        max_remaining,
+        active_at_level: active_at_level.clone(),
+        active_indices: active_indices.clone(),
+        xy_max_abs,
+        k: target_k,
+        depth: ext_depth,
+        symmetry_break: false,
+        restrict_branches: Vec::new(),
+    };
+    let ext_xy_ctx = XyBuildCtx {
+        pos_order,
         events: xy_resolved,
         lag_check: xy_lag_check_at_level,
         max_remaining: xy_max_remaining,
-        active_at_level: active_at_level.clone(),
-        active_indices: active_indices.clone(),
+        active_at_level,
+        active_indices,
         k: target_k,
         depth: ext_depth,
         symmetry_break: false,
     };
-    let target_zero = vec![0i8; target_k];
-
-    // ZW half DFS
-    fn build_zw_ext(
-        level: usize, sums: &mut [i8], active_bits: &[u8], target_k: usize,
-        ext_depth: usize, pos_order: &[usize], xy_max_abs: &[i32],
-        active_at_level: &[Vec<usize>], active_indices: &[Vec<usize>],
-        zw_events: &[Vec<(usize, usize, usize, [i8; 16])>],
-        zw_lag_check: &[Vec<usize>], zw_max_remaining: &[Vec<i32>],
-        xy_ctx: &XyBuildCtx, target_zero: &[i8],
-        nodes: &mut Vec<[u32; 4]>, unique: &mut HashMap<u64, u32>,
-        zw_memo: &mut Vec<HashMap<StateKey, u32>>,
-        xy_memo: &mut Vec<HashMap<StateKey, u32>>,
-    ) -> u32 {
-        if level == ext_depth {
-            // ZW done. Check XY feasibility, then build XY half.
-            for li in 0..target_k {
-                let zw_val = sums[li] as i32;
-                if zw_val.abs() > xy_max_abs[li] { return DEAD; }
-                if (zw_val + xy_max_abs[li]) % 2 != 0 { return DEAD; }
-            }
-            for m in xy_memo.iter_mut() { m.clear(); }
-            return build_xy_dfs(
-                0, sums, &[], target_zero,
-                xy_ctx, nodes, unique, xy_memo,
-            );
-        }
-        let active = &active_at_level[level];
-        let n_active = active.len();
-        let mut cv = [0u8; 32];
-        if level > 0 {
-            let pi = &active_indices[level - 1];
-            for (i, &pos) in active.iter().enumerate() {
-                if pos != pos_order[level] { let p = pi[pos]; if p != usize::MAX { cv[i] = active_bits[p]; } }
-            }
-        }
-        let new_idx = active_indices[level][pos_order[level]];
-        let sk = (pack_sums(sums), pack_active(&cv[..n_active]));
-        if let Some(&c) = zw_memo[level].get(&sk) { return c; }
-
-        let mut children = [DEAD; 4];
-        for branch in 0u32..4 {
-            // No symmetry breaking in extension — base already handles it
-            cv[new_idx] = branch as u8;
-            for &(li, ia, ib, ref d) in &zw_events[level] {
-                sums[li] += d[cv[ia] as usize * 4 + cv[ib] as usize];
-            }
-            let mut ok = true;
-            for &li in &zw_lag_check[level] {
-                let v = sums[li] as i32;
-                if v.abs() > xy_max_abs[li] { ok = false; break; }
-            }
-            if ok && level + 1 < ext_depth {
-                for li in 0..target_k {
-                    let v = sums[li] as i32;
-                    let rem = zw_max_remaining[level+1][li];
-                    if (v.abs() - rem) > xy_max_abs[li] { ok = false; break; }
-                }
-            }
-            if ok {
-                children[branch as usize] = build_zw_ext(
-                    level+1, sums, &cv[..n_active], target_k, ext_depth, pos_order, xy_max_abs,
-                    active_at_level, active_indices, zw_events, zw_lag_check, zw_max_remaining,
-                    xy_ctx, target_zero,
-                    nodes, unique, zw_memo, xy_memo,
-                );
-            }
-            for &(li, ia, ib, ref d) in &zw_events[level] {
-                sums[li] -= d[cv[ia] as usize * 4 + cv[ib] as usize];
-            }
-        }
-        let result = reduce_node(level as u8, children, nodes, unique);
-        zw_memo[level].insert(sk, result);
-        result
-    }
-
     let mut sums = initial_sums;
-    let root = build_zw_ext(
-        0, &mut sums, &[], target_k, ext_depth, &pos_order, &xy_max_abs,
-        &active_at_level, &active_indices,
-        &zw_resolved, &lag_check_at_level, &max_remaining,
-        &ext_xy_ctx, &target_zero,
+    let mut zw_memo_count = 0usize;
+    let root = build_zw_dfs(
+        0, &mut sums, &[],
+        &ext_zw_ctx, &ext_xy_ctx,
         &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo,
+        0, &mut zw_memo_count,
     );
 
     eprintln!("build_extension: base_k={}, target_k={}, extra={}, {} nodes, root={}",
