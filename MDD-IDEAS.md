@@ -92,6 +92,74 @@ Precompute per-position domain restrictions before DFS/BFS.
 Complex to implement correctly and may not add much beyond range pruning.
 Forward checking during DFS would help but is hard to combine with memoization.
 
+## New Ideas (2026-04-07 profiling round)
+
+Profiling k=9 sequential: 93.8s total, 70.3s (75%) in XY builds.
+5.3M XY sub-MDD builds, XY memo hit rate only 8% (cleared per ZW boundary).
+ZW memo hit rate 65%. Goal: make k=15 feasible.
+
+### 17. Full BFS-by-level construction (replace DFS)
+**Status**: Untested.
+Process one level at a time: expand all states at level L to get level L+1.
+Natural dedup via HashMap key. Peak memory = max(states per level).
+Two passes: enumerate states top-down, build nodes bottom-up.
+Enables disk spill for huge levels. This is the path to k=15.
+
+### 18. ZW-only BFS + batch XY builds
+**Status**: Untested.
+BFS the ZW half only (2k levels). Collect all distinct zw_sums at the
+boundary. Then batch-build XY sub-MDDs, sharing node storage. Avoids
+5.3M separate XY rebuilds — many zw_sums may share XY sub-MDD structure.
+
+### 19. Tighter per-event pruning
+**Status**: Untested.
+Currently range pruning only fires at lag checkpoints. Add lightweight
+range checks after every event: if any lag's partial sum is already
+impossible given remaining budget, prune immediately. May cut 10-30% of
+branches in the XY half where pruning is weakest.
+
+### 20. Inline fixed-size state arrays
+**Status**: Untested.
+Replace Vec<i8> sums and Vec<u8> active_bits with fixed-size arrays
+(e.g., [i8; 32] and [u8; 32]). Eliminates heap allocation on every
+recursive call. Should give 5-15% speedup in hot path.
+
+### 21. Better variable ordering for BFS
+**Status**: Untested.
+Try orderings that minimize peak states per level in BFS. Candidates:
+constraint-density ordering (most-constrained-first), or reverse bounce.
+Can dramatically reduce peak memory and total states enumerated.
+
+### 22. Compressed node storage (file size)
+**Status**: Untested.
+Delta-encode or LZ4-compress the node array before writing. The 4-way
+children arrays have lots of DEAD entries and sequential IDs. Could cut
+file size 50-80% for easier transfer between machines.
+
+### 23. Parallel BFS level expansion
+**Status**: Untested.
+Parallelize state expansion within each BFS level using rayon.
+Each state's 4 children are independent. Shard the HashMap by key prefix.
+Expected 3-4x speedup on 4 cores.
+
+### 24. Streaming two-level BFS with disk spill
+**Status**: Untested.
+In BFS, only keep the current and next level in RAM. Write completed
+levels to disk (redb or raw file). Read back during bottom-up node build.
+Reduces peak memory from O(total_states) to O(max_states_per_level).
+
+### 25. XY sub-MDD caching by zw_sums signature
+**Status**: Untested.
+Many of the 5.3M ZW boundaries produce identical or similar XY sub-MDDs.
+Cache completed XY sub-MDD roots keyed by zw_sums. If the same zw_sums
+appears twice, reuse the XY root. Eliminates redundant XY builds entirely.
+
+### 26. Batch XY builds with shared memo
+**Status**: Untested.
+Group ZW boundaries by compatible zw_sums patterns. Build XY sub-MDDs
+in batches, keeping the XY memo warm across the batch. Increases XY memo
+hit rate from 8% to potentially 50%+.
+
 ## Rejected Ideas
 
 ### 7 (old). Clear completed level memos during DFS
