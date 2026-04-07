@@ -23,6 +23,9 @@ fn main() {
 
     let start = std::time::Instant::now();
 
+    // For k >= 11, default to sequential (parallel 4× node duplication causes OOM)
+    let use_sequential = sequential || (k >= 11 && parallel_depth == 0 && !legacy);
+
     let reordered = if legacy {
         eprintln!("Using legacy 16-way builder + reorder...");
         let interleaved = turyn::mdd::BoundaryMdd::build(k);
@@ -30,8 +33,9 @@ fn main() {
         let r = turyn::mdd_reorder::reorder_zw_first(&interleaved.nodes, interleaved.root, k);
         drop(interleaved);
         r
-    } else if sequential {
-        eprintln!("Using sequential ZW-first builder...");
+    } else if use_sequential {
+        eprintln!("Using sequential ZW-first builder{}...",
+            if k >= 11 && !sequential { " (auto: k>=11 saves memory)" } else { "" });
         let zw = turyn::mdd_zw_first::ZwFirstMdd::build(k);
         turyn::mdd_reorder::Mdd4 {
             nodes: zw.nodes, root: zw.root, k: zw.k, depth: zw.total_depth,

@@ -880,10 +880,29 @@ impl ZwFirstMdd {
         let num_parallel = if restrict_branches.is_some() {
             4u32.pow(restrict_branches.unwrap().len() as u32) as usize
         } else if restrict_level1.is_some() { 4 } else { 1 };
-        // Default 80M entries (~11GB). Override with MDD_MEMO_CAP env var.
+        // Auto-detect: use ~50% of available RAM for memo, leave rest for nodes/etc.
+        // Default ~80M entries. Override with MDD_MEMO_CAP env var.
+        let auto_cap = {
+            let total_bytes = std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("MemTotal:"))
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .and_then(|n| n.parse::<usize>().ok())
+                        .map(|kb| kb * 1024)
+                })
+                .unwrap_or(16 * 1024 * 1024 * 1024); // fallback 16GB
+            // Use 40% of total RAM for memo (140 bytes/entry)
+            // Leave 60% for nodes, unique table, xy_cache, OS, etc.
+            let memo_budget = total_bytes * 2 / 5;
+            (memo_budget / 140).min(200_000_000) // cap at 200M entries
+        };
         let total_memo_cap: usize = std::env::var("MDD_MEMO_CAP")
             .ok().and_then(|s| s.parse().ok())
-            .unwrap_or(80_000_000);
+            .unwrap_or(auto_cap);
+        eprintln!("  Memo budget: {} entries ({:.1} GB) across {} parallel tasks",
+            total_memo_cap, total_memo_cap as f64 * 140.0 / 1e9, num_parallel);
         let max_memo_entries: usize = total_memo_cap / num_parallel;
         let per_level_cap: usize = max_memo_entries / (zw_depth + 1);
         let mut zw_memo_count: usize = 0;
