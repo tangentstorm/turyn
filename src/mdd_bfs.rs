@@ -378,17 +378,17 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
     let mut level_key_counts: Vec<usize> = vec![1];
 
     for level in 0..zw_depth {
+        // Use HashMap for dedup (back to original approach, but with parallel expansion)
         let mut next_key_to_idx: HashMap<StateKey, u32> = HashMap::default();
         let mut parent_children: Vec<[u32; 4]> = Vec::with_capacity(current_keys.len());
 
         for &key in &current_keys {
-            let expanded = ctx.expand_state(key, level);
             let mut ch = [NO_CHILD; 4];
-            for (branch, child_key) in expanded {
+            ctx.expand_state_cb(key, level, |branch, child_key| {
                 let next_len = next_key_to_idx.len() as u32;
                 let idx = *next_key_to_idx.entry(child_key).or_insert(next_len);
                 ch[branch as usize] = idx;
-            }
+            });
             parent_children.push(ch);
         }
 
@@ -397,6 +397,7 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
         for (&key, &idx) in &next_key_to_idx {
             next_keys[idx as usize] = key;
         }
+        drop(next_key_to_idx); // free HashMap before allocating next level
 
         // Write parent children to disk (for pass 2)
         let path = format!("{}/children_{}.bin", tmp_dir, level);
