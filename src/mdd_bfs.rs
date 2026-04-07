@@ -289,7 +289,46 @@ impl BfsCtx {
     }
 }
 
+/// Write child indices to disk. Each parent has [u32; 4] child indices.
+/// u32::MAX means DEAD/no child.
+fn write_children(path: &str, children: &[[u32; 4]]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    for ch in children {
+        for &c in ch {
+            f.write_all(&c.to_le_bytes())?;
+        }
+    }
+    f.flush()?;
+    Ok(())
+}
+
+fn read_children(path: &str) -> std::io::Result<Vec<[u32; 4]>> {
+    use std::io::Read;
+    let file_len = std::fs::metadata(path)?.len() as usize;
+    let n = file_len / 16;
+    let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut result = Vec::with_capacity(n);
+    let mut buf = [0u8; 16];
+    for _ in 0..n {
+        f.read_exact(&mut buf)?;
+        let ch = [
+            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        ];
+        result.push(ch);
+    }
+    Ok(result)
+}
+
+const NO_CHILD: u32 = u32::MAX - 1; // sentinel for "no child in next level"
+
 /// Build a complete ZW+XY MDD using BFS for the ZW half and DFS for XY sub-MDDs.
+///
+/// Single-pass approach: during top-down BFS, store parent→child index mappings.
+/// Then bottom-up, just look up child indices (no re-expansion needed).
 pub fn build_bfs_mdd(k: usize) -> Mdd4 {
     let zw_depth = 2 * k;
     let total_depth = 4 * k;
@@ -299,7 +338,7 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
     let tmp_dir = format!("/tmp/mdd_bfs_k{}", k);
     let _ = std::fs::create_dir_all(&tmp_dir);
 
-    // ===== Pass 1: BFS top-down, enumerate states per level =====
+    // ===== Pass 1: BFS top-down, enumerate states + store children =====
     eprintln!("BFS Pass 1: enumerating ZW states (k={}, depth={})...", k, zw_depth);
 
     let init_key: StateKey = (pack_sums(&vec![0i8; k]), 0u64);
@@ -307,19 +346,32 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
     let mut level_key_counts: Vec<usize> = vec![1];
 
     for level in 0..zw_depth {
-        // Write current level keys to disk
-        let path = format!("{}/level_{}.bin", tmp_dir, level);
-        write_keys(&path, &current_keys).expect("Failed to write level keys");
+        // Build key→index map for next level
+        let mut next_key_to_idx: HashMap<StateKey, u32> = HashMap::default();
+        // For each parent, store [u32; 4] child indices into next level
+        let mut parent_children: Vec<[u32; 4]> = Vec::with_capacity(current_keys.len());
 
-        // Expand all states to next level
-        let mut next_set: HashMap<StateKey, ()> = HashMap::default();
         for &key in &current_keys {
-            for (_, child_key) in ctx.expand_state(key, level) {
-                next_set.entry(child_key).or_insert(());
+            let expanded = ctx.expand_state(key, level);
+            let mut ch = [NO_CHILD; 4];
+            for (branch, child_key) in expanded {
+                let next_len = next_key_to_idx.len() as u32;
+                let idx = *next_key_to_idx.entry(child_key).or_insert(next_len);
+                ch[branch as usize] = idx;
             }
+            parent_children.push(ch);
         }
 
-        let next_keys: Vec<StateKey> = next_set.into_keys().collect();
+        // Build next level's key list in index order
+        let mut next_keys = vec![(0u128, 0u64); next_key_to_idx.len()];
+        for (&key, &idx) in &next_key_to_idx {
+            next_keys[idx as usize] = key;
+        }
+
+        // Write parent children to disk (for pass 2)
+        let path = format!("{}/children_{}.bin", tmp_dir, level);
+        write_children(&path, &parent_children).expect("Failed to write children");
+
         let count = next_keys.len();
         eprint!("\r  Level {}/{}: {} → {} states ({:.1?})   ",
             level + 1, zw_depth, current_keys.len(), count, start.elapsed());
@@ -327,27 +379,19 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
         current_keys = next_keys;
     }
 
-    // Write final (boundary) level
-    let path = format!("{}/level_{}.bin", tmp_dir, zw_depth);
-    write_keys(&path, &current_keys).expect("Failed to write boundary keys");
-
     let max_states = level_key_counts.iter().max().copied().unwrap_or(0);
     let total_states: usize = level_key_counts.iter().sum();
     eprintln!("\n  Pass 1 done in {:.1?}: max {}, total {} states",
         start.elapsed(), max_states, total_states);
 
-    // ===== Build XY sub-MDDs for each boundary state =====
+    // ===== Build XY sub-MDDs for distinct boundary zw_sums =====
     eprintln!("Building XY sub-MDDs for {} boundary states...", current_keys.len());
     let xy_start = std::time::Instant::now();
 
     let mut nodes: Vec<[u32; 4]> = Vec::new();
     nodes.push([DEAD; 4]); // sentinel node 0
     let mut unique: HashMap<u64, u32> = HashMap::default();
-
-    // Cache: zw_sums → XY sub-MDD root
     let mut xy_cache: HashMap<u128, u32> = HashMap::default();
-    // Map: boundary state key → XY root node
-    let mut boundary_xy_roots: HashMap<StateKey, u32> = HashMap::default();
 
     let distinct_sums: Vec<u128> = {
         let mut set: HashMap<u128, ()> = HashMap::default();
@@ -356,7 +400,6 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
         }
         set.into_keys().collect()
     };
-
     eprintln!("  {} distinct zw_sums from {} boundary states", distinct_sums.len(), current_keys.len());
 
     for (i, &sums_packed) in distinct_sums.iter().enumerate() {
@@ -375,36 +418,36 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
     eprintln!("\r  XY builds done: {} sub-MDDs in {:.1?}, {} total nodes",
         distinct_sums.len(), xy_start.elapsed(), nodes.len());
 
-    // Map each boundary state to its XY root
-    for &key in &current_keys {
-        let root = xy_cache[&key.0];
-        boundary_xy_roots.insert(key, root);
+    // Map boundary states to XY root node IDs (indexed by position in current_keys)
+    let mut boundary_nids: Vec<u32> = Vec::with_capacity(current_keys.len());
+    for &(sums, _) in &current_keys {
+        boundary_nids.push(xy_cache[&sums]);
     }
 
-    // ===== Pass 2: BFS bottom-up, build ZW MDD nodes =====
+    // ===== Pass 2: bottom-up, build ZW nodes using stored children =====
     eprintln!("BFS Pass 2: building ZW nodes bottom-up...");
     let pass2_start = std::time::Instant::now();
 
-    // At the boundary: state key → XY root
-    let mut level_node_map: HashMap<StateKey, u32> = boundary_xy_roots;
+    // child_nids[i] = node ID for state i at the "next" level
+    let mut child_nids: Vec<u32> = boundary_nids;
 
     for level in (0..zw_depth).rev() {
-        // Read this level's keys from disk
-        let path = format!("{}/level_{}.bin", tmp_dir, level);
-        let level_keys = read_keys(&path).expect("Failed to read level keys");
+        let path = format!("{}/children_{}.bin", tmp_dir, level);
+        let parent_children = read_children(&path).expect("Failed to read children");
+        let _ = std::fs::remove_file(&path); // cleanup as we go
 
-        let mut new_level_map: HashMap<StateKey, u32> = HashMap::default();
         let mut node_dedup: HashMap<[u32; 4], u32> = HashMap::default();
+        let mut level_nids: Vec<u32> = Vec::with_capacity(parent_children.len());
 
-        for &key in &level_keys {
+        for ch_indices in &parent_children {
             let mut children = [DEAD; 4];
-            for (branch, child_key) in ctx.expand_state(key, level) {
-                if let Some(&child_nid) = level_node_map.get(&child_key) {
-                    children[branch as usize] = child_nid;
+            for b in 0..4 {
+                let idx = ch_indices[b];
+                if idx != NO_CHILD {
+                    children[b] = child_nids[idx as usize];
                 }
             }
 
-            // Create/dedup node
             let node_id = if children.iter().all(|&c| c == DEAD) {
                 DEAD
             } else {
@@ -420,27 +463,22 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
                     nid
                 }
             };
-            new_level_map.insert(key, node_id);
+            level_nids.push(node_id);
         }
 
         eprint!("\r  Level {}/{}: {} states → {} nodes total ({:.1?})   ",
-            level, zw_depth, level_keys.len(), nodes.len(), pass2_start.elapsed());
-        level_node_map = new_level_map;
+            level, zw_depth, parent_children.len(), nodes.len(), pass2_start.elapsed());
+        child_nids = level_nids;
     }
     eprintln!();
 
-    let root = level_node_map.values().next().copied().unwrap_or(DEAD);
+    let root = if child_nids.is_empty() { DEAD } else { child_nids[0] };
     eprintln!("BFS MDD k={}: {} nodes, {:.1} MB, total {:.1?}",
         k, nodes.len(), nodes.len() as f64 * 16.0 / 1_048_576.0, start.elapsed());
 
-    // Cleanup temp files
-    for level in 0..=zw_depth {
-        let path = format!("{}/level_{}.bin", tmp_dir, level);
-        let _ = std::fs::remove_file(&path);
-    }
+    // Cleanup
     let _ = std::fs::remove_dir(&tmp_dir);
 
-    let pos_order: Vec<usize> = ctx.pos_order.clone();
     Mdd4 {
         nodes,
         root,
