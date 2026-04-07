@@ -144,6 +144,17 @@ impl ZwFirstMdd {
         Self::build_inner(k, None, None)
     }
 
+    /// Build ZW-only MDD (no XY sub-MDDs). Much faster and smaller.
+    /// At the ZW boundary, valid states become LEAF instead of building
+    /// an XY sub-MDD. Use build_xy_for_boundary() at runtime to get XY.
+    pub fn build_zw_only(k: usize) -> Self {
+        let (mdd, stats) = Self::build_inner_opts(k, None, None, true);
+        if std::env::var("MDD_PROFILE").is_ok() {
+            stats.report(k);
+        }
+        mdd
+    }
+
     /// Build with parallel branches using rayon.
     /// parallel_depth=1: 4 subtrees (level 1). parallel_depth=2: 16 subtrees (levels 1+2).
     pub fn build_parallel(k: usize) -> Self {
@@ -328,6 +339,11 @@ impl ZwFirstMdd {
     }
 
     fn build_inner(k: usize, restrict_level1: Option<u32>, restrict_branches: Option<&[u32]>) -> (Self, BuildStats) {
+        let zw_only = std::env::var("MDD_ZW_ONLY").is_ok();
+        Self::build_inner_opts(k, restrict_level1, restrict_branches, zw_only)
+    }
+
+    fn build_inner_opts(k: usize, restrict_level1: Option<u32>, restrict_branches: Option<&[u32]>, zw_only: bool) -> (Self, BuildStats) {
         let mut stats = BuildStats::new(k);
         let zw_depth = 2 * k;
         let total_depth = 4 * k;
@@ -583,6 +599,7 @@ impl ZwFirstMdd {
             zw_depth: usize,
             restrict_level1: Option<u32>,
             restrict_branches: Vec<(usize, u32)>, // (level, required_branch)
+            zw_only: bool,  // If true, skip XY sub-MDD building (return LEAF at ZW boundary)
         }
 
         let ctx = Ctx {
@@ -607,6 +624,7 @@ impl ZwFirstMdd {
                     .collect(),
                 None => Vec::new(),
             },
+            zw_only,
         };
 
         let mut nodes: Vec<[u32; 4]> = Vec::new();
@@ -786,9 +804,22 @@ impl ZwFirstMdd {
             status.tick(nodes.len(), *zw_memo_count, xy_cache.len());
 
             if level == ctx.zw_depth {
-                // ZW half done. Build XY sub-MDD for these zw_sums.
+                // ZW half done.
                 stats.zw_level_stats[level].3 += 1;
 
+                if ctx.zw_only {
+                    // ZW-only mode: check if any (x,y) can satisfy the constraint.
+                    // Range + parity check: for each lag, |zw_val| <= max_xy and right parity.
+                    for li in 0..ctx.k {
+                        let zw_val = sums[li] as i32;
+                        let max_xy = ctx.xy_max_abs[li];
+                        if zw_val.abs() > max_xy { return DEAD; }
+                        if (zw_val + max_xy) % 2 != 0 { return DEAD; }
+                    }
+                    return LEAF;
+                }
+
+                // Build XY sub-MDD for these zw_sums.
                 // Check XY cache: same zw_sums → same XY sub-MDD root
                 let sums_key = pack_sums(sums);
                 if let Some(&cached_root) = xy_cache.get(&sums_key) {

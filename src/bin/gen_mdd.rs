@@ -1,13 +1,16 @@
 /// Generate a ZW-first MDD boundary table and save to file.
-/// Usage: gen_mdd [k] [outfile] [--legacy]
+/// Usage: gen_mdd [k] [outfile] [--legacy] [--zw-only]
 /// Default: k=8, outfile=mdd-{k}.bin
 /// --legacy: use 16-way interleaved build + reorder (slower, more memory)
+/// --zw-only: build ZW half only (no XY sub-MDDs). Much faster, smaller file.
+///            Use build_xy_for_boundary() at runtime for XY.
 /// Default is ZW-first direct builder (faster, 4x less node memory)
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let k: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(8);
-    let default_out = format!("mdd-{}.bin", k);
+    let zw_only = args.iter().any(|s| s == "--zw-only");
+    let default_out = if zw_only { format!("mdd-{}-zw.bin", k) } else { format!("mdd-{}.bin", k) };
     let outfile = args.get(2)
         .filter(|s| !s.starts_with("--"))
         .map(|s| s.as_str())
@@ -19,7 +22,12 @@ fn main() {
         .and_then(|i| args.get(i + 1)?.parse().ok())
         .unwrap_or(0); // 0 = auto-detect from cores
 
-    eprintln!("Building MDD for k={} (valid for all n >= {})", k, 2 * k);
+    if zw_only {
+        unsafe { std::env::set_var("MDD_ZW_ONLY", "1"); }
+    }
+
+    eprintln!("Building MDD for k={}{} (valid for all n >= {})",
+        k, if zw_only { " [ZW-only]" } else { "" }, 2 * k);
 
     let start = std::time::Instant::now();
 
