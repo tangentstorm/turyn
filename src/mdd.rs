@@ -9,7 +9,7 @@
 ///   u32::MAX   = LEAF (valid terminal)
 ///   other      = index into nodes[]
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 pub const DEAD: u32 = 0;
 pub const LEAF: u32 = u32::MAX;
@@ -76,6 +76,31 @@ impl BoundaryMdd {
             lag_check_at_level[lag_complete].push(li);
         }
 
+        // Compute max remaining contribution for each lag at each level (for range pruning).
+        // After processing level L, the remaining events for lag j contribute at most
+        // max_remaining[L][j] to the sum. If |sums[j]| > max_remaining[L][j], prune.
+        let mut max_remaining: Vec<Vec<i32>> = vec![vec![0i32; k]; depth + 1];
+        for (li, lag) in lags.iter().enumerate() {
+            for &(a, b) in &lag.pairs {
+                let complete = pos_to_level[a].max(pos_to_level[b]);
+                // is_xyzw=true: max contribution = |xa*xb + ya*yb + 2*za*zb| <= 4
+                for level in 0..=complete {
+                    max_remaining[level][li] += 4;
+                }
+            }
+            for &(a, b) in &lag.w_pairs {
+                let complete = pos_to_level[a].max(pos_to_level[b]);
+                // is_xyzw=false: max contribution = |2*wa*wb| = 2
+                for level in 0..=complete {
+                    max_remaining[level][li] += 2;
+                }
+            }
+        }
+        // max_remaining[level][lag] = max absolute sum that events at levels > level can contribute
+        // After processing level L, events at level L have already been applied,
+        // so the remaining budget is max_remaining[L+1][lag] (events at levels L+1..depth-1)
+        // We need: |sums[j]| <= max_remaining[level+1][j] to be feasible
+
         // Compute which positions' values are still needed at each level
         let mut last_use_level: Vec<usize> = vec![0; depth];
         for events in &events_at_level {
@@ -111,7 +136,9 @@ impl BoundaryMdd {
             lag_check_at_level: Vec<Vec<usize>>,
             active_at_level: Vec<Vec<usize>>,
             active_indices: Vec<HashMap<usize, usize>>,
+            max_remaining: Vec<Vec<i32>>,
             depth: usize,
+            k: usize,
         }
 
         let ctx = Ctx {
@@ -120,16 +147,36 @@ impl BoundaryMdd {
             lag_check_at_level,
             active_at_level,
             active_indices,
+            max_remaining,
             depth,
+            k,
         };
 
         let mut nodes: Vec<[u32; 16]> = Vec::new();
         nodes.push([DEAD; 16]); // node 0 = DEAD
 
-        let mut unique: HashMap<(u8, [u32; 16]), u32> = HashMap::new();
+        // Use hash-based dedup: hash (level, children) → node_id.
+        // Tiny collision risk (~0.01% at 100M nodes) creates a few duplicate
+        // nodes but doesn't affect correctness.
+        fn hash_node(level: u8, children: &[u32; 16]) -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut h = rustc_hash::FxHasher::default();
+            level.hash(&mut h);
+            for &c in children { c.hash(&mut h); }
+            h.finish()
+        }
+        let mut unique: HashMap<u64, u32> = HashMap::default();
 
-        type StateKey = (Vec<i8>, u64);
-        let mut memo: Vec<HashMap<StateKey, u32>> = (0..=depth).map(|_| HashMap::new()).collect();
+        type StateKey = (u128, u64);
+        let mut memo: Vec<HashMap<StateKey, u32>> = (0..=depth).map(|_| HashMap::default()).collect();
+
+        fn pack_sums(sums: &[i8]) -> u128 {
+            let mut packed = 0u128;
+            for (i, &s) in sums.iter().enumerate() {
+                packed |= ((s as u8 as u128) & 0xFF) << (i * 8);
+            }
+            packed
+        }
 
         fn pack_active(sign_cols: &[u8]) -> u64 {
             let mut packed = 0u64;
@@ -145,7 +192,7 @@ impl BoundaryMdd {
             active_bits: &mut Vec<u8>,
             ctx: &Ctx,
             nodes: &mut Vec<[u32; 16]>,
-            unique: &mut HashMap<(u8, [u32; 16]), u32>,
+            unique: &mut HashMap<u64, u32>,
             memo: &mut Vec<HashMap<StateKey, u32>>,
         ) -> u32 {
             if level == ctx.depth {
@@ -172,7 +219,7 @@ impl BoundaryMdd {
             let new_pos = ctx.pos_order[level];
             let new_idx = ctx.active_indices[level][&new_pos];
 
-            let state_key = (sums.clone(), pack_active(&current_active_vals));
+            let state_key = (pack_sums(sums), pack_active(&current_active_vals));
             if let Some(&cached) = memo[level].get(&state_key) {
                 return cached;
             }
@@ -183,7 +230,7 @@ impl BoundaryMdd {
 
                 current_active_vals[new_idx] = sign_col as u8;
 
-                let sums_backup: Vec<i8> = sums.clone();
+                let sums_backup = pack_sums(sums);
                 for &(pos_a, pos_b, lag_idx, is_xyzw) in &ctx.events_at_level[level] {
                     let idx_a = ctx.active_indices[level][&pos_a];
                     let idx_b = ctx.active_indices[level][&pos_b];
@@ -206,8 +253,19 @@ impl BoundaryMdd {
                 }
 
                 let mut ok = true;
+                // Exact check: completed lags must be zero
                 for &li in &ctx.lag_check_at_level[level] {
                     if sums[li] != 0 { ok = false; break; }
+                }
+                // Range check: partial sums must be achievable by remaining events
+                if ok && level + 1 < ctx.depth {
+                    for li in 0..ctx.k {
+                        let remaining = ctx.max_remaining[level + 1][li];
+                        if (sums[li] as i32).abs() > remaining {
+                            ok = false;
+                            break;
+                        }
+                    }
                 }
 
                 if ok {
@@ -221,7 +279,10 @@ impl BoundaryMdd {
                     }
                 }
 
-                sums.copy_from_slice(&sums_backup);
+                // Restore sums from packed backup
+                for i in 0..sums.len() {
+                    sums[i] = ((sums_backup >> (i * 8)) & 0xFF) as i8;
+                }
             }
 
             let result = if children.iter().all(|&c| c == DEAD) {
@@ -231,7 +292,7 @@ impl BoundaryMdd {
                 if children.iter().all(|&c| c == first) {
                     first
                 } else {
-                    let key = (level as u8, children);
+                    let key = hash_node(level as u8, &children);
                     if let Some(&nid) = unique.get(&key) { nid }
                     else {
                         let nid = nodes.len() as u32;
@@ -306,8 +367,8 @@ impl BoundaryMdd {
         let mut nodes_4: Vec<[u32; 4]> = Vec::new();
         nodes_4.push([DEAD; 4]); // node 0 = DEAD
 
-        let mut unique_4: HashMap<(u8, [u32; 4]), u32> = HashMap::new();
-        let mut memo: HashMap<u32, u32> = HashMap::new();
+        let mut unique_4: HashMap<(u8, [u32; 4]), u32> = HashMap::default();
+        let mut memo: HashMap<u32, u32> = HashMap::default();
 
         let root = Self::project_node(
             self.root, 0, &self.nodes, self.k,
@@ -501,7 +562,7 @@ impl ZwProjection {
 
     /// Count total valid (z,w) pairs.
     pub fn count_paths(&self) -> u128 {
-        let mut memo: HashMap<u32, u128> = HashMap::new();
+        let mut memo: HashMap<u32, u128> = HashMap::default();
         fn count(nid: u32, nodes: &[[u32; 4]], memo: &mut HashMap<u32, u128>) -> u128 {
             if nid == DEAD { return 0; }
             if nid == LEAF { return 1; }

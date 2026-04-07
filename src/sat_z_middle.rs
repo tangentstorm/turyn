@@ -34,7 +34,6 @@ impl LagTemplate {
     /// Build template for Z middle (length n, boundary width k).
     pub fn new_z(n: usize, k: usize) -> Self {
         let middle_n = n - 2 * k;
-        let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
         let is_mid = |pos: usize| -> bool { pos >= k && pos < n - k };
 
         let mut lags = Vec::with_capacity(n - 1);
@@ -234,13 +233,12 @@ pub fn fill_z_solver(
 pub fn fill_w_solver(
     solver: &mut radical::Solver,
     tmpl: &LagTemplate,
-    seq_len: usize,
+    _seq_len: usize,
     boundary: &[i8],
 ) {
     let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
 
-    for (s, lag) in tmpl.lags.iter().enumerate() {
-        let s = s + 1;
+    for (_s, lag) in tmpl.lags.iter().enumerate() {
         let agree_lo = 0u32;
         let agree_hi = lag.num_pairs as u32;
 

@@ -229,7 +229,6 @@ impl SpectralConstraint {
         num_freqs: usize,
     ) -> Self {
         let middle_len = seq_len - 2 * k;
-        let pi2 = 2.0 * std::f64::consts::PI;
 
         let mut cos_table = vec![0.0f32; middle_len * num_freqs];
         let mut sin_table = vec![0.0f32; middle_len * num_freqs];
@@ -1118,15 +1117,7 @@ impl Solver {
         }
 
         // Rebuild watches (substitution may have changed watched literals)
-        for wl in &mut self.watches {
-            wl.clear();
-        }
-        for (ci, m) in self.clause_meta.iter().enumerate() {
-            if m.deleted || m.len < 2 { continue; }
-            let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
-            self.watches[lit_index(negate(lits[0]))].push((ci as u32, lits[1]));
-            self.watches[lit_index(negate(lits[1]))].push((ci as u32, lits[0]));
-        }
+        self.rebuild_watches();
 
         equivs
     }
@@ -1318,6 +1309,14 @@ impl Solver {
         }
 
         // Rebuild all watches from scratch (clean and correct)
+        self.rebuild_watches();
+
+        eliminated
+    }
+
+    /// Rebuild all watch lists from the clause database.
+    /// Clears existing watches and re-adds watches for all non-deleted clauses with >= 2 literals.
+    fn rebuild_watches(&mut self) {
         for wl in &mut self.watches { wl.clear(); }
         for (ci, m) in self.clause_meta.iter().enumerate() {
             if m.deleted || m.len < 2 { continue; }
@@ -1325,12 +1324,8 @@ impl Solver {
             self.watches[lit_index(negate(lits[0]))].push((ci as u32, lits[1]));
             self.watches[lit_index(negate(lits[1]))].push((ci as u32, lits[0]));
         }
-
-        eliminated
     }
 
-    /// Simplify clause database using level-0 assignments.
-    /// Removes satisfied clauses and false literals.
     /// Simplify the clause database using level-0 assignments.
     /// Removes satisfied clauses and false literals. Also rebuilds watch lists.
     /// Returns the number of clauses removed.
@@ -1345,13 +1340,7 @@ impl Solver {
         if !self.ok { return 0; }
         let after = self.clause_meta.iter().filter(|m| !m.deleted).count();
         // Rebuild watch lists from scratch (since clauses were modified)
-        for wl in &mut self.watches { wl.clear(); }
-        for (ci, m) in self.clause_meta.iter().enumerate() {
-            if m.deleted || m.len < 2 { continue; }
-            let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
-            self.watches[lit_index(negate(lits[0]))].push((ci as u32, lits[1]));
-            self.watches[lit_index(negate(lits[1]))].push((ci as u32, lits[0]));
-        }
+        self.rebuild_watches();
         before - after
     }
 
@@ -1485,7 +1474,7 @@ impl Solver {
     /// Restore the solver to a previous checkpoint, removing all clauses/PBs
     /// added after the checkpoint. Backtracks, then truncates and rebuilds watches.
     pub fn restore_checkpoint(&mut self, cp: (usize, usize, usize, usize)) {
-        let (n_clauses, n_lits, n_pbs, n_vars) = cp;
+        let (n_clauses, n_lits, n_pbs, _n_vars) = cp;
         self.backtrack(0);
 
         // Mark post-checkpoint clauses as deleted
@@ -1836,17 +1825,12 @@ impl Solver {
                 let v = var_of(lit);
                 let known_val = self.assigns[v]; // just assigned, hot in cache
                 // Recompute stale constraints before incremental updates
-                for idx in 0..self.quad_pb_var_watches[v].len() {
+                let has_stale = (0..self.quad_pb_var_watches[v].len()).any(|idx| {
                     let qi = self.quad_pb_var_watches[v][idx];
-                    if self.quad_pb_constraints[qi as usize].stale {
-                        // Batch: recompute all stale at once for cache locality
-                        for i in 0..self.quad_pb_constraints.len() {
-                            if self.quad_pb_constraints[i].stale {
-                                self.recompute_quad_pb(i as u32);
-                            }
-                        }
-                        break;
-                    }
+                    self.quad_pb_constraints[qi as usize].stale
+                });
+                if has_stale {
+                    self.recompute_stale_quad_pb();
                 }
                 // Update term states for all terms involving this variable
                 for idx in 0..self.quad_pb_var_terms[v].len() {
@@ -2175,16 +2159,21 @@ impl Solver {
         self.quad_pb_constraints[qi].stale = false;
     }
 
+    /// Batch-recompute all stale quad PB constraints (better cache locality
+    /// than recomputing one at a time as they're encountered).
+    fn recompute_stale_quad_pb(&mut self) {
+        for i in 0..self.quad_pb_constraints.len() {
+            if self.quad_pb_constraints[i].stale {
+                self.recompute_quad_pb(i as u32);
+            }
+        }
+    }
+
     /// Single-pass: finds propagation and builds explanation in one fused scan.
     #[inline]
     fn propagate_quad_pb(&mut self, qi: u32) -> Option<Reason> {
         if self.quad_pb_constraints[qi as usize].stale {
-            // Batch recompute all stale constraints at once (better cache locality)
-            for i in 0..self.quad_pb_constraints.len() {
-                if self.quad_pb_constraints[i].stale {
-                    self.recompute_quad_pb(i as u32);
-                }
-            }
+            self.recompute_stale_quad_pb();
         }
         let qc = &self.quad_pb_constraints[qi as usize];
         let n = qc.num_terms as usize;
@@ -2283,6 +2272,27 @@ impl Solver {
     /// Returns (learnt clause, backtrack level).
     /// Uses solver-level reusable buffers to eliminate per-conflict allocations.
     fn analyze(&mut self, conflict_reason: Reason) -> (Vec<Lit>, u32) {
+        // Shared logic for processing each reason literal during 1-UIP analysis.
+        // Marks the variable as seen, bumps its activity, and either increments
+        // the current-level counter or adds the literal to the learnt clause.
+        macro_rules! process_reason_lit {
+            ($self:ident, $lit:expr, $p:expr, $counter:expr, $learnt:expr, $bt_level:expr) => {{
+                let lit = $lit;
+                if lit != $p {
+                    let v = var_of(lit);
+                    if !$self.analyze_seen[v] {
+                        $self.analyze_seen[v] = true;
+                        $self.bump_activity(v);
+                        if $self.level[v] == $self.decision_level() {
+                            $counter += 1;
+                        } else if $self.level[v] > 0 {
+                            $learnt.push(lit);
+                            $bt_level = $bt_level.max($self.level[v]);
+                        }
+                    }
+                }
+            }};
+        }
         // Reuse analyze_seen buffer (fill is O(num_vars) = O(44) at n=26)
         self.analyze_seen.resize(self.num_vars, false);
         self.analyze_seen.fill(false);
@@ -2302,18 +2312,7 @@ impl Solver {
                     let cstart = m.start as usize;
                     let clen = m.len as usize;
                     for idx in 0..clen {
-                        let lit = self.clause_lits[cstart + idx];
-                        if lit == p { continue; }
-                        let v = var_of(lit);
-                        if self.analyze_seen[v] { continue; }
-                        self.analyze_seen[v] = true;
-                        self.bump_activity(v);
-                        if self.level[v] == self.decision_level() {
-                            counter += 1;
-                        } else if self.level[v] > 0 {
-                            learnt.push(lit);
-                            bt_level = bt_level.max(self.level[v]);
-                        }
+                        process_reason_lit!(self, self.clause_lits[cstart + idx], p, counter, learnt, bt_level);
                     }
                 }
                 Reason::Pb(pbi) => {
@@ -2329,18 +2328,7 @@ impl Solver {
                     }
                     if p != 0 { self.analyze_reason_buf.push(p); }
                     for idx in 0..self.analyze_reason_buf.len() {
-                        let lit = self.analyze_reason_buf[idx];
-                        if lit == p { continue; }
-                        let v = var_of(lit);
-                        if self.analyze_seen[v] { continue; }
-                        self.analyze_seen[v] = true;
-                        self.bump_activity(v);
-                        if self.level[v] == self.decision_level() {
-                            counter += 1;
-                        } else if self.level[v] > 0 {
-                            learnt.push(lit);
-                            bt_level = bt_level.max(self.level[v]);
-                        }
+                        process_reason_lit!(self, self.analyze_reason_buf[idx], p, counter, learnt, bt_level);
                     }
                 }
                 Reason::QuadPb(qi_encoded) => {
@@ -2369,18 +2357,7 @@ impl Solver {
                         }
                     }
                     for idx in 0..buf.len() {
-                        let lit = buf[idx];
-                        if lit == p { continue; }
-                        let v = var_of(lit);
-                        if self.analyze_seen[v] { continue; }
-                        self.analyze_seen[v] = true;
-                        self.bump_activity(v);
-                        if self.level[v] == self.decision_level() {
-                            counter += 1;
-                        } else if self.level[v] > 0 {
-                            learnt.push(lit);
-                            bt_level = bt_level.max(self.level[v]);
-                        }
+                        process_reason_lit!(self, buf[idx], p, counter, learnt, bt_level);
                     }
                     self.analyze_reason_buf = buf;
                 }
@@ -2400,18 +2377,7 @@ impl Solver {
                     // Also include the propagated literal itself (if not conflict)
                     if p != 0 { buf.push(p); }
                     for idx in 0..buf.len() {
-                        let lit = buf[idx];
-                        if lit == p { continue; }
-                        let v = var_of(lit);
-                        if self.analyze_seen[v] { continue; }
-                        self.analyze_seen[v] = true;
-                        self.bump_activity(v);
-                        if self.level[v] == self.decision_level() {
-                            counter += 1;
-                        } else if self.level[v] > 0 {
-                            learnt.push(lit);
-                            bt_level = bt_level.max(self.level[v]);
-                        }
+                        process_reason_lit!(self, buf[idx], p, counter, learnt, bt_level);
                     }
                     self.analyze_reason_buf = buf;
                 }
@@ -2504,6 +2470,28 @@ impl Solver {
     /// Uses `analyze_seen` and `minimize_levels` from caller, and reusable
     /// `minimize_stack`/`minimize_visited`/`analyze_reason_buf2` buffers.
     fn lit_removable(&mut self, v: usize) -> bool {
+        // Shared logic for checking one antecedent variable during minimization.
+        // Sets `fail = true` and breaks if the variable blocks removal.
+        macro_rules! check_minimize_var {
+            ($self:ident, $u:expr, $cur:expr, $fail:ident) => {{
+                let u = $u;
+                if u != $cur && !$self.minimize_visited[u] {
+                    $self.minimize_visited[u] = true;
+                    if $self.level[u] != 0 && !$self.analyze_seen[u] {
+                        let lv = $self.level[u] as usize;
+                        if lv >= $self.minimize_levels.len() || !$self.minimize_levels[lv] {
+                            $fail = true;
+                        } else {
+                            match $self.reason[u] {
+                                Reason::Decision => { $fail = true; }
+                                _ => { $self.minimize_stack.push(u); }
+                            }
+                        }
+                    }
+                }
+            }};
+        }
+
         self.minimize_stack.clear();
         self.minimize_stack.push(v);
         self.minimize_visited.resize(self.num_vars, false);
@@ -2511,6 +2499,7 @@ impl Solver {
         self.minimize_visited[v] = true;
 
         while let Some(cur) = self.minimize_stack.pop() {
+            let mut fail = false;
             // Process reason literals inline to avoid allocation
             match self.reason[cur] {
                 Reason::Clause(ci) => {
@@ -2518,55 +2507,25 @@ impl Solver {
                     let cstart = m.start as usize;
                     let clen = m.len as usize;
                     for idx in 0..clen {
-                        let lit = self.clause_lits[cstart + idx];
-                        let u = var_of(lit);
-                        if u == cur || self.minimize_visited[u] { continue; }
-                        self.minimize_visited[u] = true;
-                        if self.level[u] == 0 { continue; }
-                        if self.analyze_seen[u] { continue; }
-                        let lv = self.level[u] as usize;
-                        if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { return false; }
-                        match self.reason[u] {
-                            Reason::Decision => return false,
-                            _ => { self.minimize_stack.push(u); }
-                        }
+                        check_minimize_var!(self, var_of(self.clause_lits[cstart + idx]), cur, fail);
+                        if fail { return false; }
                     }
                 }
                 Reason::Pb(pbi) => {
                     let n = self.pb_constraints[pbi as usize].lits.len();
                     for i in 0..n {
                         let lit = self.pb_constraints[pbi as usize].lits[i];
-                        let u = var_of(lit);
-                        if u == cur || self.minimize_visited[u] { continue; }
                         if self.lit_value(lit) != LBool::False { continue; }
-                        self.minimize_visited[u] = true;
-                        if self.level[u] == 0 { continue; }
-                        if self.analyze_seen[u] { continue; }
-                        let lv = self.level[u] as usize;
-                        if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { return false; }
-                        match self.reason[u] {
-                            Reason::Decision => return false,
-                            _ => { self.minimize_stack.push(u); }
-                        }
+                        check_minimize_var!(self, var_of(lit), cur, fail);
+                        if fail { return false; }
                     }
                 }
                 Reason::QuadPb(qi_encoded) => {
                     let mut buf2 = std::mem::take(&mut self.analyze_reason_buf2);
                     self.compute_quad_pb_explanation_into(qi_encoded, cur, &mut buf2);
-                    let mut fail = false;
                     for idx in 0..buf2.len() {
-                        let lit = buf2[idx];
-                        let u = var_of(lit);
-                        if u == cur || self.minimize_visited[u] { continue; }
-                        self.minimize_visited[u] = true;
-                        if self.level[u] == 0 { continue; }
-                        if self.analyze_seen[u] { continue; }
-                        let lv = self.level[u] as usize;
-                        if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { fail = true; break; }
-                        match self.reason[u] {
-                            Reason::Decision => { fail = true; break; }
-                            _ => { self.minimize_stack.push(u); }
-                        }
+                        check_minimize_var!(self, var_of(buf2[idx]), cur, fail);
+                        if fail { break; }
                     }
                     self.analyze_reason_buf2 = buf2;
                     if fail { return false; }
@@ -2575,17 +2534,9 @@ impl Solver {
                     let xc = &self.xor_constraints[xi as usize];
                     for vi in 0..xc.vars.len() {
                         let u = xc.vars[vi];
-                        if u == cur || self.minimize_visited[u] { continue; }
                         if self.assigns[u] == LBool::Undef { continue; }
-                        self.minimize_visited[u] = true;
-                        if self.level[u] == 0 { continue; }
-                        if self.analyze_seen[u] { continue; }
-                        let lv = self.level[u] as usize;
-                        if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { return false; }
-                        match self.reason[u] {
-                            Reason::Decision => return false,
-                            _ => { self.minimize_stack.push(u); }
-                        }
+                        check_minimize_var!(self, u, cur, fail);
+                        if fail { return false; }
                     }
                 }
                 Reason::Spectral => {
@@ -2662,37 +2613,12 @@ impl Solver {
         }
     }
 
-    /// Minimize a learnt clause by removing redundant literals.
-    /// A literal is redundant if it's at level 0 (always false) or
-    /// if its reason clause is subsumed by the learnt clause.
-    /// Add a learnt clause and enqueue the asserting literal.
-    fn add_learnt_clause(&mut self, lits: Vec<Lit>) {
+    /// Add a learnt clause. If `enqueue_asserting` is true, enqueue lits[0] as
+    /// the asserting literal (normal CDCL). If false, skip enqueueing (used for
+    /// chronological backtracking where the clause isn't unit at the current level).
+    fn add_learnt_clause_inner(&mut self, lits: Vec<Lit>, enqueue_asserting: bool) {
         if lits.len() == 1 {
-            // Unit learnt clause: enqueue at level 0
-            self.enqueue(lits[0], Reason::Decision); // no clause needed
-            return;
-        }
-
-        let ci = self.clause_meta.len() as u32;
-        let lbd = self.compute_lbd(&lits);
-        let start = self.clause_lits.len() as u32;
-        let asserting_lit = lits[0];
-
-        // Watch the first two literals (blocker = the other watched lit)
-        self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
-        self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
-        self.clause_lits.extend_from_slice(&lits);
-        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8, deleted: false });
-
-        // The asserting literal (lits[0]) should be propagated
-        self.enqueue(asserting_lit, Reason::Clause(ci));
-    }
-
-    /// Add a learnt clause WITHOUT enqueueing the asserting literal.
-    /// Used for chronological backtracking where the clause isn't unit.
-    fn add_learnt_clause_no_enqueue(&mut self, lits: Vec<Lit>) {
-        if lits.len() == 1 {
-            // Unit — still enqueue
+            // Unit learnt clause: always enqueue at level 0
             self.enqueue(lits[0], Reason::Decision);
             return;
         }
@@ -2701,11 +2627,26 @@ impl Solver {
         let lbd = self.compute_lbd(&lits);
         let start = self.clause_lits.len() as u32;
 
+        // Watch the first two literals (blocker = the other watched lit)
         self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
         self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
         self.clause_lits.extend_from_slice(&lits);
         self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8, deleted: false });
-        // Don't enqueue — at chronological backtrack level, clause is not unit
+
+        if enqueue_asserting {
+            self.enqueue(lits[0], Reason::Clause(ci));
+        }
+    }
+
+    /// Add a learnt clause and enqueue the asserting literal.
+    fn add_learnt_clause(&mut self, lits: Vec<Lit>) {
+        self.add_learnt_clause_inner(lits, true);
+    }
+
+    /// Add a learnt clause WITHOUT enqueueing the asserting literal.
+    /// Used for chronological backtracking where the clause isn't unit.
+    fn add_learnt_clause_no_enqueue(&mut self, lits: Vec<Lit>) {
+        self.add_learnt_clause_inner(lits, false);
     }
 
     /// Compute LBD (Literal Block Distance) of a clause.
