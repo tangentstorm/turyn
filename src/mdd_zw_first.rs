@@ -696,6 +696,7 @@ impl ZwFirstMdd {
             unique: &mut HashMap<u64, u32>,
             zw_memo: &mut Vec<HashMap<StateKey, u32>>,
             xy_memo: &mut Vec<HashMap<XyStateKey, u32>>,
+            xy_cache: &mut HashMap<u128, u32>,
             zw_memo_count: &mut usize,
             max_memo_entries: usize,
             per_level_cap: usize,
@@ -706,6 +707,13 @@ impl ZwFirstMdd {
             if level == ctx.zw_depth {
                 // ZW half done. Build XY sub-MDD for these zw_sums.
                 stats.zw_level_stats[level].3 += 1;
+
+                // Check XY cache: same zw_sums → same XY sub-MDD root
+                let sums_key = pack_sums(sums);
+                if let Some(&cached_root) = xy_cache.get(&sums_key) {
+                    return cached_root;
+                }
+
                 stats.xy_build_count += 1;
                 let xy_start = std::time::Instant::now();
                 // Clear xy_memo for each distinct zw_sums to prevent memory explosion.
@@ -719,6 +727,7 @@ impl ZwFirstMdd {
                     ctx, nodes, unique, xy_memo, stats,
                 );
                 stats.xy_build_ns += xy_start.elapsed().as_nanos() as u64;
+                xy_cache.insert(sums_key, result);
                 return result;
             }
 
@@ -812,7 +821,7 @@ impl ZwFirstMdd {
                 if ok {
                     children[branch as usize] = build_zw(
                         level + 1, sums, &mut current_vals,
-                        ctx, nodes, unique, zw_memo, xy_memo,
+                        ctx, nodes, unique, zw_memo, xy_memo, xy_cache,
                         zw_memo_count, max_memo_entries, per_level_cap,
                         stats,
                     );
@@ -872,20 +881,23 @@ impl ZwFirstMdd {
         let max_memo_entries: usize = 50_000_000 / num_parallel; // ~7GB total budget
         let per_level_cap: usize = max_memo_entries / (zw_depth + 1);
         let mut zw_memo_count: usize = 0;
+        let mut xy_cache: HashMap<u128, u32> = HashMap::default();
         let mut sums = vec![0i8; k];
         let mut active_bits: Vec<u8> = Vec::new();
         let root = build_zw(
             0, &mut sums, &mut active_bits,
-            &ctx, &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo,
+            &ctx, &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo, &mut xy_cache,
             &mut zw_memo_count, max_memo_entries, per_level_cap,
             &mut stats,
         );
 
         let zw_memo_entries: usize = zw_memo.iter().map(|m| m.len()).sum();
         let xy_memo_entries: usize = xy_memo.iter().map(|m| m.len()).sum();
-        eprintln!("ZW-first MDD k={}: {} nodes, {:.1} MB (zw_memo={}, xy_memo={})",
+        let zw_boundary_calls: u64 = stats.zw_level_stats[zw_depth].3;
+        eprintln!("ZW-first MDD k={}: {} nodes, {:.1} MB (zw_memo={}, xy_memo={}, xy_cache={}/{} = {:.1}% hit)",
             k, nodes.len(), nodes.len() as f64 * 16.0 / 1_048_576.0,
-            zw_memo_entries, xy_memo_entries);
+            zw_memo_entries, xy_memo_entries, xy_cache.len(), zw_boundary_calls,
+            if zw_boundary_calls > 0 { 100.0 * (1.0 - xy_cache.len() as f64 / zw_boundary_calls as f64) } else { 0.0 });
 
         // Report per-level memo sizes
         eprintln!("  ZW memo per level:");
