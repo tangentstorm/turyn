@@ -9,6 +9,7 @@ use std::time::Instant;
 use rustfft::{FftPlanner, num_complex::Complex};
 
 use turyn::mdd_reorder;
+use turyn::mdd_zw_first;
 use turyn::sat_z_middle;
 
 #[derive(Clone, Copy, Debug)]
@@ -284,6 +285,8 @@ struct SearchConfig {
     use_mdd: bool,
     /// MDD boundary width (default: 8).
     mdd_k: usize,
+    /// Extension filter: prune dead boundaries by checking k+N extensibility (0 = off).
+    mdd_extend: usize,
 }
 
 impl Default for SearchConfig {
@@ -314,6 +317,7 @@ impl Default for SearchConfig {
             quad_pb: true,
             use_mdd: false,
             mdd_k: 8,
+            mdd_extend: 0,
         }
     }
 }
@@ -3078,6 +3082,7 @@ fn run_mdd_sat_search(
     let theta = cfg.theta_samples;
     let max_z = cfg.max_z;
     let max_spectral = cfg.max_spectral;
+    let mdd_extend = cfg.mdd_extend;
 
     run_parallel_search(problem, None, cfg.sat_config.clone(), move |tx, found| {
         let mut stats = SearchStats::default();
@@ -3234,6 +3239,16 @@ fn run_mdd_sat_search(
                         &pos_order_clone, &mdd.nodes, max_bnd_sum,
                         middle_n as i32, tuple,
                         &mut |x_bits, y_bits| {
+                            // Extension filter: skip provably dead boundaries
+                            if mdd_extend > 0 {
+                                let target_k = k + mdd_extend;
+                                if (n as i32) - 2 * (target_k as i32) >= 0
+                                    && !mdd_zw_first::has_extension(
+                                        k, target_k, z_bits, w_bits, x_bits, y_bits)
+                                {
+                                    return; // dead boundary
+                                }
+                            }
                             total_items += 1;
                             let _ = tx.send(SatWorkItem {
                                 tuple,
@@ -4281,6 +4296,9 @@ fn parse_args() -> SearchConfig {
         } else if let Some(v) = arg.strip_prefix("--mdd-k=") {
             cfg.mdd_k = v.parse().unwrap_or(8);
             cfg.use_mdd = true;
+        } else if let Some(v) = arg.strip_prefix("--mdd-extend=") {
+            cfg.mdd_extend = v.parse().unwrap_or(0);
+            cfg.use_mdd = true;
         } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
             cfg.dump_dimacs = Some(v.to_string());
         } else {
@@ -4699,6 +4717,7 @@ mod tests {
             quad_pb: true,
             use_mdd: false,
             mdd_k: 8,
+            mdd_extend: 0,
         };
         let report = run_hybrid_search(&cfg, false);
         assert!(report.found_solution, "n=4 hybrid should find solution");

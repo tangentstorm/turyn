@@ -1223,6 +1223,8 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
 /// new×new terms. At the end, all sums must be zero.
 ///
 /// Returns a ZwFirstMdd over the extension positions.
+///
+/// See also `has_extension` for a quick yes/no check that avoids full enumeration.
 pub fn build_extension(
     base_k: usize,
     target_k: usize,
@@ -1615,4 +1617,18 @@ pub fn build_extension(
         if root == DEAD { "DEAD".to_string() } else if root == LEAF { "LEAF".to_string() } else { root.to_string() });
 
     (nodes, root)
+}
+
+/// Check if ANY valid extension exists for a base boundary (quick yes/no).
+/// Builds the full extension MDD but only checks if the root is live.
+pub fn has_extension(
+    base_k: usize,
+    target_k: usize,
+    z_bits: u32,
+    w_bits: u32,
+    x_bits: u32,
+    y_bits: u32,
+) -> bool {
+    let (_, root) = build_extension(base_k, target_k, z_bits, w_bits, x_bits, y_bits);
+    root != DEAD
 }
