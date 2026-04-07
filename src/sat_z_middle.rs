@@ -31,49 +31,15 @@ pub struct LagInfo {
 }
 
 impl LagTemplate {
-    /// Build template for Z middle (length n, boundary width k).
-    pub fn new_z(n: usize, k: usize) -> Self {
-        let middle_n = n - 2 * k;
-        let is_mid = |pos: usize| -> bool { pos >= k && pos < n - k };
+    /// Build template for a sequence of given length and boundary width k.
+    /// Works for both Z (length n) and W (length m).
+    pub fn new(seq_len: usize, k: usize) -> Self {
+        let middle_len = seq_len - 2 * k;
+        let is_mid = |pos: usize| -> bool { pos >= k && pos < seq_len - k };
 
-        let mut lags = Vec::with_capacity(n - 1);
-        for s in 1..n {
-            let num_pairs = n - s;
-            let mut bnd_bnd = Vec::new();
-            let mut bnd_mid = Vec::new();
-            let mut mid_mid = Vec::new();
-
-            for i in 0..num_pairs {
-                let j = i + s;
-                let i_mid = is_mid(i);
-                let j_mid = is_mid(j);
-
-                if !i_mid && !j_mid {
-                    bnd_bnd.push((i, j));
-                } else if i_mid && !j_mid {
-                    bnd_mid.push((j, i - k)); // (bnd_pos, mid_idx)
-                } else if !i_mid && j_mid {
-                    bnd_mid.push((i, j - k));
-                } else {
-                    mid_mid.push((i - k, j - k));
-                }
-            }
-
-            let aux_base = (middle_n + 1 + s * n) as i32;
-            lags.push(LagInfo { bnd_bnd, bnd_mid, mid_mid, aux_base, num_pairs });
-        }
-
-        LagTemplate { lags }
-    }
-
-    /// Build template for W middle (length m, boundary width k).
-    pub fn new_w(m: usize, k: usize) -> Self {
-        let middle_m = m - 2 * k;
-        let is_mid = |pos: usize| -> bool { pos >= k && pos < m - k };
-
-        let mut lags = Vec::with_capacity(m - 1);
-        for s in 1..m {
-            let num_pairs = m - s;
+        let mut lags = Vec::with_capacity(seq_len - 1);
+        for s in 1..seq_len {
+            let num_pairs = seq_len - s;
             let mut bnd_bnd = Vec::new();
             let mut bnd_mid = Vec::new();
             let mut mid_mid = Vec::new();
@@ -94,7 +60,7 @@ impl LagTemplate {
                 }
             }
 
-            let aux_base = (middle_m + 1 + s * m) as i32;
+            let aux_base = (middle_len + 1 + s * seq_len) as i32;
             lags.push(LagInfo { bnd_bnd, bnd_mid, mid_mid, aux_base, num_pairs });
         }
 
@@ -417,7 +383,7 @@ pub fn build_z_middle_solver(
     z_mid_sum: i32,
 ) -> radical::Solver {
     let middle_n = n - 2 * k;
-    let tmpl = LagTemplate::new_z(n, k);
+    let tmpl = LagTemplate::new(n, k);
     let mut solver = tmpl.build_base_solver(middle_n, z_mid_sum);
     fill_z_solver(&mut solver, &tmpl, n, m, z_boundary, w_vals);
     solver

@@ -10,7 +10,6 @@ use rustfft::{FftPlanner, num_complex::Complex};
 
 use turyn::mdd_reorder;
 use turyn::sat_z_middle;
-use turyn::sat_w_middle;
 
 #[derive(Clone, Copy, Debug)]
 struct Problem {
@@ -3099,8 +3098,8 @@ fn run_mdd_sat_search(
 
         // Precompute lag templates + base solvers (XNOR clauses are boundary-independent).
         // Clone base solver per boundary, then fill in boundary-specific PB constraints.
-        let z_tmpl = sat_z_middle::LagTemplate::new_z(n, k);
-        let w_tmpl = sat_z_middle::LagTemplate::new_w(m, k);
+        let z_tmpl = sat_z_middle::LagTemplate::new(n, k);
+        let w_tmpl = sat_z_middle::LagTemplate::new(m, k);
 
         // W base solvers keyed by w_mid_sum (sum constraint + XNOR clauses, no boundary values)
         let mut w_bases: HashMap<i32, radical::Solver> = HashMap::new();
@@ -4460,7 +4459,9 @@ fn main() {
                     // SAT-based W middle generation with autocorrelation constraints
                     let mut w_boundary = vec![0i8; m];
                     for i in 0..k { w_boundary[i] = w_prefix[i]; w_boundary[m - k + i] = w_suffix[i]; }
-                    let mut w_solver = sat_w_middle::build_w_middle_solver(m, k, w_mid_sum, &w_boundary);
+                    let w_tmpl_local = sat_z_middle::LagTemplate::new(m, k);
+                    let mut w_solver = w_tmpl_local.build_base_solver(middle_m, w_mid_sum);
+                    sat_z_middle::fill_w_solver(&mut w_solver, &w_tmpl_local, m, &w_boundary);
                     let w_mid_vars: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
                     let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
                     let mut fft_buf_w = Vec::with_capacity(state.spectral_w.fft_size);
