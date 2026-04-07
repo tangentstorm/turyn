@@ -1381,3 +1381,282 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
 
     (nodes, root)
 }
+
+/// Build an MDD that extends a k=base_k boundary to k=target_k.
+///
+/// Given concrete boundary values (z_bits, w_bits, x_bits, y_bits) from a
+/// base_k-sized MDD, this builds an MDD over the *extension* positions only
+/// (positions base_k..target_k-1 in the "short" halves and their corresponding
+/// "long" counterparts).
+///
+/// The lag structure: lag j pairs position i with position (k + i + j) for Z/X,
+/// and position i with position (k + i + j + 1) for W/Y. When extending from
+/// base_k to target_k, we get three kinds of autocorrelation terms:
+///   1. Old×Old: fully determined by the base boundary bits (frozen, becomes initial sums)
+///   2. Old×New: one factor is known, the other is a new variable (cross-terms)
+///   3. New×New: both factors are new variables
+///
+/// The extension MDD branches on the new positions and tracks partial sums that
+/// include contributions from cross-terms (using the known old bit values) and
+/// new×new terms. At the end, all sums must be zero.
+///
+/// Returns a ZwFirstMdd over the extension positions.
+pub fn build_extension(
+    base_k: usize,
+    target_k: usize,
+    z_bits: u32,
+    w_bits: u32,
+    x_bits: u32,
+    y_bits: u32,
+) -> (Vec<[u32; 4]>, u32) {
+    assert!(target_k > base_k, "target_k must be > base_k");
+    let extra = target_k - base_k;
+
+    // Compute initial sums from old×old pairs (these are fixed)
+    let mut initial_sums = vec![0i8; target_k];
+    for j in 0..target_k {
+        let mut sum = 0i32;
+
+        // Z old×old pairs: lag j, positions (i, base_k + i + j)
+        // Only pairs where BOTH positions are in 0..2*base_k
+        for i in 0..base_k {
+            let pos_b = base_k + i + j;
+            if pos_b < 2 * base_k {
+                let za = if (z_bits >> i) & 1 == 1 { 1 } else { -1i32 };
+                let zb = if (z_bits >> pos_b) & 1 == 1 { 1 } else { -1i32 };
+                sum += 2 * za * zb;
+            }
+        }
+        // W old×old pairs: lag j, positions (i, base_k + i + j + 1)
+        if j < target_k - 1 {
+            for i in 0..base_k {
+                let pos_b = base_k + i + j + 1;
+                if pos_b < 2 * base_k {
+                    let wa = if (w_bits >> i) & 1 == 1 { 1 } else { -1i32 };
+                    let wb = if (w_bits >> pos_b) & 1 == 1 { 1 } else { -1i32 };
+                    sum += 2 * wa * wb;
+                }
+            }
+        }
+        // X old×old pairs
+        for i in 0..base_k {
+            let pos_b = base_k + i + j;
+            if pos_b < 2 * base_k {
+                let xa = if (x_bits >> i) & 1 == 1 { 1 } else { -1i32 };
+                let xb = if (x_bits >> pos_b) & 1 == 1 { 1 } else { -1i32 };
+                sum += xa * xb;
+            }
+        }
+        // Y old×old pairs
+        for i in 0..base_k {
+            let pos_b = base_k + i + j;
+            if pos_b < 2 * base_k {
+                let ya = if (y_bits >> i) & 1 == 1 { 1 } else { -1i32 };
+                let yb = if (y_bits >> pos_b) & 1 == 1 { 1 } else { -1i32 };
+                sum += ya * yb;
+            }
+        }
+
+        initial_sums[j] = sum as i8;
+    }
+
+    // Now build an MDD for the extension positions.
+    // The extension has 2*extra positions per sequence (extra "short" + extra "long").
+    // We interleave all 4 sequences: each level assigns (z,w,x,y) at a new position.
+    // But to match the ZW-first structure, we do ZW first, then XY.
+
+    let ext_depth = 2 * extra;  // positions per half-sequence
+
+    // Position mapping: extension position p maps to actual position (base_k + p)
+    // in the full sequence. The "short" half uses positions 0..extra-1,
+    // the "long" half uses positions extra..2*extra-1.
+
+    // Build position order (bouncing within extension)
+    let mut pos_order: Vec<usize> = Vec::with_capacity(ext_depth);
+    for t in 0..extra {
+        pos_order.push(t);
+        pos_order.push(2 * extra - 1 - t);
+    }
+    let mut pos_to_level: Vec<usize> = vec![0; ext_depth];
+    for (level, &pos) in pos_order.iter().enumerate() {
+        pos_to_level[pos] = level;
+    }
+
+    // Events: for each lag j, determine which pairs involve extension positions.
+    // A pair (i, base_k+i+j) where i or base_k+i+j is in the extension range.
+    //
+    // Extension positions in the full sequence:
+    //   Short half: base_k..base_k+extra-1  (ext pos 0..extra-1)
+    //   Long half:  base_k+extra..2*target_k-1  (ext pos extra..2*extra-1)
+    //
+    // Actually: the full sequence has 2*target_k positions. Positions 0..target_k-1
+    // are "short", positions target_k..2*target_k-1 are "long".
+    // Old positions: 0..base_k-1 (short) and target_k..target_k+base_k-1 (long)
+    // New positions: base_k..target_k-1 (short) and target_k+base_k..2*target_k-1 (long)
+    //
+    // In the extension MDD, we number new positions 0..2*extra-1:
+    //   0..extra-1 = actual positions base_k..target_k-1 (new short)
+    //   extra..2*extra-1 = actual positions target_k+base_k..2*target_k-1 (new long)
+
+    // For each lag j, collect events involving at least one new position.
+    // Each event: which ext positions are involved, and if one is old, what's the known value.
+    struct ExtEvent {
+        lag: usize,
+        // If both positions are new: ext_a and ext_b are extension positions
+        // If one is old: ext_new is the extension position, old_sign is the known ±1 value
+        kind: ExtEventKind,
+    }
+    enum ExtEventKind {
+        // Both positions are new extension positions
+        NewNew { ext_a: usize, ext_b: usize, is_z: bool },
+        // One position is old (known sign), one is new
+        OldNew { ext_new: usize, old_sign_z: i8, old_sign_w: i8, old_sign_x: i8, old_sign_y: i8 },
+    }
+
+    let mut events_at_level: Vec<Vec<ExtEvent>> = (0..ext_depth).map(|_| Vec::new()).collect();
+    let mut lag_check_at_level: Vec<Vec<usize>> = (0..=ext_depth).map(|_| Vec::new()).collect();
+    let mut max_remaining: Vec<Vec<i32>> = vec![vec![0i32; target_k]; ext_depth + 1];
+
+    for j in 0..target_k {
+        let mut max_complete_level: Option<usize> = None;
+
+        // Z/X pairs: (i, target_k + i + j) for i in 0..target_k-j
+        for i in 0..target_k.saturating_sub(j) {
+            let actual_a = i;
+            let actual_b = target_k + i + j;
+            if actual_b >= 2 * target_k { continue; }
+
+            let a_is_new = actual_a >= base_k && actual_a < target_k;
+            let b_is_new = actual_b >= target_k + base_k;
+
+            if !a_is_new && !b_is_new {
+                continue; // old×old: already in initial_sums
+            }
+
+            let ext_a = if a_is_new { Some(actual_a - base_k) } else { None };
+            let ext_b = if b_is_new { Some(extra + (actual_b - target_k - base_k)) } else { None };
+
+            // Determine when this event completes (both positions assigned)
+            let complete_level = match (ext_a, ext_b) {
+                (Some(ea), Some(eb)) => pos_to_level[ea].max(pos_to_level[eb]),
+                (Some(ea), None) => pos_to_level[ea],
+                (None, Some(eb)) => pos_to_level[eb],
+                (None, None) => unreachable!(),
+            };
+
+            let event = match (ext_a, ext_b) {
+                (Some(ea), Some(eb)) => ExtEvent {
+                    lag: j,
+                    kind: ExtEventKind::NewNew { ext_a: ea, ext_b: eb, is_z: true },
+                },
+                (Some(en), None) => {
+                    // b is old position
+                    let zb = if (z_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                    let xb = if (x_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                    ExtEvent {
+                        lag: j,
+                        kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: zb, old_sign_w: 0, old_sign_x: xb, old_sign_y: 0 },
+                    }
+                },
+                (None, Some(en)) => {
+                    // a is old position
+                    let za = if (z_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                    let xa = if (x_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                    ExtEvent {
+                        lag: j,
+                        kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: za, old_sign_w: 0, old_sign_x: xa, old_sign_y: 0 },
+                    }
+                },
+                _ => unreachable!(),
+            };
+
+            // Track max contribution for pruning
+            for lv in 0..=complete_level {
+                max_remaining[lv][j] += 4; // max |delta| per event (2 for Z + 2 for X)
+            }
+
+            events_at_level[complete_level].push(event);
+            max_complete_level = Some(max_complete_level.map_or(complete_level, |c: usize| c.max(complete_level)));
+        }
+
+        // W/Y pairs: (i, target_k + i + j + 1) for i in 0..target_k-j-1
+        if j < target_k - 1 {
+            for i in 0..target_k - j - 1 {
+                let actual_a = i;
+                let actual_b = target_k + i + j + 1;
+                if actual_b >= 2 * target_k { continue; }
+
+                let a_is_new = actual_a >= base_k && actual_a < target_k;
+                let b_is_new = actual_b >= target_k + base_k;
+
+                if !a_is_new && !b_is_new {
+                    continue; // old×old
+                }
+
+                let ext_a = if a_is_new { Some(actual_a - base_k) } else { None };
+                let ext_b = if b_is_new { Some(extra + (actual_b - target_k - base_k)) } else { None };
+
+                let complete_level = match (ext_a, ext_b) {
+                    (Some(ea), Some(eb)) => pos_to_level[ea].max(pos_to_level[eb]),
+                    (Some(ea), None) => pos_to_level[ea],
+                    (None, Some(eb)) => pos_to_level[eb],
+                    (None, None) => unreachable!(),
+                };
+
+                let event = match (ext_a, ext_b) {
+                    (Some(ea), Some(eb)) => ExtEvent {
+                        lag: j,
+                        kind: ExtEventKind::NewNew { ext_a: ea, ext_b: eb, is_z: false },
+                    },
+                    (Some(en), None) => {
+                        let wb = if (w_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                        let yb = if (y_bits >> actual_b) & 1 == 1 { 1i8 } else { -1 };
+                        ExtEvent {
+                            lag: j,
+                            kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: 0, old_sign_w: wb, old_sign_x: 0, old_sign_y: yb },
+                        }
+                    },
+                    (None, Some(en)) => {
+                        let wa = if (w_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                        let ya = if (y_bits >> actual_a) & 1 == 1 { 1i8 } else { -1 };
+                        ExtEvent {
+                            lag: j,
+                            kind: ExtEventKind::OldNew { ext_new: en, old_sign_z: 0, old_sign_w: wa, old_sign_x: 0, old_sign_y: ya },
+                        }
+                    },
+                    _ => unreachable!(),
+                };
+
+                for lv in 0..=complete_level {
+                    max_remaining[lv][j] += 4;
+                }
+
+                events_at_level[complete_level].push(event);
+                max_complete_level = Some(max_complete_level.map_or(complete_level, |c: usize| c.max(complete_level)));
+            }
+        }
+
+        if let Some(cl) = max_complete_level {
+            lag_check_at_level[cl].push(j);
+        }
+    }
+
+    // TODO: The full DFS builder for extension positions goes here.
+    // For now, this sets up the event structure. The actual DFS is structurally
+    // identical to build_inner but operates on extension positions only,
+    // with 16-way branching (z,w,x,y per position) and initial_sums as starting state.
+    //
+    // Each level assigns (z[pos], w[pos], x[pos], y[pos]) at an extension position.
+    // Events update sums based on both new×new and old×new interactions.
+
+    // Placeholder: return empty MDD
+    // TODO: implement the actual DFS/BFS builder
+    let nodes = vec![[DEAD; 4]];
+    let root = DEAD;
+
+    eprintln!("build_extension: base_k={}, target_k={}, extra={}, {} initial_sums, {} events",
+        base_k, target_k, extra, initial_sums.len(),
+        events_at_level.iter().map(|e| e.len()).sum::<usize>());
+
+    (nodes, root)
+}
