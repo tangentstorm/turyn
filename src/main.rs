@@ -905,7 +905,8 @@ impl SpectralIndex {
 /// Streaming Z×W pairing with spectral index for fast candidate lookup.
 /// For each spectrally-valid Z, uses the index to find W candidates that pass
 /// the top-4 tightest frequency constraints, then full-checks only those.
-fn stream_zw_candidates(
+/// Calls `emit` for each valid pair; `emit` returns true to continue.
+fn for_each_zw_pair(
     problem: Problem,
     z_sum: i32,
     w_candidates: &[SeqWithSpectrum],
@@ -914,10 +915,10 @@ fn stream_zw_candidates(
     spectral_z: &SpectralFilter,
     stats: &mut SearchStats,
     found: &AtomicBool,
-) -> Vec<CandidateZW> {
+    mut emit: impl FnMut(&PackedSeq, &PackedSeq, Vec<i32>, &[f64], &[f64]) -> bool,
+) {
     let individual_bound = problem.spectral_bound();
     let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
-    let mut out = Vec::new();
     let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
     let mut idx_buf = Vec::new();
     generate_sequences_permuted(problem.n, z_sum, true, true, cfg.max_z, |values| {
@@ -934,14 +935,28 @@ fn stream_zw_candidates(
             if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
             stats.candidate_pair_spectral_ok += 1;
             let zw = compute_zw_autocorr(problem, &z_seq, &w.seq);
-            out.push(CandidateZW {
-                z: z_seq.clone(),
-                w: w.seq.clone(),
-                zw_autocorr: zw,
-            });
+            if !emit(&z_seq, &w.seq, zw, &z_spectrum, &w.spectrum) { return false; }
         }
         true
     });
+}
+
+fn stream_zw_candidates(
+    problem: Problem,
+    z_sum: i32,
+    w_candidates: &[SeqWithSpectrum],
+    w_index: &SpectralIndex,
+    cfg: &SearchConfig,
+    spectral_z: &SpectralFilter,
+    stats: &mut SearchStats,
+    found: &AtomicBool,
+) -> Vec<CandidateZW> {
+    let mut out = Vec::new();
+    for_each_zw_pair(problem, z_sum, w_candidates, w_index, cfg, spectral_z, stats, found,
+        |z_seq, w_seq, zw, _, _| {
+            out.push(CandidateZW { z: z_seq.clone(), w: w_seq.clone(), zw_autocorr: zw });
+            true
+        });
     out
 }
 
@@ -958,40 +973,23 @@ fn stream_zw_candidates_to_channel(
     found: &AtomicBool,
     tx: &std::sync::mpsc::SyncSender<SatWorkItem>,
 ) {
-    let individual_bound = problem.spectral_bound();
-    let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
-    let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
     let mut seen = std::collections::HashSet::new();
-    let mut idx_buf = Vec::new();
-    generate_sequences_permuted(problem.n, tuple.z, true, true, cfg.max_z, |values| {
-        if found.load(AtomicOrdering::Relaxed) { return false; }
-        stats.z_generated += 1;
-        let Some(z_spectrum) =
-            spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf) else { return true; };
-        stats.z_spectral_ok += 1;
-        let z_seq = PackedSeq::from_values(values);
-        w_index.candidates_for(&z_spectrum, pair_bound, w_candidates, &mut idx_buf);
-        for &wi in &idx_buf {
-            let w = &w_candidates[wi];
-            stats.candidate_pair_attempts += 1;
-            if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
-            let max_power = spectral_pair_max_power(&z_spectrum, &w.spectrum);
-            stats.candidate_pair_spectral_ok += 1;
-            let zw = compute_zw_autocorr(problem, &z_seq, &w.seq);
+    for_each_zw_pair(problem, tuple.z, w_candidates, w_index, cfg, spectral_z, stats, found,
+        |z_seq, w_seq, zw, z_spectrum, w_spectrum| {
+            let max_power = spectral_pair_max_power(z_spectrum, w_spectrum);
             if seen.insert(zw.clone()) {
                 let _ = tx.send(SatWorkItem {
                     tuple,
                     x: SeqInput::Blank, y: SeqInput::Blank,
                     z: SeqInput::Fixed(z_seq.clone()),
-                    w: SeqInput::Fixed(w.seq.clone()),
+                    w: SeqInput::Fixed(w_seq.clone()),
                     zw_autocorr: Some(zw),
                     priority: max_power,
                     boundary: None,
                 });
             }
-        }
-        true
-    });
+            true
+        });
 }
 
 fn build_zw_candidates(
