@@ -571,7 +571,7 @@ impl ZwFirstMdd {
         fn build_xy(
             level: usize,  // 0..2k within xy half
             sums: &mut Vec<i8>,  // partial N_X + N_Y at each lag
-            active_bits: &mut Vec<u8>,
+            active_bits: &[u8],
             zw_sums: &[i8],  // target: sums[li] must equal -zw_sums[li] at end
             ctx: &Ctx,
             nodes: &mut Vec<[u32; 4]>,
@@ -589,29 +589,24 @@ impl ZwFirstMdd {
             }
 
             let active = &ctx.xy_active_at_level[level];
-            let mut current_vals: Vec<u8> = Vec::with_capacity(active.len());
+            let n_active = active.len();
+            let mut current_vals = [0u8; 32];
             if level > 0 {
                 let prev_indices = &ctx.xy_active_indices[level - 1];
-                for &pos in active {
-                    if pos == ctx.pos_order[level] {
-                        current_vals.push(0);
-                    } else {
+                for (i, &pos) in active.iter().enumerate() {
+                    if pos != ctx.pos_order[level] {
                         let pi = prev_indices[pos];
                         if pi != usize::MAX {
-                            current_vals.push(active_bits[pi]);
-                        } else {
-                            current_vals.push(0);
+                            current_vals[i] = active_bits[pi];
                         }
                     }
                 }
-            } else {
-                current_vals.resize(active.len(), 0);
             }
 
             let new_pos = ctx.pos_order[level];
             let new_idx = ctx.xy_active_indices[level][new_pos];
 
-            let state_key = (pack_sums(sums), pack_active(&current_vals));
+            let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
             if let Some(&cached) = memo[level].get(&state_key) {
                 stats.xy_level_stats[level].1 += 1;
                 return cached;
@@ -661,7 +656,7 @@ impl ZwFirstMdd {
 
                 if ok {
                     children[branch as usize] = build_xy(
-                        level + 1, sums, &mut current_vals, zw_sums,
+                        level + 1, sums, &current_vals[..n_active], zw_sums,
                         ctx, nodes, unique, memo, stats,
                     );
                 } else {
@@ -700,7 +695,7 @@ impl ZwFirstMdd {
         fn build_zw(
             level: usize,  // 0..2k within zw half
             sums: &mut Vec<i8>,  // partial 2*N_Z + 2*N_W at each lag
-            active_bits: &mut Vec<u8>,
+            active_bits: &[u8],
             ctx: &Ctx,
             nodes: &mut Vec<[u32; 4]>,
             unique: &mut HashMap<u64, u32>,
@@ -731,9 +726,8 @@ impl ZwFirstMdd {
                 for m in xy_memo.iter_mut() { m.clear(); }
                 let zw_sums: Vec<i8> = sums.to_vec();
                 let mut xy_sums = vec![0i8; ctx.k];
-                let mut xy_active: Vec<u8> = Vec::new();
                 let result = build_xy(
-                    0, &mut xy_sums, &mut xy_active, &zw_sums,
+                    0, &mut xy_sums, &[], &zw_sums,
                     ctx, nodes, unique, xy_memo, stats,
                 );
                 stats.xy_build_ns += xy_start.elapsed().as_nanos() as u64;
@@ -742,29 +736,24 @@ impl ZwFirstMdd {
             }
 
             let active = &ctx.zw_active_at_level[level];
-            let mut current_vals: Vec<u8> = Vec::with_capacity(active.len());
+            let n_active = active.len();
+            let mut current_vals = [0u8; 32];
             if level > 0 {
                 let prev_indices = &ctx.zw_active_indices[level - 1];
-                for &pos in active {
-                    if pos == ctx.pos_order[level] {
-                        current_vals.push(0);
-                    } else {
+                for (i, &pos) in active.iter().enumerate() {
+                    if pos != ctx.pos_order[level] {
                         let pi = prev_indices[pos];
                         if pi != usize::MAX {
-                            current_vals.push(active_bits[pi]);
-                        } else {
-                            current_vals.push(0);
+                            current_vals[i] = active_bits[pi];
                         }
                     }
                 }
-            } else {
-                current_vals.resize(active.len(), 0);
             }
 
             let new_pos = ctx.pos_order[level];
             let new_idx = ctx.zw_active_indices[level][new_pos];
 
-            let state_key = (pack_sums(sums), pack_active(&current_vals));
+            let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
             if let Some(&cached) = zw_memo[level].get(&state_key) {
                 stats.zw_level_stats[level].1 += 1;
                 return cached;
@@ -833,7 +822,7 @@ impl ZwFirstMdd {
 
                 if ok {
                     children[branch as usize] = build_zw(
-                        level + 1, sums, &mut current_vals,
+                        level + 1, sums, &current_vals[..n_active],
                         ctx, nodes, unique, zw_memo, xy_memo, xy_cache,
                         zw_memo_count, max_memo_entries, per_level_cap,
                         stats,
@@ -896,9 +885,8 @@ impl ZwFirstMdd {
         let mut zw_memo_count: usize = 0;
         let mut xy_cache: HashMap<u128, u32> = HashMap::default();
         let mut sums = vec![0i8; k];
-        let mut active_bits: Vec<u8> = Vec::new();
         let root = build_zw(
-            0, &mut sums, &mut active_bits,
+            0, &mut sums, &[],
             &ctx, &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo, &mut xy_cache,
             &mut zw_memo_count, max_memo_entries, per_level_cap,
             &mut stats,
