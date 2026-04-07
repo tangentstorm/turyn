@@ -909,30 +909,13 @@ fn stream_zw_candidates(
             spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf) else { return true; };
         stats.z_spectral_ok += 1;
         let z_seq = PackedSeq::from_values(values);
-        let mut z_auto: Option<Vec<i32>> = None;
         w_index.candidates_for(&z_spectrum, pair_bound, w_candidates, &mut idx_buf);
         for &wi in &idx_buf {
             let w = &w_candidates[wi];
             stats.candidate_pair_attempts += 1;
             if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
             stats.candidate_pair_spectral_ok += 1;
-            let z_auto = z_auto.get_or_insert_with(|| {
-                let mut a = vec![0i32; problem.n];
-                for s in 1..problem.n { a[s] = z_seq.autocorrelation(s); }
-                a
-            });
-            let w_auto = w.autocorr.as_ref().cloned()
-                .unwrap_or_else(|| {
-                    let mut a = vec![0i32; problem.m()];
-                    for s in 1..problem.m() { a[s] = w.seq.autocorrelation(s); }
-                    a
-                });
-            let mut zw = vec![0; problem.n];
-            for (s, slot) in zw.iter_mut().enumerate().skip(1) {
-                let nz = z_auto[s];
-                let nw = if s < problem.m() { w_auto[s] } else { 0 };
-                *slot = 2 * nz + 2 * nw;
-            }
+            let zw = compute_zw_autocorr(problem, &z_seq, &w.seq);
             out.push(CandidateZW {
                 z: z_seq.clone(),
                 w: w.seq.clone(),
@@ -969,7 +952,6 @@ fn stream_zw_candidates_to_channel(
             spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf) else { return true; };
         stats.z_spectral_ok += 1;
         let z_seq = PackedSeq::from_values(values);
-        let mut z_auto: Option<Vec<i32>> = None;
         w_index.candidates_for(&z_spectrum, pair_bound, w_candidates, &mut idx_buf);
         for &wi in &idx_buf {
             let w = &w_candidates[wi];
@@ -977,23 +959,7 @@ fn stream_zw_candidates_to_channel(
             if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
             let max_power = spectral_pair_max_power(&z_spectrum, &w.spectrum);
             stats.candidate_pair_spectral_ok += 1;
-            let z_auto = z_auto.get_or_insert_with(|| {
-                let mut a = vec![0i32; problem.n];
-                for s in 1..problem.n { a[s] = z_seq.autocorrelation(s); }
-                a
-            });
-            let w_auto = w.autocorr.as_ref().cloned()
-                .unwrap_or_else(|| {
-                    let mut a = vec![0i32; problem.m()];
-                    for s in 1..problem.m() { a[s] = w.seq.autocorrelation(s); }
-                    a
-                });
-            let mut zw = vec![0; problem.n];
-            for (s, slot) in zw.iter_mut().enumerate().skip(1) {
-                let nz = z_auto[s];
-                let nw = if s < problem.m() { w_auto[s] } else { 0 };
-                *slot = 2 * nz + 2 * nw;
-            }
+            let zw = compute_zw_autocorr(problem, &z_seq, &w.seq);
             if seen.insert(zw.clone()) {
                 let _ = tx.send(SatWorkItem {
                     tuple,
@@ -4420,13 +4386,7 @@ fn main() {
         let p = Problem::new(n);
         let zs = z.sum();
         let ws = w.sum();
-        // Compute ZW autocorrelation
-        let mut zw_autocorr = vec![0i32; n];
-        for s in 1..n {
-            let nz = z.autocorrelation(s);
-            let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
-            zw_autocorr[s] = 2 * nz + 2 * nw;
-        }
+        let zw_autocorr = compute_zw_autocorr(p, &z, &w);
         let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr };
         // Try all sum tuples that match this Z/W
         let mut tuples = phase_a_tuples(p, cfg.test_tuple.as_ref());
