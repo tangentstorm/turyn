@@ -705,8 +705,6 @@ impl ZwFirstMdd {
 
                 current_vals[new_idx] = branch as u8;
 
-                let sums_backup = pack_sums(sums);
-
                 // Process XY pair events at this level (pre-resolved indices + delta table)
                 for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.xy_events_at_level[level] {
                     let bits_a = current_vals[idx_a] as usize;
@@ -737,9 +735,11 @@ impl ZwFirstMdd {
                     stats.xy_level_stats[level].2 += 1;
                 }
 
-                // Restore sums from packed backup
-                for i in 0..sums.len() {
-                    sums[i] = ((sums_backup >> (i * 8)) & 0xFF) as i8;
+                // Restore sums by subtracting deltas
+                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.xy_events_at_level[level] {
+                    let bits_a = current_vals[idx_a] as usize;
+                    let bits_b = current_vals[idx_b] as usize;
+                    sums[lag_idx] -= delta[bits_a * 4 + bits_b];
                 }
             }
 
@@ -855,8 +855,6 @@ impl ZwFirstMdd {
 
                 current_vals[new_idx] = branch as u8;
 
-                let sums_backup = pack_sums(sums);
-
                 // Process ZW pair events at this level (pre-resolved indices + delta table)
                 for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.zw_events_at_level[level] {
                     let bits_a = current_vals[idx_a] as usize;
@@ -879,9 +877,6 @@ impl ZwFirstMdd {
                         let zw_val = sums[li] as i32;
                         let zw_remaining = ctx.zw_max_remaining[level + 1][li];
                         let max_xy = ctx.xy_max_abs[li];
-                        // After all ZW events: zw_val + remaining_zw in [-max_zw_total, +max_zw_total]
-                        // Need: |final_zw_val| <= max_xy and right parity
-                        // Quick check: if |zw_val| - zw_remaining > max_xy, impossible
                         if (zw_val.abs() - zw_remaining) > max_xy { ok = false; break; }
                     }
                 }
@@ -901,9 +896,11 @@ impl ZwFirstMdd {
                     stats.zw_level_stats[level].2 += 1;
                 }
 
-                // Restore sums from packed backup
-                for i in 0..sums.len() {
-                    sums[i] = ((sums_backup >> (i * 8)) & 0xFF) as i8;
+                // Restore sums by subtracting deltas (avoids pack/unpack overhead)
+                for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.zw_events_at_level[level] {
+                    let bits_a = current_vals[idx_a] as usize;
+                    let bits_b = current_vals[idx_b] as usize;
+                    sums[lag_idx] -= delta[bits_a * 4 + bits_b];
                 }
             }
 
