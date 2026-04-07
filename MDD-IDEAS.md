@@ -149,10 +149,9 @@ levels to disk (redb or raw file). Read back during bottom-up node build.
 Reduces peak memory from O(total_states) to O(max_states_per_level).
 
 ### 25. XY sub-MDD caching by zw_sums signature
-**Status**: Untested.
-Many of the 5.3M ZW boundaries produce identical or similar XY sub-MDDs.
-Cache completed XY sub-MDD roots keyed by zw_sums. If the same zw_sums
-appears twice, reuse the XY root. Eliminates redundant XY builds entirely.
+**Status**: Implemented. **-60% build time.**
+74% of ZW boundary visits have duplicate sums. Cache XY sub-MDD roots
+keyed by packed zw_sums (u128). k=9 seq: 93.8→37.8s; k=9 par: 40→28.1s.
 
 ### 26. Batch XY builds with shared memo
 **Status**: Untested.
