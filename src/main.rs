@@ -3719,21 +3719,27 @@ fn run_mdd_sat_search(
                     true
                 } else { false }
             } else {
-                // Flexible worker: go to bottleneck (lowest rate with work)
-                let has_d = !xy_queue.is_empty();
-                let has_c = !zxy_queue.is_empty();
+                // Flexible worker: go to the bottleneck — lowest throughput
+                // rate among phases that have work queued.
                 let has_b = !phase_b_queue.is_empty();
-                if has_d && (d_rate <= c_rate || !has_c) {
-                    dispatched_c += 1;
-                    let _ = worker_txs[tid].send(HybridWork::PhaseD(xy_queue.pop_front().unwrap()));
-                    true
-                } else if has_c && (c_rate <= b_rate || !has_b) {
-                    let _ = worker_txs[tid].send(HybridWork::PhaseC(zxy_queue.pop_front().unwrap()));
-                    true
-                } else if has_b {
+                let has_c = !zxy_queue.is_empty();
+                let has_d = !xy_queue.is_empty();
+                // Rate for each phase; MAX if no work (not a candidate).
+                // Tiebreaker: favor C > D > B (middle of pipeline first).
+                let br = if has_b { b_rate + 0.02 } else { f64::MAX };
+                let cr = if has_c { c_rate } else { f64::MAX };
+                let dr = if has_d { d_rate + 0.01 } else { f64::MAX };
+                if br <= cr && br <= dr && has_b {
                     dispatched_b += 1;
                     phase_b_remaining = phase_b_queue.len() - 1;
                     let _ = worker_txs[tid].send(HybridWork::PhaseB(phase_b_queue.pop_front().unwrap()));
+                    true
+                } else if cr <= dr && has_c {
+                    let _ = worker_txs[tid].send(HybridWork::PhaseC(zxy_queue.pop_front().unwrap()));
+                    true
+                } else if has_d {
+                    dispatched_c += 1;
+                    let _ = worker_txs[tid].send(HybridWork::PhaseD(xy_queue.pop_front().unwrap()));
                     true
                 } else { false }
             };
