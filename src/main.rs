@@ -3501,13 +3501,12 @@ fn run_mdd_sat_search(
                     if let Some(top) = gq.peek() {
                         let quality = top.priority; // 0.0..1.0
                         // Always accept if quality > 0.9 or gold queue is huge (>1000)
-                        // Coinflip: probability = quality (0..1).
-                        // High quality items process often, low quality rarely.
-                        // But if work queue is empty, always accept (slow lane still moves).
-                        let work_empty = self.work.lock().unwrap().is_empty();
-                        let accept = work_empty || quality > 0.9 || {
+                        // If gold queue has >=100 items, it's well-stocked — take the best.
+                        // If <100 items, 50/50 between processing and generating more.
+                        let well_stocked = gq.len() >= 100;
+                        let accept = well_stocked || {
                             *rng ^= *rng << 13; *rng ^= *rng >> 7; *rng ^= *rng << 17;
-                            (*rng as f64 / u64::MAX as f64) < quality
+                            *rng & 1 == 0
                         };
                         if accept {
                             return Some(gq.pop().unwrap().work);
