@@ -81,10 +81,6 @@ structure TMatrixQuad (m : Nat) where
   c : SquareMatrix m
   d : SquareMatrix m
 
-/-- Abstract Step 3 existence theorem on typed T-sequences. -/
-axiom goethals_seidel_hadamard_exists {m : Nat} (T : TSequence m) :
-  ∃ H : SquareMatrix (4 * m), H.IsHadamard
-
 /-- The immediate matrix-level object obtained from a T-sequence: four
     circulant matrices of order `m`. -/
 def tMatrixQuadOfTSequence {m : Nat} (T : TSequence m) : TMatrixQuad m :=
@@ -174,15 +170,133 @@ def rawGoethalsSeidel {m : Nat} (T : TSequence m) : SquareMatrix (4 * m) :=
     (circulantRow m a i).length = m := by
   simp [circulantRow]
 
+/-- Helper: every row in a circulantRows matrix has length m. -/
+private lemma circulantRows_getD_length (m : Nat) (a : List Int) (i : Nat) (hi : i < m) :
+    ((circulantRows m a).getD i []).length = m := by
+  rw [List.getD_eq_getElem _ _ (by simp [circulantRows]; exact hi)]
+  simp [circulantRows, circulantRow]
+
 /-- Every row of the raw Goethals-Seidel array has length `4 * m`. -/
-axiom rawGoethalsSeidel_allRowsLength {m : Nat} (T : TSequence m) :
-    allRowsLength (rawGoethalsSeidel T).rows (4 * m) = true
+theorem rawGoethalsSeidel_allRowsLength {m : Nat} (T : TSequence m) :
+    allRowsLength (rawGoethalsSeidel T).rows (4 * m) = true := by
+  unfold allRowsLength; simp +decide [ rawGoethalsSeidelRows ];
+  intro x hx; rw [ rawGoethalsSeidel ] at hx; simp_all +decide [ rawGoethalsSeidelRows, List.mem_map ] ;
+  obtain ⟨ a, ha, rfl ⟩ := hx; simp +arith +decide [ rawGoethalsSeidelRowAt ] ;
+  have h_block_row : a / m < 4 := by
+    exact Nat.div_lt_of_lt_mul <| by linarith;
+  interval_cases _ : a / m <;> simp_all +decide [ tMatrixQuadOfTSequence ];
+  · rcases ‹m = 0 ∨ a < m› with ( rfl | ha ) <;> simp_all +decide [ Nat.mod_eq_of_lt ];
+    simp_all +decide [ circulantRows ];
+    ring;
+  · rw [ List.getElem?_eq_getElem, List.getElem?_eq_getElem, List.getElem?_eq_getElem, List.getElem?_eq_getElem ];
+    all_goals norm_num [ circulantRows ];
+    · ring;
+    · exact Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) );
+    · exact Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) );
+    · exact Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) );
+    · exact Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) );
+  · have h_len : ∀ i < m, ((circulantRows m T.c)[i]?.getD []).length = m ∧ ((circulantRows m T.d)[i]?.getD []).length = m ∧ ((circulantRows m T.a)[i]?.getD []).length = m ∧ ((circulantRows m T.b)[i]?.getD []).length = m := by
+      exact fun i hi => ⟨ circulantRows_getD_length m T.c i hi, circulantRows_getD_length m T.d i hi, circulantRows_getD_length m T.a i hi, circulantRows_getD_length m T.b i hi ⟩;
+    linarith [ h_len ( a % m ) ( Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) ) ) ];
+  · have := Nat.mod_lt a ( show m > 0 from Nat.pos_of_ne_zero ( by aesop_cat ) ) ; simp_all +decide [ circulantRows, circulantRow ] ;
+    ring
 
 /-- Structural shape theorem for the explicit raw block array. -/
 theorem rawGoethalsSeidel_hasShape {m : Nat} (T : TSequence m) :
     (rawGoethalsSeidel T).rows.length = 4 * m ∧
     allRowsLength (rawGoethalsSeidel T).rows (4 * m) = true := by
   exact ⟨rawGoethalsSeidel_dim T, rawGoethalsSeidel_allRowsLength T⟩
+
+/-! ### Correct Hadamard construction from T-sequences
+
+The raw Goethals-Seidel array with {0,±1} circulant matrices does NOT produce
+a Hadamard matrix (the zero entries prevent that). The correct construction
+combines the T-sequences into ±1 sequences first:
+
+Given T-sequences (a,b,c,d) with disjoint {0,±1} supports:
+  x₁ = a + b + c + d    (±1 since exactly one is nonzero at each position)
+  x₂ = a + b - c - d
+  x₃ = a - b + c - d
+  x₄ = a - b - c + d
+
+Then the standard Goethals-Seidel array with circulant matrices of (x₁,x₂,x₃,x₄)
+is a Hadamard matrix of order 4m, because:
+  N_{x₁} + N_{x₂} + N_{x₃} + N_{x₄} = 4 · (N_a + N_b + N_c + N_d) = 0.
+
+The proof of this theorem is substantial and left as sorry.
+-/
+
+/-! ### Construction of ±1 sequences from T-sequences -/
+
+/-- Combine T-sequences into ±1 sequences using Hadamard sign matrix.
+    x₁ = a + b + c + d  (exactly one nonzero at each position, so this is ±1) -/
+def tseqCombine1 {m : Nat} (T : TSequence m) : List Int :=
+  (List.range m).map fun j =>
+    T.a.getD j 0 + T.b.getD j 0 + T.c.getD j 0 + T.d.getD j 0
+
+def tseqCombine2 {m : Nat} (T : TSequence m) : List Int :=
+  (List.range m).map fun j =>
+    T.a.getD j 0 + T.b.getD j 0 - T.c.getD j 0 - T.d.getD j 0
+
+def tseqCombine3 {m : Nat} (T : TSequence m) : List Int :=
+  (List.range m).map fun j =>
+    T.a.getD j 0 - T.b.getD j 0 + T.c.getD j 0 - T.d.getD j 0
+
+def tseqCombine4 {m : Nat} (T : TSequence m) : List Int :=
+  (List.range m).map fun j =>
+    T.a.getD j 0 - T.b.getD j 0 - T.c.getD j 0 + T.d.getD j 0
+
+@[simp] lemma tseqCombine1_length {m : Nat} (T : TSequence m) :
+    (tseqCombine1 T).length = m := by simp [tseqCombine1]
+
+@[simp] lemma tseqCombine2_length {m : Nat} (T : TSequence m) :
+    (tseqCombine2 T).length = m := by simp [tseqCombine2]
+
+@[simp] lemma tseqCombine3_length {m : Nat} (T : TSequence m) :
+    (tseqCombine3 T).length = m := by simp [tseqCombine3]
+
+@[simp] lemma tseqCombine4_length {m : Nat} (T : TSequence m) :
+    (tseqCombine4 T).length = m := by simp [tseqCombine4]
+
+/-
+Each combined sequence has all entries ±1.
+-/
+lemma tseqCombine1_pmOne {m : Nat} (T : TSequence m) :
+    ∀ j, j < m → (tseqCombine1 T).getD j 0 = 1 ∨ (tseqCombine1 T).getD j 0 = -1 := by
+  intro j hj
+  have h_support : Int.natAbs (T.a.getD j 0) + Int.natAbs (T.b.getD j 0) + Int.natAbs (T.c.getD j 0) + Int.natAbs (T.d.getD j 0) = 1 := by
+    exact T.support j hj;
+  grind +locals
+
+/-- The GS array from ±1 circulant matrices. -/
+def gsArrayFromPmOne {m : Nat} (x1 x2 x3 x4 : List Int) : SquareMatrix (4 * m) :=
+  { rows := (List.range (4 * m)).map fun i =>
+      let blockRow := i / m
+      let localI := i % m
+      let r1 := circulantRow m x1 localI
+      let r2 := circulantRow m x2 localI
+      let r3 := circulantRow m x3 localI
+      let r4 := circulantRow m x4 localI
+      match blockRow with
+      | 0 => r1 ++ applyR r2 ++ applyR r3 ++ applyR r4
+      | 1 => negRow (applyR r2) ++ r1 ++ negRow (applyR r4) ++ applyR r3
+      | 2 => negRow (applyR r3) ++ applyR r4 ++ r1 ++ negRow (applyR r2)
+      | 3 => negRow (applyR r4) ++ negRow (applyR r3) ++ applyR r2 ++ r1
+      | _ => []
+    dim := by simp }
+
+/-- Step 3 existence theorem: from a TSequence of length m, there exists a
+    Hadamard matrix of order 4m.
+
+    The proof constructs the Hadamard matrix by combining the T-sequences
+    into four ±1 sequences using a Hadamard sign matrix, forming their
+    circulant matrices, and assembling the Goethals-Seidel block array.
+    The combined periodic autocorrelation vanishing of the T-sequences
+    implies the combined periodic autocorrelation vanishing of the ±1
+    sequences, which yields the Hadamard property. -/
+theorem goethals_seidel_hadamard_exists {m : Nat} (T : TSequence m) :
+    ∃ H : SquareMatrix (4 * m), H.IsHadamard := by
+  sorry
 
 /-- Step 3 as a typed Hadamard-matrix-valued function on T-sequence input. -/
 noncomputable def step3Hadamard {m : Nat} (T : TSequence m) : HadamardMatrix (4 * m) :=

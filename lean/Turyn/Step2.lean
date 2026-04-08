@@ -1,6 +1,5 @@
 import Turyn.Step1
-import Mathlib.Algebra.BigOperators.Group.Finset.Basic
-import Mathlib.Algebra.BigOperators.Ring.Finset
+import Mathlib
 
 open Finset
 open BigOperators
@@ -204,9 +203,157 @@ theorem step2_support {n : Nat} (T : TurynType n) :
         (signedSeq_getD_pmOne T.x (by simpa [T.x.len] using hx))
         (signedSeq_getD_pmOne T.y (by simpa [T.y.len] using hy))
 
-axiom step2_periodic {n : Nat} (T : TurynType n) :
-  ∀ s, 1 ≤ s → s < 3 * n - 1 →
-    combinedPeriodicAutocorr (step2a T) (step2b T) (step2c T) (step2d T) s = 0
+/-! ### Helper lemmas for periodic autocorrelation -/
+
+/-- Aperiodic autocorrelation vanishes when the lag meets or exceeds the length. -/
+private lemma aperiodicAutocorr_zero_of_ge (a : List Int) (s : Nat) (h : s ≥ a.length) :
+    aperiodicAutocorr a s = 0 := by
+  unfold aperiodicAutocorr; exact if_pos h
+
+/-- Periodic autocorrelation decomposes into aperiodic at lag s plus aperiodic at lag m-s. -/
+lemma periodic_eq_aperiodic_sum (a : List Int) (s : Nat) (hs : 0 < s) (hsm : s < a.length)
+    (hm : a.length > 0) :
+    periodicAutocorr a s =
+      aperiodicAutocorr a s + aperiodicAutocorr a (a.length - s) := by
+  set m := a.length with hm_def
+  have hper : periodicAutocorr a s = ∑ i ∈ range m, a.getD i 0 * a.getD ((i + s) % m) 0 := by
+    simp only [periodicAutocorr]
+    split
+    next h => exfalso; simp_all [beq_iff_eq]
+    next => rfl
+  have hap1 : aperiodicAutocorr a s = ∑ i ∈ range (m - s), a.getD i 0 * a.getD (i + s) 0 := by
+    unfold aperiodicAutocorr; exact if_neg (by omega)
+  have hap2 : aperiodicAutocorr a (m - s) = ∑ i ∈ range s, a.getD i 0 * a.getD (i + (m - s)) 0 := by
+    unfold aperiodicAutocorr
+    rw [if_neg (by omega), show m - (m - s) = s from by omega]
+  rw [hper, hap1, hap2, ← Finset.sum_range_add_sum_Ico _ (Nat.sub_le m s)]
+  congr 1
+  · apply Finset.sum_congr rfl
+    intro i hi; rw [Finset.mem_range] at hi
+    rw [show (i + s) % m = i + s from Nat.mod_eq_of_lt (by omega)]
+  · rw [Finset.sum_Ico_eq_sum_range, show m - (m - s) = s from by omega]
+    apply Finset.sum_congr rfl
+    intro i hi; rw [Finset.mem_range] at hi
+    rw [show (m - s + i + s) % m = i from by
+      rw [show m - s + i + s = i + m from by omega, Nat.add_mod_right]
+      exact Nat.mod_eq_of_lt (by omega)]
+    ring
+
+/-
+Appending zeros does not change the aperiodic autocorrelation.
+-/
+lemma aperiodicAutocorr_append_zeros (a : List Int) (k s : Nat) :
+    aperiodicAutocorr (a ++ zeroSeq k) s = aperiodicAutocorr a s := by
+  unfold aperiodicAutocorr;
+  split_ifs <;> simp_all +decide [ List.getD_append ];
+  · linarith;
+  · rw [ Finset.sum_eq_zero ] ; intros ; simp_all +decide [ List.getElem?_append, zeroSeq ];
+    grind +revert;
+  · rw [ ← Finset.sum_range_add_sum_Ico _ ( show a.length - s ≤ a.length + k - s from by omega ) ];
+    simp +decide [ List.getElem?_append, zeroSeq ];
+    rw [ Finset.sum_congr rfl fun x hx => by rw [ if_pos ( by linarith [ Finset.mem_range.mp hx, Nat.sub_add_cancel ( by linarith : s ≤ a.length ) ] ), if_pos ( by linarith [ Finset.mem_range.mp hx, Nat.sub_add_cancel ( by linarith : s ≤ a.length ) ] ) ] ];
+    simp +zetaDelta at *;
+    refine' Finset.sum_eq_zero fun x hx => _;
+    grind +revert
+
+/-
+Prepending zeros does not change the aperiodic autocorrelation.
+-/
+lemma aperiodicAutocorr_prepend_zeros (a : List Int) (k s : Nat) :
+    aperiodicAutocorr (zeroSeq k ++ a) s = aperiodicAutocorr a s := by
+  unfold aperiodicAutocorr;
+  split_ifs <;> simp_all +decide [ zeroSeq ];
+  · linarith;
+  · rw [ Finset.sum_eq_zero ] ; intros ; simp_all +decide [ List.getElem?_append ];
+    grind;
+  · rw [ show k + a.length - s = ( a.length - s ) + k by omega, add_comm, Finset.sum_range_add ];
+    simp +decide [ List.getElem?_append, List.getElem?_replicate ];
+    simp +decide [ add_assoc, Nat.add_sub_assoc ];
+    exact Finset.sum_eq_zero fun x hx => by aesop;
+
+/-
+Half-sum/half-difference autocorrelation identity for ±1 sequences.
+-/
+lemma sumHalf_diffHalf_autocorr (a b : List Int) (s : Nat)
+    (hab : a.length = b.length) (ha : AllPmOne a) (hb : AllPmOne b) :
+    2 * (aperiodicAutocorr (seqSumHalf a b) s +
+         aperiodicAutocorr (seqDiffHalf a b) s) =
+    aperiodicAutocorr a s + aperiodicAutocorr b s := by
+  unfold aperiodicAutocorr;
+  split_ifs <;> simp_all +decide [ seqSumHalf, seqDiffHalf ];
+  rw [ ← Finset.sum_add_distrib, ← Finset.sum_add_distrib ];
+  rw [ Finset.mul_sum _ _ _ ];
+  refine' Finset.sum_congr rfl fun i hi => _;
+  by_cases hi' : i < a.length <;> by_cases hi'' : i + s < a.length <;> simp_all +decide [ List.getElem?_eq_none ];
+  have := ha ( a[i] ) ( by simp ) ; have := hb ( b[i] ) ( by simp ) ; have := ha ( a[i + s] ) ( by simp ) ; have := hb ( b[i + s] ) ( by simp ) ; aesop
+
+/-- Length of seqSumHalf. -/
+@[simp] lemma seqSumHalf_length (a b : List Int) :
+    (seqSumHalf a b).length = min a.length b.length := by
+  simp [seqSumHalf, List.length_zipWith]
+
+/-- Length of seqDiffHalf. -/
+@[simp] lemma seqDiffHalf_length (a b : List Int) :
+    (seqDiffHalf a b).length = min a.length b.length := by
+  simp [seqDiffHalf, List.length_zipWith]
+
+/-- Combined aperiodic autocorrelation of the step2 sequences vanishes. -/
+lemma step2_aperiodic_vanishing {n : Nat} (T : TurynType n) (s : Nat)
+    (hs : 1 ≤ s) (hsm : s < 3 * n - 1) :
+    aperiodicAutocorr (step2a T) s + aperiodicAutocorr (step2b T) s +
+    aperiodicAutocorr (step2c T) s + aperiodicAutocorr (step2d T) s = 0 := by
+  -- Simplify each T-sequence's aperiodic autocorrelation
+  simp only [step2a, step2b, step2c, step2d]
+  rw [aperiodicAutocorr_append_zeros, -- step2a: z ++ zeros → z
+      aperiodicAutocorr_prepend_zeros, -- step2b: zeros ++ (w ++ zeros) → w ++ zeros
+      aperiodicAutocorr_append_zeros, -- w ++ zeros → w
+      aperiodicAutocorr_prepend_zeros, -- step2c: zeros ++ sumHalf → sumHalf
+      aperiodicAutocorr_prepend_zeros] -- step2d: zeros ++ diffHalf → diffHalf
+  -- Now goal: N_z(s) + N_w(s) + N_{(x+y)/2}(s) + N_{(x-y)/2}(s) = 0
+  have hxy : T.x.data.length = T.y.data.length := by rw [T.x.len, T.y.len]
+  have hXY := sumHalf_diffHalf_autocorr T.x.data T.y.data s hxy T.x.pm T.y.pm
+  have hbase := concat_neg_autocorr_sum' T.z.data T.w.data s
+  by_cases hsn : s < n
+  · have := T.vanishing s hs hsn
+    unfold combinedAutocorr at this
+    linarith
+  · simp only [not_lt] at hsn
+    rw [aperiodicAutocorr_zero_of_ge T.z.data s (by rw [T.z.len]; omega),
+        aperiodicAutocorr_zero_of_ge T.w.data s (by rw [T.w.len]; omega)]
+    have : aperiodicAutocorr (seqSumHalf T.x.data T.y.data) s = 0 := by
+      apply aperiodicAutocorr_zero_of_ge
+      rw [seqSumHalf_length]; simp only [hxy, Nat.min_self]; rw [T.y.len]; omega
+    have : aperiodicAutocorr (seqDiffHalf T.x.data T.y.data) s = 0 := by
+      apply aperiodicAutocorr_zero_of_ge
+      rw [seqDiffHalf_length]; simp only [hxy, Nat.min_self]; rw [T.y.len]; omega
+    linarith
+
+/-- Step 2 periodic vanishing: combined periodic autocorrelation of T-sequences vanishes. -/
+theorem step2_periodic {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < 3 * n - 1 →
+      combinedPeriodicAutocorr (step2a T) (step2b T) (step2c T) (step2d T) s = 0 := by
+  intro s hs1 hs2
+  unfold combinedPeriodicAutocorr
+  -- Use the decomposition: periodicAutocorr a s = aperiodicAutocorr a s + aperiodicAutocorr a (m-s)
+  set m := 3 * n - 1
+  -- We need all four sequences to have length m
+  have ha_len : (step2a T).length = m := by
+    simp [step2a, zeroSeq, T.z.len]; omega
+  have hb_len : (step2b T).length = m := by
+    simp [step2b, zeroSeq, T.w.len]; omega
+  have hc_len : (step2c T).length = m := by
+    simp [step2c, zeroSeq, seqSumHalf, List.length_zipWith, T.x.len, T.y.len]; omega
+  have hd_len : (step2d T).length = m := by
+    simp [step2d, zeroSeq, seqDiffHalf, List.length_zipWith, T.x.len, T.y.len]; omega
+  have hm : m > 0 := by omega
+  rw [periodic_eq_aperiodic_sum _ s (by omega) (by rw [ha_len]; omega) (by rw [ha_len]; omega),
+      periodic_eq_aperiodic_sum _ s (by omega) (by rw [hb_len]; omega) (by rw [hb_len]; omega),
+      periodic_eq_aperiodic_sum _ s (by omega) (by rw [hc_len]; omega) (by rw [hc_len]; omega),
+      periodic_eq_aperiodic_sum _ s (by omega) (by rw [hd_len]; omega) (by rw [hd_len]; omega)]
+  rw [ha_len, hb_len, hc_len, hd_len]
+  have h1 := step2_aperiodic_vanishing T s hs1 hs2
+  have h2 := step2_aperiodic_vanishing T (m - s) (by omega) (by omega)
+  linarith
 
 /-- Step 2 as a typed function from Turyn data to a certified T-sequence. -/
 def step2 {n : Nat} (T : TurynType n) : TSequence (3 * n - 1) :=
