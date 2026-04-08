@@ -3393,8 +3393,10 @@ fn run_mdd_sat_search(
     });
 
     let run_start = Instant::now();
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get()).unwrap_or(1).max(1);
+    let workers = std::env::var("TURYN_THREADS")
+        .ok().and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism()
+            .map(|n| n.get()).unwrap_or(1).max(1));
     let sat_secs = cfg.sat_secs;
     let use_quad_pb = cfg.quad_pb;
 
@@ -3724,24 +3726,28 @@ fn run_mdd_sat_search(
                 let has_b = !phase_b_queue.is_empty();
                 let has_c = !zxy_queue.is_empty();
                 let has_d = !xy_queue.is_empty();
-                // Rate for each phase; MAX if no work (not a candidate).
-                // Tiebreaker: favor C > D > B (middle of pipeline first).
-                let br = if has_b { b_rate + 0.02 } else { f64::MAX };
-                let cr = if has_c { c_rate } else { f64::MAX };
-                let dr = if has_d { d_rate + 0.01 } else { f64::MAX };
-                if br <= cr && br <= dr && has_b {
+                // Bottleneck = phase whose downstream queue is starved,
+                // BUT only add a worker if that phase doesn't already have extras.
+                let b_active = phase_b_active.load(AtomicOrdering::Relaxed);
+                let c_active = phase_c_active.load(AtomicOrdering::Relaxed);
+                if has_d {
+                    // D has items — process them
+                    dispatched_c += 1;
+                    let _ = worker_txs[tid].send(HybridWork::PhaseD(xy_queue.pop_front().unwrap()));
+                    true
+                } else if has_c && xy_queue.is_empty() {
+                    // C has items but D is starved → C is bottleneck
+                    let _ = worker_txs[tid].send(HybridWork::PhaseC(zxy_queue.pop_front().unwrap()));
+                    true
+                } else if has_b && zxy_queue.is_empty() && b_active <= 1 {
+                    // B has items, C is starved, B only has its dedicated worker
                     dispatched_b += 1;
                     phase_b_remaining = phase_b_queue.len() - 1;
                     let _ = worker_txs[tid].send(HybridWork::PhaseB(phase_b_queue.pop_front().unwrap()));
                     true
-                } else if cr <= dr && has_c {
-                    let _ = worker_txs[tid].send(HybridWork::PhaseC(zxy_queue.pop_front().unwrap()));
-                    true
-                } else if has_d {
-                    dispatched_c += 1;
-                    let _ = worker_txs[tid].send(HybridWork::PhaseD(xy_queue.pop_front().unwrap()));
-                    true
-                } else { false }
+                } else {
+                    false // no work or phase already has enough workers — sit idle
+                }
             };
             if dispatched { idle_workers.remove(i); }
         }
