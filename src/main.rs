@@ -3638,6 +3638,7 @@ fn run_mdd_sat_search(
             };
             let mut w_bases: HashMap<i32, radical::Solver> = HashMap::new();
             let mut z_bases: HashMap<i32, radical::Solver> = HashMap::new();
+            let mut zw_solver_cache: Option<(Vec<i32>, radical::Solver)> = None;
             let spectral_w = SpectralFilter::new(ctx.problem.m(), ctx.theta);
             let spectral_z = SpectralFilter::new(ctx.problem.n, ctx.theta);
             let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
@@ -3812,34 +3813,56 @@ fn run_mdd_sat_search(
                             let z_seq = PackedSeq::from_values(&z_vals);
                             let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
 
-                            // Emit XY solves for each valid boundary config.
-                            // Each boundary constrains X/Y prefix/suffix, making each
-                            // a distinct SAT problem. Batch to reduce lock contention.
-                            let mut xy_batch: Vec<PipelineWork> = Vec::new();
-                            walk_xy_sub_mdd(
-                                sz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
-                                &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
-                                ctx.middle_n as i32, sz.tuple,
-                                &mut |x_bits, y_bits| {
-                                    xy_batch.push(PipelineWork::SolveXY(SolveXYWork {
-                                        item: SatWorkItem {
-                                            tuple: sz.tuple,
-                                            x: SeqInput::Blank,
-                                            y: SeqInput::Blank,
-                                            z: SeqInput::Fixed(z_seq.clone()),
-                                            w: SeqInput::Fixed(w_seq.clone()),
-                                            zw_autocorr: Some(zw_autocorr.clone()),
-                                            priority: pair_power,
-                                            boundary: Some(BoundaryConfig {
-                                                k, x_bits, y_bits,
-                                                z_bits: sz.z_bits, w_bits: sz.w_bits,
-                                            }),
-                                        },
-                                    }));
-                                },
+                            // Solve XY inline using solve_with_assumptions for each boundary.
+                            // This reuses the same solver across boundaries: learnt clauses
+                            // from one boundary transfer to the next, and no clone per boundary.
+                            let tuple_key = (sz.tuple.x, sz.tuple.y, sz.tuple.z, sz.tuple.w);
+                            let template = template_cache.entry(tuple_key).or_insert_with(||
+                                SatXYTemplate::build(problem, sz.tuple, &sat_config).unwrap()
                             );
-                            stage_enter[3].fetch_add(xy_batch.len() as u64, AtomicOrdering::Relaxed);
-                            wq.push_batch(xy_batch);
+                            let candidate = CandidateZW {
+                                z: z_seq.clone(), w: w_seq.clone(), zw_autocorr,
+                            };
+                            if let Some(mut xy_solver) = template.prepare_candidate_solver(&candidate) {
+                                if n > 30 { xy_solver.set_conflict_limit(5000); }
+                                if warm.inject_phase {
+                                    if let Some(ref ph) = warm.phase { xy_solver.set_phase(ph); }
+                                }
+
+                                walk_xy_sub_mdd(
+                                    sz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
+                                    &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
+                                    ctx.middle_n as i32, sz.tuple,
+                                    &mut |x_bits, y_bits| {
+                                        if ctx.found.load(AtomicOrdering::Relaxed) { return; }
+                                        stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
+
+                                        // Build assumptions for XY boundary
+                                        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+                                        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+                                        let mut assumptions = Vec::with_capacity(4 * k);
+                                        for i in 0..k {
+                                            assumptions.push(if (x_bits >> i) & 1 == 1 { x_var(i) } else { -x_var(i) });
+                                            assumptions.push(if (x_bits >> (k + i)) & 1 == 1 { x_var(n - k + i) } else { -x_var(n - k + i) });
+                                            assumptions.push(if (y_bits >> i) & 1 == 1 { y_var(i) } else { -y_var(i) });
+                                            assumptions.push(if (y_bits >> (k + i)) & 1 == 1 { y_var(n - k + i) } else { -y_var(n - k + i) });
+                                        }
+
+                                        let result = xy_solver.solve_with_assumptions(&assumptions);
+                                        items_completed.fetch_add(1, AtomicOrdering::Relaxed);
+                                        stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
+
+                                        if result == Some(true) {
+                                            let (x, y) = template.extract_xy(&xy_solver);
+                                            if verify_tt(problem, &x, &y, &z_seq, &w_seq) {
+                                                ctx.found.store(true, AtomicOrdering::Relaxed);
+                                                let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
+                                            }
+                                        }
+                                    },
+                                );
+                                warm.phase = Some(xy_solver.get_phase());
+                            }
                         }
                         z_solver.spectral = None;
                         z_solver.restore_checkpoint(z_cp);
@@ -3848,12 +3871,73 @@ fn run_mdd_sat_search(
                     }
 
                     PipelineWork::SolveXY(xy) => {
-                        // XY SAT solve
-                        let solved = solve_work_item(
-                            problem, &xy.item, &mut template_cache,
-                            xy_table.as_deref(), &sat_config,
-                            &mut warm, use_quad_pb,
-                        );
+                        // XY SAT solve with per-ZW solver caching.
+                        // The expensive part is prepare_candidate_solver (GJ + quad PB + XOR).
+                        // If zw_autocorr matches the cached solver, clone from cache instead
+                        // of rebuilding from scratch.
+                        let solved = {
+                            let zw_ac = xy.item.zw_autocorr.as_ref();
+                            let cache_hit = zw_ac.is_some() && zw_solver_cache.as_ref()
+                                .map_or(false, |(cached_ac, _)| cached_ac == zw_ac.unwrap());
+
+                            if cache_hit {
+                                // Clone from cached per-ZW solver (has GJ + quad PB + XOR already)
+                                let (_, base_solver) = zw_solver_cache.as_ref().unwrap();
+                                let mut solver = base_solver.clone();
+                                // Add boundary constraints
+                                if let Some(ref bnd) = xy.item.boundary {
+                                    let n = problem.n;
+                                    let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+                                    let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+                                    for i in 0..bnd.k {
+                                        solver.add_clause([if (bnd.x_bits >> i) & 1 == 1 { x_var(i) } else { -x_var(i) }]);
+                                        solver.add_clause([if (bnd.x_bits >> (bnd.k + i)) & 1 == 1 { x_var(n - bnd.k + i) } else { -x_var(n - bnd.k + i) }]);
+                                        solver.add_clause([if (bnd.y_bits >> i) & 1 == 1 { y_var(i) } else { -y_var(i) }]);
+                                        solver.add_clause([if (bnd.y_bits >> (bnd.k + i)) & 1 == 1 { y_var(n - bnd.k + i) } else { -y_var(n - bnd.k + i) }]);
+                                    }
+                                }
+                                if problem.n > 30 { solver.set_conflict_limit(5000); }
+                                if warm.inject_phase {
+                                    if let Some(ref ph) = warm.phase { solver.set_phase(ph); }
+                                }
+                                let result = solver.solve();
+                                warm.phase = Some(solver.get_phase());
+                                let tuple_key = (xy.item.tuple.x, xy.item.tuple.y, xy.item.tuple.z, xy.item.tuple.w);
+                                let template = template_cache.entry(tuple_key).or_insert_with(||
+                                    SatXYTemplate::build(problem, xy.item.tuple, &sat_config).unwrap()
+                                );
+                                match result {
+                                    Some(true) => Some((template.extract_xy(&solver),
+                                        match (&xy.item.z, &xy.item.w) {
+                                            (SeqInput::Fixed(z), SeqInput::Fixed(w)) => (z.clone(), w.clone()),
+                                            _ => unreachable!(),
+                                        })),
+                                    _ => None,
+                                }.map(|((x, y), (z, w))| (x, y, z, w))
+                            } else {
+                                // Cache miss: build fresh, cache the per-ZW solver
+                                let tuple_key = (xy.item.tuple.x, xy.item.tuple.y, xy.item.tuple.z, xy.item.tuple.w);
+                                let template = template_cache.entry(tuple_key).or_insert_with(||
+                                    SatXYTemplate::build(problem, xy.item.tuple, &sat_config).unwrap()
+                                );
+                                if let Some(ref ac) = xy.item.zw_autocorr {
+                                    let zw = CandidateZW {
+                                        z: match &xy.item.z { SeqInput::Fixed(z) => z.clone(), _ => unreachable!() },
+                                        w: match &xy.item.w { SeqInput::Fixed(w) => w.clone(), _ => unreachable!() },
+                                        zw_autocorr: ac.clone(),
+                                    };
+                                    if let Some(solver) = template.prepare_candidate_solver(&zw) {
+                                        zw_solver_cache = Some((ac.clone(), solver));
+                                    }
+                                }
+                                // Fall through to normal solve
+                                solve_work_item(
+                                    problem, &xy.item, &mut template_cache,
+                                    xy_table.as_deref(), &sat_config,
+                                    &mut warm, use_quad_pb,
+                                )
+                            }
+                        };
                         items_completed.fetch_add(1, AtomicOrdering::Relaxed);
                         stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
 
