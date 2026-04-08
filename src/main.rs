@@ -3448,21 +3448,37 @@ fn run_mdd_sat_search(
 
     // Shared priority queue: workers push and pop. Higher stage = higher priority.
     use std::collections::BinaryHeap;
-    struct PqEntry { stage: u8, work: PipelineWork }
-    impl PartialEq for PqEntry { fn eq(&self, other: &Self) -> bool { self.stage == other.stage } }
+    // Priority: stage as integer part, spectral quality as fractional part.
+    // Higher priority = processed first. Within stage 3, lower spectral power = higher priority.
+    struct PqEntry { priority: f64, work: PipelineWork }
+    impl PartialEq for PqEntry { fn eq(&self, other: &Self) -> bool { self.priority == other.priority } }
     impl Eq for PqEntry {}
     impl PartialOrd for PqEntry { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
-    impl Ord for PqEntry { fn cmp(&self, other: &Self) -> Ordering { self.stage.cmp(&other.stage) } }
+    impl Ord for PqEntry {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.priority.partial_cmp(&other.priority).unwrap_or(Ordering::Equal)
+        }
+    }
 
     struct WorkQueue {
         queue: std::sync::Mutex<BinaryHeap<PqEntry>>,
         condvar: std::sync::Condvar,
+        pair_bound: f64,
     }
     impl WorkQueue {
         fn push(&self, work: PipelineWork) {
-            let stage = work.stage();
+            let pair_bound = self.pair_bound;
+            let stage = work.stage() as f64;
+            // Sub-priority for stage 3: lower spectral power = higher priority
+            let sub = match &work {
+                PipelineWork::SolveXY(xy) => {
+                    (1.0 - xy.item.priority / pair_bound.max(1.0)).max(0.0)
+                }
+                _ => 0.0,
+            };
+            let priority = stage + sub;
             let mut q = self.queue.lock().unwrap();
-            q.push(PqEntry { stage, work });
+            q.push(PqEntry { priority, work });
             self.condvar.notify_one();
         }
         fn pop_blocking(&self, found: &AtomicBool) -> Option<PipelineWork> {
@@ -3480,6 +3496,7 @@ fn run_mdd_sat_search(
     let work_queue = Arc::new(WorkQueue {
         queue: std::sync::Mutex::new(BinaryHeap::new()),
         condvar: std::sync::Condvar::new(),
+        pair_bound: ctx.pair_bound,
     });
     let (result_tx, result_rx) =
         std::sync::mpsc::channel::<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>();
@@ -3487,12 +3504,9 @@ fn run_mdd_sat_search(
     // Shared counters
     let items_completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let boundaries_walked = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let stage_counts = [
-        Arc::new(std::sync::atomic::AtomicU64::new(0)), // stage 0: MDD chunks processed
-        Arc::new(std::sync::atomic::AtomicU64::new(0)), // stage 1: W solves
-        Arc::new(std::sync::atomic::AtomicU64::new(0)), // stage 2: Z solves
-        Arc::new(std::sync::atomic::AtomicU64::new(0)), // stage 3: XY solves
-    ];
+    // Per-stage enter/exit counters: depth = enter - exit.
+    let stage_enter: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
+    let stage_exit: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
 
     let sat_config = cfg.sat_config.clone();
     let xy_table: Option<Arc<XYBoundaryTable>> = None;
@@ -3507,7 +3521,8 @@ fn run_mdd_sat_search(
         let result_tx = result_tx.clone();
         let items_completed = Arc::clone(&items_completed);
         let boundaries_walked = Arc::clone(&boundaries_walked);
-        let stage_counts: Vec<_> = stage_counts.iter().map(Arc::clone).collect();
+        let stage_enter: Vec<_> = stage_enter.iter().map(Arc::clone).collect();
+        let stage_exit: Vec<_> = stage_exit.iter().map(Arc::clone).collect();
         let xy_table = xy_table.clone();
         let sat_config = sat_config.clone();
 
@@ -3551,12 +3566,13 @@ fn run_mdd_sat_search(
                             if ctx.mdd_extend > 0 {
                                 // TODO: check extension here when we have (x,y) info
                             }
+                            stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
                             wq.push(PipelineWork::SolveW(SolveWWork {
                                 tuple, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
                                 xy_root: bnd.xy_root, z_mid_sum, w_mid_sum,
                             }));
                         }
-                        stage_counts[0].fetch_add(1, AtomicOrdering::Relaxed);
+                        stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
                     }
 
                     PipelineWork::SolveW(sw) => {
@@ -3595,6 +3611,7 @@ fn run_mdd_sat_search(
 
                             let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) else { continue; };
 
+                            stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
                             wq.push(PipelineWork::SolveZ(SolveZWork {
                                 tuple: sw.tuple, z_bits: sw.z_bits, w_bits: sw.w_bits,
                                 w_vals, w_spectrum, xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
@@ -3603,7 +3620,7 @@ fn run_mdd_sat_search(
                         w_solver.spectral = None;
                         w_solver.restore_checkpoint(w_cp);
                         w_bases.insert(sw.w_mid_sum, w_solver);
-                        stage_counts[1].fetch_add(1, AtomicOrdering::Relaxed);
+                        stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
                     }
 
                     PipelineWork::SolveZ(sz) => {
@@ -3661,6 +3678,9 @@ fn run_mdd_sat_search(
 
                             let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, ctx.individual_bound, &mut fft_buf_z) else { continue; };
 
+                            // Spectral pair quality: lower power = better candidate
+                            let pair_power = spectral_pair_max_power(&z_spectrum, &sz.w_spectrum);
+
                             let z_seq = PackedSeq::from_values(&z_vals);
                             let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
 
@@ -3669,6 +3689,7 @@ fn run_mdd_sat_search(
                                 &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
                                 ctx.middle_n as i32, sz.tuple,
                                 &mut |x_bits, y_bits| {
+                                    stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
                                     wq.push(PipelineWork::SolveXY(SolveXYWork {
                                         item: SatWorkItem {
                                             tuple: sz.tuple,
@@ -3677,7 +3698,7 @@ fn run_mdd_sat_search(
                                             z: SeqInput::Fixed(z_seq.clone()),
                                             w: SeqInput::Fixed(w_seq.clone()),
                                             zw_autocorr: Some(zw_autocorr.clone()),
-                                            priority: 0.0,
+                                            priority: pair_power,
                                             boundary: Some(BoundaryConfig {
                                                 k, x_bits, y_bits,
                                                 z_bits: sz.z_bits, w_bits: sz.w_bits,
@@ -3690,7 +3711,7 @@ fn run_mdd_sat_search(
                         z_solver.spectral = None;
                         z_solver.restore_checkpoint(z_cp);
                         z_bases.insert(sz.z_mid_sum, z_solver);
-                        stage_counts[2].fetch_add(1, AtomicOrdering::Relaxed);
+                        stage_exit[2].fetch_add(1, AtomicOrdering::Relaxed);
                     }
 
                     PipelineWork::SolveXY(xy) => {
@@ -3701,7 +3722,7 @@ fn run_mdd_sat_search(
                             &mut warm, use_quad_pb,
                         );
                         items_completed.fetch_add(1, AtomicOrdering::Relaxed);
-                        stage_counts[3].fetch_add(1, AtomicOrdering::Relaxed);
+                        stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
 
                         if let Some(ref sol) = solved {
                             if verify_tt(problem, &sol.0, &sol.1, &sol.2, &sol.3) {
@@ -3719,7 +3740,7 @@ fn run_mdd_sat_search(
     drop(result_tx);
 
     // Monitor loop: feed MDD boundaries on demand + check for solution/time limit
-    let queue_target = workers * 8; // keep this many items queued
+    let queue_target = 200; // quality buffer: accumulate XY items for spectral sorting
     let mut found_solution = false;
     let mut last_progress = Instant::now();
     let mut last_counts = [0u64; 4];
@@ -3727,10 +3748,11 @@ fn run_mdd_sat_search(
     let mut last_snap = Instant::now();
 
     loop {
-        // Feed MDD boundaries if queue is low
-        let q_len = work_queue.queue.lock().unwrap().len();
-        if q_len < queue_target {
-            let batch = queue_target - q_len;
+        // Feed MDD boundaries when XY queue depth is low (quality buffer)
+        let xy_queued = stage_enter[3].load(AtomicOrdering::Relaxed)
+            .saturating_sub(stage_exit[3].load(AtomicOrdering::Relaxed));
+        if xy_queued < queue_target as u64 {
+            let batch = queue_target;
             let mut fed = 0;
             while fed < batch {
                 let idx = path_counter.fetch_add(1, AtomicOrdering::Relaxed);
@@ -3772,7 +3794,7 @@ fn run_mdd_sat_search(
         if last_snap.elapsed().as_secs_f64() >= 2.0 {
             let dt = last_snap.elapsed().as_secs_f64();
             for i in 0..4 {
-                let cur = stage_counts[i].load(AtomicOrdering::Relaxed);
+                let cur = stage_exit[i].load(AtomicOrdering::Relaxed);
                 rates[i] = (cur - last_counts[i]) as f64 / dt;
                 last_counts[i] = cur;
             }
@@ -3784,22 +3806,24 @@ fn run_mdd_sat_search(
             let elapsed = run_start.elapsed().as_secs_f64();
             let done = items_completed.load(AtomicOrdering::Relaxed);
             let walked = boundaries_walked.load(AtomicOrdering::Relaxed);
-            let max_rate = rates.iter().cloned().fold(0.01f64, f64::max);
-            let shade = |r: f64| -> char {
-                let frac = r / max_rate;
-                if frac > 0.75 { '\u{2588}' }
-                else if frac > 0.50 { '\u{2593}' }
-                else if frac > 0.25 { '\u{2592}' }
-                else if frac > 0.01 { '\u{2591}' }
-                else { ' ' }
+            // Per-stage queue depths
+            let mut depths = [0i64; 4];
+            for i in 0..4 {
+                depths[i] = (stage_enter[i].load(AtomicOrdering::Relaxed) as i64
+                    - stage_exit[i].load(AtomicOrdering::Relaxed) as i64).max(0);
+            }
+            let fill_chars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+            let max_depth = depths.iter().cloned().max().unwrap_or(1).max(1) as f64;
+            let bar = |d: i64| -> char {
+                let idx = ((d as f64 / max_depth) * 8.0).round() as usize;
+                fill_chars[idx.min(8)]
             };
             let total_rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
-            eprintln!("[{:>3.0}s] {:>6.0} xy/s | MDD{} W{}{:.0} Z{}{:.0} XY{}{:.0} | walked {:>4}K",
-                elapsed, total_rate,
-                shade(rates[0]),
-                shade(rates[1]), rates[1],
-                shade(rates[2]), rates[2],
-                shade(rates[3]), rates[3],
+            eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5}  {:>4}K walked",
+                elapsed,
+                bar(depths[0]), bar(depths[1]), bar(depths[2]), bar(depths[3]),
+                total_rate,
+                depths[0], depths[1], depths[2], depths[3],
                 walked / 1000);
             last_progress = Instant::now();
         }
@@ -3821,7 +3845,7 @@ fn run_mdd_sat_search(
     if verbose {
         println!("\n--- MDD pipeline k={} ({} workers) ---", k, workers);
         for (i, name) in ["MDD", "W", "Z", "XY"].iter().enumerate() {
-            println!("  Stage {} ({}): {:>10} items", i, name, stage_counts[i].load(AtomicOrdering::Relaxed));
+            println!("  Stage {} ({}): {:>10} items", i, name, stage_exit[i].load(AtomicOrdering::Relaxed));
         }
         println!("  XY solves:                {:>10}", done);
         println!("  Boundaries walked:        {:>10}", walked);
