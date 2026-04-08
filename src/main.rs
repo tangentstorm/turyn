@@ -3692,48 +3692,52 @@ fn run_mdd_sat_search(
             last_snap = Instant::now();
         }
 
-        // Theory of constraints dispatch:
-        // B always gets exactly 1 worker (long-running subtrees, acts as producer).
-        // Remaining workers split between C and D based on which is the bottleneck.
-        let mut b_now = phase_b_active.load(AtomicOrdering::Relaxed);
-        let mut c_now = phase_c_active.load(AtomicOrdering::Relaxed);
-        while !idle_workers.is_empty() {
-            // Phase B: exactly 1 worker
-            if b_now == 0 && !phase_b_queue.is_empty() {
-                let tid = idle_workers.pop().unwrap();
-                dispatched_b += 1;
-                b_now += 1;
-                phase_b_remaining = phase_b_queue.len() - 1;
-                let _ = worker_txs[tid].send(HybridWork::PhaseB(phase_b_queue.pop_front().unwrap()));
-                continue;
-            }
-
-            // Remaining: C or D based on bottleneck (lower rate = needs more workers)
-            let has_c = !zxy_queue.is_empty();
-            let has_d = !xy_queue.is_empty();
-            if !has_c && !has_d { break; }
-
-            // If only one has work, send there
-            if has_d && !has_c {
-                let tid = idle_workers.pop().unwrap();
-                dispatched_c += 1;
-                let _ = worker_txs[tid].send(HybridWork::PhaseD(xy_queue.pop_front().unwrap()));
-            } else if has_c && !has_d {
-                let tid = idle_workers.pop().unwrap();
-                c_now += 1;
-                let _ = worker_txs[tid].send(HybridWork::PhaseC(zxy_queue.pop_front().unwrap()));
+        // Dedicated dispatch: first 3 workers are dedicated to B, C, D.
+        // They only accept work for their phase, and sit idle if none exists.
+        // Extra workers (3+) go to whichever phase is the bottleneck.
+        for i in (0..idle_workers.len()).rev() {
+            let tid = idle_workers[i];
+            let dispatched = if tid == 0 {
+                // Dedicated B worker
+                if let Some(subtree) = phase_b_queue.pop_front() {
+                    dispatched_b += 1;
+                    phase_b_remaining = phase_b_queue.len();
+                    let _ = worker_txs[tid].send(HybridWork::PhaseB(subtree));
+                    true
+                } else { false }
+            } else if tid == 1 {
+                // Dedicated C worker
+                if let Some(zxy) = zxy_queue.pop_front() {
+                    let _ = worker_txs[tid].send(HybridWork::PhaseC(zxy));
+                    true
+                } else { false }
+            } else if tid == 2 {
+                // Dedicated D worker
+                if let Some(xy) = xy_queue.pop_front() {
+                    dispatched_c += 1;
+                    let _ = worker_txs[tid].send(HybridWork::PhaseD(xy));
+                    true
+                } else { false }
             } else {
-                // Both have work: send to bottleneck (lower throughput rate)
-                if c_rate <= d_rate {
-                    let tid = idle_workers.pop().unwrap();
-                    c_now += 1;
-                    let _ = worker_txs[tid].send(HybridWork::PhaseC(zxy_queue.pop_front().unwrap()));
-                } else {
-                    let tid = idle_workers.pop().unwrap();
+                // Flexible worker: go to bottleneck (lowest rate with work)
+                let has_d = !xy_queue.is_empty();
+                let has_c = !zxy_queue.is_empty();
+                let has_b = !phase_b_queue.is_empty();
+                if has_d && (d_rate <= c_rate || !has_c) {
                     dispatched_c += 1;
                     let _ = worker_txs[tid].send(HybridWork::PhaseD(xy_queue.pop_front().unwrap()));
-                }
-            }
+                    true
+                } else if has_c && (c_rate <= b_rate || !has_b) {
+                    let _ = worker_txs[tid].send(HybridWork::PhaseC(zxy_queue.pop_front().unwrap()));
+                    true
+                } else if has_b {
+                    dispatched_b += 1;
+                    phase_b_remaining = phase_b_queue.len() - 1;
+                    let _ = worker_txs[tid].send(HybridWork::PhaseB(phase_b_queue.pop_front().unwrap()));
+                    true
+                } else { false }
+            };
+            if dispatched { idle_workers.remove(i); }
         }
 
         // Done check: all queues empty, no active workers
