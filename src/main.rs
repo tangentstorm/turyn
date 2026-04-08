@@ -3041,11 +3041,11 @@ fn load_best_mdd(max_k: usize, verbose: bool) -> Option<mdd_reorder::Mdd4> {
 
 /// Unified pipeline work item. Priority = stage (higher = closer to result).
 enum PipelineWork {
-    /// Stage 0: Walk a chunk of the MDD, emit Stage 1 items per (boundary, tuple).
-    MddChunk(MddChunkWork),
-    /// Stage 1: SAT-solve W given boundary + tuple. Enumerate multiple W with blocking clauses.
+    /// Stage 0: Check boundary feasibility + extension filter → emit SolveW.
+    Boundary(BoundaryWork),
+    /// Stage 1: SAT-solve W given boundary + tuple. Enumerate W with blocking clauses.
     SolveW(SolveWWork),
-    /// Stage 2: SAT-solve one Z given boundary + W. Re-enqueue with blocking clause for next Z.
+    /// Stage 2: SAT-solve Z given boundary + W. Enumerate Z with blocking clauses.
     SolveZ(SolveZWork),
     /// Stage 3: SAT-solve XY given boundary + Z + W.
     SolveXY(SolveXYWork),
@@ -3055,7 +3055,7 @@ enum PipelineWork {
 impl PipelineWork {
     fn stage(&self) -> u8 {
         match self {
-            PipelineWork::MddChunk(_) => 0,
+            PipelineWork::Boundary(_) => 0,
             PipelineWork::SolveW(_) => 1,
             PipelineWork::SolveZ(_) => 2,
             PipelineWork::SolveXY(_) => 3,
@@ -3064,10 +3064,10 @@ impl PipelineWork {
     }
 }
 
-struct MddChunkWork {
-    subtree_root: u32,
-    z_acc: u32,
-    w_acc: u32,
+struct BoundaryWork {
+    z_bits: u32,
+    w_bits: u32,
+    xy_root: u32,
 }
 
 struct SolveWWork {
@@ -3099,6 +3099,29 @@ struct SubtreeWork {
     subtree_root: u32,
     z_acc: u32,
     w_acc: u32,
+}
+
+/// Navigate the MDD along a deterministic path to reach one boundary.
+/// Returns (z_bits, w_bits, xy_root) or None if the path hits DEAD.
+fn mdd_navigate_path(
+    root: u32, zw_depth: usize, path: u64,
+    pos_order: &[usize], nodes: &[[u32; 4]],
+) -> Option<(u32, u32, u32)> {
+    let mut nid = root;
+    let mut z_acc = 0u32;
+    let mut w_acc = 0u32;
+    for level in 0..zw_depth {
+        if nid == mdd_reorder::DEAD { return None; }
+        let branch = ((path >> (2 * level)) & 3) as usize;
+        let pos = pos_order[level];
+        z_acc |= ((branch & 1) as u32) << pos;
+        w_acc |= (((branch >> 1) & 1) as u32) << pos;
+        if nid != mdd_reorder::LEAF {
+            nid = nodes[nid as usize][branch];
+            if nid == mdd_reorder::DEAD { return None; }
+        }
+    }
+    Some((z_acc, w_acc, nid))
 }
 
 /// Partition the ZW half of the MDD into subtrees at the given depth.
@@ -3379,24 +3402,23 @@ fn run_mdd_sat_search(
         v
     };
 
-    // Partition MDD into subtrees for the pipeline.
-    let partition_depth = 5.min(zw_depth);
-    let subtrees = partition_mdd_subtrees(
-        mdd.root, partition_depth, zw_depth, &full_pos_order, &mdd.nodes);
-    let subtree_pos_order: Vec<usize> = full_pos_order[partition_depth..].to_vec();
-    let subtree_zw_depth = zw_depth - partition_depth;
+    // Pull-based MDD feeding: monitor navigates paths on demand.
+    let total_paths: u64 = 4u64.pow(zw_depth as u32);
+    let lcg_mult: u64 = 0x5851F42D4C957F2D; // odd, full-period LCG for power-of-2
+    let lcg_mask: u64 = total_paths - 1;
+    let path_counter = std::sync::atomic::AtomicU64::new(0);
 
     // Shared read-only context for all workers
     let ctx = Arc::new(PhaseBContext {
         mdd: Arc::clone(&mdd),
-        pos_order: subtree_pos_order,
+        pos_order: full_pos_order.clone(),
         xy_pos_order: full_pos_order.clone(),
         tuples: tuples.to_vec(),
         w_tmpl: sat_z_middle::LagTemplate::new(m, k),
         z_tmpl: sat_z_middle::LagTemplate::new(n, k),
         problem,
         k,
-        zw_depth: subtree_zw_depth,
+        zw_depth,
         xy_zw_depth: zw_depth,
         middle_n,
         middle_m,
@@ -3420,8 +3442,8 @@ fn run_mdd_sat_search(
     let use_quad_pb = cfg.quad_pb;
 
     if verbose {
-        eprintln!("Partitioned MDD into {} subtrees (depth {})", subtrees.len(), partition_depth);
-        eprintln!("TT({}): MDD pipeline k={}, {} workers", n, k, workers);
+        eprintln!("TT({}): MDD pipeline k={}, {} workers, 4^{}={:.0e} paths",
+            n, k, workers, zw_depth, total_paths as f64);
     }
 
     // Shared priority queue: workers push and pop. Higher stage = higher priority.
@@ -3475,12 +3497,7 @@ fn run_mdd_sat_search(
     let sat_config = cfg.sat_config.clone();
     let xy_table: Option<Arc<XYBoundaryTable>> = None;
 
-    // Seed the queue with MDD chunk work items
-    for s in &subtrees {
-        work_queue.push(PipelineWork::MddChunk(MddChunkWork {
-            subtree_root: s.subtree_root, z_acc: s.z_acc, w_acc: s.w_acc,
-        }));
-    }
+    // No seed — monitor feeds MDD boundaries inline on demand.
 
     // Spawn workers — all identical, they grab highest-stage item
     let mut handles = Vec::new();
@@ -3521,28 +3538,24 @@ fn run_mdd_sat_search(
                 if matches!(work, PipelineWork::Shutdown) { break; }
 
                 match work {
-                    PipelineWork::MddChunk(chunk) => {
-                        // Walk MDD subtree, emit SolveW per (boundary, tuple)
-                        walk_mdd_4way(
-                            chunk.subtree_root, 0, ctx.zw_depth,
-                            chunk.z_acc, chunk.w_acc,
-                            &ctx.pos_order, &ctx.mdd.nodes,
-                            &mut |z_bits, w_bits, xy_root| {
-                                if ctx.found.load(AtomicOrdering::Relaxed) { return; }
-                                boundaries_walked.fetch_add(1, AtomicOrdering::Relaxed);
-                                let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - ctx.max_bnd_sum;
-                                let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - ctx.max_bnd_sum;
-                                for &tuple in &ctx.tuples {
-                                    let z_mid_sum = tuple.z - z_bnd_sum;
-                                    if z_mid_sum.abs() > ctx.middle_n as i32 || (z_mid_sum + ctx.middle_n as i32) % 2 != 0 { continue; }
-                                    let w_mid_sum = tuple.w - w_bnd_sum;
-                                    if w_mid_sum.abs() > ctx.middle_m as i32 || (w_mid_sum + ctx.middle_m as i32) % 2 != 0 { continue; }
-                                    wq.push(PipelineWork::SolveW(SolveWWork {
-                                        tuple, z_bits, w_bits, xy_root, z_mid_sum, w_mid_sum,
-                                    }));
-                                }
-                            },
-                        );
+                    PipelineWork::Boundary(bnd) => {
+                        // Check sum feasibility for each tuple, emit SolveW items
+                        let z_bnd_sum = 2 * (bnd.z_bits.count_ones() as i32) - ctx.max_bnd_sum;
+                        let w_bnd_sum = 2 * (bnd.w_bits.count_ones() as i32) - ctx.max_bnd_sum;
+                        for &tuple in &ctx.tuples {
+                            let z_mid_sum = tuple.z - z_bnd_sum;
+                            if z_mid_sum.abs() > ctx.middle_n as i32 || (z_mid_sum + ctx.middle_n as i32) % 2 != 0 { continue; }
+                            let w_mid_sum = tuple.w - w_bnd_sum;
+                            if w_mid_sum.abs() > ctx.middle_m as i32 || (w_mid_sum + ctx.middle_m as i32) % 2 != 0 { continue; }
+                            // Extension filter
+                            if ctx.mdd_extend > 0 {
+                                // TODO: check extension here when we have (x,y) info
+                            }
+                            wq.push(PipelineWork::SolveW(SolveWWork {
+                                tuple, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
+                                xy_root: bnd.xy_root, z_mid_sum, w_mid_sum,
+                            }));
+                        }
                         stage_counts[0].fetch_add(1, AtomicOrdering::Relaxed);
                     }
 
@@ -3705,7 +3718,8 @@ fn run_mdd_sat_search(
     }
     drop(result_tx);
 
-    // Monitor loop — just check for solution and time limit
+    // Monitor loop: feed MDD boundaries on demand + check for solution/time limit
+    let queue_target = workers * 8; // keep this many items queued
     let mut found_solution = false;
     let mut last_progress = Instant::now();
     let mut last_counts = [0u64; 4];
@@ -3713,7 +3727,25 @@ fn run_mdd_sat_search(
     let mut last_snap = Instant::now();
 
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Feed MDD boundaries if queue is low
+        let q_len = work_queue.queue.lock().unwrap().len();
+        if q_len < queue_target {
+            let batch = queue_target - q_len;
+            let mut fed = 0;
+            while fed < batch {
+                let idx = path_counter.fetch_add(1, AtomicOrdering::Relaxed);
+                if idx >= total_paths { break; } // exhausted all paths
+                let path = idx.wrapping_mul(lcg_mult) & lcg_mask;
+                let bnd = mdd_navigate_path(mdd.root, zw_depth, path, &full_pos_order, &mdd.nodes);
+                if let Some((z_bits, w_bits, xy_root)) = bnd {
+                    boundaries_walked.fetch_add(1, AtomicOrdering::Relaxed);
+                    work_queue.push(PipelineWork::Boundary(BoundaryWork { z_bits, w_bits, xy_root }));
+                    fed += 1;
+                }
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
         // Check for solution
         match result_rx.try_recv() {
