@@ -3039,6 +3039,17 @@ fn load_best_mdd(max_k: usize, verbose: bool) -> Option<mdd_reorder::Mdd4> {
     None
 }
 
+/// Work item for Z enumeration + XY solving given a fixed W.
+struct ZxyWork {
+    tuple: SumTuple,
+    z_bits: u32,
+    w_bits: u32,
+    w_vals: Vec<i8>,
+    w_spectrum: Vec<f64>,
+    xy_root: u32,
+    z_mid_sum: i32,
+}
+
 /// A subtree of the MDD to be processed by a Phase B worker.
 #[derive(Clone)]
 struct SubtreeWork {
@@ -3167,7 +3178,7 @@ impl PhaseBWorker {
         &mut self,
         ctx: &PhaseBContext,
         subtree: &SubtreeWork,
-        tx: &std::sync::mpsc::SyncSender<SatWorkItem>,
+        tx: &std::sync::mpsc::SyncSender<ZxyWork>,
         walked_counter: &std::sync::atomic::AtomicU64,
     ) {
         self.walk_and_process(
@@ -3182,7 +3193,7 @@ impl PhaseBWorker {
         nid: u32, level: usize, depth: usize,
         z_acc: u32, w_acc: u32,
         ctx: &PhaseBContext,
-        tx: &std::sync::mpsc::SyncSender<SatWorkItem>,
+        tx: &std::sync::mpsc::SyncSender<ZxyWork>,
         walked_counter: &std::sync::atomic::AtomicU64,
     ) {
         if nid == mdd_reorder::DEAD { return; }
@@ -3222,7 +3233,7 @@ impl PhaseBWorker {
         &mut self,
         ctx: &PhaseBContext,
         z_bits: u32, w_bits: u32, xy_root: u32,
-        tx: &std::sync::mpsc::SyncSender<SatWorkItem>,
+        tx: &std::sync::mpsc::SyncSender<ZxyWork>,
         walked_counter: &std::sync::atomic::AtomicU64,
     ) {
         if ctx.found.load(AtomicOrdering::Relaxed) { return; }
@@ -3277,105 +3288,17 @@ impl PhaseBWorker {
 
             let Some(w_spectrum) = spectrum_if_ok(&w_vals, &self.spectral_w, ctx.individual_bound, &mut self.fft_buf_w) else { continue; };
             self.stats.w_spectral_ok += 1;
-            let w_seq = PackedSeq::from_values(&w_vals);
 
-            // Build Z boundary values
-            let mut z_boundary = vec![0i8; n];
-            for i in 0..k {
-                z_boundary[i] = if (z_bits >> i) & 1 == 1 { 1 } else { -1 };
-                z_boundary[n - k + i] = if (z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-            }
-
-            // Take solver out of HashMap to avoid split-borrow issues in the Z loop.
-            // The loop needs &mut self for rng, stats, fft_bufs while also using z_solver.
-            let mut z_solver = self.z_bases.remove(&z_mid_sum).unwrap_or_else(||
-                ctx.z_tmpl.build_base_solver(ctx.middle_n, z_mid_sum)
-            );
-            let z_cp = z_solver.save_checkpoint();
-            sat_z_middle::fill_z_solver(&mut z_solver, &ctx.z_tmpl, n, m, &z_boundary, &w_vals);
-            if ctx.middle_n >= 8 {
-                let mut z_spec = radical::SpectralConstraint::new(
-                    n, k, &z_boundary, ctx.pair_bound, 16,
-                );
-                let mut pfb = vec![ctx.pair_bound; z_spec.num_freqs];
-                for fi in 0..z_spec.num_freqs {
-                    let omega = (fi as f64 + 1.0) / (z_spec.num_freqs as f64 + 1.0) * std::f64::consts::PI;
-                    let (mut w_re, mut w_im) = (0.0f64, 0.0f64);
-                    for (j, &wv) in w_vals.iter().enumerate() {
-                        w_re += wv as f64 * (omega * j as f64).cos();
-                        w_im += wv as f64 * (omega * j as f64).sin();
-                    }
-                    pfb[fi] = (ctx.pair_bound - w_re*w_re - w_im*w_im).max(0.0);
-                }
-                z_spec.per_freq_bound = Some(pfb);
-                z_solver.spectral = Some(z_spec);
-            }
-            let mut z_count = 0usize;
-            loop {
-                if ctx.found.load(AtomicOrdering::Relaxed) { break; }
-                if z_count >= ctx.max_z { break; }
-                let z_phases: Vec<bool> = (0..ctx.middle_n)
-                    .map(|_| self.next_rng() & 1 == 1).collect();
-                z_solver.set_phase(&z_phases);
-                if z_solver.solve() != Some(true) { break; }
-                self.stats.z_generated += 1;
-                z_count += 1;
-
-                let z_mid = extract_vals(&z_solver, |i| ctx.z_mid_vars[i], ctx.middle_n);
-                let mut z_vals = Vec::with_capacity(n);
-                z_vals.extend_from_slice(&z_boundary[..k]);
-                z_vals.extend_from_slice(&z_mid);
-                z_vals.extend_from_slice(&z_boundary[n-k..]);
-
-                let z_block: Vec<i32> = ctx.z_mid_vars.iter().map(|&v| {
-                    if z_solver.value(v) == Some(true) { -v } else { v }
-                }).collect();
-                z_solver.add_clause(z_block);
-
-                let Some(z_spectrum) = spectrum_if_ok(&z_vals, &self.spectral_z, ctx.individual_bound, &mut self.fft_buf_z) else { continue; };
-                self.stats.z_spectral_ok += 1;
-
-                self.stats.candidate_pair_attempts += 1;
-                self.stats.candidate_pair_spectral_ok += 1;
-
-                let z_seq = PackedSeq::from_values(&z_vals);
-                let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
-
-                walk_xy_sub_mdd(
-                    xy_root, 0, ctx.xy_zw_depth, 0, 0,
-                    &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
-                    ctx.middle_n as i32, tuple,
-                    &mut |x_bits, y_bits| {
-                        if ctx.mdd_extend > 0 {
-                            let target_k = k + ctx.mdd_extend;
-                            if (n as i32) - 2 * (target_k as i32) >= 0
-                                && !mdd_zw_first::has_extension(
-                                    k, target_k, z_bits, w_bits, x_bits, y_bits)
-                            {
-                                return;
-                            }
-                        }
-                        self.total_items += 1;
-                        let _ = tx.send(SatWorkItem {
-                            tuple,
-                            x: SeqInput::Blank,
-                            y: SeqInput::Blank,
-                            z: SeqInput::Fixed(z_seq.clone()),
-                            w: SeqInput::Fixed(w_seq.clone()),
-                            zw_autocorr: Some(zw_autocorr.clone()),
-                            priority: spectral_pair_max_power(&z_spectrum, &w_spectrum),
-                            boundary: Some(BoundaryConfig {
-                                k, x_bits, y_bits,
-                                z_bits, w_bits,
-                            }),
-                        });
-                    },
-                );
-            }
-            z_solver.spectral = None;
-            z_solver.restore_checkpoint(z_cp);
-            // Put solver back in cache for reuse
-            self.z_bases.insert(z_mid_sum, z_solver);
+            // Emit ZxyWork — Phase C worker will do Z SAT + XY walk + XY SAT
+            self.total_items += 1;
+            let _ = tx.send(ZxyWork {
+                tuple,
+                z_bits, w_bits,
+                w_vals,
+                w_spectrum,
+                xy_root,
+                z_mid_sum,
+            });
         }
     }
 }
@@ -3417,7 +3340,7 @@ fn run_mdd_sat_search(
 
     // Partition MDD into subtrees for parallel Phase B.
     // Depth 3 gives ~64 subtrees (some may be dead/pruned by MDD).
-    let partition_depth = 3.min(zw_depth);
+    let partition_depth = 5.min(zw_depth); // 4^5 = 1024 subtrees, each ~20K boundaries
     let subtrees = partition_mdd_subtrees(
         reordered.root, partition_depth, zw_depth, &pos_order, &reordered.nodes);
     if verbose {
@@ -3463,14 +3386,15 @@ fn run_mdd_sat_search(
     }
 
     // Channels: workers send Phase C items back to coordinator, coordinator dispatches both types
-    let (item_tx, item_rx) = std::sync::mpsc::sync_channel::<SatWorkItem>(1024);
+    let (item_tx, item_rx) = std::sync::mpsc::sync_channel::<ZxyWork>(1024);
     let (result_tx, result_rx) =
         std::sync::mpsc::channel::<Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<(usize, Option<SearchStats>)>();
 
     enum HybridWork {
         PhaseB(SubtreeWork),
-        PhaseC(SatWorkItem),
+        PhaseZxy(ZxyWork),   // Z SAT enumerate → XY walk → XY SAT
+        PhaseC(SatWorkItem), // XY SAT (legacy path, still used by ZxyWork internally)
         Shutdown,
     }
 
@@ -3511,6 +3435,16 @@ fn run_mdd_sat_search(
                 inject_clauses: false,
                 inject_phase: true,
             };
+            // Per-thread Z solver state for PhaseZxy
+            let mut z_bases: HashMap<i32, radical::Solver> = HashMap::new();
+            let spectral_z = SpectralFilter::new(n, ctx.theta);
+            let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
+            let mut zxy_rng: u64 = 0x9e3779b97f4a7c15 ^ (tid as u64 * 0x517cc1b727220a95);
+            let mut zxy_next_rng = || -> u64 {
+                zxy_rng ^= zxy_rng << 13; zxy_rng ^= zxy_rng >> 7; zxy_rng ^= zxy_rng << 17; zxy_rng
+            };
+            let mut zxy_stats = SearchStats::default();
+
             let _ = ready_tx.send((tid, None));
             while let Ok(work) = work_rx.recv() {
                 if found.load(AtomicOrdering::Relaxed) { break; }
@@ -3521,28 +3455,122 @@ fn run_mdd_sat_search(
                         phase_b_active.fetch_sub(1, AtomicOrdering::Relaxed);
                         let _ = ready_tx.send((tid, None));
                     }
-                    HybridWork::PhaseC(item) => {
+                    HybridWork::PhaseZxy(zxy) => {
                         let c_start = Instant::now();
-                        let solved = solve_work_item(
-                            problem, &item, &mut template_cache,
-                            xy_table.as_deref(), &sat_config,
-                            &mut warm, use_quad_pb,
+                        let k = ctx.k;
+                        let n = ctx.problem.n;
+                        let m = ctx.problem.m();
+
+                        // Build Z boundary
+                        let mut z_boundary = vec![0i8; n];
+                        for i in 0..k {
+                            z_boundary[i] = if (zxy.z_bits >> i) & 1 == 1 { 1 } else { -1 };
+                            z_boundary[n - k + i] = if (zxy.z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                        }
+
+                        // Z SAT with spectral constraint
+                        let mut z_solver = z_bases.remove(&zxy.z_mid_sum).unwrap_or_else(||
+                            ctx.z_tmpl.build_base_solver(ctx.middle_n, zxy.z_mid_sum)
                         );
+                        let z_cp = z_solver.save_checkpoint();
+                        sat_z_middle::fill_z_solver(&mut z_solver, &ctx.z_tmpl, n, m, &z_boundary, &zxy.w_vals);
+                        if ctx.middle_n >= 8 {
+                            let mut z_spec = radical::SpectralConstraint::new(
+                                n, k, &z_boundary, ctx.pair_bound, 16,
+                            );
+                            let mut pfb = vec![ctx.pair_bound; z_spec.num_freqs];
+                            for fi in 0..z_spec.num_freqs {
+                                let omega = (fi as f64 + 1.0) / (z_spec.num_freqs as f64 + 1.0) * std::f64::consts::PI;
+                                let (mut w_re, mut w_im) = (0.0f64, 0.0f64);
+                                for (j, &wv) in zxy.w_vals.iter().enumerate() {
+                                    w_re += wv as f64 * (omega * j as f64).cos();
+                                    w_im += wv as f64 * (omega * j as f64).sin();
+                                }
+                                pfb[fi] = (ctx.pair_bound - w_re*w_re - w_im*w_im).max(0.0);
+                            }
+                            z_spec.per_freq_bound = Some(pfb);
+                            z_solver.spectral = Some(z_spec);
+                        }
+
+                        let w_seq = PackedSeq::from_values(&zxy.w_vals);
+                        let mut z_count = 0usize;
+                        loop {
+                            if found.load(AtomicOrdering::Relaxed) { break; }
+                            if z_count >= ctx.max_z { break; }
+                            let z_phases: Vec<bool> = (0..ctx.middle_n)
+                                .map(|_| zxy_next_rng() & 1 == 1).collect();
+                            z_solver.set_phase(&z_phases);
+                            if z_solver.solve() != Some(true) { break; }
+                            zxy_stats.z_generated += 1;
+                            z_count += 1;
+
+                            let z_mid = extract_vals(&z_solver, |i| ctx.z_mid_vars[i], ctx.middle_n);
+                            let mut z_vals = Vec::with_capacity(n);
+                            z_vals.extend_from_slice(&z_boundary[..k]);
+                            z_vals.extend_from_slice(&z_mid);
+                            z_vals.extend_from_slice(&z_boundary[n-k..]);
+
+                            let z_block: Vec<i32> = ctx.z_mid_vars.iter().map(|&v| {
+                                if z_solver.value(v) == Some(true) { -v } else { v }
+                            }).collect();
+                            z_solver.add_clause(z_block);
+
+                            let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, ctx.individual_bound, &mut fft_buf_z) else { continue; };
+                            zxy_stats.z_spectral_ok += 1;
+
+                            let z_seq = PackedSeq::from_values(&z_vals);
+                            let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
+
+                            // XY walk + XY SAT
+                            walk_xy_sub_mdd(
+                                zxy.xy_root, 0, ctx.xy_zw_depth, 0, 0,
+                                &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
+                                ctx.middle_n as i32, zxy.tuple,
+                                &mut |x_bits, y_bits| {
+                                    let item = SatWorkItem {
+                                        tuple: zxy.tuple,
+                                        x: SeqInput::Blank,
+                                        y: SeqInput::Blank,
+                                        z: SeqInput::Fixed(z_seq.clone()),
+                                        w: SeqInput::Fixed(w_seq.clone()),
+                                        zw_autocorr: Some(zw_autocorr.clone()),
+                                        priority: 0.0,
+                                        boundary: Some(BoundaryConfig {
+                                            k, x_bits, y_bits,
+                                            z_bits: zxy.z_bits, w_bits: zxy.w_bits,
+                                        }),
+                                    };
+                                    let solved = solve_work_item(
+                                        problem, &item, &mut template_cache,
+                                        xy_table.as_deref(), &sat_config,
+                                        &mut warm, use_quad_pb,
+                                    );
+                                    items_completed.fetch_add(1, AtomicOrdering::Relaxed);
+
+                                    if let Some(ref sol) = solved {
+                                        if verify_tt(problem, &sol.0, &sol.1, &sol.2, &sol.3) {
+                                            found.store(true, AtomicOrdering::Relaxed);
+                                            let _ = result_tx.send(solved.clone());
+                                        }
+                                    }
+                                },
+                            );
+                        }
+                        z_solver.spectral = None;
+                        z_solver.restore_checkpoint(z_cp);
+                        z_bases.insert(zxy.z_mid_sum, z_solver);
+
                         phase_c_nanos.fetch_add(
                             c_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
-                        items_completed.fetch_add(1, AtomicOrdering::Relaxed);
-
-                        if let Some(ref sol) = solved {
-                            if verify_tt(problem, &sol.0, &sol.1, &sol.2, &sol.3) {
-                                found.store(true, AtomicOrdering::Relaxed);
-                                let _ = result_tx.send(solved);
-                                break;
-                            }
-                        }
+                        let _ = ready_tx.send((tid, None));
+                    }
+                    HybridWork::PhaseC(_item) => {
+                        // Legacy path — not used in the new pipeline
                         let _ = ready_tx.send((tid, None));
                     }
                     HybridWork::Shutdown => {
-                        // Send final stats
+                        // Merge zxy_stats into phase_b stats for reporting
+                        phase_b.stats.merge_from(&zxy_stats);
                         let _ = ready_tx.send((tid, Some(phase_b.stats.clone())));
                         break;
                     }
@@ -3557,17 +3585,7 @@ fn run_mdd_sat_search(
     // Coordinator: adaptive dispatch of Phase B subtrees and Phase C items
     use std::collections::{BinaryHeap, VecDeque};
 
-    struct PqItem { priority: f64, item: SatWorkItem }
-    impl PartialEq for PqItem { fn eq(&self, other: &Self) -> bool { self.priority == other.priority } }
-    impl Eq for PqItem {}
-    impl PartialOrd for PqItem { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
-    impl Ord for PqItem {
-        fn cmp(&self, other: &Self) -> Ordering {
-            other.priority.partial_cmp(&self.priority).unwrap_or(Ordering::Equal)
-        }
-    }
-
-    let mut phase_c_pq: BinaryHeap<PqItem> = BinaryHeap::new();
+    let mut zxy_queue: VecDeque<ZxyWork> = VecDeque::new();
     let mut phase_b_queue: VecDeque<SubtreeWork> = VecDeque::from(subtrees);
     let mut idle_workers: Vec<usize> = Vec::new();
     let mut found_solution = false;
@@ -3590,12 +3608,11 @@ fn run_mdd_sat_search(
             break;
         }
 
-        // Drain Phase C items from workers doing Phase B
+        // Drain ZxyWork items from Phase B workers
         loop {
             match item_rx.try_recv() {
                 Ok(item) => {
-                    let priority = item.priority;
-                    phase_c_pq.push(PqItem { priority, item });
+                    zxy_queue.push_back(item);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
@@ -3619,17 +3636,17 @@ fn run_mdd_sat_search(
             }
         }
 
-        // Adaptive dispatch: Phase C items have priority. Cap Phase B workers
-        // at workers-1 (always leave capacity for Phase C).
-        // Track b_dispatched locally since phase_b_active only updates
-        // after the worker thread processes the message.
-        let max_b = if workers <= 2 { 1 } else { workers - 1 };
+        // Adaptive dispatch: ZXY work priority, then Phase B subtrees.
+        // Cap Phase B at workers-1 to keep capacity for ZXY.
+        // Phase B is lightweight now (just SAT W), so cap it at 1 worker.
+        // All other workers handle ZXY (the bottleneck).
+        let max_b = 1;
         let mut b_dispatched_now = phase_b_active.load(AtomicOrdering::Relaxed);
         while !idle_workers.is_empty() {
-            if let Some(pqi) = phase_c_pq.pop() {
+            if let Some(zxy) = zxy_queue.pop_front() {
                 let tid = idle_workers.pop().unwrap();
                 dispatched_c += 1;
-                let _ = worker_txs[tid].send(HybridWork::PhaseC(pqi.item));
+                let _ = worker_txs[tid].send(HybridWork::PhaseZxy(zxy));
             } else if !phase_b_queue.is_empty() && b_dispatched_now < max_b {
                 if let Some(subtree) = phase_b_queue.pop_front() {
                     let tid = idle_workers.pop().unwrap();
@@ -3643,9 +3660,9 @@ fn run_mdd_sat_search(
             }
         }
 
-        // Done check: all Phase B dispatched, no Phase C items, all workers idle
+        // Done check
         let b_active = phase_b_active.load(AtomicOrdering::Relaxed);
-        if phase_b_queue.is_empty() && phase_c_pq.is_empty()
+        if phase_b_queue.is_empty() && zxy_queue.is_empty()
             && b_active == 0 && idle_workers.len() == workers
         {
             break;
@@ -3667,7 +3684,7 @@ fn run_mdd_sat_search(
             let c_active = workers - idle_workers.len() - b_active;
             eprintln!("[{:.0}s] k={} | B:{}/C:{} active | walked {}K | queue {} | dispatched {} | done {} | {:.1}/s",
                 elapsed, k, b_active, c_active, walked / 1000,
-                phase_c_pq.len(), dispatched_c, done,
+                zxy_queue.len(), dispatched_c, done,
                 if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 });
             last_progress = Instant::now();
         }
