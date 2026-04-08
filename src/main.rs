@@ -1538,9 +1538,10 @@ impl SatXYTemplate {
         };
 
         // Conflict limit: fail fast on hard UNSAT instances.
-        // Most n=56 XY instances resolve in <5K conflicts; spending more
-        // on a single hard instance is less valuable than trying the next candidate.
-        solver.set_conflict_limit(5000);
+        // Scale with problem size: more vars need more conflicts.
+        // n=18 (36 vars): 50K limit. n=56 (112 vars): 5K limit.
+        let conflict_limit = if self.n <= 30 { 50000 } else { 5000 };
+        solver.set_conflict_limit(conflict_limit);
 
         // Inject warm-start data
         if warm.inject_clauses && !warm.clauses.is_empty() {
