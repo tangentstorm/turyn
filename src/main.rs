@@ -1537,6 +1537,11 @@ impl SatXYTemplate {
             return None;
         };
 
+        // Conflict limit: fail fast on hard UNSAT instances.
+        // Most n=56 XY instances resolve in <5K conflicts; spending more
+        // on a single hard instance is less valuable than trying the next candidate.
+        solver.set_conflict_limit(5000);
+
         // Inject warm-start data
         if warm.inject_clauses && !warm.clauses.is_empty() {
             solver.inject_clauses(&warm.clauses, 2);
@@ -3541,7 +3546,8 @@ fn run_mdd_sat_search(
     let stage_enter: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let stage_exit: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
 
-    let sat_config = cfg.sat_config.clone();
+    let mut sat_config = cfg.sat_config.clone();
+    // SAT config: use defaults (EMA restarts/vivification/chrono BT tested and regressed)
     let xy_table: Option<Arc<XYBoundaryTable>> = None;
 
     // No seed — monitor feeds MDD boundaries inline on demand.

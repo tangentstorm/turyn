@@ -559,3 +559,104 @@ Entries with identical (w_bits, z_bits) share BOTH W and Z spectral filtering + 
 Add per-lag W autocorrelation decomposition to the W SAT solver: boundary×boundary (constant), boundary×middle (linear PB terms), middle×middle (quad PB terms via XNOR aux or direct quad PB). Even with trivially-satisfied per-lag bounds, the quad PB variable interactions create CDCL conflicts that bias the solver toward lower-autocorrelation (hence lower-spectral-power) solutions. Expected to increase spectral pass rate.
 
 **Single commit:** In `build_w_middle_solver()`, for each lag s (1..m-1): decompose agree count into const + linear + quad terms. Add PB/quad PB constraints with bounds [adj_lo, adj_hi]. Benchmark spectral pass rate before/after.
+
+## Throughput Optimization Ideas (April 2026, from profiling)
+
+Profile: n=56 k=10, 4 workers, 30s. Baseline: **2487 xy/s**.
+The SAT solver (radical) dominates: recompute_quad_pb (34.7%), propagate (20.1%), compute_quad_pb_explanation_into (15.1%), solve_inner (11.2%), propagate_pb (7.2%), backtrack (4.3%).
+
+### T1. Eliminate Vec allocation in compute_lbd
+`compute_lbd` allocates `vec![false; decision_level+1]` on every conflict. Replace with a reusable solver-level buffer.
+**Single commit:** Add `lbd_buf: Vec<bool>` field to Solver, resize and clear in `compute_lbd` instead of allocating.
+
+### T2. SIMD-accelerate recompute_quad_pb
+The inner loop loads aa/ab from assigns[], does table lookup, accumulates sums. Batch 8+ terms with SIMD gather/scatter.
+**Single commit:** Rewrite `recompute_quad_pb` inner loop with `#[target_feature(enable = "avx2")]` using gather intrinsics.
+
+### T3. Track dirty quad PB constraints explicitly
+`recompute_stale_quad_pb` scans ALL constraints. Replace with explicit dirty-set Vec.
+**Single commit:** Add `stale_quad_pb: Vec<u32>` to Solver, push on mark-stale, drain on recompute.
+
+### T4. Pack QuadPbTerm tighter for cache density
+Currently 16 bytes. Explore 12-byte packing by combining small fields.
+**Single commit:** Restructure QuadPbTerm layout, benchmark cache effect.
+
+### T5. Conflict limit per XY solve
+Hard UNSAT instances waste time. Set conflict limit (e.g., 10K) to fail fast.
+**Single commit:** Add `solver.set_conflict_limit(10000)` before XY solve, benchmark throughput vs. miss rate.
+
+### T6. Pre-gather assigns for cache-friendly quad PB recompute
+Sort terms by variable index or pre-copy assigns into contiguous buffer.
+**Single commit:** Pre-sort terms in `add_quad_pb_eq`, benchmark recompute speedup.
+
+### T7. Replace GJ with assumptions-based approach
+GJ is O(n^2) per candidate. Use solver assumptions instead.
+**Single commit:** Convert GJ equalities to unit assumptions, skip Gauss-Jordan.
+
+### T8. Strengthen feasibility pre-filter
+Add parity checks and tighter range bounds before cloning solver.
+**Single commit:** Add parity + tighter bound checks in `is_feasible`.
+
+### T9. Cache GJ results by zw_autocorr
+Many candidates share zw_autocorr. Cache equalities by hash.
+**Single commit:** Add `HashMap<u64, Vec<(i32,i32,bool)>>` cache in worker, hash zw_autocorr.
+
+### T10. Copy-on-write solver clone
+Share immutable clause DB, only copy mutable state.
+**Single commit:** Split Solver into shared/mutable parts, share clause_lits/clause_meta.
+
+### T11. Merge quad PB constraints for lags with same target
+Reduce constraint count by combining equivalent lags.
+**Single commit:** Group lags by target, merge term lists, benchmark propagation savings.
+
+### T12. Incremental XY solver with checkpoint/restore
+Skip clone entirely: keep persistent solver, checkpoint/restore per candidate.
+**Single commit:** Use save_checkpoint/restore_checkpoint in solve_for_warm.
+
+### T13. Skip trivially-satisfied PB constraints
+Track min-slack incrementally, skip propagation when slack is large.
+**Single commit:** Add slack tracking to PB propagation, skip when slack > max_coeff.
+
+### T14. Branchless lit_value
+Replace branches in lit_value with lookup table.
+**Single commit:** Implement 6-entry lookup table for lit_value.
+
+### T15. Pre-compute spectral constraint boundary-independent parts
+Avoid re-creating SpectralConstraint per boundary.
+**Single commit:** Factor SpectralConstraint::new into reusable + boundary parts.
+
+### T16. Lock-free work queue
+Replace Mutex<BinaryHeap> with lock-free concurrent queue.
+**Single commit:** Implement crossbeam-style lock-free priority queue or per-worker queues.
+
+### T17. Batch XY item emission
+Batch walk_xy_sub_mdd results, push all at once.
+**Single commit:** Collect XY items in Vec, single lock acquisition for batch push.
+
+### T18. Sort quad PB terms by variable index
+Improve assigns[] cache locality during recompute.
+**Single commit:** Sort terms in add_quad_pb_eq by min(var_a, var_b).
+
+### T19. Optimize XOR propagation — precompute last-unknown
+Replace linear scan with tracked last-unknown variable.
+**Single commit:** Cache last_unknown_var in XorConstraint, update incrementally.
+
+### T20. Disable warm-start clause injection
+Profile whether warm-start clauses help or hurt throughput.
+**Single commit:** Set `inject_clauses: false` (already default), verify no regression.
+
+### T21. Share lag_pairs across tuples in template cache
+SatXYTemplate is rebuilt per tuple but lag_pairs is tuple-independent.
+**Single commit:** Factor lag_pairs out of SatXYTemplate, share via Arc.
+
+### T22. Smaller clause indices for cache density
+Use u16 for watch list entries if clause count < 65K.
+**Single commit:** Conditional u16 clause IDs, benchmark cache improvement.
+
+### T23. Dedicated monitor thread (already exists)
+Verify monitor thread isn't starving workers by sleeping too long.
+**Single commit:** Reduce monitor sleep from 10ms to 1ms, benchmark fill rate.
+
+### T24. Fuse GJ equalities into quad PB terms
+Substitute equal variables directly into quad PB constraints.
+**Single commit:** After GJ, rewrite quad PB term lists to use canonical variables.

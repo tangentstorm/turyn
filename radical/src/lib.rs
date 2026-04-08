@@ -440,6 +440,7 @@ pub struct Solver {
     minimize_stack: Vec<usize>,        // stack for lit_removable()
     minimize_visited: Vec<bool>,       // visited[] for lit_removable()
     minimize_levels: Vec<bool>,        // levels_in_learnt for minimize_learnt()
+    lbd_seen: Vec<bool>,              // reusable buffer for compute_lbd (avoids per-conflict alloc)
 
     // XOR (GF(2)) constraints
     xor_constraints: Vec<XorConstraint>,
@@ -531,6 +532,7 @@ impl Solver {
             minimize_stack: Vec::new(),
             minimize_visited: Vec::new(),
             minimize_levels: Vec::new(),
+            lbd_seen: Vec::new(),
             activity: Vec::new(),
             var_inc: 1.0,
             var_decay: 0.95,
@@ -2650,15 +2652,24 @@ impl Solver {
     }
 
     /// Compute LBD (Literal Block Distance) of a clause.
-    fn compute_lbd(&self, lits: &[Lit]) -> u32 {
-        // Use a small bitset for levels (decision levels rarely exceed a few hundred)
-        let mut seen_levels = vec![false; self.decision_level() as usize + 1];
+    fn compute_lbd(&mut self, lits: &[Lit]) -> u32 {
+        let needed = self.decision_level() as usize + 1;
+        if self.lbd_seen.len() < needed {
+            self.lbd_seen.resize(needed, false);
+        }
         let mut count = 0u32;
         for &lit in lits {
             let lv = self.level[var_of(lit)] as usize;
-            if lv < seen_levels.len() && !seen_levels[lv] {
-                seen_levels[lv] = true;
+            if lv < needed && !self.lbd_seen[lv] {
+                self.lbd_seen[lv] = true;
                 count += 1;
+            }
+        }
+        // Clear only touched entries
+        for &lit in lits {
+            let lv = self.level[var_of(lit)] as usize;
+            if lv < needed {
+                self.lbd_seen[lv] = false;
             }
         }
         count

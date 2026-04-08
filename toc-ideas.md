@@ -116,6 +116,95 @@ Some tuples are "easier" (fewer valid W's needed, smaller search space). Track w
 ### Idea 12: Larger k for better boundary pruning — TESTED
 Larger k means more of the sequence is fixed by the boundary, leaving less for SAT. The MDD prunes more aggressively. For n=18 k=8: boundary is 16 of 18 positions, only 2 free. If the MDD has valid paths, they're very likely solvable.
 
+## Throughput Optimization Ideas (April 2026)
+
+### Profiling baseline (n=56, k=10, 4 workers, 30s)
+
+Baseline: **2487 xy/s** (commit 90557ce)
+
+Callgrind profiling shows the SAT solver dominates:
+- 34.7% `recompute_quad_pb` — recomputing term states from assigns[]
+- 20.1% `propagate` — main BCP loop
+- 15.1% `compute_quad_pb_explanation_into` — lazy explanation for conflict analysis
+- 11.2% `solve_inner` — CDCL decision/conflict loop
+- 7.2% `propagate_pb` — PB constraint propagation
+- 4.3% `backtrack` — undoing assignments
+- 3.3% `propagate_quad_pb` — quadratic PB propagation/search
+- 0.3% `compute_lbd` — LBD computation (allocates Vec per call!)
+- 0.6% `malloc/free` — heap allocation overhead
+
+### Idea T1: Eliminate Vec allocation in compute_lbd — use reusable bitset
+`compute_lbd` allocates `vec![false; decision_level+1]` on every conflict. Replace with a solver-level reusable buffer (like `analyze_seen`). This is called on every learnt clause.
+
+### Idea T2: SIMD-accelerate recompute_quad_pb inner loop
+`recompute_quad_pb` is 34.7% of runtime. The inner loop does: load aa/ab from assigns[], table lookup, accumulate sums[state]. This is a perfect target for SIMD: batch 8 terms at a time, gather aa/ab from assigns[], vectorized table lookup, horizontal sum.
+
+### Idea T3: Reduce stale recomputation by tracking dirty constraint set
+`recompute_stale_quad_pb` scans ALL constraints to find stale ones. Replace with an explicit dirty-set (Vec of stale constraint indices). This avoids touching clean constraints during the scan.
+
+### Idea T4: Pack QuadPbTerm tighter — merge var_a/var_b into state byte
+Currently QuadPbTerm is 16 bytes. The `state` and `tv_offset` fields are only 1 byte each. Explore whether we can pack the struct to 12 bytes for better cache density in the recompute loop.
+
+### Idea T5: Conflict limit per XY solve — fail fast on hard instances
+Many XY SAT instances are UNSAT and take many conflicts to prove. Set a per-instance conflict limit (e.g., 10K conflicts). If exceeded, skip to the next candidate. Most SAT instances resolve quickly; hard ones are unlikely to be SAT anyway.
+
+### Idea T6: Batch recompute_quad_pb with SIMD gather from assigns[]
+Instead of per-term `assigns[var_a]` + `assigns[var_b]` (random memory access), sort terms by variable proximity and process in cache-friendly order. Or pre-gather all assigns into a contiguous buffer before the loop.
+
+### Idea T7: Eliminate GJ candidate equalities — use assumptions instead
+`gj_candidate_equalities` does Gauss-Jordan on every candidate. This is O(n^3) in worst case. Instead, add the GJ-derived equalities as unit assumptions to the solver, using solve_with_assumptions().
+
+### Idea T8: Skip trivially UNSAT candidates before solver clone
+Before cloning the template solver, check if any lag target is out of range (infeasible). The `is_feasible` check exists but could be strengthened with parity and GJ-derived contradictions earlier.
+
+### Idea T9: Cache GJ results by zw_autocorr hash
+Many candidates share the same zw_autocorr vector (since Z/W from same boundary have correlated autocorrelations). Cache GJ equalities by autocorr hash to avoid redundant O(n^2) GJ computation.
+
+### Idea T10: Reduce solver clone cost — share immutable clause database
+Each XY solve clones the entire template solver. Instead, use a copy-on-write approach: share the immutable initial clause database and only copy mutable state (assigns, trail, activity, etc.).
+
+### Idea T11: Reduce quad PB constraint count — merge lags with same parity
+Lags with the same target value could potentially share constraint structures, reducing the number of quad PB constraints the propagator must check.
+
+### Idea T12: Incremental XY solver — add/remove per-candidate constraints
+Instead of clone+dispose per candidate, keep a persistent solver and use checkpoint/restore to add/remove the per-candidate quad PB constraints. This avoids the clone overhead entirely.
+
+### Idea T13: Reduce propagate_pb overhead — skip trivially satisfied PB constraints
+If a PB constraint's current slack is large (all coefficients are 1 and many vars still free), skip the per-literal propagation check. Track min-slack incrementally.
+
+### Idea T14: Branchless lit_value using lookup table
+`lit_value` is called millions of times in propagate. Currently has two branches. Replace with `LBool::from(assigns[v] as u8 ^ (lit < 0) as u8)` or a 6-entry lookup table.
+
+### Idea T15: Avoid re-cloning spectral constraints in Z solver
+The Z solver creates a new SpectralConstraint per boundary. Pre-compute the boundary-independent parts and only update the boundary contribution.
+
+### Idea T16: Reduce gold queue lock contention — use lock-free queue
+The dual queue uses Mutex<BinaryHeap>. Workers contend on this lock. Use a lock-free concurrent priority queue or per-worker local queues with work-stealing.
+
+### Idea T17: Batch XY boundary walks — emit multiple XY items per Z solve
+Currently `walk_xy_sub_mdd` emits XY items one at a time through a closure. Batch them into a Vec and push all at once, reducing lock acquisitions on the work queue.
+
+### Idea T18: Pre-sort quad PB terms by variable index for cache locality
+Terms in a quad PB constraint are in lag order, not variable order. Sorting by `var_a` could improve cache locality when accessing `assigns[]` during recompute.
+
+### Idea T19: Eliminate XOR constraint propagation overhead for small n
+XOR constraint propagation has a linear scan per variable to find the unassigned var. For small constraints, use a branchless approach or precompute.
+
+### Idea T20: Reduce warm-start overhead — skip clause injection
+The warm-start mechanism extracts and injects learnt clauses between solves. Profile whether this actually helps or just adds overhead.
+
+### Idea T21: Reduce template build cost — cache across tuples
+SatXYTemplate is built per tuple. If tuples share the same n, the lag_pairs structure is identical. Only the PB targets differ. Share the lag structure and only vary the PB bounds.
+
+### Idea T22: Use smaller data types in SAT solver — u16 for clause indices
+If clause count stays under 65K, use u16 for clause metadata indices to improve cache density in watch lists.
+
+### Idea T23: Parallelism tuning — use N-1 workers for pipeline, 1 for monitor
+Currently all workers share the pipeline. Dedicate one thread exclusively to feeding boundaries, preventing starvation when all workers are doing XY SAT.
+
+### Idea T24: GJ + quad PB fusion — apply GJ equalities directly to quad PB terms
+Instead of adding GJ equalities as extra clauses, fold them into the quad PB constraints by substituting equal variables. This reduces the number of terms in quad PB constraints.
+
 ## Testing Protocol
 
 For each idea:
