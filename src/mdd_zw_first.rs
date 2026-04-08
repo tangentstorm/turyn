@@ -1612,9 +1612,11 @@ pub fn build_extension(
         0, &mut zw_memo_count,
     );
 
-    eprintln!("build_extension: base_k={}, target_k={}, extra={}, {} nodes, root={}",
-        base_k, target_k, extra, nodes.len(),
-        if root == DEAD { "DEAD".to_string() } else if root == LEAF { "LEAF".to_string() } else { root.to_string() });
+    if std::env::var("MDD_PROFILE").is_ok() {
+        eprintln!("build_extension: base_k={}, target_k={}, extra={}, {} nodes, root={}",
+            base_k, target_k, extra, nodes.len(),
+            if root == DEAD { "DEAD".to_string() } else if root == LEAF { "LEAF".to_string() } else { root.to_string() });
+    }
 
     (nodes, root)
 }
