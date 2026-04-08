@@ -151,6 +151,7 @@ impl QuadPbTerm {
 struct QuadPbConstraint {
     terms: Vec<QuadPbTerm>,  // single Vec instead of 10 separate ones
     target: u32,
+    target_hi: u32,         // for range constraints; equals target for equality
     num_terms: u32,
     /// Branchless counter array indexed by state: sums[0]=dead(unused), sums[1]=maybe, sums[2]=true.
     /// Replaces separate sum_true/sum_maybe fields for branch-free updates.
@@ -739,6 +740,7 @@ impl Solver {
         }).collect();
         self.quad_pb_constraints.push(QuadPbConstraint {
             target,
+            target_hi: target,
             num_terms: terms.len() as u32,
             sums: [0, coeffs.iter().sum::<u32>() as i32, 0],
             terms,
@@ -746,6 +748,60 @@ impl Solver {
         });
 
         // Recompute from current assignments, then propagate
+        self.recompute_quad_pb(qi);
+        if self.propagate_quad_pb(qi).is_some() {
+            self.ok = false;
+        }
+    }
+
+    /// Add a quadratic PB range constraint: target_lo ≤ Σ(coeffs[i] * lits_a[i] * lits_b[i]) ≤ target_hi
+    /// Same as add_quad_pb_eq but with a range instead of exact target.
+    pub fn add_quad_pb_range(&mut self, lits_a: &[i32], lits_b: &[i32], coeffs: &[u32], target_lo: u32, target_hi: u32) {
+        if !self.ok { return; }
+        if target_lo == target_hi {
+            self.add_quad_pb_eq(lits_a, lits_b, coeffs, target_lo);
+            return;
+        }
+        assert_eq!(lits_a.len(), lits_b.len());
+        assert_eq!(lits_a.len(), coeffs.len());
+
+        for &lit in lits_a.iter().chain(lits_b.iter()) {
+            assert!(lit != 0);
+            self.ensure_var(lit.unsigned_abs() as usize);
+        }
+
+        let qi = self.quad_pb_constraints.len() as u32;
+
+        let mut watched = std::collections::HashSet::new();
+        for i in 0..lits_a.len() {
+            let va = var_of(lits_a[i]);
+            let vb = var_of(lits_b[i]);
+            if watched.insert(va) { self.quad_pb_var_watches[va].push(qi); }
+            if watched.insert(vb) { self.quad_pb_var_watches[vb].push(qi); }
+            self.quad_pb_var_terms[va].push((qi, i as u16, true));
+            self.quad_pb_var_terms[vb].push((qi, i as u16, false));
+        }
+
+        let terms: Vec<QuadPbTerm> = (0..lits_a.len()).map(|i| {
+            QuadPbTerm {
+                lit_a: lits_a[i],
+                lit_b: lits_b[i],
+                coeff: coeffs[i] as u16,
+                var_a: var_of(lits_a[i]) as u16,
+                var_b: var_of(lits_b[i]) as u16,
+                state: 1,
+                tv_offset: (if lits_a[i] < 0 { 2u8 } else { 0 }) + (if lits_b[i] < 0 { 1 } else { 0 }),
+            }
+        }).collect();
+        self.quad_pb_constraints.push(QuadPbConstraint {
+            target: target_lo,
+            target_hi,
+            num_terms: terms.len() as u32,
+            sums: [0, coeffs.iter().sum::<u32>() as i32, 0],
+            terms,
+            stale: true,
+        });
+
         self.recompute_quad_pb(qi);
         if self.propagate_quad_pb(qi).is_some() {
             self.ok = false;
@@ -1466,17 +1522,18 @@ impl Solver {
     }
 
     /// Save a checkpoint of the constraint database sizes.
-    /// After calling this, new clauses/PBs can be added and later undone
-    /// with `restore_checkpoint`. Cheap: just records 4 integers.
-    pub fn save_checkpoint(&self) -> (usize, usize, usize, usize) {
+    /// After calling this, new clauses/PBs/quad PBs can be added and later undone
+    /// with `restore_checkpoint`. Cheap: just records 5 integers.
+    pub fn save_checkpoint(&self) -> (usize, usize, usize, usize, usize) {
         (self.clause_meta.len(), self.clause_lits.len(),
-         self.pb_constraints.len(), self.num_vars)
+         self.pb_constraints.len(), self.num_vars,
+         self.quad_pb_constraints.len())
     }
 
-    /// Restore the solver to a previous checkpoint, removing all clauses/PBs
+    /// Restore the solver to a previous checkpoint, removing all clauses/PBs/quad PBs
     /// added after the checkpoint. Backtracks, then truncates and rebuilds watches.
-    pub fn restore_checkpoint(&mut self, cp: (usize, usize, usize, usize)) {
-        let (n_clauses, n_lits, n_pbs, _n_vars) = cp;
+    pub fn restore_checkpoint(&mut self, cp: (usize, usize, usize, usize, usize)) {
+        let (n_clauses, n_lits, n_pbs, _n_vars, n_quad_pbs) = cp;
         self.backtrack(0);
 
         // Mark post-checkpoint clauses as deleted
@@ -1498,9 +1555,16 @@ impl Solver {
             wl.retain(|&ci| (ci as usize) < n_pbs);
         }
 
-        // Note: we don't remove variables (aux vars from XNOR are in base solver).
-        // We don't remove quad_pb constraints (those are also in base solver).
-        // Learnt clauses from post-checkpoint solves are cleared by watch list rebuild.
+        // Remove post-checkpoint quad PB constraints and their watch entries
+        if n_quad_pbs < self.quad_pb_constraints.len() {
+            self.quad_pb_constraints.truncate(n_quad_pbs);
+            for wl in &mut self.quad_pb_var_watches {
+                wl.retain(|&qi| (qi as usize) < n_quad_pbs);
+            }
+            for wl in &mut self.quad_pb_var_terms {
+                wl.retain(|&(qi, _, _)| (qi as usize) < n_quad_pbs);
+            }
+        }
 
         // Reset spectral constraint to boundary-only state
         if let Some(ref mut spec) = self.spectral {
@@ -2172,6 +2236,7 @@ impl Solver {
     }
 
     /// Single-pass: finds propagation and builds explanation in one fused scan.
+    /// Supports range constraints: target <= sum <= target_hi.
     #[inline]
     fn propagate_quad_pb(&mut self, qi: u32) -> Option<Reason> {
         if self.quad_pb_constraints[qi as usize].stale {
@@ -2179,16 +2244,20 @@ impl Solver {
         }
         let qc = &self.quad_pb_constraints[qi as usize];
         let n = qc.num_terms as usize;
-        let target = qc.target as i64;
+        let target_lo = qc.target as i64;
+        let target_hi = qc.target_hi as i64;
         let sum_true = qc.sums[2] as i64;
         let sum_maybe = qc.sums[1] as i64;
 
-        if sum_true + sum_maybe < target || sum_true > target {
+        if sum_true + sum_maybe < target_lo || sum_true > target_hi {
             return Some(Reason::QuadPb(qi)); // conflict
         }
 
-        let slack_up = sum_true + sum_maybe - target;
-        let slack_down = target - sum_true;
+        // slack_up: how many more MAYBE terms can become TRUE before exceeding lower bound requirement
+        // Actually: slack_up = (sum_true + sum_maybe) - target_lo = how much we can still "lose" from maybe
+        let slack_up = sum_true + sum_maybe - target_lo;
+        // slack_down: how many more can become TRUE before exceeding upper bound
+        let slack_down = target_hi - sum_true;
         if slack_up > 0 && slack_down > 0 { return None; }
 
         for i in 0..n {

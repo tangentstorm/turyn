@@ -3688,10 +3688,10 @@ fn run_mdd_sat_search(
                         }
 
                         let mut z_solver = z_bases.remove(&sz.z_mid_sum).unwrap_or_else(||
-                            ctx.z_tmpl.build_base_solver(ctx.middle_n, sz.z_mid_sum)
+                            ctx.z_tmpl.build_base_solver_quad_pb(ctx.middle_n, sz.z_mid_sum)
                         );
                         let z_cp = z_solver.save_checkpoint();
-                        sat_z_middle::fill_z_solver(&mut z_solver, &ctx.z_tmpl, n, m, &z_boundary, &sz.w_vals);
+                        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver, &ctx.z_tmpl, n, m, ctx.middle_n, &z_boundary, &sz.w_vals);
                         if ctx.middle_n >= 8 {
                             let mut z_spec = radical::SpectralConstraint::new(
                                 n, k, &z_boundary, ctx.pair_bound, 16,
