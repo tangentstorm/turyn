@@ -3448,53 +3448,78 @@ fn run_mdd_sat_search(
 
     // Shared priority queue: workers push and pop. Higher stage = higher priority.
     use std::collections::BinaryHeap;
-    // Priority: stage as integer part, spectral quality as fractional part.
-    // Higher priority = processed first. Within stage 3, lower spectral power = higher priority.
+    // Two-queue system:
+    // - work: stages 0-2 (Boundary, SolveW, SolveZ) — higher stage first
+    // - gold: stage 3 (SolveXY) — lower spectral power first (best candidates)
+    // Workers check gold first; if empty, take from work to generate more gold.
     struct PqEntry { priority: f64, work: PipelineWork }
-    impl PartialEq for PqEntry { fn eq(&self, other: &Self) -> bool { self.priority == other.priority } }
+    impl PartialEq for PqEntry { fn eq(&self, o: &Self) -> bool { self.priority == o.priority } }
     impl Eq for PqEntry {}
-    impl PartialOrd for PqEntry { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
+    impl PartialOrd for PqEntry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
     impl Ord for PqEntry {
-        fn cmp(&self, other: &Self) -> Ordering {
-            self.priority.partial_cmp(&other.priority).unwrap_or(Ordering::Equal)
+        fn cmp(&self, o: &Self) -> Ordering {
+            self.priority.partial_cmp(&o.priority).unwrap_or(Ordering::Equal)
         }
     }
 
-    struct WorkQueue {
-        queue: std::sync::Mutex<BinaryHeap<PqEntry>>,
+    struct DualQueue {
+        work: std::sync::Mutex<BinaryHeap<PqEntry>>,  // stages 0-2
+        gold: std::sync::Mutex<BinaryHeap<PqEntry>>,  // stage 3, ranked by quality
         condvar: std::sync::Condvar,
         pair_bound: f64,
     }
-    impl WorkQueue {
-        fn push(&self, work: PipelineWork) {
-            let pair_bound = self.pair_bound;
-            let stage = work.stage() as f64;
-            // Sub-priority for stage 3: lower spectral power = higher priority
-            let sub = match &work {
+    impl DualQueue {
+        fn push(&self, item: PipelineWork) {
+            match &item {
                 PipelineWork::SolveXY(xy) => {
-                    (1.0 - xy.item.priority / pair_bound.max(1.0)).max(0.0)
+                    // Gold queue: lower spectral power = higher priority (inverted)
+                    let quality = (1.0 - xy.item.priority / self.pair_bound.max(1.0)).max(0.0);
+                    self.gold.lock().unwrap().push(PqEntry { priority: quality, work: item });
                 }
-                _ => 0.0,
-            };
-            let priority = stage + sub;
-            let mut q = self.queue.lock().unwrap();
-            q.push(PqEntry { priority, work });
+                _ => {
+                    let priority = item.stage() as f64;
+                    self.work.lock().unwrap().push(PqEntry { priority, work: item });
+                }
+            }
             self.condvar.notify_one();
         }
-        fn pop_blocking(&self, found: &AtomicBool) -> Option<PipelineWork> {
-            let mut q = self.queue.lock().unwrap();
+        fn pop_blocking(&self, found: &AtomicBool, rng: &mut u64) -> Option<PipelineWork> {
             loop {
                 if found.load(AtomicOrdering::Relaxed) { return None; }
-                if let Some(entry) = q.pop() { return Some(entry.work); }
-                // Wait with timeout so we can check found flag
-                let (guard, _) = self.condvar.wait_timeout(q, std::time::Duration::from_millis(50)).unwrap();
-                q = guard;
+                // Check gold queue: accept based on quality (weighted coinflip).
+                // Top item has priority = quality (0.0 = bad, 1.0 = excellent).
+                // Accept with probability = quality^2 (strongly favor the best).
+                // If rejected, do work-queue stuff to generate more gold.
+                {
+                    let mut gq = self.gold.lock().unwrap();
+                    if let Some(top) = gq.peek() {
+                        let quality = top.priority; // 0.0..1.0
+                        // Always accept if quality > 0.9 or gold queue is huge (>1000)
+                        let accept = quality > 0.9
+                            || gq.len() > 1000
+                            || {
+                                *rng ^= *rng << 13; *rng ^= *rng >> 7; *rng ^= *rng << 17;
+                                (*rng as f64 / u64::MAX as f64) < quality * quality
+                            };
+                        if accept {
+                            return Some(gq.pop().unwrap().work);
+                        }
+                    }
+                }
+                // Work queue (generate more gold candidates)
+                if let Some(e) = self.work.lock().unwrap().pop() { return Some(e.work); }
+                // Both empty or gold not accepted — wait briefly
+                let guard = self.work.lock().unwrap();
+                let (_guard, _) = self.condvar.wait_timeout(guard, std::time::Duration::from_millis(50)).unwrap();
             }
         }
+        fn gold_len(&self) -> usize { self.gold.lock().unwrap().len() }
+        fn work_len(&self) -> usize { self.work.lock().unwrap().len() }
     }
 
-    let work_queue = Arc::new(WorkQueue {
-        queue: std::sync::Mutex::new(BinaryHeap::new()),
+    let work_queue = Arc::new(DualQueue {
+        work: std::sync::Mutex::new(BinaryHeap::new()),
+        gold: std::sync::Mutex::new(BinaryHeap::new()),
         condvar: std::sync::Condvar::new(),
         pair_bound: ctx.pair_bound,
     });
@@ -3540,15 +3565,13 @@ fn run_mdd_sat_search(
             let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
             let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
             let mut rng: u64 = 0x517cc1b727220a95 ^ (tid as u64 * 0x9e3779b97f4a7c15);
-            let mut next_rng = || -> u64 {
-                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng
-            };
+            macro_rules! next_rng { () => {{ rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng }} }
             let k = ctx.k;
             let n = ctx.problem.n;
             let m = ctx.problem.m();
 
             loop {
-                let Some(work) = wq.pop_blocking(&ctx.found) else { break; };
+                let Some(work) = wq.pop_blocking(&ctx.found, &mut rng) else { break; };
                 if ctx.found.load(AtomicOrdering::Relaxed) { break; }
                 if matches!(work, PipelineWork::Shutdown) { break; }
 
@@ -3576,7 +3599,7 @@ fn run_mdd_sat_search(
                     }
 
                     PipelineWork::SolveW(sw) => {
-                        // SAT-solve for W with spectral constraint, enumerate multiple W
+                        // SAT-solve for W, enumerate ALL valid W's for this boundary.
                         let (w_prefix, w_suffix) = expand_boundary_bits(sw.w_bits, k);
                         let mut w_boundary = vec![0i8; m];
                         w_boundary[..k].copy_from_slice(&w_prefix);
@@ -3596,7 +3619,7 @@ fn run_mdd_sat_search(
                         loop {
                             if ctx.found.load(AtomicOrdering::Relaxed) { break; }
                             let phases: Vec<bool> = (0..ctx.middle_m)
-                                .map(|_| next_rng() & 1 == 1).collect();
+                                .map(|_| next_rng!() & 1 == 1).collect();
                             w_solver.set_phase(&phases);
                             if w_solver.solve() != Some(true) { break; }
 
@@ -3660,7 +3683,7 @@ fn run_mdd_sat_search(
                             if ctx.found.load(AtomicOrdering::Relaxed) { break; }
                             if z_count >= ctx.max_z { break; }
                             let z_phases: Vec<bool> = (0..ctx.middle_n)
-                                .map(|_| next_rng() & 1 == 1).collect();
+                                .map(|_| next_rng!() & 1 == 1).collect();
                             z_solver.set_phase(&z_phases);
                             if z_solver.solve() != Some(true) { break; }
                             z_count += 1;
@@ -3818,12 +3841,14 @@ fn run_mdd_sat_search(
                 let idx = ((d as f64 / max_depth) * 8.0).round() as usize;
                 fill_chars[idx.min(8)]
             };
+            let gold = work_queue.gold_len();
             let total_rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
-            eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5}  {:>4}K walked",
+            eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5} gold:{:<5}  {:>4}K walked",
                 elapsed,
                 bar(depths[0]), bar(depths[1]), bar(depths[2]), bar(depths[3]),
                 total_rate,
                 depths[0], depths[1], depths[2], depths[3],
+                gold,
                 walked / 1000);
             last_progress = Instant::now();
         }
