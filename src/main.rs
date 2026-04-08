@@ -1533,15 +1533,39 @@ impl SatXYTemplate {
         candidate: &CandidateZW,
         warm: &mut WarmStartState,
     ) -> Option<(PackedSeq, PackedSeq)> {
+        self.solve_for_warm_bnd(candidate, warm, None)
+    }
+
+    fn solve_for_warm_bnd(
+        &self,
+        candidate: &CandidateZW,
+        warm: &mut WarmStartState,
+        boundary: Option<&BoundaryConfig>,
+    ) -> Option<(PackedSeq, PackedSeq)> {
         let Some(mut solver) = self.prepare_candidate_solver(candidate) else {
             return None;
         };
 
+        // Add boundary constraints: fix X/Y prefix and suffix positions.
+        // This makes each (Z,W,boundary) combo a distinct SAT problem.
+        if let Some(bnd) = boundary {
+            let n = self.n;
+            let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+            let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+            for i in 0..bnd.k {
+                solver.add_clause([if (bnd.x_bits >> i) & 1 == 1 { x_var(i) } else { -x_var(i) }]);
+                solver.add_clause([if (bnd.x_bits >> (bnd.k + i)) & 1 == 1 { x_var(n - bnd.k + i) } else { -x_var(n - bnd.k + i) }]);
+                solver.add_clause([if (bnd.y_bits >> i) & 1 == 1 { y_var(i) } else { -y_var(i) }]);
+                solver.add_clause([if (bnd.y_bits >> (bnd.k + i)) & 1 == 1 { y_var(n - bnd.k + i) } else { -y_var(n - bnd.k + i) }]);
+            }
+        }
+
         // Conflict limit: fail fast on hard UNSAT instances.
-        // Scale with problem size: more vars need more conflicts.
-        // n=18 (36 vars): 50K limit. n=56 (112 vars): 5K limit.
-        let conflict_limit = if self.n <= 30 { 50000 } else { 5000 };
-        solver.set_conflict_limit(conflict_limit);
+        // n<=30: no limit (small enough to solve quickly).
+        // n>30: 5K limit (skip hard UNSAT to maximize exploration).
+        if self.n > 30 {
+            solver.set_conflict_limit(5000);
+        }
 
         // Inject warm-start data
         if warm.inject_clauses && !warm.clauses.is_empty() {
@@ -1729,7 +1753,7 @@ fn solve_work_item(
                 table.solve_xy_with_sat(problem, item.tuple, &candidate, template)
                     .map(|(x, y)| (x, y, z.clone(), w.clone()))
             } else {
-                template.solve_for_warm(&candidate, warm)
+                template.solve_for_warm_bnd(&candidate, warm, item.boundary.as_ref())
                     .map(|(x, y)| (x, y, z.clone(), w.clone()))
             }
         }
@@ -3788,39 +3812,34 @@ fn run_mdd_sat_search(
                             let z_seq = PackedSeq::from_values(&z_vals);
                             let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
 
-                            // Emit a single XY solve per (Z,W) pair.
-                            // The XY SAT solver is unconstrained on XY boundaries
-                            // (x_bits/y_bits are not applied as SAT assumptions in
-                            // the solve_for_warm path), so all XY boundary configs
-                            // from the same Z/W pair produce the same SAT instance.
-                            // We just need to verify at least one XY boundary exists.
-                            let mut has_xy = false;
+                            // Emit XY solves for each valid boundary config.
+                            // Each boundary constrains X/Y prefix/suffix, making each
+                            // a distinct SAT problem. Batch to reduce lock contention.
+                            let mut xy_batch: Vec<PipelineWork> = Vec::new();
                             walk_xy_sub_mdd(
                                 sz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
                                 &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
                                 ctx.middle_n as i32, sz.tuple,
                                 &mut |x_bits, y_bits| {
-                                    if !has_xy {
-                                        has_xy = true;
-                                        stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                        wq.push(PipelineWork::SolveXY(SolveXYWork {
-                                            item: SatWorkItem {
-                                                tuple: sz.tuple,
-                                                x: SeqInput::Blank,
-                                                y: SeqInput::Blank,
-                                                z: SeqInput::Fixed(z_seq.clone()),
-                                                w: SeqInput::Fixed(w_seq.clone()),
-                                                zw_autocorr: Some(zw_autocorr.clone()),
-                                                priority: pair_power,
-                                                boundary: Some(BoundaryConfig {
-                                                    k, x_bits, y_bits,
-                                                    z_bits: sz.z_bits, w_bits: sz.w_bits,
-                                                }),
-                                            },
-                                        }));
-                                    }
+                                    xy_batch.push(PipelineWork::SolveXY(SolveXYWork {
+                                        item: SatWorkItem {
+                                            tuple: sz.tuple,
+                                            x: SeqInput::Blank,
+                                            y: SeqInput::Blank,
+                                            z: SeqInput::Fixed(z_seq.clone()),
+                                            w: SeqInput::Fixed(w_seq.clone()),
+                                            zw_autocorr: Some(zw_autocorr.clone()),
+                                            priority: pair_power,
+                                            boundary: Some(BoundaryConfig {
+                                                k, x_bits, y_bits,
+                                                z_bits: sz.z_bits, w_bits: sz.w_bits,
+                                            }),
+                                        },
+                                    }));
                                 },
                             );
+                            stage_enter[3].fetch_add(xy_batch.len() as u64, AtomicOrdering::Relaxed);
+                            wq.push_batch(xy_batch);
                         }
                         z_solver.spectral = None;
                         z_solver.restore_checkpoint(z_cp);
