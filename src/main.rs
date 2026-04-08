@@ -3197,6 +3197,8 @@ struct PhaseBContext {
     mdd_extend: usize,
     w_mid_vars: Vec<i32>,
     z_mid_vars: Vec<i32>,
+    z_spectral_tables: Option<radical::SpectralTables>,
+    w_spectral_tables: Option<radical::SpectralTables>,
     found: Arc<AtomicBool>,
 }
 
@@ -3328,9 +3330,9 @@ impl PhaseBWorker_ {
             );
             let w_cp = w_solver.save_checkpoint();
             sat_z_middle::fill_w_solver(&mut w_solver, &ctx.w_tmpl, m, &w_boundary);
-            if ctx.middle_m >= 8 {
-                w_solver.spectral = Some(radical::SpectralConstraint::new(
-                    m, k, &w_boundary, ctx.individual_bound, 16,
+            if let Some(ref wtab) = ctx.w_spectral_tables {
+                w_solver.spectral = Some(radical::SpectralConstraint::from_tables(
+                    wtab, &w_boundary, ctx.individual_bound,
                 ));
             }
 
@@ -3436,6 +3438,12 @@ fn run_mdd_sat_search(
         mdd_extend: cfg.mdd_extend,
         w_mid_vars: (0..middle_m).map(|i| (i + 1) as i32).collect(),
         z_mid_vars: (0..middle_n).map(|i| (i + 1) as i32).collect(),
+        z_spectral_tables: if middle_n >= 8 {
+            Some(radical::SpectralTables::new(n, k, 16))
+        } else { None },
+        w_spectral_tables: if middle_m >= 8 {
+            Some(radical::SpectralTables::new(m, k, 16))
+        } else { None },
         found: Arc::new(AtomicBool::new(false)),
     });
 
@@ -3674,9 +3682,9 @@ fn run_mdd_sat_search(
                             );
                             let w_cp = w_solver.save_checkpoint();
                             sat_z_middle::fill_w_solver(&mut w_solver, &ctx.w_tmpl, m, &w_boundary);
-                            if ctx.middle_m >= 8 {
-                                w_solver.spectral = Some(radical::SpectralConstraint::new(
-                                    m, k, &w_boundary, ctx.individual_bound, 16,
+                            if let Some(ref wtab) = ctx.w_spectral_tables {
+                                w_solver.spectral = Some(radical::SpectralConstraint::from_tables(
+                                    wtab, &w_boundary, ctx.individual_bound,
                                 ));
                             }
 
@@ -3724,9 +3732,9 @@ fn run_mdd_sat_search(
                         );
                         let z_cp = z_solver.save_checkpoint();
                         sat_z_middle::fill_z_solver_quad_pb(&mut z_solver, &ctx.z_tmpl, n, m, ctx.middle_n, &z_boundary, &sz.w_vals);
-                        if ctx.middle_n >= 8 {
-                            let mut z_spec = radical::SpectralConstraint::new(
-                                n, k, &z_boundary, ctx.pair_bound, 16,
+                        if let Some(ref ztab) = ctx.z_spectral_tables {
+                            let mut z_spec = radical::SpectralConstraint::from_tables(
+                                ztab, &z_boundary, ctx.pair_bound,
                             );
                             let mut pfb = vec![ctx.pair_bound; z_spec.num_freqs];
                             for fi in 0..z_spec.num_freqs {

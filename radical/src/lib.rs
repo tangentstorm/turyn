@@ -215,6 +215,71 @@ pub struct SpectralConstraint {
     pub values: Vec<i8>,
 }
 
+/// Pre-computed trig tables for spectral constraint (boundary-independent).
+/// Shared across all SpectralConstraint instances with the same (seq_len, k, num_freqs).
+#[derive(Clone)]
+pub struct SpectralTables {
+    pub cos_table: Vec<f32>,
+    pub sin_table: Vec<f32>,
+    pub amplitudes: Vec<f32>,
+    pub max_reduction_total: Vec<f64>,  // sum of all amplitudes per freq
+    pub num_freqs: usize,
+    pub middle_len: usize,
+    pub seq_len: usize,
+    pub k: usize,
+    /// Precomputed omega values for boundary DFT
+    omega: Vec<f64>,
+    /// Precomputed cos/sin for ALL positions (for boundary DFT)
+    pos_cos: Vec<f64>,  // [pos * num_freqs + fi]
+    pos_sin: Vec<f64>,
+}
+
+impl SpectralTables {
+    /// Build once per (seq_len, k, num_freqs). Reuse across boundaries.
+    pub fn new(seq_len: usize, k: usize, num_freqs: usize) -> Self {
+        let middle_len = seq_len - 2 * k;
+        let mut cos_table = vec![0.0f32; middle_len * num_freqs];
+        let mut sin_table = vec![0.0f32; middle_len * num_freqs];
+        let mut omega_vec = vec![0.0f64; num_freqs];
+        let mut pos_cos = vec![0.0f64; seq_len * num_freqs];
+        let mut pos_sin = vec![0.0f64; seq_len * num_freqs];
+
+        for fi in 0..num_freqs {
+            let omega = (fi as f64 + 1.0) / (num_freqs as f64 + 1.0) * std::f64::consts::PI;
+            omega_vec[fi] = omega;
+
+            for pos in 0..seq_len {
+                pos_cos[pos * num_freqs + fi] = (omega * pos as f64).cos();
+                pos_sin[pos * num_freqs + fi] = (omega * pos as f64).sin();
+            }
+
+            for vi in 0..middle_len {
+                let pos = k + vi;
+                cos_table[vi * num_freqs + fi] = pos_cos[pos * num_freqs + fi] as f32;
+                sin_table[vi * num_freqs + fi] = pos_sin[pos * num_freqs + fi] as f32;
+            }
+        }
+
+        let mut amplitudes = vec![0.0f32; middle_len * num_freqs];
+        let mut max_reduction_total = vec![0.0f64; num_freqs];
+        for vi in 0..middle_len {
+            for fi in 0..num_freqs {
+                let c = cos_table[vi * num_freqs + fi] as f64;
+                let s = sin_table[vi * num_freqs + fi] as f64;
+                let amp = (c * c + s * s).sqrt() as f32;
+                amplitudes[vi * num_freqs + fi] = amp;
+                max_reduction_total[fi] += amp as f64;
+            }
+        }
+
+        SpectralTables {
+            cos_table, sin_table, amplitudes, max_reduction_total,
+            num_freqs, middle_len, seq_len, k,
+            omega: omega_vec, pos_cos, pos_sin,
+        }
+    }
+}
+
 impl SpectralConstraint {
     /// Create a new spectral constraint.
     /// `seq_len`: total sequence length (including boundary)
@@ -229,36 +294,33 @@ impl SpectralConstraint {
         bound: f64,
         num_freqs: usize,
     ) -> Self {
-        let middle_len = seq_len - 2 * k;
+        let tables = SpectralTables::new(seq_len, k, num_freqs);
+        Self::from_tables(&tables, boundary, bound)
+    }
 
-        let mut cos_table = vec![0.0f32; middle_len * num_freqs];
-        let mut sin_table = vec![0.0f32; middle_len * num_freqs];
+    /// Create from pre-computed tables (fast: skips trig computation).
+    pub fn from_tables(tables: &SpectralTables, boundary: &[i8], bound: f64) -> Self {
+        let num_freqs = tables.num_freqs;
+        let middle_len = tables.middle_len;
+        let seq_len = tables.seq_len;
+        let k = tables.k;
+
+        // Compute boundary DFT using precomputed pos_cos/pos_sin
         let mut re_boundary = vec![0.0f64; num_freqs];
         let mut im_boundary = vec![0.0f64; num_freqs];
-
-        for fi in 0..num_freqs {
-            let omega = (fi as f64 + 1.0) / (num_freqs as f64 + 1.0) * std::f64::consts::PI;
-
-            // Boundary contribution (constant)
-            for pos in 0..seq_len {
-                if pos >= k && pos < seq_len - k { continue; } // middle
-                let val = boundary[pos] as f64;
-                re_boundary[fi] += val * (omega * pos as f64).cos();
-                im_boundary[fi] += val * (omega * pos as f64).sin();
-            }
-
-            // Middle variable cosine/sine tables
-            for vi in 0..middle_len {
-                let pos = k + vi; // position in full sequence
-                cos_table[vi * num_freqs + fi] = (omega * pos as f64).cos() as f32;
-                sin_table[vi * num_freqs + fi] = (omega * pos as f64).sin() as f32;
+        for pos in 0..seq_len {
+            if pos >= k && pos < seq_len - k { continue; }
+            let val = boundary[pos] as f64;
+            for fi in 0..num_freqs {
+                re_boundary[fi] += val * tables.pos_cos[pos * num_freqs + fi];
+                im_boundary[fi] += val * tables.pos_sin[pos * num_freqs + fi];
             }
         }
 
-        let mut sc = SpectralConstraint {
+        SpectralConstraint {
             num_seq_vars: middle_len,
-            cos_table,
-            sin_table,
+            cos_table: tables.cos_table.clone(),
+            sin_table: tables.sin_table.clone(),
             num_freqs,
             re: re_boundary.clone(),
             im: im_boundary.clone(),
@@ -266,24 +328,11 @@ impl SpectralConstraint {
             im_boundary,
             bound,
             per_freq_bound: None,
-            max_reduction: vec![0.0; num_freqs],
-            amplitudes: vec![0.0f32; middle_len * num_freqs],
+            max_reduction: tables.max_reduction_total.clone(),
+            amplitudes: tables.amplitudes.clone(),
             assigned: vec![false; middle_len],
             values: vec![0i8; middle_len],
-        };
-
-        // Precompute amplitudes and initial max_reduction (all vars unassigned)
-        for vi in 0..middle_len {
-            for fi in 0..num_freqs {
-                let c = sc.cos_table[vi * num_freqs + fi] as f64;
-                let s = sc.sin_table[vi * num_freqs + fi] as f64;
-                let amp = (c * c + s * s).sqrt() as f32;
-                sc.amplitudes[vi * num_freqs + fi] = amp;
-                sc.max_reduction[fi] += amp as f64;
-            }
         }
-
-        sc
     }
 
     /// Reset DFT sums to boundary-only state (for checkpoint/restore).
