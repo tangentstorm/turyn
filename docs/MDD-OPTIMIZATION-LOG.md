@@ -1,6 +1,36 @@
 # MDD Optimization Log
 
-Tracks measured before/after for MDD generation optimizations.
+Tracks measured before/after for MDD generation and search optimizations.
+
+## MDD Search Pipeline Optimization (n=56 throughput)
+
+Benchmark: `target/release/turyn --n=56 --mdd --mdd-k=10 --sat-secs=30`
+
+| Date | Change | n=56 xy/s | Cumulative | Notes |
+|------|--------|-----------|------------|-------|
+| PR#54 baseline | Single-thread Phase B | 7 | 1x | Phase B bottleneck |
+| 2026-04-08 | Adaptive B/C threading | 56 | 8x | Multi-thread, dispatch complexity |
+| 2026-04-08 | Z SAT moved to Phase C | 137 | 20x | Z distributed to workers |
+| 2026-04-08 | Unified priority queue (MDD→W→Z→XY) | 327 | 47x | One queue, stage priority |
+| 2026-04-08 | Pull-based MDD (LCG paths, no partition) | 473 | 68x | Monitor feeds on demand |
+| 2026-04-08 | Dual queue (gold + work) | ~680 avg | 97x | Spectral ranking for XY |
+| 2026-04-08 | Spectral pair check (Idea 5) | ~680 | 97x | Fixed n=18-22 solution finding |
+| 2026-04-08 | Brute-force W for small n (Idea 8) | ~680 | 97x | +10% throughput, n=22 found |
+
+Solution finding (with --mdd pipeline):
+
+| n | k | Status | Time |
+|---|---|--------|------|
+| 12 | 4 | found | 40ms |
+| 14 | 4 | found | <1s |
+| 16 | 4-5 | found | <1s |
+| 18 | 5 | found | <1s |
+| 20 | 5 | found | <20s |
+| 22 | 5 | found | <60s |
+| 24+ | | not found in 120s | needs more search time |
+| 56 | 10 | ~680 xy/s throughput | searching |
+
+## MDD Generation Optimization
 
 ## Benchmark protocol
 

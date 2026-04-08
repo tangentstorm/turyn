@@ -57,10 +57,10 @@ fn main() {
 
         // Count target configs that match the base boundary.
         // Old prefix positions 0..base_k-1 stay the same in both layouts.
-        // Old suffix positions base_k..2*base_k-1 (in base layout) map to
-        // target_k..target_k+base_k-1 (in target layout).
-        // So we need to check: target prefix bits 0..base_k-1 match base prefix,
-        // AND target suffix bits target_k..target_k+base_k-1 match base suffix.
+        // Old short: base 0..base_k-1 → target 0..base_k-1 (same).
+        // Old long: base base_k..2*base_k-1 → target target_k+extra..2*target_k-1.
+        // (Old long covers actual positions n-base_k..n-1, which in target encoding
+        //  start at target_k+extra.)
         let extra = target_k - base_k;
         let expected_count = target_configs.iter().filter(|&&(tz, tw, tx, ty)| {
             // Check prefix: positions 0..base_k-1
@@ -70,10 +70,10 @@ fn main() {
                 if ((tx >> p) & 1) != ((x >> p) & 1) { return false; }
                 if ((ty >> p) & 1) != ((y >> p) & 1) { return false; }
             }
-            // Check suffix: base pos base_k+m → target pos target_k+m
+            // Check suffix: base pos base_k+m → target pos target_k+extra+m
             for m in 0..base_k {
                 let base_pos = base_k + m;
-                let target_pos = target_k + m;
+                let target_pos = target_k + extra + m;
                 if ((tz >> target_pos) & 1) != ((z >> base_pos) & 1) { return false; }
                 if ((tw >> target_pos) & 1) != ((w >> base_pos) & 1) { return false; }
                 if ((tx >> target_pos) & 1) != ((x >> base_pos) & 1) { return false; }
