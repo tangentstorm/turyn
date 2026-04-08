@@ -80,8 +80,19 @@ Currently SolveW finds W's sequentially with blocking clauses. For small n, enum
 ### Idea 7: Batch boundaries per tuple — EXPECTED: systematic coverage
 Instead of interleaving all tuples across random boundaries, process one tuple at a time. Exhaust all boundaries for tuple 0, then tuple 1, etc. This matches the old pipeline's strategy.
 
-### Idea 8: Use brute-force W for SolveW, SAT only for SolveZ — HYBRID
-Enumerate W's via brute-force (with spectral filtering), use SAT only for Z (which benefits from the spectral constraint against known W). This combines the old pipeline's W quality with the new pipeline's Z efficiency.
+### Idea 8: Use brute-force W for SolveW, SAT only for SolveZ — **ACCEPTED**
+Brute-force W enumeration for middle_m <= 20 (small problems). SAT for larger.
+This matches the old pipeline's proven strategy for small n. Results:
+n=22 k=5: FOUND (60s) — NEW! n=56: 1974 xy/s (+10% from ~1800).
+
+### Idea 5: Post-hoc spectral pair check — **ACCEPTED** (critical fix)
+Without this, bad (Z,W) pairs flood the XY solver and solutions are never found
+for n≥18. Hard pair check for middle_n ≤ 20, skip for larger n (too tight at 16 freqs).
+Fixes: n=18 found (<1s), n=20 found, n=56 maintained throughput.
+
+### Idea 3: Sequential MDD walk — **REJECTED**
+Sequential walk gets stuck in one MDD region. LCG shuffle is essential for
+coverage diversity. n=18 regression when used.
 
 ### Idea 9: Adaptive gold queue threshold — EXPECTED: better quality selection
 Track the distribution of spectral pair powers in the gold queue. Set acceptance threshold at the 10th percentile (adaptive). Only process items better than 90% of what we've seen.
