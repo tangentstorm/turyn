@@ -3933,11 +3933,13 @@ fn run_mdd_sat_search(
                 fill_chars[idx.min(8)]
             };
             let gold = work_queue.gold_len();
-            let total_rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
-            eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5} gold:{:<5}  {:>4}K walked",
+            let z_done = stage_exit[2].load(AtomicOrdering::Relaxed);
+            let z_rate = if elapsed > 0.0 { z_done as f64 / elapsed } else { 0.0 };
+            let bnd_rate = if elapsed > 0.0 { walked as f64 / elapsed } else { 0.0 };
+            eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}bnd/s {:>4.0}z/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5} gold:{:<5}  {:>4}K walked",
                 elapsed,
                 bar(depths[0]), bar(depths[1]), bar(depths[2]), bar(depths[3]),
-                total_rate,
+                bnd_rate, z_rate,
                 depths[0], depths[1], depths[2], depths[3],
                 gold,
                 walked / 1000);
@@ -3963,9 +3965,12 @@ fn run_mdd_sat_search(
         for (i, name) in ["MDD", "W", "Z", "XY"].iter().enumerate() {
             println!("  Stage {} ({}): {:>10} items", i, name, stage_exit[i].load(AtomicOrdering::Relaxed));
         }
+        let z_done = stage_exit[2].load(AtomicOrdering::Relaxed);
         println!("  XY solves:                {:>10}", done);
         println!("  Boundaries walked:        {:>10}", walked);
-        println!("  Rate:                     {:.2} solves/s", done as f64 / elapsed.as_secs_f64());
+        println!("  Effective search rate:    {:.1} z/s, {:.1} bnd/s",
+            z_done as f64 / elapsed.as_secs_f64(),
+            walked as f64 / elapsed.as_secs_f64());
         println!("  Wall-clock:               {:>10.3?}", elapsed);
         if !found_solution { println!("No solution found."); }
     }
