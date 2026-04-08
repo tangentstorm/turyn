@@ -758,22 +758,29 @@ impl Solver {
         assert_eq!(lits_a.len(), lits_b.len());
         assert_eq!(lits_a.len(), coeffs.len());
 
-        for &lit in lits_a.iter().chain(lits_b.iter()) {
-            assert!(lit != 0);
-            self.ensure_var(lit.unsigned_abs() as usize);
+        // Skip ensure_var when all variables are known to exist already
+        let max_var = lits_a.iter().chain(lits_b.iter())
+            .map(|&l| l.unsigned_abs() as usize).max().unwrap_or(0);
+        if max_var > self.num_vars {
+            for &lit in lits_a.iter().chain(lits_b.iter()) {
+                self.ensure_var(lit.unsigned_abs() as usize);
+            }
         }
 
         let qi = self.quad_pb_constraints.len() as u32;
 
-        // Watch by variable + build term index
-        let mut watched = std::collections::HashSet::new();
+        // Watch by variable + build term index (dedup via contains, no HashSet alloc)
         for i in 0..lits_a.len() {
             let va = var_of(lits_a[i]);
             let vb = var_of(lits_b[i]);
-            if watched.insert(va) { self.quad_pb_var_watches[va].push(qi); }
-            if watched.insert(vb) { self.quad_pb_var_watches[vb].push(qi); }
-            self.quad_pb_var_terms[va].push((qi, i as u16, true));   // is_var_a = true
-            self.quad_pb_var_terms[vb].push((qi, i as u16, false));  // is_var_a = false
+            if !self.quad_pb_var_watches[va].contains(&qi) {
+                self.quad_pb_var_watches[va].push(qi);
+            }
+            if !self.quad_pb_var_watches[vb].contains(&qi) {
+                self.quad_pb_var_watches[vb].push(qi);
+            }
+            self.quad_pb_var_terms[va].push((qi, i as u16, true));
+            self.quad_pb_var_terms[vb].push((qi, i as u16, false));
         }
 
         let terms: Vec<QuadPbTerm> = (0..lits_a.len()).map(|i| {
