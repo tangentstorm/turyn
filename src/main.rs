@@ -3095,13 +3095,15 @@ fn partition_mdd_subtrees(
 /// Read-only context shared across all Phase B workers (via Arc).
 struct PhaseBContext {
     mdd: Arc<mdd_reorder::Mdd4>,
-    pos_order: Vec<usize>,
+    pos_order: Vec<usize>,     // subtree-adjusted for ZW walk (partition_depth..)
+    xy_pos_order: Vec<usize>,  // full pos_order for XY sub-MDD walk
     tuples: Vec<SumTuple>,
     w_tmpl: sat_z_middle::LagTemplate,
     z_tmpl: sat_z_middle::LagTemplate,
     problem: Problem,
     k: usize,
-    zw_depth: usize,
+    zw_depth: usize,        // subtree-adjusted for ZW walk
+    xy_zw_depth: usize,     // full 2*k for XY sub-MDD walk
     middle_n: usize,
     middle_m: usize,
     max_bnd_sum: i32,
@@ -3340,8 +3342,8 @@ impl PhaseBWorker {
                 let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
 
                 walk_xy_sub_mdd(
-                    xy_root, 0, ctx.zw_depth, 0, 0,
-                    &ctx.pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
+                    xy_root, 0, ctx.xy_zw_depth, 0, 0,
+                    &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
                     ctx.middle_n as i32, tuple,
                     &mut |x_bits, y_bits| {
                         if ctx.mdd_extend > 0 {
@@ -3429,12 +3431,14 @@ fn run_mdd_sat_search(
     let ctx = Arc::new(PhaseBContext {
         mdd: Arc::clone(&reordered),
         pos_order: subtree_pos_order,
+        xy_pos_order: pos_order.clone(),
         tuples: tuples.to_vec(),
         w_tmpl: sat_z_middle::LagTemplate::new(m, k),
         z_tmpl: sat_z_middle::LagTemplate::new(n, k),
         problem,
         k,
         zw_depth: subtree_zw_depth,
+        xy_zw_depth: zw_depth,
         middle_n,
         middle_m,
         max_bnd_sum,
@@ -3615,19 +3619,27 @@ fn run_mdd_sat_search(
             }
         }
 
-        // Adaptive dispatch: Phase C priority, Phase B when starved
+        // Adaptive dispatch: Phase C items have priority. Cap Phase B workers
+        // at workers-1 (always leave capacity for Phase C).
+        // Track b_dispatched locally since phase_b_active only updates
+        // after the worker thread processes the message.
+        let max_b = if workers <= 2 { 1 } else { workers - 1 };
+        let mut b_dispatched_now = phase_b_active.load(AtomicOrdering::Relaxed);
         while !idle_workers.is_empty() {
             if let Some(pqi) = phase_c_pq.pop() {
                 let tid = idle_workers.pop().unwrap();
                 dispatched_c += 1;
                 let _ = worker_txs[tid].send(HybridWork::PhaseC(pqi.item));
-            } else if let Some(subtree) = phase_b_queue.pop_front() {
-                let tid = idle_workers.pop().unwrap();
-                dispatched_b += 1;
-                phase_b_remaining = phase_b_queue.len();
-                let _ = worker_txs[tid].send(HybridWork::PhaseB(subtree));
+            } else if !phase_b_queue.is_empty() && b_dispatched_now < max_b {
+                if let Some(subtree) = phase_b_queue.pop_front() {
+                    let tid = idle_workers.pop().unwrap();
+                    dispatched_b += 1;
+                    b_dispatched_now += 1;
+                    phase_b_remaining = phase_b_queue.len();
+                    let _ = worker_txs[tid].send(HybridWork::PhaseB(subtree));
+                }
             } else {
-                break; // nothing to dispatch
+                break;
             }
         }
 
