@@ -102,10 +102,18 @@ Single PQ starves the pipeline: stage 3 items always have highest priority, so w
 only do XY SAT and never generate new W/Z items. n=56 dropped from ~1800 to 89 xy/s.
 The dual-queue's coinflip mechanism is necessary to balance generation vs consumption.
 
-### Idea 11: Tuple-aware priority in gold queue — EXPECTED: find solutions faster
+### Idea 6: Multiple W ranking per boundary — **REJECTED**
+W spectral quality as SolveZ sub-priority didn't help. "Better W" doesn't
+predict "more likely to produce valid Z." High variance, no clear win.
+
+### Idea 7: Batch boundaries per tuple — **SKIPPED**
+More relevant for small n (already working). For n=56 diversity matters more
+than deep-diving one tuple. The current interleaved approach is correct.
+
+### Idea 11: Tuple-aware priority in gold queue — **SKIPPED**
 Some tuples are "easier" (fewer valid W's needed, smaller search space). Track which tuples produce solvable items and prioritize those.
 
-### Idea 12: Larger k for better boundary pruning — EXPECTED: fewer but higher-quality boundaries
+### Idea 12: Larger k for better boundary pruning — TESTED
 Larger k means more of the sequence is fixed by the boundary, leaving less for SAT. The MDD prunes more aggressively. For n=18 k=8: boundary is 16 of 18 positions, only 2 free. If the MDD has valid paths, they're very likely solvable.
 
 ## Testing Protocol
