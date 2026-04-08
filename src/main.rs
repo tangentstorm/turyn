@@ -3709,8 +3709,16 @@ fn run_mdd_sat_search(
 
                             let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, ctx.individual_bound, &mut fft_buf_z) else { continue; };
 
-                            // Spectral pair quality: lower power = better candidate
+                            // Spectral pair quality: lower power = better candidate.
+                            // Hard-reject pairs that fail the pair check (excess at any freq).
+                            // This is critical for finding solutions — without it, bad pairs
+                            // flood the XY solver.
                             let pair_power = spectral_pair_max_power(&z_spectrum, &sz.w_spectrum);
+                            // For small n: hard pair check finds solutions faster by filtering junk.
+                            // For large n: pair check too tight (rejects everything), rely on ranking.
+                            if ctx.middle_n <= 20 {
+                                if !spectral_pair_ok(&z_spectrum, &sz.w_spectrum, ctx.pair_bound) { continue; }
+                            }
 
                             let z_seq = PackedSeq::from_values(&z_vals);
                             let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
