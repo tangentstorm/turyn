@@ -121,6 +121,7 @@ Larger k means more of the sequence is fixed by the boundary, leaving less for S
 ### Profiling baseline (n=56, k=10, 4 workers, 30s)
 
 Baseline: **2487 xy/s** (commit 90557ce)
+After optimizations: **~3700 xy/s** (commit c3fd62c, +458%)
 
 Callgrind profiling shows the SAT solver dominates:
 - 34.7% `recompute_quad_pb` — recomputing term states from assigns[]

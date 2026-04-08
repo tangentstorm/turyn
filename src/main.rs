@@ -3780,32 +3780,39 @@ fn run_mdd_sat_search(
                             let z_seq = PackedSeq::from_values(&z_vals);
                             let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
 
-                            // Batch XY items to reduce lock acquisitions
-                            let mut xy_batch: Vec<PipelineWork> = Vec::new();
+                            // Emit a single XY solve per (Z,W) pair.
+                            // The XY SAT solver is unconstrained on XY boundaries
+                            // (x_bits/y_bits are not applied as SAT assumptions in
+                            // the solve_for_warm path), so all XY boundary configs
+                            // from the same Z/W pair produce the same SAT instance.
+                            // We just need to verify at least one XY boundary exists.
+                            let mut has_xy = false;
                             walk_xy_sub_mdd(
                                 sz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
                                 &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
                                 ctx.middle_n as i32, sz.tuple,
                                 &mut |x_bits, y_bits| {
-                                    xy_batch.push(PipelineWork::SolveXY(SolveXYWork {
-                                        item: SatWorkItem {
-                                            tuple: sz.tuple,
-                                            x: SeqInput::Blank,
-                                            y: SeqInput::Blank,
-                                            z: SeqInput::Fixed(z_seq.clone()),
-                                            w: SeqInput::Fixed(w_seq.clone()),
-                                            zw_autocorr: Some(zw_autocorr.clone()),
-                                            priority: pair_power,
-                                            boundary: Some(BoundaryConfig {
-                                                k, x_bits, y_bits,
-                                                z_bits: sz.z_bits, w_bits: sz.w_bits,
-                                            }),
-                                        },
-                                    }));
+                                    if !has_xy {
+                                        has_xy = true;
+                                        stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
+                                        wq.push(PipelineWork::SolveXY(SolveXYWork {
+                                            item: SatWorkItem {
+                                                tuple: sz.tuple,
+                                                x: SeqInput::Blank,
+                                                y: SeqInput::Blank,
+                                                z: SeqInput::Fixed(z_seq.clone()),
+                                                w: SeqInput::Fixed(w_seq.clone()),
+                                                zw_autocorr: Some(zw_autocorr.clone()),
+                                                priority: pair_power,
+                                                boundary: Some(BoundaryConfig {
+                                                    k, x_bits, y_bits,
+                                                    z_bits: sz.z_bits, w_bits: sz.w_bits,
+                                                }),
+                                            },
+                                        }));
+                                    }
                                 },
                             );
-                            stage_enter[3].fetch_add(xy_batch.len() as u64, AtomicOrdering::Relaxed);
-                            wq.push_batch(xy_batch);
                         }
                         z_solver.spectral = None;
                         z_solver.restore_checkpoint(z_cp);
