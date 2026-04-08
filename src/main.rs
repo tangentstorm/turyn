@@ -3467,6 +3467,7 @@ fn run_mdd_sat_search(
         gold: std::sync::Mutex<BinaryHeap<PqEntry>>,  // stage 3, ranked by quality
         condvar: std::sync::Condvar,
         pair_bound: f64,
+        best_quality: std::sync::atomic::AtomicU64,    // f64 bits of best quality seen
     }
     impl DualQueue {
         fn push(&self, item: PipelineWork) {
@@ -3474,6 +3475,11 @@ fn run_mdd_sat_search(
                 PipelineWork::SolveXY(xy) => {
                     // Gold queue: lower spectral power = higher priority (inverted)
                     let quality = (1.0 - xy.item.priority / self.pair_bound.max(1.0)).max(0.0);
+                    // Track best quality seen
+                    let prev = f64::from_bits(self.best_quality.load(AtomicOrdering::Relaxed));
+                    if quality > prev {
+                        self.best_quality.store(quality.to_bits(), AtomicOrdering::Relaxed);
+                    }
                     self.gold.lock().unwrap().push(PqEntry { priority: quality, work: item });
                 }
                 _ => {
@@ -3495,12 +3501,14 @@ fn run_mdd_sat_search(
                     if let Some(top) = gq.peek() {
                         let quality = top.priority; // 0.0..1.0
                         // Always accept if quality > 0.9 or gold queue is huge (>1000)
-                        let accept = quality > 0.9
-                            || gq.len() > 1000
-                            || {
-                                *rng ^= *rng << 13; *rng ^= *rng >> 7; *rng ^= *rng << 17;
-                                (*rng as f64 / u64::MAX as f64) < quality * quality
-                            };
+                        // Coinflip: probability = quality (0..1).
+                        // High quality items process often, low quality rarely.
+                        // But if work queue is empty, always accept (slow lane still moves).
+                        let work_empty = self.work.lock().unwrap().is_empty();
+                        let accept = work_empty || quality > 0.9 || {
+                            *rng ^= *rng << 13; *rng ^= *rng >> 7; *rng ^= *rng << 17;
+                            (*rng as f64 / u64::MAX as f64) < quality
+                        };
                         if accept {
                             return Some(gq.pop().unwrap().work);
                         }
@@ -3522,6 +3530,7 @@ fn run_mdd_sat_search(
         gold: std::sync::Mutex::new(BinaryHeap::new()),
         condvar: std::sync::Condvar::new(),
         pair_bound: ctx.pair_bound,
+        best_quality: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
     });
     let (result_tx, result_rx) =
         std::sync::mpsc::channel::<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>();
@@ -3771,10 +3780,10 @@ fn run_mdd_sat_search(
     let mut last_snap = Instant::now();
 
     loop {
-        // Feed MDD boundaries when XY queue depth is low (quality buffer)
-        let xy_queued = stage_enter[3].load(AtomicOrdering::Relaxed)
-            .saturating_sub(stage_exit[3].load(AtomicOrdering::Relaxed));
-        if xy_queued < queue_target as u64 {
+        // Feed MDD boundaries when work queue is low (keep the pipeline flowing).
+        // Gold queue accumulates independently — monitor's job is to keep generating candidates.
+        let work_depth = work_queue.work_len();
+        if work_depth < queue_target {
             let batch = queue_target;
             let mut fed = 0;
             while fed < batch {
