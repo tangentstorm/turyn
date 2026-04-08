@@ -402,16 +402,138 @@ zeros doesn't affect the autocorrelation (the zero terms contribute nothing),
 the T-sequence autocorrelation reduces to the base-sequence autocorrelation.
 -/
 
+/-- Indexing into `zeroSeq k` always returns 0. -/
+private lemma zeroSeq_getD (k i : Nat) : (zeroSeq k).getD i 0 = 0 := by
+  unfold zeroSeq
+  simp [List.getD_eq_getElem?_getD, List.getElem?_replicate]
+  split <;> simp
+
+/-- Any product involving a `zeroSeq` index is 0. -/
+private lemma mul_zeroSeq_getD_left (k i : Nat) (b : List Int) (j : Nat) :
+    (zeroSeq k).getD i 0 * b.getD j 0 = 0 := by
+  rw [zeroSeq_getD]; ring
+
+/-- Any product involving a `zeroSeq` index is 0. -/
+private lemma mul_zeroSeq_getD_right (a : List Int) (i : Nat) (k j : Nat) :
+    a.getD i 0 * (zeroSeq k).getD j 0 = 0 := by
+  rw [zeroSeq_getD]; ring
+
+/-- Length of `zeroSeq`. -/
+private lemma zeroSeq_length (k : Nat) : (zeroSeq k).length = k := by
+  simp [zeroSeq, List.length_replicate]
+
 /-- Appending zeros does not change the autocorrelation at any lag. -/
 lemma aperiodicAutocorr_append_zeros (a : List Int) (k s : Nat) :
     aperiodicAutocorr (a ++ zeroSeq k) s = aperiodicAutocorr a s := by
-  sorry
+  unfold aperiodicAutocorr
+  rw [show (a ++ zeroSeq k).length = a.length + k from by
+    simp [List.length_append, zeroSeq_length]]
+  by_cases hs : a.length ≤ s
+  · simp only [hs, ↓reduceIte]
+    by_cases hsk : a.length + k ≤ s
+    · simp only [hsk, ↓reduceIte]
+    · simp only [hsk, ↓reduceIte]
+      apply Finset.sum_eq_zero; intro i hi
+      rw [Finset.mem_range] at hi
+      rw [List.getD_append_right _ _ _ _ (show a.length ≤ i + s by omega)]
+      rw [zeroSeq_getD]; ring
+  · simp only [show ¬(a.length + k ≤ s) from by omega, hs, ↓reduceIte]
+    have hle : a.length - s ≤ a.length + k - s := by omega
+    rw [← Finset.sum_range_add_sum_Ico _ hle]
+    have htail : ∑ i ∈ Finset.Ico (a.length - s) (a.length + k - s),
+        (a ++ zeroSeq k).getD i 0 * (a ++ zeroSeq k).getD (i + s) 0 = 0 := by
+      apply Finset.sum_eq_zero; intro i hi
+      rw [Finset.mem_Ico] at hi
+      rw [List.getD_append_right _ _ _ _ (show a.length ≤ i + s by omega)]
+      rw [zeroSeq_getD]; ring
+    rw [htail, add_zero]
+    apply Finset.sum_congr rfl; intro i hi
+    rw [Finset.mem_range] at hi
+    rw [List.getD_append _ _ _ _ (show i < a.length by omega),
+        List.getD_append _ _ _ _ (show i + s < a.length by omega)]
 
-/-- Prepending zeros shifts the autocorrelation indices but does not
-    change the value (the zero prefix contributes nothing). -/
+/-- Prepending zeros does not change the autocorrelation at any lag. -/
 lemma aperiodicAutocorr_prepend_zeros (a : List Int) (k s : Nat) :
     aperiodicAutocorr (zeroSeq k ++ a) s = aperiodicAutocorr a s := by
-  sorry
+  unfold aperiodicAutocorr
+  rw [show (zeroSeq k ++ a).length = k + a.length from by
+    simp [List.length_append, zeroSeq_length]]
+  by_cases hs : a.length ≤ s
+  · simp only [hs, ↓reduceIte]
+    by_cases hsk : k + a.length ≤ s
+    · simp only [hsk, ↓reduceIte]
+    · simp only [hsk, ↓reduceIte]
+      apply Finset.sum_eq_zero; intro i hi
+      rw [Finset.mem_range] at hi
+      by_cases hik : i < k
+      · rw [List.getD_append _ _ _ _ (by rw [zeroSeq_length]; omega)]
+        rw [zeroSeq_getD]; ring
+      · rw [List.getD_append_right _ _ _ _ (by rw [zeroSeq_length]; omega),
+            List.getD_append_right _ _ _ _ (by rw [zeroSeq_length]; omega)]
+        rw [List.getD_eq_default _ _ (by rw [zeroSeq_length]; omega)]
+        ring
+  · simp only [show ¬(k + a.length ≤ s) from by omega, hs, ↓reduceIte]
+    have hle : k ≤ k + a.length - s := by omega
+    rw [← Finset.sum_range_add_sum_Ico _ hle]
+    have hzero : ∑ i ∈ Finset.range k,
+        (zeroSeq k ++ a).getD i 0 * (zeroSeq k ++ a).getD (i + s) 0 = 0 := by
+      apply Finset.sum_eq_zero; intro i hi
+      rw [Finset.mem_range] at hi
+      rw [List.getD_append _ _ _ _ (by rw [zeroSeq_length]; omega)]
+      rw [zeroSeq_getD]; ring
+    rw [hzero, zero_add, Finset.sum_Ico_eq_sum_range]
+    have hrange : k + a.length - s - k = a.length - s := by omega
+    apply Finset.sum_congr (by rw [hrange])
+    intro i _
+    rw [List.getD_append_right _ _ _ _ (by rw [zeroSeq_length]; omega),
+        List.getD_append_right _ _ _ _ (by rw [zeroSeq_length]; omega)]
+    show a.getD (k + i - (zeroSeq k).length) 0 *
+         a.getD (k + i + s - (zeroSeq k).length) 0 =
+         a.getD i 0 * a.getD (i + s) 0
+    rw [zeroSeq_length]
+    congr 1 <;> (congr 1; omega)
+
+/-- For ±1 values a, `(a + a) / 2 = a`. -/
+private lemma half_sum_self (a : Int) (h : a = 1 ∨ a = -1) : (a + a) / 2 = a := by
+  rcases h with rfl | rfl <;> decide
+
+/-- For ±1 values, `(a - a) / 2 = 0`. -/
+private lemma half_diff_self (a : Int) : (a - a) / 2 = 0 := by omega
+
+/-- For ±1 values a, `(a + a * (-1)) / 2 = 0`. -/
+private lemma half_sum_neg (a : Int) : (a + a * (-1)) / 2 = 0 := by omega
+
+/-- For ±1 values a, `(a - a * (-1)) / 2 = a`. -/
+private lemma half_diff_neg (a : Int) (h : a = 1 ∨ a = -1) : (a - a * (-1)) / 2 = a := by
+  rcases h with rfl | rfl <;> decide
+
+/-- `seqSumHalf (z ++ w) (z ++ negSeq w) = z ++ zeroSeq (w.length)` when Z has ±1 entries.
+
+    For i < |z|: both sides have z[i], since (z[i] + z[i])/2 = z[i].
+    For i ≥ |z|: (w[j] + (−w[j]))/2 = 0. -/
+lemma seqSumHalf_concat (z w : PmSeq) :
+    seqSumHalf (z ++ w) (z ++ negSeq w) = z ++ zeroSeq w.length := by
+  unfold seqSumHalf negSeq zeroSeq
+  apply List.ext_getElem
+  · simp [List.length_map, List.length_zip, List.length_append, List.length_replicate]
+  · intro i h1 h2
+    simp only [List.getElem_map, List.getElem_zip, List.getElem_append,
+               List.getElem_replicate, mul_neg_one]
+    repeat (first | split | omega)
+
+/-- `seqDiffHalf (z ++ w) (z ++ negSeq w) = zeroSeq (z.length) ++ w`.
+
+    For i < |z|: (z[i] − z[i])/2 = 0.
+    For i ≥ |z|: (w[j] − (−w[j]))/2 = w[j]. -/
+lemma seqDiffHalf_concat (z w : PmSeq) :
+    seqDiffHalf (z ++ w) (z ++ negSeq w) = zeroSeq z.length ++ w := by
+  unfold seqDiffHalf negSeq zeroSeq
+  apply List.ext_getElem
+  · simp [List.length_map, List.length_zip, List.length_append, List.length_replicate]
+  · intro i h1 h2
+    simp only [List.getElem_map, List.getElem_zip, List.getElem_append,
+               List.getElem_replicate, List.length_replicate, mul_neg_one]
+    repeat (first | split | omega)
 
 /-- **Half-sum/half-difference autocorrelation identity:**
     For ±1 sequences a, b of equal length,
@@ -419,7 +541,8 @@ lemma aperiodicAutocorr_prepend_zeros (a : List Int) (k s : Nat) :
 
     The cross terms a[i]·b[i+s] cancel when the two are added. -/
 lemma sumHalf_diffHalf_autocorr (a b : PmSeq) (s : Nat)
-    (hab : a.length = b.length) :
+    (hab : a.length = b.length)
+    (ha : AllPmOne a) (hb : AllPmOne b) :
     2 * (aperiodicAutocorr (seqSumHalf a b) s +
          aperiodicAutocorr (seqDiffHalf a b) s) =
     aperiodicAutocorr a s + aperiodicAutocorr b s := by
@@ -428,11 +551,12 @@ lemma sumHalf_diffHalf_autocorr (a b : PmSeq) (s : Nat)
 /-- **T-sequence theorem:** If (X, Y, Z, W) is TT(n), the T-sequences
     of length 3n−1 have vanishing combined aperiodic autocorrelation.
 
-    The proof reduces to `base_seq_vanishing_prop` via:
-    1. `aperiodicAutocorr_append_zeros` / `aperiodicAutocorr_prepend_zeros`
-       to strip the zero padding
-    2. `sumHalf_diffHalf_autocorr` to recombine the half-sum/half-difference
-       into the original base-sequence autocorrelation -/
+    The proof uses:
+    1. `seqSumHalf_concat` / `seqDiffHalf_concat` to simplify the Z,W pair
+    2. `aperiodicAutocorr_append_zeros` / `aperiodicAutocorr_prepend_zeros`
+       to strip zero padding
+    3. `sumHalf_diffHalf_autocorr` for the X,Y pair
+    4. `base_seq_vanishing_prop` for the final cancellation -/
 theorem tseq_vanishing_prop {n : Nat} {x y z w : PmSeq}
     (htt : IsTurynTypeProp n x y z w) (hn : n ≥ 1) :
     let (t1, t2, t3, t4) := tSequences x y z w
@@ -440,24 +564,23 @@ theorem tseq_vanishing_prop {n : Nat} {x y z w : PmSeq}
       aperiodicAutocorr t1 s + aperiodicAutocorr t2 s +
       aperiodicAutocorr t3 s + aperiodicAutocorr t4 s = 0 := by
   intro s hs1 _hs2
-  -- The let bindings from tSequences/baseSequences are already reduced.
-  -- Strip zero padding
-  rw [aperiodicAutocorr_append_zeros, aperiodicAutocorr_append_zeros,
-      aperiodicAutocorr_prepend_zeros, aperiodicAutocorr_prepend_zeros]
-  -- Recombine half-sum/half-difference pairs
-  have hAB : (z ++ w).length = (z ++ negSeq w).length := by
-    simp [List.length_append, negSeq_length]
-  have hCD : x.length = y.length := by
-    rw [htt.x_len, htt.y_len]
-  -- Use the half-sum/half-difference identity for each pair
-  have hAB := sumHalf_diffHalf_autocorr (z ++ w) (z ++ negSeq w) s hAB
-  have hCD := sumHalf_diffHalf_autocorr x y s hCD
-  -- Base sequence vanishing gives the sum of the originals = 0
+  -- Simplify the Z,W half-sum/half-difference
+  rw [seqSumHalf_concat z w,
+      seqDiffHalf_concat z w]
+  -- Strip all zero padding (append and prepend) from all four T-sequences
+  simp only [aperiodicAutocorr_append_zeros, aperiodicAutocorr_prepend_zeros]
+  -- Goal: N_Z(s) + N_W(s) + N_{(X+Y)/2}(s) + N_{(X-Y)/2}(s) = 0
+  -- Use sumHalf_diffHalf_autocorr for the X,Y pair
+  have hXY := sumHalf_diffHalf_autocorr x y s
+    (by rw [htt.x_len, htt.y_len]) htt.x_pm htt.y_pm
+  -- Use base_seq_vanishing_prop: N_{Z++W} + N_{Z++(-W)} + N_X + N_Y = 0
   have hbase := base_seq_vanishing_prop htt hn hs1
-  -- hAB: 2 * (T1 + T2) = N_A + N_B
-  -- hCD: 2 * (T3 + T4) = N_X + N_Y
-  -- hbase: (N_A + N_B) + N_X + N_Y = 0
-  -- Goal: T1 + T2 + T3 + T4 = 0
+  -- And concat_neg_autocorr_sum: N_{Z++W} + N_{Z++(-W)} = 2·N_Z + 2·N_W
+  have hconcat := concat_neg_autocorr_sum z w s
+  -- hconcat: N_{Z++W} + N_{Z++(-W)} = 2·N_Z + 2·N_W
+  -- hbase: (2·N_Z + 2·N_W) + N_X + N_Y = 0  (after substituting hconcat)
+  -- hXY: 2·(N_{(X+Y)/2} + N_{(X-Y)/2}) = N_X + N_Y
+  -- Goal: N_Z + N_W + N_{(X+Y)/2} + N_{(X-Y)/2} = 0
   linarith
 
 /-! ## Step 3: T-sequences → Goethals-Seidel Hadamard matrix (statement only)
