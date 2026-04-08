@@ -3039,8 +3039,47 @@ fn load_best_mdd(max_k: usize, verbose: bool) -> Option<mdd_reorder::Mdd4> {
     None
 }
 
-/// Work item for Z enumeration + XY solving given a fixed W.
-struct ZxyWork {
+/// Unified pipeline work item. Priority = stage (higher = closer to result).
+enum PipelineWork {
+    /// Stage 0: Walk a chunk of the MDD, emit Stage 1 items per (boundary, tuple).
+    MddChunk(MddChunkWork),
+    /// Stage 1: SAT-solve W given boundary + tuple. Enumerate multiple W with blocking clauses.
+    SolveW(SolveWWork),
+    /// Stage 2: SAT-solve one Z given boundary + W. Re-enqueue with blocking clause for next Z.
+    SolveZ(SolveZWork),
+    /// Stage 3: SAT-solve XY given boundary + Z + W.
+    SolveXY(SolveXYWork),
+    Shutdown,
+}
+
+impl PipelineWork {
+    fn stage(&self) -> u8 {
+        match self {
+            PipelineWork::MddChunk(_) => 0,
+            PipelineWork::SolveW(_) => 1,
+            PipelineWork::SolveZ(_) => 2,
+            PipelineWork::SolveXY(_) => 3,
+            PipelineWork::Shutdown => 255,
+        }
+    }
+}
+
+struct MddChunkWork {
+    subtree_root: u32,
+    z_acc: u32,
+    w_acc: u32,
+}
+
+struct SolveWWork {
+    tuple: SumTuple,
+    z_bits: u32,
+    w_bits: u32,
+    xy_root: u32,
+    z_mid_sum: i32,
+    w_mid_sum: i32,
+}
+
+struct SolveZWork {
     tuple: SumTuple,
     z_bits: u32,
     w_bits: u32,
@@ -3050,8 +3089,7 @@ struct ZxyWork {
     z_mid_sum: i32,
 }
 
-/// Work item for XY SAT solve given fixed Z and W.
-struct XyWork {
+struct SolveXYWork {
     item: SatWorkItem,
 }
 
@@ -3133,21 +3171,8 @@ struct PhaseBContext {
     found: Arc<AtomicBool>,
 }
 
-/// Per-thread mutable state for Phase B processing.
-struct PhaseBWorker {
-    w_bases: HashMap<i32, radical::Solver>,
-    z_bases: HashMap<i32, radical::Solver>,
-    stats: SearchStats,
-    total_items: u64,
-    total_zw: u64,
-    rng: u64,
-    fft_buf_w: Vec<Complex<f64>>,
-    fft_buf_z: Vec<Complex<f64>>,
-    spectral_z: SpectralFilter,
-    spectral_w: SpectralFilter,
-}
-
-impl PhaseBWorker {
+/*  Dead code — PhaseBWorker replaced by unified pipeline.
+impl PhaseBWorker_ {
     fn new(seed: u64, ctx: &PhaseBContext) -> Self {
         let spectral_z = SpectralFilter::new(ctx.problem.n, ctx.theta);
         let spectral_w = SpectralFilter::new(ctx.problem.m(), ctx.theta);
@@ -3318,12 +3343,11 @@ impl PhaseBWorker {
             self.w_bases.insert(w_mid_sum, w_solver);
         }
     }
-}
+} // end dead code */
 
-/// MDD-based hybrid search with adaptive Phase B/C thread balancing.
-/// Phase B (MDD walk + SAT W/Z) and Phase C (SAT X/Y) run on the same pool
-/// of hybrid workers. The coordinator dispatches Phase B subtrees when Phase C
-/// queue is empty, and Phase C items when available.
+/// MDD pipeline search: unified priority queue with stages MDD→W→Z→XY.
+/// All workers are identical — they grab the highest-stage item from the queue.
+/// Later stages (closer to producing a result) always get processed first.
 fn run_mdd_sat_search(
     problem: Problem,
     tuples: &[SumTuple],
@@ -3335,7 +3359,7 @@ fn run_mdd_sat_search(
     let m = problem.m();
 
     let try_k = k.min((n - 1) / 2);
-    let reordered = match load_best_mdd(try_k, verbose) {
+    let mdd = match load_best_mdd(try_k, verbose) {
         Some(m) => Arc::new(m),
         None => {
             eprintln!("No MDD file found (tried mdd-1.bin through mdd-{}.bin)", try_k);
@@ -3343,35 +3367,30 @@ fn run_mdd_sat_search(
             std::process::exit(1);
         }
     };
-    let k = reordered.k;
+    let k = mdd.k;
 
     let middle_n = n - 2 * k;
     let middle_m = m - 2 * k;
     let max_bnd_sum = (2 * k) as i32;
     let zw_depth = 2 * k;
-    let pos_order: Vec<usize> = {
+    let full_pos_order: Vec<usize> = {
         let mut v = Vec::with_capacity(2 * k);
         for t in 0..k { v.push(t); v.push(2 * k - 1 - t); }
         v
     };
 
-    // Partition MDD into subtrees for parallel Phase B.
-    // Depth 3 gives ~64 subtrees (some may be dead/pruned by MDD).
-    let partition_depth = 5.min(zw_depth); // 4^5 = 1024 subtrees, each ~20K boundaries
+    // Partition MDD into subtrees for the pipeline.
+    let partition_depth = 5.min(zw_depth);
     let subtrees = partition_mdd_subtrees(
-        reordered.root, partition_depth, zw_depth, &pos_order, &reordered.nodes);
-    if verbose {
-        eprintln!("Partitioned MDD into {} subtrees (depth {})", subtrees.len(), partition_depth);
-    }
-
-    // Adjust pos_order for subtree walking: skip the first partition_depth levels
-    let subtree_pos_order: Vec<usize> = pos_order[partition_depth..].to_vec();
+        mdd.root, partition_depth, zw_depth, &full_pos_order, &mdd.nodes);
+    let subtree_pos_order: Vec<usize> = full_pos_order[partition_depth..].to_vec();
     let subtree_zw_depth = zw_depth - partition_depth;
 
+    // Shared read-only context for all workers
     let ctx = Arc::new(PhaseBContext {
-        mdd: Arc::clone(&reordered),
+        mdd: Arc::clone(&mdd),
         pos_order: subtree_pos_order,
-        xy_pos_order: pos_order.clone(),
+        xy_pos_order: full_pos_order.clone(),
         tuples: tuples.to_vec(),
         w_tmpl: sat_z_middle::LagTemplate::new(m, k),
         z_tmpl: sat_z_middle::LagTemplate::new(n, k),
@@ -3401,104 +3420,192 @@ fn run_mdd_sat_search(
     let use_quad_pb = cfg.quad_pb;
 
     if verbose {
-        eprintln!("TT({}): MDD hybrid k={} search, {} hybrid workers", n, k, workers);
+        eprintln!("Partitioned MDD into {} subtrees (depth {})", subtrees.len(), partition_depth);
+        eprintln!("TT({}): MDD pipeline k={}, {} workers", n, k, workers);
     }
 
-    // Channels: Phase B → coordinator (ZxyWork), Phase C → coordinator (XyWork)
-    let (item_tx, item_rx) = std::sync::mpsc::sync_channel::<ZxyWork>(1024);
-    let (xy_tx, xy_rx) = std::sync::mpsc::sync_channel::<XyWork>(4096);
+    // Shared priority queue: workers push and pop. Higher stage = higher priority.
+    use std::collections::BinaryHeap;
+    struct PqEntry { stage: u8, work: PipelineWork }
+    impl PartialEq for PqEntry { fn eq(&self, other: &Self) -> bool { self.stage == other.stage } }
+    impl Eq for PqEntry {}
+    impl PartialOrd for PqEntry { fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) } }
+    impl Ord for PqEntry { fn cmp(&self, other: &Self) -> Ordering { self.stage.cmp(&other.stage) } }
+
+    struct WorkQueue {
+        queue: std::sync::Mutex<BinaryHeap<PqEntry>>,
+        condvar: std::sync::Condvar,
+    }
+    impl WorkQueue {
+        fn push(&self, work: PipelineWork) {
+            let stage = work.stage();
+            let mut q = self.queue.lock().unwrap();
+            q.push(PqEntry { stage, work });
+            self.condvar.notify_one();
+        }
+        fn pop_blocking(&self, found: &AtomicBool) -> Option<PipelineWork> {
+            let mut q = self.queue.lock().unwrap();
+            loop {
+                if found.load(AtomicOrdering::Relaxed) { return None; }
+                if let Some(entry) = q.pop() { return Some(entry.work); }
+                // Wait with timeout so we can check found flag
+                let (guard, _) = self.condvar.wait_timeout(q, std::time::Duration::from_millis(50)).unwrap();
+                q = guard;
+            }
+        }
+    }
+
+    let work_queue = Arc::new(WorkQueue {
+        queue: std::sync::Mutex::new(BinaryHeap::new()),
+        condvar: std::sync::Condvar::new(),
+    });
     let (result_tx, result_rx) =
-        std::sync::mpsc::channel::<Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>>();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<(usize, Option<SearchStats>)>();
-
-    enum HybridWork {
-        PhaseB(SubtreeWork),   // MDD walk → SAT W (enumerate many W per boundary)
-        PhaseC(ZxyWork),       // Z SAT enumerate → emit XyWork per (Z, XY boundary)
-        PhaseD(XyWork),        // XY SAT solve (one call)
-        Shutdown,
-    }
-
-    let mut worker_txs: Vec<std::sync::mpsc::SyncSender<HybridWork>> = Vec::new();
+        std::sync::mpsc::channel::<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>();
 
     // Shared counters
-    let items_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let phase_c_nanos = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let items_completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let boundaries_walked = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let phase_b_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let phase_c_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    // Per-phase output counters (for throughput measurement)
-    let b_produced = Arc::new(std::sync::atomic::AtomicU64::new(0)); // ZxyWork items
-    let c_produced = Arc::new(std::sync::atomic::AtomicU64::new(0)); // XyWork items
-    let d_completed = Arc::new(std::sync::atomic::AtomicU64::new(0)); // XY SAT solves
+    let stage_counts = [
+        Arc::new(std::sync::atomic::AtomicU64::new(0)), // stage 0: MDD chunks processed
+        Arc::new(std::sync::atomic::AtomicU64::new(0)), // stage 1: W solves
+        Arc::new(std::sync::atomic::AtomicU64::new(0)), // stage 2: Z solves
+        Arc::new(std::sync::atomic::AtomicU64::new(0)), // stage 3: XY solves
+    ];
 
     let sat_config = cfg.sat_config.clone();
     let xy_table: Option<Arc<XYBoundaryTable>> = None;
 
+    // Seed the queue with MDD chunk work items
+    for s in &subtrees {
+        work_queue.push(PipelineWork::MddChunk(MddChunkWork {
+            subtree_root: s.subtree_root, z_acc: s.z_acc, w_acc: s.w_acc,
+        }));
+    }
+
+    // Spawn workers — all identical, they grab highest-stage item
+    let mut handles = Vec::new();
     for tid in 0..workers {
-        let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<HybridWork>(1);
-        worker_txs.push(work_tx);
         let ctx = Arc::clone(&ctx);
-        let found = Arc::clone(&ctx.found);
-        let ready_tx = ready_tx.clone();
+        let wq = Arc::clone(&work_queue);
         let result_tx = result_tx.clone();
-        let item_tx = item_tx.clone();
-        let xy_tx = xy_tx.clone();
         let items_completed = Arc::clone(&items_completed);
-        let phase_c_nanos = Arc::clone(&phase_c_nanos);
         let boundaries_walked = Arc::clone(&boundaries_walked);
-        let phase_b_active = Arc::clone(&phase_b_active);
-        let phase_c_active = Arc::clone(&phase_c_active);
-        let b_produced = Arc::clone(&b_produced);
-        let c_produced = Arc::clone(&c_produced);
-        let d_completed = Arc::clone(&d_completed);
+        let stage_counts: Vec<_> = stage_counts.iter().map(Arc::clone).collect();
         let xy_table = xy_table.clone();
         let sat_config = sat_config.clone();
 
-        std::thread::spawn(move || {
-            let mut phase_b = PhaseBWorker::new(0x517cc1b727220a95 ^ (tid as u64 * 0x9e3779b97f4a7c15), &ctx);
+        handles.push(std::thread::spawn(move || {
             let mut template_cache: HashMap<(i32, i32, i32, i32), SatXYTemplate> = HashMap::new();
             let mut warm = WarmStartState {
                 clauses: Vec::new(), phase: None,
                 max_clauses: 100, max_lbd: 2,
                 inject_clauses: false, inject_phase: true,
             };
+            let mut w_bases: HashMap<i32, radical::Solver> = HashMap::new();
             let mut z_bases: HashMap<i32, radical::Solver> = HashMap::new();
-            let spectral_z = SpectralFilter::new(n, ctx.theta);
+            let spectral_w = SpectralFilter::new(ctx.problem.m(), ctx.theta);
+            let spectral_z = SpectralFilter::new(ctx.problem.n, ctx.theta);
+            let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
             let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
-            let mut rng: u64 = 0x9e3779b97f4a7c15 ^ (tid as u64 * 0x517cc1b727220a95);
+            let mut rng: u64 = 0x517cc1b727220a95 ^ (tid as u64 * 0x9e3779b97f4a7c15);
             let mut next_rng = || -> u64 {
                 rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng
             };
-            let mut local_stats = SearchStats::default();
+            let k = ctx.k;
+            let n = ctx.problem.n;
+            let m = ctx.problem.m();
 
-            let _ = ready_tx.send((tid, None));
-            while let Ok(work) = work_rx.recv() {
-                if found.load(AtomicOrdering::Relaxed) { break; }
+            loop {
+                let Some(work) = wq.pop_blocking(&ctx.found) else { break; };
+                if ctx.found.load(AtomicOrdering::Relaxed) { break; }
+                if matches!(work, PipelineWork::Shutdown) { break; }
+
                 match work {
-                    HybridWork::PhaseB(subtree) => {
-                        phase_b_active.fetch_add(1, AtomicOrdering::Relaxed);
-                        phase_b.process_subtree(&ctx, &subtree, &item_tx, &boundaries_walked, &b_produced);
-                        phase_b_active.fetch_sub(1, AtomicOrdering::Relaxed);
-                        let _ = ready_tx.send((tid, None));
+                    PipelineWork::MddChunk(chunk) => {
+                        // Walk MDD subtree, emit SolveW per (boundary, tuple)
+                        walk_mdd_4way(
+                            chunk.subtree_root, 0, ctx.zw_depth,
+                            chunk.z_acc, chunk.w_acc,
+                            &ctx.pos_order, &ctx.mdd.nodes,
+                            &mut |z_bits, w_bits, xy_root| {
+                                if ctx.found.load(AtomicOrdering::Relaxed) { return; }
+                                boundaries_walked.fetch_add(1, AtomicOrdering::Relaxed);
+                                let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - ctx.max_bnd_sum;
+                                let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - ctx.max_bnd_sum;
+                                for &tuple in &ctx.tuples {
+                                    let z_mid_sum = tuple.z - z_bnd_sum;
+                                    if z_mid_sum.abs() > ctx.middle_n as i32 || (z_mid_sum + ctx.middle_n as i32) % 2 != 0 { continue; }
+                                    let w_mid_sum = tuple.w - w_bnd_sum;
+                                    if w_mid_sum.abs() > ctx.middle_m as i32 || (w_mid_sum + ctx.middle_m as i32) % 2 != 0 { continue; }
+                                    wq.push(PipelineWork::SolveW(SolveWWork {
+                                        tuple, z_bits, w_bits, xy_root, z_mid_sum, w_mid_sum,
+                                    }));
+                                }
+                            },
+                        );
+                        stage_counts[0].fetch_add(1, AtomicOrdering::Relaxed);
                     }
-                    HybridWork::PhaseC(zxy) => {
-                        // Z SAT enumerate → emit XyWork per (Z, XY boundary)
-                        phase_c_active.fetch_add(1, AtomicOrdering::Relaxed);
-                        let k = ctx.k;
-                        let n = ctx.problem.n;
-                        let m = ctx.problem.m();
 
-                        let mut z_boundary = vec![0i8; n];
-                        for i in 0..k {
-                            z_boundary[i] = if (zxy.z_bits >> i) & 1 == 1 { 1 } else { -1 };
-                            z_boundary[n - k + i] = if (zxy.z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                    PipelineWork::SolveW(sw) => {
+                        // SAT-solve for W with spectral constraint, enumerate multiple W
+                        let (w_prefix, w_suffix) = expand_boundary_bits(sw.w_bits, k);
+                        let mut w_boundary = vec![0i8; m];
+                        w_boundary[..k].copy_from_slice(&w_prefix);
+                        w_boundary[m-k..].copy_from_slice(&w_suffix);
+
+                        let mut w_solver = w_bases.remove(&sw.w_mid_sum).unwrap_or_else(||
+                            ctx.w_tmpl.build_base_solver(ctx.middle_m, sw.w_mid_sum)
+                        );
+                        let w_cp = w_solver.save_checkpoint();
+                        sat_z_middle::fill_w_solver(&mut w_solver, &ctx.w_tmpl, m, &w_boundary);
+                        if ctx.middle_m >= 8 {
+                            w_solver.spectral = Some(radical::SpectralConstraint::new(
+                                m, k, &w_boundary, ctx.individual_bound, 16,
+                            ));
                         }
 
-                        let mut z_solver = z_bases.remove(&zxy.z_mid_sum).unwrap_or_else(||
-                            ctx.z_tmpl.build_base_solver(ctx.middle_n, zxy.z_mid_sum)
+                        loop {
+                            if ctx.found.load(AtomicOrdering::Relaxed) { break; }
+                            let phases: Vec<bool> = (0..ctx.middle_m)
+                                .map(|_| next_rng() & 1 == 1).collect();
+                            w_solver.set_phase(&phases);
+                            if w_solver.solve() != Some(true) { break; }
+
+                            let w_mid = extract_vals(&w_solver, |i| ctx.w_mid_vars[i], ctx.middle_m);
+                            let mut w_vals = w_boundary.clone();
+                            w_vals[k..k+ctx.middle_m].copy_from_slice(&w_mid);
+
+                            let w_block: Vec<i32> = ctx.w_mid_vars.iter().map(|&v| {
+                                if w_solver.value(v) == Some(true) { -v } else { v }
+                            }).collect();
+                            w_solver.add_clause(w_block);
+
+                            let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) else { continue; };
+
+                            wq.push(PipelineWork::SolveZ(SolveZWork {
+                                tuple: sw.tuple, z_bits: sw.z_bits, w_bits: sw.w_bits,
+                                w_vals, w_spectrum, xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
+                            }));
+                        }
+                        w_solver.spectral = None;
+                        w_solver.restore_checkpoint(w_cp);
+                        w_bases.insert(sw.w_mid_sum, w_solver);
+                        stage_counts[1].fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+
+                    PipelineWork::SolveZ(sz) => {
+                        // SAT-solve for Z with spectral constraint, enumerate multiple Z
+                        let mut z_boundary = vec![0i8; n];
+                        for i in 0..k {
+                            z_boundary[i] = if (sz.z_bits >> i) & 1 == 1 { 1 } else { -1 };
+                            z_boundary[n - k + i] = if (sz.z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+                        }
+
+                        let mut z_solver = z_bases.remove(&sz.z_mid_sum).unwrap_or_else(||
+                            ctx.z_tmpl.build_base_solver(ctx.middle_n, sz.z_mid_sum)
                         );
                         let z_cp = z_solver.save_checkpoint();
-                        sat_z_middle::fill_z_solver(&mut z_solver, &ctx.z_tmpl, n, m, &z_boundary, &zxy.w_vals);
+                        sat_z_middle::fill_z_solver(&mut z_solver, &ctx.z_tmpl, n, m, &z_boundary, &sz.w_vals);
                         if ctx.middle_n >= 8 {
                             let mut z_spec = radical::SpectralConstraint::new(
                                 n, k, &z_boundary, ctx.pair_bound, 16,
@@ -3507,7 +3614,7 @@ fn run_mdd_sat_search(
                             for fi in 0..z_spec.num_freqs {
                                 let omega = (fi as f64 + 1.0) / (z_spec.num_freqs as f64 + 1.0) * std::f64::consts::PI;
                                 let (mut w_re, mut w_im) = (0.0f64, 0.0f64);
-                                for (j, &wv) in zxy.w_vals.iter().enumerate() {
+                                for (j, &wv) in sz.w_vals.iter().enumerate() {
                                     w_re += wv as f64 * (omega * j as f64).cos();
                                     w_im += wv as f64 * (omega * j as f64).sin();
                                 }
@@ -3517,16 +3624,15 @@ fn run_mdd_sat_search(
                             z_solver.spectral = Some(z_spec);
                         }
 
-                        let w_seq = PackedSeq::from_values(&zxy.w_vals);
+                        let w_seq = PackedSeq::from_values(&sz.w_vals);
                         let mut z_count = 0usize;
                         loop {
-                            if found.load(AtomicOrdering::Relaxed) { break; }
+                            if ctx.found.load(AtomicOrdering::Relaxed) { break; }
                             if z_count >= ctx.max_z { break; }
                             let z_phases: Vec<bool> = (0..ctx.middle_n)
                                 .map(|_| next_rng() & 1 == 1).collect();
                             z_solver.set_phase(&z_phases);
                             if z_solver.solve() != Some(true) { break; }
-                            local_stats.z_generated += 1;
                             z_count += 1;
 
                             let z_mid = extract_vals(&z_solver, |i| ctx.z_mid_vars[i], ctx.middle_n);
@@ -3541,21 +3647,18 @@ fn run_mdd_sat_search(
                             z_solver.add_clause(z_block);
 
                             let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, ctx.individual_bound, &mut fft_buf_z) else { continue; };
-                            local_stats.z_spectral_ok += 1;
 
                             let z_seq = PackedSeq::from_values(&z_vals);
                             let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
 
-                            // Walk XY sub-MDD, emit XyWork per (x,y) boundary
                             walk_xy_sub_mdd(
-                                zxy.xy_root, 0, ctx.xy_zw_depth, 0, 0,
+                                sz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
                                 &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
-                                ctx.middle_n as i32, zxy.tuple,
+                                ctx.middle_n as i32, sz.tuple,
                                 &mut |x_bits, y_bits| {
-                                    c_produced.fetch_add(1, AtomicOrdering::Relaxed);
-                                    let _ = xy_tx.send(XyWork {
+                                    wq.push(PipelineWork::SolveXY(SolveXYWork {
                                         item: SatWorkItem {
-                                            tuple: zxy.tuple,
+                                            tuple: sz.tuple,
                                             x: SeqInput::Blank,
                                             y: SeqInput::Blank,
                                             z: SeqInput::Fixed(z_seq.clone()),
@@ -3564,201 +3667,66 @@ fn run_mdd_sat_search(
                                             priority: 0.0,
                                             boundary: Some(BoundaryConfig {
                                                 k, x_bits, y_bits,
-                                                z_bits: zxy.z_bits, w_bits: zxy.w_bits,
+                                                z_bits: sz.z_bits, w_bits: sz.w_bits,
                                             }),
                                         },
-                                    });
+                                    }));
                                 },
                             );
                         }
                         z_solver.spectral = None;
                         z_solver.restore_checkpoint(z_cp);
-                        z_bases.insert(zxy.z_mid_sum, z_solver);
-                        phase_c_active.fetch_sub(1, AtomicOrdering::Relaxed);
-                        let _ = ready_tx.send((tid, None));
+                        z_bases.insert(sz.z_mid_sum, z_solver);
+                        stage_counts[2].fetch_add(1, AtomicOrdering::Relaxed);
                     }
-                    HybridWork::PhaseD(xy) => {
+
+                    PipelineWork::SolveXY(xy) => {
                         // XY SAT solve
-                        let c_start = Instant::now();
                         let solved = solve_work_item(
                             problem, &xy.item, &mut template_cache,
                             xy_table.as_deref(), &sat_config,
                             &mut warm, use_quad_pb,
                         );
-                        phase_c_nanos.fetch_add(
-                            c_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
                         items_completed.fetch_add(1, AtomicOrdering::Relaxed);
-                        d_completed.fetch_add(1, AtomicOrdering::Relaxed);
+                        stage_counts[3].fetch_add(1, AtomicOrdering::Relaxed);
 
                         if let Some(ref sol) = solved {
                             if verify_tt(problem, &sol.0, &sol.1, &sol.2, &sol.3) {
-                                found.store(true, AtomicOrdering::Relaxed);
-                                let _ = result_tx.send(solved.clone());
+                                ctx.found.store(true, AtomicOrdering::Relaxed);
+                                let _ = result_tx.send(sol.clone());
                             }
                         }
-                        let _ = ready_tx.send((tid, None));
                     }
-                    HybridWork::Shutdown => {
-                        phase_b.stats.merge_from(&local_stats);
-                        let _ = ready_tx.send((tid, Some(phase_b.stats.clone())));
-                        break;
-                    }
+
+                    PipelineWork::Shutdown => break,
                 }
             }
-        });
+        }));
     }
-    drop(ready_tx);
     drop(result_tx);
-    drop(item_tx); // workers have their own clones
-    drop(xy_tx);
 
-    // Coordinator: adaptive dispatch of Phase B subtrees and Phase C items
-    use std::collections::{BinaryHeap, VecDeque};
-
-    let mut zxy_queue: VecDeque<ZxyWork> = VecDeque::new();
-    let mut xy_queue: VecDeque<XyWork> = VecDeque::new();
-    let mut phase_b_queue: VecDeque<SubtreeWork> = VecDeque::from(subtrees);
-    let mut idle_workers: Vec<usize> = Vec::new();
+    // Monitor loop — just check for solution and time limit
     let mut found_solution = false;
-    let mut dispatched_c = 0usize;
-    let mut dispatched_b = 0usize;
     let mut last_progress = Instant::now();
-    let mut all_stats = SearchStats::default();
-    let mut phase_b_remaining = phase_b_queue.len();
-    // Throughput snapshots for adaptive dispatch
-    let mut last_b = 0u64;
-    let mut last_c = 0u64;
-    let mut last_d = 0u64;
+    let mut last_counts = [0u64; 4];
+    let mut rates = [0.0f64; 4];
     let mut last_snap = Instant::now();
-    let mut b_rate = 0.0f64; // ZxyWork items/s produced by Phase B
-    let mut c_rate = 0.0f64; // XyWork items/s produced by Phase C
-    let mut d_rate = 0.0f64; // XY solves/s completed by Phase D
 
     loop {
-        if ctx.found.load(AtomicOrdering::Relaxed) {
-            if let Ok(Some(sol)) = result_rx.recv() {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Check for solution
+        match result_rx.try_recv() {
+            Ok(sol) => {
                 if verbose {
-                    print_solution(
-                        &format!("TT({}) SOLUTION", n),
-                        &sol.0, &sol.1, &sol.2, &sol.3);
+                    print_solution(&format!("TT({}) SOLUTION", n), &sol.0, &sol.1, &sol.2, &sol.3);
                 }
                 found_solution = true;
+                ctx.found.store(true, AtomicOrdering::Relaxed);
+                break;
             }
-            break;
-        }
-
-        // Drain ZxyWork from Phase B workers
-        loop {
-            match item_rx.try_recv() {
-                Ok(item) => zxy_queue.push_back(item),
-                Err(_) => break,
-            }
-        }
-        // Drain XyWork from Phase C workers
-        loop {
-            match xy_rx.try_recv() {
-                Ok(item) => xy_queue.push_back(item),
-                Err(_) => break,
-            }
-        }
-
-        // Drain ready signals
-        loop {
-            match ready_rx.try_recv() {
-                Ok((tid, Some(stats))) => {
-                    // Worker shutting down, aggregate stats
-                    all_stats.w_generated += stats.w_generated;
-                    all_stats.w_spectral_ok += stats.w_spectral_ok;
-                    all_stats.z_generated += stats.z_generated;
-                    all_stats.z_spectral_ok += stats.z_spectral_ok;
-                    all_stats.candidate_pair_attempts += stats.candidate_pair_attempts;
-                    all_stats.candidate_pair_spectral_ok += stats.candidate_pair_spectral_ok;
-                }
-                Ok((tid, None)) => idle_workers.push(tid),
-                Err(_) => break,
-            }
-        }
-
-        // Update throughput snapshots every 2s
-        if last_snap.elapsed().as_secs_f64() >= 2.0 {
-            let dt = last_snap.elapsed().as_secs_f64();
-            let cur_b = b_produced.load(AtomicOrdering::Relaxed);
-            let cur_c = c_produced.load(AtomicOrdering::Relaxed);
-            let cur_d = d_completed.load(AtomicOrdering::Relaxed);
-            b_rate = (cur_b - last_b) as f64 / dt;
-            c_rate = (cur_c - last_c) as f64 / dt;
-            d_rate = (cur_d - last_d) as f64 / dt;
-            last_b = cur_b;
-            last_c = cur_c;
-            last_d = cur_d;
-            last_snap = Instant::now();
-        }
-
-        // Dedicated dispatch: first 3 workers are dedicated to B, C, D.
-        // They only accept work for their phase, and sit idle if none exists.
-        // Extra workers (3+) go to whichever phase is the bottleneck.
-        for i in (0..idle_workers.len()).rev() {
-            let tid = idle_workers[i];
-            let dispatched = if tid == 0 {
-                // Dedicated B worker
-                if let Some(subtree) = phase_b_queue.pop_front() {
-                    dispatched_b += 1;
-                    phase_b_remaining = phase_b_queue.len();
-                    let _ = worker_txs[tid].send(HybridWork::PhaseB(subtree));
-                    true
-                } else { false }
-            } else if tid == 1 {
-                // Dedicated C worker
-                if let Some(zxy) = zxy_queue.pop_front() {
-                    let _ = worker_txs[tid].send(HybridWork::PhaseC(zxy));
-                    true
-                } else { false }
-            } else if tid == 2 {
-                // Dedicated D worker
-                if let Some(xy) = xy_queue.pop_front() {
-                    dispatched_c += 1;
-                    let _ = worker_txs[tid].send(HybridWork::PhaseD(xy));
-                    true
-                } else { false }
-            } else {
-                // Flexible worker: go to the bottleneck — lowest throughput
-                // rate among phases that have work queued.
-                let has_b = !phase_b_queue.is_empty();
-                let has_c = !zxy_queue.is_empty();
-                let has_d = !xy_queue.is_empty();
-                // Bottleneck = phase whose downstream queue is starved,
-                // BUT only add a worker if that phase doesn't already have extras.
-                let b_active = phase_b_active.load(AtomicOrdering::Relaxed);
-                let c_active = phase_c_active.load(AtomicOrdering::Relaxed);
-                if has_d {
-                    // D has items — process them
-                    dispatched_c += 1;
-                    let _ = worker_txs[tid].send(HybridWork::PhaseD(xy_queue.pop_front().unwrap()));
-                    true
-                } else if has_c && xy_queue.is_empty() {
-                    // C has items but D is starved → C is bottleneck
-                    let _ = worker_txs[tid].send(HybridWork::PhaseC(zxy_queue.pop_front().unwrap()));
-                    true
-                } else if has_b && zxy_queue.is_empty() && b_active <= 1 {
-                    // B has items, C is starved, B only has its dedicated worker
-                    dispatched_b += 1;
-                    phase_b_remaining = phase_b_queue.len() - 1;
-                    let _ = worker_txs[tid].send(HybridWork::PhaseB(phase_b_queue.pop_front().unwrap()));
-                    true
-                } else {
-                    false // no work or phase already has enough workers — sit idle
-                }
-            };
-            if dispatched { idle_workers.remove(i); }
-        }
-
-        // Done check: all queues empty, no active workers
-        let b_active = phase_b_active.load(AtomicOrdering::Relaxed);
-        let c_active = phase_c_active.load(AtomicOrdering::Relaxed);
-        if phase_b_queue.is_empty() && zxy_queue.is_empty() && xy_queue.is_empty()
-            && b_active == 0 && c_active == 0 && idle_workers.len() == workers
-        {
-            break;
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
 
         // Time limit
@@ -3768,18 +3736,23 @@ fn run_mdd_sat_search(
             break;
         }
 
+        // Throughput snapshots
+        if last_snap.elapsed().as_secs_f64() >= 2.0 {
+            let dt = last_snap.elapsed().as_secs_f64();
+            for i in 0..4 {
+                let cur = stage_counts[i].load(AtomicOrdering::Relaxed);
+                rates[i] = (cur - last_counts[i]) as f64 / dt;
+                last_counts[i] = cur;
+            }
+            last_snap = Instant::now();
+        }
+
         // Progress display
         if verbose && last_progress.elapsed().as_secs() >= 10 {
-            static mut TICK: u32 = 0;
-            unsafe { TICK += 1; }
-            let tick = unsafe { TICK };
             let elapsed = run_start.elapsed().as_secs_f64();
             let done = items_completed.load(AtomicOrdering::Relaxed);
             let walked = boundaries_walked.load(AtomicOrdering::Relaxed);
-            let ba = phase_b_active.load(AtomicOrdering::Relaxed);
-            let ca = phase_c_active.load(AtomicOrdering::Relaxed);
-            let da = workers - idle_workers.len() - ba - ca;
-            let max_rate = b_rate.max(c_rate).max(d_rate).max(0.01);
+            let max_rate = rates.iter().cloned().fold(0.01f64, f64::max);
             let shade = |r: f64| -> char {
                 let frac = r / max_rate;
                 if frac > 0.75 { '\u{2588}' }
@@ -3789,68 +3762,43 @@ fn run_mdd_sat_search(
                 else { ' ' }
             };
             let total_rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
-            if tick % 5 == 0 {
-                // Detailed view every 5th report
-                eprintln!("[{:>3.0}s] {:>6.0} xy/s | B{}{:>5.0}/s C{}{:>5.0}/s D{}{:>5.0}/s | {}/{}/{} | walked {:>4}K | q:{}/{}",
-                    elapsed, total_rate,
-                    shade(b_rate), b_rate, shade(c_rate), c_rate, shade(d_rate), d_rate,
-                    ba, ca, da,
-                    walked / 1000,
-                    zxy_queue.len(), xy_queue.len());
-            } else {
-                eprintln!("[{:>3.0}s] {:>6.0} xy/s | B{}C{}D{} {}/{}/{}",
-                    elapsed, total_rate,
-                    shade(b_rate), shade(c_rate), shade(d_rate),
-                    ba, ca, da);
-            }
+            eprintln!("[{:>3.0}s] {:>6.0} xy/s | MDD{} W{}{:.0} Z{}{:.0} XY{}{:.0} | walked {:>4}K",
+                elapsed, total_rate,
+                shade(rates[0]),
+                shade(rates[1]), rates[1],
+                shade(rates[2]), rates[2],
+                shade(rates[3]), rates[3],
+                walked / 1000);
             last_progress = Instant::now();
         }
-
-        std::thread::yield_now();
     }
 
-    // Shutdown workers
-    for tx in &worker_txs {
-        let _ = tx.send(HybridWork::Shutdown);
+    // Signal shutdown
+    for _ in 0..workers {
+        work_queue.push(PipelineWork::Shutdown);
     }
-    // Drain remaining stats from shutdown
-    loop {
-        match ready_rx.try_recv() {
-            Ok((_, Some(stats))) => {
-                all_stats.w_generated += stats.w_generated;
-                all_stats.w_spectral_ok += stats.w_spectral_ok;
-                all_stats.z_generated += stats.z_generated;
-                all_stats.z_spectral_ok += stats.z_spectral_ok;
-                all_stats.candidate_pair_attempts += stats.candidate_pair_attempts;
-                all_stats.candidate_pair_spectral_ok += stats.candidate_pair_spectral_ok;
-            }
-            _ => break,
-        }
+    work_queue.condvar.notify_all();
+    for h in handles {
+        let _ = h.join();
     }
 
     let elapsed = run_start.elapsed();
     let done = items_completed.load(AtomicOrdering::Relaxed);
     let walked = boundaries_walked.load(AtomicOrdering::Relaxed);
-    let phase_c_ns = phase_c_nanos.load(AtomicOrdering::Relaxed);
-    all_stats.phase_c_nanos = phase_c_ns;
 
     if verbose {
-        let phase_c = std::time::Duration::from_nanos(phase_c_ns);
-        println!("\n--- MDD hybrid k={} ({} hybrid workers) ---", k, workers);
-        println!("  Phase C (SAT solve):      {:>10.3?}  (thread-sum)", phase_c);
-        println!("  Phase B subtrees:         {:>10}", dispatched_b);
-        println!("  Phase C items dispatched: {:>10}", dispatched_c);
-        println!("  Phase C items completed:  {:>10}", done);
+        println!("\n--- MDD pipeline k={} ({} workers) ---", k, workers);
+        for (i, name) in ["MDD", "W", "Z", "XY"].iter().enumerate() {
+            println!("  Stage {} ({}): {:>10} items", i, name, stage_counts[i].load(AtomicOrdering::Relaxed));
+        }
+        println!("  XY solves:                {:>10}", done);
         println!("  Boundaries walked:        {:>10}", walked);
         println!("  Rate:                     {:.2} solves/s", done as f64 / elapsed.as_secs_f64());
         println!("  Wall-clock:               {:>10.3?}", elapsed);
         if !found_solution { println!("No solution found."); }
     }
 
-    eprintln!("MDD Phase B: {}K boundaries walked, B_subtrees={} C_items={}, z_ok={} w_ok={} pairs={}",
-        walked / 1000, dispatched_b, dispatched_c,
-        all_stats.z_spectral_ok, all_stats.w_spectral_ok, all_stats.candidate_pair_spectral_ok);
-
+    let all_stats = SearchStats::default(); // TODO: aggregate from workers
     SearchReport { stats: all_stats, elapsed, found_solution }
 }
 
