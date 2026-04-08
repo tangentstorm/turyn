@@ -3525,6 +3525,37 @@ fn run_mdd_sat_search(
                 let (_guard, _) = self.condvar.wait_timeout(guard, std::time::Duration::from_millis(50)).unwrap();
             }
         }
+        fn push_batch(&self, items: Vec<PipelineWork>) {
+            if items.is_empty() { return; }
+            // Separate gold (XY) vs work items
+            let mut gold_items = Vec::new();
+            let mut work_items = Vec::new();
+            for item in items {
+                match &item {
+                    PipelineWork::SolveXY(xy) => {
+                        let quality = (1.0 - xy.item.priority / self.pair_bound.max(1.0)).max(0.0);
+                        let prev = f64::from_bits(self.best_quality.load(AtomicOrdering::Relaxed));
+                        if quality > prev {
+                            self.best_quality.store(quality.to_bits(), AtomicOrdering::Relaxed);
+                        }
+                        gold_items.push(PqEntry { priority: quality, work: item });
+                    }
+                    _ => {
+                        let priority = item.stage() as f64;
+                        work_items.push(PqEntry { priority, work: item });
+                    }
+                }
+            }
+            if !gold_items.is_empty() {
+                let mut gq = self.gold.lock().unwrap();
+                for e in gold_items { gq.push(e); }
+            }
+            if !work_items.is_empty() {
+                let mut wq = self.work.lock().unwrap();
+                for e in work_items { wq.push(e); }
+            }
+            self.condvar.notify_all();
+        }
         fn gold_len(&self) -> usize { self.gold.lock().unwrap().len() }
         fn work_len(&self) -> usize { self.work.lock().unwrap().len() }
     }
@@ -3748,13 +3779,14 @@ fn run_mdd_sat_search(
                             let z_seq = PackedSeq::from_values(&z_vals);
                             let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
 
+                            // Batch XY items to reduce lock acquisitions
+                            let mut xy_batch: Vec<PipelineWork> = Vec::new();
                             walk_xy_sub_mdd(
                                 sz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
                                 &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
                                 ctx.middle_n as i32, sz.tuple,
                                 &mut |x_bits, y_bits| {
-                                    stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                    wq.push(PipelineWork::SolveXY(SolveXYWork {
+                                    xy_batch.push(PipelineWork::SolveXY(SolveXYWork {
                                         item: SatWorkItem {
                                             tuple: sz.tuple,
                                             x: SeqInput::Blank,
@@ -3771,6 +3803,8 @@ fn run_mdd_sat_search(
                                     }));
                                 },
                             );
+                            stage_enter[3].fetch_add(xy_batch.len() as u64, AtomicOrdering::Relaxed);
+                            wq.push_batch(xy_batch);
                         }
                         z_solver.spectral = None;
                         z_solver.restore_checkpoint(z_cp);
