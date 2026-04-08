@@ -3607,50 +3607,69 @@ fn run_mdd_sat_search(
                     }
 
                     PipelineWork::SolveW(sw) => {
-                        // SAT-solve for W, enumerate ALL valid W's for this boundary.
                         let (w_prefix, w_suffix) = expand_boundary_bits(sw.w_bits, k);
                         let mut w_boundary = vec![0i8; m];
                         w_boundary[..k].copy_from_slice(&w_prefix);
                         w_boundary[m-k..].copy_from_slice(&w_suffix);
 
-                        let mut w_solver = w_bases.remove(&sw.w_mid_sum).unwrap_or_else(||
-                            ctx.w_tmpl.build_base_solver(ctx.middle_m, sw.w_mid_sum)
-                        );
-                        let w_cp = w_solver.save_checkpoint();
-                        sat_z_middle::fill_w_solver(&mut w_solver, &ctx.w_tmpl, m, &w_boundary);
-                        if ctx.middle_m >= 8 {
-                            w_solver.spectral = Some(radical::SpectralConstraint::new(
-                                m, k, &w_boundary, ctx.individual_bound, 16,
-                            ));
+                        // For small middle: brute-force W enumeration (proven to find solutions).
+                        // For large middle: SAT-based W generation (handles big search spaces).
+                        if ctx.middle_m <= 20 {
+                            // Brute-force: enumerate all W middles, spectral filter each
+                            generate_sequences_permuted(ctx.middle_m, sw.w_mid_sum, false, false, 200_000, |w_mid| {
+                                if ctx.found.load(AtomicOrdering::Relaxed) { return false; }
+                                let mut w_vals = w_boundary.clone();
+                                w_vals[k..k+ctx.middle_m].copy_from_slice(w_mid);
+                                if let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) {
+                                    stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
+                                    wq.push(PipelineWork::SolveZ(SolveZWork {
+                                        tuple: sw.tuple, z_bits: sw.z_bits, w_bits: sw.w_bits,
+                                        w_vals, w_spectrum, xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
+                                    }));
+                                }
+                                true
+                            });
+                        } else {
+                            // SAT-based W generation
+                            let mut w_solver = w_bases.remove(&sw.w_mid_sum).unwrap_or_else(||
+                                ctx.w_tmpl.build_base_solver(ctx.middle_m, sw.w_mid_sum)
+                            );
+                            let w_cp = w_solver.save_checkpoint();
+                            sat_z_middle::fill_w_solver(&mut w_solver, &ctx.w_tmpl, m, &w_boundary);
+                            if ctx.middle_m >= 8 {
+                                w_solver.spectral = Some(radical::SpectralConstraint::new(
+                                    m, k, &w_boundary, ctx.individual_bound, 16,
+                                ));
+                            }
+
+                            loop {
+                                if ctx.found.load(AtomicOrdering::Relaxed) { break; }
+                                let phases: Vec<bool> = (0..ctx.middle_m)
+                                    .map(|_| next_rng!() & 1 == 1).collect();
+                                w_solver.set_phase(&phases);
+                                if w_solver.solve() != Some(true) { break; }
+
+                                let w_mid = extract_vals(&w_solver, |i| ctx.w_mid_vars[i], ctx.middle_m);
+                                let mut w_vals = w_boundary.clone();
+                                w_vals[k..k+ctx.middle_m].copy_from_slice(&w_mid);
+
+                                let w_block: Vec<i32> = ctx.w_mid_vars.iter().map(|&v| {
+                                    if w_solver.value(v) == Some(true) { -v } else { v }
+                                }).collect();
+                                w_solver.add_clause(w_block);
+
+                                let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) else { continue; };
+
+                                stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
+                                wq.push(PipelineWork::SolveZ(SolveZWork {
+                                    tuple: sw.tuple, z_bits: sw.z_bits, w_bits: sw.w_bits,
+                                    w_vals, w_spectrum, xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
+                                }));
+                            }
+                            w_solver.spectral = None;
+                            w_solver.restore_checkpoint(w_cp);
+                            w_bases.insert(sw.w_mid_sum, w_solver);
                         }
-
-                        loop {
-                            if ctx.found.load(AtomicOrdering::Relaxed) { break; }
-                            let phases: Vec<bool> = (0..ctx.middle_m)
-                                .map(|_| next_rng!() & 1 == 1).collect();
-                            w_solver.set_phase(&phases);
-                            if w_solver.solve() != Some(true) { break; }
-
-                            let w_mid = extract_vals(&w_solver, |i| ctx.w_mid_vars[i], ctx.middle_m);
-                            let mut w_vals = w_boundary.clone();
-                            w_vals[k..k+ctx.middle_m].copy_from_slice(&w_mid);
-
-                            let w_block: Vec<i32> = ctx.w_mid_vars.iter().map(|&v| {
-                                if w_solver.value(v) == Some(true) { -v } else { v }
-                            }).collect();
-                            w_solver.add_clause(w_block);
-
-                            let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) else { continue; };
-
-                            stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
-                            wq.push(PipelineWork::SolveZ(SolveZWork {
-                                tuple: sw.tuple, z_bits: sw.z_bits, w_bits: sw.w_bits,
-                                w_vals, w_spectrum, xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
-                            }));
-                        }
-                        w_solver.spectral = None;
-                        w_solver.restore_checkpoint(w_cp);
-                        w_bases.insert(sw.w_mid_sum, w_solver);
                         stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
                     }
 

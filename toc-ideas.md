@@ -86,8 +86,10 @@ Enumerate W's via brute-force (with spectral filtering), use SAT only for Z (whi
 ### Idea 9: Adaptive gold queue threshold — EXPECTED: better quality selection
 Track the distribution of spectral pair powers in the gold queue. Set acceptance threshold at the 10th percentile (adaptive). Only process items better than 90% of what we've seen.
 
-### Idea 10: Drop the dual-queue, go back to single PQ — EXPECTED: simpler, maybe faster
-The dual-queue adds complexity. If spectral ranking doesn't differentiate items (all near bound), the gold queue just adds overhead. A single PQ with stage priority might be faster.
+### Idea 10: Drop the dual-queue, go back to single PQ — **REJECTED**
+Single PQ starves the pipeline: stage 3 items always have highest priority, so workers
+only do XY SAT and never generate new W/Z items. n=56 dropped from ~1800 to 89 xy/s.
+The dual-queue's coinflip mechanism is necessary to balance generation vs consumption.
 
 ### Idea 11: Tuple-aware priority in gold queue — EXPECTED: find solutions faster
 Some tuples are "easier" (fewer valid W's needed, smaller search space). Track which tuples produce solvable items and prioritize those.
