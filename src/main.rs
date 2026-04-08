@@ -3185,11 +3185,12 @@ impl PhaseBWorker {
         subtree: &SubtreeWork,
         tx: &std::sync::mpsc::SyncSender<ZxyWork>,
         walked_counter: &std::sync::atomic::AtomicU64,
+        b_produced: &std::sync::atomic::AtomicU64,
     ) {
         self.walk_and_process(
             subtree.subtree_root, 0, ctx.zw_depth,
             subtree.z_acc, subtree.w_acc,
-            ctx, tx, walked_counter,
+            ctx, tx, walked_counter, b_produced,
         );
     }
 
@@ -3200,11 +3201,12 @@ impl PhaseBWorker {
         ctx: &PhaseBContext,
         tx: &std::sync::mpsc::SyncSender<ZxyWork>,
         walked_counter: &std::sync::atomic::AtomicU64,
+        b_produced: &std::sync::atomic::AtomicU64,
     ) {
         if nid == mdd_reorder::DEAD { return; }
         if ctx.found.load(AtomicOrdering::Relaxed) { return; }
         if level == depth {
-            self.process_boundary(ctx, z_acc, w_acc, nid, tx, walked_counter);
+            self.process_boundary(ctx, z_acc, w_acc, nid, tx, walked_counter, b_produced);
             return;
         }
         if nid == mdd_reorder::LEAF {
@@ -3215,7 +3217,7 @@ impl PhaseBWorker {
                 self.walk_and_process(
                     mdd_reorder::LEAF, level + 1, depth,
                     z_acc | (z_val << pos), w_acc | (w_val << pos),
-                    ctx, tx, walked_counter,
+                    ctx, tx, walked_counter, b_produced,
                 );
             }
             return;
@@ -3229,7 +3231,7 @@ impl PhaseBWorker {
             self.walk_and_process(
                 child, level + 1, depth,
                 z_acc | (z_val << pos), w_acc | (w_val << pos),
-                ctx, tx, walked_counter,
+                ctx, tx, walked_counter, b_produced,
             );
         }
     }
@@ -3240,6 +3242,7 @@ impl PhaseBWorker {
         z_bits: u32, w_bits: u32, xy_root: u32,
         tx: &std::sync::mpsc::SyncSender<ZxyWork>,
         walked_counter: &std::sync::atomic::AtomicU64,
+        b_produced: &std::sync::atomic::AtomicU64,
     ) {
         if ctx.found.load(AtomicOrdering::Relaxed) { return; }
         let k = ctx.k;
@@ -3300,6 +3303,7 @@ impl PhaseBWorker {
 
                 // Emit ZxyWork — Phase C worker will enumerate Z, Phase D does XY SAT
                 self.total_items += 1;
+                b_produced.fetch_add(1, AtomicOrdering::Relaxed);
                 let _ = tx.send(ZxyWork {
                     tuple,
                     z_bits, w_bits,
@@ -3420,6 +3424,10 @@ fn run_mdd_sat_search(
     let boundaries_walked = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let phase_b_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let phase_c_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Per-phase output counters (for throughput measurement)
+    let b_produced = Arc::new(std::sync::atomic::AtomicU64::new(0)); // ZxyWork items
+    let c_produced = Arc::new(std::sync::atomic::AtomicU64::new(0)); // XyWork items
+    let d_completed = Arc::new(std::sync::atomic::AtomicU64::new(0)); // XY SAT solves
 
     let sat_config = cfg.sat_config.clone();
     let xy_table: Option<Arc<XYBoundaryTable>> = None;
@@ -3438,6 +3446,9 @@ fn run_mdd_sat_search(
         let boundaries_walked = Arc::clone(&boundaries_walked);
         let phase_b_active = Arc::clone(&phase_b_active);
         let phase_c_active = Arc::clone(&phase_c_active);
+        let b_produced = Arc::clone(&b_produced);
+        let c_produced = Arc::clone(&c_produced);
+        let d_completed = Arc::clone(&d_completed);
         let xy_table = xy_table.clone();
         let sat_config = sat_config.clone();
 
@@ -3464,7 +3475,7 @@ fn run_mdd_sat_search(
                 match work {
                     HybridWork::PhaseB(subtree) => {
                         phase_b_active.fetch_add(1, AtomicOrdering::Relaxed);
-                        phase_b.process_subtree(&ctx, &subtree, &item_tx, &boundaries_walked);
+                        phase_b.process_subtree(&ctx, &subtree, &item_tx, &boundaries_walked, &b_produced);
                         phase_b_active.fetch_sub(1, AtomicOrdering::Relaxed);
                         let _ = ready_tx.send((tid, None));
                     }
@@ -3539,6 +3550,7 @@ fn run_mdd_sat_search(
                                 &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
                                 ctx.middle_n as i32, zxy.tuple,
                                 &mut |x_bits, y_bits| {
+                                    c_produced.fetch_add(1, AtomicOrdering::Relaxed);
                                     let _ = xy_tx.send(XyWork {
                                         item: SatWorkItem {
                                             tuple: zxy.tuple,
@@ -3574,6 +3586,7 @@ fn run_mdd_sat_search(
                         phase_c_nanos.fetch_add(
                             c_start.elapsed().as_nanos() as u64, AtomicOrdering::Relaxed);
                         items_completed.fetch_add(1, AtomicOrdering::Relaxed);
+                        d_completed.fetch_add(1, AtomicOrdering::Relaxed);
 
                         if let Some(ref sol) = solved {
                             if verify_tt(problem, &sol.0, &sol.1, &sol.2, &sol.3) {
@@ -3610,6 +3623,14 @@ fn run_mdd_sat_search(
     let mut last_progress = Instant::now();
     let mut all_stats = SearchStats::default();
     let mut phase_b_remaining = phase_b_queue.len();
+    // Throughput snapshots for adaptive dispatch
+    let mut last_b = 0u64;
+    let mut last_c = 0u64;
+    let mut last_d = 0u64;
+    let mut last_snap = Instant::now();
+    let mut b_rate = 0.0f64; // ZxyWork items/s produced by Phase B
+    let mut c_rate = 0.0f64; // XyWork items/s produced by Phase C
+    let mut d_rate = 0.0f64; // XY solves/s completed by Phase D
 
     loop {
         if ctx.found.load(AtomicOrdering::Relaxed) {
@@ -3656,12 +3677,28 @@ fn run_mdd_sat_search(
             }
         }
 
-        // Adaptive dispatch: track local counts of what we're dispatching this round,
-        // ensure at least 1 on each active phase, give rest to longest queue.
+        // Update throughput snapshots every 2s
+        if last_snap.elapsed().as_secs_f64() >= 2.0 {
+            let dt = last_snap.elapsed().as_secs_f64();
+            let cur_b = b_produced.load(AtomicOrdering::Relaxed);
+            let cur_c = c_produced.load(AtomicOrdering::Relaxed);
+            let cur_d = d_completed.load(AtomicOrdering::Relaxed);
+            b_rate = (cur_b - last_b) as f64 / dt;
+            c_rate = (cur_c - last_c) as f64 / dt;
+            d_rate = (cur_d - last_d) as f64 / dt;
+            last_b = cur_b;
+            last_c = cur_c;
+            last_d = cur_d;
+            last_snap = Instant::now();
+        }
+
+        // Theory of constraints dispatch:
+        // B always gets exactly 1 worker (long-running subtrees, acts as producer).
+        // Remaining workers split between C and D based on which is the bottleneck.
         let mut b_now = phase_b_active.load(AtomicOrdering::Relaxed);
         let mut c_now = phase_c_active.load(AtomicOrdering::Relaxed);
         while !idle_workers.is_empty() {
-            // Ensure minimums: 1 B (if subtrees remain), 1 C (if zxy items)
+            // Phase B: exactly 1 worker
             if b_now == 0 && !phase_b_queue.is_empty() {
                 let tid = idle_workers.pop().unwrap();
                 dispatched_b += 1;
@@ -3670,27 +3707,32 @@ fn run_mdd_sat_search(
                 let _ = worker_txs[tid].send(HybridWork::PhaseB(phase_b_queue.pop_front().unwrap()));
                 continue;
             }
-            if c_now == 0 && !zxy_queue.is_empty() {
-                let tid = idle_workers.pop().unwrap();
-                c_now += 1;
-                let _ = worker_txs[tid].send(HybridWork::PhaseC(zxy_queue.pop_front().unwrap()));
-                continue;
-            }
 
-            // Remaining idle workers → D first, then C. Never extra B
-            // (B subtrees are long-running; excess B workers starve C/D).
-            let d_len = xy_queue.len();
-            let c_len = zxy_queue.len();
-            if d_len > 0 && d_len >= c_len {
+            // Remaining: C or D based on bottleneck (lower rate = needs more workers)
+            let has_c = !zxy_queue.is_empty();
+            let has_d = !xy_queue.is_empty();
+            if !has_c && !has_d { break; }
+
+            // If only one has work, send there
+            if has_d && !has_c {
                 let tid = idle_workers.pop().unwrap();
                 dispatched_c += 1;
                 let _ = worker_txs[tid].send(HybridWork::PhaseD(xy_queue.pop_front().unwrap()));
-            } else if c_len > 0 {
+            } else if has_c && !has_d {
                 let tid = idle_workers.pop().unwrap();
                 c_now += 1;
                 let _ = worker_txs[tid].send(HybridWork::PhaseC(zxy_queue.pop_front().unwrap()));
             } else {
-                break; // no C/D work available, leave workers idle for now
+                // Both have work: send to bottleneck (lower throughput rate)
+                if c_rate <= d_rate {
+                    let tid = idle_workers.pop().unwrap();
+                    c_now += 1;
+                    let _ = worker_txs[tid].send(HybridWork::PhaseC(zxy_queue.pop_front().unwrap()));
+                } else {
+                    let tid = idle_workers.pop().unwrap();
+                    dispatched_c += 1;
+                    let _ = worker_txs[tid].send(HybridWork::PhaseD(xy_queue.pop_front().unwrap()));
+                }
             }
         }
 
@@ -3712,15 +3754,39 @@ fn run_mdd_sat_search(
 
         // Progress display
         if verbose && last_progress.elapsed().as_secs() >= 10 {
+            static mut TICK: u32 = 0;
+            unsafe { TICK += 1; }
+            let tick = unsafe { TICK };
             let elapsed = run_start.elapsed().as_secs_f64();
             let done = items_completed.load(AtomicOrdering::Relaxed);
             let walked = boundaries_walked.load(AtomicOrdering::Relaxed);
-            let b_active = phase_b_active.load(AtomicOrdering::Relaxed);
-            let c_active = workers - idle_workers.len() - b_active;
-            eprintln!("[{:.0}s] k={} | B:{}/C:{} active | walked {}K | queue {} | dispatched {} | done {} | {:.1}/s",
-                elapsed, k, b_active, c_active, walked / 1000,
-                zxy_queue.len() + xy_queue.len(), dispatched_c, done,
-                if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 });
+            let ba = phase_b_active.load(AtomicOrdering::Relaxed);
+            let ca = phase_c_active.load(AtomicOrdering::Relaxed);
+            let da = workers - idle_workers.len() - ba - ca;
+            let max_rate = b_rate.max(c_rate).max(d_rate).max(0.01);
+            let shade = |r: f64| -> char {
+                let frac = r / max_rate;
+                if frac > 0.75 { '\u{2588}' }
+                else if frac > 0.50 { '\u{2593}' }
+                else if frac > 0.25 { '\u{2592}' }
+                else if frac > 0.01 { '\u{2591}' }
+                else { ' ' }
+            };
+            let total_rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+            if tick % 5 == 0 {
+                // Detailed view every 5th report
+                eprintln!("[{:>3.0}s] {:>6.0} xy/s | B{}{:>5.0}/s C{}{:>5.0}/s D{}{:>5.0}/s | {}/{}/{} | walked {:>4}K | q:{}/{}",
+                    elapsed, total_rate,
+                    shade(b_rate), b_rate, shade(c_rate), c_rate, shade(d_rate), d_rate,
+                    ba, ca, da,
+                    walked / 1000,
+                    zxy_queue.len(), xy_queue.len());
+            } else {
+                eprintln!("[{:>3.0}s] {:>6.0} xy/s | B{}C{}D{} {}/{}/{}",
+                    elapsed, total_rate,
+                    shade(b_rate), shade(c_rate), shade(d_rate),
+                    ba, ca, da);
+            }
             last_progress = Instant::now();
         }
 
