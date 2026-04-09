@@ -1902,6 +1902,31 @@ impl Solver {
         self.ok = true;
     }
 
+    /// Delete all learnt clauses, backtrack, and rebuild watches.
+    /// Keeps original (non-learnt) clauses, PB, quad PB, XOR intact.
+    /// Use between solve_with_assumptions calls to prevent learnt clause poisoning.
+    pub fn clear_learnt_clauses(&mut self) {
+        self.backtrack(0);
+        // Mark learnt clauses as deleted
+        for cm in &mut self.clause_meta {
+            if cm.learnt { cm.deleted = true; }
+        }
+        // Rebuild watch lists (only non-deleted clauses)
+        for wl in &mut self.watches { wl.clear(); }
+        for (ci, cm) in self.clause_meta.iter().enumerate() {
+            if cm.deleted || cm.len < 2 { continue; }
+            let start = cm.start as usize;
+            let l0 = self.clause_lits[start];
+            let l1 = self.clause_lits[start + 1];
+            self.watches[lit_index(l0)].push((ci as u32, l1));
+            self.watches[lit_index(l1)].push((ci as u32, l0));
+        }
+        self.conflicts = 0;
+        self.restart_limit = 100;
+        self.luby_index = 0;
+        self.ok = true;
+    }
+
     /// Full reset to base state: unassign all variables, clear trail, reset conflicts.
     /// Keeps all constraints and learnt clauses intact.
     pub fn reset_to_base(&mut self) {

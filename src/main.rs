@@ -3895,16 +3895,20 @@ fn run_mdd_sat_search(
 
                             let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, ctx.individual_bound, &mut fft_buf_z) else {
                                 flow_z_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                                if trace_z { eprintln!("TRACE:   Z#{} FAIL spec, z_vals={:?}", z_count, &z_vals); }
                                 continue;
                             };
+                            if trace_z { eprintln!("TRACE:   Z solution #{} passed spectral", z_count); }
 
                             let pair_power = spectral_pair_max_power(&z_spectrum, &sz.w_spectrum);
                             if ctx.middle_n <= 20 {
                                 if !spectral_pair_ok(&z_spectrum, &sz.w_spectrum, ctx.pair_bound) {
                                     flow_z_pair_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                                    if trace_z { eprintln!("TRACE:   Z solution #{} FAILED pair check", z_count); }
                                     continue;
                                 }
                             }
+                            if trace_z { eprintln!("TRACE:   Z solution #{} REACHED XY!", z_count); }
 
                             let z_seq = PackedSeq::from_values(&z_vals);
                             let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
@@ -4009,7 +4013,16 @@ fn run_mdd_sat_search(
                                             assumptions.push(if (y_bits >> (k + i)) & 1 == 1 { y_var(n - k + i) } else { -y_var(n - k + i) });
                                         }
 
+                                        xy_solver.clear_learnt_clauses();
                                         let result = xy_solver.solve_with_assumptions(&assumptions);
+                                        // ORACLE CHECK: track ALL XY solves for this boundary+tuple
+                                        if sz.z_bits == 43 && sz.w_bits == 47 && sz.tuple.z == 8
+                                            && result != Some(true) {
+                                            // Try fresh solver for this EXACT case
+                                            let mut fresh = template.prepare_candidate_solver(&candidate).unwrap();
+                                            let fresh_result = fresh.solve_with_assumptions(&assumptions);
+                                            eprintln!("ORACLE: x={} y={} reused={:?} fresh={:?}", x_bits, y_bits, result, fresh_result);
+                                        }
                                         items_completed.fetch_add(1, AtomicOrdering::Relaxed);
                                         stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
                                         match result {
@@ -4033,7 +4046,11 @@ fn run_mdd_sat_search(
                                 flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
                             }
                         }
-                        if trace_z { eprintln!("TRACE: SolveZ done: {} Z solutions found, z_spec_fail/pair_fail/prep_fail/reach_xy counted in flow", z_count); }
+                        if trace_z {
+                            let z_sf = flow_z_spec_fail.load(AtomicOrdering::Relaxed);
+                            let z_pf = flow_z_pair_fail.load(AtomicOrdering::Relaxed);
+                            eprintln!("TRACE: SolveZ done for target: {} Z found (global z_spec_fail={}, z_pair_fail={})", z_count, z_sf, z_pf);
+                        }
                         z_solver.spectral = None;
                         z_solver.restore_checkpoint(z_cp);
                         z_bases.insert(sz.z_mid_sum, z_solver);
