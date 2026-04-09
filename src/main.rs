@@ -4151,29 +4151,54 @@ fn run_mdd_sat_search(
         println!("  Wall-clock:               {:>10.3?}", elapsed);
         if !found_solution { println!("No solution found."); }
 
-        // Pipeline flow summary (for Sankey diagram)
+        // Pipeline flow funnel
         let f = |c: &Arc<std::sync::atomic::AtomicU64>| c.load(AtomicOrdering::Relaxed);
-        let total_tuples_checked = f(&flow_bnd_sum_fail) + stage_enter[1].load(AtomicOrdering::Relaxed);
+        let w_emitted = stage_enter[1].load(AtomicOrdering::Relaxed);
+        let sum_fail = f(&flow_bnd_sum_fail);
+        let w_sols = f(&flow_w_solutions);
+        let w_sf = f(&flow_w_spec_fail);
+        let w_sp = f(&flow_w_spec_pass);
+        let z_sols = f(&flow_z_solutions);
+        let z_sf = f(&flow_z_spec_fail);
+        let z_pf = f(&flow_z_pair_fail);
+        let z_gj = f(&flow_z_prep_fail);
+        let z_xy = z_sols.saturating_sub(z_sf + z_pf + z_gj);
+        let xy_total = ext_pruned + f(&flow_xy_sat) + f(&flow_xy_unsat) + f(&flow_xy_timeout);
+        let xy_sat = f(&flow_xy_sat);
+        let xy_unsat = f(&flow_xy_unsat);
+        let xy_timeout = f(&flow_xy_timeout);
+        let pct = |num: u64, den: u64| if den > 0 { format!("{:.1}%", num as f64 / den as f64 * 100.0) } else { "—".into() };
+
         println!("\n  --- Pipeline Flow ---");
-        println!("  Boundaries walked:        {:>10}", walked);
-        println!("  Tuples checked:           {:>10}  (per boundary × tuples)", total_tuples_checked);
-        println!("    → sum infeasible:       {:>10}", f(&flow_bnd_sum_fail));
-        println!("    → SolveW emitted:       {:>10}", stage_enter[1].load(AtomicOrdering::Relaxed));
-        println!("  W solutions found:        {:>10}", f(&flow_w_solutions));
-        println!("    → spectral fail:        {:>10}", f(&flow_w_spec_fail));
-        println!("    → spectral pass→Z:      {:>10}", f(&flow_w_spec_pass));
-        println!("  W calls with no solution: {:>10}", f(&flow_w_unsat));
-        println!("  Z solutions found:        {:>10}", f(&flow_z_solutions));
-        println!("    → spectral fail:        {:>10}", f(&flow_z_spec_fail));
-        println!("    → pair fail:            {:>10}", f(&flow_z_pair_fail));
-        println!("    → prep fail (GJ):       {:>10}", f(&flow_z_prep_fail));
-        println!("    → reached XY:           {:>10}", f(&flow_z_solutions).saturating_sub(f(&flow_z_spec_fail) + f(&flow_z_pair_fail) + f(&flow_z_prep_fail)));
-        println!("  Z calls with no solution: {:>10}", f(&flow_z_unsat));
-        println!("  XY extension pruned:      {:>10}", ext_pruned);
-        println!("  XY SAT results:");
-        println!("    → SAT (solution!):      {:>10}", f(&flow_xy_sat));
-        println!("    → UNSAT (proved):       {:>10}", f(&flow_xy_unsat));
-        println!("    → TIMEOUT (gave up):    {:>10}", f(&flow_xy_timeout));
+        println!("  Boundaries  {}", walked);
+        if sum_fail > 0 {
+            println!("    → Tuples    {}  (sum infeasible: {})", walked as u64 * ctx.tuples.len() as u64, sum_fail);
+        }
+        println!("    → SolveW    {}", w_emitted);
+        println!("      → W sols    {}", w_sols);
+        if w_sols > 0 {
+            println!("        ✗ {} W spectral fail ({})", w_sf, pct(w_sf, w_sols));
+        }
+        println!("        → {} pass → SolveZ", w_sp);
+        println!("          → {} Z solutions", z_sols);
+        if z_sols > 0 {
+            if z_sf > 0 { println!("            ✗ {} Z spectral fail ({})", z_sf, pct(z_sf, z_sols)); }
+            if z_pf > 0 { println!("            ✗ {} Z pair fail ({})", z_pf, pct(z_pf, z_sols)); }
+            if z_gj > 0 { println!("            ✗ {} Z prep/GJ fail", z_gj); }
+        }
+        println!("            → {} reach XY stage", z_xy);
+        if z_xy > 0 {
+            println!("              → {} XY candidates", xy_total);
+            if ext_pruned > 0 { println!("                ✗ {} extension pruned ({})", ext_pruned, pct(ext_pruned, xy_total)); }
+            println!("                → {} XY SAT solves", xy_sat + xy_unsat + xy_timeout);
+            println!("                  ✗ {} UNSAT proved ({})", xy_unsat, pct(xy_unsat, xy_unsat + xy_timeout + xy_sat));
+            if xy_timeout > 0 {
+                println!("                  ✗ {} TIMEOUT gave up ({})", xy_timeout, pct(xy_timeout, xy_unsat + xy_timeout + xy_sat));
+            }
+            if xy_sat > 0 {
+                println!("                  ✓ {} SAT!", xy_sat);
+            }
+        }
     }
 
     let all_stats = SearchStats::default(); // TODO: aggregate from workers
