@@ -6396,4 +6396,53 @@ mod tests {
         assert!(verify_tt(p, &x, &y, &z, &w), "Solution should verify");
     }
 
+    #[test]
+    fn z_sat_finds_known_tt22_z_middle() {
+        // Known TT(22) solution
+        let z_full: Vec<i8> = vec![1,1,-1,-1,-1,1,1,-1,1,1,1,1,1,1,1,1,-1,1,-1,1,-1,1];
+        let w_full: Vec<i8> = vec![1,1,1,1,-1,-1,1,1,-1,-1,1,-1,1,1,-1,-1,-1,-1,1,-1,1];
+        let n = 22usize;
+        let m = 21usize;
+        let k = 3usize;
+        let middle_n = n - 2 * k; // 16
+        let z_mid_sum: i32 = z_full[k..n-k].iter().map(|&v| v as i32).sum(); // 6
+
+        // Build Z boundary
+        let mut z_boundary = vec![0i8; n];
+        z_boundary[..k].copy_from_slice(&z_full[..k]);
+        z_boundary[n-k..].copy_from_slice(&z_full[n-k..]);
+
+        // Build Z SAT solver (same as pipeline)
+        let z_tmpl = sat_z_middle::LagTemplate::new(n, k);
+        let mut z_solver = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
+        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+
+        // Test 1: does solve() find ANY Z middle?
+        let result = z_solver.solve();
+        eprintln!("Z SAT (no spectral): {:?}", result);
+        assert_eq!(result, Some(true), "Z SAT should find a solution for the known Z/W pair");
+
+        if result == Some(true) {
+            let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
+            let found_mid: Vec<i8> = (0..middle_n).map(|i| {
+                if z_solver.value(z_mid_vars[i]).unwrap() { 1 } else { -1 }
+            }).collect();
+            let known_mid: Vec<i8> = z_full[k..n-k].to_vec();
+            eprintln!("Found Z mid: {:?}", found_mid);
+            eprintln!("Known Z mid: {:?}", known_mid);
+        }
+
+        // Test 2: with known Z middle as assumptions, is it SAT?
+        let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
+        let known_mid: Vec<i8> = z_full[k..n-k].to_vec();
+        let assumptions: Vec<i32> = (0..middle_n).map(|i| {
+            if known_mid[i] == 1 { z_mid_vars[i] } else { -z_mid_vars[i] }
+        }).collect();
+        let mut z_solver2 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
+        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver2, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        let result2 = z_solver2.solve_with_assumptions(&assumptions);
+        eprintln!("Z SAT with known Z middle assumptions: {:?}", result2);
+        assert_eq!(result2, Some(true), "Known Z middle should satisfy Z SAT constraints");
+    }
+
 }
