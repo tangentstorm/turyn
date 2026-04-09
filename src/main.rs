@@ -3607,6 +3607,21 @@ fn run_mdd_sat_search(
     let items_completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let boundaries_walked = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let extensions_pruned = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Pipeline flow counters for Sankey visualization
+    let flow_bnd_sum_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));      // boundaries failing sum feasibility
+    let flow_w_unsat = Arc::new(std::sync::atomic::AtomicU64::new(0));            // W SAT: no solutions found
+    let flow_w_solutions = Arc::new(std::sync::atomic::AtomicU64::new(0));        // W solutions found (pre-spectral)
+    let flow_w_spec_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));        // W solutions failing spectral
+    let flow_w_spec_pass = Arc::new(std::sync::atomic::AtomicU64::new(0));        // W solutions passing spectral → SolveZ
+    let flow_z_unsat = Arc::new(std::sync::atomic::AtomicU64::new(0));            // Z SAT: no solutions found
+    let flow_z_solutions = Arc::new(std::sync::atomic::AtomicU64::new(0));        // Z solutions found (pre-spectral)
+    let flow_z_spec_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));        // Z solutions failing individual spectral
+    let flow_z_pair_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));        // Z solutions failing pair check
+    let flow_z_prep_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));        // Z solutions failing prepare_candidate (infeasible/GJ)
+    let flow_xy_ext_pruned = Arc::new(std::sync::atomic::AtomicU64::new(0));      // XY candidates pruned by extension
+    let flow_xy_sat = Arc::new(std::sync::atomic::AtomicU64::new(0));             // XY SAT result = SAT
+    let flow_xy_unsat = Arc::new(std::sync::atomic::AtomicU64::new(0));           // XY SAT result = UNSAT (proved)
+    let flow_xy_timeout = Arc::new(std::sync::atomic::AtomicU64::new(0));         // XY SAT result = None (conflict limit)
     // Per-stage enter/exit counters: depth = enter - exit.
     let stage_enter: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let stage_exit: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
@@ -3626,6 +3641,20 @@ fn run_mdd_sat_search(
         let items_completed = Arc::clone(&items_completed);
         let boundaries_walked = Arc::clone(&boundaries_walked);
         let extensions_pruned = Arc::clone(&extensions_pruned);
+        let flow_bnd_sum_fail = Arc::clone(&flow_bnd_sum_fail);
+        let flow_w_unsat = Arc::clone(&flow_w_unsat);
+        let flow_w_solutions = Arc::clone(&flow_w_solutions);
+        let flow_w_spec_fail = Arc::clone(&flow_w_spec_fail);
+        let flow_w_spec_pass = Arc::clone(&flow_w_spec_pass);
+        let flow_z_unsat = Arc::clone(&flow_z_unsat);
+        let flow_z_solutions = Arc::clone(&flow_z_solutions);
+        let flow_z_spec_fail = Arc::clone(&flow_z_spec_fail);
+        let flow_z_pair_fail = Arc::clone(&flow_z_pair_fail);
+        let flow_z_prep_fail = Arc::clone(&flow_z_prep_fail);
+        let flow_xy_ext_pruned = Arc::clone(&flow_xy_ext_pruned);
+        let flow_xy_sat = Arc::clone(&flow_xy_sat);
+        let flow_xy_unsat = Arc::clone(&flow_xy_unsat);
+        let flow_xy_timeout = Arc::clone(&flow_xy_timeout);
         let stage_enter: Vec<_> = stage_enter.iter().map(Arc::clone).collect();
         let stage_exit: Vec<_> = stage_exit.iter().map(Arc::clone).collect();
         let xy_table = xy_table.clone();
@@ -3664,9 +3693,13 @@ fn run_mdd_sat_search(
                         let w_bnd_sum = 2 * (bnd.w_bits.count_ones() as i32) - ctx.max_bnd_sum;
                         for &tuple in &ctx.tuples {
                             let z_mid_sum = tuple.z - z_bnd_sum;
-                            if z_mid_sum.abs() > ctx.middle_n as i32 || (z_mid_sum + ctx.middle_n as i32) % 2 != 0 { continue; }
+                            if z_mid_sum.abs() > ctx.middle_n as i32 || (z_mid_sum + ctx.middle_n as i32) % 2 != 0 {
+                                flow_bnd_sum_fail.fetch_add(1, AtomicOrdering::Relaxed); continue;
+                            }
                             let w_mid_sum = tuple.w - w_bnd_sum;
-                            if w_mid_sum.abs() > ctx.middle_m as i32 || (w_mid_sum + ctx.middle_m as i32) % 2 != 0 { continue; }
+                            if w_mid_sum.abs() > ctx.middle_m as i32 || (w_mid_sum + ctx.middle_m as i32) % 2 != 0 {
+                                flow_bnd_sum_fail.fetch_add(1, AtomicOrdering::Relaxed); continue;
+                            }
                             stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
                             wq.push(PipelineWork::SolveW(SolveWWork {
                                 tuple, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
@@ -3684,18 +3717,23 @@ fn run_mdd_sat_search(
 
                         // For small middle: brute-force W enumeration (proven to find solutions).
                         // For large middle: SAT-based W generation (handles big search spaces).
+                        let mut w_found_any = false;
                         if ctx.middle_m <= 20 {
-                            // Brute-force: enumerate all W middles, spectral filter each
                             generate_sequences_permuted(ctx.middle_m, sw.w_mid_sum, false, false, 200_000, |w_mid| {
                                 if ctx.found.load(AtomicOrdering::Relaxed) { return false; }
                                 let mut w_vals = w_boundary.clone();
                                 w_vals[k..k+ctx.middle_m].copy_from_slice(w_mid);
+                                flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
                                 if let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) {
+                                    flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
+                                    w_found_any = true;
                                     stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
                                     wq.push(PipelineWork::SolveZ(SolveZWork {
                                         tuple: sw.tuple, z_bits: sw.z_bits, w_bits: sw.w_bits,
                                         w_vals, w_spectrum, xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
                                     }));
+                                } else {
+                                    flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
                                 }
                                 true
                             });
@@ -3718,6 +3756,7 @@ fn run_mdd_sat_search(
                                     .map(|_| next_rng!() & 1 == 1).collect();
                                 w_solver.set_phase(&phases);
                                 if w_solver.solve() != Some(true) { break; }
+                                flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
 
                                 let w_mid = extract_vals(&w_solver, |i| ctx.w_mid_vars[i], ctx.middle_m);
                                 let mut w_vals = w_boundary.clone();
@@ -3728,7 +3767,12 @@ fn run_mdd_sat_search(
                                 }).collect();
                                 w_solver.add_clause(w_block);
 
-                                let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) else { continue; };
+                                let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) else {
+                                    flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                                    continue;
+                                };
+                                flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
+                                w_found_any = true;
 
                                 stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
                                 wq.push(PipelineWork::SolveZ(SolveZWork {
@@ -3740,6 +3784,7 @@ fn run_mdd_sat_search(
                             w_solver.restore_checkpoint(w_cp);
                             w_bases.insert(sw.w_mid_sum, w_solver);
                         }
+                        if !w_found_any { flow_w_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
                         stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
                     }
 
@@ -3782,8 +3827,13 @@ fn run_mdd_sat_search(
                             let z_phases: Vec<bool> = (0..ctx.middle_n)
                                 .map(|_| next_rng!() & 1 == 1).collect();
                             z_solver.set_phase(&z_phases);
-                            if z_solver.solve() != Some(true) { break; }
+                            let z_result = z_solver.solve();
+                            if z_result != Some(true) {
+                                if z_count == 0 { flow_z_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
+                                break;
+                            }
                             z_count += 1;
+                            flow_z_solutions.fetch_add(1, AtomicOrdering::Relaxed);
 
                             let z_mid = extract_vals(&z_solver, |i| ctx.z_mid_vars[i], ctx.middle_n);
                             let mut z_vals = Vec::with_capacity(n);
@@ -3796,17 +3846,17 @@ fn run_mdd_sat_search(
                             }).collect();
                             z_solver.add_clause(z_block);
 
-                            let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, ctx.individual_bound, &mut fft_buf_z) else { continue; };
+                            let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, ctx.individual_bound, &mut fft_buf_z) else {
+                                flow_z_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                                continue;
+                            };
 
-                            // Spectral pair quality: lower power = better candidate.
-                            // Hard-reject pairs that fail the pair check (excess at any freq).
-                            // This is critical for finding solutions — without it, bad pairs
-                            // flood the XY solver.
                             let pair_power = spectral_pair_max_power(&z_spectrum, &sz.w_spectrum);
-                            // For small n: hard pair check finds solutions faster by filtering junk.
-                            // For large n: pair check too tight (rejects everything), rely on ranking.
                             if ctx.middle_n <= 20 {
-                                if !spectral_pair_ok(&z_spectrum, &sz.w_spectrum, ctx.pair_bound) { continue; }
+                                if !spectral_pair_ok(&z_spectrum, &sz.w_spectrum, ctx.pair_bound) {
+                                    flow_z_pair_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                                    continue;
+                                }
                             }
 
                             let z_seq = PackedSeq::from_values(&z_vals);
@@ -3823,6 +3873,7 @@ fn run_mdd_sat_search(
                                 z: z_seq.clone(), w: w_seq.clone(), zw_autocorr,
                             };
                             if let Some(mut xy_solver) = template.prepare_candidate_solver(&candidate) {
+                            // (else: flow_z_prep_fail tracked below)
                                 if n > 30 { xy_solver.set_conflict_limit(5000); }
                                 if warm.inject_phase {
                                     if let Some(ref ph) = warm.phase { xy_solver.set_phase(ph); }
@@ -3865,6 +3916,11 @@ fn run_mdd_sat_search(
                                         let result = xy_solver.solve_with_assumptions(&assumptions);
                                         items_completed.fetch_add(1, AtomicOrdering::Relaxed);
                                         stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
+                                        match result {
+                                            Some(true) => flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed),
+                                            Some(false) => flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed),
+                                            None => flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed),
+                                        };
 
                                         if result == Some(true) {
                                             let (x, y) = template.extract_xy(&xy_solver);
@@ -3876,6 +3932,8 @@ fn run_mdd_sat_search(
                                     },
                                 );
                                 warm.phase = Some(xy_solver.get_phase());
+                            } else {
+                                flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
                             }
                         }
                         z_solver.spectral = None;
@@ -4092,6 +4150,30 @@ fn run_mdd_sat_search(
             walked as f64 / elapsed.as_secs_f64());
         println!("  Wall-clock:               {:>10.3?}", elapsed);
         if !found_solution { println!("No solution found."); }
+
+        // Pipeline flow summary (for Sankey diagram)
+        let f = |c: &Arc<std::sync::atomic::AtomicU64>| c.load(AtomicOrdering::Relaxed);
+        let total_tuples_checked = f(&flow_bnd_sum_fail) + stage_enter[1].load(AtomicOrdering::Relaxed);
+        println!("\n  --- Pipeline Flow ---");
+        println!("  Boundaries walked:        {:>10}", walked);
+        println!("  Tuples checked:           {:>10}  (per boundary × tuples)", total_tuples_checked);
+        println!("    → sum infeasible:       {:>10}", f(&flow_bnd_sum_fail));
+        println!("    → SolveW emitted:       {:>10}", stage_enter[1].load(AtomicOrdering::Relaxed));
+        println!("  W solutions found:        {:>10}", f(&flow_w_solutions));
+        println!("    → spectral fail:        {:>10}", f(&flow_w_spec_fail));
+        println!("    → spectral pass→Z:      {:>10}", f(&flow_w_spec_pass));
+        println!("  W calls with no solution: {:>10}", f(&flow_w_unsat));
+        println!("  Z solutions found:        {:>10}", f(&flow_z_solutions));
+        println!("    → spectral fail:        {:>10}", f(&flow_z_spec_fail));
+        println!("    → pair fail:            {:>10}", f(&flow_z_pair_fail));
+        println!("    → prep fail (GJ):       {:>10}", f(&flow_z_prep_fail));
+        println!("    → reached XY:           {:>10}", f(&flow_z_solutions).saturating_sub(f(&flow_z_spec_fail) + f(&flow_z_pair_fail) + f(&flow_z_prep_fail)));
+        println!("  Z calls with no solution: {:>10}", f(&flow_z_unsat));
+        println!("  XY extension pruned:      {:>10}", ext_pruned);
+        println!("  XY SAT results:");
+        println!("    → SAT (solution!):      {:>10}", f(&flow_xy_sat));
+        println!("    → UNSAT (proved):       {:>10}", f(&flow_xy_unsat));
+        println!("    → TIMEOUT (gave up):    {:>10}", f(&flow_xy_timeout));
     }
 
     let all_stats = SearchStats::default(); // TODO: aggregate from workers
