@@ -3720,6 +3720,9 @@ fn run_mdd_sat_search(
 
                 match work {
                     PipelineWork::Boundary(bnd) => {
+                        // TRACE: check if this is the known solution's boundary
+                        let trace_bnd = bnd.z_bits == 43 && bnd.w_bits == 47;
+                        if trace_bnd { eprintln!("TRACE: found target boundary z=43 w=47 xy_root={}", bnd.xy_root); }
                         // Check sum feasibility for each tuple, emit SolveW items
                         let z_bnd_sum = 2 * (bnd.z_bits.count_ones() as i32) - ctx.max_bnd_sum;
                         let w_bnd_sum = 2 * (bnd.w_bits.count_ones() as i32) - ctx.max_bnd_sum;
@@ -3732,6 +3735,10 @@ fn run_mdd_sat_search(
                             if w_mid_sum.abs() > ctx.middle_m as i32 || (w_mid_sum + ctx.middle_m as i32) % 2 != 0 {
                                 flow_bnd_sum_fail.fetch_add(1, AtomicOrdering::Relaxed); continue;
                             }
+                            if trace_bnd && tuple.z == 8 && tuple.w == 1 {
+                                eprintln!("TRACE: emitting SolveW for tuple ({},{},{},{}) z_mid_sum={} w_mid_sum={}",
+                                    tuple.x, tuple.y, tuple.z, tuple.w, z_mid_sum, w_mid_sum);
+                            }
                             stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
                             wq.push(PipelineWork::SolveW(SolveWWork {
                                 tuple, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
@@ -3742,6 +3749,8 @@ fn run_mdd_sat_search(
                     }
 
                     PipelineWork::SolveW(sw) => {
+                        let trace_w = sw.z_bits == 43 && sw.w_bits == 47 && sw.tuple.z == 8 && sw.tuple.w == 1;
+                        if trace_w { eprintln!("TRACE: SolveW for target boundary, w_mid_sum={}", sw.w_mid_sum); }
                         let (w_prefix, w_suffix) = expand_boundary_bits(sw.w_bits, k);
                         let mut w_boundary = vec![0i8; m];
                         w_boundary[..k].copy_from_slice(&w_prefix);
@@ -3750,13 +3759,17 @@ fn run_mdd_sat_search(
                         // For small middle: brute-force W enumeration (proven to find solutions).
                         // For large middle: SAT-based W generation (handles big search spaces).
                         let mut w_found_any = false;
+                        let mut trace_w_total = 0u64;
+                        let mut trace_w_pass = 0u64;
                         if ctx.middle_m <= 20 {
                             generate_sequences_permuted(ctx.middle_m, sw.w_mid_sum, false, false, 200_000, |w_mid| {
                                 if ctx.found.load(AtomicOrdering::Relaxed) { return false; }
                                 let mut w_vals = w_boundary.clone();
                                 w_vals[k..k+ctx.middle_m].copy_from_slice(w_mid);
                                 flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
+                                if trace_w { trace_w_total += 1; }
                                 if let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) {
+                                    if trace_w { trace_w_pass += 1; }
                                     flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
                                     w_found_any = true;
                                     stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
@@ -3817,10 +3830,12 @@ fn run_mdd_sat_search(
                             w_bases.insert(sw.w_mid_sum, w_solver);
                         }
                         if !w_found_any { flow_w_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
+                        if trace_w { eprintln!("TRACE: SolveW done: {} W middles checked, {} passed spectral", trace_w_total, trace_w_pass); }
                         stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
                     }
 
                     PipelineWork::SolveZ(sz) => {
+                        let trace_z = sz.z_bits == 43 && sz.w_bits == 47 && sz.tuple.z == 8;
                         // SAT-solve for Z with spectral constraint, enumerate multiple Z
                         let mut z_boundary = vec![0i8; n];
                         for i in 0..k {
@@ -4018,6 +4033,7 @@ fn run_mdd_sat_search(
                                 flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
                             }
                         }
+                        if trace_z { eprintln!("TRACE: SolveZ done: {} Z solutions found, z_spec_fail/pair_fail/prep_fail/reach_xy counted in flow", z_count); }
                         z_solver.spectral = None;
                         z_solver.restore_checkpoint(z_cp);
                         z_bases.insert(sz.z_mid_sum, z_solver);
