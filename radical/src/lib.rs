@@ -71,6 +71,32 @@ struct XorConstraint {
     assigned_xor: bool,   // XOR of assigned variable values (true = 1)
 }
 
+/// MDD constraint: encodes a multi-valued decision diagram over boundary variable pairs.
+/// At each of `depth` levels, two SAT variables (x, y) select one of 4 branches.
+/// The MDD prunes infeasible boundary combinations without auxiliary variables.
+///
+/// Propagation: when a boundary variable is assigned, recompute the set of
+/// reachable MDD nodes (top-down frontier). If the frontier becomes empty → conflict.
+/// If only one branch is viable at some level → force the implied variable.
+#[derive(Clone)]
+pub struct MddConstraint {
+    /// MDD node table. nodes[nid] = [child0, child1, child2, child3].
+    /// Branch index = x_val | (y_val << 1). DEAD=0, LEAF=u32::MAX.
+    pub nodes: Vec<[u32; 4]>,
+    pub root: u32,
+    pub depth: usize,
+    /// level_x_var[level] = 0-based SAT variable for X at this MDD level
+    pub level_x_var: Vec<usize>,
+    /// level_y_var[level] = 0-based SAT variable for Y at this MDD level
+    pub level_y_var: Vec<usize>,
+    /// var_to_level[var_0based] = MDD level, or usize::MAX if not an MDD variable
+    pub var_to_level: Vec<usize>,
+    /// Whether this var is the X (true) or Y (false) variable at its level
+    pub var_is_x: Vec<bool>,
+    /// Stale flag: set on backtrack, triggers recompute before next propagation
+    pub stale: bool,
+}
+
 /// A quadratic pseudo-boolean constraint with exact target:
 ///   sum(coeffs[i] * lits_a[i] * lits_b[i]) = target
 /// Each term contributes coeffs[i] iff both lits_a[i] and lits_b[i] are true.
@@ -169,6 +195,7 @@ enum Reason {
     QuadPb(u32),  // index into quad_pb_constraints; bit 31 = is_upper flag
     Xor(u32),     // index into xor_constraints
     Spectral,     // spectral power constraint violation
+    Mdd,          // MDD constraint: boundary variables violate MDD path feasibility
 }
 
 /// Trail entry: records an assignment.
@@ -496,6 +523,9 @@ pub struct Solver {
     xor_constraints: Vec<XorConstraint>,
     xor_var_watches: Vec<Vec<u32>>,  // xor_var_watches[var] = list of XOR constraint indices
 
+    // MDD constraint (at most one, optional)
+    pub mdd: Option<MddConstraint>,
+
     // Propagation queue
     prop_head: usize, // next trail entry to propagate
 
@@ -603,6 +633,7 @@ impl Solver {
             conflict_limit: 0,
             ok: true,
             skip_backtrack_quad_pb: false,
+            mdd: None,
             spectral: None,
         }
     }
@@ -938,6 +969,175 @@ impl Solver {
                 }
             }
         }
+    }
+
+    /// Add an MDD constraint over boundary variable pairs.
+    /// `nodes` is the MDD node table (nodes[0] = dead sentinel).
+    /// `level_x_vars` and `level_y_vars` are 1-based SAT variable IDs for each level.
+    /// The solver will enforce that the boundary variables follow a valid MDD path.
+    pub fn add_mdd_constraint(
+        &mut self,
+        nodes: &[[u32; 4]],
+        root: u32,
+        depth: usize,
+        level_x_vars_1based: &[i32],
+        level_y_vars_1based: &[i32],
+    ) {
+        assert_eq!(level_x_vars_1based.len(), depth);
+        assert_eq!(level_y_vars_1based.len(), depth);
+
+        // Ensure all variables exist
+        for &v in level_x_vars_1based { self.ensure_var(v.unsigned_abs() as usize); }
+        for &v in level_y_vars_1based { self.ensure_var(v.unsigned_abs() as usize); }
+
+        let lx: Vec<usize> = level_x_vars_1based.iter().map(|&v| v.unsigned_abs() as usize - 1).collect();
+        let ly: Vec<usize> = level_y_vars_1based.iter().map(|&v| v.unsigned_abs() as usize - 1).collect();
+
+        let max_var = lx.iter().chain(ly.iter()).copied().max().unwrap_or(0);
+        let mut var_to_level = vec![usize::MAX; max_var + 1];
+        let mut var_is_x = vec![false; max_var + 1];
+        for (level, &v) in lx.iter().enumerate() {
+            var_to_level[v] = level;
+            var_is_x[v] = true;
+        }
+        for (level, &v) in ly.iter().enumerate() {
+            var_to_level[v] = level;
+            var_is_x[v] = false;
+        }
+
+        self.mdd = Some(MddConstraint {
+            nodes: nodes.to_vec(),
+            root, depth,
+            level_x_var: lx,
+            level_y_var: ly,
+            var_to_level,
+            var_is_x,
+            stale: true,
+        });
+        // Count reachable nodes for diagnostic
+        let mdd = self.mdd.as_ref().unwrap();
+        let mut count = 0;
+        let mut stack = vec![mdd.root];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(nid) = stack.pop() {
+            if nid == 0 || nid == u32::MAX { continue; }
+            if !seen.insert(nid) { continue; }
+            count += 1;
+            for &c in &mdd.nodes[nid as usize] { stack.push(c); }
+        }
+        eprintln!("[MDD] root={} depth={} reachable_nodes={} x_vars={:?} y_vars={:?}",
+            root, depth, count, &mdd.level_x_var[..depth.min(4)], &mdd.level_y_var[..depth.min(4)]);
+    }
+
+    /// Propagate MDD constraint. Returns conflict reason if dead-end, None otherwise.
+    /// Uses top-down frontier BFS: walk MDD levels, filtering nodes by assigned vars.
+    /// When only one branch is viable at a level, force the implied variable.
+    fn propagate_mdd(&mut self) -> Option<Reason> {
+        const MDD_DEAD: u32 = 0;
+        const MDD_LEAF: u32 = u32::MAX;
+
+        let mdd = match self.mdd.as_ref() { Some(m) => m, None => return None };
+        if mdd.root == MDD_DEAD { return Some(Reason::Mdd); }
+
+        // Collect forced literals (to avoid borrow conflict with self.enqueue)
+        let mut forced: Vec<Lit> = Vec::new();
+        let mut conflict = false;
+
+        let mut frontier: Vec<u32> = vec![mdd.root];
+        let mut next: Vec<u32> = Vec::new();
+
+        for level in 0..mdd.depth {
+            let xv = mdd.level_x_var[level];
+            let yv = mdd.level_y_var[level];
+            let x_asgn = self.assigns[xv];
+            let y_asgn = self.assigns[yv];
+
+            next.clear();
+
+            if x_asgn != LBool::Undef && y_asgn != LBool::Undef {
+                let branch = (x_asgn == LBool::True) as usize | (((y_asgn == LBool::True) as usize) << 1);
+                for &nid in &frontier {
+                    if nid == MDD_LEAF { next.push(MDD_LEAF); }
+                    else {
+                        let c = mdd.nodes[nid as usize][branch];
+                        if c != MDD_DEAD && !next.contains(&c) { next.push(c); }
+                    }
+                }
+            } else if x_asgn != LBool::Undef {
+                let xv_bool = x_asgn == LBool::True;
+                let b0 = xv_bool as usize;       // y=false
+                let b1 = b0 | 2;                  // y=true
+                let (mut y0_ok, mut y1_ok) = (false, false);
+                for &nid in &frontier {
+                    if nid == MDD_LEAF { y0_ok = true; y1_ok = true; if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); } }
+                    else {
+                        let (c0, c1) = (mdd.nodes[nid as usize][b0], mdd.nodes[nid as usize][b1]);
+                        if c0 != MDD_DEAD { y0_ok = true; if !next.contains(&c0) { next.push(c0); } }
+                        if c1 != MDD_DEAD { y1_ok = true; if !next.contains(&c1) { next.push(c1); } }
+                    }
+                }
+                if !y0_ok && !y1_ok { conflict = true; break; }
+                if !y0_ok && self.assigns[yv] == LBool::Undef { forced.push((yv + 1) as Lit); break; }
+                if !y1_ok && self.assigns[yv] == LBool::Undef { forced.push(-((yv + 1) as Lit)); break; }
+            } else if y_asgn != LBool::Undef {
+                let yv_bool = y_asgn == LBool::True;
+                let b0 = (yv_bool as usize) << 1; // x=false
+                let b1 = b0 | 1;                   // x=true
+                let (mut x0_ok, mut x1_ok) = (false, false);
+                for &nid in &frontier {
+                    if nid == MDD_LEAF { x0_ok = true; x1_ok = true; if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); } }
+                    else {
+                        let (c0, c1) = (mdd.nodes[nid as usize][b0], mdd.nodes[nid as usize][b1]);
+                        if c0 != MDD_DEAD { x0_ok = true; if !next.contains(&c0) { next.push(c0); } }
+                        if c1 != MDD_DEAD { x1_ok = true; if !next.contains(&c1) { next.push(c1); } }
+                    }
+                }
+                if !x0_ok && !x1_ok { conflict = true; break; }
+                if !x0_ok && self.assigns[xv] == LBool::Undef { forced.push((xv + 1) as Lit); break; }
+                if !x1_ok && self.assigns[xv] == LBool::Undef { forced.push(-((xv + 1) as Lit)); break; }
+            } else {
+                // Neither assigned: check which x/y values have viable branches
+                let (mut x0_ok, mut x1_ok, mut y0_ok, mut y1_ok) = (false, false, false, false);
+                for &nid in &frontier {
+                    if nid == MDD_LEAF {
+                        x0_ok = true; x1_ok = true; y0_ok = true; y1_ok = true;
+                        if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); }
+                    } else {
+                        for b in 0..4usize {
+                            let c = mdd.nodes[nid as usize][b];
+                            if c != MDD_DEAD {
+                                if b & 1 == 0 { x0_ok = true; } else { x1_ok = true; }
+                                if b & 2 == 0 { y0_ok = true; } else { y1_ok = true; }
+                                if !next.contains(&c) { next.push(c); }
+                            }
+                        }
+                    }
+                }
+                if !x0_ok && !x1_ok { conflict = true; break; }
+                if !y0_ok && !y1_ok { conflict = true; break; }
+                let mut did_force = false;
+                if !x0_ok && self.assigns[xv] == LBool::Undef { forced.push((xv + 1) as Lit); did_force = true; }
+                if !x1_ok && self.assigns[xv] == LBool::Undef { forced.push(-((xv + 1) as Lit)); did_force = true; }
+                if !y0_ok && self.assigns[yv] == LBool::Undef { forced.push((yv + 1) as Lit); did_force = true; }
+                if !y1_ok && self.assigns[yv] == LBool::Undef { forced.push(-((yv + 1) as Lit)); did_force = true; }
+                if did_force { break; } // recompute frontier after forced vars are enqueued
+            }
+
+            if next.is_empty() { conflict = true; break; }
+            std::mem::swap(&mut frontier, &mut next);
+        }
+
+        if conflict { return Some(Reason::Mdd); }
+
+        // Enqueue forced literals
+        for flit in forced {
+            if self.lit_value(flit) == LBool::False { return Some(Reason::Mdd); }
+            if self.lit_value(flit) == LBool::Undef {
+                self.enqueue(flit, Reason::Mdd);
+            }
+        }
+
+        None
     }
 
     /// Solve the formula. Returns Some(true) if SAT, Some(false) if UNSAT.
@@ -2060,6 +2260,19 @@ impl Solver {
                     }
                 }
             }
+            // MDD constraint propagation
+            if self.mdd.is_some() {
+                let v = var_of(lit);
+                let is_mdd_var = {
+                    let mdd = self.mdd.as_ref().unwrap();
+                    v < mdd.var_to_level.len() && mdd.var_to_level[v] != usize::MAX
+                };
+                if is_mdd_var {
+                    if let Some(conflict) = self.propagate_mdd() {
+                        return Some(conflict);
+                    }
+                }
+            }
             // Spectral constraint: incrementally update DFT, check conflict, propagate
             if self.spectral.is_some() {
                 let v = var_of(lit);
@@ -2598,6 +2811,37 @@ impl Solver {
                     }
                     self.analyze_reason_buf = buf;
                 }
+                Reason::Mdd => {
+                    // MDD reason: all assigned boundary variables
+                    let mut buf = std::mem::take(&mut self.analyze_reason_buf);
+                    buf.clear();
+                    if let Some(ref mdd) = self.mdd {
+                        for level in 0..mdd.depth {
+                            for &v in &[mdd.level_x_var[level], mdd.level_y_var[level]] {
+                                if self.assigns[v] != LBool::Undef {
+                                    let lit_v = (v + 1) as Lit;
+                                    buf.push(if self.assigns[v] == LBool::True { -lit_v } else { lit_v });
+                                }
+                            }
+                        }
+                    }
+                    if p != 0 { buf.push(p); }
+                    for idx in 0..buf.len() {
+                        let lit = buf[idx];
+                        if lit == p { continue; }
+                        let v = var_of(lit);
+                        if self.analyze_seen[v] { continue; }
+                        self.analyze_seen[v] = true;
+                        self.bump_activity(v);
+                        if self.level[v] == self.decision_level() {
+                            counter += 1;
+                        } else if self.level[v] > 0 {
+                            learnt.push(negate(lit));
+                            if self.level[v] > bt_level { bt_level = self.level[v]; }
+                        }
+                    }
+                    self.analyze_reason_buf = buf;
+                }
                 Reason::Decision => { unreachable!(); }
             }
 
@@ -2641,7 +2885,7 @@ impl Solver {
             let lit = learnt[i];
             let v = var_of(lit);
             match self.reason[v] {
-                Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) | Reason::Xor(_) | Reason::Spectral => {
+                Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) | Reason::Xor(_) | Reason::Spectral | Reason::Mdd => {
                     if self.lit_removable(v) { continue; }
                 }
                 Reason::Decision => {}
@@ -2743,6 +2987,25 @@ impl Solver {
                         }
                     }
                 }
+                Reason::Mdd => {
+                    if let Some(ref mdd) = self.mdd {
+                        for level in 0..mdd.depth {
+                            for &v in &[mdd.level_x_var[level], mdd.level_y_var[level]] {
+                                if self.assigns[v] == LBool::Undef { continue; }
+                                if v == cur || self.minimize_visited[v] { continue; }
+                                self.minimize_visited[v] = true;
+                                if self.level[v] == 0 { continue; }
+                                if self.analyze_seen[v] { continue; }
+                                let lv = self.level[v] as usize;
+                                if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { return false; }
+                                match self.reason[v] {
+                                    Reason::Decision => return false,
+                                    _ => { self.minimize_stack.push(v); }
+                                }
+                            }
+                        }
+                    }
+                }
                 Reason::Decision => return false,
             }
         }
@@ -2762,6 +3025,12 @@ impl Solver {
             if let Some(ref mut spec) = self.spectral {
                 if v < spec.num_seq_vars && spec.assigned[v] {
                     spec.unassign(v);
+                }
+            }
+            // Mark MDD constraint as stale if this is a boundary variable
+            if let Some(ref mut mdd) = self.mdd {
+                if v < mdd.var_to_level.len() && mdd.var_to_level[v] != usize::MAX {
+                    mdd.stale = true;
                 }
             }
             // Mark quad PB constraints involving this variable as stale.
