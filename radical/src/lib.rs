@@ -435,7 +435,7 @@ impl Default for SolverConfig {
             ema_restarts: false,
             probing: false,
             rephasing: false,
-            xor_propagation: false, // Disabled: soundness bug with QuadPB interaction (see xor_quad_pb_no_gj_n26_oracle test)
+            xor_propagation: true,
             lucky_phases: false,
             vivification: false,
             chrono_bt: false,
@@ -1987,15 +1987,28 @@ impl Solver {
                     if xc.num_unknown == 0 { continue; } // already fully resolved (e.g. by add_xor)
                     xc.num_unknown -= 1;
                     xc.assigned_xor ^= val;
-                    if xc.num_unknown == 0 {
-                        // All assigned: check parity
-                        if xc.assigned_xor != xc.parity {
+                    // Recount unknowns from scratch. The incremental num_unknown
+                    // can be stale when multiple variables are enqueued before
+                    // propagation (e.g. solve_with_assumptions batches assumptions).
+                    let mut real_unknown = 0u32;
+                    let mut real_xor = false;
+                    for &xv in &self.xor_constraints[xi as usize].vars {
+                        if self.assigns[xv] == LBool::Undef {
+                            real_unknown += 1;
+                        } else if self.assigns[xv] == LBool::True {
+                            real_xor ^= true;
+                        }
+                    }
+                    let xc = &mut self.xor_constraints[xi as usize];
+                    xc.num_unknown = real_unknown;
+                    xc.assigned_xor = real_xor;
+
+                    if real_unknown == 0 {
+                        if real_xor != xc.parity {
                             return Some(Reason::Xor(xi));
                         }
-                    } else if xc.num_unknown == 1 {
-                        // One unknown left: force it
-                        let need_true = xc.assigned_xor ^ xc.parity;
-                        // Find the unassigned var
+                    } else if real_unknown == 1 {
+                        let need_true = real_xor ^ xc.parity;
                         let mut forced_var = 0;
                         for &xv in &xc.vars {
                             if self.assigns[xv] == LBool::Undef {
@@ -3715,6 +3728,29 @@ mod tests {
     }
 
     #[test]
+    fn xor_quad_pb_forced_solution() {
+        // Force the known TT(26) X/Y solution via assumptions.
+        // If UNSAT: the constraints themselves are wrong (encoding bug).
+        // If SAT: the constraints are correct and the search is wrong.
+        let mut s = build_xor_quad_pb_no_gj_n26_solver(true);
+        let x: Vec<i8> = "++--+--+++++++-+-++--+-++-".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let y: Vec<i8> = "+++-+-++++++-++-+---+-++--".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let n = 26;
+        let mut assumptions = Vec::new();
+        for i in 0..n {
+            let lit = (i + 1) as i32;
+            assumptions.push(if x[i] == 1 { lit } else { -lit });
+        }
+        for i in 0..n {
+            let lit = (n + i + 1) as i32;
+            assumptions.push(if y[i] == 1 { lit } else { -lit });
+        }
+        let result = s.solve_with_assumptions(&assumptions);
+        assert_eq!(result, Some(true),
+            "Forcing the known TT(26) solution should be SAT even with XOR+QuadPB");
+    }
+
+    #[test]
     fn xor_quad_pb_bisect_lag() {
         // Binary search: add XOR constraints one lag at a time to find which breaks.
         use super::*;
@@ -3782,7 +3818,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Known bug: XOR+QuadPB interaction causes false UNSAT
+
     fn xor_quad_pb_no_gj_n26_oracle() {
         let mut s = build_xor_quad_pb_no_gj_n26_solver(true);
         let result = s.solve();
@@ -3790,7 +3826,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Known bug: a SAT-consistent branch from the reference model becomes UNSAT with XOR on
+
     fn xor_quad_pb_no_gj_n26_reference_branch_oracle() {
         let mut reference = build_xor_quad_pb_no_gj_n26_solver(false);
         assert_eq!(reference.solve(), Some(true), "reference X/Y model should exist without XOR");
