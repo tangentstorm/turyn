@@ -6432,7 +6432,74 @@ mod tests {
             eprintln!("Known Z mid: {:?}", known_mid);
         }
 
-        // Test 2: with known Z middle as assumptions, is it SAT?
+        // Test 2: enumerate ALL Z middles — how many exist?
+        let mut z_solver_enum = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
+        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver_enum, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
+        let mut z_enum_count = 0;
+        loop {
+            let r = z_solver_enum.solve();
+            if r != Some(true) { break; }
+            z_enum_count += 1;
+            let mid: Vec<i8> = (0..middle_n).map(|i| {
+                if z_solver_enum.value(z_mid_vars[i]).unwrap() { 1 } else { -1 }
+            }).collect();
+            eprintln!("  Z#{}: {:?}", z_enum_count, mid);
+            // Add blocking clause
+            let block: Vec<i32> = z_mid_vars.iter().map(|&v| {
+                if z_solver_enum.value(v) == Some(true) { -v } else { v }
+            }).collect();
+            z_solver_enum.add_clause(block);
+        }
+        eprintln!("Total Z middles (no spectral): {}", z_enum_count);
+
+        // Test 3: enumerate with spectral constraint
+        let mut z_solver_spec = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
+        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver_spec, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        let ztab = radical::SpectralTables::new(n, k, 16);
+        let z_spec = radical::SpectralConstraint::from_tables(&ztab, &z_boundary, (6*n as i32 - 2) as f64 / 2.0);
+        z_solver_spec.spectral = Some(z_spec);
+        let mut z_spec_count = 0;
+        loop {
+            let r = z_solver_spec.solve();
+            if r != Some(true) { break; }
+            z_spec_count += 1;
+            let mid: Vec<i8> = (0..middle_n).map(|i| {
+                if z_solver_spec.value(z_mid_vars[i]).unwrap() { 1 } else { -1 }
+            }).collect();
+            eprintln!("  Z_spec#{}: {:?}", z_spec_count, mid);
+            let block: Vec<i32> = z_mid_vars.iter().map(|&v| {
+                if z_solver_spec.value(v) == Some(true) { -v } else { v }
+            }).collect();
+            z_solver_spec.add_clause(block);
+        }
+        eprintln!("Total Z middles (with spectral): {}", z_spec_count);
+        // Note: only 1 Z found even without spectral — investigating why
+
+        // Test 4: find Z#1, block it, then test known Z with assumptions
+        let mut z_solver3 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
+        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver3, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        let r1 = z_solver3.solve();
+        assert_eq!(r1, Some(true));
+        let found1: Vec<i8> = (0..middle_n).map(|i| {
+            if z_solver3.value(z_mid_vars[i]).unwrap() { 1 } else { -1 }
+        }).collect();
+        eprintln!("Before blocking: found {:?}", found1);
+        // Add blocking clause
+        let block: Vec<i32> = z_mid_vars.iter().map(|&v| {
+            if z_solver3.value(v) == Some(true) { -v } else { v }
+        }).collect();
+        z_solver3.add_clause(block);
+        // Now test known Z with assumptions
+        let known_mid2: Vec<i8> = z_full[k..n-k].to_vec();
+        let known_assumptions: Vec<i32> = (0..middle_n).map(|i| {
+            if known_mid2[i] == 1 { z_mid_vars[i] } else { -z_mid_vars[i] }
+        }).collect();
+        let r2 = z_solver3.solve_with_assumptions(&known_assumptions);
+        eprintln!("After blocking Z#1, known Z assumptions: {:?}", r2);
+        assert_eq!(r2, Some(true), "Known Z should still be SAT after blocking a different Z");
+
+        // Test 5: with known Z middle as assumptions, is it SAT?
         let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
         let known_mid: Vec<i8> = z_full[k..n-k].to_vec();
         let assumptions: Vec<i32> = (0..middle_n).map(|i| {
