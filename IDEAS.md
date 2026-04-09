@@ -698,12 +698,16 @@ can't possibly combine with any Z to meet the pair bound. This prunes W earlier,
 freeing workers for more boundaries.
 **Single commit:** Add combined ZW spectral pre-filter in SolveW brute-force loop.
 
-### E5. Conflict limit proportional to boundary promise
-Currently XY SAT uses a fixed conflict limit (5K for n>30, 50K for n<=30).
-Instead, give more conflicts to boundaries with better spectral scores (from
-the gold queue ranking). Spend less time on marginal boundaries, more on
-promising ones. Net effect: process more boundaries per second.
-**Single commit:** Scale conflict limit by gold queue priority score.
+### E4. Early W spectral reject — **REJECTED (analysis)**
+Analyzed: W individual bound = (6n-2)/2 = 3n-1. The pair constraint gives
+2|W(ω)|² ≤ 6n-2, i.e., |W(ω)|² ≤ 3n-1 = individual_bound. Already optimal.
+A tighter Z-aware bound using min_Z_power(ω) = max(0, |DFT_Z_bnd|-middle_n)²
+degenerates to individual_bound when middle_n > 2k (true for n=56 k=10).
+
+### E5. Conflict limit proportional to boundary promise — **REJECTED**
+Tested reducing XY conflict limit from 5K to 2K at n=56: median bnd/s dropped
+from 431 to 123. The 5K limit is well-tuned: enough to find SAT answers that
+exist, not too many to waste on hard UNSAT.
 
 ### E6. Skip already-explored ZW pairs across tuples
 When a (z_bits, w_bits) pair is explored for one tuple, the W/Z work is done.
@@ -717,3 +721,18 @@ Build MDD at k+1, precompute which k-boundary (z_bits, w_bits) patterns are
 prefixes of valid k+1 boundaries. Store as a Bloom filter or HashSet. At stage 0,
 reject boundaries not in the set. Cost: one-time MDD build at k+1.
 **Single commit:** After loading k-MDD, build k+1 ZW-only MDD, extract valid k-prefixes.
+
+### E8. Checkpoint/restore XY solver instead of clone — **REJECTED (profiling)**
+Profiled: prepare_candidate_solver (clone) takes only 504us/call, 12ms total
+in a 30s run = 0.04% of time. The clone overhead is negligible compared to
+XY SAT time (5036ms). Not worth the complexity of checkpoint/restore.
+
+### E9. Pre-check XY extensions at stage 0 — **REJECTED (analysis)**
+Walk XY sub-MDD at stage 0 and check extension for all (x,y). If none pass,
+skip the boundary. Analysis: with 44% per-candidate prune rate and ~44
+candidates per boundary, P(all fail) = 0.35^44 ≈ 0. No boundaries pruned.
+
+### E10. extend=2 vs extend=1 comparison
+Tested: extend=1 median=538 bnd/s, extend=2 median=485 bnd/s (5 runs each).
+extend=2 prunes more candidates but the per-check cost is higher (larger MDD).
+extend=1 is the better choice for n=56 k=10.
