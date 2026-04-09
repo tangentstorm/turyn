@@ -3495,10 +3495,10 @@ fn run_mdd_sat_search(
         w_mid_vars: (0..middle_m).map(|i| (i + 1) as i32).collect(),
         z_mid_vars: (0..middle_n).map(|i| (i + 1) as i32).collect(),
         z_spectral_tables: if middle_n >= 8 {
-            Some(radical::SpectralTables::new(n, k, 16))
+            Some(radical::SpectralTables::new(n, k, 128))
         } else { None },
         w_spectral_tables: if middle_m >= 8 {
-            Some(radical::SpectralTables::new(m, k, 16))
+            Some(radical::SpectralTables::new(m, k, 128))
         } else { None },
         found: Arc::new(AtomicBool::new(false)),
     });
