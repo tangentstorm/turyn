@@ -3890,7 +3890,18 @@ fn run_mdd_sat_search(
                                         &ctx.mdd.nodes, sz.xy_root, ctx.xy_zw_depth,
                                         &level_x, &level_y,
                                     );
-                                    if n > 30 { xy_solver.set_conflict_limit(5000); }
+                                    // Suppress boundary variable activity: let MDD propagation
+                                    // handle boundary navigation, solver focuses on middle vars
+                                    for l in 0..ctx.xy_zw_depth {
+                                        let pos = ctx.xy_pos_order[l];
+                                        let xv = if pos < k { (pos + 1) as i32 } else { (n - 2*k + pos + 1) as i32 };
+                                        let yv = if pos < k { (n + pos + 1) as i32 } else { (n + n - 2*k + pos + 1) as i32 };
+                                        xy_solver.set_var_activity(xv, 0.0);
+                                        xy_solver.set_var_activity(yv, 0.0);
+                                    }
+                                    let xy_limit: u64 = std::env::var("XY_LIMIT").ok()
+                                        .and_then(|s| s.parse().ok()).unwrap_or(5000);
+                                    if n > 30 { xy_solver.set_conflict_limit(xy_limit); }
                                     if warm.inject_phase {
                                         if let Some(ref ph) = warm.phase { xy_solver.set_phase(ph); }
                                     }

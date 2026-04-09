@@ -95,6 +95,11 @@ pub struct MddConstraint {
     pub var_is_x: Vec<bool>,
     /// Stale flag: set on backtrack, triggers recompute before next propagation
     pub stale: bool,
+    /// Cached frontier per level (level_frontier[l] = reachable nodes entering level l)
+    /// level_frontier[0] = [root], updated incrementally
+    pub level_frontier: Vec<Vec<u32>>,
+    /// Lowest dirty level (levels below this are clean)
+    pub dirty_level: usize,
 }
 
 /// A quadratic pseudo-boolean constraint with exact target:
@@ -1013,6 +1018,12 @@ impl Solver {
             var_to_level,
             var_is_x,
             stale: true,
+            level_frontier: {
+                let mut f = vec![Vec::new(); depth + 1];
+                f[0] = vec![root];
+                f
+            },
+            dirty_level: 0,
         });
         // Count reachable nodes for diagnostic
         let mdd = self.mdd.as_ref().unwrap();
@@ -1039,64 +1050,76 @@ impl Solver {
         let mdd = match self.mdd.as_ref() { Some(m) => m, None => return None };
         if mdd.root == MDD_DEAD { return Some(Reason::Mdd); }
 
-        // Collect forced literals (to avoid borrow conflict with self.enqueue)
+        // If stale (backtrack occurred), find the lowest level with changed assignments
+        if mdd.stale {
+            let mdd = self.mdd.as_mut().unwrap();
+            mdd.stale = false;
+            mdd.dirty_level = 0; // conservative: full recompute on backtrack
+            mdd.level_frontier[0] = vec![mdd.root];
+        }
+
         let mut forced: Vec<Lit> = Vec::new();
         let mut conflict = false;
 
-        let mut frontier: Vec<u32> = vec![mdd.root];
-        let mut next: Vec<u32> = Vec::new();
+        // Read MDD fields via raw pointer to avoid borrow issues
+        let mdd = self.mdd.as_ref().unwrap();
+        let start = mdd.dirty_level;
+        let depth = mdd.depth;
+        let nodes = &mdd.nodes as *const Vec<[u32; 4]>;
+        let level_x = &mdd.level_x_var as *const Vec<usize>;
+        let level_y = &mdd.level_y_var as *const Vec<usize>;
 
-        for level in 0..mdd.depth {
-            let xv = mdd.level_x_var[level];
-            let yv = mdd.level_y_var[level];
+        for level in start..depth {
+            let xv = unsafe { &*level_x }[level];
+            let yv = unsafe { &*level_y }[level];
             let x_asgn = self.assigns[xv];
             let y_asgn = self.assigns[yv];
 
-            next.clear();
+            // Read current frontier for this level
+            let frontier: Vec<u32> = self.mdd.as_ref().unwrap().level_frontier[level].clone();
+            let mut next: Vec<u32> = Vec::new();
+            let nodes_ref = unsafe { &*nodes };
 
             if x_asgn != LBool::Undef && y_asgn != LBool::Undef {
                 let branch = (x_asgn == LBool::True) as usize | (((y_asgn == LBool::True) as usize) << 1);
                 for &nid in &frontier {
                     if nid == MDD_LEAF { next.push(MDD_LEAF); }
                     else {
-                        let c = mdd.nodes[nid as usize][branch];
+                        let c = nodes_ref[nid as usize][branch];
                         if c != MDD_DEAD && !next.contains(&c) { next.push(c); }
                     }
                 }
             } else if x_asgn != LBool::Undef {
-                let xv_bool = x_asgn == LBool::True;
-                let b0 = xv_bool as usize;       // y=false
-                let b1 = b0 | 2;                  // y=true
+                let b0 = (x_asgn == LBool::True) as usize;
+                let b1 = b0 | 2;
                 let (mut y0_ok, mut y1_ok) = (false, false);
                 for &nid in &frontier {
                     if nid == MDD_LEAF { y0_ok = true; y1_ok = true; if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); } }
                     else {
-                        let (c0, c1) = (mdd.nodes[nid as usize][b0], mdd.nodes[nid as usize][b1]);
+                        let (c0, c1) = (nodes_ref[nid as usize][b0], nodes_ref[nid as usize][b1]);
                         if c0 != MDD_DEAD { y0_ok = true; if !next.contains(&c0) { next.push(c0); } }
                         if c1 != MDD_DEAD { y1_ok = true; if !next.contains(&c1) { next.push(c1); } }
                     }
                 }
-                if !y0_ok && !y1_ok { conflict = true; break; }
-                if !y0_ok && self.assigns[yv] == LBool::Undef { forced.push((yv + 1) as Lit); break; }
-                if !y1_ok && self.assigns[yv] == LBool::Undef { forced.push(-((yv + 1) as Lit)); break; }
+                if !y0_ok && !y1_ok { conflict = true; }
+                else if !y0_ok && self.assigns[yv] == LBool::Undef { forced.push((yv + 1) as Lit); }
+                else if !y1_ok && self.assigns[yv] == LBool::Undef { forced.push(-((yv + 1) as Lit)); }
             } else if y_asgn != LBool::Undef {
-                let yv_bool = y_asgn == LBool::True;
-                let b0 = (yv_bool as usize) << 1; // x=false
-                let b1 = b0 | 1;                   // x=true
+                let b0 = ((y_asgn == LBool::True) as usize) << 1;
+                let b1 = b0 | 1;
                 let (mut x0_ok, mut x1_ok) = (false, false);
                 for &nid in &frontier {
                     if nid == MDD_LEAF { x0_ok = true; x1_ok = true; if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); } }
                     else {
-                        let (c0, c1) = (mdd.nodes[nid as usize][b0], mdd.nodes[nid as usize][b1]);
+                        let (c0, c1) = (nodes_ref[nid as usize][b0], nodes_ref[nid as usize][b1]);
                         if c0 != MDD_DEAD { x0_ok = true; if !next.contains(&c0) { next.push(c0); } }
                         if c1 != MDD_DEAD { x1_ok = true; if !next.contains(&c1) { next.push(c1); } }
                     }
                 }
-                if !x0_ok && !x1_ok { conflict = true; break; }
-                if !x0_ok && self.assigns[xv] == LBool::Undef { forced.push((xv + 1) as Lit); break; }
-                if !x1_ok && self.assigns[xv] == LBool::Undef { forced.push(-((xv + 1) as Lit)); break; }
+                if !x0_ok && !x1_ok { conflict = true; }
+                else if !x0_ok && self.assigns[xv] == LBool::Undef { forced.push((xv + 1) as Lit); }
+                else if !x1_ok && self.assigns[xv] == LBool::Undef { forced.push(-((xv + 1) as Lit)); }
             } else {
-                // Neither assigned: check which x/y values have viable branches
                 let (mut x0_ok, mut x1_ok, mut y0_ok, mut y1_ok) = (false, false, false, false);
                 for &nid in &frontier {
                     if nid == MDD_LEAF {
@@ -1104,7 +1127,7 @@ impl Solver {
                         if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); }
                     } else {
                         for b in 0..4usize {
-                            let c = mdd.nodes[nid as usize][b];
+                            let c = nodes_ref[nid as usize][b];
                             if c != MDD_DEAD {
                                 if b & 1 == 0 { x0_ok = true; } else { x1_ok = true; }
                                 if b & 2 == 0 { y0_ok = true; } else { y1_ok = true; }
@@ -1113,23 +1136,29 @@ impl Solver {
                         }
                     }
                 }
-                if !x0_ok && !x1_ok { conflict = true; break; }
-                if !y0_ok && !y1_ok { conflict = true; break; }
-                let mut did_force = false;
-                if !x0_ok && self.assigns[xv] == LBool::Undef { forced.push((xv + 1) as Lit); did_force = true; }
-                if !x1_ok && self.assigns[xv] == LBool::Undef { forced.push(-((xv + 1) as Lit)); did_force = true; }
-                if !y0_ok && self.assigns[yv] == LBool::Undef { forced.push((yv + 1) as Lit); did_force = true; }
-                if !y1_ok && self.assigns[yv] == LBool::Undef { forced.push(-((yv + 1) as Lit)); did_force = true; }
-                if did_force { break; } // recompute frontier after forced vars are enqueued
+                if !x0_ok && !x1_ok { conflict = true; }
+                else if !y0_ok && !y1_ok { conflict = true; }
+                else {
+                    if !x0_ok && self.assigns[xv] == LBool::Undef { forced.push((xv + 1) as Lit); }
+                    if !x1_ok && self.assigns[xv] == LBool::Undef { forced.push(-((xv + 1) as Lit)); }
+                    if !y0_ok && self.assigns[yv] == LBool::Undef { forced.push((yv + 1) as Lit); }
+                    if !y1_ok && self.assigns[yv] == LBool::Undef { forced.push(-((yv + 1) as Lit)); }
+                }
             }
 
-            if next.is_empty() { conflict = true; break; }
-            std::mem::swap(&mut frontier, &mut next);
+            // Store frontier for next level
+            if !conflict && level + 1 <= depth {
+                let mdd = self.mdd.as_mut().unwrap();
+                mdd.level_frontier[level + 1] = next;
+                mdd.dirty_level = level + 1;
+            }
+
+            if conflict { break; }
+            if !forced.is_empty() { break; } // let forced vars trigger re-propagation
         }
 
         if conflict { return Some(Reason::Mdd); }
 
-        // Enqueue forced literals
         for flit in forced {
             if self.lit_value(flit) == LBool::False { return Some(Reason::Mdd); }
             if self.lit_value(flit) == LBool::Undef {
