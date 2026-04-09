@@ -3606,6 +3606,7 @@ fn run_mdd_sat_search(
     // Shared counters
     let items_completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let boundaries_walked = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let extensions_pruned = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Per-stage enter/exit counters: depth = enter - exit.
     let stage_enter: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let stage_exit: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
@@ -3624,6 +3625,7 @@ fn run_mdd_sat_search(
         let result_tx = result_tx.clone();
         let items_completed = Arc::clone(&items_completed);
         let boundaries_walked = Arc::clone(&boundaries_walked);
+        let extensions_pruned = Arc::clone(&extensions_pruned);
         let stage_enter: Vec<_> = stage_enter.iter().map(Arc::clone).collect();
         let stage_exit: Vec<_> = stage_exit.iter().map(Arc::clone).collect();
         let xy_table = xy_table.clone();
@@ -3639,6 +3641,7 @@ fn run_mdd_sat_search(
             let mut w_bases: HashMap<i32, radical::Solver> = HashMap::new();
             let mut z_bases: HashMap<i32, radical::Solver> = HashMap::new();
             let mut zw_solver_cache: Option<(Vec<i32>, radical::Solver)> = None;
+            let mut ext_cache: HashMap<u128, bool> = HashMap::new();
             let spectral_w = SpectralFilter::new(ctx.problem.m(), ctx.theta);
             let spectral_z = SpectralFilter::new(ctx.problem.n, ctx.theta);
             let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
@@ -3664,10 +3667,6 @@ fn run_mdd_sat_search(
                             if z_mid_sum.abs() > ctx.middle_n as i32 || (z_mid_sum + ctx.middle_n as i32) % 2 != 0 { continue; }
                             let w_mid_sum = tuple.w - w_bnd_sum;
                             if w_mid_sum.abs() > ctx.middle_m as i32 || (w_mid_sum + ctx.middle_m as i32) % 2 != 0 { continue; }
-                            // Extension filter
-                            if ctx.mdd_extend > 0 {
-                                // TODO: check extension here when we have (x,y) info
-                            }
                             stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
                             wq.push(PipelineWork::SolveW(SolveWWork {
                                 tuple, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
@@ -3835,6 +3834,21 @@ fn run_mdd_sat_search(
                                     ctx.middle_n as i32, sz.tuple,
                                     &mut |x_bits, y_bits| {
                                         if ctx.found.load(AtomicOrdering::Relaxed) { return; }
+                                        // E1: Extension filter with cache.
+                                        if ctx.mdd_extend > 0 {
+                                            let cache_key = (sz.z_bits as u128) | ((sz.w_bits as u128) << 32)
+                                                          | ((x_bits as u128) << 64) | ((y_bits as u128) << 96);
+                                            let ext_ok = *ext_cache.entry(cache_key).or_insert_with(||
+                                                mdd_zw_first::has_extension(
+                                                    k, k + ctx.mdd_extend,
+                                                    sz.z_bits, sz.w_bits, x_bits, y_bits,
+                                                )
+                                            );
+                                            if !ext_ok {
+                                                extensions_pruned.fetch_add(1, AtomicOrdering::Relaxed);
+                                                return;
+                                            }
+                                        }
                                         stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
 
                                         // Build assumptions for XY boundary
@@ -4069,7 +4083,9 @@ fn run_mdd_sat_search(
             println!("  Stage {} ({}): {:>10} items", i, name, stage_exit[i].load(AtomicOrdering::Relaxed));
         }
         let z_done = stage_exit[2].load(AtomicOrdering::Relaxed);
+        let ext_pruned = extensions_pruned.load(AtomicOrdering::Relaxed);
         println!("  XY solves:                {:>10}", done);
+        println!("  Extensions pruned:        {:>10}", ext_pruned);
         println!("  Boundaries walked:        {:>10}", walked);
         println!("  Effective search rate:    {:.1} z/s, {:.1} bnd/s",
             z_done as f64 / elapsed.as_secs_f64(),

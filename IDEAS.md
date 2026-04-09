@@ -660,3 +660,63 @@ Verify monitor thread isn't starving workers by sleeping too long.
 ### T24. Fuse GJ equalities into quad PB terms
 Substitute equal variables directly into quad PB constraints.
 **Single commit:** After GJ, rewrite quad PB term lists to use canonical variables.
+
+---
+
+## Boundaries/s paradigm shift (2026-04-09)
+
+**Key insight**: The right optimization metric is boundaries/s (how fast we eliminate
+regions of the search space), NOT xy/s (individual XY solve throughput). Pruning a
+dead boundary early is a huge win even if per-boundary overhead increases, because
+it frees workers from wasted W/Z/XY work on that boundary.
+
+Previous ideas like --mdd-extend=1 were rejected because they lowered xy/s. That was
+the wrong metric. If an extension check prunes 52% of boundaries at 14us/call, that's
+a massive win in effective search progress.
+
+### E1. Restore extension check before XY SAT (previously worked, lost in refactor)
+Commit 48f92e0 added has_extension() into walk_xy_sub_mdd, pruning 52.5% of XY
+boundaries at ~14us/call. This was lost when the pipeline was refactored to 4 stages.
+Restore it: in the SolveZ handler's walk_xy_sub_mdd callback, before running XY SAT,
+call has_extension(k, k+1, z_bits, w_bits, x_bits, y_bits). Skip XY SAT if dead.
+**Single commit:** Add has_extension call in walk_xy_sub_mdd callback, gate with mdd_extend > 0.
+
+### E2. ZW-only boundary autocorrelation bound at stage 0
+At the Boundary stage (stage 0), we have z_bits and w_bits but no x/y. Compute the
+partial ZW autocorrelation from boundary pairs for each lag. Check if the maximum
+achievable correction from middle positions + XY can zero it. If not, prune.
+This is stronger than the current sum feasibility check (which only checks counts).
+**Single commit:** Add compute_zw_boundary_autocorr() check in Boundary handler.
+
+### E3. Extension check cache by (z_bits, w_bits, x_bits, y_bits)
+The has_extension call from E1 may be called repeatedly for the same boundary
+4-tuple across different tuples. Cache results in a thread-local HashMap<u128, bool>
+(pack 4 x u32 into u128). Avoids redundant MDD builds.
+**Single commit:** Add thread-local extension cache, benchmark hit rate.
+
+### E4. Early W spectral reject saves boundary throughput
+Currently SolveW generates W middles and filters by individual spectral bound.
+Tighten this: compute the ZW combined spectral bound and reject W values that
+can't possibly combine with any Z to meet the pair bound. This prunes W earlier,
+freeing workers for more boundaries.
+**Single commit:** Add combined ZW spectral pre-filter in SolveW brute-force loop.
+
+### E5. Conflict limit proportional to boundary promise
+Currently XY SAT uses a fixed conflict limit (5K for n>30, 50K for n<=30).
+Instead, give more conflicts to boundaries with better spectral scores (from
+the gold queue ranking). Spend less time on marginal boundaries, more on
+promising ones. Net effect: process more boundaries per second.
+**Single commit:** Scale conflict limit by gold queue priority score.
+
+### E6. Skip already-explored ZW pairs across tuples
+When a (z_bits, w_bits) pair is explored for one tuple, the W/Z work is done.
+If the same ZW pair appears for another tuple (different sum target), the
+W middles and Z solves are independent. But the boundary was already "walked."
+Track explored ZW pairs to avoid re-processing expensive stages.
+**Single commit:** Add per-worker HashSet of explored (z_bits, w_bits, tuple) triples.
+
+### E7. Batch boundary pruning with precomputed k+1 node reachability
+Build MDD at k+1, precompute which k-boundary (z_bits, w_bits) patterns are
+prefixes of valid k+1 boundaries. Store as a Bloom filter or HashSet. At stage 0,
+reject boundaries not in the set. Cost: one-time MDD build at k+1.
+**Single commit:** After loading k-MDD, build k+1 ZW-only MDD, extract valid k-prefixes.
