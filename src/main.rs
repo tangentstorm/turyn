@@ -6457,7 +6457,7 @@ mod tests {
         // Test 3: enumerate with spectral constraint
         let mut z_solver_spec = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
         sat_z_middle::fill_z_solver_quad_pb(&mut z_solver_spec, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
-        let ztab = radical::SpectralTables::new(n, k, 16);
+        let ztab = radical::SpectralTables::new(n, k, 256);
         let z_spec = radical::SpectralConstraint::from_tables(&ztab, &z_boundary, (6*n as i32 - 2) as f64 / 2.0);
         z_solver_spec.spectral = Some(z_spec);
         let mut z_spec_count = 0;
