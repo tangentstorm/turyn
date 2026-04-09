@@ -736,3 +736,10 @@ candidates per boundary, P(all fail) = 0.35^44 ≈ 0. No boundaries pruned.
 Tested: extend=1 median=538 bnd/s, extend=2 median=485 bnd/s (5 runs each).
 extend=2 prunes more candidates but the per-check cost is higher (larger MDD).
 extend=1 is the better choice for n=56 k=10.
+
+### E11. Group SolveW by w_mid_sum to share W SAT — **REJECTED**
+Group tuples with same w_mid_sum into one SolveW, run W SAT once and fan out
+SolveZ items to all matching tuples. Reduces W items from 161K to 68K (-58%).
+But bnd/s dropped from 538 to 381 (-29%). The Vec cloning overhead for fan-out
+and altered pipeline dynamics (more SolveZ items created simultaneously) cause
+a systematic regression. The W SAT reduction doesn't compensate.
