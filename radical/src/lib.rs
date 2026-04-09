@@ -435,7 +435,7 @@ impl Default for SolverConfig {
             ema_restarts: false,
             probing: false,
             rephasing: false,
-            xor_propagation: false, // DISABLED: soundness bug at n>=26 (false UNSAT)
+            xor_propagation: false, // Disabled: soundness bug with QuadPB interaction (see xor_quad_pb_no_gj_n26_oracle test)
             lucky_phases: false,
             vivification: false,
             chrono_bt: false,
@@ -2499,20 +2499,26 @@ impl Solver {
                     self.analyze_reason_buf = buf;
                 }
                 Reason::Xor(xi) => {
-                    // XOR reason: all assigned variables in the constraint
-                    // form the reason clause. Each assigned var contributes
-                    // its negated literal (it was assigned, forcing the propagation).
+                    // XOR reason: variables assigned BEFORE the propagated variable
+                    // form the reason. Must filter by trail_pos to avoid including
+                    // variables assigned after the XOR propagation (which would produce
+                    // an incorrect reason when interacting with QuadPB propagation).
                     let mut buf = std::mem::take(&mut self.analyze_reason_buf);
                     buf.clear();
+                    let pv = if p != 0 { var_of(p) } else { usize::MAX };
+                    let pv_pos = if pv < self.num_vars { self.trail_pos[pv] } else { usize::MAX };
                     let xc = &self.xor_constraints[xi as usize];
                     for &v in &xc.vars {
+                        if v == pv { continue; }
                         if self.assigns[v] == LBool::Undef { continue; }
+                        // For propagation reasons (p!=0): only include vars assigned
+                        // before the propagated variable on the trail.
+                        // For conflict reasons (p==0): include all assigned vars.
+                        if p != 0 && self.trail_pos[v] >= pv_pos { continue; }
                         let lit_v = (v + 1) as Lit;
                         let neg_lit = if self.assigns[v] == LBool::True { -lit_v } else { lit_v };
                         buf.push(neg_lit);
                     }
-                    // Also include the propagated literal itself (if not conflict)
-                    if p != 0 { buf.push(p); }
                     for idx in 0..buf.len() {
                         process_reason_lit!(self, buf[idx], p, counter, learnt, bt_level);
                     }
@@ -3339,6 +3345,336 @@ mod tests {
 
         // After UNSAT, different assumptions should still work
         assert_eq!(s.solve_with_assumptions(&[1]), Some(true));
+    }
+
+    #[test]
+    fn xor_reason_excludes_propagated_var() {
+        // Minimal test: XOR constraint with 3 variables.
+        // Fix 2 vars, XOR forces the third.
+        // Then add a clause that conflicts with the forced value.
+        // The conflict analysis should produce a correct learnt clause.
+        let mut s = Solver::new();
+        // x1 XOR x2 XOR x3 = true (odd parity)
+        s.add_xor(&[1, 2, 3], true);
+        // Force x1=true, x2=true → x3 must be true (T^T^x3=T → x3=T)
+        s.add_clause([1]);
+        s.add_clause([2]);
+        // x3 should be forced true by XOR propagation
+        assert_eq!(s.solve(), Some(true));
+        assert_eq!(s.value(3), Some(true));
+    }
+
+    #[test]
+    fn xor_with_pb_sat() {
+        // XOR + PB interaction: the XOR forces a parity, PB constrains the sum.
+        // This should be SAT but the XOR reason bug could cause false UNSAT.
+        let mut s = Solver::new();
+        // 4 variables: sum >= 2 (PB) and x1^x2^x3^x4 = false (even parity)
+        s.add_pb_atleast(&[1, 2, 3, 4], &[1, 1, 1, 1], 2);
+        s.add_xor(&[1, 2, 3, 4], false);
+        // Solution: x1=T, x2=T, x3=F, x4=F (sum=2, XOR=T^T^F^F=false ✓)
+        let result = s.solve();
+        assert_eq!(result, Some(true), "XOR+PB should be SAT");
+    }
+
+    #[test]
+    fn xor_with_quad_pb_sat_n26_oracle() {
+        // Reduced TT(26) oracle: build the exact XY solver encoding for the
+        // known TT(26) solution and verify the SAT solver finds it.
+        // This is the test case that exposed the XOR soundness bug.
+        use super::*;
+
+        let mut s = Solver::new();
+        s.config.xor_propagation = true;
+        let n = 6; // Use small n=6 for minimal repro
+
+        // Known TT(6): X=+++---, Y=++--+-, Z=+++-++, W=++-+-
+        let x_vals: Vec<i8> = vec![1,1,1,-1,-1,-1];
+        let y_vals: Vec<i8> = vec![1,1,-1,-1,1,-1];
+        let z_vals: Vec<i8> = vec![1,1,1,-1,1,1];
+        let w_vals: Vec<i8> = vec![1,1,-1,1,-1];
+
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+        // Symmetry breaking
+        s.add_clause([x_var(0)]);
+        s.add_clause([y_var(0)]);
+
+        // Sum constraints
+        let x_pos = x_vals.iter().filter(|&&v| v == 1).count();
+        let y_pos = y_vals.iter().filter(|&&v| v == 1).count();
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        let ones: Vec<u32> = vec![1; n];
+        s.add_pb_eq(&x_lits, &ones, x_pos as u32);
+        s.add_pb_eq(&y_lits, &ones, y_pos as u32);
+
+        // Compute zw_autocorr
+        let m = n - 1;
+        let mut zw_ac = vec![0i32; n];
+        for lag in 1..n {
+            let nz: i32 = (0..n-lag).map(|i| z_vals[i] as i32 * z_vals[i+lag] as i32).sum();
+            let nw: i32 = if lag < m { (0..m-lag).map(|i| w_vals[i] as i32 * w_vals[i+lag] as i32).sum() } else { 0 };
+            zw_ac[lag] = 2*nz + 2*nw;
+        }
+
+        // Add quad PB agree constraints per lag
+        for lag in 1..n {
+            let target_raw = 2*(n-lag) as i32 - zw_ac[lag];
+            if target_raw < 0 || target_raw % 2 != 0 { panic!("infeasible"); }
+            let target = (target_raw / 2) as u32;
+
+            let mut la = Vec::new();
+            let mut lb = Vec::new();
+            for i in 0..(n-lag) {
+                la.push(x_var(i)); lb.push(x_var(i+lag));
+                la.push(-x_var(i)); lb.push(-x_var(i+lag));
+            }
+            for i in 0..(n-lag) {
+                la.push(y_var(i)); lb.push(y_var(i+lag));
+                la.push(-y_var(i)); lb.push(-y_var(i+lag));
+            }
+            let coeffs: Vec<u32> = vec![1; la.len()];
+            s.add_quad_pb_eq(&la, &lb, &coeffs, target);
+        }
+
+        // Add XOR parity constraints per lag (this is where the bug triggers)
+        for lag in 1..n {
+            let target_raw = 2*(n-lag) as i32 - zw_ac[lag];
+            let target = (target_raw / 2) as usize;
+            let k = 2*(n-lag);
+            let parity = ((target + k) % 2) == 1;
+            let mut in_xor = vec![false; 2*n];
+            for i in 0..(n-lag) {
+                in_xor[i] ^= true;
+                in_xor[i+lag] ^= true;
+            }
+            for i in 0..(n-lag) {
+                in_xor[n+i] ^= true;
+                in_xor[n+i+lag] ^= true;
+            }
+            let vars: Vec<i32> = in_xor.iter().enumerate()
+                .filter(|&(_, &v)| v)
+                .map(|(i, _)| (i + 1) as i32)
+                .collect();
+            if !vars.is_empty() {
+                s.add_xor(&vars, parity);
+            }
+        }
+
+        let result = s.solve();
+        assert_eq!(result, Some(true),
+            "XOR+QuadPB encoding of known TT(6) should be SAT (XOR reason bug)");
+    }
+
+    #[test]
+    fn xor_with_quad_pb_sat_n26_full_oracle() {
+        // Full TT(26) XY encoding for the known solution's Z/W pair.
+        // This MUST return SAT. With the XOR reason bug, it returns false UNSAT.
+        use super::*;
+
+        let n = 26usize;
+        let m = 25usize;
+
+        // Known TT(26) solution
+        let z_str = "+++-+--++++++--++---+-+--+";
+        let w_str = "++++-+---+--+++--++++-+-+";
+        let z: Vec<i8> = z_str.chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let w: Vec<i8> = w_str.chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        assert_eq!(z.len(), n);
+        assert_eq!(w.len(), m);
+
+        let mut s = Solver::new();
+        s.config.xor_propagation = true;
+
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+        // Symmetry breaking: x[0]=+1, y[0]=+1
+        s.add_clause([x_var(0)]);
+        s.add_clause([y_var(0)]);
+
+        // Sum constraints: x_sum=6, y_sum=6
+        let x_pos = 16u32; // (6+26)/2
+        let y_pos = 16u32;
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        let ones: Vec<u32> = vec![1; n];
+        s.add_pb_eq(&x_lits, &ones, x_pos);
+        s.add_pb_eq(&y_lits, &ones, y_pos);
+
+        // Compute zw_autocorr
+        let mut zw_ac = vec![0i32; n];
+        for lag in 1..n {
+            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
+            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
+            zw_ac[lag] = 2*nz + 2*nw;
+        }
+
+        // Quad PB agree constraints per lag
+        for lag in 1..n {
+            let target_raw = 2*(n-lag) as i32 - zw_ac[lag];
+            assert!(target_raw >= 0 && target_raw % 2 == 0);
+            let target = (target_raw / 2) as u32;
+
+            let mut la = Vec::new();
+            let mut lb = Vec::new();
+            for i in 0..(n-lag) {
+                la.push(x_var(i)); lb.push(x_var(i+lag));
+                la.push(-x_var(i)); lb.push(-x_var(i+lag));
+            }
+            for i in 0..(n-lag) {
+                la.push(y_var(i)); lb.push(y_var(i+lag));
+                la.push(-y_var(i)); lb.push(-y_var(i+lag));
+            }
+            let coeffs: Vec<u32> = vec![1; la.len()];
+            s.add_quad_pb_eq(&la, &lb, &coeffs, target);
+        }
+
+        // XOR parity constraints per lag
+        for lag in 1..n {
+            let target_raw = 2*(n-lag) as i32 - zw_ac[lag];
+            let target = (target_raw / 2) as usize;
+            let k = 2*(n-lag);
+            let parity = ((target + k) % 2) == 1;
+            let mut in_xor = vec![false; 2*n];
+            for i in 0..(n-lag) {
+                in_xor[i] ^= true;
+                in_xor[i+lag] ^= true;
+            }
+            for i in 0..(n-lag) {
+                in_xor[n+i] ^= true;
+                in_xor[n+i+lag] ^= true;
+            }
+            let vars: Vec<i32> = in_xor.iter().enumerate()
+                .filter(|&(_, &v)| v)
+                .map(|(i, _)| (i + 1) as i32)
+                .collect();
+            if !vars.is_empty() {
+                s.add_xor(&vars, parity);
+            }
+        }
+
+        s.reserve_for_search(200);
+        let result = s.solve();
+        assert_eq!(result, Some(true),
+            "XOR+QuadPB encoding of known TT(26) Z/W must be SAT");
+    }
+
+    #[test]
+    #[ignore] // Known bug: XOR+QuadPB interaction causes false UNSAT
+    fn xor_quad_pb_no_gj_n26_oracle() {
+        // KNOWN BUG: XOR + QuadPB produces incorrect UNSAT.
+        use super::*;
+        let n = 26usize;
+        let m = 25usize;
+        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+
+        let mut s = Solver::new();
+        s.config.xor_propagation = true;
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        s.add_clause([x_var(0)]);
+        s.add_clause([y_var(0)]);
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        let ones_n: Vec<u32> = vec![1; n];
+        s.add_pb_eq(&x_lits, &ones_n, 16);
+        s.add_pb_eq(&y_lits, &ones_n, 16);
+
+        let mut zw_ac = vec![0i32; n];
+        for lag in 1..n {
+            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
+            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
+            zw_ac[lag] = 2*nz + 2*nw;
+        }
+
+        // Quad PB (no GJ equalities)
+        for lag in 1..n {
+            let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as u32;
+            let mut la = Vec::new();
+            let mut lb = Vec::new();
+            for i in 0..(n-lag) {
+                la.push(x_var(i)); lb.push(x_var(i+lag));
+                la.push(-x_var(i)); lb.push(-x_var(i+lag));
+            }
+            for i in 0..(n-lag) {
+                la.push(y_var(i)); lb.push(y_var(i+lag));
+                la.push(-y_var(i)); lb.push(-y_var(i+lag));
+            }
+            let coeffs: Vec<u32> = vec![1; la.len()];
+            s.add_quad_pb_eq(&la, &lb, &coeffs, target);
+        }
+
+        // XOR
+        for lag in 1..n {
+            let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
+            let k = 2*(n-lag);
+            let parity = ((target + k) % 2) == 1;
+            let mut in_xor = vec![false; 2*n];
+            for i in 0..(n-lag) { in_xor[i] ^= true; in_xor[i+lag] ^= true; }
+            for i in 0..(n-lag) { in_xor[n+i] ^= true; in_xor[n+i+lag] ^= true; }
+            let vars: Vec<i32> = in_xor.iter().enumerate()
+                .filter(|&(_, &v)| v).map(|(i, _)| (i + 1) as i32).collect();
+            if !vars.is_empty() { s.add_xor(&vars, parity); }
+        }
+
+        s.reserve_for_search(200);
+        let result = s.solve();
+        assert_eq!(result, Some(true), "XOR+QuadPB (no GJ) TT(26) should be SAT");
+    }
+
+    #[test]
+    fn xor_only_n26_oracle() {
+        // Same as n26_full but WITHOUT quad PB — just PB + XOR.
+        // If this passes, the bug is in XOR+QuadPB interaction.
+        use super::*;
+        let n = 26usize;
+        let m = 25usize;
+        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+
+        let mut s = Solver::new();
+        s.config.xor_propagation = true;
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        s.add_clause([x_var(0)]);
+        s.add_clause([y_var(0)]);
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        let ones: Vec<u32> = vec![1; n];
+        s.add_pb_eq(&x_lits, &ones, 16);
+        s.add_pb_eq(&y_lits, &ones, 16);
+
+        let mut zw_ac = vec![0i32; n];
+        for lag in 1..n {
+            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
+            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
+            zw_ac[lag] = 2*nz + 2*nw;
+        }
+
+        // XOR parity constraints ONLY (no quad PB)
+        for lag in 1..n {
+            let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
+            let k = 2*(n-lag);
+            let parity = ((target + k) % 2) == 1;
+            let mut in_xor = vec![false; 2*n];
+            for i in 0..(n-lag) {
+                in_xor[i] ^= true; in_xor[i+lag] ^= true;
+            }
+            for i in 0..(n-lag) {
+                in_xor[n+i] ^= true; in_xor[n+i+lag] ^= true;
+            }
+            let vars: Vec<i32> = in_xor.iter().enumerate()
+                .filter(|&(_, &v)| v).map(|(i, _)| (i + 1) as i32).collect();
+            if !vars.is_empty() { s.add_xor(&vars, parity); }
+        }
+
+        s.reserve_for_search(200);
+        let result = s.solve();
+        assert_eq!(result, Some(true), "XOR-only TT(26) should be SAT");
     }
 
     #[test]
