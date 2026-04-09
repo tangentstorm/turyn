@@ -3874,6 +3874,44 @@ fn run_mdd_sat_search(
                             };
                             if let Some(mut xy_solver) = template.prepare_candidate_solver(&candidate) {
                             // (else: flow_z_prep_fail tracked below)
+                                // Native MDD constraint: solver explores all valid XY
+                                // boundaries in a single solve() call.
+                                let use_mdd_solve = std::env::var("XY_MODE").ok().map_or(false, |v| v == "mdd");
+                                if use_mdd_solve {
+                                    let level_x: Vec<i32> = (0..ctx.xy_zw_depth).map(|l| {
+                                        let pos = ctx.xy_pos_order[l];
+                                        if pos < k { (pos + 1) as i32 } else { (n - 2*k + pos + 1) as i32 }
+                                    }).collect();
+                                    let level_y: Vec<i32> = (0..ctx.xy_zw_depth).map(|l| {
+                                        let pos = ctx.xy_pos_order[l];
+                                        if pos < k { (n + pos + 1) as i32 } else { (n + n - 2*k + pos + 1) as i32 }
+                                    }).collect();
+                                    xy_solver.add_mdd_constraint(
+                                        &ctx.mdd.nodes, sz.xy_root, ctx.xy_zw_depth,
+                                        &level_x, &level_y,
+                                    );
+                                    if n > 30 { xy_solver.set_conflict_limit(5000); }
+                                    if warm.inject_phase {
+                                        if let Some(ref ph) = warm.phase { xy_solver.set_phase(ph); }
+                                    }
+                                    stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
+                                    let result = xy_solver.solve();
+                                    items_completed.fetch_add(1, AtomicOrdering::Relaxed);
+                                    stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
+                                    match result {
+                                        Some(true) => flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed),
+                                        Some(false) => flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed),
+                                        None => flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed),
+                                    };
+                                    if result == Some(true) {
+                                        let (x, y) = template.extract_xy(&xy_solver);
+                                        if verify_tt(problem, &x, &y, &z_seq, &w_seq) {
+                                            ctx.found.store(true, AtomicOrdering::Relaxed);
+                                            let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
+                                        }
+                                    }
+                                    warm.phase = Some(xy_solver.get_phase());
+                                } else {
                                 if n > 30 { xy_solver.set_conflict_limit(5000); }
                                 if warm.inject_phase {
                                     if let Some(ref ph) = warm.phase { xy_solver.set_phase(ph); }
@@ -3932,6 +3970,7 @@ fn run_mdd_sat_search(
                                     },
                                 );
                                 warm.phase = Some(xy_solver.get_phase());
+                                } // end else (enumerate mode)
                             } else {
                                 flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
                             }
