@@ -3574,6 +3574,137 @@ mod tests {
     }
 
     #[test]
+    fn xor_quad_pb_single_lag4() {
+        // Minimal: QuadPB for all lags, but XOR ONLY for lag 4.
+        use super::*;
+        let n = 26usize;
+        let m = 25usize;
+        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+        let mut zw_ac = vec![0i32; n];
+        for lag in 1..n {
+            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
+            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
+            zw_ac[lag] = 2*nz + 2*nw;
+        }
+
+        let mut s = Solver::new();
+        s.config.xor_propagation = true;
+        s.add_clause([x_var(0)]);
+        s.add_clause([y_var(0)]);
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        let ones_n: Vec<u32> = vec![1; n];
+        s.add_pb_eq(&x_lits, &ones_n, 16);
+        s.add_pb_eq(&y_lits, &ones_n, 16);
+
+        // All quad PB
+        for lag in 1..n {
+            let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as u32;
+            let mut la = Vec::new();
+            let mut lb = Vec::new();
+            for i in 0..(n-lag) {
+                la.push(x_var(i)); lb.push(x_var(i+lag));
+                la.push(-x_var(i)); lb.push(-x_var(i+lag));
+            }
+            for i in 0..(n-lag) {
+                la.push(y_var(i)); lb.push(y_var(i+lag));
+                la.push(-y_var(i)); lb.push(-y_var(i+lag));
+            }
+            let coeffs: Vec<u32> = vec![1; la.len()];
+            s.add_quad_pb_eq(&la, &lb, &coeffs, target);
+        }
+
+        // XOR ONLY for lag 4
+        let lag = 4;
+        let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
+        let k = 2*(n-lag);
+        let parity = ((target + k) % 2) == 1;
+        let mut in_xor = vec![false; 2*n];
+        for i in 0..(n-lag) { in_xor[i] ^= true; in_xor[i+lag] ^= true; }
+        for i in 0..(n-lag) { in_xor[n+i] ^= true; in_xor[n+i+lag] ^= true; }
+        let vars: Vec<i32> = in_xor.iter().enumerate()
+            .filter(|&(_, &v)| v).map(|(i, _)| (i + 1) as i32).collect();
+        s.add_xor(&vars, parity);
+
+        s.reserve_for_search(200);
+        s.set_conflict_limit(50000);
+        let result = s.solve();
+        assert_eq!(result, Some(true), "QuadPB + single lag-4 XOR should be SAT");
+    }
+
+    #[test]
+    fn xor_quad_pb_bisect_lag() {
+        // Binary search: add XOR constraints one lag at a time to find which breaks.
+        use super::*;
+        let n = 26usize;
+        let m = 25usize;
+        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+        let mut zw_ac = vec![0i32; n];
+        for lag in 1..n {
+            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
+            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
+            zw_ac[lag] = 2*nz + 2*nw;
+        }
+
+        for max_lag in 1..n {
+            let mut s = Solver::new();
+            s.config.xor_propagation = true;
+            s.add_clause([x_var(0)]);
+            s.add_clause([y_var(0)]);
+            let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+            let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+            let ones_n: Vec<u32> = vec![1; n];
+            s.add_pb_eq(&x_lits, &ones_n, 16);
+            s.add_pb_eq(&y_lits, &ones_n, 16);
+
+            for lag in 1..n {
+                let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as u32;
+                let mut la = Vec::new();
+                let mut lb = Vec::new();
+                for i in 0..(n-lag) {
+                    la.push(x_var(i)); lb.push(x_var(i+lag));
+                    la.push(-x_var(i)); lb.push(-x_var(i+lag));
+                }
+                for i in 0..(n-lag) {
+                    la.push(y_var(i)); lb.push(y_var(i+lag));
+                    la.push(-y_var(i)); lb.push(-y_var(i+lag));
+                }
+                let coeffs: Vec<u32> = vec![1; la.len()];
+                s.add_quad_pb_eq(&la, &lb, &coeffs, target);
+            }
+
+            for lag in 1..=max_lag {
+                let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
+                let k = 2*(n-lag);
+                let parity = ((target + k) % 2) == 1;
+                let mut in_xor = vec![false; 2*n];
+                for i in 0..(n-lag) { in_xor[i] ^= true; in_xor[i+lag] ^= true; }
+                for i in 0..(n-lag) { in_xor[n+i] ^= true; in_xor[n+i+lag] ^= true; }
+                let vars: Vec<i32> = in_xor.iter().enumerate()
+                    .filter(|&(_, &v)| v).map(|(i, _)| (i + 1) as i32).collect();
+                if !vars.is_empty() { s.add_xor(&vars, parity); }
+            }
+
+            s.reserve_for_search(200);
+            s.set_conflict_limit(50000);
+            let result = s.solve();
+            if result != Some(true) {
+                panic!("FAILS at max_lag={}: result={:?}", max_lag, result);
+            }
+        }
+    }
+
+    #[test]
     #[ignore] // Known bug: XOR+QuadPB interaction causes false UNSAT
     fn xor_quad_pb_no_gj_n26_oracle() {
         // KNOWN BUG: XOR + QuadPB produces incorrect UNSAT.
