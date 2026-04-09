@@ -4222,7 +4222,7 @@ fn run_mdd_sat_search(
         // from the total search space of 2^(4n-1).
         // "Subcubes struck/s" is the k-independent measure of search progress.
         let total_bits = 4 * n - 1;  // total sign degrees of freedom
-        let bnd_bits = 8 * k;        // bits fixed by boundary (2k positions × 4 sequences)
+        let bnd_bits = 4 * k;        // bits fixed by ZW boundary (2k positions × 2 sequences)
         let subcube_bits = if total_bits > bnd_bits { total_bits - bnd_bits } else { 0 };
         let total_paths: f64 = 4.0f64.powi(2 * k as i32);
         let resolved_per_sec = if secs > 0.0 { fully_resolved / secs } else { 0.0 };
