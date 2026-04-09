@@ -190,10 +190,10 @@ fn colored_pm(seq: &PackedSeq) -> String {
 
 fn print_solution(label: &str, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &PackedSeq) {
     use std::io::Write;
-    let n = x.len();
+    let n = x.len().max(y.len()).max(z.len()).max(w.len());
     let mut buf = format!("\n{}\n", label);
     for (name, seq) in [("X", x), ("Y", y), ("Z", z), ("W", w)] {
-        let pad = " ".repeat(n - seq.len());
+        let pad = " ".repeat(n.saturating_sub(seq.len()));
         buf.push_str(&format!("{} =: '{}'{}  NB. {}\n", name, colored_pm(seq), pad, seq.sum()));
     }
     buf.push('\n');

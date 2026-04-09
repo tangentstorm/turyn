@@ -435,7 +435,7 @@ impl Default for SolverConfig {
             ema_restarts: false,
             probing: false,
             rephasing: false,
-            xor_propagation: true,
+            xor_propagation: false, // DISABLED: soundness bug at n>=26 (false UNSAT)
             lucky_phases: false,
             vivification: false,
             chrono_bt: false,
