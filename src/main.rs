@@ -3810,6 +3810,7 @@ fn run_mdd_sat_search(
                                 let w_block: Vec<i32> = ctx.w_mid_vars.iter().map(|&v| {
                                     if w_solver.value(v) == Some(true) { -v } else { v }
                                 }).collect();
+                                w_solver.reset(); // backtrack before blocking clause
                                 w_solver.add_clause(w_block);
 
                                 let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) else {
@@ -3891,8 +3892,8 @@ fn run_mdd_sat_search(
                             let z_block: Vec<i32> = ctx.z_mid_vars.iter().map(|&v| {
                                 if z_solver.value(v) == Some(true) { -v } else { v }
                             }).collect();
+                            z_solver.reset(); // backtrack before adding blocking clause
                             z_solver.add_clause(z_block);
-                            z_solver.clear_learnt_clauses();
 
                             let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, ctx.individual_bound, &mut fft_buf_z) else {
                                 flow_z_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
@@ -4014,7 +4015,6 @@ fn run_mdd_sat_search(
                                             assumptions.push(if (y_bits >> (k + i)) & 1 == 1 { y_var(n - k + i) } else { -y_var(n - k + i) });
                                         }
 
-                                        xy_solver.clear_learnt_clauses();
                                         let result = xy_solver.solve_with_assumptions(&assumptions);
                                         // ORACLE CHECK: track ALL XY solves for this boundary+tuple
                                         if sz.z_bits == 43 && sz.w_bits == 47 && sz.tuple.z == 8
@@ -6525,7 +6525,44 @@ mod tests {
         let r2b = z_solver3.solve_with_assumptions(&known_assumptions);
         eprintln!("After clearing learnt clauses: {:?}", r2b);
 
-        // Test 5: FRESH solver + blocking clause + known Z — is it the solver or the clause?
+        // Test 4c: reset BEFORE adding blocking clause (the actual fix)
+        let mut z_solver3c = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
+        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver3c, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        let _ = z_solver3c.solve();
+        let block2 = z_mid_vars.iter().map(|&v| {
+            if z_solver3c.value(v) == Some(true) { -v } else { v }
+        }).collect::<Vec<i32>>();
+        z_solver3c.reset(); // THE FIX: backtrack before adding blocking clause
+        z_solver3c.add_clause(block2);
+        eprintln!("ok flag after reset+add_clause: {}", z_solver3c.ok);
+        let r2c = z_solver3c.solve_with_assumptions(&known_assumptions);
+        eprintln!("With reset before block: {:?}", r2c);
+        assert_eq!(r2c, Some(true), "Reset before blocking clause should fix enumeration");
+
+        // Test 5: binary search for the bad learnt clause
+        let learnt = z_solver3.get_learnt_clauses();
+        eprintln!("Learnt clauses after first solve: {}", learnt.len());
+        // Test each learnt clause: which one makes the known Z UNSAT?
+        for (ci, lc) in learnt.iter().enumerate() {
+            let mut ts = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
+            sat_z_middle::fill_z_solver_quad_pb(&mut ts, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+            ts.add_clause(block.clone()); // blocking clause for Z#1
+            ts.add_clause(lc.clone());    // one learnt clause
+            let r = ts.solve_with_assumptions(&known_assumptions);
+            if r != Some(true) {
+                eprintln!("BAD LEARNT CLAUSE #{}: {:?} → {:?}", ci, lc, r);
+                // Also check: is this clause actually implied by the original constraints?
+                let mut ts2 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
+                sat_z_middle::fill_z_solver_quad_pb(&mut ts2, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+                // Check if the negation of the clause is SAT (if so, clause is NOT implied)
+                let neg: Vec<i32> = lc.iter().map(|&l| -l).collect();
+                for &l in &neg { ts2.add_clause([l]); }
+                let r3 = ts2.solve();
+                eprintln!("  Negation SAT? {:?} (if SAT, learnt clause is WRONG)", r3);
+            }
+        }
+
+        // Test 6: FRESH solver + blocking clause + known Z — is it the solver or the clause?
         let mut z_solver4 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
         sat_z_middle::fill_z_solver_quad_pb(&mut z_solver4, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
         z_solver4.add_clause(block.clone());

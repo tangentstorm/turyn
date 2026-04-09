@@ -555,7 +555,7 @@ pub struct Solver {
     conflict_limit: u64,  // 0 = no limit
 
     // State
-    ok: bool, // false if top-level conflict detected
+    pub ok: bool, // false if top-level conflict detected
     /// When true, skip quad PB incremental updates during backtrack.
     /// Used when the caller will reset quad PB state externally.
     pub skip_backtrack_quad_pb: bool,
@@ -1289,6 +1289,14 @@ impl Solver {
             }
         }
         bad
+    }
+
+    /// Get all learnt clauses as Vec<Vec<Lit>> (for debugging).
+    pub fn get_learnt_clauses(&self) -> Vec<Vec<Lit>> {
+        self.clause_meta.iter().filter(|cm| cm.learnt && !cm.deleted).map(|cm| {
+            let s = cm.start as usize;
+            self.clause_lits[s..s + cm.len as usize].to_vec()
+        }).collect()
     }
 
     /// Force recompute of ALL quad PB constraints (public, for testing).
