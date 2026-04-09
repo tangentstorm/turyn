@@ -3451,6 +3451,27 @@ fn run_mdd_sat_search(
     let lcg_mask: u64 = total_paths - 1;
     let path_counter = std::sync::atomic::AtomicU64::new(0);
 
+    // Count live ZW paths for progress estimation
+    let live_zw_paths = {
+        let mut memo = std::collections::HashMap::new();
+        fn count_zw(nid: u32, level: usize, depth: usize, nodes: &[[u32; 4]],
+                    memo: &mut std::collections::HashMap<u32, f64>) -> f64 {
+            if nid == mdd_reorder::DEAD as u32 { return 0.0; }
+            if nid == mdd_reorder::LEAF { return 4.0f64.powi((depth - level) as i32); }
+            if level >= depth { return 1.0; }
+            if let Some(&c) = memo.get(&nid) { return c; }
+            let mut s = 0.0;
+            for b in 0..4 { s += count_zw(nodes[nid as usize][b], level + 1, depth, nodes, memo); }
+            memo.insert(nid, s);
+            s
+        }
+        count_zw(mdd.root, 0, zw_depth, &mdd.nodes, &mut memo)
+    };
+    if verbose {
+        eprintln!("  {:.0} live ZW paths of {} total ({:.4}% live)",
+            live_zw_paths, total_paths, live_zw_paths / total_paths as f64 * 100.0);
+    }
+
     // Shared read-only context for all workers
     let ctx = Arc::new(PhaseBContext {
         mdd: Arc::clone(&mdd),
@@ -4172,13 +4193,18 @@ fn run_mdd_sat_search(
             let z_done = stage_exit[2].load(AtomicOrdering::Relaxed);
             let z_rate = if elapsed > 0.0 { z_done as f64 / elapsed } else { 0.0 };
             let bnd_rate = if elapsed > 0.0 { walked as f64 / elapsed } else { 0.0 };
-            eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}bnd/s {:>4.0}z/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5} gold:{:<5}  {:>4}K walked",
+            let pct_done = if live_zw_paths > 0.0 { walked as f64 / live_zw_paths * 100.0 } else { 0.0 };
+            let eta = if bnd_rate > 0.0 { (live_zw_paths - walked as f64) / bnd_rate } else { f64::INFINITY };
+            let eta_str = if eta < 3600.0 { format!("{:.0}m", eta / 60.0) }
+                         else if eta < 86400.0 { format!("{:.1}h", eta / 3600.0) }
+                         else { format!("{:.0}d", eta / 86400.0) };
+            eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}bnd/s {:>4.0}z/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5} gold:{:<5}  {:.2}% ETA {}",
                 elapsed,
                 bar(depths[0]), bar(depths[1]), bar(depths[2]), bar(depths[3]),
                 bnd_rate, z_rate,
                 depths[0], depths[1], depths[2], depths[3],
                 gold,
-                walked / 1000);
+                pct_done, eta_str);
             last_progress = Instant::now();
         }
     }
