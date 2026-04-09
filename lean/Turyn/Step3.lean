@@ -682,7 +682,70 @@ lemma circulant_cross_dot_eq_shifted_sum {m : Nat} (x y : List Int)
     (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
     listDotProduct (circulantRow m x i) (circulantRow m y j) =
       ∑ k ∈ Finset.range m, x.getD k 0 * y.getD ((k + ((i + m - j) % m)) % m) 0 := by
-  sorry
+  have hm : m ≠ 0 := by omega
+  rw [circulant_cross_dot_eq_sum x y hi hj]
+  let s := ((i + m - j) % m)
+  refine Finset.sum_nbij'
+    (i := fun k => (k + m - i) % m)
+    (j := fun t => (t + i) % m)
+    ?_ ?_ ?_ ?_ ?_
+  · intro k hk
+    exact Finset.mem_range.mpr (Nat.mod_lt _ (Nat.pos_of_ne_zero hm))
+  · intro t ht
+    exact Finset.mem_range.mpr (Nat.mod_lt _ (Nat.pos_of_ne_zero hm))
+  · intro k hk
+    change (((k + m - i) % m) + i) % m = k
+    have hk' : k < m := Finset.mem_range.mp hk
+    by_cases hki : k < i
+    · have hlt : k + m - i < m := by omega
+      rw [Nat.mod_eq_of_lt hlt]
+      have hsub : k + m - i + i = k + m := by omega
+      rw [hsub, Nat.add_mod_right, Nat.mod_eq_of_lt hk']
+    · have hle : i ≤ k := by omega
+      have hmle : m ≤ k + m - i := by omega
+      have hlt2 : k + m - i < 2 * m := by omega
+      rw [Nat.mod_eq_sub_mod hmle]
+      have hlt' : k + m - i - m < m := by omega
+      rw [Nat.mod_eq_of_lt hlt']
+      have hsub : k + m - i - m + i = k := by omega
+      rw [hsub, Nat.mod_eq_of_lt hk']
+  · intro t ht
+    change (((t + i) % m) + m - i) % m = t
+    have ht' : t < m := Finset.mem_range.mp ht
+    by_cases hsum : t + i < m
+    · rw [Nat.mod_eq_of_lt hsum]
+      have hsub : t + i + (m - i) = t + m := by omega
+      rw [show t + i + m - i = t + m by omega, Nat.add_mod_right, Nat.mod_eq_of_lt ht']
+    · have hmle : m ≤ t + i := by omega
+      have hlt2 : t + i < 2 * m := by omega
+      rw [Nat.mod_eq_sub_mod hmle]
+      have hlt' : t + i - m < m := by omega
+      rw [Nat.mod_eq_of_lt hlt']
+      have hsub : t + i - m + (m - i) = t := by omega
+      rw [show t + i - m + m - i = t by omega, Nat.mod_eq_of_lt ht']
+  · intro k hk
+    dsimp
+    have hidx : (((k + m - i) % m + s) % m) = ((k + m - j) % m) := by
+      have h1 : (((k + m - i) % m + s) % m) ≡ ((k + m - i) % m + s) [MOD m] :=
+        Nat.mod_modEq _ _
+      have h2 : ((k + m - i) % m + s) ≡ (k + m - i) + s [MOD m] :=
+        (Nat.mod_modEq (k + m - i) m).add_right s
+      have h3 : (k + m - i) + s ≡ (k + m - i) + (i + m - j) [MOD m] := by
+        dsimp [s]
+        exact (Nat.mod_modEq (i + m - j) m).add_left (k + m - i)
+      have h4 : (k + m - i) + (i + m - j) ≡ (k + m - j) + m [MOD m] := by
+        have hsub : (k + m - i) + (i + m - j) = (k + m - j) + m := by omega
+        exact hsub ▸ Nat.ModEq.refl _
+      have h5 : (k + m - j) + m ≡ k + m - j [MOD m] :=
+        Nat.add_modEq_right (a := k + m - j) (n := m)
+      have h6 : k + m - j ≡ (k + m - j) % m [MOD m] :=
+        (Nat.mod_modEq (k + m - j) m).symm
+      exact Nat.ModEq.eq_of_lt_of_lt
+        (h1.trans (h2.trans (h3.trans (h4.trans (h5.trans h6)))))
+        (Nat.mod_lt _ (Nat.pos_of_ne_zero hm))
+        (Nat.mod_lt _ (Nat.pos_of_ne_zero hm))
+    dsimp [s] at hidx ⊢
+    rw [hidx]
 
 lemma circulant_applyR_dot_eq_skew_sum {m : Nat} (x y : List Int)
     (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
