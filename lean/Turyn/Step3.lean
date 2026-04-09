@@ -1,4 +1,4 @@
-import Turyn.Step2
+import Turyn.MatrixHelp
 
 /-!
 # Step 3: Typed Matrices and Hadamard Construction
@@ -15,35 +15,6 @@ structure SquareMatrix (n : Nat) where
 /-- Row accessor for a typed square matrix. -/
 def SquareMatrix.row {n : Nat} (M : SquareMatrix n) (i : Nat) : List Int :=
   M.rows.getD i []
-
-/-- Dot product of two integer lists. -/
-def listDotProduct (a b : List Int) : Int :=
-  ((a.zip b).map fun p => p.1 * p.2).foldl (· + ·) 0
-
-/-- Reverse a row, corresponding to the reversal matrix action on columns. -/
-def applyR (row : List Int) : List Int := row.reverse
-
-/-- Negate every entry in a row. -/
-def negRow (row : List Int) : List Int := row.map (· * (-1))
-
-@[simp] theorem applyR_length (row : List Int) : (applyR row).length = row.length := by
-  simp [applyR]
-
-@[simp] theorem negRow_length (row : List Int) : (negRow row).length = row.length := by
-  simp [negRow]
-
-/-- Circulant matrix rows from a length-`m` first row. -/
-def circulantRow (m : Nat) (a : List Int) (i : Nat) : List Int :=
-  (List.range m).map fun j =>
-    a.getD ((j + m - i) % m) 0
-
-/-- Circulant matrix rows from a length-`m` first row. -/
-def circulantRows (m : Nat) (a : List Int) : List (List Int) :=
-  (List.range m).map fun i => circulantRow m a i
-
-@[simp] theorem circulantRows_length (m : Nat) (a : List Int) :
-    (circulantRows m a).length = m := by
-  simp [circulantRows]
 
 /-- Boolean check: every entry is `±1`. -/
 def allEntriesPmOne (m : List (List Int)) : Bool :=
@@ -165,10 +136,6 @@ def rawGoethalsSeidel {m : Nat} (T : TSequence m) : SquareMatrix (4 * m) :=
 @[simp] theorem rawGoethalsSeidel_dim {m : Nat} (T : TSequence m) :
     (rawGoethalsSeidel T).rows.length = 4 * m := by
   simp [rawGoethalsSeidel]
-
-@[simp] theorem circulantRow_length (m : Nat) (a : List Int) (i : Nat) :
-    (circulantRow m a i).length = m := by
-  simp [circulantRow]
 
 /-- Helper: every row in a circulantRows matrix has length m. -/
 private lemma circulantRows_getD_length (m : Nat) (a : List Int) (i : Nat) (hi : i < m) :
@@ -407,30 +374,6 @@ lemma tseqCombine_periodic_sum_identity {m : Nat} (T : TSequence m) (s : Nat) :
   intro i hi
   exact tseqCombine_periodic_summand_identity T s i
 
-lemma periodicAutocorr_eq_sum_of_length {a : List Int} {m s : Nat}
-    (ha : a.length = m) (hm : m ≠ 0) :
-    periodicAutocorr a s =
-      ∑ i ∈ Finset.range m, a.getD i 0 * a.getD ((i + s) % m) 0 := by
-  unfold periodicAutocorr
-  simp [ha, hm]
-
-lemma combinedPeriodicAutocorr_eq_sum_of_lengths
-    {a b c d : List Int} {m s : Nat}
-    (ha : a.length = m) (hb : b.length = m) (hc : c.length = m) (hd : d.length = m)
-    (hm : m ≠ 0) :
-    combinedPeriodicAutocorr a b c d s =
-      ∑ i ∈ Finset.range m,
-        (a.getD i 0 * a.getD ((i + s) % m) 0 +
-          b.getD i 0 * b.getD ((i + s) % m) 0 +
-          c.getD i 0 * c.getD ((i + s) % m) 0 +
-          d.getD i 0 * d.getD ((i + s) % m) 0) := by
-  rw [combinedPeriodicAutocorr]
-  rw [periodicAutocorr_eq_sum_of_length ha hm,
-      periodicAutocorr_eq_sum_of_length hb hm,
-      periodicAutocorr_eq_sum_of_length hc hm,
-      periodicAutocorr_eq_sum_of_length hd hm]
-  rw [← Finset.sum_add_distrib, ← Finset.sum_add_distrib, ← Finset.sum_add_distrib]
-
 /-- Layer A target: the periodic identity for the four GS-combined sequences. -/
 theorem tseqCombine_periodic_identity {m : Nat} (T : TSequence m) :
     ∀ s, combinedPeriodicAutocorr (tseqCombine1 T) (tseqCombine2 T)
@@ -498,19 +441,43 @@ def gsSequenceQuadOfTSequence {m : Nat} (T : TSequence m) : GSSequenceQuad m :=
       exact tseqCombine_periodic_vanishing T s hs1 hs2 }
 
 /-- The GS array from ±1 circulant matrices. -/
+def gsRow0 {m : Nat} (x1 x2 x3 x4 : List Int) (i : Nat) : List Int :=
+  let r1 := circulantRow m x1 i
+  let r2 := circulantRow m x2 i
+  let r3 := circulantRow m x3 i
+  let r4 := circulantRow m x4 i
+  r1 ++ applyR r2 ++ applyR r3 ++ applyR r4
+
+def gsRow1 {m : Nat} (x1 x2 x3 x4 : List Int) (i : Nat) : List Int :=
+  let r1 := circulantRow m x1 i
+  let r2 := circulantRow m x2 i
+  let r3 := circulantRow m x3 i
+  let r4 := circulantRow m x4 i
+  negRow (applyR r2) ++ r1 ++ negRow (applyR r4) ++ applyR r3
+
+def gsRow2 {m : Nat} (x1 x2 x3 x4 : List Int) (i : Nat) : List Int :=
+  let r1 := circulantRow m x1 i
+  let r2 := circulantRow m x2 i
+  let r3 := circulantRow m x3 i
+  let r4 := circulantRow m x4 i
+  negRow (applyR r3) ++ applyR r4 ++ r1 ++ negRow (applyR r2)
+
+def gsRow3 {m : Nat} (x1 x2 x3 x4 : List Int) (i : Nat) : List Int :=
+  let r1 := circulantRow m x1 i
+  let r2 := circulantRow m x2 i
+  let r3 := circulantRow m x3 i
+  let r4 := circulantRow m x4 i
+  negRow (applyR r4) ++ negRow (applyR r3) ++ applyR r2 ++ r1
+
 def gsArrayFromPmOne {m : Nat} (x1 x2 x3 x4 : List Int) : SquareMatrix (4 * m) :=
   { rows := (List.range (4 * m)).map fun i =>
       let blockRow := i / m
       let localI := i % m
-      let r1 := circulantRow m x1 localI
-      let r2 := circulantRow m x2 localI
-      let r3 := circulantRow m x3 localI
-      let r4 := circulantRow m x4 localI
       match blockRow with
-      | 0 => r1 ++ applyR r2 ++ applyR r3 ++ applyR r4
-      | 1 => negRow (applyR r2) ++ r1 ++ negRow (applyR r4) ++ applyR r3
-      | 2 => negRow (applyR r3) ++ applyR r4 ++ r1 ++ negRow (applyR r2)
-      | 3 => negRow (applyR r4) ++ negRow (applyR r3) ++ applyR r2 ++ r1
+      | 0 => gsRow0 (m := m) x1 x2 x3 x4 localI
+      | 1 => gsRow1 (m := m) x1 x2 x3 x4 localI
+      | 2 => gsRow2 (m := m) x1 x2 x3 x4 localI
+      | 3 => gsRow3 (m := m) x1 x2 x3 x4 localI
       | _ => []
     dim := by simp }
 
@@ -523,126 +490,190 @@ def gsMatrixOfTSequence {m : Nat} (T : TSequence m) : SquareMatrix (4 * m) :=
     (gsMatrixOfTSequence T).rows.length = 4 * m := by
   exact (gsMatrixOfTSequence T).dim
 
-lemma pmOne_bool_of_eq (x : Int) (hx : x = 1 ∨ x = -1) :
-    (x == 1 || x == -1) = true := by
-  rcases hx with rfl | rfl <;> decide
-
-lemma list_all_pmOne_of_forall (row : List Int)
-    (hrow : ∀ v, v ∈ row → v = 1 ∨ v = -1) :
-    row.all (fun v => v == 1 || v == -1) = true := by
-  induction row with
-  | nil =>
-      simp
-  | cons x xs ih =>
-      have hx : x = 1 ∨ x = -1 := hrow x (by simp)
-      have hxbool : (x == 1 || x == -1) = true := pmOne_bool_of_eq x hx
-      have hxs : ∀ v, v ∈ xs → v = 1 ∨ v = -1 := by
-        intro v hv
-        exact hrow v (by simp [hv])
-      simp [hxbool, ih hxs]
-
-lemma append_pmOne_mem {r₁ r₂ : List Int}
-    (h₁ : ∀ v, v ∈ r₁ → v = 1 ∨ v = -1)
-    (h₂ : ∀ v, v ∈ r₂ → v = 1 ∨ v = -1) :
-    ∀ v, v ∈ r₁ ++ r₂ → v = 1 ∨ v = -1 := by
-  intro v hv
-  simp at hv
-  rcases hv with hv | hv
-  · exact h₁ v hv
-  · exact h₂ v hv
-
-lemma applyR_pmOne_mem {row : List Int}
-    (hrow : ∀ v, v ∈ row → v = 1 ∨ v = -1) :
-    ∀ v, v ∈ applyR row → v = 1 ∨ v = -1 := by
-  intro v hv
-  have hmem : v ∈ row := by
-    simpa [applyR] using hv
-  exact hrow v hmem
-
-lemma negRow_pmOne_mem {row : List Int}
-    (hrow : ∀ v, v ∈ row → v = 1 ∨ v = -1) :
-    ∀ v, v ∈ negRow row → v = 1 ∨ v = -1 := by
-  intro v hv
-  unfold negRow at hv
-  rw [List.mem_map] at hv
-  rcases hv with ⟨u, hu, rfl⟩
-  rcases hrow u hu with hu1 | hu1 <;> simp [hu1]
-
-lemma circulantRow_pmOne_mem {m : Nat} {x : List Int}
-    (hx_len : x.length = m)
-    (hx_pm : ∀ j, j < m → x.getD j 0 = 1 ∨ x.getD j 0 = -1)
-    (i : Nat) :
-    ∀ v, v ∈ circulantRow m x i → v = 1 ∨ v = -1 := by
-  intro v hv
-  simp [circulantRow] at hv
-  rcases hv with ⟨j, hj, rfl⟩
-  have hmod : (j + m - i) % m < m := by
-    by_cases hm : m = 0
-    · subst hm
-      simp at hj
-    · exact Nat.mod_lt _ (Nat.pos_of_ne_zero hm)
-  exact hx_pm ((j + m - i) % m) hmod
-
-/-- Circulant row dot-products compute periodic autocorrelation. -/
-lemma listDotProduct_eq_sum {a b : List Int} (h : a.length = b.length) :
-    listDotProduct a b =
-      ∑ i ∈ Finset.range a.length, a.getD i 0 * b.getD i 0 := by
-  sorry
-
-lemma circulantRow_getD {m : Nat} (x : List Int) {r c : Nat} (hc : c < m) :
-    (circulantRow m x r).getD c 0 = x.getD ((c + m - r) % m) 0 := by
-  rw [List.getD_eq_getElem _ _ (by simpa [circulantRow] using hc)]
-  simp [circulantRow, hc]
-
-lemma circulantRow_dot_eq_sum {m : Nat} (x : List Int)
-    {i j : Nat} (hi : i < m) (hj : j < m) :
-    listDotProduct (circulantRow m x i) (circulantRow m x j) =
-      ∑ k ∈ Finset.range m,
-        x.getD ((k + m - i) % m) 0 * x.getD ((k + m - j) % m) 0 := by
-  sorry
-
 lemma circulantRow_dot_eq_periodic_shifted_sum {m : Nat} (x : List Int)
-    {i j : Nat} (hi : i < m) (hj : j < m) :
+    (hx : x.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
     (∑ k ∈ Finset.range m,
         x.getD ((k + m - i) % m) 0 * x.getD ((k + m - j) % m) 0) =
       periodicAutocorr x ((j + m - i) % m) := by
-  sorry
+  have hm : m ≠ 0 := by omega
+  rw [periodicAutocorr_eq_sum_of_length hx hm]
+  let s := ((j + m - i) % m)
+  refine Finset.sum_nbij'
+    (i := fun k => (k + m - j) % m)
+    (j := fun t => (t + j) % m)
+    ?_ ?_ ?_ ?_ ?_
+  · intro k hk
+    exact Finset.mem_range.mpr (Nat.mod_lt _ (Nat.pos_of_ne_zero hm))
+  · intro t ht
+    exact Finset.mem_range.mpr (Nat.mod_lt _ (Nat.pos_of_ne_zero hm))
+  · intro k hk
+    change (((k + m - j) % m) + j) % m = k
+    have hk' : k < m := Finset.mem_range.mp hk
+    by_cases hkj : k < j
+    · have hlt : k + m - j < m := by omega
+      rw [Nat.mod_eq_of_lt hlt]
+      have hsub : k + m - j + j = k + m := by omega
+      rw [hsub, Nat.add_mod_right, Nat.mod_eq_of_lt hk']
+    · have hle : j ≤ k := by omega
+      have hmle : m ≤ k + m - j := by omega
+      have hlt2 : k + m - j < 2 * m := by omega
+      rw [Nat.mod_eq_sub_mod hmle]
+      have hlt' : k + m - j - m < m := by omega
+      rw [Nat.mod_eq_of_lt hlt']
+      have hsub : k + m - j - m + j = k := by omega
+      rw [hsub, Nat.mod_eq_of_lt hk']
+  · intro t ht
+    change (((t + j) % m) + m - j) % m = t
+    have ht' : t < m := Finset.mem_range.mp ht
+    by_cases hsum : t + j < m
+    · rw [Nat.mod_eq_of_lt hsum]
+      have hsub : t + j + (m - j) = t + m := by omega
+      rw [show t + j + m - j = t + m by omega, Nat.add_mod_right, Nat.mod_eq_of_lt ht']
+    · have hmle : m ≤ t + j := by omega
+      have hlt2 : t + j < 2 * m := by omega
+      rw [Nat.mod_eq_sub_mod hmle]
+      have hlt' : t + j - m < m := by omega
+      rw [Nat.mod_eq_of_lt hlt']
+      have hsub : t + j - m + (m - j) = t := by omega
+      rw [show t + j - m + m - j = t by omega, Nat.mod_eq_of_lt ht']
+  · intro k hk
+    dsimp
+    rw [mul_comm]
+    have hidx : (((k + m - j) % m + s) % m) = ((k + m - i) % m) := by
+      have h1 : (((k + m - j) % m + s) % m) ≡ ((k + m - j) % m + s) [MOD m] :=
+        Nat.mod_modEq _ _
+      have h2 : ((k + m - j) % m + s) ≡ (k + m - j) + s [MOD m] :=
+        (Nat.mod_modEq (k + m - j) m).add_right s
+      have h3 : (k + m - j) + s ≡ (k + m - j) + (j + m - i) [MOD m] := by
+        dsimp [s]
+        exact (Nat.mod_modEq (j + m - i) m).add_left (k + m - j)
+      have h4 : (k + m - j) + (j + m - i) ≡ (k + m - i) + m [MOD m] := by
+        have hsub : (k + m - j) + (j + m - i) = (k + m - i) + m := by omega
+        exact hsub ▸ Nat.ModEq.refl _
+      have h5 : (k + m - i) + m ≡ k + m - i [MOD m] :=
+        Nat.add_modEq_right (a := k + m - i) (n := m)
+      have h6 : k + m - i ≡ (k + m - i) % m [MOD m] :=
+        (Nat.mod_modEq (k + m - i) m).symm
+      exact Nat.ModEq.eq_of_lt_of_lt
+        (h1.trans (h2.trans (h3.trans (h4.trans (h5.trans h6)))))
+        (Nat.mod_lt _ (Nat.pos_of_ne_zero hm))
+        (Nat.mod_lt _ (Nat.pos_of_ne_zero hm))
+    dsimp [s] at hidx ⊢
+    rw [hidx]
 
 theorem circulantRow_dot_eq_periodic {m : Nat} (x : List Int)
-    {i j : Nat} (hi : i < m) (hj : j < m) :
+    (hx : x.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
     listDotProduct (circulantRow m x i) (circulantRow m x j) =
       periodicAutocorr x ((j + m - i) % m) := by
   rw [circulantRow_dot_eq_sum x hi hj]
-  exact circulantRow_dot_eq_periodic_shifted_sum x hi hj
+  exact circulantRow_dot_eq_periodic_shifted_sum x hx hi hj
 
 /-- Reversal/sign variants of circulant rows still reduce to periodic autocorrelation terms. -/
-lemma applyR_dot_applyR_eq {a b : List Int} :
+lemma applyR_dot_applyR_eq {a b : List Int} (h : a.length = b.length) :
     listDotProduct (applyR a) (applyR b) = listDotProduct a b := by
-  sorry
+  exact listDotProduct_reverse a b h
 
 lemma negRow_dot_left {a b : List Int} :
     listDotProduct (negRow a) b = - listDotProduct a b := by
-  sorry
+  exact listDotProduct_negRow_left a b
 
 lemma negRow_dot_right {a b : List Int} :
     listDotProduct a (negRow b) = - listDotProduct a b := by
-  sorry
+  exact listDotProduct_negRow_right a b
 
 lemma gs_block_pair_dot_eq_periodic {m : Nat} (x : List Int)
-    {i j : Nat} (hi : i < m) (hj : j < m) :
-    True := by
-  sorry
+    (hx : x.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
+    let s := periodicAutocorr x ((j + m - i) % m)
+    listDotProduct (circulantRow m x i) (circulantRow m x j) = s ∧
+    listDotProduct (applyR (circulantRow m x i)) (applyR (circulantRow m x j)) = s ∧
+    listDotProduct (negRow (applyR (circulantRow m x i))) (applyR (circulantRow m x j)) = -s ∧
+    listDotProduct (applyR (circulantRow m x i)) (negRow (applyR (circulantRow m x j))) = -s := by
+  dsimp
+  constructor
+  · exact circulantRow_dot_eq_periodic x hx hi hj
+  constructor
+  · rw [applyR_dot_applyR_eq (by simp [circulantRow])]
+    exact circulantRow_dot_eq_periodic x hx hi hj
+  constructor
+  · rw [negRow_dot_left, applyR_dot_applyR_eq (by simp [circulantRow])]
+    rw [circulantRow_dot_eq_periodic x hx hi hj]
+  · rw [negRow_dot_right, applyR_dot_applyR_eq (by simp [circulantRow])]
+    rw [circulantRow_dot_eq_periodic x hx hi hj]
 
 /-- Reversal/sign variants of circulant rows still reduce to periodic autocorrelation terms. -/
 theorem gs_block_dot_reduces_to_periodic {m : Nat} (x : List Int)
-    (i j : Nat) :
-    True := by
-  sorry
+    (hx : x.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
+    let s := periodicAutocorr x ((j + m - i) % m)
+    listDotProduct (circulantRow m x i) (circulantRow m x j) = s ∧
+    listDotProduct (applyR (circulantRow m x i)) (applyR (circulantRow m x j)) = s ∧
+    listDotProduct (negRow (applyR (circulantRow m x i))) (applyR (circulantRow m x j)) = -s ∧
+    listDotProduct (negRow (applyR (circulantRow m x i))) (negRow (applyR (circulantRow m x j))) = s := by
+  dsimp
+  rcases gs_block_pair_dot_eq_periodic x hx hi hj with ⟨h0, h1, h2, _h3⟩
+  refine ⟨h0, h1, h2, ?_⟩
+  rw [negRow_dot_left, negRow_dot_right, applyR_dot_applyR_eq (by simp [circulantRow])]
+  rw [circulantRow_dot_eq_periodic x hx hi hj]
+  ring
+
+/-- Double negation on reversed circulant rows preserves the periodic reduction. -/
+lemma neg_applyR_dot_neg_applyR_eq_periodic {m : Nat} (x : List Int)
+    (hx : x.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
+    listDotProduct (negRow (applyR (circulantRow m x i))) (negRow (applyR (circulantRow m x j))) =
+      periodicAutocorr x ((j + m - i) % m) := by
+  rw [negRow_dot_left, negRow_dot_right, applyR_dot_applyR_eq (by simp [circulantRow])]
+  rw [circulantRow_dot_eq_periodic x hx hi hj]
+  ring
 
 /-- Same block-row case reduced to the combined periodic sum of the four GS sequences. -/
-lemma gs_same_block_row_reduces_to_combined_periodic {m : Nat} (T : TSequence m) :
-    True := by
-  sorry
+lemma gs_same_block_row_reduces_to_combined_periodic {m : Nat} (T : TSequence m)
+    {i j : Nat} (hi : i < m) (hj : j < m) :
+    let Q := gsSequenceQuadOfTSequence T
+    let s := ((j + m - i) % m)
+    listDotProduct (gsRow0 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow0 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) =
+      combinedPeriodicAutocorr Q.x1 Q.x2 Q.x3 Q.x4 s ∧
+    listDotProduct (gsRow1 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow1 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) =
+      combinedPeriodicAutocorr Q.x1 Q.x2 Q.x3 Q.x4 s ∧
+    listDotProduct (gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) =
+      combinedPeriodicAutocorr Q.x1 Q.x2 Q.x3 Q.x4 s ∧
+    listDotProduct (gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) =
+      combinedPeriodicAutocorr Q.x1 Q.x2 Q.x3 Q.x4 s := by
+  dsimp [gsRow0, gsRow1, gsRow2, gsRow3]
+  let Q := gsSequenceQuadOfTSequence T
+  let s := ((j + m - i) % m)
+  have h1 := gs_block_pair_dot_eq_periodic Q.x1 Q.x1_len hi hj
+  have h2 := gs_block_pair_dot_eq_periodic Q.x2 Q.x2_len hi hj
+  have h3 := gs_block_pair_dot_eq_periodic Q.x3 Q.x3_len hi hj
+  have h4 := gs_block_pair_dot_eq_periodic Q.x4 Q.x4_len hi hj
+  constructor
+  · repeat rw [listDotProduct_append _ _ _ _ (by simp [circulantRow])]
+    rcases h1 with ⟨h11, _, _, _⟩
+    rcases h2 with ⟨_, h22, _, _⟩
+    rcases h3 with ⟨_, h32, _, _⟩
+    rcases h4 with ⟨_, h42, _, _⟩
+    rw [h11, h22, h32, h42]
+    ring_nf
+    simp [Q, combinedPeriodicAutocorr]
+  constructor
+  · repeat rw [listDotProduct_append _ _ _ _ (by simp [circulantRow])]
+    rcases h1 with ⟨h11, _, _, _⟩
+    rcases h3 with ⟨_, h32, _, _⟩
+    rw [neg_applyR_dot_neg_applyR_eq_periodic Q.x2 Q.x2_len hi hj, h11,
+        neg_applyR_dot_neg_applyR_eq_periodic Q.x4 Q.x4_len hi hj, h32]
+    simp [Q, combinedPeriodicAutocorr, add_assoc, add_comm, add_left_comm]
+  constructor
+  · repeat rw [listDotProduct_append _ _ _ _ (by simp [circulantRow])]
+    rcases h1 with ⟨h11, _, _, _⟩
+    rcases h4 with ⟨_, h42, _, _⟩
+    rw [neg_applyR_dot_neg_applyR_eq_periodic Q.x3 Q.x3_len hi hj, h42, h11,
+        neg_applyR_dot_neg_applyR_eq_periodic Q.x2 Q.x2_len hi hj]
+    simp [Q, combinedPeriodicAutocorr, add_assoc, add_comm, add_left_comm]
+  · repeat rw [listDotProduct_append _ _ _ _ (by simp [circulantRow])]
+    rw [neg_applyR_dot_neg_applyR_eq_periodic Q.x4 Q.x4_len hi hj,
+        neg_applyR_dot_neg_applyR_eq_periodic Q.x3 Q.x3_len hi hj]
+    rcases h1 with ⟨h11, _, _, _⟩
+    rcases h2 with ⟨_, h22, _, _⟩
+    rw [h22, h11]
+    simp [Q, combinedPeriodicAutocorr, add_assoc, add_comm, add_left_comm]
 
 /-- Different block-row case reduced to the combined periodic sum of the four GS sequences. -/
 lemma gs_different_block_rows_reduce_to_combined_periodic {m : Nat} (T : TSequence m) :
@@ -650,9 +681,36 @@ lemma gs_different_block_rows_reduce_to_combined_periodic {m : Nat} (T : TSequen
   sorry
 
 /-- Distinct rows from the same GS block-row are orthogonal by the periodic vanishing identity. -/
-theorem gs_same_block_row_orthogonal {m : Nat} (T : TSequence m) :
-    True := by
-  sorry
+theorem gs_same_block_row_orthogonal {m : Nat} (T : TSequence m)
+    {i j : Nat} (hij : i ≠ j) (hi : i < m) (hj : j < m) :
+    let Q := gsSequenceQuadOfTSequence T
+    listDotProduct (gsRow0 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow0 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 ∧
+    listDotProduct (gsRow1 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow1 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 ∧
+    listDotProduct (gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 ∧
+    listDotProduct (gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 := by
+  let Q := gsSequenceQuadOfTSequence T
+  have hs1 : 1 ≤ (j + m - i) % m := by
+    have hneq : (j + m - i) % m ≠ 0 := by
+      intro h0
+      have hEq : i = j := by
+        by_cases hij' : i ≤ j
+        · have hmle : m ≤ j + m - i := by omega
+          rw [Nat.mod_eq_sub_mod hmle, Nat.mod_eq_of_lt (by omega)] at h0
+          omega
+        · have hlt : j + m - i < m := by omega
+          rw [Nat.mod_eq_of_lt hlt] at h0
+          omega
+      exact hij hEq
+    omega
+  have hslt : (j + m - i) % m < m := Nat.mod_lt _ (by omega)
+  rcases gs_same_block_row_reduces_to_combined_periodic T hi hj with ⟨h0, h1, h2, h3⟩
+  constructor
+  · rw [h0, Q.periodic_vanishing ((j + m - i) % m) hs1 hslt]
+  constructor
+  · rw [h1, Q.periodic_vanishing ((j + m - i) % m) hs1 hslt]
+  constructor
+  · rw [h2, Q.periodic_vanishing ((j + m - i) % m) hs1 hslt]
+  · rw [h3, Q.periodic_vanishing ((j + m - i) % m) hs1 hslt]
 
 /-- Rows from different GS block-rows are orthogonal by the same periodic vanishing identity. -/
 theorem gs_different_block_rows_orthogonal {m : Nat} (T : TSequence m) :
@@ -689,10 +747,10 @@ theorem gsMatrixOfTSequence_allEntriesPmOne {m : Nat} (T : TSequence m) :
   have h_block_row : i / m < 4 := by
     exact Nat.div_lt_of_lt_mul <| by omega
   interval_cases hcase : i / m
-  · exact append_pmOne_mem hx1 (append_pmOne_mem hR2 (append_pmOne_mem hR3 hR4))
-  · exact append_pmOne_mem hN2 (append_pmOne_mem hx1 (append_pmOne_mem hN4 hR3))
-  · exact append_pmOne_mem hN3 (append_pmOne_mem hR4 (append_pmOne_mem hx1 hN2))
-  · exact append_pmOne_mem hN4 (append_pmOne_mem hN3 (append_pmOne_mem hR2 hx1))
+  · simpa [gsRow0] using append_pmOne_mem hx1 (append_pmOne_mem hR2 (append_pmOne_mem hR3 hR4))
+  · simpa [gsRow1] using append_pmOne_mem hN2 (append_pmOne_mem hx1 (append_pmOne_mem hN4 hR3))
+  · simpa [gsRow2] using append_pmOne_mem hN3 (append_pmOne_mem hR4 (append_pmOne_mem hx1 hN2))
+  · simpa [gsRow3] using append_pmOne_mem hN4 (append_pmOne_mem hN3 (append_pmOne_mem hR2 hx1))
 
 /-- The final GS matrix has the expected row lengths. -/
 theorem gsMatrixOfTSequence_allRowsLength {m : Nat} (T : TSequence m) :
@@ -702,7 +760,7 @@ theorem gsMatrixOfTSequence_allRowsLength {m : Nat} (T : TSequence m) :
   intro i hi
   have h_block_row : i / m < 4 := by
     exact Nat.div_lt_of_lt_mul <| by omega
-  interval_cases hcase : i / m <;> simp [circulantRow, applyR, negRow] <;> omega
+  interval_cases hcase : i / m <;> simp [gsRow0, gsRow1, gsRow2, gsRow3, applyR, negRow] <;> omega
 
 /-- The final GS matrix satisfies the Hadamard orthogonality check. -/
 theorem gsMatrixOfTSequence_checkOrthogonality {m : Nat} (T : TSequence m) :
