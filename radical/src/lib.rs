@@ -1588,18 +1588,18 @@ impl Solver {
     }
 
     /// Save a checkpoint of the constraint database sizes.
-    /// After calling this, new clauses/PBs/quad PBs can be added and later undone
-    /// with `restore_checkpoint`. Cheap: just records 5 integers.
-    pub fn save_checkpoint(&self) -> (usize, usize, usize, usize, usize) {
+    /// After calling this, new clauses/PBs/quad PBs/XORs can be added and later undone
+    /// with `restore_checkpoint`. Cheap: just records 6 integers.
+    pub fn save_checkpoint(&self) -> (usize, usize, usize, usize, usize, usize) {
         (self.clause_meta.len(), self.clause_lits.len(),
          self.pb_constraints.len(), self.num_vars,
-         self.quad_pb_constraints.len())
+         self.quad_pb_constraints.len(), self.xor_constraints.len())
     }
 
-    /// Restore the solver to a previous checkpoint, removing all clauses/PBs/quad PBs
+    /// Restore the solver to a previous checkpoint, removing all clauses/PBs/quad PBs/XORs
     /// added after the checkpoint. Backtracks, then truncates and rebuilds watches.
-    pub fn restore_checkpoint(&mut self, cp: (usize, usize, usize, usize, usize)) {
-        let (n_clauses, n_lits, n_pbs, _n_vars, n_quad_pbs) = cp;
+    pub fn restore_checkpoint(&mut self, cp: (usize, usize, usize, usize, usize, usize)) {
+        let (n_clauses, n_lits, n_pbs, _n_vars, n_quad_pbs, n_xors) = cp;
         self.backtrack(0);
 
         // Mark post-checkpoint clauses as deleted
@@ -1629,6 +1629,14 @@ impl Solver {
             }
             for wl in &mut self.quad_pb_var_terms {
                 wl.retain(|&(qi, _, _)| (qi as usize) < n_quad_pbs);
+            }
+        }
+
+        // Remove post-checkpoint XOR constraints
+        if n_xors < self.xor_constraints.len() {
+            self.xor_constraints.truncate(n_xors);
+            for wl in &mut self.xor_var_watches {
+                wl.retain(|&xi| (xi as usize) < n_xors);
             }
         }
 
