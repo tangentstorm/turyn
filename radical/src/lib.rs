@@ -3062,6 +3062,83 @@ pub fn parse_dimacs(input: &str) -> Solver {
 mod tests {
     use super::*;
 
+    fn build_xor_quad_pb_no_gj_n26_solver(enable_xor: bool) -> Solver {
+        let n = 26usize;
+        let m = 25usize;
+        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+
+        let mut s = Solver::new();
+        s.config.xor_propagation = enable_xor;
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        s.add_clause([x_var(0)]);
+        s.add_clause([y_var(0)]);
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        let ones_n: Vec<u32> = vec![1; n];
+        s.add_pb_eq(&x_lits, &ones_n, 16);
+        s.add_pb_eq(&y_lits, &ones_n, 16);
+
+        let mut zw_ac = vec![0i32; n];
+        for lag in 1..n {
+            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
+            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
+            zw_ac[lag] = 2*nz + 2*nw;
+        }
+
+        for lag in 1..n {
+            let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as u32;
+            let mut la = Vec::new();
+            let mut lb = Vec::new();
+            for i in 0..(n-lag) {
+                la.push(x_var(i)); lb.push(x_var(i+lag));
+                la.push(-x_var(i)); lb.push(-x_var(i+lag));
+            }
+            for i in 0..(n-lag) {
+                la.push(y_var(i)); lb.push(y_var(i+lag));
+                la.push(-y_var(i)); lb.push(-y_var(i+lag));
+            }
+            let coeffs: Vec<u32> = vec![1; la.len()];
+            s.add_quad_pb_eq(&la, &lb, &coeffs, target);
+        }
+
+        if enable_xor {
+            for lag in 1..n {
+                let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
+                let k = 2*(n-lag);
+                let parity = ((target + k) % 2) == 1;
+                let mut in_xor = vec![false; 2*n];
+                for i in 0..(n-lag) {
+                    in_xor[i] ^= true;
+                    in_xor[i+lag] ^= true;
+                }
+                for i in 0..(n-lag) {
+                    in_xor[n+i] ^= true;
+                    in_xor[n+i+lag] ^= true;
+                }
+                let vars: Vec<i32> = in_xor.iter().enumerate()
+                    .filter(|&(_, &v)| v)
+                    .map(|(i, _)| (i + 1) as i32)
+                    .collect();
+                if !vars.is_empty() {
+                    s.add_xor(&vars, parity);
+                }
+            }
+        }
+
+        s.reserve_for_search(200);
+        s
+    }
+
+    fn model_lit(s: &Solver, var: usize) -> Lit {
+        if s.value(var as i32) == Some(true) {
+            var as Lit
+        } else {
+            -(var as Lit)
+        }
+    }
+
     // ── API compatibility tests (match cadical::Solver behavior) ──
 
     #[test]
@@ -3707,65 +3784,25 @@ mod tests {
     #[test]
     #[ignore] // Known bug: XOR+QuadPB interaction causes false UNSAT
     fn xor_quad_pb_no_gj_n26_oracle() {
-        // KNOWN BUG: XOR + QuadPB produces incorrect UNSAT.
-        use super::*;
-        let n = 26usize;
-        let m = 25usize;
-        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
-        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
-
-        let mut s = Solver::new();
-        s.config.xor_propagation = true;
-        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
-        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
-        s.add_clause([x_var(0)]);
-        s.add_clause([y_var(0)]);
-        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
-        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
-        let ones_n: Vec<u32> = vec![1; n];
-        s.add_pb_eq(&x_lits, &ones_n, 16);
-        s.add_pb_eq(&y_lits, &ones_n, 16);
-
-        let mut zw_ac = vec![0i32; n];
-        for lag in 1..n {
-            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
-            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
-            zw_ac[lag] = 2*nz + 2*nw;
-        }
-
-        // Quad PB (no GJ equalities)
-        for lag in 1..n {
-            let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as u32;
-            let mut la = Vec::new();
-            let mut lb = Vec::new();
-            for i in 0..(n-lag) {
-                la.push(x_var(i)); lb.push(x_var(i+lag));
-                la.push(-x_var(i)); lb.push(-x_var(i+lag));
-            }
-            for i in 0..(n-lag) {
-                la.push(y_var(i)); lb.push(y_var(i+lag));
-                la.push(-y_var(i)); lb.push(-y_var(i+lag));
-            }
-            let coeffs: Vec<u32> = vec![1; la.len()];
-            s.add_quad_pb_eq(&la, &lb, &coeffs, target);
-        }
-
-        // XOR
-        for lag in 1..n {
-            let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
-            let k = 2*(n-lag);
-            let parity = ((target + k) % 2) == 1;
-            let mut in_xor = vec![false; 2*n];
-            for i in 0..(n-lag) { in_xor[i] ^= true; in_xor[i+lag] ^= true; }
-            for i in 0..(n-lag) { in_xor[n+i] ^= true; in_xor[n+i+lag] ^= true; }
-            let vars: Vec<i32> = in_xor.iter().enumerate()
-                .filter(|&(_, &v)| v).map(|(i, _)| (i + 1) as i32).collect();
-            if !vars.is_empty() { s.add_xor(&vars, parity); }
-        }
-
-        s.reserve_for_search(200);
+        let mut s = build_xor_quad_pb_no_gj_n26_solver(true);
         let result = s.solve();
         assert_eq!(result, Some(true), "XOR+QuadPB (no GJ) TT(26) should be SAT");
+    }
+
+    #[test]
+    #[ignore] // Known bug: a SAT-consistent branch from the reference model becomes UNSAT with XOR on
+    fn xor_quad_pb_no_gj_n26_reference_branch_oracle() {
+        let mut reference = build_xor_quad_pb_no_gj_n26_solver(false);
+        assert_eq!(reference.solve(), Some(true), "reference X/Y model should exist without XOR");
+
+        // Variable 51 is the first explicit branch in the failing run; use the
+        // polarity from a real X/Y witness so this assumption stays SAT-consistent.
+        let branch_lit = model_lit(&reference, 51);
+
+        let mut s = build_xor_quad_pb_no_gj_n26_solver(true);
+        let result = s.solve_with_assumptions(&[branch_lit]);
+        assert_eq!(result, Some(true),
+            "XOR+QuadPB should stay SAT under a branch literal taken from a reference X/Y model");
     }
 
     #[test]
