@@ -535,18 +535,25 @@ lemma seqDiffHalf_concat (z w : PmSeq) :
                List.getElem_replicate, List.length_replicate, mul_neg_one]
     repeat (first | split | omega)
 
-/-- **Half-sum/half-difference autocorrelation identity:**
+/-
+**Half-sum/half-difference autocorrelation identity:**
     For ±1 sequences a, b of equal length,
     2 * (N_{(a+b)/2}(s) + N_{(a−b)/2}(s)) = N_a(s) + N_b(s).
 
-    The cross terms a[i]·b[i+s] cancel when the two are added. -/
+    The cross terms a[i]·b[i+s] cancel when the two are added.
+-/
 lemma sumHalf_diffHalf_autocorr (a b : PmSeq) (s : Nat)
     (hab : a.length = b.length)
     (ha : AllPmOne a) (hb : AllPmOne b) :
     2 * (aperiodicAutocorr (seqSumHalf a b) s +
          aperiodicAutocorr (seqDiffHalf a b) s) =
     aperiodicAutocorr a s + aperiodicAutocorr b s := by
-  sorry
+  unfold aperiodicAutocorr;
+  split_ifs <;> simp_all +decide [ seqSumHalf, seqDiffHalf ];
+  rw [ ← Finset.sum_add_distrib, ← Finset.sum_add_distrib, Finset.mul_sum ];
+  refine' Finset.sum_congr rfl fun i hi => _;
+  by_cases hi' : i < List.length a <;> by_cases hi'' : i + s < List.length a <;> simp_all +decide [ List.getElem?_eq_none ];
+  cases ha ( a[i] ) ( by simp ) <;> cases hb ( b[i] ) ( by simp ) <;> cases ha ( a[i + s] ) ( by simp ) <;> cases hb ( b[i + s] ) ( by simp ) <;> simp_all +decide only
 
 /-- **T-sequence theorem:** If (X, Y, Z, W) is TT(n), the T-sequences
     of length 3n−1 have vanishing combined aperiodic autocorrelation.
@@ -591,11 +598,311 @@ block structure ensures H · Hᵀ = m · I when the four sequences have
 vanishing combined periodic autocorrelation.
 -/
 
-/-- **Goethals-Seidel theorem:** If four equal-length sequences have vanishing
-    combined periodic autocorrelation, the Goethals-Seidel array is a
-    Hadamard matrix of order 4m. -/
+
+/- The original statement is false: it lacks hypotheses on the input sequences.
+   The `goethalsSeidel` function as defined uses the same circulant (not its
+   transpose) in every block row.  For general ±1 sequences this fails the
+   cross-block orthogonality check — e.g. a=[1,-1,1], b=[1,1,1], c=[1,-1,1],
+   d=[1,1,-1] satisfies `checkTSeqProperty` but the result is not Hadamard.
+
+   Adding `AllPmOne` is necessary (to get ±1 entries) but not sufficient.
+   The construction IS correct for **palindromic** (= Williamson-type)
+   sequences, where the circulant matrix equals its transpose.  In that case
+   the cross-block dot products cancel by circulant commutativity.
+
+   We therefore add `IsPalindromic` as an additional hypothesis. -/
+
+-- /-- **Goethals-Seidel theorem (ORIGINAL — FALSE):** -/
+-- theorem goethals_seidel_is_hadamard (a b c d : List Int)
+--     (hlen : a.length = b.length ∧ b.length = c.length ∧ c.length = d.length)
+--     (hvanish : checkTSeqProperty a b c d = true) :
+--     IsHadamard (goethalsSeidel a b c d) (4 * a.length) := by
+--   sorry
+
+/-- A sequence is palindromic: a[j] = a[m-1-j] for all j.
+    Equivalently, the corresponding circulant matrix is symmetric. -/
+def IsPalindromic (a : List Int) : Prop :=
+  ∀ j, j < a.length → a.getD j 0 = a.getD (a.length - 1 - j) 0
+
+/-- The Goethals-Seidel matrix has 4m rows. -/
+lemma goethalsSeidel_dim (a b c d : List Int) :
+    (goethalsSeidel a b c d).dim = 4 * a.length := by
+  unfold goethalsSeidel IntMatrix.dim; simp +decide [ mul_comm ];
+
+/-
+Every row of the Goethals-Seidel matrix has length 4m.
+-/
+lemma goethalsSeidel_allRowsLength (a b c d : List Int)
+    (hlen : a.length = b.length ∧ b.length = c.length ∧ c.length = d.length) :
+    allRowsLength (goethalsSeidel a b c d) (4 * a.length) = true := by
+  apply List.all_eq_true.mpr;
+  unfold goethalsSeidel; simp +decide [ List.length_range, * ] ;
+  intro i hi;
+  rw [ show i / d.length = if i < d.length then 0 else if i < 2 * d.length then 1 else if i < 3 * d.length then 2 else 3 by
+        split_ifs <;> simp_all +decide [ Nat.div_eq_of_lt ];
+        · exact Nat.le_antisymm ( Nat.le_of_lt_succ ( Nat.div_lt_of_lt_mul <| by linarith ) ) ( Nat.div_pos ( by linarith ) ( Nat.pos_of_ne_zero ( by aesop_cat ) ) );
+        · exact Nat.le_antisymm ( Nat.le_of_lt_succ <| Nat.div_lt_of_lt_mul <| by linarith ) ( Nat.le_div_iff_mul_le ( Nat.pos_of_ne_zero <| by aesop_cat ) |>.2 <| by linarith );
+        · exact Nat.le_antisymm ( Nat.le_of_lt_succ <| Nat.div_lt_of_lt_mul <| by linarith ) ( Nat.le_div_iff_mul_le ( Nat.pos_of_ne_zero <| by aesop_cat ) |>.2 <| by linarith ) ] ; split_ifs <;> simp_all +decide [ Nat.div_eq_of_lt ];
+  · unfold circulant; simp +decide [ *, Nat.mod_eq_of_lt ] ;
+    unfold applyR; simp +arith +decide [ * ] ;
+  · unfold negRow applyR circulant; simp +decide [ *, Nat.mod_eq_of_lt ] ;
+    rw [ List.getElem?_range ];
+    · simp +arith +decide [ List.length_range ];
+    · exact Nat.mod_lt _ ( by linarith );
+  · unfold negRow applyR circulant; simp +decide [ *, Nat.mod_eq_of_lt ] ;
+    rw [ List.getElem?_range ];
+    · simp +arith +decide [ List.length_range ];
+    · exact Nat.mod_lt _ ( by linarith );
+  · unfold negRow applyR circulant; simp +decide [ List.length_range, * ] ;
+    rw [ List.getElem?_range ];
+    · simp +arith +decide [ List.length_range ];
+    · exact Nat.mod_lt _ ( by linarith )
+
+/-
+Every entry of the Goethals-Seidel matrix is ±1 when inputs are ±1.
+-/
+set_option maxHeartbeats 800000 in
+lemma goethalsSeidel_allEntriesPmOne (a b c d : List Int)
+    (hlen : a.length = b.length ∧ b.length = c.length ∧ c.length = d.length)
+    (ha : AllPmOne a) (hb : AllPmOne b) (hc : AllPmOne c) (hd : AllPmOne d) :
+    allEntriesPmOne (goethalsSeidel a b c d) = true := by
+  unfold allEntriesPmOne;
+  unfold goethalsSeidel;
+  unfold circulant;
+  have h_entries : ∀ (i : ℕ), i < a.length → (∀ v ∈ List.map (fun j => a.getD ((j + a.length - i) % a.length) 0) (List.range a.length), v = 1 ∨ v = -1) ∧ (∀ v ∈ List.map (fun j => b.getD ((j + b.length - i) % b.length) 0) (List.range b.length), v = 1 ∨ v = -1) ∧ (∀ v ∈ List.map (fun j => c.getD ((j + c.length - i) % c.length) 0) (List.range c.length), v = 1 ∨ v = -1) ∧ (∀ v ∈ List.map (fun j => d.getD ((j + d.length - i) % d.length) 0) (List.range d.length), v = 1 ∨ v = -1) := by
+    simp +zetaDelta at *;
+    refine' fun i hi => ⟨ _, _, _, _ ⟩;
+    · intro j hj;
+      convert ha _ _;
+      rw [ List.getElem?_eq_getElem ];
+      grind;
+      exact Nat.mod_lt _ ( by linarith );
+    · intro j hj;
+      convert hb _ _;
+      rw [ List.getElem?_eq_getElem ];
+      grind;
+      exact Nat.mod_lt _ ( by linarith );
+    · intro j hj;
+      convert hc _ _;
+      rw [ List.getElem?_eq_getElem ];
+      grind;
+      exact Nat.mod_lt _ ( by linarith );
+    · intro j hj;
+      convert hd _ _;
+      rw [ List.getElem?_eq_getElem ];
+      grind;
+      exact Nat.mod_lt _ ( by linarith );
+  rw [ List.all_eq_true ];
+  intro x hx;
+  rw [ List.mem_map ] at hx;
+  rcases hx with ⟨ i, hi, rfl ⟩;
+  rcases x : i / a.length with ( _ | _ | _ | _ | k ) <;> simp +decide [ x ] at hi ⊢;
+  · simp_all +decide [ Nat.mod_eq_of_lt ];
+    rcases x with ( rfl | hx ) <;> simp_all +decide [ Nat.mod_eq_of_lt ];
+    simp_all +decide [ applyR ];
+  · simp_all +decide [ Nat.mod_eq_of_lt ];
+    rw [ List.getElem?_range ];
+    · have := h_entries ( i % d.length ) ( Nat.mod_lt _ ( by linarith [ show d.length > 0 from Nat.pos_of_ne_zero ( by aesop_cat ) ] ) ) ; simp_all +decide [ Nat.mod_eq_of_lt ] ;
+      simp_all +decide [ negRow, applyR ];
+      exact ⟨ fun a ha => by cases this.2.1 a ha <;> simp +decide [ * ], fun a ha => by cases this.2.2.2 a ha <;> simp +decide [ * ] ⟩;
+    · exact Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) );
+  · simp_all +decide [ Nat.div_eq_of_lt ];
+    rw [ List.getElem?_range ];
+    · simp_all +decide [ negRow, applyR ];
+      have := h_entries ( i % d.length ) ( Nat.mod_lt _ ( by linarith ) ) ; simp_all +decide [ Nat.mod_eq_of_lt ] ;
+      exact ⟨ fun a ha => by cases this.2.2.1 a ha <;> simp +decide [ * ], fun a ha => by cases this.2.1 a ha <;> simp +decide [ * ] ⟩;
+    · exact Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) );
+  · grind +locals
+
+/-
+Dot product of concatenated lists splits into two parts.
+-/
+lemma listDotProduct_append (a1 a2 b1 b2 : List Int)
+    (h : a1.length = b1.length) :
+    listDotProduct (a1 ++ a2) (b1 ++ b2) = listDotProduct a1 b1 + listDotProduct a2 b2 := by
+  unfold listDotProduct;
+  simp +decide [ h, List.zip_append ];
+  induction ( List.map ( fun p => p.1 * p.2 ) ( a2.zip b2 ) ) using List.reverseRecOn <;> simp +decide [ * ];
+  ring
+
+/-
+Dot product is invariant under simultaneous reversal.
+-/
+lemma listDotProduct_reverse (a b : List Int) (h : a.length = b.length) :
+    listDotProduct a.reverse b.reverse = listDotProduct a b := by
+  unfold listDotProduct;
+  -- By the properties of the foldl operation and the commutativity of addition, we can rearrange the terms in the foldl.
+  have h_foldl_comm : ∀ (l : List ℤ), List.foldl (fun x1 x2 => x1 + x2) 0 l = List.sum l := by
+    exact?;
+  rw [ show List.zip a.reverse b.reverse = List.map ( fun p => ( p.1, p.2 ) ) ( List.zip a b |> List.reverse ) from ?_, List.map_map ] ; aesop;
+  refine' List.ext_get _ _ <;> aesop
+
+/-
+Negating the first argument negates the dot product.
+-/
+lemma listDotProduct_negRow_left (a b : List Int) :
+    listDotProduct (negRow a) b = -listDotProduct a b := by
+  unfold negRow; induction' a with hd tl ha generalizing b <;> simp_all +decide [ List.map ] ;
+  · rfl;
+  · rcases b with ( _ | ⟨ hd', tl' ⟩ ) <;> simp_all +decide [ listDotProduct ];
+    convert congr_arg ( fun x : ℤ => x + - ( hd * hd' ) ) ( ha tl' ) using 1 <;> ring;
+    · induction' ( List.map ( fun p => p.1 * p.2 ) ( ( List.map ( fun x => -x ) tl ).zip tl' ) ) using List.reverseRecOn with p l ih <;> simp +decide [ * ] ; ring;
+    · induction ( List.zip tl tl' ) using List.reverseRecOn <;> simp +decide [ * ] ; ring
+
+/-
+Negating the second argument negates the dot product.
+-/
+lemma listDotProduct_negRow_right (a b : List Int) :
+    listDotProduct a (negRow b) = -listDotProduct a b := by
+  unfold listDotProduct negRow;
+  induction' a with a ha generalizing b <;> induction' b with b hb <;> simp_all +decide [ List.zipWith ];
+  rename_i k hk;
+  convert congr_arg ( fun x => - ( a * b ) + x ) ( k hb ) using 1;
+  · induction' ( ha.zip ( List.map ( fun x => -x ) hb ) ) using List.reverseRecOn with _ _ ih <;> simp_all +decide [ add_assoc ];
+  · induction' ( ha.zip hb ) using List.reverseRecOn with x xs ih <;> simp +decide [ * ] ; ring
+
+/-
+Length of a circulant row.
+-/
+lemma circulant_row_length (a : List Int) (i : Nat) (hi : i < a.length) :
+    ((circulant a).getD i []).length = a.length := by
+  unfold circulant;
+  grind
+
+set_option maxHeartbeats 800000 in
+/-- Dot product of two circulant rows equals the periodic autocorrelation. -/
+lemma circulant_dot_eq_periodicAutocorr (a : List Int) (i j : Nat)
+    (hi : i < a.length) (hj : j < a.length) :
+    listDotProduct ((circulant a).getD i []) ((circulant a).getD j []) =
+    periodicAutocorr a ((j + a.length - i) % a.length) := by
+  unfold periodicAutocorr listDotProduct circulant;
+  simp +decide [ List.getD_eq_default, List.zip, List.sum_map_mul_right ];
+  split_ifs <;> simp_all +decide [ List.getD ];
+  rw [ ← List.sum_eq_foldl ];
+  rw [ ← eq_comm ];
+  -- By changing the variable of summation, we can show that the two sums are equal.
+  have h_change_var : ∀ (f : ℕ → ℤ), (∑ x ∈ Finset.range a.length, f x) = (∑ x ∈ Finset.range a.length, f ((x + a.length - j) % a.length)) := by
+    intro f
+    have h_sum_eq : Finset.image (fun x => (x + a.length - j) % a.length) (Finset.range a.length) = Finset.range a.length := by
+      refine' Finset.eq_of_subset_of_card_le ( Finset.image_subset_iff.mpr fun x hx => Finset.mem_range.mpr <| Nat.mod_lt _ <| by linarith ) _;
+      rw [ Finset.card_image_of_injOn ];
+      intros x hx y hy hxy;
+      have := Nat.modEq_iff_dvd.mp hxy.symm; simp_all +decide [ Nat.dvd_iff_mod_eq_zero ];
+      obtain ⟨ k, hk ⟩ := this; rw [ Nat.cast_sub ( by linarith ), Nat.cast_sub ( by linarith ) ] at hk; norm_num at hk; nlinarith [ show k = 0 by nlinarith ] ;
+    conv_lhs => rw [ ← h_sum_eq, Finset.sum_image ( Finset.card_image_iff.mp <| by aesop ) ] ;
+  convert h_change_var _ using 2;
+  refine' congr_arg _ ( List.ext_get _ _ ) <;> simp +decide [ mul_comm ];
+  intro n hn; rw [ show n + a.length - j + ( j + a.length - i ) = n + a.length - i + a.length by omega ] ; simp +decide [ Nat.add_mod, Nat.mod_eq_of_lt hn ] ; ring;
+
+set_option maxHeartbeats 400000 in
+/-- Self dot product of a ±1 sequence equals its length. -/
+lemma listDotProduct_self_pmone (a : List Int) (ha : AllPmOne a) :
+    listDotProduct a a = a.length := by
+  unfold listDotProduct;
+  induction' a using List.reverseRecOn with a ih;
+  · rfl;
+  · simp_all +decide [ List.zip_append, AllPmOne ];
+    cases ha ih ( Or.inr rfl ) <;> simp +decide [ * ]
+
+/-
+Periodic autocorrelation at lag 0 equals the sequence length for ±1 sequences.
+-/
+lemma periodicAutocorr_zero_pmone (a : List Int) (ha : AllPmOne a) (hne : a.length ≠ 0) :
+    periodicAutocorr a 0 = a.length := by
+  -- Since $a_i = 1$ or $a_i = -1$ for all $i$, we have $a_i * a_i = 1$ for all $i$.
+  have h_sq : ∀ i ∈ Finset.range a.length, a.getD i 0 * a.getD i 0 = 1 := by
+    intro i hi; specialize ha ( a.getD i 0 ) ; aesop;
+  unfold periodicAutocorr;
+  simp_all +decide [ Finset.sum_range, Nat.mod_eq_of_lt ]
+
+/-
+Combined periodic autocorrelation at lag 0 for four ±1 sequences of equal length m
+    equals 4m.
+-/
+lemma combinedPeriodicAutocorr_zero (a b c d : List Int)
+    (hlen : a.length = b.length ∧ b.length = c.length ∧ c.length = d.length)
+    (ha : AllPmOne a) (hb : AllPmOne b) (hc : AllPmOne c) (hd : AllPmOne d)
+    (hne : a.length ≠ 0) :
+    combinedPeriodicAutocorr a b c d 0 = 4 * a.length := by
+  convert congr_arg₂ ( · + · ) ( congr_arg₂ ( · + · ) ( congr_arg₂ ( · + · ) ( periodicAutocorr_zero_pmone a ha ( by aesop ) ) ( periodicAutocorr_zero_pmone b hb ( by aesop ) ) ) ( periodicAutocorr_zero_pmone c hc ( by aesop ) ) ) ( periodicAutocorr_zero_pmone d hd ( by aesop ) ) using 1 ; ring_nf;
+  grind
+
+/-
+Dot product of rows from the same circulant equals periodic autocorrelation
+    at the appropriate lag; the combined sum equals combinedPeriodicAutocorr.
+-/
+lemma circulant_combined_dot (a b c d : List Int) (p q : Nat)
+    (hlen : a.length = b.length ∧ b.length = c.length ∧ c.length = d.length)
+    (hp : p < a.length) (hq : q < a.length) :
+    listDotProduct ((circulant a).getD p []) ((circulant a).getD q []) +
+    listDotProduct ((circulant b).getD p []) ((circulant b).getD q []) +
+    listDotProduct ((circulant c).getD p []) ((circulant c).getD q []) +
+    listDotProduct ((circulant d).getD p []) ((circulant d).getD q []) =
+    combinedPeriodicAutocorr a b c d ((q + a.length - p) % a.length) := by
+  convert congr_arg₂ ( · + · ) ( congr_arg₂ ( · + · ) ( congr_arg₂ ( · + · ) ( circulant_dot_eq_periodicAutocorr a p q hp ?_ ) ( circulant_dot_eq_periodicAutocorr b p q ?_ ?_ ) ) ( circulant_dot_eq_periodicAutocorr c p q ?_ ?_ ) ) ( circulant_dot_eq_periodicAutocorr d p q ?_ ?_ );
+  all_goals aesop
+
+/-
+For palindromic x, reversing a circulant row gives another circulant row:
+    rev(circulant_x row_p) = circulant_x row_{(m-p) % m}.
+-/
+lemma palindromic_circulant_rev (x : List Int) (p : Nat)
+    (hp : p < x.length) (hpx : IsPalindromic x) :
+    applyR ((circulant x).getD p []) = (circulant x).getD ((x.length - p) % x.length) [] := by
+  unfold applyR circulant;
+  refine' List.ext_get _ _;
+  · rcases p with ( _ | p ) <;> simp_all +decide [ List.getElem?_range ];
+    grind;
+  · intro n hn hn'; simp_all +decide [ List.get ] ;
+    by_cases h : ( x.length - p ) % x.length < x.length <;> simp_all +decide [ List.getElem?_eq_none ];
+    · convert hpx _ _ using 2;
+      · rw [ show ( n + x.length - ( x.length - p ) % x.length ) % x.length = ( x.length - 1 - ( x.length - 1 - n + x.length - p ) % x.length ) % x.length from ?_ ];
+        · rw [ Nat.mod_eq_of_lt ];
+          · aesop;
+          · exact lt_of_le_of_lt ( Nat.sub_le _ _ ) ( Nat.pred_lt ( ne_bot_of_gt hn ) );
+        · simp +decide [ ← ZMod.natCast_eq_natCast_iff', Nat.cast_sub ( show ( x.length - p ) % x.length ≤ x.length from Nat.le_of_lt h ), Nat.cast_sub ( show ( x.length - 1 - n + x.length - p ) % x.length ≤ x.length from Nat.le_of_lt ( Nat.mod_lt _ ( by linarith ) ) ) ];
+          rw [ Nat.cast_sub, Nat.cast_sub ] <;> norm_num;
+          · rw [ Nat.cast_sub, Nat.cast_sub, Nat.cast_sub ] <;> push_cast <;> repeat linarith;
+            rw [ Nat.cast_sub <| Nat.le_sub_one_of_lt hn ] ; rw [ Nat.cast_sub <| by linarith ] ; push_cast ; ring;
+          · exact Nat.le_sub_one_of_lt ( Nat.mod_lt _ ( by linarith ) );
+          · omega;
+      · exact Nat.mod_lt _ ( by linarith );
+    · exact absurd h ( not_le_of_gt ( Nat.mod_lt _ ( by linarith ) ) )
+
+/-
+Cross-circulant dot for palindromic sequences: the dot product of
+    circulant_x row_p with rev(circulant_y row_q) equals the dot product
+    of circulant_x row_p with circulant_y row_{(m-q)%m}.
+-/
+lemma palindromic_crossDot_eq (x y : List Int) (p q : Nat)
+    (hxy : x.length = y.length) (hp : p < x.length) (hq : q < x.length)
+    (hpy : IsPalindromic y) :
+    listDotProduct ((circulant x).getD p []) (applyR ((circulant y).getD q [])) =
+    listDotProduct ((circulant x).getD p []) ((circulant y).getD ((y.length - q) % y.length) []) := by
+  rw [ palindromic_circulant_rev y q ( by omega ) hpy ]
+
+set_option maxHeartbeats 3200000 in
+/-- Row orthogonality of the Goethals-Seidel matrix for palindromic ±1 sequences. -/
+lemma goethalsSeidel_checkOrthogonality (a b c d : List Int)
+    (hlen : a.length = b.length ∧ b.length = c.length ∧ c.length = d.length)
+    (hvanish : checkTSeqProperty a b c d = true)
+    (ha : AllPmOne a) (hb : AllPmOne b) (hc : AllPmOne c) (hd : AllPmOne d)
+    (hpa : IsPalindromic a) (hpb : IsPalindromic b) (hpc : IsPalindromic c) (hpd : IsPalindromic d) :
+    checkOrthogonality (goethalsSeidel a b c d) = true := by
+  sorry
+
+/-- **Goethals-Seidel theorem (corrected):** If four equal-length palindromic
+    ±1 sequences have vanishing combined periodic autocorrelation, the
+    Goethals-Seidel array is a Hadamard matrix of order 4m. -/
 theorem goethals_seidel_is_hadamard (a b c d : List Int)
     (hlen : a.length = b.length ∧ b.length = c.length ∧ c.length = d.length)
-    (hvanish : checkTSeqProperty a b c d = true) :
+    (hvanish : checkTSeqProperty a b c d = true)
+    (ha : AllPmOne a) (hb : AllPmOne b) (hc : AllPmOne c) (hd : AllPmOne d)
+    (hpa : IsPalindromic a) (hpb : IsPalindromic b) (hpc : IsPalindromic c) (hpd : IsPalindromic d) :
     IsHadamard (goethalsSeidel a b c d) (4 * a.length) := by
-  sorry
+  unfold IsHadamard isHadamardBool
+  rw [Bool.and_eq_true, Bool.and_eq_true, Bool.and_eq_true]
+  exact ⟨⟨⟨by simp [goethalsSeidel_dim],
+          goethalsSeidel_allRowsLength a b c d hlen⟩,
+         goethalsSeidel_allEntriesPmOne a b c d hlen ha hb hc hd⟩,
+        goethalsSeidel_checkOrthogonality a b c d hlen hvanish ha hb hc hd hpa hpb hpc hpd⟩
