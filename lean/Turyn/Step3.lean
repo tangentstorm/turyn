@@ -763,13 +763,32 @@ lemma circulant_trRow_dot_eq_cross_sum {m : Nat} (x y : List Int)
     (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
     listDotProduct (circulantRow m x i) (trRow (m := m) y j) =
       ∑ k ∈ Finset.range m, x.getD k 0 * y.getD ((k + i + j + 1) % m) 0 := by
-  sorry
+  rw [trRow]
+  rw [circulant_cross_dot_eq_shifted_sum x y hx hy hi (by omega)]
+  apply Finset.sum_congr rfl
+  intro k hk
+  have hinner0 : i + m - (m - 1 - j) = i + j + 1 := by
+    omega
+  have hidx : (k + ((i + m - (m - 1 - j)) % m)) % m = (k + i + j + 1) % m := by
+    rw [hinner0]
+    have hmod : (((i + j + 1) % m) % m) = (i + j + 1) % m := by rw [Nat.mod_mod]
+    have hadd := Nat.add_mod_eq_add_mod_left k hmod.symm
+    simpa [Nat.add_assoc] using hadd
+  simpa [hidx]
 
 lemma circulant_trRow_dot_swap {m : Nat} (x y : List Int)
     (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
     listDotProduct (circulantRow m x i) (trRow (m := m) y j) =
       listDotProduct (trRow (m := m) y i) (circulantRow m x j) := by
-  sorry
+  rw [circulant_trRow_dot_eq_cross_sum x y hx hy hi hj]
+  rw [listDotProduct_comm (by simp [circulantRow, trRow])]
+  rw [circulant_trRow_dot_eq_cross_sum x y hx hy hj hi]
+  apply Finset.sum_congr rfl
+  intro k hk
+  have hidx : (k + j + i + 1) % m = (k + i + j + 1) % m := by
+    have hEq : k + j + i + 1 = k + i + j + 1 := by omega
+    rw [hEq]
+  simpa [hidx]
 
 lemma applyR_trRow_dot_swap {m : Nat} (x y : List Int)
     (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
