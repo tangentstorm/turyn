@@ -151,6 +151,14 @@ lemma listDotProduct_eq_sum {a b : List Int} (h : a.length = b.length) :
           rw [Finset.sum_range_succ']
           simp [ih h, add_comm]
 
+lemma listDotProduct_comm {a b : List Int} (h : a.length = b.length) :
+    listDotProduct a b = listDotProduct b a := by
+  rw [listDotProduct_eq_sum h, listDotProduct_eq_sum h.symm]
+  rw [h]
+  apply Finset.sum_congr rfl
+  intro i hi
+  ring
+
 /-- Dot product of concatenated rows splits when the first parts have equal length. -/
 lemma listDotProduct_append (a1 a2 b1 b2 : List Int)
     (h : a1.length = b1.length) :
