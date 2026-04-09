@@ -2871,7 +2871,11 @@ impl Solver {
                     }
                     self.analyze_reason_buf = buf;
                 }
-                Reason::Decision => { unreachable!(); }
+                Reason::Decision => {
+                    // Reached a decision variable — MDD explanation over-approximate.
+                    learnt[0] = negate(p);
+                    return (learnt, bt_level);
+                }
             }
 
             // Find next literal on trail at current decision level that was seen
