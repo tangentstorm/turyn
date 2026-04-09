@@ -753,6 +753,20 @@ lemma circulant_applyR_dot_eq_skew_sum {m : Nat} (x y : List Int)
       ∑ k ∈ Finset.range m, x.getD k 0 * y.getD ((m - 1 - k + m - i - j) % m) 0 := by
   sorry
 
+/-- Pure skew-correlation sum attached to the `applyR` branch. -/
+def skewCorrSum (m : Nat) (x y : List Int) (s : Nat) : Int :=
+  ∑ k ∈ Finset.range m, x.getD k 0 * y.getD ((m - 1 - k + s) % m) 0
+
+lemma circulant_applyR_dot_eq_skewCorrSum {m : Nat} (x y : List Int)
+    (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
+    listDotProduct (circulantRow m x i) (applyR (circulantRow m y j)) =
+      skewCorrSum m x y (m - i - j) := by
+  sorry
+
+lemma skewCorrSum_swap {m : Nat} (x y : List Int) {s : Nat} :
+    skewCorrSum m x y s = skewCorrSum m y x s := by
+  sorry
+
 lemma circulant_applyR_dot_swap {m : Nat} (x y : List Int)
     (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
     listDotProduct (circulantRow m x i) (applyR (circulantRow m y j)) =
@@ -800,7 +814,20 @@ lemma applyR_applyR_dot_eq_tr_tr_swap {m : Nat} (x y : List Int)
     (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
     listDotProduct (applyR (circulantRow m x i)) (applyR (circulantRow m y j)) =
       listDotProduct (trRow (m := m) y i) (trRow (m := m) x j) := by
-  sorry
+  have hleft :
+      listDotProduct (applyR (circulantRow m x i)) (applyR (circulantRow m y j)) =
+        listDotProduct (circulantRow m x i) (circulantRow m y j) := by
+    rw [applyR_dot_applyR_eq (by simp [circulantRow])]
+  have hright :
+      listDotProduct (trRow (m := m) y i) (trRow (m := m) x j) =
+        listDotProduct (circulantRow m y (m - 1 - i)) (circulantRow m x (m - 1 - j)) := by
+    rfl
+  rw [hleft, hright]
+  have hswap :
+      listDotProduct (circulantRow m x i) (circulantRow m y j) =
+        listDotProduct (circulantRow m y (m - 1 - i)) (circulantRow m x (m - 1 - j)) := by
+    sorry
+  exact hswap
 
 lemma trRow_pmOne_mem {m : Nat} {x : List Int}
     (hx_len : x.length = m)
