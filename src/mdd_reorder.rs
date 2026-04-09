@@ -20,6 +20,28 @@ pub struct Mdd4 {
 }
 
 impl Mdd4 {
+    /// Count the number of live (non-DEAD) paths through the full MDD.
+    /// Uses memoization. Returns f64 because path counts can exceed 2^64.
+    pub fn count_live_paths(&self) -> f64 {
+        let mut cache: std::collections::HashMap<u32, f64> = std::collections::HashMap::new();
+        self.count_paths_from(self.root, 0, &mut cache)
+    }
+
+    fn count_paths_from(&self, nid: u32, level: usize, cache: &mut std::collections::HashMap<u32, f64>) -> f64 {
+        if nid == DEAD { return 0.0; }
+        if nid == LEAF {
+            let remaining = self.depth.saturating_sub(level);
+            return 4.0f64.powi(remaining as i32);
+        }
+        if level >= self.depth { return 1.0; }
+        if let Some(&c) = cache.get(&nid) { return c; }
+        let mut count = 0.0f64;
+        for b in 0..4 {
+            count += self.count_paths_from(self.nodes[nid as usize][b], level + 1, cache);
+        }
+        cache.insert(nid, count);
+        count
+    }
     /// Save to binary file. Format: magic "MDD4", k (u32), root (u32), node_count (u32), node data.
     pub fn save(&self, path: &str) -> std::io::Result<()> {
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);

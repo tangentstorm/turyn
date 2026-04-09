@@ -3060,8 +3060,12 @@ fn load_best_mdd(max_k: usize, verbose: bool) -> Option<mdd_reorder::Mdd4> {
         let path = format!("mdd-{}.bin", try_k);
         if let Some(m) = mdd_reorder::Mdd4::load(&path) {
             if verbose {
-                eprintln!("Loaded MDD from {} (k={}, {} nodes, {:.1} MB)",
-                    path, m.k, m.nodes.len(), m.nodes.len() as f64 * 16.0 / 1_048_576.0);
+                let live = m.count_live_paths();
+                let total = 4.0f64.powi(m.depth as i32);
+                let dead_frac = 1.0 - live / total;
+                eprintln!("Loaded MDD from {} (k={}, {} nodes, {:.1} MB, {:.2e} live / {:.2e} total paths, {:.4}% pruned)",
+                    path, m.k, m.nodes.len(), m.nodes.len() as f64 * 16.0 / 1_048_576.0,
+                    live, total, dead_frac * 100.0);
             }
             return Some(m);
         }
@@ -4218,27 +4222,33 @@ fn run_mdd_sat_search(
             walked_f - z_reaching_xy as f64 * timeout_frac
         };
 
-        // Key metric: each resolved boundary eliminates a subcube of size 2^(4n-1-8k)
-        // from the total search space of 2^(4n-1).
-        // "Subcubes struck/s" is the k-independent measure of search progress.
+        // Search progress metric.
+        // The MDD at width k partitions the boundary space into 4^(4k) full paths
+        // (each fixing 8k bits across Z,W,X,Y). The MDD pre-eliminates dead paths
+        // during construction. We count live paths to compute remaining work.
         let total_bits = 4 * n - 1;  // total sign degrees of freedom
-        let bnd_bits = 4 * k;        // bits fixed by ZW boundary (2k positions × 2 sequences)
+        let bnd_bits = 8 * k;        // bits fixed per full MDD path (all 4 seqs × 2k positions)
         let subcube_bits = if total_bits > bnd_bits { total_bits - bnd_bits } else { 0 };
-        let total_paths: f64 = 4.0f64.powi(2 * k as i32);
+        let live_paths = mdd.count_live_paths();
+        let total_paths = 4.0f64.powi(mdd.depth as i32);
+        let mdd_pruned_frac = 1.0 - live_paths / total_paths;
         let resolved_per_sec = if secs > 0.0 { fully_resolved / secs } else { 0.0 };
-
-        // Log2 of search configurations eliminated per second:
-        // = log2(resolved_bnd/s) + subcube_bits
-        let log2_elim = if resolved_per_sec > 1.0 {
-            resolved_per_sec.log2() + subcube_bits as f64
+        // Each live path is a subcube of 2^subcube_bits configs.
+        // MDD already eliminated (total - live) × 2^subcube_bits configs.
+        // Runtime resolves walked boundaries: each ZW boundary covers
+        // its full XY sub-tree, eliminating multiple full paths.
+        let mdd_elim_log2 = if mdd_pruned_frac > 0.0 {
+            (total_paths - live_paths).log2() + subcube_bits as f64
         } else { 0.0 };
 
-        println!("  Search space:             2^{} total ({:.0} bnd/s × 2^{} subcube = 2^{:.1} elim/s)",
-            total_bits, resolved_per_sec, subcube_bits, log2_elim);
-        println!("  Path space:               4^{} = {:.2e} paths, {:.2e} fraction/s",
-            2 * k, total_paths, if secs > 0.0 { fully_resolved / total_paths / secs } else { 0.0 });
-        println!("  XY timeout:               {:.1}%  ({} timeout / {} solved)",
-            timeout_frac * 100.0, xy_timeout_count, xy_total_solves);
+        println!("  MDD k={} pre-elimination: {:.4}% of 4^{} paths pruned (= 2^{:.1} configs eliminated for free)",
+            k, mdd_pruned_frac * 100.0, mdd.depth, mdd_elim_log2);
+        println!("  Live paths remaining:     {:.2e} ({:.2e} fraction of {:.2e})",
+            live_paths, live_paths / total_paths, total_paths);
+        println!("  Subcube per full path:    2^{} configs (8k={} boundary bits fixed)",
+            subcube_bits, bnd_bits);
+        println!("  Runtime resolved:         {:.0} ZW-bnd/s  ({:.1}% XY timeout)",
+            resolved_per_sec, timeout_frac * 100.0);
         println!("  Wall-clock:               {:>10.3?}", elapsed);
         if !found_solution { println!("No solution found."); }
 
