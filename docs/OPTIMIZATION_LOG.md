@@ -56,6 +56,26 @@ Cumulative result on n=24 MDD search (k=4):
 - n=18 k=4: 45.3ms → 47.3ms (within noise)
 - Primary exhaustive benchmark: no regression
 
+## MDD Pipeline throughput optimizations (April 2026)
+
+Baseline: n=56 mdd-k=10, 60s, ~40K XY solves (pre-optimization).
+
+| Date | Change | Measured effect |
+|---|---|---|
+| 2026-04-08 | T1: Reusable LBD buffer (eliminate per-conflict Vec alloc) + T5: 5K conflict limit on XY SAT | avg 85K XY solves (+112%) |
+| 2026-04-08 | Quad PB range constraints for Z solver: replace XNOR aux vars with native quad PB | avg 166K XY solves (+95% cumulative) |
+| 2026-04-08 | T17: Batch XY item emission (single lock per Z solve) | avg 182K XY solves (+10%) |
+| 2026-04-08 | Adaptive conflict limit (50K for n≤30, 5K for n>30) | Fixes TT(18) reliability (80%→100%) |
+| 2026-04-08 | **XY dedup: 1 solve per Z/W pair** (was ~69 redundant solves) | 3x more boundaries explored; TT(18) in 148ms |
+
+Tested and rejected:
+- EMA restarts/vivification/chrono BT for XY: all regressed
+- XOR propagation for Z solver: 5x regression
+- Fewer spectral frequencies (8): breaks TT(18) (lets through garbage)
+- More spectral frequencies (32): 50x slower Z solver
+- Fixed-point spectral (London §3.4 i16/i32): 50% regression (modern FPU wins)
+- No-multiply spectral (branch on val sign): regression (code cache pressure)
+
 ## Current baseline (latest)
 
 - Exhaustive search (n=16, theta=20000):

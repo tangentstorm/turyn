@@ -67,9 +67,19 @@ impl LagTemplate {
         LagTemplate { lags }
     }
 
-    /// Build a base solver with sum constraint + XNOR aux clauses (boundary-independent).
-    /// Clone this and call `fill_for_boundary` to get a boundary-specific solver.
+    /// Build a base solver with sum constraint (boundary-independent).
+    /// If `use_quad_pb` is true, skip XNOR aux clauses — the fill functions
+    /// will use native quad PB range constraints instead.
     pub fn build_base_solver(&self, middle_len: usize, mid_sum: i32) -> radical::Solver {
+        self.build_base_solver_inner(middle_len, mid_sum, false)
+    }
+
+    /// Quad PB mode: no XNOR aux vars, adds a "true" helper variable for linear terms.
+    pub fn build_base_solver_quad_pb(&self, middle_len: usize, mid_sum: i32) -> radical::Solver {
+        self.build_base_solver_inner(middle_len, mid_sum, true)
+    }
+
+    fn build_base_solver_inner(&self, middle_len: usize, mid_sum: i32, use_quad_pb: bool) -> radical::Solver {
         let mut solver = radical::Solver::new();
         let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
 
@@ -79,20 +89,32 @@ impl LagTemplate {
         let ones: Vec<u32> = vec![1; middle_len];
         solver.add_pb_eq(&lits, &ones, mid_ones as u32);
 
-        // XNOR aux clauses for all mid×mid pairs (boundary-independent)
-        for lag in &self.lags {
-            for (qi, &(mid_a, mid_b)) in lag.mid_mid.iter().enumerate() {
-                let a = mid_var(mid_a);
-                let b = mid_var(mid_b);
-                let aux = lag.aux_base + qi as i32;
-                solver.add_clause([-aux, -a, b]);
-                solver.add_clause([-aux, a, -b]);
-                solver.add_clause([a, b, aux]);
-                solver.add_clause([-a, -b, aux]);
+        if use_quad_pb {
+            // Add a "true" helper variable for encoding linear terms as products.
+            // var (middle_len+1) is forced to true.
+            let true_var = (middle_len + 1) as i32;
+            solver.add_clause([true_var]);
+        } else {
+            // Legacy: XNOR aux clauses for all mid×mid pairs
+            for lag in &self.lags {
+                for (qi, &(mid_a, mid_b)) in lag.mid_mid.iter().enumerate() {
+                    let a = mid_var(mid_a);
+                    let b = mid_var(mid_b);
+                    let aux = lag.aux_base + qi as i32;
+                    solver.add_clause([-aux, -a, b]);
+                    solver.add_clause([-aux, a, -b]);
+                    solver.add_clause([a, b, aux]);
+                    solver.add_clause([-a, -b, aux]);
+                }
             }
         }
 
         solver
+    }
+
+    /// Variable ID for the "true" helper variable (only valid in quad_pb mode).
+    pub fn true_var(&self, middle_len: usize) -> i32 {
+        (middle_len + 1) as i32
     }
 }
 
@@ -192,6 +214,96 @@ pub fn fill_z_solver(
                 solver.add_pb_atleast(&neg_all, &ones, all_lits.len() as u32 - adj_hi);
             }
         }
+    }
+}
+
+/// Fill a base solver with boundary-specific quad PB range constraints for Z middle.
+/// Uses native quad PB instead of XNOR aux vars — fewer variables, native propagation.
+pub fn fill_z_solver_quad_pb(
+    solver: &mut radical::Solver,
+    tmpl: &LagTemplate,
+    n: usize,
+    m: usize,
+    middle_len: usize,
+    z_boundary: &[i8],
+    w_vals: &[i8],
+) {
+    let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
+    let true_var = tmpl.true_var(middle_len);
+
+    for (s, lag) in tmpl.lags.iter().enumerate() {
+        let s = s + 1;
+
+        let nw_s: i32 = if s < m {
+            (0..m - s).map(|i| w_vals[i] as i32 * w_vals[i + s] as i32).sum()
+        } else { 0 };
+
+        let max_nz = (n - s) as i32;
+        let lo = (-max_nz).max(-max_nz - nw_s);
+        let hi = max_nz.min(max_nz - nw_s);
+
+        if lo > hi {
+            solver.add_clause(std::iter::empty::<i32>());
+            return;
+        }
+
+        let agree_lo = ((lo + max_nz) / 2) as u32;
+        let agree_hi = ((hi + max_nz) / 2) as u32;
+
+        // Compute agree_const from bnd×bnd pairs
+        let mut agree_const: u32 = 0;
+        for &(i, j) in &lag.bnd_bnd {
+            if z_boundary[i] == z_boundary[j] {
+                agree_const += 1;
+            }
+        }
+
+        let max_variable = lag.bnd_mid.len() as u32 + lag.mid_mid.len() as u32;
+
+        if agree_lo > agree_const + max_variable {
+            solver.add_clause(std::iter::empty::<i32>());
+            return;
+        }
+
+        let adj_lo = agree_lo.saturating_sub(agree_const);
+        let adj_hi = agree_hi - agree_const;
+
+        if lag.bnd_mid.is_empty() && lag.mid_mid.is_empty() {
+            if agree_const < agree_lo || agree_const > agree_hi {
+                solver.add_clause(std::iter::empty::<i32>());
+                return;
+            }
+            continue;
+        }
+
+        // Skip trivially satisfied constraints
+        if adj_lo == 0 && adj_hi >= max_variable { continue; }
+
+        // Build quad PB terms for ALL agree pairs:
+        // - bnd×mid: agree(bnd, mid) = product of (signed mid_var, true_var)
+        // - mid×mid: agree(a, b) = a·b + ¬a·¬b (2 product terms per pair)
+        let mut lits_a = Vec::with_capacity(lag.bnd_mid.len() + 2 * lag.mid_mid.len());
+        let mut lits_b = Vec::with_capacity(lag.bnd_mid.len() + 2 * lag.mid_mid.len());
+
+        // bnd×mid: agree = 1 iff mid matches boundary value
+        for &(bnd_pos, mid_idx) in &lag.bnd_mid {
+            let lit = if z_boundary[bnd_pos] == 1 { mid_var(mid_idx) } else { -mid_var(mid_idx) };
+            lits_a.push(lit);
+            lits_b.push(true_var); // product with true = just the literal
+        }
+
+        // mid×mid: agree(a,b) = a·b + ¬a·¬b
+        for &(mid_a, mid_b) in &lag.mid_mid {
+            // Both-true term
+            lits_a.push(mid_var(mid_a));
+            lits_b.push(mid_var(mid_b));
+            // Both-false term
+            lits_a.push(-mid_var(mid_a));
+            lits_b.push(-mid_var(mid_b));
+        }
+
+        let coeffs: Vec<u32> = vec![1; lits_a.len()];
+        solver.add_quad_pb_range(&lits_a, &lits_b, &coeffs, adj_lo, adj_hi);
     }
 }
 

@@ -151,6 +151,7 @@ impl QuadPbTerm {
 struct QuadPbConstraint {
     terms: Vec<QuadPbTerm>,  // single Vec instead of 10 separate ones
     target: u32,
+    target_hi: u32,         // for range constraints; equals target for equality
     num_terms: u32,
     /// Branchless counter array indexed by state: sums[0]=dead(unused), sums[1]=maybe, sums[2]=true.
     /// Replaces separate sum_true/sum_maybe fields for branch-free updates.
@@ -214,6 +215,71 @@ pub struct SpectralConstraint {
     pub values: Vec<i8>,
 }
 
+/// Pre-computed trig tables for spectral constraint (boundary-independent).
+/// Shared across all SpectralConstraint instances with the same (seq_len, k, num_freqs).
+#[derive(Clone)]
+pub struct SpectralTables {
+    pub cos_table: Vec<f32>,
+    pub sin_table: Vec<f32>,
+    pub amplitudes: Vec<f32>,
+    pub max_reduction_total: Vec<f64>,  // sum of all amplitudes per freq
+    pub num_freqs: usize,
+    pub middle_len: usize,
+    pub seq_len: usize,
+    pub k: usize,
+    /// Precomputed omega values for boundary DFT
+    omega: Vec<f64>,
+    /// Precomputed cos/sin for ALL positions (for boundary DFT)
+    pos_cos: Vec<f64>,  // [pos * num_freqs + fi]
+    pos_sin: Vec<f64>,
+}
+
+impl SpectralTables {
+    /// Build once per (seq_len, k, num_freqs). Reuse across boundaries.
+    pub fn new(seq_len: usize, k: usize, num_freqs: usize) -> Self {
+        let middle_len = seq_len - 2 * k;
+        let mut cos_table = vec![0.0f32; middle_len * num_freqs];
+        let mut sin_table = vec![0.0f32; middle_len * num_freqs];
+        let mut omega_vec = vec![0.0f64; num_freqs];
+        let mut pos_cos = vec![0.0f64; seq_len * num_freqs];
+        let mut pos_sin = vec![0.0f64; seq_len * num_freqs];
+
+        for fi in 0..num_freqs {
+            let omega = (fi as f64 + 1.0) / (num_freqs as f64 + 1.0) * std::f64::consts::PI;
+            omega_vec[fi] = omega;
+
+            for pos in 0..seq_len {
+                pos_cos[pos * num_freqs + fi] = (omega * pos as f64).cos();
+                pos_sin[pos * num_freqs + fi] = (omega * pos as f64).sin();
+            }
+
+            for vi in 0..middle_len {
+                let pos = k + vi;
+                cos_table[vi * num_freqs + fi] = pos_cos[pos * num_freqs + fi] as f32;
+                sin_table[vi * num_freqs + fi] = pos_sin[pos * num_freqs + fi] as f32;
+            }
+        }
+
+        let mut amplitudes = vec![0.0f32; middle_len * num_freqs];
+        let mut max_reduction_total = vec![0.0f64; num_freqs];
+        for vi in 0..middle_len {
+            for fi in 0..num_freqs {
+                let c = cos_table[vi * num_freqs + fi] as f64;
+                let s = sin_table[vi * num_freqs + fi] as f64;
+                let amp = (c * c + s * s).sqrt() as f32;
+                amplitudes[vi * num_freqs + fi] = amp;
+                max_reduction_total[fi] += amp as f64;
+            }
+        }
+
+        SpectralTables {
+            cos_table, sin_table, amplitudes, max_reduction_total,
+            num_freqs, middle_len, seq_len, k,
+            omega: omega_vec, pos_cos, pos_sin,
+        }
+    }
+}
+
 impl SpectralConstraint {
     /// Create a new spectral constraint.
     /// `seq_len`: total sequence length (including boundary)
@@ -228,36 +294,33 @@ impl SpectralConstraint {
         bound: f64,
         num_freqs: usize,
     ) -> Self {
-        let middle_len = seq_len - 2 * k;
+        let tables = SpectralTables::new(seq_len, k, num_freqs);
+        Self::from_tables(&tables, boundary, bound)
+    }
 
-        let mut cos_table = vec![0.0f32; middle_len * num_freqs];
-        let mut sin_table = vec![0.0f32; middle_len * num_freqs];
+    /// Create from pre-computed tables (fast: skips trig computation).
+    pub fn from_tables(tables: &SpectralTables, boundary: &[i8], bound: f64) -> Self {
+        let num_freqs = tables.num_freqs;
+        let middle_len = tables.middle_len;
+        let seq_len = tables.seq_len;
+        let k = tables.k;
+
+        // Compute boundary DFT using precomputed pos_cos/pos_sin
         let mut re_boundary = vec![0.0f64; num_freqs];
         let mut im_boundary = vec![0.0f64; num_freqs];
-
-        for fi in 0..num_freqs {
-            let omega = (fi as f64 + 1.0) / (num_freqs as f64 + 1.0) * std::f64::consts::PI;
-
-            // Boundary contribution (constant)
-            for pos in 0..seq_len {
-                if pos >= k && pos < seq_len - k { continue; } // middle
-                let val = boundary[pos] as f64;
-                re_boundary[fi] += val * (omega * pos as f64).cos();
-                im_boundary[fi] += val * (omega * pos as f64).sin();
-            }
-
-            // Middle variable cosine/sine tables
-            for vi in 0..middle_len {
-                let pos = k + vi; // position in full sequence
-                cos_table[vi * num_freqs + fi] = (omega * pos as f64).cos() as f32;
-                sin_table[vi * num_freqs + fi] = (omega * pos as f64).sin() as f32;
+        for pos in 0..seq_len {
+            if pos >= k && pos < seq_len - k { continue; }
+            let val = boundary[pos] as f64;
+            for fi in 0..num_freqs {
+                re_boundary[fi] += val * tables.pos_cos[pos * num_freqs + fi];
+                im_boundary[fi] += val * tables.pos_sin[pos * num_freqs + fi];
             }
         }
 
-        let mut sc = SpectralConstraint {
+        SpectralConstraint {
             num_seq_vars: middle_len,
-            cos_table,
-            sin_table,
+            cos_table: tables.cos_table.clone(),
+            sin_table: tables.sin_table.clone(),
             num_freqs,
             re: re_boundary.clone(),
             im: im_boundary.clone(),
@@ -265,24 +328,11 @@ impl SpectralConstraint {
             im_boundary,
             bound,
             per_freq_bound: None,
-            max_reduction: vec![0.0; num_freqs],
-            amplitudes: vec![0.0f32; middle_len * num_freqs],
+            max_reduction: tables.max_reduction_total.clone(),
+            amplitudes: tables.amplitudes.clone(),
             assigned: vec![false; middle_len],
             values: vec![0i8; middle_len],
-        };
-
-        // Precompute amplitudes and initial max_reduction (all vars unassigned)
-        for vi in 0..middle_len {
-            for fi in 0..num_freqs {
-                let c = sc.cos_table[vi * num_freqs + fi] as f64;
-                let s = sc.sin_table[vi * num_freqs + fi] as f64;
-                let amp = (c * c + s * s).sqrt() as f32;
-                sc.amplitudes[vi * num_freqs + fi] = amp;
-                sc.max_reduction[fi] += amp as f64;
-            }
         }
-
-        sc
     }
 
     /// Reset DFT sums to boundary-only state (for checkpoint/restore).
@@ -440,6 +490,7 @@ pub struct Solver {
     minimize_stack: Vec<usize>,        // stack for lit_removable()
     minimize_visited: Vec<bool>,       // visited[] for lit_removable()
     minimize_levels: Vec<bool>,        // levels_in_learnt for minimize_learnt()
+    lbd_seen: Vec<bool>,              // reusable buffer for compute_lbd (avoids per-conflict alloc)
 
     // XOR (GF(2)) constraints
     xor_constraints: Vec<XorConstraint>,
@@ -531,6 +582,7 @@ impl Solver {
             minimize_stack: Vec::new(),
             minimize_visited: Vec::new(),
             minimize_levels: Vec::new(),
+            lbd_seen: Vec::new(),
             activity: Vec::new(),
             var_inc: 1.0,
             var_decay: 0.95,
@@ -706,22 +758,29 @@ impl Solver {
         assert_eq!(lits_a.len(), lits_b.len());
         assert_eq!(lits_a.len(), coeffs.len());
 
-        for &lit in lits_a.iter().chain(lits_b.iter()) {
-            assert!(lit != 0);
-            self.ensure_var(lit.unsigned_abs() as usize);
+        // Skip ensure_var when all variables are known to exist already
+        let max_var = lits_a.iter().chain(lits_b.iter())
+            .map(|&l| l.unsigned_abs() as usize).max().unwrap_or(0);
+        if max_var > self.num_vars {
+            for &lit in lits_a.iter().chain(lits_b.iter()) {
+                self.ensure_var(lit.unsigned_abs() as usize);
+            }
         }
 
         let qi = self.quad_pb_constraints.len() as u32;
 
-        // Watch by variable + build term index
-        let mut watched = std::collections::HashSet::new();
+        // Watch by variable + build term index (dedup via contains, no HashSet alloc)
         for i in 0..lits_a.len() {
             let va = var_of(lits_a[i]);
             let vb = var_of(lits_b[i]);
-            if watched.insert(va) { self.quad_pb_var_watches[va].push(qi); }
-            if watched.insert(vb) { self.quad_pb_var_watches[vb].push(qi); }
-            self.quad_pb_var_terms[va].push((qi, i as u16, true));   // is_var_a = true
-            self.quad_pb_var_terms[vb].push((qi, i as u16, false));  // is_var_a = false
+            if !self.quad_pb_var_watches[va].contains(&qi) {
+                self.quad_pb_var_watches[va].push(qi);
+            }
+            if !self.quad_pb_var_watches[vb].contains(&qi) {
+                self.quad_pb_var_watches[vb].push(qi);
+            }
+            self.quad_pb_var_terms[va].push((qi, i as u16, true));
+            self.quad_pb_var_terms[vb].push((qi, i as u16, false));
         }
 
         let terms: Vec<QuadPbTerm> = (0..lits_a.len()).map(|i| {
@@ -737,6 +796,7 @@ impl Solver {
         }).collect();
         self.quad_pb_constraints.push(QuadPbConstraint {
             target,
+            target_hi: target,
             num_terms: terms.len() as u32,
             sums: [0, coeffs.iter().sum::<u32>() as i32, 0],
             terms,
@@ -744,6 +804,70 @@ impl Solver {
         });
 
         // Recompute from current assignments, then propagate
+        self.recompute_quad_pb(qi);
+        if self.propagate_quad_pb(qi).is_some() {
+            self.ok = false;
+        }
+    }
+
+    /// Add a quadratic PB range constraint: target_lo ≤ Σ(coeffs[i] * lits_a[i] * lits_b[i]) ≤ target_hi
+    /// Same as add_quad_pb_eq but with a range instead of exact target.
+    pub fn add_quad_pb_range(&mut self, lits_a: &[i32], lits_b: &[i32], coeffs: &[u32], target_lo: u32, target_hi: u32) {
+        if !self.ok { return; }
+        if target_lo == target_hi {
+            self.add_quad_pb_eq(lits_a, lits_b, coeffs, target_lo);
+            return;
+        }
+        assert_eq!(lits_a.len(), lits_b.len());
+        assert_eq!(lits_a.len(), coeffs.len());
+
+        // Skip ensure_var when all variables are known to exist already
+        // (common in checkpoint/restore path where base solver has all vars)
+        let max_var = lits_a.iter().chain(lits_b.iter())
+            .map(|&l| l.unsigned_abs() as usize).max().unwrap_or(0);
+        if max_var > self.num_vars {
+            for &lit in lits_a.iter().chain(lits_b.iter()) {
+                self.ensure_var(lit.unsigned_abs() as usize);
+            }
+        }
+
+        let qi = self.quad_pb_constraints.len() as u32;
+
+        // Use a Vec<bool> instead of HashSet for dedup (faster for small var counts)
+        for i in 0..lits_a.len() {
+            let va = var_of(lits_a[i]);
+            let vb = var_of(lits_b[i]);
+            // Check if already watched by scanning (O(n) but small n per constraint)
+            if !self.quad_pb_var_watches[va].contains(&qi) {
+                self.quad_pb_var_watches[va].push(qi);
+            }
+            if !self.quad_pb_var_watches[vb].contains(&qi) {
+                self.quad_pb_var_watches[vb].push(qi);
+            }
+            self.quad_pb_var_terms[va].push((qi, i as u16, true));
+            self.quad_pb_var_terms[vb].push((qi, i as u16, false));
+        }
+
+        let terms: Vec<QuadPbTerm> = (0..lits_a.len()).map(|i| {
+            QuadPbTerm {
+                lit_a: lits_a[i],
+                lit_b: lits_b[i],
+                coeff: coeffs[i] as u16,
+                var_a: var_of(lits_a[i]) as u16,
+                var_b: var_of(lits_b[i]) as u16,
+                state: 1,
+                tv_offset: (if lits_a[i] < 0 { 2u8 } else { 0 }) + (if lits_b[i] < 0 { 1 } else { 0 }),
+            }
+        }).collect();
+        self.quad_pb_constraints.push(QuadPbConstraint {
+            target: target_lo,
+            target_hi,
+            num_terms: terms.len() as u32,
+            sums: [0, coeffs.iter().sum::<u32>() as i32, 0],
+            terms,
+            stale: true,
+        });
+
         self.recompute_quad_pb(qi);
         if self.propagate_quad_pb(qi).is_some() {
             self.ok = false;
@@ -1464,17 +1588,18 @@ impl Solver {
     }
 
     /// Save a checkpoint of the constraint database sizes.
-    /// After calling this, new clauses/PBs can be added and later undone
-    /// with `restore_checkpoint`. Cheap: just records 4 integers.
-    pub fn save_checkpoint(&self) -> (usize, usize, usize, usize) {
+    /// After calling this, new clauses/PBs/quad PBs can be added and later undone
+    /// with `restore_checkpoint`. Cheap: just records 5 integers.
+    pub fn save_checkpoint(&self) -> (usize, usize, usize, usize, usize) {
         (self.clause_meta.len(), self.clause_lits.len(),
-         self.pb_constraints.len(), self.num_vars)
+         self.pb_constraints.len(), self.num_vars,
+         self.quad_pb_constraints.len())
     }
 
-    /// Restore the solver to a previous checkpoint, removing all clauses/PBs
+    /// Restore the solver to a previous checkpoint, removing all clauses/PBs/quad PBs
     /// added after the checkpoint. Backtracks, then truncates and rebuilds watches.
-    pub fn restore_checkpoint(&mut self, cp: (usize, usize, usize, usize)) {
-        let (n_clauses, n_lits, n_pbs, _n_vars) = cp;
+    pub fn restore_checkpoint(&mut self, cp: (usize, usize, usize, usize, usize)) {
+        let (n_clauses, n_lits, n_pbs, _n_vars, n_quad_pbs) = cp;
         self.backtrack(0);
 
         // Mark post-checkpoint clauses as deleted
@@ -1496,9 +1621,16 @@ impl Solver {
             wl.retain(|&ci| (ci as usize) < n_pbs);
         }
 
-        // Note: we don't remove variables (aux vars from XNOR are in base solver).
-        // We don't remove quad_pb constraints (those are also in base solver).
-        // Learnt clauses from post-checkpoint solves are cleared by watch list rebuild.
+        // Remove post-checkpoint quad PB constraints and their watch entries
+        if n_quad_pbs < self.quad_pb_constraints.len() {
+            self.quad_pb_constraints.truncate(n_quad_pbs);
+            for wl in &mut self.quad_pb_var_watches {
+                wl.retain(|&qi| (qi as usize) < n_quad_pbs);
+            }
+            for wl in &mut self.quad_pb_var_terms {
+                wl.retain(|&(qi, _, _)| (qi as usize) < n_quad_pbs);
+            }
+        }
 
         // Reset spectral constraint to boundary-only state
         if let Some(ref mut spec) = self.spectral {
@@ -1855,15 +1987,28 @@ impl Solver {
                     if xc.num_unknown == 0 { continue; } // already fully resolved (e.g. by add_xor)
                     xc.num_unknown -= 1;
                     xc.assigned_xor ^= val;
-                    if xc.num_unknown == 0 {
-                        // All assigned: check parity
-                        if xc.assigned_xor != xc.parity {
+                    // Recount unknowns from scratch. The incremental num_unknown
+                    // can be stale when multiple variables are enqueued before
+                    // propagation (e.g. solve_with_assumptions batches assumptions).
+                    let mut real_unknown = 0u32;
+                    let mut real_xor = false;
+                    for &xv in &self.xor_constraints[xi as usize].vars {
+                        if self.assigns[xv] == LBool::Undef {
+                            real_unknown += 1;
+                        } else if self.assigns[xv] == LBool::True {
+                            real_xor ^= true;
+                        }
+                    }
+                    let xc = &mut self.xor_constraints[xi as usize];
+                    xc.num_unknown = real_unknown;
+                    xc.assigned_xor = real_xor;
+
+                    if real_unknown == 0 {
+                        if real_xor != xc.parity {
                             return Some(Reason::Xor(xi));
                         }
-                    } else if xc.num_unknown == 1 {
-                        // One unknown left: force it
-                        let need_true = xc.assigned_xor ^ xc.parity;
-                        // Find the unassigned var
+                    } else if real_unknown == 1 {
+                        let need_true = real_xor ^ xc.parity;
                         let mut forced_var = 0;
                         for &xv in &xc.vars {
                             if self.assigns[xv] == LBool::Undef {
@@ -2170,6 +2315,7 @@ impl Solver {
     }
 
     /// Single-pass: finds propagation and builds explanation in one fused scan.
+    /// Supports range constraints: target <= sum <= target_hi.
     #[inline]
     fn propagate_quad_pb(&mut self, qi: u32) -> Option<Reason> {
         if self.quad_pb_constraints[qi as usize].stale {
@@ -2177,16 +2323,20 @@ impl Solver {
         }
         let qc = &self.quad_pb_constraints[qi as usize];
         let n = qc.num_terms as usize;
-        let target = qc.target as i64;
+        let target_lo = qc.target as i64;
+        let target_hi = qc.target_hi as i64;
         let sum_true = qc.sums[2] as i64;
         let sum_maybe = qc.sums[1] as i64;
 
-        if sum_true + sum_maybe < target || sum_true > target {
+        if sum_true + sum_maybe < target_lo || sum_true > target_hi {
             return Some(Reason::QuadPb(qi)); // conflict
         }
 
-        let slack_up = sum_true + sum_maybe - target;
-        let slack_down = target - sum_true;
+        // slack_up: how many more MAYBE terms can become TRUE before exceeding lower bound requirement
+        // Actually: slack_up = (sum_true + sum_maybe) - target_lo = how much we can still "lose" from maybe
+        let slack_up = sum_true + sum_maybe - target_lo;
+        // slack_down: how many more can become TRUE before exceeding upper bound
+        let slack_down = target_hi - sum_true;
         if slack_up > 0 && slack_down > 0 { return None; }
 
         for i in 0..n {
@@ -2362,20 +2512,26 @@ impl Solver {
                     self.analyze_reason_buf = buf;
                 }
                 Reason::Xor(xi) => {
-                    // XOR reason: all assigned variables in the constraint
-                    // form the reason clause. Each assigned var contributes
-                    // its negated literal (it was assigned, forcing the propagation).
+                    // XOR reason: variables assigned BEFORE the propagated variable
+                    // form the reason. Must filter by trail_pos to avoid including
+                    // variables assigned after the XOR propagation (which would produce
+                    // an incorrect reason when interacting with QuadPB propagation).
                     let mut buf = std::mem::take(&mut self.analyze_reason_buf);
                     buf.clear();
+                    let pv = if p != 0 { var_of(p) } else { usize::MAX };
+                    let pv_pos = if pv < self.num_vars { self.trail_pos[pv] } else { usize::MAX };
                     let xc = &self.xor_constraints[xi as usize];
                     for &v in &xc.vars {
+                        if v == pv { continue; }
                         if self.assigns[v] == LBool::Undef { continue; }
+                        // For propagation reasons (p!=0): only include vars assigned
+                        // before the propagated variable on the trail.
+                        // For conflict reasons (p==0): include all assigned vars.
+                        if p != 0 && self.trail_pos[v] >= pv_pos { continue; }
                         let lit_v = (v + 1) as Lit;
                         let neg_lit = if self.assigns[v] == LBool::True { -lit_v } else { lit_v };
                         buf.push(neg_lit);
                     }
-                    // Also include the propagated literal itself (if not conflict)
-                    if p != 0 { buf.push(p); }
                     for idx in 0..buf.len() {
                         process_reason_lit!(self, buf[idx], p, counter, learnt, bt_level);
                     }
@@ -2586,20 +2742,31 @@ impl Solver {
                     self.quad_pb_constraints[qi as usize].stale = true;
                 }
             }
-            // Undo XOR constraint updates
-            if !self.xor_constraints.is_empty() {
-                let val = entry.lit > 0;
-                for idx in 0..self.xor_var_watches[v].len() {
-                    let xi = self.xor_var_watches[v][idx];
-                    let xc = &mut self.xor_constraints[xi as usize];
-                    xc.num_unknown += 1;
-                    xc.assigned_xor ^= val;
-                }
-            }
             self.heap_insert(v);
         }
         self.trail_lim.truncate(level as usize);
         self.prop_head = self.trail.len();
+
+        // XOR incremental state is updated during propagation, not enqueue.
+        // A conflict can arise before a freshly enqueued literal reaches the XOR
+        // propagation phase, so blindly undoing all popped trail entries is
+        // unsound. Recompute from the surviving assignment instead.
+        if !self.xor_constraints.is_empty() {
+            for xc in &mut self.xor_constraints {
+                let mut num_unknown = xc.vars.len() as u32;
+                let mut assigned_xor = false;
+                for &v in &xc.vars {
+                    if self.assigns[v] != LBool::Undef {
+                        num_unknown -= 1;
+                        if self.assigns[v] == LBool::True {
+                            assigned_xor ^= true;
+                        }
+                    }
+                }
+                xc.num_unknown = num_unknown;
+                xc.assigned_xor = assigned_xor;
+            }
+        }
 
         // For backtrack to level 0 with external state management:
         // batch-reset all quad PB constraints (all vars Undef → all terms MAYBE).
@@ -2650,15 +2817,24 @@ impl Solver {
     }
 
     /// Compute LBD (Literal Block Distance) of a clause.
-    fn compute_lbd(&self, lits: &[Lit]) -> u32 {
-        // Use a small bitset for levels (decision levels rarely exceed a few hundred)
-        let mut seen_levels = vec![false; self.decision_level() as usize + 1];
+    fn compute_lbd(&mut self, lits: &[Lit]) -> u32 {
+        let needed = self.decision_level() as usize + 1;
+        if self.lbd_seen.len() < needed {
+            self.lbd_seen.resize(needed, false);
+        }
         let mut count = 0u32;
         for &lit in lits {
             let lv = self.level[var_of(lit)] as usize;
-            if lv < seen_levels.len() && !seen_levels[lv] {
-                seen_levels[lv] = true;
+            if lv < needed && !self.lbd_seen[lv] {
+                self.lbd_seen[lv] = true;
                 count += 1;
+            }
+        }
+        // Clear only touched entries
+        for &lit in lits {
+            let lv = self.level[var_of(lit)] as usize;
+            if lv < needed {
+                self.lbd_seen[lv] = false;
             }
         }
         count
@@ -2898,6 +3074,83 @@ pub fn parse_dimacs(input: &str) -> Solver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn build_xor_quad_pb_no_gj_n26_solver(enable_xor: bool) -> Solver {
+        let n = 26usize;
+        let m = 25usize;
+        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+
+        let mut s = Solver::new();
+        s.config.xor_propagation = enable_xor;
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        s.add_clause([x_var(0)]);
+        s.add_clause([y_var(0)]);
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        let ones_n: Vec<u32> = vec![1; n];
+        s.add_pb_eq(&x_lits, &ones_n, 16);
+        s.add_pb_eq(&y_lits, &ones_n, 16);
+
+        let mut zw_ac = vec![0i32; n];
+        for lag in 1..n {
+            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
+            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
+            zw_ac[lag] = 2*nz + 2*nw;
+        }
+
+        for lag in 1..n {
+            let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as u32;
+            let mut la = Vec::new();
+            let mut lb = Vec::new();
+            for i in 0..(n-lag) {
+                la.push(x_var(i)); lb.push(x_var(i+lag));
+                la.push(-x_var(i)); lb.push(-x_var(i+lag));
+            }
+            for i in 0..(n-lag) {
+                la.push(y_var(i)); lb.push(y_var(i+lag));
+                la.push(-y_var(i)); lb.push(-y_var(i+lag));
+            }
+            let coeffs: Vec<u32> = vec![1; la.len()];
+            s.add_quad_pb_eq(&la, &lb, &coeffs, target);
+        }
+
+        if enable_xor {
+            for lag in 1..n {
+                let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
+                let k = 2*(n-lag);
+                let parity = ((target + k) % 2) == 1;
+                let mut in_xor = vec![false; 2*n];
+                for i in 0..(n-lag) {
+                    in_xor[i] ^= true;
+                    in_xor[i+lag] ^= true;
+                }
+                for i in 0..(n-lag) {
+                    in_xor[n+i] ^= true;
+                    in_xor[n+i+lag] ^= true;
+                }
+                let vars: Vec<i32> = in_xor.iter().enumerate()
+                    .filter(|&(_, &v)| v)
+                    .map(|(i, _)| (i + 1) as i32)
+                    .collect();
+                if !vars.is_empty() {
+                    s.add_xor(&vars, parity);
+                }
+            }
+        }
+
+        s.reserve_for_search(200);
+        s
+    }
+
+    fn model_lit(s: &Solver, var: usize) -> Lit {
+        if s.value(var as i32) == Some(true) {
+            var as Lit
+        } else {
+            -(var as Lit)
+        }
+    }
 
     // ── API compatibility tests (match cadical::Solver behavior) ──
 
@@ -3193,6 +3446,450 @@ mod tests {
 
         // After UNSAT, different assumptions should still work
         assert_eq!(s.solve_with_assumptions(&[1]), Some(true));
+    }
+
+    #[test]
+    fn xor_reason_excludes_propagated_var() {
+        // Minimal test: XOR constraint with 3 variables.
+        // Fix 2 vars, XOR forces the third.
+        // Then add a clause that conflicts with the forced value.
+        // The conflict analysis should produce a correct learnt clause.
+        let mut s = Solver::new();
+        // x1 XOR x2 XOR x3 = true (odd parity)
+        s.add_xor(&[1, 2, 3], true);
+        // Force x1=true, x2=true → x3 must be true (T^T^x3=T → x3=T)
+        s.add_clause([1]);
+        s.add_clause([2]);
+        // x3 should be forced true by XOR propagation
+        assert_eq!(s.solve(), Some(true));
+        assert_eq!(s.value(3), Some(true));
+    }
+
+    #[test]
+    fn xor_with_pb_sat() {
+        // XOR + PB interaction: the XOR forces a parity, PB constrains the sum.
+        // This should be SAT but the XOR reason bug could cause false UNSAT.
+        let mut s = Solver::new();
+        // 4 variables: sum >= 2 (PB) and x1^x2^x3^x4 = false (even parity)
+        s.add_pb_atleast(&[1, 2, 3, 4], &[1, 1, 1, 1], 2);
+        s.add_xor(&[1, 2, 3, 4], false);
+        // Solution: x1=T, x2=T, x3=F, x4=F (sum=2, XOR=T^T^F^F=false ✓)
+        let result = s.solve();
+        assert_eq!(result, Some(true), "XOR+PB should be SAT");
+    }
+
+    #[test]
+    fn xor_with_quad_pb_sat_n26_oracle() {
+        // Reduced TT(26) oracle: build the exact XY solver encoding for the
+        // known TT(26) solution and verify the SAT solver finds it.
+        // This is the test case that exposed the XOR soundness bug.
+        use super::*;
+
+        let mut s = Solver::new();
+        s.config.xor_propagation = true;
+        let n = 6; // Use small n=6 for minimal repro
+
+        // Known TT(6): X=+++---, Y=++--+-, Z=+++-++, W=++-+-
+        let x_vals: Vec<i8> = vec![1,1,1,-1,-1,-1];
+        let y_vals: Vec<i8> = vec![1,1,-1,-1,1,-1];
+        let z_vals: Vec<i8> = vec![1,1,1,-1,1,1];
+        let w_vals: Vec<i8> = vec![1,1,-1,1,-1];
+
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+        // Symmetry breaking
+        s.add_clause([x_var(0)]);
+        s.add_clause([y_var(0)]);
+
+        // Sum constraints
+        let x_pos = x_vals.iter().filter(|&&v| v == 1).count();
+        let y_pos = y_vals.iter().filter(|&&v| v == 1).count();
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        let ones: Vec<u32> = vec![1; n];
+        s.add_pb_eq(&x_lits, &ones, x_pos as u32);
+        s.add_pb_eq(&y_lits, &ones, y_pos as u32);
+
+        // Compute zw_autocorr
+        let m = n - 1;
+        let mut zw_ac = vec![0i32; n];
+        for lag in 1..n {
+            let nz: i32 = (0..n-lag).map(|i| z_vals[i] as i32 * z_vals[i+lag] as i32).sum();
+            let nw: i32 = if lag < m { (0..m-lag).map(|i| w_vals[i] as i32 * w_vals[i+lag] as i32).sum() } else { 0 };
+            zw_ac[lag] = 2*nz + 2*nw;
+        }
+
+        // Add quad PB agree constraints per lag
+        for lag in 1..n {
+            let target_raw = 2*(n-lag) as i32 - zw_ac[lag];
+            if target_raw < 0 || target_raw % 2 != 0 { panic!("infeasible"); }
+            let target = (target_raw / 2) as u32;
+
+            let mut la = Vec::new();
+            let mut lb = Vec::new();
+            for i in 0..(n-lag) {
+                la.push(x_var(i)); lb.push(x_var(i+lag));
+                la.push(-x_var(i)); lb.push(-x_var(i+lag));
+            }
+            for i in 0..(n-lag) {
+                la.push(y_var(i)); lb.push(y_var(i+lag));
+                la.push(-y_var(i)); lb.push(-y_var(i+lag));
+            }
+            let coeffs: Vec<u32> = vec![1; la.len()];
+            s.add_quad_pb_eq(&la, &lb, &coeffs, target);
+        }
+
+        // Add XOR parity constraints per lag (this is where the bug triggers)
+        for lag in 1..n {
+            let target_raw = 2*(n-lag) as i32 - zw_ac[lag];
+            let target = (target_raw / 2) as usize;
+            let k = 2*(n-lag);
+            let parity = ((target + k) % 2) == 1;
+            let mut in_xor = vec![false; 2*n];
+            for i in 0..(n-lag) {
+                in_xor[i] ^= true;
+                in_xor[i+lag] ^= true;
+            }
+            for i in 0..(n-lag) {
+                in_xor[n+i] ^= true;
+                in_xor[n+i+lag] ^= true;
+            }
+            let vars: Vec<i32> = in_xor.iter().enumerate()
+                .filter(|&(_, &v)| v)
+                .map(|(i, _)| (i + 1) as i32)
+                .collect();
+            if !vars.is_empty() {
+                s.add_xor(&vars, parity);
+            }
+        }
+
+        let result = s.solve();
+        assert_eq!(result, Some(true),
+            "XOR+QuadPB encoding of known TT(6) should be SAT (XOR reason bug)");
+    }
+
+    #[test]
+    fn xor_with_quad_pb_sat_n26_full_oracle() {
+        // Full TT(26) XY encoding for the known solution's Z/W pair.
+        // This MUST return SAT. With the XOR reason bug, it returns false UNSAT.
+        use super::*;
+
+        let n = 26usize;
+        let m = 25usize;
+
+        // Known TT(26) solution
+        let z_str = "+++-+--++++++--++---+-+--+";
+        let w_str = "++++-+---+--+++--++++-+-+";
+        let z: Vec<i8> = z_str.chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let w: Vec<i8> = w_str.chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        assert_eq!(z.len(), n);
+        assert_eq!(w.len(), m);
+
+        let mut s = Solver::new();
+        s.config.xor_propagation = true;
+
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+        // Symmetry breaking: x[0]=+1, y[0]=+1
+        s.add_clause([x_var(0)]);
+        s.add_clause([y_var(0)]);
+
+        // Sum constraints: x_sum=6, y_sum=6
+        let x_pos = 16u32; // (6+26)/2
+        let y_pos = 16u32;
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        let ones: Vec<u32> = vec![1; n];
+        s.add_pb_eq(&x_lits, &ones, x_pos);
+        s.add_pb_eq(&y_lits, &ones, y_pos);
+
+        // Compute zw_autocorr
+        let mut zw_ac = vec![0i32; n];
+        for lag in 1..n {
+            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
+            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
+            zw_ac[lag] = 2*nz + 2*nw;
+        }
+
+        // Quad PB agree constraints per lag
+        for lag in 1..n {
+            let target_raw = 2*(n-lag) as i32 - zw_ac[lag];
+            assert!(target_raw >= 0 && target_raw % 2 == 0);
+            let target = (target_raw / 2) as u32;
+
+            let mut la = Vec::new();
+            let mut lb = Vec::new();
+            for i in 0..(n-lag) {
+                la.push(x_var(i)); lb.push(x_var(i+lag));
+                la.push(-x_var(i)); lb.push(-x_var(i+lag));
+            }
+            for i in 0..(n-lag) {
+                la.push(y_var(i)); lb.push(y_var(i+lag));
+                la.push(-y_var(i)); lb.push(-y_var(i+lag));
+            }
+            let coeffs: Vec<u32> = vec![1; la.len()];
+            s.add_quad_pb_eq(&la, &lb, &coeffs, target);
+        }
+
+        // XOR parity constraints per lag
+        for lag in 1..n {
+            let target_raw = 2*(n-lag) as i32 - zw_ac[lag];
+            let target = (target_raw / 2) as usize;
+            let k = 2*(n-lag);
+            let parity = ((target + k) % 2) == 1;
+            let mut in_xor = vec![false; 2*n];
+            for i in 0..(n-lag) {
+                in_xor[i] ^= true;
+                in_xor[i+lag] ^= true;
+            }
+            for i in 0..(n-lag) {
+                in_xor[n+i] ^= true;
+                in_xor[n+i+lag] ^= true;
+            }
+            let vars: Vec<i32> = in_xor.iter().enumerate()
+                .filter(|&(_, &v)| v)
+                .map(|(i, _)| (i + 1) as i32)
+                .collect();
+            if !vars.is_empty() {
+                s.add_xor(&vars, parity);
+            }
+        }
+
+        s.reserve_for_search(200);
+        let result = s.solve();
+        assert_eq!(result, Some(true),
+            "XOR+QuadPB encoding of known TT(26) Z/W must be SAT");
+    }
+
+    #[test]
+    fn xor_quad_pb_single_lag4() {
+        // Minimal: QuadPB for all lags, but XOR ONLY for lag 4.
+        use super::*;
+        let n = 26usize;
+        let m = 25usize;
+        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+        let mut zw_ac = vec![0i32; n];
+        for lag in 1..n {
+            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
+            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
+            zw_ac[lag] = 2*nz + 2*nw;
+        }
+
+        let mut s = Solver::new();
+        s.config.xor_propagation = true;
+        s.add_clause([x_var(0)]);
+        s.add_clause([y_var(0)]);
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        let ones_n: Vec<u32> = vec![1; n];
+        s.add_pb_eq(&x_lits, &ones_n, 16);
+        s.add_pb_eq(&y_lits, &ones_n, 16);
+
+        // All quad PB
+        for lag in 1..n {
+            let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as u32;
+            let mut la = Vec::new();
+            let mut lb = Vec::new();
+            for i in 0..(n-lag) {
+                la.push(x_var(i)); lb.push(x_var(i+lag));
+                la.push(-x_var(i)); lb.push(-x_var(i+lag));
+            }
+            for i in 0..(n-lag) {
+                la.push(y_var(i)); lb.push(y_var(i+lag));
+                la.push(-y_var(i)); lb.push(-y_var(i+lag));
+            }
+            let coeffs: Vec<u32> = vec![1; la.len()];
+            s.add_quad_pb_eq(&la, &lb, &coeffs, target);
+        }
+
+        // XOR ONLY for lag 4
+        let lag = 4;
+        let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
+        let k = 2*(n-lag);
+        let parity = ((target + k) % 2) == 1;
+        let mut in_xor = vec![false; 2*n];
+        for i in 0..(n-lag) { in_xor[i] ^= true; in_xor[i+lag] ^= true; }
+        for i in 0..(n-lag) { in_xor[n+i] ^= true; in_xor[n+i+lag] ^= true; }
+        let vars: Vec<i32> = in_xor.iter().enumerate()
+            .filter(|&(_, &v)| v).map(|(i, _)| (i + 1) as i32).collect();
+        s.add_xor(&vars, parity);
+
+        s.reserve_for_search(200);
+        s.set_conflict_limit(50000);
+        let result = s.solve();
+        assert_eq!(result, Some(true), "QuadPB + single lag-4 XOR should be SAT");
+    }
+
+    #[test]
+    fn xor_quad_pb_forced_solution() {
+        // Force the known TT(26) X/Y solution via assumptions.
+        // If UNSAT: the constraints themselves are wrong (encoding bug).
+        // If SAT: the constraints are correct and the search is wrong.
+        let mut s = build_xor_quad_pb_no_gj_n26_solver(true);
+        let x: Vec<i8> = "++--+--+++++++-+-++--+-++-".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let y: Vec<i8> = "+++-+-++++++-++-+---+-++--".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let n = 26;
+        let mut assumptions = Vec::new();
+        for i in 0..n {
+            let lit = (i + 1) as i32;
+            assumptions.push(if x[i] == 1 { lit } else { -lit });
+        }
+        for i in 0..n {
+            let lit = (n + i + 1) as i32;
+            assumptions.push(if y[i] == 1 { lit } else { -lit });
+        }
+        let result = s.solve_with_assumptions(&assumptions);
+        assert_eq!(result, Some(true),
+            "Forcing the known TT(26) solution should be SAT even with XOR+QuadPB");
+    }
+
+    #[test]
+    fn xor_quad_pb_bisect_lag() {
+        // Binary search: add XOR constraints one lag at a time to find which breaks.
+        use super::*;
+        let n = 26usize;
+        let m = 25usize;
+        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+        let mut zw_ac = vec![0i32; n];
+        for lag in 1..n {
+            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
+            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
+            zw_ac[lag] = 2*nz + 2*nw;
+        }
+
+        for max_lag in 1..n {
+            let mut s = Solver::new();
+            s.config.xor_propagation = true;
+            s.add_clause([x_var(0)]);
+            s.add_clause([y_var(0)]);
+            let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+            let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+            let ones_n: Vec<u32> = vec![1; n];
+            s.add_pb_eq(&x_lits, &ones_n, 16);
+            s.add_pb_eq(&y_lits, &ones_n, 16);
+
+            for lag in 1..n {
+                let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as u32;
+                let mut la = Vec::new();
+                let mut lb = Vec::new();
+                for i in 0..(n-lag) {
+                    la.push(x_var(i)); lb.push(x_var(i+lag));
+                    la.push(-x_var(i)); lb.push(-x_var(i+lag));
+                }
+                for i in 0..(n-lag) {
+                    la.push(y_var(i)); lb.push(y_var(i+lag));
+                    la.push(-y_var(i)); lb.push(-y_var(i+lag));
+                }
+                let coeffs: Vec<u32> = vec![1; la.len()];
+                s.add_quad_pb_eq(&la, &lb, &coeffs, target);
+            }
+
+            for lag in 1..=max_lag {
+                let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
+                let k = 2*(n-lag);
+                let parity = ((target + k) % 2) == 1;
+                let mut in_xor = vec![false; 2*n];
+                for i in 0..(n-lag) { in_xor[i] ^= true; in_xor[i+lag] ^= true; }
+                for i in 0..(n-lag) { in_xor[n+i] ^= true; in_xor[n+i+lag] ^= true; }
+                let vars: Vec<i32> = in_xor.iter().enumerate()
+                    .filter(|&(_, &v)| v).map(|(i, _)| (i + 1) as i32).collect();
+                if !vars.is_empty() { s.add_xor(&vars, parity); }
+            }
+
+            s.reserve_for_search(200);
+            s.set_conflict_limit(50000);
+            let result = s.solve();
+            if result != Some(true) {
+                panic!("FAILS at max_lag={}: result={:?}", max_lag, result);
+            }
+        }
+    }
+
+    #[test]
+
+    fn xor_quad_pb_no_gj_n26_oracle() {
+        let mut s = build_xor_quad_pb_no_gj_n26_solver(true);
+        let result = s.solve();
+        assert_eq!(result, Some(true), "XOR+QuadPB (no GJ) TT(26) should be SAT");
+    }
+
+    #[test]
+
+    fn xor_quad_pb_no_gj_n26_reference_branch_oracle() {
+        let mut reference = build_xor_quad_pb_no_gj_n26_solver(false);
+        assert_eq!(reference.solve(), Some(true), "reference X/Y model should exist without XOR");
+
+        // Variable 51 is the first explicit branch in the failing run; use the
+        // polarity from a real X/Y witness so this assumption stays SAT-consistent.
+        let branch_lit = model_lit(&reference, 51);
+
+        let mut s = build_xor_quad_pb_no_gj_n26_solver(true);
+        let result = s.solve_with_assumptions(&[branch_lit]);
+        assert_eq!(result, Some(true),
+            "XOR+QuadPB should stay SAT under a branch literal taken from a reference X/Y model");
+    }
+
+    #[test]
+    fn xor_only_n26_oracle() {
+        // Same as n26_full but WITHOUT quad PB — just PB + XOR.
+        // If this passes, the bug is in XOR+QuadPB interaction.
+        use super::*;
+        let n = 26usize;
+        let m = 25usize;
+        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+
+        let mut s = Solver::new();
+        s.config.xor_propagation = true;
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        s.add_clause([x_var(0)]);
+        s.add_clause([y_var(0)]);
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        let ones: Vec<u32> = vec![1; n];
+        s.add_pb_eq(&x_lits, &ones, 16);
+        s.add_pb_eq(&y_lits, &ones, 16);
+
+        let mut zw_ac = vec![0i32; n];
+        for lag in 1..n {
+            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
+            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
+            zw_ac[lag] = 2*nz + 2*nw;
+        }
+
+        // XOR parity constraints ONLY (no quad PB)
+        for lag in 1..n {
+            let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
+            let k = 2*(n-lag);
+            let parity = ((target + k) % 2) == 1;
+            let mut in_xor = vec![false; 2*n];
+            for i in 0..(n-lag) {
+                in_xor[i] ^= true; in_xor[i+lag] ^= true;
+            }
+            for i in 0..(n-lag) {
+                in_xor[n+i] ^= true; in_xor[n+i+lag] ^= true;
+            }
+            let vars: Vec<i32> = in_xor.iter().enumerate()
+                .filter(|&(_, &v)| v).map(|(i, _)| (i + 1) as i32).collect();
+            if !vars.is_empty() { s.add_xor(&vars, parity); }
+        }
+
+        s.reserve_for_search(200);
+        let result = s.solve();
+        assert_eq!(result, Some(true), "XOR-only TT(26) should be SAT");
     }
 
     #[test]
