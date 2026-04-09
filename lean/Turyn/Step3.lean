@@ -767,6 +767,11 @@ lemma skewCorrSum_swap {m : Nat} (x y : List Int) {s : Nat} :
     skewCorrSum m x y s = skewCorrSum m y x s := by
   sorry
 
+lemma skewCorrSum_shift_normalize {m : Nat} (x y : List Int) (i j : Nat) :
+    skewCorrSum m x y (m - i - j) =
+      ∑ k ∈ Finset.range m, x.getD k 0 * y.getD ((m - 1 - k + m - i - j) % m) 0 := by
+  sorry
+
 lemma circulant_applyR_dot_swap {m : Nat} (x y : List Int)
     (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
     listDotProduct (circulantRow m x i) (applyR (circulantRow m y j)) =
@@ -810,6 +815,12 @@ lemma applyR_trRow_dot_swap {m : Nat} (x y : List Int)
       listDotProduct (applyR (circulantRow m y i)) (trRow (m := m) x j) := by
   sorry
 
+lemma circulant_reflect_shift_swap {m : Nat} (x y : List Int)
+    (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
+    listDotProduct (circulantRow m x i) (circulantRow m y j) =
+      listDotProduct (circulantRow m y (m - 1 - i)) (circulantRow m x (m - 1 - j)) := by
+    sorry
+
 lemma applyR_applyR_dot_eq_tr_tr_swap {m : Nat} (x y : List Int)
     (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
     listDotProduct (applyR (circulantRow m x i)) (applyR (circulantRow m y j)) =
@@ -823,11 +834,7 @@ lemma applyR_applyR_dot_eq_tr_tr_swap {m : Nat} (x y : List Int)
         listDotProduct (circulantRow m y (m - 1 - i)) (circulantRow m x (m - 1 - j)) := by
     rfl
   rw [hleft, hright]
-  have hswap :
-      listDotProduct (circulantRow m x i) (circulantRow m y j) =
-        listDotProduct (circulantRow m y (m - 1 - i)) (circulantRow m x (m - 1 - j)) := by
-    sorry
-  exact hswap
+  exact circulant_reflect_shift_swap x y hx hy hi hj
 
 lemma trRow_pmOne_mem {m : Nat} {x : List Int}
     (hx_len : x.length = m)
@@ -1112,10 +1119,43 @@ lemma mod_ne_of_div_eq {m i j : Nat} (hm : 0 < m) (hdiv : i / m = j / m) (hij : 
         exact Nat.div_add_mod j m
   exact hij heq
 
+lemma gsMatrix_diag_dot {m : Nat} (T : TSequence m) {i : Nat} (hi : i < 4 * m) :
+    listDotProduct ((gsMatrixOfTSequence T).rows.getD i [])
+      ((gsMatrixOfTSequence T).rows.getD i []) = 4 * m := by
+  sorry
+
+lemma gsMatrix_offdiag_dot {m : Nat} (T : TSequence m) {i j : Nat}
+    (hi : i < 4 * m) (hj : j < 4 * m) (hij : i ≠ j) :
+    listDotProduct ((gsMatrixOfTSequence T).rows.getD i [])
+      ((gsMatrixOfTSequence T).rows.getD j []) = 0 := by
+  sorry
+
+lemma gsMatrix_checkOrthogonality_from_dot {m : Nat} (T : TSequence m)
+    (hdiag : ∀ i, i < 4 * m →
+      listDotProduct ((gsMatrixOfTSequence T).rows.getD i [])
+        ((gsMatrixOfTSequence T).rows.getD i []) = 4 * m)
+    (hoffdiag : ∀ i j, i < 4 * m → j < 4 * m → i ≠ j →
+      listDotProduct ((gsMatrixOfTSequence T).rows.getD i [])
+        ((gsMatrixOfTSequence T).rows.getD j []) = 0) :
+    checkOrthogonality (gsMatrixOfTSequence T).rows = true := by
+  sorry
+
 /-- The final GS matrix satisfies the Hadamard orthogonality check. -/
 theorem gsMatrixOfTSequence_checkOrthogonality {m : Nat} (T : TSequence m) :
     checkOrthogonality (gsMatrixOfTSequence T).rows = true := by
-  sorry
+  have hdiag :
+      ∀ i, i < 4 * m →
+        listDotProduct ((gsMatrixOfTSequence T).rows.getD i [])
+          ((gsMatrixOfTSequence T).rows.getD i []) = 4 * m := by
+    intro i hi
+    exact gsMatrix_diag_dot T hi
+  have hoffdiag :
+      ∀ i j, i < 4 * m → j < 4 * m → i ≠ j →
+        listDotProduct ((gsMatrixOfTSequence T).rows.getD i [])
+          ((gsMatrixOfTSequence T).rows.getD j []) = 0 := by
+    intro i j hi hj hij
+    exact gsMatrix_offdiag_dot T hi hj hij
+  exact gsMatrix_checkOrthogonality_from_dot T hdiag hoffdiag
 
 /-- The final GS matrix built from a T-sequence is Hadamard. -/
 theorem gsMatrixOfTSequence_isHadamard {m : Nat} (T : TSequence m) :

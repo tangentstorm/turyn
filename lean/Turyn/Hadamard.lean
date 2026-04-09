@@ -552,7 +552,7 @@ lemma sumHalf_diffHalf_autocorr (a b : PmSeq) (s : Nat)
   split_ifs <;> simp_all +decide [ seqSumHalf, seqDiffHalf ];
   rw [ ← Finset.sum_add_distrib, ← Finset.sum_add_distrib, Finset.mul_sum ];
   refine' Finset.sum_congr rfl fun i hi => _;
-  by_cases hi' : i < List.length a <;> by_cases hi'' : i + s < List.length a <;> simp_all +decide [ List.getElem?_eq_none ];
+  by_cases hi' : i < List.length a <;> by_cases hi'' : i + s < List.length a <;> simp_all +decide;
   cases ha ( a[i] ) ( by simp ) <;> cases hb ( b[i] ) ( by simp ) <;> cases ha ( a[i + s] ) ( by simp ) <;> cases hb ( b[i + s] ) ( by simp ) <;> simp_all +decide only
 
 /-- **T-sequence theorem:** If (X, Y, Z, W) is TT(n), the T-sequences
@@ -636,24 +636,24 @@ lemma goethalsSeidel_allRowsLength (a b c d : List Int)
     (hlen : a.length = b.length ∧ b.length = c.length ∧ c.length = d.length) :
     allRowsLength (goethalsSeidel a b c d) (4 * a.length) = true := by
   apply List.all_eq_true.mpr;
-  unfold goethalsSeidel; simp +decide [ List.length_range, * ] ;
+  unfold goethalsSeidel; simp +decide [ * ] ;
   intro i hi;
   rw [ show i / d.length = if i < d.length then 0 else if i < 2 * d.length then 1 else if i < 3 * d.length then 2 else 3 by
         split_ifs <;> simp_all +decide [ Nat.div_eq_of_lt ];
         · exact Nat.le_antisymm ( Nat.le_of_lt_succ ( Nat.div_lt_of_lt_mul <| by linarith ) ) ( Nat.div_pos ( by linarith ) ( Nat.pos_of_ne_zero ( by aesop_cat ) ) );
         · exact Nat.le_antisymm ( Nat.le_of_lt_succ <| Nat.div_lt_of_lt_mul <| by linarith ) ( Nat.le_div_iff_mul_le ( Nat.pos_of_ne_zero <| by aesop_cat ) |>.2 <| by linarith );
-        · exact Nat.le_antisymm ( Nat.le_of_lt_succ <| Nat.div_lt_of_lt_mul <| by linarith ) ( Nat.le_div_iff_mul_le ( Nat.pos_of_ne_zero <| by aesop_cat ) |>.2 <| by linarith ) ] ; split_ifs <;> simp_all +decide [ Nat.div_eq_of_lt ];
+        · exact Nat.le_antisymm ( Nat.le_of_lt_succ <| Nat.div_lt_of_lt_mul <| by linarith ) ( Nat.le_div_iff_mul_le ( Nat.pos_of_ne_zero <| by aesop_cat ) |>.2 <| by linarith ) ] ; split_ifs <;> simp_all +decide;
   · unfold circulant; simp +decide [ *, Nat.mod_eq_of_lt ] ;
     unfold applyR; simp +arith +decide [ * ] ;
-  · unfold negRow applyR circulant; simp +decide [ *, Nat.mod_eq_of_lt ] ;
+  · unfold negRow applyR circulant; simp +decide [ * ] ;
     rw [ List.getElem?_range ];
     · simp +arith +decide [ List.length_range ];
     · exact Nat.mod_lt _ ( by linarith );
-  · unfold negRow applyR circulant; simp +decide [ *, Nat.mod_eq_of_lt ] ;
+  · unfold negRow applyR circulant; simp +decide [ * ] ;
     rw [ List.getElem?_range ];
     · simp +arith +decide [ List.length_range ];
     · exact Nat.mod_lt _ ( by linarith );
-  · unfold negRow applyR circulant; simp +decide [ List.length_range, * ] ;
+  · unfold negRow applyR circulant; simp +decide [ * ] ;
     rw [ List.getElem?_range ];
     · simp +arith +decide [ List.length_range ];
     · exact Nat.mod_lt _ ( by linarith )
@@ -697,7 +697,7 @@ lemma goethalsSeidel_allEntriesPmOne (a b c d : List Int)
   rw [ List.mem_map ] at hx;
   rcases hx with ⟨ i, hi, rfl ⟩;
   rcases x : i / a.length with ( _ | _ | _ | _ | k ) <;> simp +decide [ x ] at hi ⊢;
-  · simp_all +decide [ Nat.mod_eq_of_lt ];
+  · simp_all +decide;
     rcases x with ( rfl | hx ) <;> simp_all +decide [ Nat.mod_eq_of_lt ];
     simp_all +decide [ applyR ];
   · simp_all +decide [ Nat.mod_eq_of_lt ];
@@ -745,7 +745,7 @@ lemma listDotProduct_negRow_left (a b : List Int) :
   unfold negRow; induction' a with hd tl ha generalizing b <;> simp_all +decide [ List.map ] ;
   · rfl;
   · rcases b with ( _ | ⟨ hd', tl' ⟩ ) <;> simp_all +decide [ listDotProduct ];
-    convert congr_arg ( fun x : ℤ => x + - ( hd * hd' ) ) ( ha tl' ) using 1 <;> ring;
+    convert congr_arg ( fun x : ℤ => x + - ( hd * hd' ) ) ( ha tl' ) using 1 <;> ring_nf;
     · induction' ( List.map ( fun p => p.1 * p.2 ) ( ( List.map ( fun x => -x ) tl ).zip tl' ) ) using List.reverseRecOn with p l ih <;> simp +decide [ * ] ; ring;
     · induction ( List.zip tl tl' ) using List.reverseRecOn <;> simp +decide [ * ] ; ring
 
