@@ -1260,6 +1260,44 @@ impl Solver {
     /// Number of variables.
     pub fn num_vars(&self) -> usize { self.num_vars }
     /// Number of active (non-deleted) clauses.
+    /// Verify all quad PB constraint states match actual variable assignments.
+    /// Returns the number of mismatched constraints found.
+    pub fn verify_quad_pb_state(&self) -> usize {
+        let mut bad = 0;
+        for (qi, qc) in self.quad_pb_constraints.iter().enumerate() {
+            if qc.stale { continue; } // stale will be recomputed
+            let mut expected_sums = [0i32, 0, 0];
+            for ti in 0..qc.num_terms as usize {
+                let t = &qc.terms[ti];
+                let aa = self.assigns[t.var_a()];
+                let ab = self.assigns[t.var_b()];
+                let expected_state = t.compute_state(aa, ab);
+                expected_sums[expected_state as usize] += t.coeff as i32;
+                if t.state != expected_state {
+                    if bad == 0 {
+                        eprintln!("QUAD PB BUG: constraint {} term {} state={} expected={} (var_a={} val={:?}, var_b={} val={:?})",
+                            qi, ti, t.state, expected_state, t.var_a(), aa, t.var_b(), ab);
+                    }
+                    bad += 1;
+                }
+            }
+            if qc.sums != expected_sums {
+                if bad == 0 {
+                    eprintln!("QUAD PB BUG: constraint {} sums={:?} expected={:?}", qi, qc.sums, expected_sums);
+                }
+                bad += 1;
+            }
+        }
+        bad
+    }
+
+    /// Force recompute of ALL quad PB constraints (public, for testing).
+    pub fn recompute_all_quad_pb(&mut self) {
+        for i in 0..self.quad_pb_constraints.len() {
+            self.recompute_quad_pb(i as u32);
+        }
+    }
+
     pub fn num_clauses(&self) -> usize {
         self.clause_meta.iter().filter(|m| !m.deleted).count()
     }

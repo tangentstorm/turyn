@@ -3892,6 +3892,7 @@ fn run_mdd_sat_search(
                                 if z_solver.value(v) == Some(true) { -v } else { v }
                             }).collect();
                             z_solver.add_clause(z_block);
+                            z_solver.clear_learnt_clauses();
 
                             let Some(z_spectrum) = spectrum_if_ok(&z_vals, &spectral_z, ctx.individual_bound, &mut fft_buf_z) else {
                                 flow_z_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
@@ -6476,7 +6477,7 @@ mod tests {
         eprintln!("Total Z middles (with spectral): {}", z_spec_count);
         // Note: only 1 Z found even without spectral — investigating why
 
-        // Test 4: find Z#1, block it, then test known Z with assumptions
+        // Test 4: find Z#1, block it, verify state, test known Z
         let mut z_solver3 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
         sat_z_middle::fill_z_solver_quad_pb(&mut z_solver3, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
         let r1 = z_solver3.solve();
@@ -6485,19 +6486,59 @@ mod tests {
             if z_solver3.value(z_mid_vars[i]).unwrap() { 1 } else { -1 }
         }).collect();
         eprintln!("Before blocking: found {:?}", found1);
-        // Add blocking clause
+
+        // Verify state BEFORE blocking clause
+        let bad_before = z_solver3.verify_quad_pb_state();
+        eprintln!("Quad PB state before blocking: {} mismatches", bad_before);
+
+        // Add blocking clause (while model is still in place)
         let block: Vec<i32> = z_mid_vars.iter().map(|&v| {
             if z_solver3.value(v) == Some(true) { -v } else { v }
         }).collect();
-        z_solver3.add_clause(block);
+        z_solver3.add_clause(block.clone());
+
+        // Verify state AFTER blocking clause
+        let bad_after = z_solver3.verify_quad_pb_state();
+        eprintln!("Quad PB state after blocking: {} mismatches", bad_after);
+
+        // Backtrack to level 0 (what solve_with_assumptions does)
+        z_solver3.reset();
+        let bad_reset = z_solver3.verify_quad_pb_state();
+        eprintln!("Quad PB state after reset: {} mismatches", bad_reset);
+
+        // Recompute stale
+        z_solver3.recompute_all_quad_pb();
+        let bad_recomp = z_solver3.verify_quad_pb_state();
+        eprintln!("Quad PB state after recompute: {} mismatches", bad_recomp);
+
         // Now test known Z with assumptions
         let known_mid2: Vec<i8> = z_full[k..n-k].to_vec();
         let known_assumptions: Vec<i32> = (0..middle_n).map(|i| {
             if known_mid2[i] == 1 { z_mid_vars[i] } else { -z_mid_vars[i] }
         }).collect();
         let r2 = z_solver3.solve_with_assumptions(&known_assumptions);
-        eprintln!("After blocking Z#1, known Z assumptions: {:?}", r2);
-        assert_eq!(r2, Some(true), "Known Z should still be SAT after blocking a different Z");
+        eprintln!("After blocking Z#1, known Z assumptions (reused, with learnt): {:?}", r2);
+
+        // Test 4b: same thing but clear learnt clauses first
+        z_solver3.reset();
+        z_solver3.clear_learnt_clauses();
+        let r2b = z_solver3.solve_with_assumptions(&known_assumptions);
+        eprintln!("After clearing learnt clauses: {:?}", r2b);
+
+        // Test 5: FRESH solver + blocking clause + known Z — is it the solver or the clause?
+        let mut z_solver4 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
+        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver4, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        z_solver4.add_clause(block.clone());
+        let r3 = z_solver4.solve_with_assumptions(&known_assumptions);
+        eprintln!("Fresh solver + blocking clause + known Z: {:?}", r3);
+
+        // Test 6: FRESH solver, no blocking clause, known Z
+        let mut z_solver5 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
+        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver5, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        let r4 = z_solver5.solve_with_assumptions(&known_assumptions);
+        eprintln!("Fresh solver, no block, known Z: {:?}", r4);
+
+        assert_eq!(r3, Some(true), "Fresh solver + blocking clause should find known Z");
 
         // Test 5: with known Z middle as assumptions, is it SAT?
         let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
