@@ -743,3 +743,29 @@ SolveZ items to all matching tuples. Reduces W items from 161K to 68K (-58%).
 But bnd/s dropped from 538 to 381 (-29%). The Vec cloning overhead for fan-out
 and altered pipeline dynamics (more SolveZ items created simultaneously) cause
 a systematic regression. The W SAT reduction doesn't compensate.
+
+### E12. Encode XY sub-MDD as SAT constraint — **IN PROGRESS (promising direction)**
+Instead of enumerating ~3400 (x,y) boundary candidates and solving independently,
+encode the MDD as a constraint so the solver explores all boundaries in ONE call.
+The CDCL search learns from conflicts across boundaries (clause transfer).
+
+**Tseitin encoding (tested, scales poorly):**
+- Introduces auxiliary "reachability" variables per MDD node (100-700 aux vars)
+- Transition clauses link parent→child via boundary variables
+- n=18: **10x faster to find solution** (114ms vs 1.2s) — huge win!
+- n=20: slightly slower (median 10s vs 6.5s)
+- n=22: **regression** — one run failed to find solution in 60s
+- n=56: bnd/s similar to baseline at 5K conflicts, but high variance
+- Problem: aux variables make CDCL search space 2-8x larger
+
+**Activity boosting (tested, no benefit):**
+- Boost boundary var activities in MDD level order
+- Doesn't help because boundary vars are pinned by assumptions (VSIDS irrelevant)
+
+**Native MDD propagator (NOT YET IMPLEMENTED — next step):**
+- Add MDD as a native constraint type in radical (like GJ, PB, spectral, XOR)
+- Zero auxiliary variables — MDD navigated directly during BCP
+- When boundary var assigned → walk MDD forward, prune dead branches, force implied
+- When all MDD paths dead → conflict with explanation from assigned boundary vars
+- This is the right approach: combines the 10x solution-finding speedup with
+  the scalability of native constraint propagation.
