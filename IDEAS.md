@@ -674,25 +674,22 @@ Previous ideas like --mdd-extend=1 were rejected because they lowered xy/s. That
 the wrong metric. If an extension check prunes 52% of boundaries at 14us/call, that's
 a massive win in effective search progress.
 
-### E1. Restore extension check before XY SAT (previously worked, lost in refactor)
-Commit 48f92e0 added has_extension() into walk_xy_sub_mdd, pruning 52.5% of XY
-boundaries at ~14us/call. This was lost when the pipeline was refactored to 4 stages.
-Restore it: in the SolveZ handler's walk_xy_sub_mdd callback, before running XY SAT,
-call has_extension(k, k+1, z_bits, w_bits, x_bits, y_bits). Skip XY SAT if dead.
-**Single commit:** Add has_extension call in walk_xy_sub_mdd callback, gate with mdd_extend > 0.
+### E1. Restore extension check before XY SAT — **ACCEPTED (+28% bnd/s at n=56)**
+Restored has_extension() in walk_xy_sub_mdd callback with per-worker u128 cache.
+Prunes 44% of XY candidates at n=56 k=10. Median bnd/s: 394→504 (+28%).
+Also eliminates worst-case cliffs (baseline 92 bnd/s, extension 498-538 stable).
+Neutral at n=26 (median 307 both). Commit: ab65d41.
 
-### E2. ZW-only boundary autocorrelation bound at stage 0
-At the Boundary stage (stage 0), we have z_bits and w_bits but no x/y. Compute the
-partial ZW autocorrelation from boundary pairs for each lag. Check if the maximum
-achievable correction from middle positions + XY can zero it. If not, prune.
-This is stronger than the current sum feasibility check (which only checks counts).
-**Single commit:** Add compute_zw_boundary_autocorr() check in Boundary handler.
+### E2. ZW-only boundary autocorrelation bound at stage 0 — **REJECTED**
+Implemented and tested. At n=26 k=7: only 27 out of 8637 boundaries pruned (0.3%).
+At n=56 k=10: similarly negligible. The XY slack (2×(n-1-j) free pairs) overwhelms
+the ZW boundary contribution. Would need XY info to be effective, but that's only
+available at stage 3. ZW-only check fundamentally too loose.
 
-### E3. Extension check cache by (z_bits, w_bits, x_bits, y_bits)
-The has_extension call from E1 may be called repeatedly for the same boundary
-4-tuple across different tuples. Cache results in a thread-local HashMap<u128, bool>
-(pack 4 x u32 into u128). Avoids redundant MDD builds.
-**Single commit:** Add thread-local extension cache, benchmark hit rate.
+### E3. Extension check cache — **IMPLEMENTED (part of E1)**
+Per-worker HashMap<u128, bool> cache. Key = (z_bits, w_bits, x_bits, y_bits) packed
+into u128. Critical for performance: same boundary 4-tuple is checked across Z
+solutions, cache avoids redundant MDD builds.
 
 ### E4. Early W spectral reject saves boundary throughput
 Currently SolveW generates W middles and filters by individual spectral bound.

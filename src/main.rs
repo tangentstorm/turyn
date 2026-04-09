@@ -5130,6 +5130,10 @@ fn parse_args() -> SearchConfig {
         print_help();
         std::process::exit(1);
     }
+    // Default: enable extension check for MDD pipeline (clear win at n>=26)
+    if cfg.use_mdd && cfg.mdd_extend == 0 {
+        cfg.mdd_extend = 1;
+    }
     cfg
 }
 
