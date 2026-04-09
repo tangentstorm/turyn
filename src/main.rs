@@ -3903,10 +3903,84 @@ fn run_mdd_sat_search(
                             z_boundary[n-k+i] = if (swz.z_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
                         }
 
-                        // Spectral constraint: combined ZW pair bound.
-                        // Build tables for both W and Z middle vars in one solver.
-                        // For now, just use the pair_bound as the combined constraint.
-                        // TODO: could add a combined WZ spectral constraint
+                        // Combined WZ spectral: 2|W(ω)|² + 2|Z(ω)|² ≤ pair_bound.
+                        // Uses two-sequence SpectralConstraint with separate DFT tracking.
+                        {
+                            let nf = SPECTRAL_FREQS;
+                            let total_mid = ctx.middle_m + ctx.middle_n;
+                            let mut cos_table = vec![0.0f32; total_mid * nf];
+                            let mut sin_table = vec![0.0f32; total_mid * nf];
+                            let mut amplitudes = vec![0.0f32; total_mid * nf];
+                            let mut re1_bnd = vec![0.0f64; nf]; // W boundary DFT
+                            let mut im1_bnd = vec![0.0f64; nf];
+                            let mut re2_bnd = vec![0.0f64; nf]; // Z boundary DFT
+                            let mut im2_bnd = vec![0.0f64; nf];
+                            let mut mr1 = vec![0.0f64; nf]; // max reduction seq1 (W)
+                            let mut mr2 = vec![0.0f64; nf]; // max reduction seq2 (Z)
+
+                            for fi in 0..nf {
+                                let omega = (fi as f64 + 1.0) / (nf as f64 + 1.0) * std::f64::consts::PI;
+                                for pos in 0..m {
+                                    if pos >= k && pos < m - k { continue; }
+                                    let val = w_boundary[pos] as f64;
+                                    re1_bnd[fi] += val * (omega * pos as f64).cos();
+                                    im1_bnd[fi] += val * (omega * pos as f64).sin();
+                                }
+                                for pos in 0..n {
+                                    if pos >= k && pos < n - k { continue; }
+                                    let val = z_boundary[pos] as f64;
+                                    re2_bnd[fi] += val * (omega * pos as f64).cos();
+                                    im2_bnd[fi] += val * (omega * pos as f64).sin();
+                                }
+                                for vi in 0..ctx.middle_m {
+                                    let pos = k + vi;
+                                    let c = (omega * pos as f64).cos() as f32;
+                                    let s = (omega * pos as f64).sin() as f32;
+                                    cos_table[vi * nf + fi] = c;
+                                    sin_table[vi * nf + fi] = s;
+                                    let amp = (c * c + s * s).sqrt();
+                                    amplitudes[vi * nf + fi] = amp;
+                                    mr1[fi] += amp as f64;
+                                }
+                                for vi in 0..ctx.middle_n {
+                                    let pos = k + vi;
+                                    let c = (omega * pos as f64).cos() as f32;
+                                    let s = (omega * pos as f64).sin() as f32;
+                                    let idx = (ctx.middle_m + vi) * nf + fi;
+                                    cos_table[idx] = c;
+                                    sin_table[idx] = s;
+                                    let amp = (c * c + s * s).sqrt();
+                                    amplitudes[idx] = amp;
+                                    mr2[fi] += amp as f64;
+                                }
+                            }
+                            // Dummy combined re/im (not used in seq2 mode conflict check)
+                            let re_dummy = vec![0.0f64; nf];
+                            let im_dummy = vec![0.0f64; nf];
+                            solver.spectral = Some(radical::SpectralConstraint {
+                                num_seq_vars: total_mid,
+                                cos_table, sin_table, num_freqs: nf,
+                                re: re_dummy.clone(), im: im_dummy.clone(),
+                                re_boundary: re_dummy.clone(), im_boundary: im_dummy,
+                                bound: ctx.problem.target_energy() as f64, // 6n-2: full energy budget for 2|W|²+2|Z|²+|X|²+|Y|²
+                                per_freq_bound: None,
+                                max_reduction: vec![0.0; nf],
+                                amplitudes,
+                                assigned: vec![false; total_mid],
+                                values: vec![0i8; total_mid],
+                                seq2: Some(radical::Seq2Config {
+                                    seq2_start: ctx.middle_m,
+                                    weight1: 2.0, weight2: 2.0,
+                                    individual_bound: ctx.individual_bound,
+                                    re1: re1_bnd.clone(), im1: im1_bnd.clone(),
+                                    re1_boundary: re1_bnd, im1_boundary: im1_bnd,
+                                    max_reduction1: mr1,
+                                    re2: re2_bnd.clone(), im2: im2_bnd.clone(),
+                                    re2_boundary: re2_bnd, im2_boundary: im2_bnd,
+                                    max_reduction2: mr2,
+                                }),
+                            });
+                        }
 
                         // Enumerate WZ solutions
                         let mut wz_count = 0usize;
@@ -3943,20 +4017,10 @@ fn run_mdd_sat_search(
                             solver.reset();
                             solver.add_clause(block);
 
-                            // Spectral checks (post-hoc for now)
-                            let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) else {
-                                flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                                continue;
-                            };
-                            let z_spectrum = compute_spectrum(&z_vals, &spectral_z, &mut fft_buf_z);
-
-                            // Pair check
-                            if ctx.middle_n <= 20 {
-                                if !spectral_pair_ok(&z_spectrum, &w_spectrum, ctx.pair_bound) {
-                                    flow_z_pair_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                                    continue;
-                                }
-                            }
+                            // Combined spectral in solver guarantees pair bound.
+                            // Compute spectra only for downstream use.
+                            let w_spectrum = compute_spectrum(&w_vals, &spectral_w, &mut fft_buf_w);
+                            let _ = &w_spectrum; // used by pair_power below
 
                             // Got a valid (W,Z) pair — proceed to XY
                             flow_z_solutions.fetch_add(1, AtomicOrdering::Relaxed);

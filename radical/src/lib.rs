@@ -245,6 +245,36 @@ pub struct SpectralConstraint {
     pub assigned: Vec<bool>,
     /// The value assigned to each variable (+1 or -1), 0 if unassigned
     pub values: Vec<i8>,
+    /// Optional second sequence for combined spectral (e.g., WZ pair bound).
+    /// If set, vars 0..seq2_start are sequence 1 (weight seq1_weight),
+    /// vars seq2_start.. are sequence 2 (weight seq2_weight).
+    /// Check: w1*|S1(ω)|² + w2*|S2(ω)|² ≤ bound.
+    pub seq2: Option<Seq2Config>,
+}
+
+/// Config for a two-sequence spectral constraint.
+#[derive(Clone)]
+pub struct Seq2Config {
+    /// First var index of the second sequence (0-based).
+    pub seq2_start: usize,
+    /// Weight for sequence 1 power in combined constraint (e.g., 2.0 for W).
+    pub weight1: f64,
+    /// Weight for sequence 2 power in combined constraint (e.g., 2.0 for Z).
+    pub weight2: f64,
+    /// Individual bound per sequence (e.g., individual_bound for W and Z separately).
+    pub individual_bound: f64,
+    /// Separate DFT tracking for sequence 1.
+    pub re1: Vec<f64>,
+    pub im1: Vec<f64>,
+    pub re1_boundary: Vec<f64>,
+    pub im1_boundary: Vec<f64>,
+    pub max_reduction1: Vec<f64>,
+    /// Separate DFT tracking for sequence 2.
+    pub re2: Vec<f64>,
+    pub im2: Vec<f64>,
+    pub re2_boundary: Vec<f64>,
+    pub im2_boundary: Vec<f64>,
+    pub max_reduction2: Vec<f64>,
 }
 
 /// Pre-computed trig tables for spectral constraint (boundary-independent).
@@ -364,6 +394,7 @@ impl SpectralConstraint {
             amplitudes: tables.amplitudes.clone(),
             assigned: vec![false; middle_len],
             values: vec![0i8; middle_len],
+            seq2: None,
         }
     }
 
@@ -381,6 +412,24 @@ impl SpectralConstraint {
         }
         for v in &mut self.assigned { *v = false; }
         for v in &mut self.values { *v = 0; }
+        if let Some(ref mut s2) = self.seq2 {
+            s2.re1.copy_from_slice(&s2.re1_boundary);
+            s2.im1.copy_from_slice(&s2.im1_boundary);
+            s2.re2.copy_from_slice(&s2.re2_boundary);
+            s2.im2.copy_from_slice(&s2.im2_boundary);
+            // Recompute max_reduction from amplitudes
+            for fi in 0..self.num_freqs { s2.max_reduction1[fi] = 0.0; s2.max_reduction2[fi] = 0.0; }
+            for vi in 0..s2.seq2_start {
+                for fi in 0..self.num_freqs {
+                    s2.max_reduction1[fi] += self.amplitudes[vi * self.num_freqs + fi] as f64;
+                }
+            }
+            for vi in s2.seq2_start..self.num_seq_vars {
+                for fi in 0..self.num_freqs {
+                    s2.max_reduction2[fi] += self.amplitudes[vi * self.num_freqs + fi] as f64;
+                }
+            }
+        }
     }
 
     /// Assign a variable (0-indexed middle position) to val (+1 or -1).
@@ -397,6 +446,22 @@ impl SpectralConstraint {
             self.im[fi] += v * self.sin_table[base + fi] as f64;
             self.max_reduction[fi] -= self.amplitudes[base + fi] as f64;
         }
+        // Two-sequence mode: update the appropriate sequence's DFT
+        if let Some(ref mut s2) = self.seq2 {
+            if var < s2.seq2_start {
+                for fi in 0..self.num_freqs {
+                    s2.re1[fi] += v * self.cos_table[base + fi] as f64;
+                    s2.im1[fi] += v * self.sin_table[base + fi] as f64;
+                    s2.max_reduction1[fi] -= self.amplitudes[base + fi] as f64;
+                }
+            } else {
+                for fi in 0..self.num_freqs {
+                    s2.re2[fi] += v * self.cos_table[base + fi] as f64;
+                    s2.im2[fi] += v * self.sin_table[base + fi] as f64;
+                    s2.max_reduction2[fi] -= self.amplitudes[base + fi] as f64;
+                }
+            }
+        }
     }
 
     /// Unassign a variable. Undoes DFT contribution.
@@ -409,6 +474,21 @@ impl SpectralConstraint {
             self.re[fi] -= v * self.cos_table[base + fi] as f64;
             self.im[fi] -= v * self.sin_table[base + fi] as f64;
             self.max_reduction[fi] += self.amplitudes[base + fi] as f64;
+        }
+        if let Some(ref mut s2) = self.seq2 {
+            if var < s2.seq2_start {
+                for fi in 0..self.num_freqs {
+                    s2.re1[fi] -= v * self.cos_table[base + fi] as f64;
+                    s2.im1[fi] -= v * self.sin_table[base + fi] as f64;
+                    s2.max_reduction1[fi] += self.amplitudes[base + fi] as f64;
+                }
+            } else {
+                for fi in 0..self.num_freqs {
+                    s2.re2[fi] -= v * self.cos_table[base + fi] as f64;
+                    s2.im2[fi] -= v * self.sin_table[base + fi] as f64;
+                    s2.max_reduction2[fi] += self.amplitudes[base + fi] as f64;
+                }
+            }
         }
         self.assigned[var] = false;
         self.values[var] = 0;
@@ -425,18 +505,42 @@ impl SpectralConstraint {
     /// O(num_freqs) conflict check using precomputed max_reduction.
     #[inline]
     pub fn check_conflict(&self) -> Option<usize> {
-        for fi in 0..self.num_freqs {
-            let b = match self.per_freq_bound {
-                Some(ref pfb) => pfb[fi],
-                None => self.bound,
-            };
-            if b <= 0.0 { return Some(fi); } // impossible bound
-            let mag = (self.re[fi] * self.re[fi] + self.im[fi] * self.im[fi]).sqrt();
-            if mag - self.max_reduction[fi] > b.sqrt() {
-                return Some(fi);
+        if let Some(ref s2) = self.seq2 {
+            // Three checks per frequency:
+            // 1. |W(ω)|² ≤ individual_bound
+            // 2. |Z(ω)|² ≤ individual_bound
+            // 3. w1*|W(ω)|² + w2*|Z(ω)|² ≤ pair_bound
+            let ib_sqrt = s2.individual_bound.sqrt();
+            for fi in 0..self.num_freqs {
+                let mag1 = (s2.re1[fi] * s2.re1[fi] + s2.im1[fi] * s2.im1[fi]).sqrt();
+                let mag2 = (s2.re2[fi] * s2.re2[fi] + s2.im2[fi] * s2.im2[fi]).sqrt();
+                let min1 = (mag1 - s2.max_reduction1[fi]).max(0.0);
+                let min2 = (mag2 - s2.max_reduction2[fi]).max(0.0);
+                // Individual W bound
+                if min1 > ib_sqrt { return Some(fi); }
+                // Individual Z bound
+                if min2 > ib_sqrt { return Some(fi); }
+                // Combined pair bound
+                if s2.weight1 * min1 * min1 + s2.weight2 * min2 * min2 > self.bound {
+                    return Some(fi);
+                }
             }
+            None
+        } else {
+            // Single-sequence mode (original)
+            for fi in 0..self.num_freqs {
+                let b = match self.per_freq_bound {
+                    Some(ref pfb) => pfb[fi],
+                    None => self.bound,
+                };
+                if b <= 0.0 { return Some(fi); }
+                let mag = (self.re[fi] * self.re[fi] + self.im[fi] * self.im[fi]).sqrt();
+                if mag - self.max_reduction[fi] > b.sqrt() {
+                    return Some(fi);
+                }
+            }
+            None
         }
-        None
     }
 }
 
