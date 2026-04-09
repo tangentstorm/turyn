@@ -651,6 +651,43 @@ lemma periodicAutocorr_shift_symm {m : Nat} (x : List Int)
   rw [listDotProduct_comm (by simp [circulantRow])]
   rw [circulantRow_dot_eq_periodic x hx hj hi]
 
+lemma applyR_circulantRow_getD {m : Nat} (x : List Int) {r k : Nat} (hk : k < m) :
+    (applyR (circulantRow m x r)).getD k 0 =
+      x.getD ((m - 1 - k + m - r) % m) 0 := by
+  rw [applyR_getD (row := circulantRow m x r) (by simpa [circulantRow] using hk)]
+  have hk' : (circulantRow m x r).length - 1 - k = m - 1 - k := by
+    simp [circulantRow, hk]
+  rw [hk', circulantRow_getD x (r := r) (by omega)]
+
+lemma trRow_getD {m : Nat} (x : List Int) {r k : Nat} (hk : k < m) :
+    (trRow (m := m) x r).getD k 0 =
+      x.getD ((k + m - (m - 1 - r)) % m) 0 := by
+  simpa [trRow] using circulantRow_getD x (r := m - 1 - r) hk
+
+lemma circulant_applyR_dot_swap {m : Nat} (x y : List Int)
+    (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
+    listDotProduct (circulantRow m x i) (applyR (circulantRow m y j)) =
+      listDotProduct (applyR (circulantRow m y i)) (circulantRow m x j) := by
+  sorry
+
+lemma circulant_trRow_dot_swap {m : Nat} (x y : List Int)
+    (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
+    listDotProduct (circulantRow m x i) (trRow (m := m) y j) =
+      listDotProduct (trRow (m := m) y i) (circulantRow m x j) := by
+  sorry
+
+lemma applyR_trRow_dot_swap {m : Nat} (x y : List Int)
+    (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
+    listDotProduct (applyR (circulantRow m x i)) (trRow (m := m) y j) =
+      listDotProduct (applyR (circulantRow m y i)) (trRow (m := m) x j) := by
+  sorry
+
+lemma applyR_applyR_dot_eq_tr_tr_swap {m : Nat} (x y : List Int)
+    (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
+    listDotProduct (applyR (circulantRow m x i)) (applyR (circulantRow m y j)) =
+      listDotProduct (trRow (m := m) y i) (trRow (m := m) x j) := by
+  sorry
+
 lemma trRow_pmOne_mem {m : Nat} {x : List Int}
     (hx_len : x.length = m)
     (hx_pm : ∀ j, j < m → x.getD j 0 = 1 ∨ x.getD j 0 = -1)
@@ -721,9 +758,58 @@ lemma gs_same_block_row_reduces_to_combined_periodic {m : Nat} (T : TSequence m)
     simp [Q, combinedPeriodicAutocorr, add_assoc, add_comm, add_left_comm]
 
 /-- Different block-row case reduced to the combined periodic sum of the four GS sequences. -/
-lemma gs_different_block_rows_reduce_to_combined_periodic {m : Nat} (T : TSequence m) :
-    True := by
-  sorry
+lemma gs_different_block_rows_reduce_to_combined_periodic {m : Nat} (T : TSequence m)
+    {i j : Nat} (hi : i < m) (hj : j < m) :
+    let Q := gsSequenceQuadOfTSequence T
+    listDotProduct (gsRow0 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow1 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 ∧
+    listDotProduct (gsRow0 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 ∧
+    listDotProduct (gsRow0 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 ∧
+    listDotProduct (gsRow1 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 ∧
+    listDotProduct (gsRow1 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 ∧
+    listDotProduct (gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 := by
+  dsimp [gsRow0, gsRow1, gsRow2, gsRow3]
+  let Q := gsSequenceQuadOfTSequence T
+  constructor
+  · repeat rw [listDotProduct_append _ _ _ _ (by simp [circulantRow, trRow])]
+    rw [negRow_dot_right,
+      circulant_applyR_dot_swap Q.x1 Q.x2 Q.x1_len Q.x2_len hi hj,
+      applyR_trRow_dot_swap Q.x3 Q.x4 Q.x3_len Q.x4_len hi hj,
+      negRow_dot_right]
+    ring
+  constructor
+  · repeat rw [listDotProduct_append _ _ _ _ (by simp [circulantRow, trRow])]
+    rw [negRow_dot_right,
+      circulant_applyR_dot_swap Q.x1 Q.x3 Q.x1_len Q.x3_len hi hj,
+      negRow_dot_right,
+      applyR_trRow_dot_swap Q.x2 Q.x4 Q.x2_len Q.x4_len hi hj]
+    ring
+  constructor
+  · repeat rw [listDotProduct_append _ _ _ _ (by simp [circulantRow, trRow])]
+    rw [negRow_dot_right,
+      circulant_applyR_dot_swap Q.x1 Q.x4 Q.x1_len Q.x4_len hi hj,
+      applyR_trRow_dot_swap Q.x2 Q.x3 Q.x2_len Q.x3_len hi hj,
+      negRow_dot_right]
+    ring
+  constructor
+  · repeat rw [listDotProduct_append _ _ _ _ (by simp [circulantRow, trRow])]
+    rw [negRow_dot_left, negRow_dot_right,
+        negRow_dot_right, negRow_dot_left,
+        circulant_trRow_dot_swap Q.x1 Q.x4 Q.x1_len Q.x4_len hi hj,
+        applyR_applyR_dot_eq_tr_tr_swap Q.x2 Q.x3 Q.x2_len Q.x3_len hi hj]
+    ring
+  constructor
+  · repeat rw [listDotProduct_append _ _ _ _ (by simp [circulantRow, trRow])]
+    rw [negRow_dot_left, negRow_dot_right,
+        negRow_dot_right, negRow_dot_left,
+        applyR_applyR_dot_eq_tr_tr_swap Q.x2 Q.x4 Q.x2_len Q.x4_len hi hj,
+        circulant_trRow_dot_swap Q.x1 Q.x3 Q.x1_len Q.x3_len hi hj]
+    ring
+  · repeat rw [listDotProduct_append _ _ _ _ (by simp [circulantRow, trRow])]
+    rw [negRow_dot_left, negRow_dot_right,
+        negRow_dot_left, negRow_dot_right,
+        applyR_applyR_dot_eq_tr_tr_swap Q.x3 Q.x4 Q.x3_len Q.x4_len hi hj,
+        circulant_trRow_dot_swap Q.x1 Q.x2 Q.x1_len Q.x2_len hi hj]
+    ring
 
 /-- Distinct rows from the same GS block-row are orthogonal by the periodic vanishing identity. -/
 theorem gs_same_block_row_orthogonal {m : Nat} (T : TSequence m)
@@ -758,9 +844,16 @@ theorem gs_same_block_row_orthogonal {m : Nat} (T : TSequence m)
   · rw [h3, Q.periodic_vanishing ((j + m - i) % m) hs1 hslt]
 
 /-- Rows from different GS block-rows are orthogonal by the same periodic vanishing identity. -/
-theorem gs_different_block_rows_orthogonal {m : Nat} (T : TSequence m) :
-    True := by
-  sorry
+theorem gs_different_block_rows_orthogonal {m : Nat} (T : TSequence m)
+    {i j : Nat} (hi : i < m) (hj : j < m) :
+    let Q := gsSequenceQuadOfTSequence T
+    listDotProduct (gsRow0 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow1 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 ∧
+    listDotProduct (gsRow0 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 ∧
+    listDotProduct (gsRow0 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 ∧
+    listDotProduct (gsRow1 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 ∧
+    listDotProduct (gsRow1 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 ∧
+    listDotProduct (gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 := by
+  exact gs_different_block_rows_reduce_to_combined_periodic T hi hj
 
 /-- The final GS matrix has only `±1` entries. -/
 theorem gsMatrixOfTSequence_allEntriesPmOne {m : Nat} (T : TSequence m) :

@@ -27,6 +27,12 @@ def negRow (row : List Int) : List Int := row.map (· * (-1))
 @[simp] theorem negRow_length (row : List Int) : (negRow row).length = row.length := by
   simp [negRow]
 
+lemma applyR_getD {row : List Int} {k : Nat} (hk : k < row.length) :
+    (applyR row).getD k 0 = row.getD (row.length - 1 - k) 0 := by
+  rw [List.getD_eq_getElem _ _ (by simpa [applyR] using hk)]
+  rw [List.getD_eq_getElem _ _ (by omega)]
+  simpa [applyR] using List.getElem_reverse (l := row) (i := k) hk
+
 /-- Circulant matrix rows from a length-`m` first row. -/
 def circulantRow (m : Nat) (a : List Int) (i : Nat) : List Int :=
   (List.range m).map fun j =>
@@ -158,6 +164,10 @@ lemma listDotProduct_comm {a b : List Int} (h : a.length = b.length) :
   apply Finset.sum_congr rfl
   intro i hi
   ring
+
+lemma sum_range_reflect {α : Type} [AddCommMonoid α] {m : Nat} (hm : m ≠ 0) (f : Nat → α) :
+    (∑ k ∈ Finset.range m, f k) = ∑ k ∈ Finset.range m, f (m - 1 - k) := by
+  simpa using (Finset.sum_range_reflect (f := f) (n := m)).symm
 
 /-- Dot product of concatenated rows splits when the first parts have equal length. -/
 lemma listDotProduct_append (a1 a2 b1 b2 : List Int)
