@@ -1634,3 +1634,325 @@ pub fn has_extension(
     let (_, root) = build_extension(base_k, target_k, z_bits, w_bits, x_bits, y_bits);
     root != DEAD
 }
+
+/// Fast extension feasibility check for mdd_extend=1.
+/// Brute-forces all 256 assignments for the 8 new boundary positions
+/// (z/w/x/y × front/back) and checks if the extended boundary's partial
+/// autocorrelation sums are achievable by the remaining middle positions.
+/// ~1000x faster than has_extension() (no MDD/HashMap allocation).
+pub fn has_extension_fast(
+    base_k: usize,
+    n: usize,
+    z_bits: u32,
+    w_bits: u32,
+    x_bits: u32,
+    y_bits: u32,
+) -> bool {
+    let m = n - 1;
+    let tk = base_k + 1; // target_k
+
+    // New positions: seq[base_k] (front) and seq[len-base_k-1] (back)
+    let z_new = [base_k, n - base_k - 1];
+    let w_new = [base_k, m - base_k - 1];
+    // x,y new positions same as z
+
+    // Helper: is position in the EXTENDED boundary (first tk or last tk)?
+    let is_z_bnd = |p: usize| p < tk || p >= n - tk;
+    let is_w_bnd = |p: usize| p < tk || p >= m - tk;
+
+    // Helper: get old boundary value from bits
+    let zv = |p: usize| -> i32 {
+        if p < base_k { if (z_bits >> p) & 1 == 1 { 1 } else { -1 } }
+        else { let b = base_k + (p - (n - base_k)); if (z_bits >> b) & 1 == 1 { 1 } else { -1 } }
+    };
+    let wv = |p: usize| -> i32 {
+        if p < base_k { if (w_bits >> p) & 1 == 1 { 1 } else { -1 } }
+        else { let b = base_k + (p - (m - base_k)); if (w_bits >> b) & 1 == 1 { 1 } else { -1 } }
+    };
+    let xv = |p: usize| -> i32 {
+        if p < base_k { if (x_bits >> p) & 1 == 1 { 1 } else { -1 } }
+        else { let b = base_k + (p - (n - base_k)); if (x_bits >> b) & 1 == 1 { 1 } else { -1 } }
+    };
+    let yv = |p: usize| -> i32 {
+        if p < base_k { if (y_bits >> p) & 1 == 1 { 1 } else { -1 } }
+        else { let b = base_k + (p - (n - base_k)); if (y_bits >> b) & 1 == 1 { 1 } else { -1 } }
+    };
+
+    // Identify which lags have boundary-boundary pairs (only these need checking)
+    let mut check_lags: Vec<usize> = Vec::new();
+    for j in 1..n {
+        let has_z = (0..n.saturating_sub(j)).any(|i| is_z_bnd(i) && is_z_bnd(i + j));
+        let has_w = (0..m.saturating_sub(j)).any(|i| is_w_bnd(i) && is_w_bnd(i + j));
+        if has_z || has_w { check_lags.push(j); }
+    }
+
+    // Pre-compute old×old sums and max_middle for each check lag
+    let is_old_z = |p: usize| p < base_k || p >= n - base_k;
+    let is_old_w = |p: usize| p < base_k || p >= m - base_k;
+    let is_new_z = |p: usize| p == z_new[0] || p == z_new[1];
+    let is_new_w = |p: usize| p == w_new[0] || p == w_new[1];
+
+    struct LagInfo {
+        old_old_sum: i32,
+        max_mid: i32,
+        // Linear coefficients: [zf, zb, wf, wb, xf, xb, yf, yb]
+        linear: [i32; 8],
+        // Bilinear: (var_a, var_b, weight) pairs
+        bilinear: Vec<(usize, usize, i32)>,
+    }
+
+    let mut lag_infos: Vec<LagInfo> = Vec::with_capacity(check_lags.len());
+
+    for &j in &check_lags {
+        let mut old_old_sum = 0i32;
+        let mut linear = [0i32; 8];
+        let mut bilinear: Vec<(usize, usize, i32)> = Vec::new();
+
+        // Z pairs: (i, i+j), weight 2
+        for i in 0..n.saturating_sub(j) {
+            let a = i;
+            let b = i + j;
+            if !is_z_bnd(a) || !is_z_bnd(b) { continue; }
+            let a_old = is_old_z(a);
+            let b_old = is_old_z(b);
+            let a_new_idx = if a == z_new[0] { Some(0usize) } else if a == z_new[1] { Some(1) } else { None };
+            let b_new_idx = if b == z_new[0] { Some(0usize) } else if b == z_new[1] { Some(1) } else { None };
+
+            if a_old && b_old {
+                old_old_sum += 2 * zv(a) * zv(b);
+            } else if let (Some(ai), None) = (a_new_idx, b_new_idx) {
+                // new × old: contribution = 2 * new_val * old_val
+                linear[ai] += 2 * zv(b);
+            } else if let (None, Some(bi)) = (a_new_idx, b_new_idx) {
+                // old × new
+                linear[bi] += 2 * zv(a);
+            } else if let (Some(ai), Some(bi)) = (a_new_idx, b_new_idx) {
+                // new × new
+                bilinear.push((ai, bi, 2));
+            }
+        }
+
+        // W pairs: (i, i+j), weight 2
+        for i in 0..m.saturating_sub(j) {
+            let a = i;
+            let b = i + j;
+            if !is_w_bnd(a) || !is_w_bnd(b) { continue; }
+            let a_old = is_old_w(a);
+            let b_old = is_old_w(b);
+            let a_new_idx = if a == w_new[0] { Some(2usize) } else if a == w_new[1] { Some(3) } else { None };
+            let b_new_idx = if b == w_new[0] { Some(2usize) } else if b == w_new[1] { Some(3) } else { None };
+
+            if a_old && b_old {
+                old_old_sum += 2 * wv(a) * wv(b);
+            } else if let (Some(ai), None) = (a_new_idx, b_new_idx) {
+                linear[ai] += 2 * wv(b);
+            } else if let (None, Some(bi)) = (a_new_idx, b_new_idx) {
+                linear[bi] += 2 * wv(a);
+            } else if let (Some(ai), Some(bi)) = (a_new_idx, b_new_idx) {
+                bilinear.push((ai, bi, 2));
+            }
+        }
+
+        // X pairs: (i, i+j), weight 1, same positions as Z
+        for i in 0..n.saturating_sub(j) {
+            let a = i;
+            let b = i + j;
+            if !is_z_bnd(a) || !is_z_bnd(b) { continue; }
+            let a_old = is_old_z(a);
+            let b_old = is_old_z(b);
+            let a_new_idx = if a == z_new[0] { Some(4usize) } else if a == z_new[1] { Some(5) } else { None };
+            let b_new_idx = if b == z_new[0] { Some(4usize) } else if b == z_new[1] { Some(5) } else { None };
+
+            if a_old && b_old {
+                old_old_sum += xv(a) * xv(b);
+            } else if let (Some(ai), None) = (a_new_idx, b_new_idx) {
+                linear[ai] += xv(b);
+            } else if let (None, Some(bi)) = (a_new_idx, b_new_idx) {
+                linear[bi] += xv(a);
+            } else if let (Some(ai), Some(bi)) = (a_new_idx, b_new_idx) {
+                bilinear.push((ai, bi, 1));
+            }
+        }
+
+        // Y pairs: (i, i+j), weight 1, same positions as Z
+        for i in 0..n.saturating_sub(j) {
+            let a = i;
+            let b = i + j;
+            if !is_z_bnd(a) || !is_z_bnd(b) { continue; }
+            let a_old = is_old_z(a);
+            let b_old = is_old_z(b);
+            let a_new_idx = if a == z_new[0] { Some(6usize) } else if a == z_new[1] { Some(7) } else { None };
+            let b_new_idx = if b == z_new[0] { Some(6usize) } else if b == z_new[1] { Some(7) } else { None };
+
+            if a_old && b_old {
+                old_old_sum += yv(a) * yv(b);
+            } else if let (Some(ai), None) = (a_new_idx, b_new_idx) {
+                linear[ai] += yv(b);
+            } else if let (None, Some(bi)) = (a_new_idx, b_new_idx) {
+                linear[bi] += yv(a);
+            } else if let (Some(ai), Some(bi)) = (a_new_idx, b_new_idx) {
+                bilinear.push((ai, bi, 1));
+            }
+        }
+
+        // Max middle correction
+        let z_total = n.saturating_sub(j) as i32;
+        let z_bnd: i32 = (0..n.saturating_sub(j)).filter(|&i| is_z_bnd(i) && is_z_bnd(i + j)).count() as i32;
+        let w_total = m.saturating_sub(j) as i32;
+        let w_bnd: i32 = (0..m.saturating_sub(j)).filter(|&i| is_w_bnd(i) && is_w_bnd(i + j)).count() as i32;
+        let max_mid = 2 * (z_total - z_bnd) + 2 * (w_total - w_bnd)
+                    + (z_total - z_bnd) + (z_total - z_bnd); // X + Y same as Z
+
+        lag_infos.push(LagInfo { old_old_sum, max_mid, linear, bilinear });
+    }
+
+    // Evaluate all 256 combos
+    let vals_for = |combo: u32| -> [i32; 8] {
+        [
+            if combo & 1 != 0 { 1 } else { -1 },   // zf
+            if combo & 2 != 0 { 1 } else { -1 },   // zb
+            if combo & 4 != 0 { 1 } else { -1 },   // wf
+            if combo & 8 != 0 { 1 } else { -1 },   // wb
+            if combo & 16 != 0 { 1 } else { -1 },  // xf
+            if combo & 32 != 0 { 1 } else { -1 },  // xb
+            if combo & 64 != 0 { 1 } else { -1 },  // yf
+            if combo & 128 != 0 { 1 } else { -1 },  // yb
+        ]
+    };
+
+    'combo: for combo in 0u32..256 {
+        let v = vals_for(combo);
+        for info in &lag_infos {
+            let mut s = info.old_old_sum;
+            for i in 0..8 { s += info.linear[i] * v[i]; }
+            for &(a, b, w) in &info.bilinear { s += w * v[a] * v[b]; }
+            if s.abs() > info.max_mid || (s + info.max_mid) % 2 != 0 {
+                continue 'combo;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// ZW-only extension check for use at stage 0 (Boundary handler).
+/// Only needs z_bits/w_bits — treats all XY positions as free variables.
+/// Checks if the ZW boundary can extend to k+1 with any XY assignment.
+/// Very fast: only 16 ZW combos (vs 256 for full check).
+pub fn has_zw_extension_fast(
+    base_k: usize,
+    n: usize,
+    z_bits: u32,
+    w_bits: u32,
+) -> bool {
+    let m = n - 1;
+    let tk = base_k + 1;
+
+    let z_new = [base_k, n - base_k - 1];
+    let w_new = [base_k, m - base_k - 1];
+
+    let is_z_bnd = |p: usize| p < tk || p >= n - tk;
+    let is_w_bnd = |p: usize| p < tk || p >= m - tk;
+
+    let zv = |p: usize| -> i32 {
+        if p < base_k { if (z_bits >> p) & 1 == 1 { 1 } else { -1 } }
+        else { let b = base_k + (p - (n - base_k)); if (z_bits >> b) & 1 == 1 { 1 } else { -1 } }
+    };
+    let wv = |p: usize| -> i32 {
+        if p < base_k { if (w_bits >> p) & 1 == 1 { 1 } else { -1 } }
+        else { let b = base_k + (p - (m - base_k)); if (w_bits >> b) & 1 == 1 { 1 } else { -1 } }
+    };
+
+    let is_old_z = |p: usize| p < base_k || p >= n - base_k;
+    let is_old_w = |p: usize| p < base_k || p >= m - base_k;
+
+    // Identify check lags (where ZW boundary pairs exist)
+    let mut check_lags: Vec<usize> = Vec::new();
+    for j in 1..n {
+        let has_z = (0..n.saturating_sub(j)).any(|i| is_z_bnd(i) && is_z_bnd(i + j));
+        let has_w = (0..m.saturating_sub(j)).any(|i| is_w_bnd(i) && is_w_bnd(i + j));
+        if has_z || has_w { check_lags.push(j); }
+    }
+
+    struct ZwLagInfo {
+        zw_old_old_sum: i32,
+        max_correction: i32,
+        // Linear coefficients for 4 ZW vars: [zf, zb, wf, wb]
+        linear: [i32; 4],
+        bilinear: Vec<(usize, usize, i32)>,
+    }
+
+    let mut lag_infos: Vec<ZwLagInfo> = Vec::with_capacity(check_lags.len());
+
+    for &j in &check_lags {
+        let mut zw_old_old_sum = 0i32;
+        let mut linear = [0i32; 4];
+        let mut bilinear: Vec<(usize, usize, i32)> = Vec::new();
+
+        // Z boundary pairs: weight 2
+        for i in 0..n.saturating_sub(j) {
+            let (a, b) = (i, i + j);
+            if !is_z_bnd(a) || !is_z_bnd(b) { continue; }
+            let a_new = if a == z_new[0] { Some(0usize) } else if a == z_new[1] { Some(1) } else { None };
+            let b_new = if b == z_new[0] { Some(0usize) } else if b == z_new[1] { Some(1) } else { None };
+
+            if a_new.is_none() && b_new.is_none() {
+                zw_old_old_sum += 2 * zv(a) * zv(b);
+            } else if let (Some(ai), None) = (a_new, b_new) {
+                linear[ai] += 2 * zv(b);
+            } else if let (None, Some(bi)) = (a_new, b_new) {
+                linear[bi] += 2 * zv(a);
+            } else if let (Some(ai), Some(bi)) = (a_new, b_new) {
+                bilinear.push((ai, bi, 2));
+            }
+        }
+
+        // W boundary pairs: weight 2
+        for i in 0..m.saturating_sub(j) {
+            let (a, b) = (i, i + j);
+            if !is_w_bnd(a) || !is_w_bnd(b) { continue; }
+            let a_new = if a == w_new[0] { Some(2usize) } else if a == w_new[1] { Some(3) } else { None };
+            let b_new = if b == w_new[0] { Some(2usize) } else if b == w_new[1] { Some(3) } else { None };
+
+            if a_new.is_none() && b_new.is_none() {
+                zw_old_old_sum += 2 * wv(a) * wv(b);
+            } else if let (Some(ai), None) = (a_new, b_new) {
+                linear[ai] += 2 * wv(b);
+            } else if let (None, Some(bi)) = (a_new, b_new) {
+                linear[bi] += 2 * wv(a);
+            } else if let (Some(ai), Some(bi)) = (a_new, b_new) {
+                bilinear.push((ai, bi, 2));
+            }
+        }
+
+        // Max correction: ZW middle pairs + ALL X/Y pairs (free since no X/Y boundary)
+        let z_total = n.saturating_sub(j) as i32;
+        let z_bnd: i32 = (0..n.saturating_sub(j)).filter(|&i| is_z_bnd(i) && is_z_bnd(i + j)).count() as i32;
+        let w_total = m.saturating_sub(j) as i32;
+        let w_bnd: i32 = (0..m.saturating_sub(j)).filter(|&i| is_w_bnd(i) && is_w_bnd(i + j)).count() as i32;
+        // ZW middle pairs + ALL XY pairs (X and Y boundary positions are free)
+        let max_correction = 2 * (z_total - z_bnd) + 2 * (w_total - w_bnd) + 2 * z_total;
+
+        lag_infos.push(ZwLagInfo { zw_old_old_sum, max_correction, linear, bilinear });
+    }
+
+    // Only 16 ZW combos (4 vars: zf, zb, wf, wb)
+    'combo: for combo in 0u32..16 {
+        let v: [i32; 4] = [
+            if combo & 1 != 0 { 1 } else { -1 },
+            if combo & 2 != 0 { 1 } else { -1 },
+            if combo & 4 != 0 { 1 } else { -1 },
+            if combo & 8 != 0 { 1 } else { -1 },
+        ];
+        for info in &lag_infos {
+            let mut s = info.zw_old_old_sum;
+            for i in 0..4 { s += info.linear[i] * v[i]; }
+            for &(a, b, w) in &info.bilinear { s += w * v[a] * v[b]; }
+            if s.abs() > info.max_correction || (s + info.max_correction) % 2 != 0 {
+                continue 'combo;
+            }
+        }
+        return true;
+    }
+    false
+}

@@ -660,3 +660,112 @@ Verify monitor thread isn't starving workers by sleeping too long.
 ### T24. Fuse GJ equalities into quad PB terms
 Substitute equal variables directly into quad PB constraints.
 **Single commit:** After GJ, rewrite quad PB term lists to use canonical variables.
+
+---
+
+## Boundaries/s paradigm shift (2026-04-09)
+
+**Key insight**: The right optimization metric is boundaries/s (how fast we eliminate
+regions of the search space), NOT xy/s (individual XY solve throughput). Pruning a
+dead boundary early is a huge win even if per-boundary overhead increases, because
+it frees workers from wasted W/Z/XY work on that boundary.
+
+Previous ideas like --mdd-extend=1 were rejected because they lowered xy/s. That was
+the wrong metric. If an extension check prunes 52% of boundaries at 14us/call, that's
+a massive win in effective search progress.
+
+### E1. Restore extension check before XY SAT — **ACCEPTED (+28% bnd/s at n=56)**
+Restored has_extension() in walk_xy_sub_mdd callback with per-worker u128 cache.
+Prunes 44% of XY candidates at n=56 k=10. Median bnd/s: 394→504 (+28%).
+Also eliminates worst-case cliffs (baseline 92 bnd/s, extension 498-538 stable).
+Neutral at n=26 (median 307 both). Commit: ab65d41.
+
+### E2. ZW-only boundary autocorrelation bound at stage 0 — **REJECTED**
+Implemented and tested. At n=26 k=7: only 27 out of 8637 boundaries pruned (0.3%).
+At n=56 k=10: similarly negligible. The XY slack (2×(n-1-j) free pairs) overwhelms
+the ZW boundary contribution. Would need XY info to be effective, but that's only
+available at stage 3. ZW-only check fundamentally too loose.
+
+### E3. Extension check cache — **IMPLEMENTED (part of E1)**
+Per-worker HashMap<u128, bool> cache. Key = (z_bits, w_bits, x_bits, y_bits) packed
+into u128. Critical for performance: same boundary 4-tuple is checked across Z
+solutions, cache avoids redundant MDD builds.
+
+### E4. Early W spectral reject saves boundary throughput
+Currently SolveW generates W middles and filters by individual spectral bound.
+Tighten this: compute the ZW combined spectral bound and reject W values that
+can't possibly combine with any Z to meet the pair bound. This prunes W earlier,
+freeing workers for more boundaries.
+**Single commit:** Add combined ZW spectral pre-filter in SolveW brute-force loop.
+
+### E4. Early W spectral reject — **REJECTED (analysis)**
+Analyzed: W individual bound = (6n-2)/2 = 3n-1. The pair constraint gives
+2|W(ω)|² ≤ 6n-2, i.e., |W(ω)|² ≤ 3n-1 = individual_bound. Already optimal.
+A tighter Z-aware bound using min_Z_power(ω) = max(0, |DFT_Z_bnd|-middle_n)²
+degenerates to individual_bound when middle_n > 2k (true for n=56 k=10).
+
+### E5. Conflict limit proportional to boundary promise — **REJECTED**
+Tested reducing XY conflict limit from 5K to 2K at n=56: median bnd/s dropped
+from 431 to 123. The 5K limit is well-tuned: enough to find SAT answers that
+exist, not too many to waste on hard UNSAT.
+
+### E6. Skip already-explored ZW pairs across tuples
+When a (z_bits, w_bits) pair is explored for one tuple, the W/Z work is done.
+If the same ZW pair appears for another tuple (different sum target), the
+W middles and Z solves are independent. But the boundary was already "walked."
+Track explored ZW pairs to avoid re-processing expensive stages.
+**Single commit:** Add per-worker HashSet of explored (z_bits, w_bits, tuple) triples.
+
+### E7. Batch boundary pruning with precomputed k+1 node reachability
+Build MDD at k+1, precompute which k-boundary (z_bits, w_bits) patterns are
+prefixes of valid k+1 boundaries. Store as a Bloom filter or HashSet. At stage 0,
+reject boundaries not in the set. Cost: one-time MDD build at k+1.
+**Single commit:** After loading k-MDD, build k+1 ZW-only MDD, extract valid k-prefixes.
+
+### E8. Checkpoint/restore XY solver instead of clone — **REJECTED (profiling)**
+Profiled: prepare_candidate_solver (clone) takes only 504us/call, 12ms total
+in a 30s run = 0.04% of time. The clone overhead is negligible compared to
+XY SAT time (5036ms). Not worth the complexity of checkpoint/restore.
+
+### E9. Pre-check XY extensions at stage 0 — **REJECTED (analysis)**
+Walk XY sub-MDD at stage 0 and check extension for all (x,y). If none pass,
+skip the boundary. Analysis: with 44% per-candidate prune rate and ~44
+candidates per boundary, P(all fail) = 0.35^44 ≈ 0. No boundaries pruned.
+
+### E10. extend=2 vs extend=1 comparison
+Tested: extend=1 median=538 bnd/s, extend=2 median=485 bnd/s (5 runs each).
+extend=2 prunes more candidates but the per-check cost is higher (larger MDD).
+extend=1 is the better choice for n=56 k=10.
+
+### E11. Group SolveW by w_mid_sum to share W SAT — **REJECTED**
+Group tuples with same w_mid_sum into one SolveW, run W SAT once and fan out
+SolveZ items to all matching tuples. Reduces W items from 161K to 68K (-58%).
+But bnd/s dropped from 538 to 381 (-29%). The Vec cloning overhead for fan-out
+and altered pipeline dynamics (more SolveZ items created simultaneously) cause
+a systematic regression. The W SAT reduction doesn't compensate.
+
+### E12. Encode XY sub-MDD as SAT constraint — **IN PROGRESS (promising direction)**
+Instead of enumerating ~3400 (x,y) boundary candidates and solving independently,
+encode the MDD as a constraint so the solver explores all boundaries in ONE call.
+The CDCL search learns from conflicts across boundaries (clause transfer).
+
+**Tseitin encoding (tested, scales poorly):**
+- Introduces auxiliary "reachability" variables per MDD node (100-700 aux vars)
+- Transition clauses link parent→child via boundary variables
+- n=18: **10x faster to find solution** (114ms vs 1.2s) — huge win!
+- n=20: slightly slower (median 10s vs 6.5s)
+- n=22: **regression** — one run failed to find solution in 60s
+- n=56: bnd/s similar to baseline at 5K conflicts, but high variance
+- Problem: aux variables make CDCL search space 2-8x larger
+
+**Activity boosting (tested, no benefit):**
+- Boost boundary var activities in MDD level order
+- Doesn't help because boundary vars are pinned by assumptions (VSIDS irrelevant)
+
+**Native MDD propagator (NOT YET IMPLEMENTED — next step):**
+- Add MDD as a native constraint type in radical (like GJ, PB, spectral, XOR)
+- Zero auxiliary variables — MDD navigated directly during BCP
+- When boundary var assigned → walk MDD forward, prune dead branches, force implied
+- When all MDD paths dead → conflict with explanation from assigned boundary vars
+- This is the right approach: combines the 10x solution-finding speedup with
+  the scalability of native constraint propagation.

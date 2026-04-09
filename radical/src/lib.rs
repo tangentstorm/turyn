@@ -71,6 +71,37 @@ struct XorConstraint {
     assigned_xor: bool,   // XOR of assigned variable values (true = 1)
 }
 
+/// MDD constraint: encodes a multi-valued decision diagram over boundary variable pairs.
+/// At each of `depth` levels, two SAT variables (x, y) select one of 4 branches.
+/// The MDD prunes infeasible boundary combinations without auxiliary variables.
+///
+/// Propagation: when a boundary variable is assigned, recompute the set of
+/// reachable MDD nodes (top-down frontier). If the frontier becomes empty → conflict.
+/// If only one branch is viable at some level → force the implied variable.
+#[derive(Clone)]
+pub struct MddConstraint {
+    /// MDD node table. nodes[nid] = [child0, child1, child2, child3].
+    /// Branch index = x_val | (y_val << 1). DEAD=0, LEAF=u32::MAX.
+    pub nodes: Vec<[u32; 4]>,
+    pub root: u32,
+    pub depth: usize,
+    /// level_x_var[level] = 0-based SAT variable for X at this MDD level
+    pub level_x_var: Vec<usize>,
+    /// level_y_var[level] = 0-based SAT variable for Y at this MDD level
+    pub level_y_var: Vec<usize>,
+    /// var_to_level[var_0based] = MDD level, or usize::MAX if not an MDD variable
+    pub var_to_level: Vec<usize>,
+    /// Whether this var is the X (true) or Y (false) variable at its level
+    pub var_is_x: Vec<bool>,
+    /// Stale flag: set on backtrack, triggers recompute before next propagation
+    pub stale: bool,
+    /// Cached frontier per level (level_frontier[l] = reachable nodes entering level l)
+    /// level_frontier[0] = [root], updated incrementally
+    pub level_frontier: Vec<Vec<u32>>,
+    /// Lowest dirty level (levels below this are clean)
+    pub dirty_level: usize,
+}
+
 /// A quadratic pseudo-boolean constraint with exact target:
 ///   sum(coeffs[i] * lits_a[i] * lits_b[i]) = target
 /// Each term contributes coeffs[i] iff both lits_a[i] and lits_b[i] are true.
@@ -169,6 +200,7 @@ enum Reason {
     QuadPb(u32),  // index into quad_pb_constraints; bit 31 = is_upper flag
     Xor(u32),     // index into xor_constraints
     Spectral,     // spectral power constraint violation
+    Mdd,          // MDD constraint: boundary variables violate MDD path feasibility
 }
 
 /// Trail entry: records an assignment.
@@ -213,6 +245,36 @@ pub struct SpectralConstraint {
     pub assigned: Vec<bool>,
     /// The value assigned to each variable (+1 or -1), 0 if unassigned
     pub values: Vec<i8>,
+    /// Optional second sequence for combined spectral (e.g., WZ pair bound).
+    /// If set, vars 0..seq2_start are sequence 1 (weight seq1_weight),
+    /// vars seq2_start.. are sequence 2 (weight seq2_weight).
+    /// Check: w1*|S1(ω)|² + w2*|S2(ω)|² ≤ bound.
+    pub seq2: Option<Seq2Config>,
+}
+
+/// Config for a two-sequence spectral constraint.
+#[derive(Clone)]
+pub struct Seq2Config {
+    /// First var index of the second sequence (0-based).
+    pub seq2_start: usize,
+    /// Weight for sequence 1 power in combined constraint (e.g., 2.0 for W).
+    pub weight1: f64,
+    /// Weight for sequence 2 power in combined constraint (e.g., 2.0 for Z).
+    pub weight2: f64,
+    /// Individual bound per sequence (e.g., individual_bound for W and Z separately).
+    pub individual_bound: f64,
+    /// Separate DFT tracking for sequence 1.
+    pub re1: Vec<f64>,
+    pub im1: Vec<f64>,
+    pub re1_boundary: Vec<f64>,
+    pub im1_boundary: Vec<f64>,
+    pub max_reduction1: Vec<f64>,
+    /// Separate DFT tracking for sequence 2.
+    pub re2: Vec<f64>,
+    pub im2: Vec<f64>,
+    pub re2_boundary: Vec<f64>,
+    pub im2_boundary: Vec<f64>,
+    pub max_reduction2: Vec<f64>,
 }
 
 /// Pre-computed trig tables for spectral constraint (boundary-independent).
@@ -332,6 +394,7 @@ impl SpectralConstraint {
             amplitudes: tables.amplitudes.clone(),
             assigned: vec![false; middle_len],
             values: vec![0i8; middle_len],
+            seq2: None,
         }
     }
 
@@ -349,6 +412,24 @@ impl SpectralConstraint {
         }
         for v in &mut self.assigned { *v = false; }
         for v in &mut self.values { *v = 0; }
+        if let Some(ref mut s2) = self.seq2 {
+            s2.re1.copy_from_slice(&s2.re1_boundary);
+            s2.im1.copy_from_slice(&s2.im1_boundary);
+            s2.re2.copy_from_slice(&s2.re2_boundary);
+            s2.im2.copy_from_slice(&s2.im2_boundary);
+            // Recompute max_reduction from amplitudes
+            for fi in 0..self.num_freqs { s2.max_reduction1[fi] = 0.0; s2.max_reduction2[fi] = 0.0; }
+            for vi in 0..s2.seq2_start {
+                for fi in 0..self.num_freqs {
+                    s2.max_reduction1[fi] += self.amplitudes[vi * self.num_freqs + fi] as f64;
+                }
+            }
+            for vi in s2.seq2_start..self.num_seq_vars {
+                for fi in 0..self.num_freqs {
+                    s2.max_reduction2[fi] += self.amplitudes[vi * self.num_freqs + fi] as f64;
+                }
+            }
+        }
     }
 
     /// Assign a variable (0-indexed middle position) to val (+1 or -1).
@@ -365,6 +446,22 @@ impl SpectralConstraint {
             self.im[fi] += v * self.sin_table[base + fi] as f64;
             self.max_reduction[fi] -= self.amplitudes[base + fi] as f64;
         }
+        // Two-sequence mode: update the appropriate sequence's DFT
+        if let Some(ref mut s2) = self.seq2 {
+            if var < s2.seq2_start {
+                for fi in 0..self.num_freqs {
+                    s2.re1[fi] += v * self.cos_table[base + fi] as f64;
+                    s2.im1[fi] += v * self.sin_table[base + fi] as f64;
+                    s2.max_reduction1[fi] -= self.amplitudes[base + fi] as f64;
+                }
+            } else {
+                for fi in 0..self.num_freqs {
+                    s2.re2[fi] += v * self.cos_table[base + fi] as f64;
+                    s2.im2[fi] += v * self.sin_table[base + fi] as f64;
+                    s2.max_reduction2[fi] -= self.amplitudes[base + fi] as f64;
+                }
+            }
+        }
     }
 
     /// Unassign a variable. Undoes DFT contribution.
@@ -377,6 +474,21 @@ impl SpectralConstraint {
             self.re[fi] -= v * self.cos_table[base + fi] as f64;
             self.im[fi] -= v * self.sin_table[base + fi] as f64;
             self.max_reduction[fi] += self.amplitudes[base + fi] as f64;
+        }
+        if let Some(ref mut s2) = self.seq2 {
+            if var < s2.seq2_start {
+                for fi in 0..self.num_freqs {
+                    s2.re1[fi] -= v * self.cos_table[base + fi] as f64;
+                    s2.im1[fi] -= v * self.sin_table[base + fi] as f64;
+                    s2.max_reduction1[fi] += self.amplitudes[base + fi] as f64;
+                }
+            } else {
+                for fi in 0..self.num_freqs {
+                    s2.re2[fi] -= v * self.cos_table[base + fi] as f64;
+                    s2.im2[fi] -= v * self.sin_table[base + fi] as f64;
+                    s2.max_reduction2[fi] += self.amplitudes[base + fi] as f64;
+                }
+            }
         }
         self.assigned[var] = false;
         self.values[var] = 0;
@@ -393,18 +505,42 @@ impl SpectralConstraint {
     /// O(num_freqs) conflict check using precomputed max_reduction.
     #[inline]
     pub fn check_conflict(&self) -> Option<usize> {
-        for fi in 0..self.num_freqs {
-            let b = match self.per_freq_bound {
-                Some(ref pfb) => pfb[fi],
-                None => self.bound,
-            };
-            if b <= 0.0 { return Some(fi); } // impossible bound
-            let mag = (self.re[fi] * self.re[fi] + self.im[fi] * self.im[fi]).sqrt();
-            if mag - self.max_reduction[fi] > b.sqrt() {
-                return Some(fi);
+        if let Some(ref s2) = self.seq2 {
+            // Three checks per frequency:
+            // 1. |W(ω)|² ≤ individual_bound
+            // 2. |Z(ω)|² ≤ individual_bound
+            // 3. w1*|W(ω)|² + w2*|Z(ω)|² ≤ pair_bound
+            let ib_sqrt = s2.individual_bound.sqrt();
+            for fi in 0..self.num_freqs {
+                let mag1 = (s2.re1[fi] * s2.re1[fi] + s2.im1[fi] * s2.im1[fi]).sqrt();
+                let mag2 = (s2.re2[fi] * s2.re2[fi] + s2.im2[fi] * s2.im2[fi]).sqrt();
+                let min1 = (mag1 - s2.max_reduction1[fi]).max(0.0);
+                let min2 = (mag2 - s2.max_reduction2[fi]).max(0.0);
+                // Individual W bound
+                if min1 > ib_sqrt { return Some(fi); }
+                // Individual Z bound
+                if min2 > ib_sqrt { return Some(fi); }
+                // Combined pair bound
+                if s2.weight1 * min1 * min1 + s2.weight2 * min2 * min2 > self.bound {
+                    return Some(fi);
+                }
             }
+            None
+        } else {
+            // Single-sequence mode (original)
+            for fi in 0..self.num_freqs {
+                let b = match self.per_freq_bound {
+                    Some(ref pfb) => pfb[fi],
+                    None => self.bound,
+                };
+                if b <= 0.0 { return Some(fi); }
+                let mag = (self.re[fi] * self.re[fi] + self.im[fi] * self.im[fi]).sqrt();
+                if mag - self.max_reduction[fi] > b.sqrt() {
+                    return Some(fi);
+                }
+            }
+            None
         }
-        None
     }
 }
 
@@ -496,6 +632,9 @@ pub struct Solver {
     xor_constraints: Vec<XorConstraint>,
     xor_var_watches: Vec<Vec<u32>>,  // xor_var_watches[var] = list of XOR constraint indices
 
+    // MDD constraint (at most one, optional)
+    pub mdd: Option<MddConstraint>,
+
     // Propagation queue
     prop_head: usize, // next trail entry to propagate
 
@@ -520,7 +659,7 @@ pub struct Solver {
     conflict_limit: u64,  // 0 = no limit
 
     // State
-    ok: bool, // false if top-level conflict detected
+    pub ok: bool, // false if top-level conflict detected
     /// When true, skip quad PB incremental updates during backtrack.
     /// Used when the caller will reset quad PB state externally.
     pub skip_backtrack_quad_pb: bool,
@@ -603,6 +742,7 @@ impl Solver {
             conflict_limit: 0,
             ok: true,
             skip_backtrack_quad_pb: false,
+            mdd: None,
             spectral: None,
         }
     }
@@ -940,6 +1080,199 @@ impl Solver {
         }
     }
 
+    /// Add an MDD constraint over boundary variable pairs.
+    /// `nodes` is the MDD node table (nodes[0] = dead sentinel).
+    /// `level_x_vars` and `level_y_vars` are 1-based SAT variable IDs for each level.
+    /// The solver will enforce that the boundary variables follow a valid MDD path.
+    pub fn add_mdd_constraint(
+        &mut self,
+        nodes: &[[u32; 4]],
+        root: u32,
+        depth: usize,
+        level_x_vars_1based: &[i32],
+        level_y_vars_1based: &[i32],
+    ) {
+        assert_eq!(level_x_vars_1based.len(), depth);
+        assert_eq!(level_y_vars_1based.len(), depth);
+
+        // Ensure all variables exist
+        for &v in level_x_vars_1based { self.ensure_var(v.unsigned_abs() as usize); }
+        for &v in level_y_vars_1based { self.ensure_var(v.unsigned_abs() as usize); }
+
+        let lx: Vec<usize> = level_x_vars_1based.iter().map(|&v| v.unsigned_abs() as usize - 1).collect();
+        let ly: Vec<usize> = level_y_vars_1based.iter().map(|&v| v.unsigned_abs() as usize - 1).collect();
+
+        let max_var = lx.iter().chain(ly.iter()).copied().max().unwrap_or(0);
+        let mut var_to_level = vec![usize::MAX; max_var + 1];
+        let mut var_is_x = vec![false; max_var + 1];
+        for (level, &v) in lx.iter().enumerate() {
+            var_to_level[v] = level;
+            var_is_x[v] = true;
+        }
+        for (level, &v) in ly.iter().enumerate() {
+            var_to_level[v] = level;
+            var_is_x[v] = false;
+        }
+
+        self.mdd = Some(MddConstraint {
+            nodes: nodes.to_vec(),
+            root, depth,
+            level_x_var: lx,
+            level_y_var: ly,
+            var_to_level,
+            var_is_x,
+            stale: true,
+            level_frontier: {
+                let mut f = vec![Vec::new(); depth + 1];
+                f[0] = vec![root];
+                f
+            },
+            dirty_level: 0,
+        });
+        // Count reachable nodes for diagnostic
+        let mdd = self.mdd.as_ref().unwrap();
+        let mut count = 0;
+        let mut stack = vec![mdd.root];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(nid) = stack.pop() {
+            if nid == 0 || nid == u32::MAX { continue; }
+            if !seen.insert(nid) { continue; }
+            count += 1;
+            for &c in &mdd.nodes[nid as usize] { stack.push(c); }
+        }
+        eprintln!("[MDD] root={} depth={} reachable_nodes={} x_vars={:?} y_vars={:?}",
+            root, depth, count, &mdd.level_x_var[..depth.min(4)], &mdd.level_y_var[..depth.min(4)]);
+    }
+
+    /// Propagate MDD constraint. Returns conflict reason if dead-end, None otherwise.
+    /// Uses top-down frontier BFS: walk MDD levels, filtering nodes by assigned vars.
+    /// When only one branch is viable at a level, force the implied variable.
+    fn propagate_mdd(&mut self) -> Option<Reason> {
+        const MDD_DEAD: u32 = 0;
+        const MDD_LEAF: u32 = u32::MAX;
+
+        let mdd = match self.mdd.as_ref() { Some(m) => m, None => return None };
+        if mdd.root == MDD_DEAD { return Some(Reason::Mdd); }
+
+        // If stale (backtrack occurred), find the lowest level with changed assignments
+        if mdd.stale {
+            let mdd = self.mdd.as_mut().unwrap();
+            mdd.stale = false;
+            mdd.dirty_level = 0; // conservative: full recompute on backtrack
+            mdd.level_frontier[0] = vec![mdd.root];
+        }
+
+        let mut forced: Vec<Lit> = Vec::new();
+        let mut conflict = false;
+
+        // Read MDD fields via raw pointer to avoid borrow issues
+        let mdd = self.mdd.as_ref().unwrap();
+        let start = mdd.dirty_level;
+        let depth = mdd.depth;
+        let nodes = &mdd.nodes as *const Vec<[u32; 4]>;
+        let level_x = &mdd.level_x_var as *const Vec<usize>;
+        let level_y = &mdd.level_y_var as *const Vec<usize>;
+
+        for level in start..depth {
+            let xv = unsafe { &*level_x }[level];
+            let yv = unsafe { &*level_y }[level];
+            let x_asgn = self.assigns[xv];
+            let y_asgn = self.assigns[yv];
+
+            // Read current frontier for this level
+            let frontier: Vec<u32> = self.mdd.as_ref().unwrap().level_frontier[level].clone();
+            let mut next: Vec<u32> = Vec::new();
+            let nodes_ref = unsafe { &*nodes };
+
+            if x_asgn != LBool::Undef && y_asgn != LBool::Undef {
+                let branch = (x_asgn == LBool::True) as usize | (((y_asgn == LBool::True) as usize) << 1);
+                for &nid in &frontier {
+                    if nid == MDD_LEAF { next.push(MDD_LEAF); }
+                    else {
+                        let c = nodes_ref[nid as usize][branch];
+                        if c != MDD_DEAD && !next.contains(&c) { next.push(c); }
+                    }
+                }
+            } else if x_asgn != LBool::Undef {
+                let b0 = (x_asgn == LBool::True) as usize;
+                let b1 = b0 | 2;
+                let (mut y0_ok, mut y1_ok) = (false, false);
+                for &nid in &frontier {
+                    if nid == MDD_LEAF { y0_ok = true; y1_ok = true; if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); } }
+                    else {
+                        let (c0, c1) = (nodes_ref[nid as usize][b0], nodes_ref[nid as usize][b1]);
+                        if c0 != MDD_DEAD { y0_ok = true; if !next.contains(&c0) { next.push(c0); } }
+                        if c1 != MDD_DEAD { y1_ok = true; if !next.contains(&c1) { next.push(c1); } }
+                    }
+                }
+                if !y0_ok && !y1_ok { conflict = true; }
+                else if !y0_ok && self.assigns[yv] == LBool::Undef { forced.push((yv + 1) as Lit); }
+                else if !y1_ok && self.assigns[yv] == LBool::Undef { forced.push(-((yv + 1) as Lit)); }
+            } else if y_asgn != LBool::Undef {
+                let b0 = ((y_asgn == LBool::True) as usize) << 1;
+                let b1 = b0 | 1;
+                let (mut x0_ok, mut x1_ok) = (false, false);
+                for &nid in &frontier {
+                    if nid == MDD_LEAF { x0_ok = true; x1_ok = true; if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); } }
+                    else {
+                        let (c0, c1) = (nodes_ref[nid as usize][b0], nodes_ref[nid as usize][b1]);
+                        if c0 != MDD_DEAD { x0_ok = true; if !next.contains(&c0) { next.push(c0); } }
+                        if c1 != MDD_DEAD { x1_ok = true; if !next.contains(&c1) { next.push(c1); } }
+                    }
+                }
+                if !x0_ok && !x1_ok { conflict = true; }
+                else if !x0_ok && self.assigns[xv] == LBool::Undef { forced.push((xv + 1) as Lit); }
+                else if !x1_ok && self.assigns[xv] == LBool::Undef { forced.push(-((xv + 1) as Lit)); }
+            } else {
+                let (mut x0_ok, mut x1_ok, mut y0_ok, mut y1_ok) = (false, false, false, false);
+                for &nid in &frontier {
+                    if nid == MDD_LEAF {
+                        x0_ok = true; x1_ok = true; y0_ok = true; y1_ok = true;
+                        if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); }
+                    } else {
+                        for b in 0..4usize {
+                            let c = nodes_ref[nid as usize][b];
+                            if c != MDD_DEAD {
+                                if b & 1 == 0 { x0_ok = true; } else { x1_ok = true; }
+                                if b & 2 == 0 { y0_ok = true; } else { y1_ok = true; }
+                                if !next.contains(&c) { next.push(c); }
+                            }
+                        }
+                    }
+                }
+                if !x0_ok && !x1_ok { conflict = true; }
+                else if !y0_ok && !y1_ok { conflict = true; }
+                else {
+                    if !x0_ok && self.assigns[xv] == LBool::Undef { forced.push((xv + 1) as Lit); }
+                    if !x1_ok && self.assigns[xv] == LBool::Undef { forced.push(-((xv + 1) as Lit)); }
+                    if !y0_ok && self.assigns[yv] == LBool::Undef { forced.push((yv + 1) as Lit); }
+                    if !y1_ok && self.assigns[yv] == LBool::Undef { forced.push(-((yv + 1) as Lit)); }
+                }
+            }
+
+            // Store frontier for next level
+            if !conflict && level + 1 <= depth {
+                let mdd = self.mdd.as_mut().unwrap();
+                mdd.level_frontier[level + 1] = next;
+                mdd.dirty_level = level + 1;
+            }
+
+            if conflict { break; }
+            if !forced.is_empty() { break; } // let forced vars trigger re-propagation
+        }
+
+        if conflict { return Some(Reason::Mdd); }
+
+        for flit in forced {
+            if self.lit_value(flit) == LBool::False { return Some(Reason::Mdd); }
+            if self.lit_value(flit) == LBool::Undef {
+                self.enqueue(flit, Reason::Mdd);
+            }
+        }
+
+        None
+    }
+
     /// Solve the formula. Returns Some(true) if SAT, Some(false) if UNSAT.
     pub fn solve(&mut self) -> Option<bool> {
         self.solve_with_assumptions(&[])
@@ -1031,6 +1364,52 @@ impl Solver {
     /// Number of variables.
     pub fn num_vars(&self) -> usize { self.num_vars }
     /// Number of active (non-deleted) clauses.
+    /// Verify all quad PB constraint states match actual variable assignments.
+    /// Returns the number of mismatched constraints found.
+    pub fn verify_quad_pb_state(&self) -> usize {
+        let mut bad = 0;
+        for (qi, qc) in self.quad_pb_constraints.iter().enumerate() {
+            if qc.stale { continue; } // stale will be recomputed
+            let mut expected_sums = [0i32, 0, 0];
+            for ti in 0..qc.num_terms as usize {
+                let t = &qc.terms[ti];
+                let aa = self.assigns[t.var_a()];
+                let ab = self.assigns[t.var_b()];
+                let expected_state = t.compute_state(aa, ab);
+                expected_sums[expected_state as usize] += t.coeff as i32;
+                if t.state != expected_state {
+                    if bad == 0 {
+                        eprintln!("QUAD PB BUG: constraint {} term {} state={} expected={} (var_a={} val={:?}, var_b={} val={:?})",
+                            qi, ti, t.state, expected_state, t.var_a(), aa, t.var_b(), ab);
+                    }
+                    bad += 1;
+                }
+            }
+            if qc.sums != expected_sums {
+                if bad == 0 {
+                    eprintln!("QUAD PB BUG: constraint {} sums={:?} expected={:?}", qi, qc.sums, expected_sums);
+                }
+                bad += 1;
+            }
+        }
+        bad
+    }
+
+    /// Get all learnt clauses as Vec<Vec<Lit>> (for debugging).
+    pub fn get_learnt_clauses(&self) -> Vec<Vec<Lit>> {
+        self.clause_meta.iter().filter(|cm| cm.learnt && !cm.deleted).map(|cm| {
+            let s = cm.start as usize;
+            self.clause_lits[s..s + cm.len as usize].to_vec()
+        }).collect()
+    }
+
+    /// Force recompute of ALL quad PB constraints (public, for testing).
+    pub fn recompute_all_quad_pb(&mut self) {
+        for i in 0..self.quad_pb_constraints.len() {
+            self.recompute_quad_pb(i as u32);
+        }
+    }
+
     pub fn num_clauses(&self) -> usize {
         self.clause_meta.iter().filter(|m| !m.deleted).count()
     }
@@ -1084,6 +1463,28 @@ impl Solver {
     }
 
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
+
+    /// Set a variable's VSIDS activity score. Higher = decided earlier.
+    /// Variable is 1-based (DIMACS convention).
+    pub fn set_var_activity(&mut self, var: i32, activity: f64) {
+        let v = var.unsigned_abs() as usize - 1;
+        self.ensure_var(v + 1);
+        self.activity[v] = activity;
+        // Update heap position
+        if self.heap_pos[v] < self.heap.len() {
+            // Sift up if activity increased
+            let mut pos = self.heap_pos[v];
+            while pos > 0 {
+                let parent = (pos - 1) / 2;
+                if self.activity[self.heap[pos]] > self.activity[self.heap[parent]] {
+                    self.heap.swap(pos, parent);
+                    self.heap_pos[self.heap[pos]] = pos;
+                    self.heap_pos[self.heap[parent]] = parent;
+                    pos = parent;
+                } else { break; }
+            }
+        }
+    }
 
     /// Set a per-call conflict budget: solver stops after `budget` additional conflicts.
     pub fn set_conflict_budget(&mut self, budget: u64) {
@@ -1588,18 +1989,18 @@ impl Solver {
     }
 
     /// Save a checkpoint of the constraint database sizes.
-    /// After calling this, new clauses/PBs/quad PBs can be added and later undone
-    /// with `restore_checkpoint`. Cheap: just records 5 integers.
-    pub fn save_checkpoint(&self) -> (usize, usize, usize, usize, usize) {
+    /// After calling this, new clauses/PBs/quad PBs/XORs can be added and later undone
+    /// with `restore_checkpoint`. Cheap: just records 6 integers.
+    pub fn save_checkpoint(&self) -> (usize, usize, usize, usize, usize, usize) {
         (self.clause_meta.len(), self.clause_lits.len(),
          self.pb_constraints.len(), self.num_vars,
-         self.quad_pb_constraints.len())
+         self.quad_pb_constraints.len(), self.xor_constraints.len())
     }
 
-    /// Restore the solver to a previous checkpoint, removing all clauses/PBs/quad PBs
+    /// Restore the solver to a previous checkpoint, removing all clauses/PBs/quad PBs/XORs
     /// added after the checkpoint. Backtracks, then truncates and rebuilds watches.
-    pub fn restore_checkpoint(&mut self, cp: (usize, usize, usize, usize, usize)) {
-        let (n_clauses, n_lits, n_pbs, _n_vars, n_quad_pbs) = cp;
+    pub fn restore_checkpoint(&mut self, cp: (usize, usize, usize, usize, usize, usize)) {
+        let (n_clauses, n_lits, n_pbs, _n_vars, n_quad_pbs, n_xors) = cp;
         self.backtrack(0);
 
         // Mark post-checkpoint clauses as deleted
@@ -1632,11 +2033,44 @@ impl Solver {
             }
         }
 
+        // Remove post-checkpoint XOR constraints
+        if n_xors < self.xor_constraints.len() {
+            self.xor_constraints.truncate(n_xors);
+            for wl in &mut self.xor_var_watches {
+                wl.retain(|&xi| (xi as usize) < n_xors);
+            }
+        }
+
         // Reset spectral constraint to boundary-only state
         if let Some(ref mut spec) = self.spectral {
             spec.reset();
         }
 
+        self.conflicts = 0;
+        self.restart_limit = 100;
+        self.luby_index = 0;
+        self.ok = true;
+    }
+
+    /// Delete all learnt clauses, backtrack, and rebuild watches.
+    /// Keeps original (non-learnt) clauses, PB, quad PB, XOR intact.
+    /// Use between solve_with_assumptions calls to prevent learnt clause poisoning.
+    pub fn clear_learnt_clauses(&mut self) {
+        self.backtrack(0);
+        // Mark learnt clauses as deleted
+        for cm in &mut self.clause_meta {
+            if cm.learnt { cm.deleted = true; }
+        }
+        // Rebuild watch lists (only non-deleted clauses)
+        for wl in &mut self.watches { wl.clear(); }
+        for (ci, cm) in self.clause_meta.iter().enumerate() {
+            if cm.deleted || cm.len < 2 { continue; }
+            let start = cm.start as usize;
+            let l0 = self.clause_lits[start];
+            let l1 = self.clause_lits[start + 1];
+            self.watches[lit_index(l0)].push((ci as u32, l1));
+            self.watches[lit_index(l1)].push((ci as u32, l0));
+        }
         self.conflicts = 0;
         self.restart_limit = 100;
         self.luby_index = 0;
@@ -2027,6 +2461,19 @@ impl Solver {
                         if self.lit_value(forced_lit) == LBool::Undef {
                             self.enqueue(forced_lit, Reason::Xor(xi));
                         }
+                    }
+                }
+            }
+            // MDD constraint propagation
+            if self.mdd.is_some() {
+                let v = var_of(lit);
+                let is_mdd_var = {
+                    let mdd = self.mdd.as_ref().unwrap();
+                    v < mdd.var_to_level.len() && mdd.var_to_level[v] != usize::MAX
+                };
+                if is_mdd_var {
+                    if let Some(conflict) = self.propagate_mdd() {
+                        return Some(conflict);
                     }
                 }
             }
@@ -2568,7 +3015,42 @@ impl Solver {
                     }
                     self.analyze_reason_buf = buf;
                 }
-                Reason::Decision => { unreachable!(); }
+                Reason::Mdd => {
+                    // MDD reason: all assigned boundary variables
+                    let mut buf = std::mem::take(&mut self.analyze_reason_buf);
+                    buf.clear();
+                    if let Some(ref mdd) = self.mdd {
+                        for level in 0..mdd.depth {
+                            for &v in &[mdd.level_x_var[level], mdd.level_y_var[level]] {
+                                if self.assigns[v] != LBool::Undef {
+                                    let lit_v = (v + 1) as Lit;
+                                    buf.push(if self.assigns[v] == LBool::True { -lit_v } else { lit_v });
+                                }
+                            }
+                        }
+                    }
+                    if p != 0 { buf.push(p); }
+                    for idx in 0..buf.len() {
+                        let lit = buf[idx];
+                        if lit == p { continue; }
+                        let v = var_of(lit);
+                        if self.analyze_seen[v] { continue; }
+                        self.analyze_seen[v] = true;
+                        self.bump_activity(v);
+                        if self.level[v] == self.decision_level() {
+                            counter += 1;
+                        } else if self.level[v] > 0 {
+                            learnt.push(negate(lit));
+                            if self.level[v] > bt_level { bt_level = self.level[v]; }
+                        }
+                    }
+                    self.analyze_reason_buf = buf;
+                }
+                Reason::Decision => {
+                    // Reached a decision variable — MDD explanation over-approximate.
+                    learnt[0] = negate(p);
+                    return (learnt, bt_level);
+                }
             }
 
             // Find next literal on trail at current decision level that was seen
@@ -2611,7 +3093,7 @@ impl Solver {
             let lit = learnt[i];
             let v = var_of(lit);
             match self.reason[v] {
-                Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) | Reason::Xor(_) | Reason::Spectral => {
+                Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) | Reason::Xor(_) | Reason::Spectral | Reason::Mdd => {
                     if self.lit_removable(v) { continue; }
                 }
                 Reason::Decision => {}
@@ -2713,6 +3195,25 @@ impl Solver {
                         }
                     }
                 }
+                Reason::Mdd => {
+                    if let Some(ref mdd) = self.mdd {
+                        for level in 0..mdd.depth {
+                            for &v in &[mdd.level_x_var[level], mdd.level_y_var[level]] {
+                                if self.assigns[v] == LBool::Undef { continue; }
+                                if v == cur || self.minimize_visited[v] { continue; }
+                                self.minimize_visited[v] = true;
+                                if self.level[v] == 0 { continue; }
+                                if self.analyze_seen[v] { continue; }
+                                let lv = self.level[v] as usize;
+                                if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { return false; }
+                                match self.reason[v] {
+                                    Reason::Decision => return false,
+                                    _ => { self.minimize_stack.push(v); }
+                                }
+                            }
+                        }
+                    }
+                }
                 Reason::Decision => return false,
             }
         }
@@ -2732,6 +3233,12 @@ impl Solver {
             if let Some(ref mut spec) = self.spectral {
                 if v < spec.num_seq_vars && spec.assigned[v] {
                     spec.unassign(v);
+                }
+            }
+            // Mark MDD constraint as stale if this is a boundary variable
+            if let Some(ref mut mdd) = self.mdd {
+                if v < mdd.var_to_level.len() && mdd.var_to_level[v] != usize::MAX {
+                    mdd.stale = true;
                 }
             }
             // Mark quad PB constraints involving this variable as stale.
