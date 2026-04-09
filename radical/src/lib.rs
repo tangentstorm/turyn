@@ -1085,6 +1085,28 @@ impl Solver {
 
     pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
 
+    /// Set a variable's VSIDS activity score. Higher = decided earlier.
+    /// Variable is 1-based (DIMACS convention).
+    pub fn set_var_activity(&mut self, var: i32, activity: f64) {
+        let v = var.unsigned_abs() as usize - 1;
+        self.ensure_var(v + 1);
+        self.activity[v] = activity;
+        // Update heap position
+        if self.heap_pos[v] < self.heap.len() {
+            // Sift up if activity increased
+            let mut pos = self.heap_pos[v];
+            while pos > 0 {
+                let parent = (pos - 1) / 2;
+                if self.activity[self.heap[pos]] > self.activity[self.heap[parent]] {
+                    self.heap.swap(pos, parent);
+                    self.heap_pos[self.heap[pos]] = pos;
+                    self.heap_pos[self.heap[parent]] = parent;
+                    pos = parent;
+                } else { break; }
+            }
+        }
+    }
+
     /// Set a per-call conflict budget: solver stops after `budget` additional conflicts.
     pub fn set_conflict_budget(&mut self, budget: u64) {
         self.conflict_limit = self.conflicts + budget;
