@@ -4195,9 +4195,34 @@ fn run_mdd_sat_search(
         println!("  XY solves:                {:>10}", done);
         println!("  Extensions pruned:        {:>10}", ext_pruned);
         println!("  Boundaries walked:        {:>10}", walked);
-        println!("  Effective search rate:    {:.1} z/s, {:.1} bnd/s",
-            z_done as f64 / elapsed.as_secs_f64(),
-            walked as f64 / elapsed.as_secs_f64());
+        // Coverage metrics: k-independent search progress
+        let total_paths: f64 = 4.0f64.powi(2 * k as i32);
+        let secs = elapsed.as_secs_f64();
+        let walked_f = walked as f64;
+        let xy_timeout_count = flow_xy_timeout.load(AtomicOrdering::Relaxed);
+        let xy_unsat_count = flow_xy_unsat.load(AtomicOrdering::Relaxed);
+        let xy_sat_count = flow_xy_sat.load(AtomicOrdering::Relaxed);
+        let xy_total_solves = xy_timeout_count + xy_unsat_count + xy_sat_count;
+        let timeout_frac = if xy_total_solves > 0 { xy_timeout_count as f64 / xy_total_solves as f64 } else { 0.0 };
+        // Boundaries fully resolved = walked minus those with XY timeouts
+        // (conservative: if ANY XY candidate timed out, the boundary isn't fully resolved)
+        let z_reaching_xy = flow_z_solutions.load(AtomicOrdering::Relaxed)
+            .saturating_sub(flow_z_spec_fail.load(AtomicOrdering::Relaxed)
+                + flow_z_pair_fail.load(AtomicOrdering::Relaxed)
+                + flow_z_prep_fail.load(AtomicOrdering::Relaxed));
+        // Approximate: if timeout_frac > 0, not all XY-reaching boundaries are resolved
+        let fully_resolved = if xy_timeout_count == 0 { walked_f } else {
+            // Conservatively: boundaries that never reached XY are resolved (filtered earlier)
+            // Boundaries that reached XY but had timeouts are NOT resolved
+            walked_f - z_reaching_xy as f64 * timeout_frac
+        };
+        let coverage_per_sec = if secs > 0.0 { walked_f / total_paths / secs } else { 0.0 };
+        let resolved_per_sec = if secs > 0.0 { fully_resolved / total_paths / secs } else { 0.0 };
+        println!("  Search space:             4^{} = {:.2e} paths", 2 * k, total_paths);
+        println!("  Coverage rate:            {:.2e} /s  ({:.1} bnd/s)",
+            coverage_per_sec, walked_f / secs);
+        println!("  Fully resolved rate:      {:.2e} /s  ({:.0} bnd/s, {:.1}% XY timeout)",
+            resolved_per_sec, fully_resolved / secs, timeout_frac * 100.0);
         println!("  Wall-clock:               {:>10.3?}", elapsed);
         if !found_solution { println!("No solution found."); }
 
