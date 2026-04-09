@@ -2729,20 +2729,31 @@ impl Solver {
                     self.quad_pb_constraints[qi as usize].stale = true;
                 }
             }
-            // Undo XOR constraint updates
-            if !self.xor_constraints.is_empty() {
-                let val = entry.lit > 0;
-                for idx in 0..self.xor_var_watches[v].len() {
-                    let xi = self.xor_var_watches[v][idx];
-                    let xc = &mut self.xor_constraints[xi as usize];
-                    xc.num_unknown += 1;
-                    xc.assigned_xor ^= val;
-                }
-            }
             self.heap_insert(v);
         }
         self.trail_lim.truncate(level as usize);
         self.prop_head = self.trail.len();
+
+        // XOR incremental state is updated during propagation, not enqueue.
+        // A conflict can arise before a freshly enqueued literal reaches the XOR
+        // propagation phase, so blindly undoing all popped trail entries is
+        // unsound. Recompute from the surviving assignment instead.
+        if !self.xor_constraints.is_empty() {
+            for xc in &mut self.xor_constraints {
+                let mut num_unknown = xc.vars.len() as u32;
+                let mut assigned_xor = false;
+                for &v in &xc.vars {
+                    if self.assigns[v] != LBool::Undef {
+                        num_unknown -= 1;
+                        if self.assigns[v] == LBool::True {
+                            assigned_xor ^= true;
+                        }
+                    }
+                }
+                xc.num_unknown = num_unknown;
+                xc.assigned_xor = assigned_xor;
+            }
+        }
 
         // For backtrack to level 0 with external state management:
         // batch-reset all quad PB constraints (all vars Undef → all terms MAYBE).
