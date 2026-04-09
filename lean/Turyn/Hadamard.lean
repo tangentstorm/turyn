@@ -696,20 +696,20 @@ lemma goethalsSeidel_allEntriesPmOne (a b c d : List Int)
   intro x hx;
   rw [ List.mem_map ] at hx;
   rcases hx with ⟨ i, hi, rfl ⟩;
-  rcases x : i / a.length with ( _ | _ | _ | _ | k ) <;> simp +decide [ x ] at hi ⊢;
+  rcases x : i / a.length with ( _ | _ | _ | _ | k ) <;> simp +decide at hi ⊢;
   · simp_all +decide;
     rcases x with ( rfl | hx ) <;> simp_all +decide [ Nat.mod_eq_of_lt ];
     simp_all +decide [ applyR ];
-  · simp_all +decide [ Nat.mod_eq_of_lt ];
+  · simp_all +decide;
     rw [ List.getElem?_range ];
-    · have := h_entries ( i % d.length ) ( Nat.mod_lt _ ( by linarith [ show d.length > 0 from Nat.pos_of_ne_zero ( by aesop_cat ) ] ) ) ; simp_all +decide [ Nat.mod_eq_of_lt ] ;
+    · have := h_entries ( i % d.length ) ( Nat.mod_lt _ ( by linarith [ show d.length > 0 from Nat.pos_of_ne_zero ( by aesop_cat ) ] ) ) ; simp_all +decide;
       simp_all +decide [ negRow, applyR ];
       exact ⟨ fun a ha => by cases this.2.1 a ha <;> simp +decide [ * ], fun a ha => by cases this.2.2.2 a ha <;> simp +decide [ * ] ⟩;
     · exact Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) );
-  · simp_all +decide [ Nat.div_eq_of_lt ];
+  · simp_all +decide;
     rw [ List.getElem?_range ];
     · simp_all +decide [ negRow, applyR ];
-      have := h_entries ( i % d.length ) ( Nat.mod_lt _ ( by linarith ) ) ; simp_all +decide [ Nat.mod_eq_of_lt ] ;
+      have := h_entries ( i % d.length ) ( Nat.mod_lt _ ( by linarith ) ) ; simp_all +decide ;
       exact ⟨ fun a ha => by cases this.2.2.1 a ha <;> simp +decide [ * ], fun a ha => by cases this.2.1 a ha <;> simp +decide [ * ] ⟩;
     · exact Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) );
   · grind +locals
@@ -733,7 +733,7 @@ lemma listDotProduct_reverse (a b : List Int) (h : a.length = b.length) :
   unfold listDotProduct;
   -- By the properties of the foldl operation and the commutativity of addition, we can rearrange the terms in the foldl.
   have h_foldl_comm : ∀ (l : List ℤ), List.foldl (fun x1 x2 => x1 + x2) 0 l = List.sum l := by
-    exact?;
+    exact fun l => Eq.symm List.sum_eq_foldl;
   rw [ show List.zip a.reverse b.reverse = List.map ( fun p => ( p.1, p.2 ) ) ( List.zip a b |> List.reverse ) from ?_, List.map_map ] ; aesop;
   refine' List.ext_get _ _ <;> aesop
 
@@ -755,7 +755,7 @@ Negating the second argument negates the dot product.
 lemma listDotProduct_negRow_right (a b : List Int) :
     listDotProduct a (negRow b) = -listDotProduct a b := by
   unfold listDotProduct negRow;
-  induction' a with a ha generalizing b <;> induction' b with b hb <;> simp_all +decide [ List.zipWith ];
+  induction' a with a ha generalizing b <;> induction' b with b hb <;> simp_all +decide;
   rename_i k hk;
   convert congr_arg ( fun x => - ( a * b ) + x ) ( k hb ) using 1;
   · induction' ( ha.zip ( List.map ( fun x => -x ) hb ) ) using List.reverseRecOn with _ _ ih <;> simp_all +decide [ add_assoc ];
@@ -776,8 +776,8 @@ lemma circulant_dot_eq_periodicAutocorr (a : List Int) (i j : Nat)
     listDotProduct ((circulant a).getD i []) ((circulant a).getD j []) =
     periodicAutocorr a ((j + a.length - i) % a.length) := by
   unfold periodicAutocorr listDotProduct circulant;
-  simp +decide [ List.getD_eq_default, List.zip, List.sum_map_mul_right ];
-  split_ifs <;> simp_all +decide [ List.getD ];
+  simp +decide [ List.zip ];
+  split_ifs <;> simp_all +decide;
   rw [ ← List.sum_eq_foldl ];
   rw [ ← eq_comm ];
   -- By changing the variable of summation, we can show that the two sums are equal.
@@ -787,12 +787,12 @@ lemma circulant_dot_eq_periodicAutocorr (a : List Int) (i j : Nat)
       refine' Finset.eq_of_subset_of_card_le ( Finset.image_subset_iff.mpr fun x hx => Finset.mem_range.mpr <| Nat.mod_lt _ <| by linarith ) _;
       rw [ Finset.card_image_of_injOn ];
       intros x hx y hy hxy;
-      have := Nat.modEq_iff_dvd.mp hxy.symm; simp_all +decide [ Nat.dvd_iff_mod_eq_zero ];
+      have := Nat.modEq_iff_dvd.mp hxy.symm; simp_all +decide;
       obtain ⟨ k, hk ⟩ := this; rw [ Nat.cast_sub ( by linarith ), Nat.cast_sub ( by linarith ) ] at hk; norm_num at hk; nlinarith [ show k = 0 by nlinarith ] ;
     conv_lhs => rw [ ← h_sum_eq, Finset.sum_image ( Finset.card_image_iff.mp <| by aesop ) ] ;
   convert h_change_var _ using 2;
-  refine' congr_arg _ ( List.ext_get _ _ ) <;> simp +decide [ mul_comm ];
-  intro n hn; rw [ show n + a.length - j + ( j + a.length - i ) = n + a.length - i + a.length by omega ] ; simp +decide [ Nat.add_mod, Nat.mod_eq_of_lt hn ] ; ring;
+  refine' congr_arg _ ( List.ext_get _ _ ) <;> simp +decide;
+  intro n hn; rw [ show n + a.length - j + ( j + a.length - i ) = n + a.length - i + a.length by omega ] ; simp +decide; ring;
 
 set_option maxHeartbeats 400000 in
 /-- Self dot product of a ±1 sequence equals its length. -/
@@ -851,16 +851,16 @@ lemma palindromic_circulant_rev (x : List Int) (p : Nat)
     applyR ((circulant x).getD p []) = (circulant x).getD ((x.length - p) % x.length) [] := by
   unfold applyR circulant;
   refine' List.ext_get _ _;
-  · rcases p with ( _ | p ) <;> simp_all +decide [ List.getElem?_range ];
+  · rcases p with ( _ | p ) <;> simp_all +decide;
     grind;
-  · intro n hn hn'; simp_all +decide [ List.get ] ;
-    by_cases h : ( x.length - p ) % x.length < x.length <;> simp_all +decide [ List.getElem?_eq_none ];
+  · intro n hn hn'; simp_all +decide ;
+    by_cases h : ( x.length - p ) % x.length < x.length <;> simp_all +decide;
     · convert hpx _ _ using 2;
       · rw [ show ( n + x.length - ( x.length - p ) % x.length ) % x.length = ( x.length - 1 - ( x.length - 1 - n + x.length - p ) % x.length ) % x.length from ?_ ];
         · rw [ Nat.mod_eq_of_lt ];
           · aesop;
           · exact lt_of_le_of_lt ( Nat.sub_le _ _ ) ( Nat.pred_lt ( ne_bot_of_gt hn ) );
-        · simp +decide [ ← ZMod.natCast_eq_natCast_iff', Nat.cast_sub ( show ( x.length - p ) % x.length ≤ x.length from Nat.le_of_lt h ), Nat.cast_sub ( show ( x.length - 1 - n + x.length - p ) % x.length ≤ x.length from Nat.le_of_lt ( Nat.mod_lt _ ( by linarith ) ) ) ];
+        · simp +decide [ ← ZMod.natCast_eq_natCast_iff' ];
           rw [ Nat.cast_sub, Nat.cast_sub ] <;> norm_num;
           · rw [ Nat.cast_sub, Nat.cast_sub, Nat.cast_sub ] <;> push_cast <;> repeat linarith;
             rw [ Nat.cast_sub <| Nat.le_sub_one_of_lt hn ] ; rw [ Nat.cast_sub <| by linarith ] ; push_cast ; ring;
@@ -875,7 +875,7 @@ Cross-circulant dot for palindromic sequences: the dot product of
     of circulant_x row_p with circulant_y row_{(m-q)%m}.
 -/
 lemma palindromic_crossDot_eq (x y : List Int) (p q : Nat)
-    (hxy : x.length = y.length) (hp : p < x.length) (hq : q < x.length)
+    (hxy : x.length = y.length) (hq : q < x.length)
     (hpy : IsPalindromic y) :
     listDotProduct ((circulant x).getD p []) (applyR ((circulant y).getD q [])) =
     listDotProduct ((circulant x).getD p []) ((circulant y).getD ((y.length - q) % y.length) []) := by
