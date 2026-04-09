@@ -4253,14 +4253,6 @@ fn run_mdd_sat_search(
                                         }
 
                                         let result = xy_solver.solve_with_assumptions(&assumptions);
-                                        // ORACLE CHECK: track ALL XY solves for this boundary+tuple
-                                        if sz.z_bits == 43 && sz.w_bits == 47 && sz.tuple.z == 8
-                                            && result != Some(true) {
-                                            // Try fresh solver for this EXACT case
-                                            let mut fresh = template.prepare_candidate_solver(&candidate).unwrap();
-                                            let fresh_result = fresh.solve_with_assumptions(&assumptions);
-                                            eprintln!("ORACLE: x={} y={} reused={:?} fresh={:?}", x_bits, y_bits, result, fresh_result);
-                                        }
                                         items_completed.fetch_add(1, AtomicOrdering::Relaxed);
                                         stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
                                         match result {
@@ -4465,17 +4457,17 @@ fn run_mdd_sat_search(
             let z_rate = if elapsed > 0.0 { z_done as f64 / elapsed } else { 0.0 };
             let bnd_rate = if elapsed > 0.0 { walked as f64 / elapsed } else { 0.0 };
             let pct_done = if live_zw_paths > 0.0 { walked as f64 / live_zw_paths * 100.0 } else { 0.0 };
-            let eta = if bnd_rate > 0.0 { (live_zw_paths - walked as f64) / bnd_rate } else { f64::INFINITY };
-            let eta_str = if eta < 3600.0 { format!("{:.0}m", eta / 60.0) }
-                         else if eta < 86400.0 { format!("{:.1}h", eta / 3600.0) }
-                         else { format!("{:.0}d", eta / 86400.0) };
-            eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}bnd/s {:>4.0}z/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5} gold:{:<5}  {:.2}% ETA {}",
+            let tte = if bnd_rate > 0.0 { live_zw_paths / bnd_rate } else { f64::INFINITY };
+            let tte_str = if tte < 60.0 { format!("{:.0}s", tte) }
+                         else if tte < 3600.0 { format!("{:.0}m", tte / 60.0) }
+                         else if tte < 86400.0 { format!("{:.1}h", tte / 3600.0) }
+                         else { format!("{:.0}d", tte / 86400.0) };
+            eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}bnd/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5}  {:.2}% exhaust:{}",
                 elapsed,
                 bar(depths[0]), bar(depths[1]), bar(depths[2]), bar(depths[3]),
-                bnd_rate, z_rate,
+                bnd_rate,
                 depths[0], depths[1], depths[2], depths[3],
-                gold,
-                pct_done, eta_str);
+                pct_done, tte_str);
             last_progress = Instant::now();
         }
     }
@@ -4538,14 +4530,17 @@ fn run_mdd_sat_search(
             (total_paths - live_paths).log2() + subcube_bits as f64
         } else { 0.0 };
 
-        println!("  MDD k={} pre-elimination: {:.4}% of 4^{} paths pruned (= 2^{:.1} configs eliminated for free)",
-            k, mdd_pruned_frac * 100.0, mdd.depth, mdd_elim_log2);
-        println!("  Live paths remaining:     {:.2e} ({:.2e} fraction of {:.2e})",
-            live_paths, live_paths / total_paths, total_paths);
-        println!("  Subcube per full path:    2^{} configs (8k={} boundary bits fixed)",
-            subcube_bits, bnd_bits);
-        println!("  Runtime resolved:         {:.0} ZW-bnd/s  ({:.1}% XY timeout)",
-            resolved_per_sec, timeout_frac * 100.0);
+        // Headline metric: time to exhaustion
+        let tte = if resolved_per_sec > 0.0 { live_zw_paths / resolved_per_sec } else { f64::INFINITY };
+        let tte_str = if tte < 60.0 { format!("{:.0}s", tte) }
+                     else if tte < 3600.0 { format!("{:.1}m", tte / 60.0) }
+                     else if tte < 86400.0 { format!("{:.1}h", tte / 3600.0) }
+                     else { format!("{:.1}d", tte / 86400.0) };
+        println!("  Time to exhaustion:       {} ({:.0} paths/s, {:.0} live ZW paths)",
+            tte_str, resolved_per_sec, live_zw_paths);
+        println!("  Progress:                 {:.4}% ({} walked of {:.0})",
+            walked as f64 / live_zw_paths * 100.0, walked, live_zw_paths);
+        println!("  XY timeout:               {:.1}%", timeout_frac * 100.0);
         println!("  Wall-clock:               {:>10.3?}", elapsed);
         if !found_solution { println!("No solution found."); }
 
