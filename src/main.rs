@@ -3831,6 +3831,14 @@ fn run_mdd_sat_search(
             // more expensive than the old per-item fill path.
             let mut z_prep = sat_z_middle::ZBoundaryPrep::with_template(&ctx.z_tmpl);
             let mut z_prep_z_bits: Option<u32> = None;
+            // Also cache the z_boundary DFT at the SAT frequency grid
+            // alongside the prep. Recomputing it per SolveZ item loops over
+            // (2k boundary positions × num_freqs) — not huge, but it's also
+            // not changing across the SolveW's batch. The cache key is the
+            // same z_bits used for `z_prep`.
+            let nf_z = ctx.z_spectral_tables.as_ref().map(|t| t.num_freqs).unwrap_or(0);
+            let mut z_re_boundary: Vec<f64> = vec![0.0; nf_z];
+            let mut z_im_boundary: Vec<f64> = vec![0.0; nf_z];
             let mut rng: u64 = 0x517cc1b727220a95 ^ (tid as u64 * 0x9e3779b97f4a7c15);
             macro_rules! next_rng { () => {{ rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng }} }
             let k = ctx.k;
@@ -3865,11 +3873,9 @@ fn run_mdd_sat_search(
                             if w_mid_sum.abs() > ctx.middle_m as i32 || (w_mid_sum + ctx.middle_m as i32) % 2 != 0 {
                                 flow_bnd_sum_fail.fetch_add(1, AtomicOrdering::Relaxed); continue;
                             }
-                            // MDD-guided fail-fast: if the XY sub-tree at this
-                            // boundary has no (x,y) leaf that matches this tuple's
-                            // sum constraints, skip the SolveW/Z pipeline entirely.
-                            // Otherwise workers would do full W enumeration + Z SAT
-                            // for a tuple whose XY stage is guaranteed empty.
+                            // MDD-guided fail-fast: skip tuples whose XY sub-tree
+                            // has no (x,y) leaf matching the tuple's sum
+                            // constraints. Short-circuiting DFS.
                             if !any_valid_xy(
                                 bnd.xy_root, 0, ctx.xy_zw_depth, 0, 0,
                                 &ctx.xy_pos_order, &ctx.mdd.nodes,
@@ -4227,13 +4233,50 @@ fn run_mdd_sat_search(
                         // that share z_bits (every item from the same SolveW batch).
                         if z_prep_z_bits != Some(sz.z_bits) {
                             z_prep.rebuild(&ctx.z_tmpl, ctx.middle_n, &z_boundary);
+                            // Also refresh the cached z_boundary DFT at the
+                            // SAT frequency grid — boundary DFT depends only
+                            // on z_bits, so it can be reused across this
+                            // SolveW's batch of SolveZ items.
+                            if let Some(ref ztab) = ctx.z_spectral_tables {
+                                let nf = ztab.num_freqs;
+                                z_re_boundary.iter_mut().for_each(|v| *v = 0.0);
+                                z_im_boundary.iter_mut().for_each(|v| *v = 0.0);
+                                for pos in 0..n {
+                                    if pos >= k && pos < n - k { continue; }
+                                    let val = z_boundary[pos] as f64;
+                                    let base = pos * nf;
+                                    for fi in 0..nf {
+                                        z_re_boundary[fi] += val * ztab.pos_cos[base + fi];
+                                        z_im_boundary[fi] += val * ztab.pos_sin[base + fi];
+                                    }
+                                }
+                            }
                             z_prep_z_bits = Some(sz.z_bits);
                         }
                         sat_z_middle::fill_z_solver_quad_pb(&mut z_solver, &ctx.z_tmpl, n, m, ctx.middle_n, &z_prep, &sz.w_vals);
                         if let Some(ref ztab) = ctx.z_spectral_tables {
-                            let mut z_spec = radical::SpectralConstraint::from_tables(
-                                ztab, &z_boundary, ctx.pair_bound,
-                            );
+                            // Build the SpectralConstraint manually, reusing
+                            // the cached z_boundary DFT instead of recomputing
+                            // it from scratch in from_tables.
+                            let num_freqs = ztab.num_freqs;
+                            let middle_len = ztab.middle_len;
+                            let mut z_spec = radical::SpectralConstraint {
+                                num_seq_vars: middle_len,
+                                cos_table: std::sync::Arc::clone(&ztab.cos_table),
+                                sin_table: std::sync::Arc::clone(&ztab.sin_table),
+                                num_freqs,
+                                re: z_re_boundary.clone(),
+                                im: z_im_boundary.clone(),
+                                re_boundary: z_re_boundary.clone(),
+                                im_boundary: z_im_boundary.clone(),
+                                bound: ctx.pair_bound,
+                                per_freq_bound: None,
+                                max_reduction: ztab.max_reduction_total.clone(),
+                                amplitudes: std::sync::Arc::clone(&ztab.amplitudes),
+                                assigned: vec![false; middle_len],
+                                values: vec![0i8; middle_len],
+                                seq2: None,
+                            };
                             // Compute per-frequency W DFT using the precomputed
                             // pos_cos/pos_sin tables from ztab. Loop order:
                             // outer j (position in W), inner fi (frequency).
