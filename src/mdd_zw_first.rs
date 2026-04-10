@@ -215,6 +215,7 @@ impl BuildStats {
 
 /// Lightweight status reporter. Checks wall time every N calls
 /// and prints a one-line update every ~10 seconds.
+#[allow(dead_code)]
 struct StatusLine {
     call_count: u64,
     start: std::time::Instant,
@@ -222,6 +223,7 @@ struct StatusLine {
     k: usize,
 }
 
+#[allow(dead_code)]
 impl StatusLine {
     fn new(k: usize) -> Self {
         let now = std::time::Instant::now();
@@ -471,7 +473,7 @@ impl ZwFirstMdd {
     }
 
     fn build_inner_opts(k: usize, restrict_level1: Option<u32>, restrict_branches: Option<&[u32]>, zw_only: bool) -> (Self, BuildStats) {
-        let mut stats = BuildStats::new(k);
+        let stats = BuildStats::new(k);
         let zw_depth = 2 * k;
         let total_depth = 4 * k;
 
@@ -705,7 +707,7 @@ impl ZwFirstMdd {
         eprintln!("  Memo budget: {} entries ({:.1} GB) across {} parallel tasks",
             total_memo_cap, total_memo_cap as f64 * 140.0 / 1e9, num_parallel);
         let max_memo_entries: usize = total_memo_cap / num_parallel;
-        let per_level_cap: usize = max_memo_entries / (zw_depth + 1);
+        let _per_level_cap: usize = max_memo_entries / (zw_depth + 1);
         let mut zw_memo_count: usize = 0;
         let mut xy_cache: HashMap<u128, u32> = HashMap::default();
 
@@ -1329,6 +1331,7 @@ pub fn build_extension(
         // If one is old: ext_new is the extension position, old_sign is the known ±1 value
         kind: ExtEventKind,
     }
+    #[allow(dead_code)]
     enum ExtEventKind {
         // Both positions are new extension positions
         NewNew { ext_a: usize, ext_b: usize, is_z: bool },
@@ -1689,8 +1692,8 @@ pub fn has_extension_fast(
     // Pre-compute old×old sums and max_middle for each check lag
     let is_old_z = |p: usize| p < base_k || p >= n - base_k;
     let is_old_w = |p: usize| p < base_k || p >= m - base_k;
-    let is_new_z = |p: usize| p == z_new[0] || p == z_new[1];
-    let is_new_w = |p: usize| p == w_new[0] || p == w_new[1];
+    let _is_new_z = |p: usize| p == z_new[0] || p == z_new[1];
+    let _is_new_w = |p: usize| p == w_new[0] || p == w_new[1];
 
     struct LagInfo {
         old_old_sum: i32,
@@ -1863,8 +1866,8 @@ pub fn has_zw_extension_fast(
         else { let b = base_k + (p - (m - base_k)); if (w_bits >> b) & 1 == 1 { 1 } else { -1 } }
     };
 
-    let is_old_z = |p: usize| p < base_k || p >= n - base_k;
-    let is_old_w = |p: usize| p < base_k || p >= m - base_k;
+    let _is_old_z = |p: usize| p < base_k || p >= n - base_k;
+    let _is_old_w = |p: usize| p < base_k || p >= m - base_k;
 
     // Identify check lags (where ZW boundary pairs exist)
     let mut check_lags: Vec<usize> = Vec::new();

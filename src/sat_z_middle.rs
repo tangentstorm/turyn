@@ -219,7 +219,87 @@ pub fn fill_z_solver(
 
 /// Fill a base solver with boundary-specific quad PB range constraints for Z middle.
 /// Uses native quad PB instead of XNOR aux vars — fewer variables, native propagation.
-pub fn fill_z_solver_quad_pb(
+/// Precomputed z_boundary-dependent constraint data for each lag.
+///
+/// Built once per (z_bits, middle_len) pair in the SolveW stage and reused
+/// across every SolveZ item that shares the same z_boundary. The expensive
+/// parts — computing `agree_const` (a bnd×bnd scan per lag) and building
+/// the per-lag literal lists (bnd_mid sign flips + mid_mid pairs) — are
+/// hoisted out of the per-item hot path.
+///
+/// Only the per-W bounds (`nw_s`, `adj_lo`, `adj_hi`) still need to be
+/// computed per-SolveZ-item.
+pub struct ZBoundaryPrep {
+    /// Per-lag bnd×bnd constant (count of boundary pairs that already match).
+    pub agree_const: Vec<u32>,
+    /// Per-lag lits_a list (for quad PB terms). Static across W.
+    pub lits_a: Vec<Vec<i32>>,
+    /// Per-lag lits_b list (for quad PB terms). Static across W.
+    pub lits_b: Vec<Vec<i32>>,
+    /// Per-lag coefficient list (always all 1s, reused).
+    pub coeffs: Vec<Vec<u32>>,
+}
+
+impl ZBoundaryPrep {
+    /// Allocate empty buffers sized to hold the per-lag data for the given
+    /// template. Call `rebuild` to populate.
+    pub fn with_template(tmpl: &LagTemplate) -> Self {
+        let num_lags = tmpl.lags.len();
+        ZBoundaryPrep {
+            agree_const: vec![0; num_lags],
+            lits_a: (0..num_lags).map(|_| Vec::new()).collect(),
+            lits_b: (0..num_lags).map(|_| Vec::new()).collect(),
+            coeffs: (0..num_lags).map(|_| Vec::new()).collect(),
+        }
+    }
+
+    pub fn new(tmpl: &LagTemplate, middle_len: usize, z_boundary: &[i8]) -> Self {
+        let mut prep = Self::with_template(tmpl);
+        prep.rebuild(tmpl, middle_len, z_boundary);
+        prep
+    }
+
+    /// Re-populate the per-lag data for a new z_boundary, reusing the
+    /// existing Vec allocations. No heap traffic on the common path.
+    pub fn rebuild(&mut self, tmpl: &LagTemplate, middle_len: usize, z_boundary: &[i8]) {
+        let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let true_var = tmpl.true_var(middle_len);
+
+        for (s_idx, lag) in tmpl.lags.iter().enumerate() {
+            let mut agc: u32 = 0;
+            for &(i, j) in &lag.bnd_bnd {
+                if z_boundary[i] == z_boundary[j] { agc += 1; }
+            }
+            self.agree_const[s_idx] = agc;
+
+            let la = &mut self.lits_a[s_idx];
+            let lb = &mut self.lits_b[s_idx];
+            let c = &mut self.coeffs[s_idx];
+            la.clear();
+            lb.clear();
+            c.clear();
+
+            for &(bnd_pos, mid_idx) in &lag.bnd_mid {
+                let lit = if z_boundary[bnd_pos] == 1 { mid_var(mid_idx) } else { -mid_var(mid_idx) };
+                la.push(lit);
+                lb.push(true_var);
+            }
+            for &(mid_a, mid_b) in &lag.mid_mid {
+                la.push(mid_var(mid_a));
+                lb.push(mid_var(mid_b));
+                la.push(-mid_var(mid_a));
+                lb.push(-mid_var(mid_b));
+            }
+
+            c.resize(la.len(), 1);
+        }
+    }
+}
+
+/// Convenience wrapper: build `ZBoundaryPrep` from `z_boundary` and call
+/// the prep-taking variant. Used by tests and one-off paths where caching
+/// the prep isn't worthwhile.
+pub fn fill_z_solver_quad_pb_with_boundary(
     solver: &mut radical::Solver,
     tmpl: &LagTemplate,
     n: usize,
@@ -228,11 +308,21 @@ pub fn fill_z_solver_quad_pb(
     z_boundary: &[i8],
     w_vals: &[i8],
 ) {
-    let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
-    let true_var = tmpl.true_var(middle_len);
+    let prep = ZBoundaryPrep::new(tmpl, middle_len, z_boundary);
+    fill_z_solver_quad_pb(solver, tmpl, n, m, middle_len, &prep, w_vals);
+}
 
-    for (s, lag) in tmpl.lags.iter().enumerate() {
-        let s = s + 1;
+pub fn fill_z_solver_quad_pb(
+    solver: &mut radical::Solver,
+    tmpl: &LagTemplate,
+    n: usize,
+    m: usize,
+    _middle_len: usize,
+    prep: &ZBoundaryPrep,
+    w_vals: &[i8],
+) {
+    for (s_idx, lag) in tmpl.lags.iter().enumerate() {
+        let s = s_idx + 1;
 
         let nw_s: i32 = if s < m {
             (0..m - s).map(|i| w_vals[i] as i32 * w_vals[i + s] as i32).sum()
@@ -250,14 +340,7 @@ pub fn fill_z_solver_quad_pb(
         let agree_lo = ((lo + max_nz) / 2) as u32;
         let agree_hi = ((hi + max_nz) / 2) as u32;
 
-        // Compute agree_const from bnd×bnd pairs
-        let mut agree_const: u32 = 0;
-        for &(i, j) in &lag.bnd_bnd {
-            if z_boundary[i] == z_boundary[j] {
-                agree_const += 1;
-            }
-        }
-
+        let agree_const = prep.agree_const[s_idx];
         let max_variable = lag.bnd_mid.len() as u32 + lag.mid_mid.len() as u32;
 
         if agree_lo > agree_const + max_variable {
@@ -276,34 +359,15 @@ pub fn fill_z_solver_quad_pb(
             continue;
         }
 
-        // Skip trivially satisfied constraints
         if adj_lo == 0 && adj_hi >= max_variable { continue; }
 
-        // Build quad PB terms for ALL agree pairs:
-        // - bnd×mid: agree(bnd, mid) = product of (signed mid_var, true_var)
-        // - mid×mid: agree(a, b) = a·b + ¬a·¬b (2 product terms per pair)
-        let mut lits_a = Vec::with_capacity(lag.bnd_mid.len() + 2 * lag.mid_mid.len());
-        let mut lits_b = Vec::with_capacity(lag.bnd_mid.len() + 2 * lag.mid_mid.len());
-
-        // bnd×mid: agree = 1 iff mid matches boundary value
-        for &(bnd_pos, mid_idx) in &lag.bnd_mid {
-            let lit = if z_boundary[bnd_pos] == 1 { mid_var(mid_idx) } else { -mid_var(mid_idx) };
-            lits_a.push(lit);
-            lits_b.push(true_var); // product with true = just the literal
-        }
-
-        // mid×mid: agree(a,b) = a·b + ¬a·¬b
-        for &(mid_a, mid_b) in &lag.mid_mid {
-            // Both-true term
-            lits_a.push(mid_var(mid_a));
-            lits_b.push(mid_var(mid_b));
-            // Both-false term
-            lits_a.push(-mid_var(mid_a));
-            lits_b.push(-mid_var(mid_b));
-        }
-
-        let coeffs: Vec<u32> = vec![1; lits_a.len()];
-        solver.add_quad_pb_range(&lits_a, &lits_b, &coeffs, adj_lo, adj_hi);
+        solver.add_quad_pb_range(
+            &prep.lits_a[s_idx],
+            &prep.lits_b[s_idx],
+            &prep.coeffs[s_idx],
+            adj_lo,
+            adj_hi,
+        );
     }
 }
 
@@ -485,7 +549,7 @@ pub fn fill_w_spectral(
 }
 
 /// Legacy: build Z middle solver from scratch (no template).
-/// Kept for the --phase-b --mdd path.
+/// Kept for the `--phase-b --wz=apart` diagnostic path.
 pub fn build_z_middle_solver(
     n: usize,
     m: usize,

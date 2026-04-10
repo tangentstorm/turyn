@@ -10,7 +10,6 @@
 /// Disk: O(total_states * 24 bytes) for level files.
 
 use rustc_hash::FxHashMap as HashMap;
-use rayon::prelude::*;
 use crate::mdd_reorder::Mdd4;
 use crate::mdd_zw_first::{
     DEAD, LEAF, StateKey,
@@ -22,6 +21,7 @@ fn unpack_sums(packed: u128, k: usize) -> Vec<i8> {
     (0..k).map(|i| ((packed >> (i * 8)) & 0xFF) as i8).collect()
 }
 
+#[allow(dead_code)]
 fn unpack_active(packed: u64, n: usize) -> Vec<u8> {
     (0..n).map(|i| ((packed >> (i * 2)) & 3) as u8).collect()
 }
@@ -165,6 +165,7 @@ impl BfsCtx {
     }
 
     /// Reconstruct current_vals from a state key at a given level.
+    #[allow(dead_code)]
     fn unpack_current_vals(&self, key: StateKey, level: usize) -> Vec<u8> {
         let n_active = self.active_at_level[level].len();
         unpack_active(key.1, n_active)
@@ -249,6 +250,7 @@ impl BfsCtx {
     }
 
     /// Expand a state at `level` to produce child states at `level + 1`.
+    #[allow(dead_code)]
     fn expand_state(&self, key: StateKey, level: usize) -> Vec<(u32, StateKey)> {
         let mut results = Vec::new();
         self.expand_state_cb(key, level, |branch, child_key| {
@@ -368,7 +370,6 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
                 }
             }
             drop(current_keys);
-            current_keys = Vec::new();
             all_child_keys.shrink_to_fit();
             // Now all_child_keys is sorted+unique, index = position
 
@@ -558,7 +559,7 @@ fn build_xy_dfs(
     pos_order: &[usize],
     active_at_level: &[Vec<usize>],
     active_indices: &[Vec<usize>],
-    xy_max_abs: &[i32],
+    _xy_max_abs: &[i32],
     nodes: &mut Vec<[u32; 4]>,
     unique: &mut HashMap<u64, u32>,
 ) -> u32 {

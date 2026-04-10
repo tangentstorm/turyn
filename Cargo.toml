@@ -12,6 +12,7 @@ cadical = ["dep:cadical"]
 
 [dependencies]
 rustfft = "6"
+realfft = "3"
 radical = { path = "radical" }
 cadical = { version = "0.1", optional = true }
 rustc-hash = "2"

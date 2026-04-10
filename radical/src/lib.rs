@@ -219,10 +219,12 @@ pub struct SpectralConstraint {
     /// Number of sequence variables (positions that the SAT solver controls).
     pub num_seq_vars: usize,
     /// Cosine table: cos_table[var_idx * num_freqs + freq_idx]
-    /// Precomputed: cos(2π * position_in_full_seq * ω_j / fft_size)
-    pub cos_table: Vec<f32>,
-    /// Sine table (same layout)
-    pub sin_table: Vec<f32>,
+    /// Precomputed: cos(2π * position_in_full_seq * ω_j / fft_size).
+    /// Shared across SpectralConstraint instances built from the same
+    /// SpectralTables (boundary-independent).
+    pub cos_table: std::sync::Arc<Vec<f32>>,
+    /// Sine table (same layout, shared)
+    pub sin_table: std::sync::Arc<Vec<f32>>,
     /// Number of sampled frequencies
     pub num_freqs: usize,
     /// Running DFT real parts per frequency (includes boundary contribution)
@@ -239,8 +241,9 @@ pub struct SpectralConstraint {
     /// Max possible magnitude reduction from unassigned vars, per frequency.
     /// Updated incrementally on assign/unassign.
     pub max_reduction: Vec<f64>,
-    /// Per-variable amplitude at each frequency: sqrt(cos² + sin²)
-    pub amplitudes: Vec<f32>,
+    /// Per-variable amplitude at each frequency: sqrt(cos² + sin²).
+    /// Shared across instances with the same tables.
+    pub amplitudes: std::sync::Arc<Vec<f32>>,
     /// Which variables have been assigned (for backtrack)
     pub assigned: Vec<bool>,
     /// The value assigned to each variable (+1 or -1), 0 if unassigned
@@ -281,19 +284,23 @@ pub struct Seq2Config {
 /// Shared across all SpectralConstraint instances with the same (seq_len, k, num_freqs).
 #[derive(Clone)]
 pub struct SpectralTables {
-    pub cos_table: Vec<f32>,
-    pub sin_table: Vec<f32>,
-    pub amplitudes: Vec<f32>,
+    pub cos_table: std::sync::Arc<Vec<f32>>,
+    pub sin_table: std::sync::Arc<Vec<f32>>,
+    pub amplitudes: std::sync::Arc<Vec<f32>>,
     pub max_reduction_total: Vec<f64>,  // sum of all amplitudes per freq
     pub num_freqs: usize,
     pub middle_len: usize,
     pub seq_len: usize,
     pub k: usize,
     /// Precomputed omega values for boundary DFT
+    #[allow(dead_code)]
     omega: Vec<f64>,
-    /// Precomputed cos/sin for ALL positions (for boundary DFT)
-    pos_cos: Vec<f64>,  // [pos * num_freqs + fi]
-    pos_sin: Vec<f64>,
+    /// Precomputed cos/sin for ALL positions (for boundary DFT).
+    /// Indexed as pos_cos[pos * num_freqs + fi] where pos in 0..seq_len,
+    /// fi in 0..num_freqs. Public so callers can compute W's DFT at the
+    /// SAT frequency grid without redoing the trig.
+    pub pos_cos: Vec<f64>,
+    pub pos_sin: Vec<f64>,
 }
 
 impl SpectralTables {
@@ -335,7 +342,10 @@ impl SpectralTables {
         }
 
         SpectralTables {
-            cos_table, sin_table, amplitudes, max_reduction_total,
+            cos_table: std::sync::Arc::new(cos_table),
+            sin_table: std::sync::Arc::new(sin_table),
+            amplitudes: std::sync::Arc::new(amplitudes),
+            max_reduction_total,
             num_freqs, middle_len, seq_len, k,
             omega: omega_vec, pos_cos, pos_sin,
         }
@@ -381,8 +391,8 @@ impl SpectralConstraint {
 
         SpectralConstraint {
             num_seq_vars: middle_len,
-            cos_table: tables.cos_table.clone(),
-            sin_table: tables.sin_table.clone(),
+            cos_table: std::sync::Arc::clone(&tables.cos_table),
+            sin_table: std::sync::Arc::clone(&tables.sin_table),
             num_freqs,
             re: re_boundary.clone(),
             im: im_boundary.clone(),
@@ -391,7 +401,7 @@ impl SpectralConstraint {
             bound,
             per_freq_bound: None,
             max_reduction: tables.max_reduction_total.clone(),
-            amplitudes: tables.amplitudes.clone(),
+            amplitudes: std::sync::Arc::clone(&tables.amplitudes),
             assigned: vec![false; middle_len],
             values: vec![0i8; middle_len],
             seq2: None,
