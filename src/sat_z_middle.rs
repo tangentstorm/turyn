@@ -231,6 +231,13 @@ pub fn fill_z_solver_quad_pb(
     let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
     let true_var = tmpl.true_var(middle_len);
 
+    // Reuse a single pair of buffers across all lags to avoid per-lag
+    // Vec allocations. The max width across all lags is bounded by the
+    // total middle pairs, which for n=26 is under 400.
+    let mut lits_a: Vec<i32> = Vec::with_capacity(64);
+    let mut lits_b: Vec<i32> = Vec::with_capacity(64);
+    let mut coeffs: Vec<u32> = Vec::with_capacity(64);
+
     for (s, lag) in tmpl.lags.iter().enumerate() {
         let s = s + 1;
 
@@ -282,8 +289,9 @@ pub fn fill_z_solver_quad_pb(
         // Build quad PB terms for ALL agree pairs:
         // - bnd×mid: agree(bnd, mid) = product of (signed mid_var, true_var)
         // - mid×mid: agree(a, b) = a·b + ¬a·¬b (2 product terms per pair)
-        let mut lits_a = Vec::with_capacity(lag.bnd_mid.len() + 2 * lag.mid_mid.len());
-        let mut lits_b = Vec::with_capacity(lag.bnd_mid.len() + 2 * lag.mid_mid.len());
+        lits_a.clear();
+        lits_b.clear();
+        coeffs.clear();
 
         // bnd×mid: agree = 1 iff mid matches boundary value
         for &(bnd_pos, mid_idx) in &lag.bnd_mid {
@@ -302,7 +310,7 @@ pub fn fill_z_solver_quad_pb(
             lits_b.push(-mid_var(mid_b));
         }
 
-        let coeffs: Vec<u32> = vec![1; lits_a.len()];
+        coeffs.resize(lits_a.len(), 1);
         solver.add_quad_pb_range(&lits_a, &lits_b, &coeffs, adj_lo, adj_hi);
     }
 }
