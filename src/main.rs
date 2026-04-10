@@ -4323,11 +4323,18 @@ fn run_mdd_sat_search(
                             z_vals.extend_from_slice(&z_mid);
                             z_vals.extend_from_slice(&z_boundary[n-k..]);
 
-                            let z_block: Vec<i32> = ctx.z_mid_vars.iter().map(|&v| {
-                                if z_solver.value(v) == Some(true) { -v } else { v }
-                            }).collect();
-                            z_solver.reset(); // backtrack before adding blocking clause
-                            z_solver.add_clause(z_block);
+                            // Only add the blocking clause if we'll loop again.
+                            // With max_z=1 we exit the loop immediately after
+                            // this iteration, so building + adding the blocker
+                            // would be pure wasted work (the restore_checkpoint
+                            // below throws it away anyway).
+                            if z_count < ctx.max_z {
+                                let z_block: Vec<i32> = ctx.z_mid_vars.iter().map(|&v| {
+                                    if z_solver.value(v) == Some(true) { -v } else { v }
+                                }).collect();
+                                z_solver.reset(); // backtrack before adding blocking clause
+                                z_solver.add_clause(z_block);
+                            }
 
                             // Individual spectral already enforced by solver (167 freqs).
                             // Just compute spectrum for pair check, into a reusable
