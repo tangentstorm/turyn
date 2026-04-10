@@ -4131,20 +4131,24 @@ fn run_mdd_sat_search(
                                 ztab, &z_boundary, ctx.pair_bound,
                             );
                             // Compute per-frequency W DFT using the precomputed
-                            // pos_cos/pos_sin tables from ztab (indexed by position
-                            // in the full-length sequence). This avoids ~4000 cos/sin
-                            // calls per SolveZ item at n=26 k=3 — previously the
-                            // dominant per-item cost.
+                            // pos_cos/pos_sin tables from ztab. Loop order:
+                            // outer j (position in W), inner fi (frequency).
+                            // The pos tables are laid out as [j*nf + fi], so the
+                            // inner loop is sequential in memory (good cache).
                             let nf = z_spec.num_freqs;
+                            let mut w_re = vec![0.0f64; nf];
+                            let mut w_im = vec![0.0f64; nf];
+                            for (j, &wv) in sz.w_vals.iter().enumerate() {
+                                let wv = wv as f64;
+                                let base = j * nf;
+                                for fi in 0..nf {
+                                    w_re[fi] += wv * ztab.pos_cos[base + fi];
+                                    w_im[fi] += wv * ztab.pos_sin[base + fi];
+                                }
+                            }
                             let mut pfb = vec![ctx.pair_bound; nf];
                             for fi in 0..nf {
-                                let (mut w_re, mut w_im) = (0.0f64, 0.0f64);
-                                for (j, &wv) in sz.w_vals.iter().enumerate() {
-                                    let wv = wv as f64;
-                                    w_re += wv * ztab.pos_cos[j * nf + fi];
-                                    w_im += wv * ztab.pos_sin[j * nf + fi];
-                                }
-                                pfb[fi] = (ctx.pair_bound - w_re*w_re - w_im*w_im).max(0.0);
+                                pfb[fi] = (ctx.pair_bound - w_re[fi]*w_re[fi] - w_im[fi]*w_im[fi]).max(0.0);
                             }
                             z_spec.per_freq_bound = Some(pfb);
                             z_solver.spectral = Some(z_spec);
