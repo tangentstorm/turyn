@@ -36,26 +36,35 @@ main():
     if --dump-dimacs:      write SAT instance for the first tuple; exit
     if --benchmark=N:      time N repeats; exit
 
-    # Search modes (first match wins)
+    # Search modes
     elif --stochastic:     stochastic_search()           # SA / local search
-    elif --mdd:            run_mdd_sat_search()          # MDD pipeline
-    else:                  run_hybrid_search()           # DEFAULT
+    else:
+        match cfg.effective_wz_mode():
+            WzMode::Cross    => run_hybrid_search()      # DEFAULT
+            WzMode::Apart    => run_mdd_sat_search(wz_together=false)
+            WzMode::Together => run_mdd_sat_search(wz_together=true)
 ```
 
-All five layers — verify subcommand, benchmark wrapper, stochastic
-search, hybrid search, and MDD search — share the same
-`XyOwner`/`solve_xy_via_source` XY SAT stage.  The XY enumerator is a
-k-MDD sub-tree walker; the flat `xy-table-k*.bin` format was retired
-once we proved (test: `table_vs_mdd_same_k_agree`, now removed) that
-at the same `k` it returned identical `(x_bits, y_bits)` sets.
+The producer is chosen by `--wz=cross|together|apart`. The legacy
+`--mdd` and `--wz-together` flags still work; they're aliases for
+`--wz=apart` and `--wz=together` respectively. Explicit `--wz` always
+wins over the legacy combination.
 
-## The two main search pipelines
+All three search layers plus the verify subcommand and benchmark
+wrapper share the same `SolveXyPerCandidate` / `solve_xy_via_source`
+XY SAT stage.  The XY enumerator is a k-MDD sub-tree walker; the flat
+`xy-table-k*.bin` format was retired once we proved (test:
+`table_vs_mdd_same_k_agree`, now removed) that at the same `k` it
+returned identical `(x_bits, y_bits)` sets.
 
-Both pipelines ultimately feed the same XY SAT consumer
-(`solve_xy_via_source`). They differ in how they *generate* the
-candidate `(Z, W)` pairs that get handed to that consumer.
+## The three (Z, W) producers
 
-### `run_hybrid_search` (default)
+All three modes ultimately feed the same XY SAT consumer
+(`SolveXyPerCandidate::try_candidate`). They differ in how they
+*generate* the candidate `(Z, W)` pairs that get handed to that
+consumer.
+
+### `--wz=cross` — `run_hybrid_search` (default)
 
 Brute-force full `Z` and `W` sequences, spectral-filter them, bucket
 by boundary signature, then dispatch to XY SAT:
@@ -84,10 +93,12 @@ for each SatWorkItem in priority queue:
 This is the path that found `TT(26)` on main (commit 88aae1a) in
 ~161 s at 16 threads.
 
-### `run_mdd_sat_search` (`--mdd`)
+### `--wz=apart` / `--wz=together` — `run_mdd_sat_search`
 
 Start from the MDD boundaries directly: navigate to a `(z_bits,
-w_bits)` boundary, then SAT-solve the Z and W middles inline:
+w_bits)` boundary, then SAT-solve the Z and W middles inline. The
+`apart` variant runs SolveW → SolveZ as two separate SAT stages; the
+`together` variant collapses them into a single combined W+Z SAT call.
 
 ```
 monitor thread:
@@ -104,15 +115,16 @@ N workers, identical loop:
         for each tuple:
             sum feasibility check
             any_valid_xy(xy_root, tuple) fail-fast
-            push SolveW (or SolveWZ if --wz-together)
+            push SolveW            (--wz=apart)
+            or   SolveWZ           (--wz=together)
 
-    SolveW(tuple, z_bits, w_bits, xy_root):
+    SolveW(tuple, z_bits, w_bits, xy_root):        # --wz=apart
         enumerate W middles (brute-force if middle_m ≤ 20, else SAT)
         for each passing W: push SolveZ
 
-    SolveWZ(tuple, z_bits, w_bits, xy_root):        # --wz-together
+    SolveWZ(tuple, z_bits, w_bits, xy_root):       # --wz=together
         single combined W+Z SAT call
-        for each (W, Z) pair: push SolveXY inline work
+        for each (W, Z) pair: solve XY inline
 
     SolveZ(tuple, z_bits, w_bits, w_vals, w_spectrum, xy_root):
         build Z SAT solver with cached ZBoundaryPrep
@@ -122,13 +134,30 @@ N workers, identical loop:
             SAT-solve for a Z middle
             compute Z spectrum (realfft), post-hoc pair check
             if passes:
+                SolveXyPerCandidate::new(problem, (Z,W), template)
                 walk XY sub-MDD from xy_root → (x_bits, y_bits)
-                for each: SAT-solve XY with boundary assumptions
+                for each: try_candidate(x_bits, y_bits)  → SAT
 ```
 
-The `solve_xy_via_source` call in SolveZ's XY stage is the same one
-the default hybrid path uses. The two pipelines differ only in how
-they *get* to the point of having a `(Z, W, xy_root)` triple.
+`SolveXyPerCandidate::try_candidate` is the same per-candidate fast
+path that `solve_xy_via_source` uses for `--wz=cross`, so all three
+producers share identical XY SAT behaviour once they reach that
+stage. They differ only in how they *get* to the point of having a
+`(Z, W, xy_root)` triple.
+
+### Measured TTE at `n=26` (4 threads)
+
+| Mode | TTE | Notes |
+|---|---|---|
+| `--wz=cross` | ~1 h (extrapolated) | SpectralIndex cross-matching prunes aggressively |
+| `--wz=apart` | ~7.7 h | direct MDD path walk, ~371 paths/s |
+| `--wz=together` | ~7.7 h | same walk, combined W+Z SAT changes per-stage accounting |
+
+The ~7–8× gap between `cross` and the MDD producers is the `(Z, W)`
+enumeration strategy difference, not the XY SAT stage — Commit A
+(`SolveXyPerCandidate`) unified the XY stage and closed a ~24 %
+per-solve gap at `n=22`, but at `n=26` the bottleneck is upstream of
+XY for both MDD producers.
 
 ## Known-good anchor points
 

@@ -285,6 +285,31 @@ struct SearchConfig {
     /// In the --mdd pipeline, solve W and Z with a single combined SAT call
     /// instead of the default SolveW → SolveZ two-stage pipeline.
     wz_together: bool,
+    /// Explicit (Z, W) producer selection via `--wz=cross|together|apart`.
+    /// `None` means fall back to the legacy `use_mdd`/`wz_together` flags
+    /// (which are kept as aliases for backward compatibility).
+    wz_mode: Option<WzMode>,
+}
+
+/// Which (Z, W) candidate producer feeds the shared XY SAT stage.
+///
+/// All three modes funnel through the same `SolveXyPerCandidate` fast
+/// path; they differ only in how they *generate* the `(Z, W)` pairs that
+/// the XY consumer gets to see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WzMode {
+    /// Brute-force full Z and W sequences, spectral-filter each side,
+    /// and cross-match them via `SpectralIndex` buckets that enforce the
+    /// pair spectral bound `|Z(ω)|² + |W(ω)|² ≤ 3n-1`. The classic
+    /// `run_hybrid_search` producer — the fastest path at small n.
+    Cross,
+    /// MDD boundary walker feeding a combined W+Z SAT call (one solve()
+    /// produces both the W and Z middle). `run_mdd_sat_search` with
+    /// `wz_together = true`.
+    Together,
+    /// MDD boundary walker feeding the SolveW → SolveZ two-stage SAT
+    /// pipeline. `run_mdd_sat_search` with `wz_together = false`.
+    Apart,
 }
 
 impl Default for SearchConfig {
@@ -311,6 +336,21 @@ impl Default for SearchConfig {
             mdd_k: 8,
             mdd_extend: 0,
             wz_together: false,
+            wz_mode: None,
+        }
+    }
+}
+
+impl SearchConfig {
+    /// Resolve the effective `WzMode` from the explicit `--wz` flag
+    /// (if any) or fall back to the legacy `--mdd` / `--wz-together`
+    /// flag combination.
+    fn effective_wz_mode(&self) -> WzMode {
+        if let Some(m) = self.wz_mode { return m; }
+        if self.use_mdd {
+            if self.wz_together { WzMode::Together } else { WzMode::Apart }
+        } else {
+            WzMode::Cross
         }
     }
 }
@@ -5217,14 +5257,15 @@ fn print_help() {
     eprintln!();
     eprintln!("  --n=<N>                  Sequence length to search (required)");
     eprintln!();
-    eprintln!("SEARCH MODE (pick one, default is hybrid):");
-    eprintln!("  (default)                Hybrid: enumerate Z/W via Phase B, then solve X/Y");
-    eprintln!("                           with SAT. Uses an on-disk MDD (mdd-<k>.bin) to");
-    eprintln!("                           enumerate XY boundary candidates (k=7 default).");
-    eprintln!("  --mdd                    MDD pipeline: navigate boundaries from an MDD and");
-    eprintln!("                           SAT-solve middles inline. Alternative to the default.");
-    eprintln!("  --wz-together            In --mdd, use one combined SAT call for W and Z");
-    eprintln!("                           instead of the SolveW → SolveZ two-stage pipeline.");
+    eprintln!("SEARCH MODE (default is --wz=cross):");
+    eprintln!("  --wz=cross               (default) Brute-force Z × brute-force W, spectral-");
+    eprintln!("                           filter each side, cross-match via SpectralIndex. All");
+    eprintln!("                           three --wz modes feed the same XY SAT fast path;");
+    eprintln!("                           they differ only in how (Z, W) pairs are generated.");
+    eprintln!("  --wz=apart               MDD boundary walker + SolveW → SolveZ two-stage SAT");
+    eprintln!("                           pipeline. Alias: --mdd.");
+    eprintln!("  --wz=together            MDD boundary walker + combined W+Z SAT call (one");
+    eprintln!("                           solve produces both middles). Alias: --wz-together.");
     eprintln!("  --stochastic             Stochastic local search over all four sequences");
     eprintln!("  --stochastic-secs=<S>    Stochastic search, stop after S seconds (default: 10)");
     eprintln!();
@@ -5262,8 +5303,9 @@ fn print_help() {
     eprintln!("  -h, --help               Show this help message");
     eprintln!();
     eprintln!("EXAMPLES:");
-    eprintln!("  turyn --n=26                           # search for TT(26)");
-    eprintln!("  turyn --n=26 --mdd --mdd-k=7           # use the MDD-driven pipeline");
+    eprintln!("  turyn --n=26                           # search for TT(26) (--wz=cross)");
+    eprintln!("  turyn --n=26 --wz=apart --mdd-k=7      # MDD boundary walker, SolveW→SolveZ");
+    eprintln!("  turyn --n=26 --wz=together --mdd-k=7   # MDD boundary walker, combined W+Z SAT");
     eprintln!("  turyn --n=16 --benchmark=3             # benchmark Phase B throughput");
     eprintln!("  turyn --verify=++--+-,+-+-++,+++-,+-+- # verify a candidate solution");
 }
@@ -5337,13 +5379,27 @@ fn parse_args() -> SearchConfig {
         } else if arg == "--no-quad-pb" {
             cfg.quad_pb = false;
         } else if arg == "--mdd" {
+            // Legacy alias: equivalent to --wz=apart. Kept for backward
+            // compat; the canonical flag is --wz.
             cfg.use_mdd = true;
         } else if arg == "--wz-together" {
-            // In the --mdd pipeline, solve W and Z with a single combined
-            // SAT call instead of the default SolveW → SolveZ two-stage
-            // pipeline. Implies --mdd.
+            // Legacy alias: equivalent to --wz=together. Kept for
+            // backward compat; the canonical flag is --wz.
             cfg.wz_together = true;
             cfg.use_mdd = true;
+        } else if let Some(v) = arg.strip_prefix("--wz=") {
+            // Canonical (Z, W) producer selection. Explicit --wz always
+            // wins over the legacy --mdd / --wz-together combination.
+            cfg.wz_mode = Some(match v {
+                "cross" => WzMode::Cross,
+                "together" => WzMode::Together,
+                "apart" => WzMode::Apart,
+                _ => {
+                    eprintln!("error: --wz must be one of cross|together|apart (got '{}')\n", v);
+                    print_help();
+                    std::process::exit(1);
+                }
+            });
         } else if let Some(v) = arg.strip_prefix("--mdd-k=") {
             cfg.mdd_k = v.parse().unwrap_or(8);
             cfg.use_mdd = true;
@@ -5676,16 +5732,29 @@ fn main() {
     } else if cfg.stochastic {
         let report = stochastic_search(cfg.problem, cfg.test_tuple.as_ref(), true, cfg.stochastic_seconds);
         println!("Stochastic search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
-    } else if cfg.use_mdd {
-        let tuples = phase_a_tuples(cfg.problem, cfg.test_tuple.as_ref());
-        let mdd_k = cfg.mdd_k.min((cfg.problem.n - 1) / 2);
-        let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, true, mdd_k);
-        println!("MDD hybrid search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     } else {
-        // Default: hybrid search (Phase B → SAT X/Y) using MDD XY enumerator.
-        // Use --mdd or --stochastic to override.
-        let report = run_hybrid_search(&cfg, true);
-        println!("Hybrid search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
+        // Dispatch on the effective WzMode. Explicit --wz wins; otherwise
+        // derive from the legacy --mdd / --wz-together flags.
+        match cfg.effective_wz_mode() {
+            WzMode::Cross => {
+                let report = run_hybrid_search(&cfg, true);
+                println!("Hybrid search (--wz=cross): found_solution={}, elapsed={:.3?}\n  {}",
+                    report.found_solution, report.elapsed, run_info());
+            }
+            mode @ (WzMode::Together | WzMode::Apart) => {
+                let tuples = phase_a_tuples(cfg.problem, cfg.test_tuple.as_ref());
+                let mdd_k = cfg.mdd_k.min((cfg.problem.n - 1) / 2);
+                // `run_mdd_sat_search` reads `cfg.wz_together` internally,
+                // so reflect the chosen mode onto that field before calling.
+                let mut cfg = cfg.clone();
+                cfg.wz_together = matches!(mode, WzMode::Together);
+                cfg.use_mdd = true;
+                let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, true, mdd_k);
+                let label = if matches!(mode, WzMode::Together) { "together" } else { "apart" };
+                println!("MDD hybrid search (--wz={}): found_solution={}, elapsed={:.3?}\n  {}",
+                    label, report.found_solution, report.elapsed, run_info());
+            }
+        }
     }
 }
 
@@ -5760,6 +5829,7 @@ mod tests {
             mdd_k: 8,
             mdd_extend: 0,
             wz_together: false,
+            wz_mode: None,
         };
         let report = run_hybrid_search(&cfg, false);
         assert!(report.found_solution, "n=4 hybrid should find solution");
