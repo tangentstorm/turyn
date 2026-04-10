@@ -532,6 +532,38 @@ fn spectrum_if_ok(
     Some(spectrum)
 }
 
+/// Like `spectrum_if_ok` but writes into a reusable buffer and returns a
+/// bool. The buffer is cleared and sized to `half = fft_size/2 + 1` on
+/// success; its contents are undefined on failure. Use this in hot loops
+/// where the spectrum is discarded 80%+ of the time — it avoids allocating
+/// a fresh `Vec<f64>` per rejected candidate.
+fn spectrum_into_if_ok(
+    values: &[i8],
+    filter: &SpectralFilter,
+    bound: f64,
+    fft_buf: &mut Vec<Complex<f64>>,
+    out: &mut Vec<f64>,
+) -> bool {
+    let m = filter.fft_size;
+    fft_buf.clear();
+    for &v in values {
+        fft_buf.push(Complex::new(v as f64, 0.0));
+    }
+    fft_buf.resize(m, Complex::new(0.0, 0.0));
+    filter.fft.process(fft_buf);
+    let half = m / 2 + 1;
+    out.clear();
+    out.reserve(half);
+    for k in 0..half {
+        let p = fft_buf[k].norm_sqr();
+        if p > bound {
+            return false;
+        }
+        out.push(p);
+    }
+    true
+}
+
 fn spectral_pair_ok(z_spectrum: &[f64], w_spectrum: &[f64], bound: f64) -> bool {
     for i in 0..z_spectrum.len() {
         if z_spectrum[i] + w_spectrum[i] > bound {
@@ -3826,20 +3858,24 @@ fn run_mdd_sat_search(
                             // per-W mutex contention when middle_m is small and many
                             // W candidates pass the spectral filter.
                             let mut batch: Vec<PipelineWork> = Vec::new();
+                            // Reusable spectrum buffer; we only materialize an
+                            // owned Vec at push time, so failed candidates (~85%)
+                            // never allocate a Vec<f64>.
+                            let mut spec_buf: Vec<f64> = Vec::new();
                             generate_sequences_permuted(ctx.middle_m, sw.w_mid_sum, false, false, 200_000, |w_mid| {
                                 if ctx.found.load(AtomicOrdering::Relaxed) { return false; }
                                 let mut w_vals = w_boundary.clone();
                                 w_vals[k..k+ctx.middle_m].copy_from_slice(w_mid);
                                 flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
                                 if trace_w { trace_w_total += 1; }
-                                if let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) {
+                                if spectrum_into_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w, &mut spec_buf) {
                                     if trace_w { trace_w_pass += 1; }
                                     flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
                                     w_found_any = true;
                                     stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
                                     batch.push(PipelineWork::SolveZ(SolveZWork {
                                         tuple: sw.tuple, z_bits: sw.z_bits, w_bits: sw.w_bits,
-                                        w_vals, w_spectrum, xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
+                                        w_vals, w_spectrum: spec_buf.clone(), xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
                                     }));
                                 } else {
                                     flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
