@@ -2314,10 +2314,14 @@ fn load_best_mdd(max_k: usize, verbose: bool) -> Option<mdd_reorder::Mdd4> {
             if verbose {
                 let live = m.count_live_paths();
                 let total = 4.0f64.powi(m.depth as i32);
-                let dead_frac = 1.0 - live / total;
-                eprintln!("Loaded MDD from {} (k={}, {} nodes, {:.1} MB, {:.2e} live / {:.2e} total paths, {:.4}% pruned)",
+                let live_frac = live / total;
+                // Print the live fraction with enough precision to distinguish
+                // "0.00001% live" (typical for k=7 n=26) from "literally zero".
+                // The "100% pruned" framing rounds away the only interesting
+                // digits at this scale.
+                eprintln!("Loaded MDD from {} (k={}, {} nodes, {:.1} MB, {:.2e} live / {:.2e} total paths, {:.2e} live fraction)",
                     path, m.k, m.nodes.len(), m.nodes.len() as f64 * 16.0 / 1_048_576.0,
-                    live, total, dead_frac * 100.0);
+                    live, total, live_frac);
             }
             return Some(m);
         }
@@ -3634,38 +3638,49 @@ fn run_mdd_sat_search(
         // Progress display
         if verbose && last_progress.elapsed().as_secs() >= 10 {
             let elapsed = run_start.elapsed().as_secs_f64();
-            let _done = items_completed.load(AtomicOrdering::Relaxed);
-            // Use completed boundaries (stage 0 exit) not pushed, so TTE
-            // reflects real throughput.
-            let walked = stage_exit[0].load(AtomicOrdering::Relaxed);
-            // Per-stage queue depths
-            let mut depths = [0i64; 4];
-            for i in 0..4 {
-                depths[i] = (stage_enter[i].load(AtomicOrdering::Relaxed) as i64
-                    - stage_exit[i].load(AtomicOrdering::Relaxed) as i64).max(0);
+            let done = items_completed.load(AtomicOrdering::Relaxed);
+            if wz_mode == WzMode::Cross {
+                // Cross mode: the MDD-centric depth bars are meaningless
+                // (the monitor doesn't walk paths and stages 0-2 stay at
+                // zero). Report producer progress instead: how many
+                // tuples have been enumerated, the gold queue depth, and
+                // the individual-XY-candidate throughput.
+                let gold_depth = work_queue.gold_len();
+                let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+                eprintln!(
+                    "[{:>3.0}s] --wz=cross  tuples {}/{}  gold queue {}  XY candidates {}  {:.0}/s",
+                    elapsed, cross_tuple_idx, tuples.len(), gold_depth, done, rate,
+                );
+            } else {
+                // MDD modes: boundary walker drives everything, so the
+                // depth bars and boundary-rate metric reflect real work.
+                let walked = stage_exit[0].load(AtomicOrdering::Relaxed);
+                // Per-stage queue depths
+                let mut depths = [0i64; 4];
+                for i in 0..4 {
+                    depths[i] = (stage_enter[i].load(AtomicOrdering::Relaxed) as i64
+                        - stage_exit[i].load(AtomicOrdering::Relaxed) as i64).max(0);
+                }
+                let fill_chars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+                let max_depth = depths.iter().cloned().max().unwrap_or(1).max(1) as f64;
+                let bar = |d: i64| -> char {
+                    let idx = ((d as f64 / max_depth) * 8.0).round() as usize;
+                    fill_chars[idx.min(8)]
+                };
+                let bnd_rate = if elapsed > 0.0 { walked as f64 / elapsed } else { 0.0 };
+                let pct_done = if live_zw_paths > 0.0 { walked as f64 / live_zw_paths * 100.0 } else { 0.0 };
+                let tte = if bnd_rate > 0.0 { live_zw_paths / bnd_rate } else { f64::INFINITY };
+                let tte_str = if tte < 60.0 { format!("{:.0}s", tte) }
+                             else if tte < 3600.0 { format!("{:.0}m", tte / 60.0) }
+                             else if tte < 86400.0 { format!("{:.1}h", tte / 3600.0) }
+                             else { format!("{:.0}d", tte / 86400.0) };
+                eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}bnd/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5}  {:.2}% exhaust:{}",
+                    elapsed,
+                    bar(depths[0]), bar(depths[1]), bar(depths[2]), bar(depths[3]),
+                    bnd_rate,
+                    depths[0], depths[1], depths[2], depths[3],
+                    pct_done, tte_str);
             }
-            let fill_chars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
-            let max_depth = depths.iter().cloned().max().unwrap_or(1).max(1) as f64;
-            let bar = |d: i64| -> char {
-                let idx = ((d as f64 / max_depth) * 8.0).round() as usize;
-                fill_chars[idx.min(8)]
-            };
-            let _gold = work_queue.gold_len();
-            let z_done = stage_exit[2].load(AtomicOrdering::Relaxed);
-            let _z_rate = if elapsed > 0.0 { z_done as f64 / elapsed } else { 0.0 };
-            let bnd_rate = if elapsed > 0.0 { walked as f64 / elapsed } else { 0.0 };
-            let pct_done = if live_zw_paths > 0.0 { walked as f64 / live_zw_paths * 100.0 } else { 0.0 };
-            let tte = if bnd_rate > 0.0 { live_zw_paths / bnd_rate } else { f64::INFINITY };
-            let tte_str = if tte < 60.0 { format!("{:.0}s", tte) }
-                         else if tte < 3600.0 { format!("{:.0}m", tte / 60.0) }
-                         else if tte < 86400.0 { format!("{:.1}h", tte / 3600.0) }
-                         else { format!("{:.0}d", tte / 86400.0) };
-            eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}bnd/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5}  {:.2}% exhaust:{}",
-                elapsed,
-                bar(depths[0]), bar(depths[1]), bar(depths[2]), bar(depths[3]),
-                bnd_rate,
-                depths[0], depths[1], depths[2], depths[3],
-                pct_done, tte_str);
             last_progress = Instant::now();
         }
     }
