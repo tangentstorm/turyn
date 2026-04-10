@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 /// Number of spectral frequencies for the SAT solver's built-in spectral constraint.
 /// Prime number, dense enough to make the post-hoc FFT check redundant.
-const SPECTRAL_FREQS: usize = 167;
+const SPECTRAL_FREQS: usize = 64;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -370,6 +370,7 @@ impl SearchStats {
 struct SeqWithSpectrum {
     seq: PackedSeq,
     spectrum: Vec<f64>,
+    #[allow(dead_code)]
     autocorr: Option<Vec<i32>>,  // lazily computed at pair time
 }
 
@@ -1546,6 +1547,7 @@ impl SatXYTemplate {
 
     /// Solve with warm-start: inject saved clauses/phases before solving,
     /// extract learnt clauses/phases after solving.
+    #[allow(dead_code)]
     fn solve_for_warm(
         &self,
         candidate: &CandidateZW,
@@ -3102,6 +3104,7 @@ enum PipelineWork {
     /// Stage 2: SAT-solve Z given boundary + W. Enumerate Z with blocking clauses.
     SolveZ(SolveZWork),
     /// Stage 3: SAT-solve XY given boundary + Z + W.
+    #[allow(dead_code)]
     SolveXY(SolveXYWork),
     Shutdown,
 }
@@ -3159,6 +3162,7 @@ struct SolveXYWork {
 
 /// A subtree of the MDD to be processed by a Phase B worker.
 #[derive(Clone)]
+#[allow(dead_code)]
 struct SubtreeWork {
     subtree_root: u32,
     z_acc: u32,
@@ -3190,6 +3194,7 @@ fn mdd_navigate_path(
 
 /// Partition the ZW half of the MDD into subtrees at the given depth.
 /// Returns a list of (subtree_root, z_acc, w_acc) for independent processing.
+#[allow(dead_code)]
 fn partition_mdd_subtrees(
     root: u32, depth: usize, zw_depth: usize,
     pos_order: &[usize], nodes: &[[u32; 4]],
@@ -3236,6 +3241,7 @@ fn partition_mdd_subtrees(
 /// Read-only context shared across all Phase B workers (via Arc).
 struct PhaseBContext {
     mdd: Arc<mdd_reorder::Mdd4>,
+    #[allow(dead_code)]
     pos_order: Vec<usize>,     // subtree-adjusted for ZW walk (partition_depth..)
     xy_pos_order: Vec<usize>,  // full pos_order for XY sub-MDD walk
     tuples: Vec<SumTuple>,
@@ -3243,6 +3249,7 @@ struct PhaseBContext {
     z_tmpl: sat_z_middle::LagTemplate,
     problem: Problem,
     k: usize,
+    #[allow(dead_code)]
     zw_depth: usize,        // subtree-adjusted for ZW walk
     xy_zw_depth: usize,     // full 2*k for XY sub-MDD walk
     middle_n: usize,
@@ -3598,10 +3605,8 @@ fn run_mdd_sat_search(
                 // If rejected, do work-queue stuff to generate more gold.
                 {
                     let mut gq = self.gold.lock().unwrap();
-                    if let Some(top) = gq.peek() {
-                        let quality = top.priority; // 0.0..1.0
-                        // Always accept if quality > 0.9 or gold queue is huge (>1000)
-                        // If gold queue has >=100 items, it's well-stocked — take the best.
+                    if let Some(_top) = gq.peek() {
+                        // Always accept if gold queue is well-stocked (>=100 items).
                         // If <100 items, 50/50 between processing and generating more.
                         let well_stocked = gq.len() >= 100;
                         let accept = well_stocked || {
@@ -3688,7 +3693,7 @@ fn run_mdd_sat_search(
     let stage_enter: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let stage_exit: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
 
-    let mut sat_config = cfg.sat_config.clone();
+    let sat_config = cfg.sat_config.clone();
     // SAT config: use defaults (EMA restarts/vivification/chrono BT tested and regressed)
     let xy_table: Option<Arc<XYBoundaryTable>> = None;
 
@@ -3701,7 +3706,7 @@ fn run_mdd_sat_search(
         let wq = Arc::clone(&work_queue);
         let result_tx = result_tx.clone();
         let items_completed = Arc::clone(&items_completed);
-        let boundaries_walked = Arc::clone(&boundaries_walked);
+        let _boundaries_walked = Arc::clone(&boundaries_walked);
         let extensions_pruned = Arc::clone(&extensions_pruned);
         let flow_bnd_sum_fail = Arc::clone(&flow_bnd_sum_fail);
         let flow_w_unsat = Arc::clone(&flow_w_unsat);
@@ -3713,7 +3718,7 @@ fn run_mdd_sat_search(
         let flow_z_spec_fail = Arc::clone(&flow_z_spec_fail);
         let flow_z_pair_fail = Arc::clone(&flow_z_pair_fail);
         let flow_z_prep_fail = Arc::clone(&flow_z_prep_fail);
-        let flow_xy_ext_pruned = Arc::clone(&flow_xy_ext_pruned);
+        let _flow_xy_ext_pruned = Arc::clone(&flow_xy_ext_pruned);
         let flow_xy_sat = Arc::clone(&flow_xy_sat);
         let flow_xy_unsat = Arc::clone(&flow_xy_unsat);
         let flow_xy_timeout = Arc::clone(&flow_xy_timeout);
@@ -4161,7 +4166,7 @@ fn run_mdd_sat_search(
                             // Just compute spectrum for pair check.
                             let z_spectrum = compute_spectrum(&z_vals, &spectral_z, &mut fft_buf_z);
 
-                            let pair_power = spectral_pair_max_power(&z_spectrum, &sz.w_spectrum);
+                            let _pair_power = spectral_pair_max_power(&z_spectrum, &sz.w_spectrum);
                             if ctx.middle_n <= 20 {
                                 if !spectral_pair_ok(&z_spectrum, &sz.w_spectrum, ctx.pair_bound) {
                                     flow_z_pair_fail.fetch_add(1, AtomicOrdering::Relaxed);
@@ -4460,7 +4465,7 @@ fn run_mdd_sat_search(
         // Progress display
         if verbose && last_progress.elapsed().as_secs() >= 10 {
             let elapsed = run_start.elapsed().as_secs_f64();
-            let done = items_completed.load(AtomicOrdering::Relaxed);
+            let _done = items_completed.load(AtomicOrdering::Relaxed);
             // Use completed boundaries (stage 0 exit) not pushed, so TTE
             // reflects real throughput.
             let walked = stage_exit[0].load(AtomicOrdering::Relaxed);
@@ -4476,9 +4481,9 @@ fn run_mdd_sat_search(
                 let idx = ((d as f64 / max_depth) * 8.0).round() as usize;
                 fill_chars[idx.min(8)]
             };
-            let gold = work_queue.gold_len();
+            let _gold = work_queue.gold_len();
             let z_done = stage_exit[2].load(AtomicOrdering::Relaxed);
-            let z_rate = if elapsed > 0.0 { z_done as f64 / elapsed } else { 0.0 };
+            let _z_rate = if elapsed > 0.0 { z_done as f64 / elapsed } else { 0.0 };
             let bnd_rate = if elapsed > 0.0 { walked as f64 / elapsed } else { 0.0 };
             let pct_done = if live_zw_paths > 0.0 { walked as f64 / live_zw_paths * 100.0 } else { 0.0 };
             let tte = if bnd_rate > 0.0 { live_zw_paths / bnd_rate } else { f64::INFINITY };
@@ -4521,7 +4526,7 @@ fn run_mdd_sat_search(
         for (i, name) in ["MDD", "W", "Z", "XY"].iter().enumerate() {
             println!("  Stage {} ({}): {:>10} items", i, name, stage_exit[i].load(AtomicOrdering::Relaxed));
         }
-        let z_done = stage_exit[2].load(AtomicOrdering::Relaxed);
+        let _z_done = stage_exit[2].load(AtomicOrdering::Relaxed);
         let ext_pruned = extensions_pruned.load(AtomicOrdering::Relaxed);
         println!("  XY solves:                {:>10}", done);
         println!("  Extensions pruned:        {:>10}", ext_pruned);
@@ -4557,7 +4562,7 @@ fn run_mdd_sat_search(
         // MDD already eliminated (total - live) × 2^subcube_bits configs.
         // Runtime resolves walked boundaries: each ZW boundary covers
         // its full XY sub-tree, eliminating multiple full paths.
-        let mdd_elim_log2 = if mdd_pruned_frac > 0.0 {
+        let _mdd_elim_log2 = if mdd_pruned_frac > 0.0 {
             (total_paths - live_paths).log2() + subcube_bits as f64
         } else { 0.0 };
 

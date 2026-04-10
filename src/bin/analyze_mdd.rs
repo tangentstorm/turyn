@@ -134,8 +134,8 @@ fn main() {
             if child == 0 { continue; }
             let z_val = (branch >> 0) & 1;
             let w_val = (branch >> 1) & 1;
-            let z_sign: i32 = if z_val == 1 { 1 } else { -1 };
-            let w_sign: i32 = if w_val == 1 { 1 } else { -1 };
+            let _z_sign: i32 = if z_val == 1 { 1 } else { -1 };
+            let _w_sign: i32 = if w_val == 1 { 1 } else { -1 };
 
             // Compute lag event contributions at this level
             let sums_backup: Vec<i32> = sums.clone();

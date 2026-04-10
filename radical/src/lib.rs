@@ -290,6 +290,7 @@ pub struct SpectralTables {
     pub seq_len: usize,
     pub k: usize,
     /// Precomputed omega values for boundary DFT
+    #[allow(dead_code)]
     omega: Vec<f64>,
     /// Precomputed cos/sin for ALL positions (for boundary DFT)
     pos_cos: Vec<f64>,  // [pos * num_freqs + fi]

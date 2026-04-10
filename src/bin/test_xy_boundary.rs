@@ -21,7 +21,7 @@ fn main() {
 
     // Collect all ZW boundaries with their XY roots and zw_sums
     let zw_depth = 2 * k;
-    let pos_order = full_mdd.zw_pos_order.clone();
+    let _pos_order = full_mdd.zw_pos_order.clone();
 
     // We need to compute zw_sums for each ZW boundary.
     // zw_sums[j] = sum of 2*z[i]*z[i+j] + 2*w[i]*w[i+j+1] over all valid pairs
