@@ -6479,6 +6479,33 @@ mod tests {
     }
 
     #[test]
+    fn known_tt26_verifies() {
+        // Known TT(26). Verified against the Turyn identity
+        // N_X(s) + N_Y(s) + 2 N_Z(s) + 2 N_W(s) = 0 for all s ≥ 1,
+        // and the sum-squared invariant σ_X² + σ_Y² + 2σ_Z² + 2σ_W² = 6n - 2 = 154.
+        // Source: found on main branch (commit 88aae1a) by the hybrid Phase B + SAT XY
+        // path at 16 threads in ~161 s wall-clock.
+        //
+        // X =: '++--+--+++++++-+-++--+-++-'  sum 6
+        // Y =: '+++-+-++++++-++-+---+-++--'  sum 6
+        // Z =: '+++-+--++++++--++---+-+--+'  sum 4
+        // W =: '++++-+---+--+++--++++-+-+'   sum 5
+        let p = Problem::new(26);
+        let x = PackedSeq::from_values(&[1,1,-1,-1,1,-1,-1,1,1,1,1,1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,1,-1]);
+        let y = PackedSeq::from_values(&[1,1,1,-1,1,-1,1,1,1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,1,1,-1,-1]);
+        let z = PackedSeq::from_values(&[1,1,1,-1,1,-1,-1,1,1,1,1,1,1,-1,-1,1,1,-1,-1,-1,1,-1,1,-1,-1,1]);
+        let w = PackedSeq::from_values(&[1,1,1,1,-1,1,-1,-1,-1,1,-1,-1,1,1,1,-1,-1,1,1,1,1,-1,1,-1,1]);
+        assert!(verify_tt(p, &x, &y, &z, &w), "Known TT(26) should verify the Turyn identity");
+        assert_eq!(x.sum(), 6);
+        assert_eq!(y.sum(), 6);
+        assert_eq!(z.sum(), 4);
+        assert_eq!(w.sum(), 5);
+        // Sum-squared invariant (6n-2 = 154 at n=26).
+        let ss = x.sum() * x.sum() + y.sum() * y.sum() + 2 * z.sum() * z.sum() + 2 * w.sum() * w.sum();
+        assert_eq!(ss, 154);
+    }
+
+    #[test]
     fn sat_xy_solves_known_tt36_zw() {
         // Given the known Z/W from TT(36), can SAT find X/Y?
         let p = Problem::new(36);
