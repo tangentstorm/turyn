@@ -3823,6 +3823,14 @@ fn run_mdd_sat_search(
             // Reusable spectrum output buffer for the post-hoc Z pair check.
             // Avoids allocating a fresh Vec<f64> per Z solution.
             let mut z_spectrum_buf: Vec<f64> = Vec::new();
+            // Single-slot cache for the z_boundary-dependent fill prep.
+            // SolveZ items that share z_bits (all items from the same SolveW
+            // batch) reuse this precomputed per-lag data: agree_const + the
+            // lits_a/lits_b/coeffs templates. On a cache miss we rebuild in
+            // place — reusing the per-lag Vec allocations so a miss is not
+            // more expensive than the old per-item fill path.
+            let mut z_prep = sat_z_middle::ZBoundaryPrep::with_template(&ctx.z_tmpl);
+            let mut z_prep_z_bits: Option<u32> = None;
             let mut rng: u64 = 0x517cc1b727220a95 ^ (tid as u64 * 0x9e3779b97f4a7c15);
             macro_rules! next_rng { () => {{ rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng }} }
             let k = ctx.k;
@@ -4215,7 +4223,13 @@ fn run_mdd_sat_search(
                             ctx.z_tmpl.build_base_solver_quad_pb(ctx.middle_n, sz.z_mid_sum)
                         );
                         let z_cp = z_solver.save_checkpoint();
-                        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver, &ctx.z_tmpl, n, m, ctx.middle_n, &z_boundary, &sz.w_vals);
+                        // Reuse z_boundary-dependent fill prep across SolveZ items
+                        // that share z_bits (every item from the same SolveW batch).
+                        if z_prep_z_bits != Some(sz.z_bits) {
+                            z_prep.rebuild(&ctx.z_tmpl, ctx.middle_n, &z_boundary);
+                            z_prep_z_bits = Some(sz.z_bits);
+                        }
+                        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver, &ctx.z_tmpl, n, m, ctx.middle_n, &z_prep, &sz.w_vals);
                         if let Some(ref ztab) = ctx.z_spectral_tables {
                             let mut z_spec = radical::SpectralConstraint::from_tables(
                                 ztab, &z_boundary, ctx.pair_bound,
@@ -6837,7 +6851,7 @@ mod tests {
         // Build Z SAT solver (same as pipeline)
         let z_tmpl = sat_z_middle::LagTemplate::new(n, k);
         let mut z_solver = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
 
         // Test 1: does solve() find ANY Z middle?
         let result = z_solver.solve();
@@ -6856,7 +6870,7 @@ mod tests {
 
         // Test 2: enumerate ALL Z middles — how many exist?
         let mut z_solver_enum = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver_enum, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver_enum, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
         let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
         let mut z_enum_count = 0;
         loop {
@@ -6877,7 +6891,7 @@ mod tests {
 
         // Test 3: enumerate with spectral constraint
         let mut z_solver_spec = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver_spec, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver_spec, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
         let ztab = radical::SpectralTables::new(n, k, 256);
         let z_spec = radical::SpectralConstraint::from_tables(&ztab, &z_boundary, (6*n as i32 - 2) as f64 / 2.0);
         z_solver_spec.spectral = Some(z_spec);
@@ -6900,7 +6914,7 @@ mod tests {
 
         // Test 4: find Z#1, block it, verify state, test known Z
         let mut z_solver3 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver3, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver3, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
         let r1 = z_solver3.solve();
         assert_eq!(r1, Some(true));
         let found1: Vec<i8> = (0..middle_n).map(|i| {
@@ -6948,7 +6962,7 @@ mod tests {
 
         // Test 4c: reset BEFORE adding blocking clause (the actual fix)
         let mut z_solver3c = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver3c, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver3c, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
         let _ = z_solver3c.solve();
         let block2 = z_mid_vars.iter().map(|&v| {
             if z_solver3c.value(v) == Some(true) { -v } else { v }
@@ -6966,7 +6980,7 @@ mod tests {
         // Test each learnt clause: which one makes the known Z UNSAT?
         for (ci, lc) in learnt.iter().enumerate() {
             let mut ts = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-            sat_z_middle::fill_z_solver_quad_pb(&mut ts, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+            sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut ts, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
             ts.add_clause(block.clone()); // blocking clause for Z#1
             ts.add_clause(lc.clone());    // one learnt clause
             let r = ts.solve_with_assumptions(&known_assumptions);
@@ -6974,7 +6988,7 @@ mod tests {
                 eprintln!("BAD LEARNT CLAUSE #{}: {:?} → {:?}", ci, lc, r);
                 // Also check: is this clause actually implied by the original constraints?
                 let mut ts2 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-                sat_z_middle::fill_z_solver_quad_pb(&mut ts2, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+                sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut ts2, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
                 // Check if the negation of the clause is SAT (if so, clause is NOT implied)
                 let neg: Vec<i32> = lc.iter().map(|&l| -l).collect();
                 for &l in &neg { ts2.add_clause([l]); }
@@ -6985,14 +6999,14 @@ mod tests {
 
         // Test 6: FRESH solver + blocking clause + known Z — is it the solver or the clause?
         let mut z_solver4 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver4, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver4, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
         z_solver4.add_clause(block.clone());
         let r3 = z_solver4.solve_with_assumptions(&known_assumptions);
         eprintln!("Fresh solver + blocking clause + known Z: {:?}", r3);
 
         // Test 6: FRESH solver, no blocking clause, known Z
         let mut z_solver5 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver5, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver5, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
         let r4 = z_solver5.solve_with_assumptions(&known_assumptions);
         eprintln!("Fresh solver, no block, known Z: {:?}", r4);
 
@@ -7005,7 +7019,7 @@ mod tests {
             if known_mid[i] == 1 { z_mid_vars[i] } else { -z_mid_vars[i] }
         }).collect();
         let mut z_solver2 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver2, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver2, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
         let result2 = z_solver2.solve_with_assumptions(&assumptions);
         eprintln!("Z SAT with known Z middle assumptions: {:?}", result2);
         assert_eq!(result2, Some(true), "Known Z middle should satisfy Z SAT constraints");
