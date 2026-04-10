@@ -277,6 +277,10 @@ struct SearchConfig {
     xy_table_path: Option<String>,
     /// Run without XY boundary table (slower).
     no_table: bool,
+    /// Which XY boundary enumerator to use in the hybrid path.
+    /// "table" (default, flat on-disk XY table) or "mdd" (walk a k-MDD
+    /// sub-tree at runtime — proven equivalent at the same k).
+    xy_enum: String,
     /// Dump DIMACS CNF to this path instead of solving.
     dump_dimacs: Option<String>,
     /// SAT solver feature flags.
@@ -315,6 +319,7 @@ impl Default for SearchConfig {
             phase_only: None,
             xy_table_path: None,
             no_table: false,
+            xy_enum: "table".to_string(),
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
             sat_secs: 0,
@@ -1777,6 +1782,74 @@ struct SatWorkItem {
     boundary: Option<BoundaryConfig>,
 }
 
+/// Owned XY candidate source: either the flat on-disk table or an MDD
+/// whose sub-trees we walk at runtime. Held at the worker level and
+/// handed to `solve_xy_via_source` as a borrowed `XyCandidateSource`.
+#[derive(Clone)]
+enum XyOwner {
+    Table(Arc<XYBoundaryTable>),
+    Mdd {
+        mdd: Arc<mdd_reorder::Mdd4>,
+        pos_order: Arc<Vec<usize>>,
+        xy_depth: usize,
+    },
+}
+
+impl XyOwner {
+    fn k(&self) -> usize {
+        match self {
+            XyOwner::Table(t) => t.k,
+            XyOwner::Mdd { mdd, .. } => mdd.k,
+        }
+    }
+    /// Given a (Z, W) candidate, return a borrowed XyCandidateSource
+    /// suitable for `solve_xy_via_source`. For the MDD variant this
+    /// navigates the ZW half of the MDD to the `xy_root` node that the
+    /// XY sub-tree is anchored at. Returns None if the boundary isn't
+    /// live in the MDD (shouldn't happen if the table/MDD agree).
+    fn source_for<'a>(&'a self, problem: Problem, candidate: &CandidateZW) -> Option<XyCandidateSource<'a>> {
+        match self {
+            XyOwner::Table(t) => Some(XyCandidateSource::Table(t)),
+            XyOwner::Mdd { mdd, pos_order, xy_depth } => {
+                // Extract z_bits, w_bits from the candidate (prefix+suffix
+                // bit layout as in solve_xy_via_source).
+                let n = problem.n;
+                let m = n - 1;
+                let k = mdd.k;
+                let mut z_bits = 0u32;
+                let mut w_bits = 0u32;
+                for i in 0..k {
+                    if candidate.z.get(i) == 1 { z_bits |= 1 << i; }
+                    if candidate.z.get(n - k + i) == 1 { z_bits |= 1 << (k + i); }
+                    if candidate.w.get(i) == 1 { w_bits |= 1 << i; }
+                    if candidate.w.get(m - k + i) == 1 { w_bits |= 1 << (k + i); }
+                }
+                // Navigate the ZW half to find xy_root. Each level branches
+                // on (z, w) at position pos_order[level].
+                let zw_depth = 2 * k;
+                let mut nid = mdd.root;
+                for level in 0..zw_depth {
+                    if nid == mdd_reorder::DEAD { return None; }
+                    let pos = pos_order[level];
+                    let z_val = (z_bits >> pos) & 1;
+                    let w_val = (w_bits >> pos) & 1;
+                    let branch = (z_val | (w_val << 1)) as usize;
+                    if nid != mdd_reorder::LEAF {
+                        nid = mdd.nodes[nid as usize][branch];
+                    }
+                }
+                if nid == mdd_reorder::DEAD { return None; }
+                Some(XyCandidateSource::Mdd {
+                    mdd,
+                    xy_root: nid,
+                    pos_order: pos_order.as_slice(),
+                    xy_depth: *xy_depth,
+                })
+            }
+        }
+    }
+}
+
 fn compute_zw_autocorr(problem: Problem, z: &PackedSeq, w: &PackedSeq) -> Vec<i32> {
     let mut zw = vec![0i32; problem.n];
     for s in 1..problem.n {
@@ -1793,7 +1866,7 @@ fn solve_work_item(
     problem: Problem,
     item: &SatWorkItem,
     template_cache: &mut HashMap<(i32, i32, i32, i32), SatXYTemplate>,
-    xy_table: Option<&XYBoundaryTable>,
+    xy_owner: Option<&XyOwner>,
     sat_config: &radical::SolverConfig,
     warm: &mut WarmStartState,
     use_quad_pb: bool,
@@ -1839,9 +1912,14 @@ fn solve_work_item(
             let candidate = CandidateZW {
                 z: z.clone(), w: w.clone(), zw_autocorr,
             };
-            if let Some(table) = xy_table {
-                table.solve_xy_with_sat(problem, item.tuple, &candidate, template)
-                    .map(|(x, y)| (x, y, z.clone(), w.clone()))
+            if let Some(owner) = xy_owner {
+                match owner.source_for(problem, &candidate) {
+                    Some(source) => solve_xy_via_source(problem, item.tuple, &candidate, template, source)
+                        .map(|(x, y)| (x, y, z.clone(), w.clone())),
+                    // Boundary not live in the MDD (shouldn't happen for
+                    // real candidates, but fall back gracefully).
+                    None => None,
+                }
             } else {
                 template.solve_for_warm_bnd(&candidate, warm, item.boundary.as_ref())
                     .map(|(x, y)| (x, y, z.clone(), w.clone()))
@@ -1858,7 +1936,7 @@ fn solve_work_item(
 /// workers dispatch each item to the right SAT solver via `solve_work_item`.
 fn run_parallel_search<P>(
     problem: Problem,
-    xy_table: Option<Arc<XYBoundaryTable>>,
+    xy_owner: Option<XyOwner>,
     sat_config: radical::SolverConfig,
     produce: P,
     verbose: bool,
@@ -1899,7 +1977,7 @@ where
         let found = Arc::clone(&found);
         let ready_tx = ready_tx.clone();
         let result_tx = result_tx.clone();
-        let xy_table = xy_table.clone();
+        let xy_owner = xy_owner.clone();
         let items_completed = Arc::clone(&items_completed);
         let phase_c_nanos_shared = Arc::clone(&phase_c_nanos_shared);
         let sat_config = sat_config.clone();
@@ -1920,7 +1998,7 @@ where
                 let c_start = Instant::now();
                 let solved = solve_work_item(
                     problem, &item, &mut template_cache,
-                    xy_table.as_deref(), &sat_config,
+                    xy_owner.as_ref(), &sat_config,
                     &mut warm, use_quad_pb,
                 );
                 phase_c_nanos_shared.fetch_add(
@@ -3773,7 +3851,7 @@ fn run_mdd_sat_search(
 
     let sat_config = cfg.sat_config.clone();
     // SAT config: use defaults (EMA restarts/vivification/chrono BT tested and regressed)
-    let xy_table: Option<Arc<XYBoundaryTable>> = None;
+    let xy_owner: Option<XyOwner> = None;
 
     // No seed — monitor feeds MDD boundaries inline on demand.
 
@@ -3802,7 +3880,7 @@ fn run_mdd_sat_search(
         let flow_xy_timeout = Arc::clone(&flow_xy_timeout);
         let stage_enter: Vec<_> = stage_enter.iter().map(Arc::clone).collect();
         let stage_exit: Vec<_> = stage_exit.iter().map(Arc::clone).collect();
-        let xy_table = xy_table.clone();
+        let xy_owner = xy_owner.clone();
         let sat_config = sat_config.clone();
 
         handles.push(std::thread::spawn(move || {
@@ -4565,7 +4643,7 @@ fn run_mdd_sat_search(
                                 // Fall through to normal solve
                                 solve_work_item(
                                     problem, &xy.item, &mut template_cache,
-                                    xy_table.as_deref(), &sat_config,
+                                    xy_owner.as_ref(), &sat_config,
                                     &mut warm, use_quad_pb,
                                 )
                             }
@@ -5434,205 +5512,255 @@ impl XYBoundaryTable {
         }
     }
 
-    /// Direct state injection: one clone per Z/W pair. For each boundary config,
-    /// precompute which quad PB terms are TRUE/DEAD/MAYBE and inject directly
-    /// into the solver's incremental state. No backtracking, no assumption propagation.
     fn solve_xy_with_sat(
         &self, problem: Problem, tuple: SumTuple,
         candidate: &CandidateZW, template: &SatXYTemplate,
     ) -> Option<(PackedSeq, PackedSeq)> {
-        let n = problem.n;
-        let m = n - 1; // W length
-        let k = self.k;
-        let middle_len = n - 2 * k;
-        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
-        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        let source = XyCandidateSource::Table(self);
+        solve_xy_via_source(problem, tuple, candidate, template, source)
+    }
+}
 
-        if !template.is_feasible(candidate) { return None; }
-        let Some(equalities) = gj_candidate_equalities(n, candidate) else { return None; };
+// ---- Shared XY candidate enumerator and per-candidate filtering logic ----
 
-        // Clone solver ONCE per Z/W pair, add GJ equalities and full quad PB constraints
-        let mut solver = template.solver.clone();
+struct LagFilter { s: usize, pairs: Vec<(u32, u32)>, max_unknown: i32, num_bnd_pairs: i32 }
+struct TermBndInfo { var_a: usize, var_b: usize, neg_a: bool, neg_b: bool, both_bnd: bool }
+
+/// Abstracts over the two ways we enumerate (x_bits, y_bits) candidates:
+///   - the flat on-disk XY boundary table, keyed by (z_bits, w_bits, x_sum, y_sum)
+///   - a runtime walk through the MDD's XY sub-tree rooted at xy_root
+///
+/// Both enforce the same k "exact" lags (proven by `table_vs_mdd_same_k_agree`).
+/// The walker's callback is driven by `for_each`; the caller returns early via
+/// a mutable `found` flag captured in the closure.
+enum XyCandidateSource<'a> {
+    Table(&'a XYBoundaryTable),
+    /// xy_root and the MDD walking parameters for `walk_xy_sub_mdd`.
+    Mdd {
+        mdd: &'a mdd_reorder::Mdd4,
+        xy_root: u32,
+        pos_order: &'a [usize],
+        xy_depth: usize,
+    },
+}
+
+/// Shared body of the table- and MDD-driven XY SAT paths. Builds the
+/// per-(Z,W) filter state (GJ equalities, lag filters, term-state templates)
+/// once, then iterates all (x_bits, y_bits) candidates from the chosen
+/// source and SAT-solves each one that survives the bitwise pre-filters.
+fn solve_xy_via_source(
+    problem: Problem,
+    tuple: SumTuple,
+    candidate: &CandidateZW,
+    template: &SatXYTemplate,
+    source: XyCandidateSource<'_>,
+) -> Option<(PackedSeq, PackedSeq)> {
+    let n = problem.n;
+    let m = n - 1;
+    let k = match source {
+        XyCandidateSource::Table(t) => t.k,
+        XyCandidateSource::Mdd { mdd, .. } => mdd.k,
+    };
+    let middle_len = n - 2 * k;
+    let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+    let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+
+    if !template.is_feasible(candidate) { return None; }
+    let Some(equalities) = gj_candidate_equalities(n, candidate) else { return None; };
+
+    // Clone the template solver once per (Z,W) pair and add the per-pair
+    // constraints (GJ equalities + full per-lag quad PB).
+    let mut solver = template.solver.clone();
+    for &(a, b, equal) in &equalities {
+        if equal { solver.add_clause([-a, b]); solver.add_clause([a, -b]); }
+        else { solver.add_clause([-a, -b]); solver.add_clause([a, b]); }
+    }
+    for s in 1..n {
+        let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
+        let lp = &template.lag_pairs[s];
+        let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+        solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+    }
+    solver.skip_backtrack_quad_pb = true;
+
+    // Per-quad-PB term info: precompute which terms are both-in-boundary.
+    let is_bnd = |pos: usize| -> bool { pos < k || pos >= n - k };
+    let num_qpb = solver.num_quad_pb();
+    let mut qpb_term_info: Vec<Vec<TermBndInfo>> = Vec::with_capacity(num_qpb);
+    for qi in 0..num_qpb {
+        let nt = solver.quad_pb_num_terms(qi);
+        let mut infos = Vec::with_capacity(nt);
+        for ti in 0..nt {
+            let (va, vb, na, nb) = solver.quad_pb_term_info(qi, ti);
+            let pa = va % n; let pb = vb % n;
+            infos.push(TermBndInfo { var_a: va, var_b: vb, neg_a: na, neg_b: nb, both_bnd: is_bnd(pa) && is_bnd(pb) });
+        }
+        qpb_term_info.push(infos);
+    }
+
+    // Extract Z/W boundary bits from the candidate (for the table lookup key).
+    let mut z_bits = 0u32;
+    let mut w_bits = 0u32;
+    for i in 0..k {
+        if candidate.z.get(i) == 1 { z_bits |= 1 << i; }
+        if candidate.z.get(n - k + i) == 1 { z_bits |= 1 << (k + i); }
+        if candidate.w.get(i) == 1 { w_bits |= 1 << i; }
+        if candidate.w.get(m - k + i) == 1 { w_bits |= 1 << (k + i); }
+    }
+
+    // Partial-lag autocorrelation filter (cheap bitwise pre-filter).
+    let pos_to_bit = |pos: usize| -> u32 {
+        if pos < k { pos as u32 } else { (k + pos - (n - k)) as u32 }
+    };
+    let targets: Vec<i32> = (0..n).map(|s| if s == 0 { 0 } else { -candidate.zw_autocorr[s] }).collect();
+    let mut lag_filters: Vec<LagFilter> = Vec::new();
+    for s in 1..n {
+        let mut pairs = Vec::new();
+        let mut unk = 0i32;
+        for i in 0..n - s {
+            if is_bnd(i) && is_bnd(i + s) {
+                pairs.push((pos_to_bit(i), pos_to_bit(i + s)));
+            } else { unk += 2; }
+        }
+        if !pairs.is_empty() && unk > 0 {
+            lag_filters.push(LagFilter { s, pairs: pairs.clone(), max_unknown: unk, num_bnd_pairs: 2 * pairs.len() as i32 });
+        }
+    }
+    lag_filters.sort_by_key(|f| f.max_unknown);
+
+    let max_terms = qpb_term_info.iter().map(|v| v.len()).max().unwrap_or(0);
+    let mut term_state_buf = vec![0u8; max_terms];
+    let mut configs_tested = 0usize;
+
+    // Inner body: given (x_bits, y_bits), run GJ + lag pre-filters, then
+    // SAT-solve XY. Returns Some((x, y)) on SAT success, None otherwise.
+    let mut try_candidate = |
+        x_bits: u32, y_bits: u32,
+        solver: &mut radical::Solver,
+        term_state_buf: &mut [u8],
+        configs_tested: &mut usize,
+    | -> Option<(PackedSeq, PackedSeq)> {
+        // GJ equality pre-filter on boundary bits.
         for &(a, b, equal) in &equalities {
-            if equal { solver.add_clause([-a, b]); solver.add_clause([a, -b]); }
-            else { solver.add_clause([-a, -b]); solver.add_clause([a, b]); }
+            let va = (a.unsigned_abs() as usize) - 1;
+            let vb = (b.unsigned_abs() as usize) - 1;
+            let pa = va % n; let pb = vb % n;
+            if !is_bnd(pa) || !is_bnd(pb) { continue; }
+            let ba = if va < n { (x_bits >> pos_to_bit(pa)) & 1 } else { (y_bits >> pos_to_bit(pa)) & 1 };
+            let bb = if vb < n { (x_bits >> pos_to_bit(pb)) & 1 } else { (y_bits >> pos_to_bit(pb)) & 1 };
+            let need_xor = (a < 0) as u32 ^ (b < 0) as u32 ^ (!equal) as u32;
+            if (ba ^ bb) != need_xor { return None; }
         }
-        for s in 1..n {
-            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
-            let lp = &template.lag_pairs[s];
-            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
-            solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+        // Partial-lag autocorrelation pre-filter.
+        for lf in &lag_filters {
+            let mut disagree = 0u32;
+            for &(bi, bj) in &lf.pairs {
+                disagree += ((x_bits >> bi) ^ (x_bits >> bj)) & 1;
+                disagree += ((y_bits >> bi) ^ (y_bits >> bj)) & 1;
+            }
+            let kn = lf.num_bnd_pairs - 2 * disagree as i32;
+            if (targets[lf.s] - kn).abs() > lf.max_unknown { return None; }
         }
 
-        // Skip quad PB incremental updates during backtrack — we reset state per config
-        solver.skip_backtrack_quad_pb = true;
+        // Expand boundary bits and inject quad PB term states.
+        let mut xv = [0i8; 64]; let mut yv = [0i8; 64];
+        let (xp, xs) = expand_boundary_bits(x_bits, k);
+        let (yp, ys) = expand_boundary_bits(y_bits, k);
+        xv[..k].copy_from_slice(&xp); xv[n-k..n].copy_from_slice(&xs);
+        yv[..k].copy_from_slice(&yp); yv[n-k..n].copy_from_slice(&ys);
+        let mut bnd_vals = [0i8; 128];
+        for i in 0..k { bnd_vals[i] = xv[i]; bnd_vals[n-k+i] = xv[n-k+i]; }
+        for i in 0..k { bnd_vals[n+i] = yv[i]; bnd_vals[n+n-k+i] = yv[n-k+i]; }
 
-        // Precompute per quad PB constraint: which terms have BOTH vars in boundary
-        let is_bnd = |pos: usize| -> bool { pos < k || pos >= n - k };
-        let num_qpb = solver.num_quad_pb();
-        struct TermBndInfo { var_a: usize, var_b: usize, neg_a: bool, neg_b: bool, both_bnd: bool }
-        let mut qpb_term_info: Vec<Vec<TermBndInfo>> = Vec::with_capacity(num_qpb);
         for qi in 0..num_qpb {
-            let nt = solver.quad_pb_num_terms(qi);
-            let mut infos = Vec::with_capacity(nt);
-            for ti in 0..nt {
-                let (va, vb, na, nb) = solver.quad_pb_term_info(qi, ti);
-                let pa = va % n; let pb = vb % n;
-                infos.push(TermBndInfo { var_a: va, var_b: vb, neg_a: na, neg_b: nb, both_bnd: is_bnd(pa) && is_bnd(pb) });
+            let infos = &qpb_term_info[qi];
+            let mut st = 0i32; let mut sm = 0i32;
+            for (ti, info) in infos.iter().enumerate() {
+                if info.both_bnd {
+                    let a_val = bnd_vals[info.var_a];
+                    let b_val = bnd_vals[info.var_b];
+                    let a_true = (a_val == 1 && !info.neg_a) || (a_val == -1 && info.neg_a);
+                    let b_true = (b_val == 1 && !info.neg_b) || (b_val == -1 && info.neg_b);
+                    if a_true && b_true {
+                        term_state_buf[ti] = 2; st += 1;
+                    } else {
+                        let a_false = (a_val == 1 && info.neg_a) || (a_val == -1 && !info.neg_a);
+                        let b_false = (b_val == 1 && info.neg_b) || (b_val == -1 && !info.neg_b);
+                        if a_false || b_false {
+                            term_state_buf[ti] = 0;
+                        } else {
+                            term_state_buf[ti] = 1; sm += 1;
+                        }
+                    }
+                } else {
+                    term_state_buf[ti] = 1; sm += 1;
+                }
             }
-            qpb_term_info.push(infos);
+            solver.reset_quad_pb_state(qi, &term_state_buf[..infos.len()], st, sm);
         }
 
-        // Extract Z/W boundary bits from the candidate
-        let mut z_bits = 0u32;
-        let mut w_bits = 0u32;
+        // Assumptions for boundary variables.
+        let mut assumptions = Vec::with_capacity(4 * k);
         for i in 0..k {
-            if candidate.z.get(i) == 1 { z_bits |= 1 << i; }
-            if candidate.z.get(n - k + i) == 1 { z_bits |= 1 << (k + i); }
-            if candidate.w.get(i) == 1 { w_bits |= 1 << i; }
-            if candidate.w.get(m - k + i) == 1 { w_bits |= 1 << (k + i); }
+            assumptions.push(if xv[i] == 1 { x_var(i) } else { -x_var(i) });
+            assumptions.push(if yv[i] == 1 { y_var(i) } else { -y_var(i) });
         }
-
-        // Precompute partial-lag autocorrelation filters
-        let pos_to_bit = |pos: usize| -> u32 {
-            if pos < k { pos as u32 } else { (k + pos - (n - k)) as u32 }
-        };
-        let targets: Vec<i32> = (0..n).map(|s| if s == 0 { 0 } else { -candidate.zw_autocorr[s] }).collect();
-        struct LagFilter { s: usize, pairs: Vec<(u32, u32)>, max_unknown: i32, num_bnd_pairs: i32 }
-        let mut lag_filters: Vec<LagFilter> = Vec::new();
-        for s in 1..n {
-            let mut pairs = Vec::new();
-            let mut unk = 0i32;
-            for i in 0..n - s {
-                if is_bnd(i) && is_bnd(i + s) {
-                    pairs.push((pos_to_bit(i), pos_to_bit(i + s)));
-                } else { unk += 2; }
-            }
-            if !pairs.is_empty() && unk > 0 {
-                lag_filters.push(LagFilter { s, pairs: pairs.clone(), max_unknown: unk, num_bnd_pairs: 2 * pairs.len() as i32 });
-            }
+        for i in 0..k {
+            let p = n-k+i;
+            assumptions.push(if xv[p] == 1 { x_var(p) } else { -x_var(p) });
+            assumptions.push(if yv[p] == 1 { y_var(p) } else { -y_var(p) });
         }
-        lag_filters.sort_by_key(|f| f.max_unknown);
-
-        // Pre-allocate buffers for term state injection
-        let max_terms = qpb_term_info.iter().map(|v| v.len()).max().unwrap_or(0);
-        let mut term_state_buf = vec![0u8; max_terms];
-
-        let mut configs_tested = 0usize;
-        let max_bnd_sum = (2 * k) as i32;
-        // Iterate only valid (x_bnd_sum, y_bnd_sum) pairs and look up matching entries
-        for x_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
-            let x_mid = tuple.x - x_bnd_sum;
-            if x_mid.abs() > middle_len as i32 || (x_mid + middle_len as i32) % 2 != 0 { continue; }
-            for y_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
-                let y_mid = tuple.y - y_bnd_sum;
-                if y_mid.abs() > middle_len as i32 || (y_mid + middle_len as i32) % 2 != 0 { continue; }
-
-                let xy_entries = self.get_xy_entries(z_bits, w_bits, x_bnd_sum, y_bnd_sum);
-                if xy_entries.is_empty() { continue; }
-
-                for &(x_bits, y_bits) in xy_entries {
-
-            // GJ equality filter on boundary variables
-            let mut ok = true;
-            for &(a, b, equal) in &equalities {
-                let va = (a.unsigned_abs() as usize) - 1;
-                let vb = (b.unsigned_abs() as usize) - 1;
-                let pa = va % n; let pb = vb % n;
-                if !is_bnd(pa) || !is_bnd(pb) { continue; }
-                let pos_to_bit = |pos: usize| -> u32 {
-                    if pos < k { pos as u32 } else { (k + pos - (n - k)) as u32 }
-                };
-                let ba = if va < n { (x_bits >> pos_to_bit(pa)) & 1 } else { (y_bits >> pos_to_bit(pa)) & 1 };
-                let bb = if vb < n { (x_bits >> pos_to_bit(pb)) & 1 } else { (y_bits >> pos_to_bit(pb)) & 1 };
-                let need_xor = (a < 0) as u32 ^ (b < 0) as u32 ^ (!equal) as u32;
-                if (ba ^ bb) != need_xor { ok = false; break; }
+        match solver.solve_with_assumptions(&assumptions) {
+            Some(true) => {
+                let x = extract_seq(solver, x_var, n);
+                let y = extract_seq(solver, y_var, n);
+                Some((x, y))
             }
-            if !ok { continue; }
-
-            // Partial-lag autocorrelation filter
-            for lf in &lag_filters {
-                let mut disagree = 0u32;
-                for &(bi, bj) in &lf.pairs {
-                    disagree += ((x_bits >> bi) ^ (x_bits >> bj)) & 1;
-                    disagree += ((y_bits >> bi) ^ (y_bits >> bj)) & 1;
+            _ => {
+                *configs_tested += 1;
+                if *configs_tested % 8 == 0 {
+                    solver.clear_learnt();
                 }
-                let kn = lf.num_bnd_pairs - 2 * disagree as i32;
-                if (targets[lf.s] - kn).abs() > lf.max_unknown { ok = false; break; }
+                None
             }
-            if !ok { continue; }
+        }
+    };
 
-                    // Expand bits only for entries passing all filters
-                    let mut xv = [0i8; 64]; let mut yv = [0i8; 64];
-                    let (xp, xs) = expand_boundary_bits(x_bits, k);
-                    let (yp, ys) = expand_boundary_bits(y_bits, k);
-                    xv[..k].copy_from_slice(&xp); xv[n-k..n].copy_from_slice(&xs);
-                    yv[..k].copy_from_slice(&yp); yv[n-k..n].copy_from_slice(&ys);
-                    // Build boundary value lookup
-                    let mut bnd_vals = [0i8; 128];
-                    for i in 0..k { bnd_vals[i] = xv[i]; bnd_vals[n-k+i] = xv[n-k+i]; }
-                    for i in 0..k { bnd_vals[n+i] = yv[i]; bnd_vals[n+n-k+i] = yv[n-k+i]; }
-
-                    // Precompute term states for all quad PB constraints and inject
-                    let _infeasible = false;
-                    for qi in 0..num_qpb {
-                        let infos = &qpb_term_info[qi];
-                        let mut st = 0i32; let mut sm = 0i32;
-                        for (ti, info) in infos.iter().enumerate() {
-                            if info.both_bnd {
-                                // Both boundary: evaluate the term
-                                let a_val = bnd_vals[info.var_a];
-                                let b_val = bnd_vals[info.var_b];
-                                let a_true = (a_val == 1 && !info.neg_a) || (a_val == -1 && info.neg_a);
-                                let b_true = (b_val == 1 && !info.neg_b) || (b_val == -1 && info.neg_b);
-                                if a_true && b_true {
-                                    term_state_buf[ti] = 2; st += 1; // TRUE
-                                } else {
-                                    let a_false = (a_val == 1 && info.neg_a) || (a_val == -1 && !info.neg_a);
-                                    let b_false = (b_val == 1 && info.neg_b) || (b_val == -1 && !info.neg_b);
-                                    if a_false || b_false {
-                                        term_state_buf[ti] = 0; // DEAD
-                                    } else {
-                                        term_state_buf[ti] = 1; sm += 1; // MAYBE (shouldn't happen if both_bnd)
-                                    }
-                                }
-                            } else {
-                                // At least one free variable: MAYBE
-                                term_state_buf[ti] = 1; sm += 1;
-                            }
-                        }
-                        solver.reset_quad_pb_state(qi, &term_state_buf[..infos.len()], st, sm);
-                    }
-
-                    // Build assumptions for boundary variables
-                    let mut assumptions = Vec::with_capacity(4 * k);
-                    for i in 0..k {
-                        assumptions.push(if xv[i] == 1 { x_var(i) } else { -x_var(i) });
-                        assumptions.push(if yv[i] == 1 { y_var(i) } else { -y_var(i) });
-                    }
-                    for i in 0..k {
-                        let p = n-k+i;
-                        assumptions.push(if xv[p] == 1 { x_var(p) } else { -x_var(p) });
-                        assumptions.push(if yv[p] == 1 { y_var(p) } else { -y_var(p) });
-                    }
-
-                    match solver.solve_with_assumptions(&assumptions) {
-                        Some(true) => {
-                            let x = extract_seq(&solver, x_var, n);
-                            let y = extract_seq(&solver, y_var, n);
-                            return Some((x, y));
-                        }
-                        _ => {
-                            configs_tested += 1;
-                            if configs_tested % 8 == 0 {
-                                solver.clear_learnt();
-                            }
+    let max_bnd_sum = (2 * k) as i32;
+    match source {
+        XyCandidateSource::Table(table) => {
+            for x_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
+                let x_mid = tuple.x - x_bnd_sum;
+                if x_mid.abs() > middle_len as i32 || (x_mid + middle_len as i32) % 2 != 0 { continue; }
+                for y_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
+                    let y_mid = tuple.y - y_bnd_sum;
+                    if y_mid.abs() > middle_len as i32 || (y_mid + middle_len as i32) % 2 != 0 { continue; }
+                    for &(x_bits, y_bits) in table.get_xy_entries(z_bits, w_bits, x_bnd_sum, y_bnd_sum) {
+                        if let Some(sol) = try_candidate(x_bits, y_bits, &mut solver, &mut term_state_buf, &mut configs_tested) {
+                            return Some(sol);
                         }
                     }
                 }
             }
+            None
         }
-        None
+        XyCandidateSource::Mdd { mdd, xy_root, pos_order, xy_depth } => {
+            // Walk the XY sub-MDD; walk_xy_sub_mdd already enforces the
+            // tuple's x_mid/y_mid parity/range constraints internally,
+            // which matches what the Table branch's outer loops do.
+            let mut found: Option<(PackedSeq, PackedSeq)> = None;
+            walk_xy_sub_mdd(
+                xy_root, 0, xy_depth, 0, 0, pos_order, &mdd.nodes,
+                max_bnd_sum, middle_len as i32, tuple,
+                &mut |x_bits, y_bits| {
+                    if found.is_some() { return; }
+                    if let Some(sol) = try_candidate(x_bits, y_bits, &mut solver, &mut term_state_buf, &mut configs_tested) {
+                        found = Some(sol);
+                    }
+                },
+            );
+            found
+        }
     }
 }
 
@@ -5652,15 +5780,47 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
     }
 
-    // Load boundary table
-    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table-k7.bin".to_string());
-    let skip_table = cfg.no_table || problem.n < 14;
-    let xy_table: Option<Arc<XYBoundaryTable>> = if skip_table {
+    // Load XY boundary enumerator: either the flat table (default) or
+    // a k-MDD sub-tree walker. Both are equivalent at the same k (proven
+    // by the ignored test `table_vs_mdd_same_k_agree`).
+    let xy_owner: Option<XyOwner> = if cfg.no_table || problem.n < 14 {
         if !cfg.no_table && problem.n < 14 && verbose {
-            eprintln!("Note: n={} < 14 (2*k for k=7 table), running without table", problem.n);
+            eprintln!("Note: n={} < 14 (2*k for k=7), running without XY enumerator", problem.n);
         }
         None
+    } else if cfg.xy_enum == "mdd" {
+        // Walk a k=7 MDD at runtime. Memory: ~1 MB vs the ~1.9 GB flat table.
+        let mdd_k: usize = 7;
+        match load_best_mdd(mdd_k, verbose) {
+            Some(m) => {
+                if problem.n < 2 * m.k {
+                    if verbose {
+                        eprintln!("Note: n={} < {} (2*k for MDD k={}), running without XY enumerator",
+                            problem.n, 2 * m.k, m.k);
+                    }
+                    None
+                } else {
+                    let pos_order: Vec<usize> = {
+                        let mut v = Vec::with_capacity(2 * m.k);
+                        for t in 0..m.k { v.push(t); v.push(2 * m.k - 1 - t); }
+                        v
+                    };
+                    let xy_depth = 2 * m.k;
+                    Some(XyOwner::Mdd {
+                        mdd: Arc::new(m),
+                        pos_order: Arc::new(pos_order),
+                        xy_depth,
+                    })
+                }
+            }
+            None => {
+                eprintln!("Error: MDD file mdd-{}.bin not found. Run: target/release/gen_mdd {}", mdd_k, mdd_k);
+                std::process::exit(1);
+            }
+        }
     } else {
+        // Default: flat table.
+        let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table-k7.bin".to_string());
         match XYBoundaryTable::load(&table_path) {
             Some(t) => {
                 if problem.n < 2 * t.k {
@@ -5671,7 +5831,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
                     None
                 } else {
                     if verbose { eprintln!("Loaded XY boundary table from {} (k={}, {} sigs, {} XY entries)", table_path, t.k, t.sig_offsets.len(), t.xy_data.len()); }
-                    Some(Arc::new(t))
+                    Some(XyOwner::Table(Arc::new(t)))
                 }
             }
             None => {
@@ -5684,7 +5844,11 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     };
 
     if verbose {
-        let method = if xy_table.is_some() { "table+SAT" } else { "SAT X/Y" };
+        let method = match &xy_owner {
+            Some(XyOwner::Table(_)) => "flat table+SAT",
+            Some(XyOwner::Mdd { .. }) => "MDD walk+SAT",
+            None => "SAT X/Y only",
+        };
         eprintln!("{} normalized tuples, Phase C: {}", tuples.len(), method);
         print_search_space(problem, &tuples);
     }
@@ -5692,7 +5856,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     let cfg = cfg.clone();
     let sat_secs = cfg.sat_secs;
     let sat_config = cfg.sat_config.clone();
-    run_parallel_search(problem, xy_table, sat_config, move |tx, found| {
+    run_parallel_search(problem, xy_owner, sat_config, move |tx, found| {
         let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
         let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
         let mut stats = SearchStats::default();
@@ -5867,6 +6031,14 @@ fn parse_args() -> SearchConfig {
             }
         } else if let Some(v) = arg.strip_prefix("--xy-table=") {
             cfg.xy_table_path = Some(v.to_string());
+        } else if let Some(v) = arg.strip_prefix("--xy-enum=") {
+            match v {
+                "table" | "mdd" => cfg.xy_enum = v.to_string(),
+                other => {
+                    eprintln!("--xy-enum: unknown value '{}'. expected 'table' or 'mdd'", other);
+                    std::process::exit(1);
+                }
+            }
         } else if arg == "--no-table" {
             cfg.no_table = true;
         } else if arg == "--quad-pb" {
@@ -6297,6 +6469,7 @@ mod tests {
             phase_only: None,
             xy_table_path: None,
             no_table: true,
+            xy_enum: "table".to_string(),
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
             sat_secs: 0,
