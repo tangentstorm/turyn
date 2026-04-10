@@ -3839,6 +3839,19 @@ fn run_mdd_sat_search(
                             if w_mid_sum.abs() > ctx.middle_m as i32 || (w_mid_sum + ctx.middle_m as i32) % 2 != 0 {
                                 flow_bnd_sum_fail.fetch_add(1, AtomicOrdering::Relaxed); continue;
                             }
+                            // MDD-guided fail-fast: if the XY sub-tree at this
+                            // boundary has no (x,y) leaf that matches this tuple's
+                            // sum constraints, skip the SolveW/Z pipeline entirely.
+                            // Otherwise workers would do full W enumeration + Z SAT
+                            // for a tuple whose XY stage is guaranteed empty.
+                            if !any_valid_xy(
+                                bnd.xy_root, 0, ctx.xy_zw_depth, 0, 0,
+                                &ctx.xy_pos_order, &ctx.mdd.nodes,
+                                ctx.max_bnd_sum, ctx.middle_n as i32, tuple,
+                            ) {
+                                flow_bnd_sum_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                                continue;
+                            }
                             if trace_bnd && tuple.z == 8 && tuple.w == 1 {
                                 eprintln!("TRACE: emitting SolveW for tuple ({},{},{},{}) z_mid_sum={} w_mid_sum={}",
                                     tuple.x, tuple.y, tuple.z, tuple.w, z_mid_sum, w_mid_sum);
@@ -4734,6 +4747,47 @@ fn walk_xy_sub_mdd<F: FnMut(u32, u32)>(
             if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return; }
             callback(x_bits, y_bits);
         });
+}
+
+/// Return true iff the XY sub-MDD rooted at `xy_root` has at least one
+/// (x_bits, y_bits) leaf compatible with the tuple's sum constraints.
+/// Early-exits on the first valid candidate. Used to fail-fast SolveZ
+/// items whose boundary can't possibly produce a valid XY completion.
+fn any_valid_xy(
+    nid: u32, level: usize, xy_depth: usize,
+    x_acc: u32, y_acc: u32,
+    pos_order: &[usize], nodes: &[[u32; 4]],
+    max_bnd_sum: i32, middle_n: i32, tuple: SumTuple,
+) -> bool {
+    if nid == mdd_reorder::DEAD { return false; }
+    if level == xy_depth {
+        let x_bnd_sum = 2 * (x_acc.count_ones() as i32) - max_bnd_sum;
+        let y_bnd_sum = 2 * (y_acc.count_ones() as i32) - max_bnd_sum;
+        let x_mid = tuple.x - x_bnd_sum;
+        if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return false; }
+        let y_mid = tuple.y - y_bnd_sum;
+        if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return false; }
+        return true;
+    }
+    if nid == mdd_reorder::LEAF {
+        // Below the current MDD depth — all remaining positions free.
+        // Accept as long as the sum parity/range works out at SOME completion.
+        // For our purposes (at the true xy_depth) this branch is unreachable.
+        return true;
+    }
+    let pos = pos_order[level];
+    for branch in 0u32..4 {
+        let child = nodes[nid as usize][branch as usize];
+        if child == mdd_reorder::DEAD { continue; }
+        let a_val = (branch >> 0) & 1;
+        let b_val = (branch >> 1) & 1;
+        if any_valid_xy(
+            child, level + 1, xy_depth,
+            x_acc | (a_val << pos), y_acc | (b_val << pos),
+            pos_order, nodes, max_bnd_sum, middle_n, tuple,
+        ) { return true; }
+    }
+    false
 }
 
 fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
