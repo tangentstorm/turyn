@@ -190,6 +190,91 @@ def gsBlockEquiv (n : Nat) : GSBlockIndex n ≃ Fin (4 * n) :=
   ((Equiv.sumCongr finSumFinEquiv finSumFinEquiv).trans finSumFinEquiv).trans
     (finCongr (by omega))
 
+lemma gsBlockEquiv_block0 {n : Nat} (i : Fin n) :
+    (gsBlockEquiv n (Sum.inl (Sum.inl i))).1 = i.1 := by
+  simp [gsBlockEquiv]
+
+lemma gsBlockEquiv_block1 {n : Nat} (i : Fin n) :
+    (gsBlockEquiv n (Sum.inl (Sum.inr i))).1 = i.1 + n := by
+  simp [gsBlockEquiv]
+
+lemma gsBlockEquiv_block2 {n : Nat} (i : Fin n) :
+    (gsBlockEquiv n (Sum.inr (Sum.inl i))).1 = i.1 + (n + n) := by
+  simp [gsBlockEquiv, Nat.add_assoc]
+
+lemma gsBlockEquiv_block3 {n : Nat} (i : Fin n) :
+    (gsBlockEquiv n (Sum.inr (Sum.inr i))).1 = i.1 + n + (n + n) := by
+  simp [gsBlockEquiv, Nat.add_assoc]
+
+lemma gsMatrix_block00_entry {n : Nat} (G : GSData n) (i j : Fin n) :
+    gsMatrix G (gsBlockEquiv n (Sum.inl (Sum.inl i))) (gsBlockEquiv n (Sum.inl (Sum.inl j))) =
+      gsA G i j := by
+  have hi_div : ((gsBlockEquiv n (Sum.inl (Sum.inl i))).1 / n) = 0 := by
+    rw [gsBlockEquiv_block0]
+    by_cases hn : n = 0
+    · subst hn
+      cases i.2
+    · exact Nat.div_eq_of_lt i.2
+  have hj_div : ((gsBlockEquiv n (Sum.inl (Sum.inl j))).1 / n) = 0 := by
+    rw [gsBlockEquiv_block0]
+    by_cases hn : n = 0
+    · subst hn
+      cases j.2
+    · exact Nat.div_eq_of_lt j.2
+  have hi_mod :
+      (gsBlockEquiv n (Sum.inl (Sum.inl i))).1 % n = i.1 := by
+    rw [gsBlockEquiv_block0]
+    by_cases hn : n = 0
+    · subst hn
+      cases i.2
+    · exact Nat.mod_eq_of_lt i.2
+  have hj_mod :
+      (gsBlockEquiv n (Sum.inl (Sum.inl j))).1 % n = j.1 := by
+    rw [gsBlockEquiv_block0]
+    by_cases hn : n = 0
+    · subst hn
+      cases j.2
+    · exact Nat.mod_eq_of_lt j.2
+  unfold gsMatrix gsMatrixEntry gsA
+  simp only [hi_div, hj_div, hi_mod, hj_mod]
+
+lemma gsMatrix_block01_entry {n : Nat} (G : GSData n) (i j : Fin n) :
+    gsMatrix G (gsBlockEquiv n (Sum.inl (Sum.inl i))) (gsBlockEquiv n (Sum.inl (Sum.inr j))) =
+      (gsB G * reversalMatrix n) i j := by
+  have hi_div : ((gsBlockEquiv n (Sum.inl (Sum.inl i))).1 / n) = 0 := by
+    rw [gsBlockEquiv_block0]
+    by_cases hn : n = 0
+    · subst hn
+      cases i.2
+    · exact Nat.div_eq_of_lt i.2
+  have hj_div : ((gsBlockEquiv n (Sum.inl (Sum.inr j))).1 / n) = 1 := by
+    rw [gsBlockEquiv_block1]
+    by_cases hn : n = 0
+    · subst hn
+      cases j.2
+    · have hnpos : 0 < n := Nat.pos_of_ne_zero hn
+      have hjlt : j.1 + n < 2 * n := by omega
+      have hjle : n ≤ j.1 + n := by omega
+      have hjle' : 1 * n ≤ j.1 + n := by simpa using hjle
+      exact Nat.div_eq_of_lt_le hjle' hjlt
+  have hi_mod :
+      (gsBlockEquiv n (Sum.inl (Sum.inl i))).1 % n = i.1 := by
+    rw [gsBlockEquiv_block0]
+    by_cases hn : n = 0
+    · subst hn
+      cases i.2
+    · exact Nat.mod_eq_of_lt i.2
+  have hj_mod :
+      (gsBlockEquiv n (Sum.inl (Sum.inr j))).1 % n = j.1 := by
+    rw [gsBlockEquiv_block1]
+    by_cases hn : n = 0
+    · subst hn
+      cases j.2
+    · rw [Nat.add_mod_right]
+      exact Nat.mod_eq_of_lt j.2
+  unfold gsMatrix gsMatrixEntry gsB
+  simp only [hi_div, hj_div, hi_mod, hj_mod]
+
 /-- The GS array expressed as a genuine 4×4 block matrix. -/
 def gsBlockMatrix {n : Nat} (G : GSData n) : GSBlockMat n :=
   Matrix.fromBlocks
