@@ -3986,13 +3986,15 @@ fn run_mdd_sat_search(
                             let im_dummy = vec![0.0f64; nf];
                             solver.spectral = Some(radical::SpectralConstraint {
                                 num_seq_vars: total_mid,
-                                cos_table, sin_table, num_freqs: nf,
+                                cos_table: std::sync::Arc::new(cos_table),
+                                sin_table: std::sync::Arc::new(sin_table),
+                                num_freqs: nf,
                                 re: re_dummy.clone(), im: im_dummy.clone(),
                                 re_boundary: re_dummy.clone(), im_boundary: im_dummy,
                                 bound: ctx.problem.target_energy() as f64, // 6n-2: full energy budget for 2|W|²+2|Z|²+|X|²+|Y|²
                                 per_freq_bound: None,
                                 max_reduction: vec![0.0; nf],
-                                amplitudes,
+                                amplitudes: std::sync::Arc::new(amplitudes),
                                 assigned: vec![false; total_mid],
                                 values: vec![0i8; total_mid],
                                 seq2: Some(radical::Seq2Config {
