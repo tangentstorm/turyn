@@ -6506,6 +6506,223 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // requires mdd-7.bin and xy-table-k7.bin on disk
+    fn table_vs_mdd_same_k_agree() {
+        // Compare the two XY boundary enumerators at the same k=7 for a
+        // handful of (z_bits, w_bits, tuple) samples. The flat table only
+        // enforces the Turyn identity at the k "exact" lags; the MDD also
+        // tracks non-exact lags with middle-slack budgets, so its output
+        // should be a strict subset of the table's for any given query.
+        use crate::mdd_reorder;
+
+        let mdd = match mdd_reorder::Mdd4::load("mdd-7.bin") {
+            Some(m) => m,
+            None => { eprintln!("skip: mdd-7.bin not found"); return; }
+        };
+        let table = match XYBoundaryTable::load("xy-table-k7.bin") {
+            Some(t) => t,
+            None => { eprintln!("skip: xy-table-k7.bin not found"); return; }
+        };
+        assert_eq!(mdd.k, 7);
+        assert_eq!(table.k, 7);
+        let k = 7;
+        let zw_depth = 2 * k; // 14
+        let xy_depth = 2 * k; // 14
+        // Full bouncing pos_order that the MDD was built with.
+        let pos_order: Vec<usize> = {
+            let mut v = Vec::with_capacity(2 * k);
+            for t in 0..k { v.push(t); v.push(2 * k - 1 - t); }
+            v
+        };
+
+        // Walk xy sub-MDD from a given xy_root and collect all (x_bits, y_bits)
+        // leaves that match the tuple's sum constraints. (n is inferred via
+        // middle_n = n - 2k.)
+        fn walk(
+            nid: u32, level: usize, xy_depth: usize, x_acc: u32, y_acc: u32,
+            pos_order: &[usize], nodes: &[[u32; 4]],
+            max_bnd_sum: i32, middle_n: i32, tuple: SumTuple,
+            out: &mut std::collections::HashSet<(u32, u32)>,
+        ) {
+            if nid == mdd_reorder::DEAD { return; }
+            if level == xy_depth {
+                let x_bnd_sum = 2 * (x_acc.count_ones() as i32) - max_bnd_sum;
+                let y_bnd_sum = 2 * (y_acc.count_ones() as i32) - max_bnd_sum;
+                let x_mid = tuple.x - x_bnd_sum;
+                if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return; }
+                let y_mid = tuple.y - y_bnd_sum;
+                if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return; }
+                out.insert((x_acc, y_acc));
+                return;
+            }
+            if nid == mdd_reorder::LEAF {
+                // Unused at xy_depth level; ignore.
+                return;
+            }
+            let pos = pos_order[level];
+            for branch in 0u32..4 {
+                let child = nodes[nid as usize][branch as usize];
+                if child == mdd_reorder::DEAD { continue; }
+                let a_val = (branch >> 0) & 1;
+                let b_val = (branch >> 1) & 1;
+                walk(
+                    child, level + 1, xy_depth,
+                    x_acc | (a_val << pos), y_acc | (b_val << pos),
+                    pos_order, nodes, max_bnd_sum, middle_n, tuple, out,
+                );
+            }
+        }
+
+        // Collect the table's (x_bits, y_bits) set for a given (z_bits,
+        // w_bits, tuple) by iterating over all feasible (x_bnd_sum, y_bnd_sum)
+        // pairs and merging the per-bucket lists.
+        fn table_entries(
+            table: &XYBoundaryTable, z_bits: u32, w_bits: u32,
+            middle_n: i32, tuple: SumTuple,
+        ) -> std::collections::HashSet<(u32, u32)> {
+            let mut out = std::collections::HashSet::new();
+            let max_bnd_sum = 2 * table.k as i32;
+            let mut xs = -max_bnd_sum;
+            while xs <= max_bnd_sum {
+                let x_mid = tuple.x - xs;
+                if x_mid.abs() <= middle_n && (x_mid + middle_n) % 2 == 0 {
+                    let mut ys = -max_bnd_sum;
+                    while ys <= max_bnd_sum {
+                        let y_mid = tuple.y - ys;
+                        if y_mid.abs() <= middle_n && (y_mid + middle_n) % 2 == 0 {
+                            for &(xb, yb) in table.get_xy_entries(z_bits, w_bits, xs, ys) {
+                                out.insert((xb, yb));
+                            }
+                        }
+                        ys += 2;
+                    }
+                }
+                xs += 2;
+            }
+            out
+        }
+
+        // Navigate the MDD to the xy_root for a specific (z_bits, w_bits)
+        // pair, then walk the sub-tree.
+        fn xy_root_of(
+            mdd: &mdd_reorder::Mdd4, pos_order: &[usize], zw_depth: usize,
+            z_bits: u32, w_bits: u32,
+        ) -> Option<u32> {
+            let mut nid = mdd.root;
+            for level in 0..zw_depth {
+                if nid == mdd_reorder::DEAD { return None; }
+                let pos = pos_order[level];
+                let z_val = (z_bits >> pos) & 1;
+                let w_val = (w_bits >> pos) & 1;
+                let branch = (z_val | (w_val << 1)) as usize;
+                if nid == mdd_reorder::LEAF { continue; }
+                nid = mdd.nodes[nid as usize][branch];
+            }
+            if nid == mdd_reorder::DEAD { None } else { Some(nid) }
+        }
+
+        // Samples to check. Walk the MDD with a few LCG-scrambled paths
+        // to get live (z_bits, w_bits) pairs, then probe each with a few
+        // tuples. Also include the known TT(26) boundary at k=7.
+        let n: i32 = 26;
+        let middle_n: i32 = n - 2 * k as i32;
+        let max_bnd_sum: i32 = 2 * k as i32;
+        let mut samples: Vec<(u32, u32, SumTuple)> = Vec::new();
+        let known_tuple = SumTuple { x: 6, y: 6, z: 4, w: 5 };
+        samples.push((9495, 11183, known_tuple)); // known TT(26) at k=7
+        // LCG-scrambled MDD paths to get live samples (same LCG as monitor).
+        let lcg_mult: u64 = 0x5851F42D4C957F2D;
+        let total_paths: u64 = 1u64 << (2 * zw_depth);
+        let lcg_mask: u64 = total_paths - 1;
+        for idx in 0..32u64 {
+            let path = idx.wrapping_mul(lcg_mult) & lcg_mask;
+            let mut nid = mdd.root;
+            let mut z_acc = 0u32;
+            let mut w_acc = 0u32;
+            let mut dead = false;
+            for level in 0..zw_depth {
+                if nid == mdd_reorder::DEAD { dead = true; break; }
+                let branch = ((path >> (2 * level)) & 3) as usize;
+                let pos = pos_order[level];
+                z_acc |= ((branch & 1) as u32) << pos;
+                w_acc |= (((branch >> 1) & 1) as u32) << pos;
+                if nid != mdd_reorder::LEAF {
+                    nid = mdd.nodes[nid as usize][branch];
+                }
+            }
+            if dead || nid == mdd_reorder::DEAD { continue; }
+            for tuple in [
+                SumTuple { x: 6, y: 6, z: 4, w: 5 },
+                SumTuple { x: 2, y: 2, z: 8, w: 3 },
+                SumTuple { x: 0, y: 12, z: 2, w: 1 },
+            ] {
+                samples.push((z_acc, w_acc, tuple));
+            }
+        }
+
+        let mut n_mdd_empty = 0;
+        let mut n_checked = 0;
+        let mut n_same = 0;
+        let mut n_mdd_subset = 0;
+        for (zb, wb, tuple) in &samples {
+            let xy_root = match xy_root_of(&mdd, &pos_order, zw_depth, *zb, *wb) {
+                Some(r) => r,
+                None => continue,
+            };
+            let mut mdd_set = std::collections::HashSet::new();
+            walk(
+                xy_root, 0, xy_depth, 0, 0,
+                &pos_order, &mdd.nodes, max_bnd_sum, middle_n, *tuple,
+                &mut mdd_set,
+            );
+            let table_set = table_entries(&table, *zb, *wb, middle_n, *tuple);
+            n_checked += 1;
+            if mdd_set.is_empty() { n_mdd_empty += 1; }
+            if mdd_set == table_set { n_same += 1; }
+            if mdd_set.is_subset(&table_set) { n_mdd_subset += 1; }
+            eprintln!(
+                "  z_bits={} w_bits={} tuple=({},{},{},{}): mdd={} table={} mdd⊆table={}",
+                zb, wb, tuple.x, tuple.y, tuple.z, tuple.w,
+                mdd_set.len(), table_set.len(),
+                mdd_set.is_subset(&table_set),
+            );
+        }
+        eprintln!(
+            "Checked {} samples: {} same, {} mdd⊆table, {} mdd-empty",
+            n_checked, n_same, n_mdd_subset, n_mdd_empty,
+        );
+        // The claim (verified empirically): at the same k the MDD XY sub-tree
+        // walk and the flat table enforce exactly the same constraint (the
+        // k "exact" lags). So MDD == Table for every query.
+        assert_eq!(n_same, n_checked, "MDD should equal table for all samples");
+        assert_eq!(n_mdd_subset, n_checked, "MDD should be subset of table for all samples");
+
+        // Sanity check: the known TT(26)'s (x_bits=6675, y_bits=3415) must
+        // appear in the candidate set for the known TT(26) boundary
+        // (z_bits=9495, w_bits=11183, tuple=(6,6,4,5)) at k=7.
+        let xy_root = xy_root_of(&mdd, &pos_order, zw_depth, 9495, 11183)
+            .expect("known TT(26) boundary should be live");
+        let mut known_set = std::collections::HashSet::new();
+        walk(
+            xy_root, 0, xy_depth, 0, 0,
+            &pos_order, &mdd.nodes, max_bnd_sum, middle_n, known_tuple,
+            &mut known_set,
+        );
+        assert!(
+            known_set.contains(&(6675u32, 3415u32)),
+            "known TT(26) x_bits=6675 y_bits=3415 should be in MDD's candidate set (size {})",
+            known_set.len(),
+        );
+        let tbl_set = table_entries(&table, 9495, 11183, middle_n, known_tuple);
+        assert!(
+            tbl_set.contains(&(6675u32, 3415u32)),
+            "known TT(26) x_bits=6675 y_bits=3415 should be in table's candidate set (size {})",
+            tbl_set.len(),
+        );
+        eprintln!("✓ known TT(26) (x=6675, y=3415) is in both enumerators' candidate sets");
+    }
+
+    #[test]
     fn sat_xy_solves_known_tt36_zw() {
         // Given the known Z/W from TT(36), can SAT find X/Y?
         let p = Problem::new(36);
