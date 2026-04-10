@@ -10,7 +10,7 @@ const SPECTRAL_FREQS: usize = 167;
 use std::sync::Arc;
 use std::time::Instant;
 
-use rustfft::{FftPlanner, num_complex::Complex};
+use rustfft::num_complex::Complex;
 
 use turyn::mdd_reorder;
 use turyn::mdd_zw_first;
@@ -379,7 +379,10 @@ struct SeqWithSpectrum {
 #[derive(Clone)]
 struct SpectralFilter {
     fft_size: usize,
-    fft: Arc<dyn rustfft::Fft<f64>>,
+    /// Real-input FFT (rustfft's RealFftPlanner wrapper, ~2x faster than
+    /// complex FFT for real data). Input length = fft_size, output length =
+    /// fft_size/2 + 1.
+    rfft: Arc<dyn realfft::RealToComplex<f64>>,
 }
 
 impl fmt::Debug for SpectralFilter {
@@ -397,9 +400,9 @@ impl SpectralFilter {
         // Use at least 4*n for minimum spectral resolution.
         let min_size = (4 * seq_len).max(2 * theta_samples);
         let fft_size = min_size.next_power_of_two().max(16);
-        let mut planner = FftPlanner::new();
-        let fft = planner.plan_fft_forward(fft_size);
-        Self { fft_size, fft }
+        let mut planner = realfft::RealFftPlanner::<f64>::new();
+        let rfft = planner.plan_fft_forward(fft_size);
+        Self { fft_size, rfft }
     }
 }
 
@@ -492,37 +495,63 @@ fn autocorrs_from_values(values: &[i8]) -> Vec<i32> {
     out
 }
 
+/// Scratch buffers for realfft-based spectrum computation. Each worker
+/// keeps one of these for Z and one for W. Reusing the buffers avoids
+/// reallocation in the hot path (~millions of calls per run).
+struct FftScratch {
+    /// Real input (length = fft_size).
+    input: Vec<f64>,
+    /// Complex output (length = fft_size / 2 + 1).
+    output: Vec<Complex<f64>>,
+}
+
+impl FftScratch {
+    fn new(filter: &SpectralFilter) -> Self {
+        Self {
+            input: vec![0.0; filter.fft_size],
+            output: vec![Complex::new(0.0, 0.0); filter.fft_size / 2 + 1],
+        }
+    }
+}
+
+#[inline]
+fn fill_real_input(values: &[i8], input: &mut Vec<f64>, fft_size: usize) {
+    // input is pre-sized to fft_size. Overwrite the first values.len()
+    // slots and zero the rest (padding).
+    debug_assert!(input.len() == fft_size);
+    for (i, &v) in values.iter().enumerate() {
+        input[i] = v as f64;
+    }
+    for slot in input.iter_mut().skip(values.len()) {
+        *slot = 0.0;
+    }
+}
+
 fn compute_spectrum(
     values: &[i8],
     filter: &SpectralFilter,
-    fft_buf: &mut Vec<Complex<f64>>,
+    scratch: &mut FftScratch,
 ) -> Vec<f64> {
     let m = filter.fft_size;
-    fft_buf.clear();
-    for &v in values { fft_buf.push(Complex::new(v as f64, 0.0)); }
-    fft_buf.resize(m, Complex::new(0.0, 0.0));
-    filter.fft.process(fft_buf);
-    let half = m / 2 + 1;
-    (0..half).map(|k| fft_buf[k].norm_sqr()).collect()
+    fill_real_input(values, &mut scratch.input, m);
+    filter.rfft.process(&mut scratch.input, &mut scratch.output).unwrap();
+    scratch.output.iter().map(|c| c.norm_sqr()).collect()
 }
 
 /// Write the spectrum into `out` (reusable buffer) instead of allocating.
 fn compute_spectrum_into(
     values: &[i8],
     filter: &SpectralFilter,
-    fft_buf: &mut Vec<Complex<f64>>,
+    scratch: &mut FftScratch,
     out: &mut Vec<f64>,
 ) {
     let m = filter.fft_size;
-    fft_buf.clear();
-    for &v in values { fft_buf.push(Complex::new(v as f64, 0.0)); }
-    fft_buf.resize(m, Complex::new(0.0, 0.0));
-    filter.fft.process(fft_buf);
-    let half = m / 2 + 1;
+    fill_real_input(values, &mut scratch.input, m);
+    filter.rfft.process(&mut scratch.input, &mut scratch.output).unwrap();
     out.clear();
-    out.reserve(half);
-    for k in 0..half {
-        out.push(fft_buf[k].norm_sqr());
+    out.reserve(scratch.output.len());
+    for c in &scratch.output {
+        out.push(c.norm_sqr());
     }
 }
 
@@ -530,20 +559,14 @@ fn spectrum_if_ok(
     values: &[i8],
     filter: &SpectralFilter,
     bound: f64,
-    fft_buf: &mut Vec<Complex<f64>>,
+    scratch: &mut FftScratch,
 ) -> Option<Vec<f64>> {
     let m = filter.fft_size;
-    fft_buf.clear();
-    for &v in values {
-        fft_buf.push(Complex::new(v as f64, 0.0));
-    }
-    fft_buf.resize(m, Complex::new(0.0, 0.0));
-    filter.fft.process(fft_buf);
-    // Only check [0, M/2] — real sequence has symmetric spectrum
-    let half = m / 2 + 1;
-    let mut spectrum = Vec::with_capacity(half);
-    for k in 0..half {
-        let p = fft_buf[k].norm_sqr();
+    fill_real_input(values, &mut scratch.input, m);
+    filter.rfft.process(&mut scratch.input, &mut scratch.output).unwrap();
+    let mut spectrum = Vec::with_capacity(scratch.output.len());
+    for c in &scratch.output {
+        let p = c.norm_sqr();
         if p > bound {
             return None;
         }
@@ -561,21 +584,16 @@ fn spectrum_into_if_ok(
     values: &[i8],
     filter: &SpectralFilter,
     bound: f64,
-    fft_buf: &mut Vec<Complex<f64>>,
+    scratch: &mut FftScratch,
     out: &mut Vec<f64>,
 ) -> bool {
     let m = filter.fft_size;
-    fft_buf.clear();
-    for &v in values {
-        fft_buf.push(Complex::new(v as f64, 0.0));
-    }
-    fft_buf.resize(m, Complex::new(0.0, 0.0));
-    filter.fft.process(fft_buf);
-    let half = m / 2 + 1;
+    fill_real_input(values, &mut scratch.input, m);
+    filter.rfft.process(&mut scratch.input, &mut scratch.output).unwrap();
     out.clear();
-    out.reserve(half);
-    for k in 0..half {
-        let p = fft_buf[k].norm_sqr();
+    out.reserve(scratch.output.len());
+    for c in &scratch.output {
+        let p = c.norm_sqr();
         if p > bound {
             return false;
         }
@@ -891,7 +909,7 @@ fn build_w_candidates(
 ) -> Vec<SeqWithSpectrum> {
     let individual_bound = problem.spectral_bound();
     let mut w_candidates: Vec<SeqWithSpectrum> = Vec::new();
-    let mut fft_buf = Vec::with_capacity(spectral_w.fft_size);
+    let mut fft_buf = FftScratch::new(spectral_w);
     generate_sequences_permuted(problem.m(), w_sum, true, false, cfg.max_w, |values| {
         if found.load(AtomicOrdering::Relaxed) { return false; }
         stats.w_generated += 1;
@@ -994,7 +1012,7 @@ fn for_each_zw_pair(
 ) {
     let individual_bound = problem.spectral_bound();
     let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
-    let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
+    let mut fft_buf = FftScratch::new(spectral_z);
     let mut idx_buf = Vec::new();
     generate_sequences_permuted(problem.n, z_sum, true, true, cfg.max_z, |values| {
         if found.load(AtomicOrdering::Relaxed) { return false; }
@@ -2292,7 +2310,7 @@ fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let mut stats = SearchStats::default();
         let individual_bound = problem.spectral_bound();
         let max_z_per_w = 10;
-        let mut fft_buf = Vec::with_capacity(spectral_w.fft_size);
+        let mut fft_buf = FftScratch::new(&spectral_w);
         for (&w_sum, w_tuples) in &tuples_by_w {
             if found.load(AtomicOrdering::Relaxed) { break; }
             generate_sequences_permuted(problem.m(), w_sum, true, false, max_w, |w_values| {
@@ -2340,7 +2358,7 @@ fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         let individual_bound = problem.spectral_bound();
         for tuple in &tuples {
             if found.load(AtomicOrdering::Relaxed) { break; }
-            let mut fft_buf = Vec::with_capacity(spectral_z.fft_size);
+            let mut fft_buf = FftScratch::new(&spectral_z);
             generate_sequences_permuted(problem.n, tuple.z, true, true, max_z, |z_values| {
                 if found.load(AtomicOrdering::Relaxed) { return false; }
                 stats.z_generated += 1;
@@ -3800,8 +3818,8 @@ fn run_mdd_sat_search(
             let mut ext_cache: HashMap<u128, bool> = HashMap::new();
             let spectral_w = SpectralFilter::new(ctx.problem.m(), ctx.theta);
             let spectral_z = SpectralFilter::new(ctx.problem.n, ctx.theta);
-            let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
-            let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
+            let mut fft_buf_w = FftScratch::new(&spectral_w);
+            let mut fft_buf_z = FftScratch::new(&spectral_z);
             // Reusable spectrum output buffer for the post-hoc Z pair check.
             // Avoids allocating a fresh Vec<f64> per Z solution.
             let mut z_spectrum_buf: Vec<f64> = Vec::new();
@@ -5974,7 +5992,7 @@ fn main() {
                     sat_z_middle::fill_w_solver(&mut w_solver, &w_tmpl_local, m, &w_boundary);
                     let w_mid_vars: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
                     let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
-                    let mut fft_buf_w = Vec::with_capacity(state.spectral_w.fft_size);
+                    let mut fft_buf_w = FftScratch::new(state.spectral_w);
                     let mut w_passing = 0usize;
 
                     // Simple PRNG for phase randomization
