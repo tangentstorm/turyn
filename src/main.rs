@@ -282,6 +282,9 @@ struct SearchConfig {
     mdd_k: usize,
     /// Extension filter: prune dead boundaries by checking k+N extensibility (0 = off).
     mdd_extend: usize,
+    /// In the --mdd pipeline, solve W and Z with a single combined SAT call
+    /// instead of the default SolveW → SolveZ two-stage pipeline.
+    wz_together: bool,
 }
 
 impl Default for SearchConfig {
@@ -307,6 +310,7 @@ impl Default for SearchConfig {
             use_mdd: false,
             mdd_k: 8,
             mdd_extend: 0,
+            wz_together: false,
         }
     }
 }
@@ -3291,6 +3295,9 @@ struct PhaseBContext {
     pair_bound: f64,
     theta: usize,
     mdd_extend: usize,
+    /// Use the combined SolveWZ stage instead of the default SolveW →
+    /// SolveZ two-stage pipeline. Plumbed from cfg.wz_together.
+    wz_together: bool,
     w_mid_vars: Vec<i32>,
     z_mid_vars: Vec<i32>,
     z_spectral_tables: Option<radical::SpectralTables>,
@@ -3568,6 +3575,7 @@ fn run_mdd_sat_search(
         pair_bound: cfg.max_spectral.unwrap_or(problem.spectral_bound()),
         theta: cfg.theta_samples,
         mdd_extend: cfg.mdd_extend,
+        wz_together: cfg.wz_together,
         w_mid_vars: (0..middle_m).map(|i| (i + 1) as i32).collect(),
         z_mid_vars: (0..middle_n).map(|i| (i + 1) as i32).collect(),
         z_spectral_tables: if middle_n >= 8 {
@@ -3805,7 +3813,7 @@ fn run_mdd_sat_search(
             let k = ctx.k;
             let n = ctx.problem.n;
             let m = ctx.problem.m();
-            let use_wz_mode = std::env::var("WZ_MODE").is_ok();
+            let use_wz_mode = ctx.wz_together;
 
             loop {
                 let Some(work) = wq.pop_blocking(&ctx.found, &mut rng) else { break; };
@@ -5152,6 +5160,8 @@ fn print_help() {
     eprintln!("                           enumerate XY boundary candidates (k=7 default).");
     eprintln!("  --mdd                    MDD pipeline: navigate boundaries from an MDD and");
     eprintln!("                           SAT-solve middles inline. Alternative to the default.");
+    eprintln!("  --wz-together            In --mdd, use one combined SAT call for W and Z");
+    eprintln!("                           instead of the SolveW → SolveZ two-stage pipeline.");
     eprintln!("  --stochastic             Stochastic local search over all four sequences");
     eprintln!("  --stochastic-secs=<S>    Stochastic search, stop after S seconds (default: 10)");
     eprintln!();
@@ -5264,6 +5274,12 @@ fn parse_args() -> SearchConfig {
         } else if arg == "--no-quad-pb" {
             cfg.quad_pb = false;
         } else if arg == "--mdd" {
+            cfg.use_mdd = true;
+        } else if arg == "--wz-together" {
+            // In the --mdd pipeline, solve W and Z with a single combined
+            // SAT call instead of the default SolveW → SolveZ two-stage
+            // pipeline. Implies --mdd.
+            cfg.wz_together = true;
             cfg.use_mdd = true;
         } else if let Some(v) = arg.strip_prefix("--mdd-k=") {
             cfg.mdd_k = v.parse().unwrap_or(8);
@@ -5680,6 +5696,7 @@ mod tests {
             use_mdd: false,
             mdd_k: 8,
             mdd_extend: 0,
+            wz_together: false,
         };
         let report = run_hybrid_search(&cfg, false);
         assert!(report.found_solution, "n=4 hybrid should find solution");
