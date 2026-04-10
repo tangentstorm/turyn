@@ -3602,7 +3602,7 @@ fn run_mdd_sat_search(
         // A small cap lets workers move on to fresh (z_boundary, W) pairs
         // faster, which matters more than exhaustively enumerating Z for
         // one pair.
-        max_z: cfg.max_z.min(10),
+        max_z: cfg.max_z.min(1),
         individual_bound: problem.spectral_bound(),
         pair_bound: cfg.max_spectral.unwrap_or(problem.spectral_bound()),
         theta: cfg.theta_samples,
