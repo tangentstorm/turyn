@@ -8,63 +8,58 @@ Turyn-type sequence search engine. Finds TT(n) — four {+1,-1} sequences whose 
 
 ```bash
 cargo build --release
-target/release/turyn --n=26          # default hybrid search (uses table for n>=14)
-target/release/turyn --n=26 --no-table  # without table (slower)
-target/release/turyn --n=8            # auto-skips table for n<14 (table requires n>=2k)
+target/release/turyn --n=26               # default (--wz=cross)
+target/release/turyn --n=18 --mdd-k=5     # shorthand for --wz=apart --mdd-k=5
 ```
 
-### MDD pipeline (recommended for n >= 18)
+### Producer modes (`--wz`)
+
+All three modes load the same `mdd-<k>.bin` for XY boundary enumeration
+and feed the same `SolveXyPerCandidate` XY SAT fast path. They differ
+only in how they generate the `(Z, W)` candidate pairs:
 
 ```bash
-# Generate k=10 MDD (one-time, ~2 min, 262 MB)
-cargo build --release --bin gen_mdd && target/release/gen_mdd 10
-
-# Search using MDD pipeline
-target/release/turyn --n=56 --mdd --mdd-k=10
-target/release/turyn --n=26 --mdd --mdd-k=7
-target/release/turyn --n=18 --mdd --mdd-k=5
+target/release/turyn --n=26 --wz=cross                 # default: brute-force Z × W, SpectralIndex match
+target/release/turyn --n=26 --wz=apart    --mdd-k=7    # MDD walker + SolveW → SolveZ
+target/release/turyn --n=26 --wz=together --mdd-k=7    # MDD walker + combined W+Z SAT
 ```
 
-The MDD pipeline uses a pull-based 4-stage priority queue:
+The `--wz=apart|together` modes use a pull-based 4-stage priority queue:
 1. **Boundary** (stage 0): MDD path navigation → sum feasibility check
 2. **SolveW** (stage 1): SAT or brute-force W middle generation with spectral filtering
 3. **SolveZ** (stage 2): SAT Z with per-frequency spectral constraint + pair check
-4. **SolveXY** (stage 3): SAT X/Y solve with boundary config
+4. **SolveXY** (stage 3): XY SAT solve via `SolveXyPerCandidate::try_candidate`
 
 Workers pull from a dual queue (gold queue for ranked XY items, work queue for stages 0-2). The monitor navigates MDD paths on demand (nanosecond per path, no upfront enumeration).
 
-## Startup: generate XY boundary table
+## Startup: generate the MDD
 
-On first run (or if `xy-table-k7.bin` is missing), generate the table:
+On first run (or if `mdd-<k>.bin` is missing), generate the MDD:
 
 ```bash
-cargo build --release --bin gen_table && target/release/gen_table 7 xy-table-k7.bin
+cargo build --release --bin gen_mdd && target/release/gen_mdd 7    # for --wz=cross (hardcoded k=7)
+target/release/gen_mdd 10                                          # for --wz=apart|together at larger n
 ```
 
-This takes a few minutes and produces the k=7 boundary table used by the hybrid solver. The table is a pure function of k, not n, so it works for all n >= 14.
+`mdd-<k>.bin` is the only on-disk artifact the search needs. `gen_mdd 7` is ~1 MB and <1 min; `gen_mdd 10` is ~262 MB and ~2 min.
 
 ## Benchmarking
 
-### MDD pipeline throughput (n=56)
+### `--wz=apart|together` throughput (n=56)
 ```bash
-target/release/turyn --n=56 --mdd --mdd-k=10 --sat-secs=30
+target/release/turyn --n=56 --wz=apart --mdd-k=10 --sat-secs=30
 ```
 Current: ~680 xy/s average (high variance 200-1100 due to LCG path ordering).
 
-### MDD pipeline correctness (n=18, should find solution)
+### Correctness smoke test (n=18, should find solution)
 ```bash
-target/release/turyn --n=18 --mdd --mdd-k=5 --sat-secs=10
+target/release/turyn --n=18 --wz=apart --mdd-k=5 --sat-secs=10
 ```
 Should find TT(18) in <1s.
 
-### Legacy benchmark (Phase B throughput)
-```bash
-target/release/turyn --n=16 --theta=20000 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3
-```
-
 ### Override thread count
 ```bash
-TURYN_THREADS=8 target/release/turyn --n=56 --mdd --mdd-k=10 --sat-secs=30
+TURYN_THREADS=8 target/release/turyn --n=56 --wz=apart --mdd-k=10 --sat-secs=30
 ```
 
 ## Key architecture

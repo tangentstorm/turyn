@@ -549,7 +549,7 @@ pub fn fill_w_spectral(
 }
 
 /// Legacy: build Z middle solver from scratch (no template).
-/// Kept for the --phase-b --mdd path.
+/// Kept for the `--phase-b --wz=apart` diagnostic path.
 pub fn build_z_middle_solver(
     n: usize,
     m: usize,

@@ -45,17 +45,21 @@ main():
             WzMode::Together => run_mdd_sat_search(wz_together=true)
 ```
 
-The producer is chosen by `--wz=cross|together|apart`. The legacy
-`--mdd` and `--wz-together` flags still work; they're aliases for
-`--wz=apart` and `--wz=together` respectively. Explicit `--wz` always
-wins over the legacy combination.
+The producer is chosen by `--wz=cross|together|apart`. `--wz-together`
+still works as a short alias for `--wz=together`, and `--mdd-k=N` /
+`--mdd-extend=N` imply `--wz=apart` when no explicit `--wz` is given.
+Explicit `--wz` always wins.
 
-All three search layers plus the verify subcommand and benchmark
-wrapper share the same `SolveXyPerCandidate` / `solve_xy_via_source`
-XY SAT stage.  The XY enumerator is a k-MDD sub-tree walker; the flat
-`xy-table-k*.bin` format was retired once we proved (test:
-`table_vs_mdd_same_k_agree`, now removed) that at the same `k` it
-returned identical `(x_bits, y_bits)` sets.
+**All three modes load the same MDD** (`mdd-<k>.bin`) — the name
+"MDD pipeline" for `--wz=apart|together` is a historical artefact.
+Every search layer uses the MDD as its XY boundary enumerator; the
+three `--wz` modes differ only in how they generate the `(Z, W)`
+candidate pairs before handing each pair off to the shared
+`SolveXyPerCandidate::try_candidate` XY SAT path.
+
+The flat `xy-table-k*.bin` format was retired once we proved (test:
+`table_vs_mdd_same_k_agree`, now removed) that at the same `k` the
+MDD sub-tree walker returned identical `(x_bits, y_bits)` sets.
 
 ## The three (Z, W) producers
 
@@ -248,8 +252,9 @@ are gone.
 
 ## Offline artifacts
 
-- `gen_mdd K` → `mdd-K.bin` — used by **both** search paths (hybrid
-  loads `k = 7` for XY enumeration, `--mdd` loads whatever `--mdd-k`
-  says). The only on-disk artifact the search needs.
+- `gen_mdd K` → `mdd-K.bin` — used by **all three** `--wz` modes
+  (`--wz=cross` always loads `k = 7` for XY enumeration;
+  `--wz=apart|together` load whatever `--mdd-k` says, defaulting to 8).
+  The only on-disk artifact the search needs.
 - `gen_mdd_bfs K` — an alternative BFS-based MDD builder used for
   very large `k`.
