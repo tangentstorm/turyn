@@ -4285,12 +4285,24 @@ fn run_mdd_sat_search(
                             let nf = z_spec.num_freqs;
                             let mut w_re = vec![0.0f64; nf];
                             let mut w_im = vec![0.0f64; nf];
+                            // Inner loop is 25 × 167 fmadds per SolveZ item. Since
+                            // w_vals are ±1, replace the multiply with a conditional
+                            // add/sub. Lets the compiler emit one SIMD add/sub per
+                            // cache line rather than a vector multiply + add.
                             for (j, &wv) in sz.w_vals.iter().enumerate() {
-                                let wv = wv as f64;
                                 let base = j * nf;
-                                for fi in 0..nf {
-                                    w_re[fi] += wv * ztab.pos_cos[base + fi];
-                                    w_im[fi] += wv * ztab.pos_sin[base + fi];
+                                let cos_slice = &ztab.pos_cos[base..base + nf];
+                                let sin_slice = &ztab.pos_sin[base..base + nf];
+                                if wv > 0 {
+                                    for fi in 0..nf {
+                                        w_re[fi] += cos_slice[fi];
+                                        w_im[fi] += sin_slice[fi];
+                                    }
+                                } else {
+                                    for fi in 0..nf {
+                                        w_re[fi] -= cos_slice[fi];
+                                        w_im[fi] -= sin_slice[fi];
+                                    }
                                 }
                             }
                             let mut pfb = vec![ctx.pair_bound; nf];
