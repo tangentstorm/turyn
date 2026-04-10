@@ -150,13 +150,6 @@ impl PackedSeq {
             .map(|i| if self.get(i) == 1 { '+' } else { '-' })
             .collect()
     }
-
-    #[allow(dead_code)]
-    fn as_blocks(&self) -> String {
-        (0..self.len)
-            .map(|i| if self.get(i) == 1 { '\u{2593}' } else { '\u{2591}' })
-            .collect()
-    }
 }
 
 /// Extract a ±1 sequence from a SAT solver's assignment.
@@ -349,14 +342,13 @@ impl SearchConfig {
     }
 }
 
+/// A (Z, W) candidate reduced to everything the XY SAT stage actually
+/// reads — the aperiodic autocorrelation sum `2·N_Z(s) + 2·N_W(s)` for
+/// `s in 1..n`. Z and W themselves are carried alongside as PackedSeq
+/// values in the work item (`SatWorkItem`); this struct is just the
+/// per-lag target that drives `SolveXyPerCandidate`.
 #[derive(Clone, Debug)]
 struct CandidateZW {
-    // z/w kept on the struct because tests and legacy callers still
-    // populate them; only `zw_autocorr` is read by the fast path.
-    #[allow(dead_code)]
-    z: PackedSeq,
-    #[allow(dead_code)]
-    w: PackedSeq,
     zw_autocorr: Vec<i32>,
 }
 
@@ -369,11 +361,7 @@ struct SearchStats {
     candidate_pair_attempts: usize,
     candidate_pair_spectral_ok: usize,
     xy_nodes: usize,
-    xy_pruned_sum: usize,
-    xy_pruned_autocorr: usize,
-    xy_pruned_lex: usize,
     phase_b_nanos: u64,
-    phase_c_nanos: u64,
 }
 
 impl SearchStats {
@@ -385,11 +373,7 @@ impl SearchStats {
         self.candidate_pair_attempts += other.candidate_pair_attempts;
         self.candidate_pair_spectral_ok += other.candidate_pair_spectral_ok;
         self.xy_nodes += other.xy_nodes;
-        self.xy_pruned_sum += other.xy_pruned_sum;
-        self.xy_pruned_autocorr += other.xy_pruned_autocorr;
-        self.xy_pruned_lex += other.xy_pruned_lex;
         self.phase_b_nanos += other.phase_b_nanos;
-        self.phase_c_nanos += other.phase_c_nanos;
     }
 }
 
@@ -397,8 +381,6 @@ impl SearchStats {
 struct SeqWithSpectrum {
     seq: PackedSeq,
     spectrum: Vec<f64>,
-    #[allow(dead_code)]
-    autocorr: Option<Vec<i32>>,  // lazily computed at pair time
 }
 
 // BoundarySignature removed: bucketing provided no benefit (see commit history).
@@ -497,30 +479,6 @@ fn phase_a_tuples(problem: Problem, test_tuple: Option<&SumTuple>) -> Vec<SumTup
     tuples
 }
 
-
-#[allow(dead_code)]
-fn autocorrs_from_values(values: &[i8]) -> Vec<i32> {
-    let n = values.len();
-    let mut out = vec![0; n];
-    for s in 0..n {
-        let mut acc = 0i32;
-        let limit = n - s;
-        let mut i = 0usize;
-        while i + 4 <= limit {
-            acc += (values[i] as i32) * (values[i + s] as i32);
-            acc += (values[i + 1] as i32) * (values[i + 1 + s] as i32);
-            acc += (values[i + 2] as i32) * (values[i + 2 + s] as i32);
-            acc += (values[i + 3] as i32) * (values[i + 3 + s] as i32);
-            i += 4;
-        }
-        while i < limit {
-            acc += (values[i] as i32) * (values[i + s] as i32);
-            i += 1;
-        }
-        out[s] = acc;
-    }
-    out
-}
 
 /// Scratch buffers for realfft-based spectrum computation. Each worker
 /// keeps one of these for Z and one for W. Reusing the buffers avoids
@@ -946,7 +904,6 @@ fn build_w_candidates(
             stats.w_spectral_ok += 1;
             w_candidates.push(SeqWithSpectrum {
                 spectrum,
-                autocorr: None,
                 seq: PackedSeq::from_values(values),
             });
         }
@@ -1073,8 +1030,8 @@ fn stream_zw_candidates(
 ) -> Vec<CandidateZW> {
     let mut out = Vec::new();
     for_each_zw_pair(problem, z_sum, w_candidates, w_index, cfg, spectral_z, stats, found,
-        |z_seq, w_seq, zw, _, _| {
-            out.push(CandidateZW { z: z_seq.clone(), w: w_seq.clone(), zw_autocorr: zw });
+        |_z_seq, _w_seq, zw, _, _| {
+            out.push(CandidateZW { zw_autocorr: zw });
             true
         });
     out
@@ -1093,29 +1050,6 @@ fn build_zw_candidates(
     if found.load(AtomicOrdering::Relaxed) { return Vec::new(); }
     let w_index = SpectralIndex::build(&w_candidates);
     stream_zw_candidates(problem, tuple.z, &w_candidates, &w_index, cfg, spectral_z, stats, found)
-}
-
-/// Cached version: caches W candidates and spectral index by sum value.
-/// Z is streamed fresh each time — no storage limit, every spectrally-valid Z is tried.
-#[allow(dead_code)]
-fn build_zw_candidates_cached(
-    problem: Problem,
-    tuple: SumTuple,
-    cfg: &SearchConfig,
-    spectral_z: &SpectralFilter,
-    spectral_w: &SpectralFilter,
-    w_cache: &mut HashMap<i32, (Vec<SeqWithSpectrum>, SpectralIndex)>,
-    stats: &mut SearchStats,
-    found: &AtomicBool,
-) -> Vec<CandidateZW> {
-    if !w_cache.contains_key(&tuple.w) {
-        let w_candidates = build_w_candidates(problem, tuple.w, cfg, spectral_w, stats, found);
-        let w_index = SpectralIndex::build(&w_candidates);
-        w_cache.insert(tuple.w, (w_candidates, w_index));
-    }
-    if found.load(AtomicOrdering::Relaxed) { return Vec::new(); }
-    let (w_candidates, w_index) = w_cache.get(&tuple.w).unwrap();
-    stream_zw_candidates(problem, tuple.z, w_candidates, w_index, cfg, spectral_z, stats, found)
 }
 
 /// Pre-built SAT template for X/Y solving. Contains the structural clauses
@@ -1590,116 +1524,25 @@ impl SatXYTemplate {
     }
 
     /// Solve for X/Y given a specific Z/W candidate.
-    /// Returns (result, was_limited): result is Some if SAT, None if UNSAT/UNKNOWN.
-    /// was_limited=true means we hit the conflict limit (UNKNOWN).
-    fn solve_for_limited(&self, candidate: &CandidateZW, conflict_limit: u64) -> (Option<(PackedSeq, PackedSeq)>, bool) {
-        let Some(mut solver) = self.prepare_candidate_solver(candidate) else {
-            return (None, false);
-        };
-        if conflict_limit > 0 {
-            solver.set_conflict_limit(conflict_limit);
-        }
-        match solver.solve() {
-            Some(true) => (Some(self.extract_xy(&solver)), false),
-            Some(false) => (None, false),
-            None => (None, true),
-        }
-    }
-
+    /// Solve a single (Z, W) candidate to completion with no conflict
+    /// limit. Used by tests and by the `--test-zw` diagnostic path; the
+    /// production XY stage goes through `SolveXyPerCandidate` directly.
     fn solve_for(&self, candidate: &CandidateZW) -> Option<(PackedSeq, PackedSeq)> {
-        self.solve_for_limited(candidate, 0).0
-    }
-
-    /// Solve with warm-start: inject saved clauses/phases before solving,
-    /// extract learnt clauses/phases after solving.
-    #[allow(dead_code)]
-    fn solve_for_warm(
-        &self,
-        candidate: &CandidateZW,
-        warm: &mut WarmStartState,
-    ) -> Option<(PackedSeq, PackedSeq)> {
-        self.solve_for_warm_bnd(candidate, warm, None)
-    }
-
-    fn solve_for_warm_bnd(
-        &self,
-        candidate: &CandidateZW,
-        warm: &mut WarmStartState,
-        boundary: Option<&BoundaryConfig>,
-    ) -> Option<(PackedSeq, PackedSeq)> {
-        let Some(mut solver) = self.prepare_candidate_solver(candidate) else {
-            return None;
-        };
-
-        // Add boundary constraints: fix X/Y prefix and suffix positions.
-        // This makes each (Z,W,boundary) combo a distinct SAT problem.
-        if let Some(bnd) = boundary {
-            let n = self.n;
-            let x_var = |i: usize| -> i32 { (i + 1) as i32 };
-            let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
-            for i in 0..bnd.k {
-                solver.add_clause([if (bnd.x_bits >> i) & 1 == 1 { x_var(i) } else { -x_var(i) }]);
-                solver.add_clause([if (bnd.x_bits >> (bnd.k + i)) & 1 == 1 { x_var(n - bnd.k + i) } else { -x_var(n - bnd.k + i) }]);
-                solver.add_clause([if (bnd.y_bits >> i) & 1 == 1 { y_var(i) } else { -y_var(i) }]);
-                solver.add_clause([if (bnd.y_bits >> (bnd.k + i)) & 1 == 1 { y_var(n - bnd.k + i) } else { -y_var(n - bnd.k + i) }]);
-            }
-        }
-
-        // Conflict limit: fail fast on hard UNSAT instances.
-        // n<=30: no limit (small enough to solve quickly).
-        // n>30: 5K limit (skip hard UNSAT to maximize exploration).
-        if self.n > 30 {
-            solver.set_conflict_limit(5000);
-        }
-
-        // Inject warm-start data
-        if warm.inject_clauses && !warm.clauses.is_empty() {
-            solver.inject_clauses(&warm.clauses, 2);
-        }
-        if warm.inject_phase {
-            if let Some(ref ph) = warm.phase {
-                solver.set_phase(ph);
-            }
-        }
-
-        let result = solver.solve();
-
-        // Extract warm-start data for next solve
-        let new_clauses = solver.extract_learnt_clauses(warm.max_lbd);
-        for c in new_clauses {
-            if warm.clauses.len() < warm.max_clauses {
-                warm.clauses.push(c);
-            }
-        }
-        warm.phase = Some(solver.get_phase());
-
-        match result {
+        let mut solver = self.prepare_candidate_solver(candidate)?;
+        match solver.solve() {
             Some(true) => Some(self.extract_xy(&solver)),
             _ => None,
         }
     }
 }
 
-/// Per-worker warm-start state for clause/phase transfer between SAT solves.
+/// Per-worker warm-start state for phase transfer between SAT solves.
+/// Each worker captures the last solver's phase vector and injects it
+/// into the next clone-and-solve cycle — a cheap way to preserve value
+/// hints across closely-related XY SAT instances.
 struct WarmStartState {
-    clauses: Vec<Vec<i32>>,
     phase: Option<Vec<bool>>,
-    max_clauses: usize,
-    max_lbd: u8,
-    inject_clauses: bool,
     inject_phase: bool,
-}
-
-/// SAT-based X/Y solver: given fixed Z/W, encode just X/Y constraints and solve.
-#[allow(dead_code)]
-fn sat_solve_xy(
-    problem: Problem,
-    tuple: SumTuple,
-    candidate: &CandidateZW,
-    _stats: &mut SearchStats,
-) -> Option<(PackedSeq, PackedSeq)> {
-    let template = SatXYTemplate::build(problem, tuple, &radical::SolverConfig::default())?;
-    template.solve_for(candidate)
 }
 
 fn verify_tt(problem: Problem, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &PackedSeq) -> bool {
@@ -1737,18 +1580,6 @@ struct SearchReport {
 
 // ==================== Unified SAT work-item types ====================
 
-/// Pre-screened boundary configuration (prefix + suffix bits) for all four sequences.
-/// Each `*_bits` packs k prefix bits (low) and k suffix bits (high).
-#[allow(dead_code)]
-#[derive(Clone)]
-struct BoundaryConfig {
-    k: usize,
-    x_bits: u32,
-    y_bits: u32,
-    z_bits: u32,
-    w_bits: u32,
-}
-
 /// A fully-specified `(Z, W)` candidate ready for the XY SAT stage.
 /// Wrapped in `SolveXYWork` and pushed onto the unified runner's gold
 /// queue by the cross-mode producer.
@@ -1773,212 +1604,6 @@ fn compute_zw_autocorr(problem: Problem, z: &PackedSeq, w: &PackedSeq) -> Vec<i3
     zw
 }
 
-
-/// SAT-based X/Y/W solver: given fixed Z (from DFS), encode X/Y/W + autocorrelation
-/// constraints and solve. This avoids the spectral pairing bottleneck of Phase B.
-///
-/// Variables: X[0..n), Y[0..n), W[0..m) as SAT vars; Z values hardcoded as constants.
-#[allow(dead_code)]
-fn sat_solve_xyw(
-    problem: Problem,
-    tuple: SumTuple,
-    z_values: &[i8],
-    verbose: bool,
-) -> Option<(PackedSeq, PackedSeq, PackedSeq)> {
-    let n = problem.n;
-    let m = problem.m();
-    // Variables: X=1..n, Y=n+1..2n, W=2n+1..2n+m
-    let total_vars = 2 * n + m;
-    let mut enc = SatEncoder { n: total_vars, m: 0, next_var: (total_vars + 1) as i32, xnor_triples: Vec::new() };
-    let mut solver: radical::Solver = Default::default();
-
-    let x_var = |i: usize| -> i32 { (i + 1) as i32 };
-    let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
-    let w_var = |i: usize| -> i32 { (2 * n + i + 1) as i32 };
-
-    // Symmetry breaking: fix first element of each free sequence to +1
-    solver.add_clause([x_var(0)]); // x[0] = +1
-    solver.add_clause([y_var(0)]); // y[0] = +1
-    solver.add_clause([w_var(0)]); // w[0] = +1
-
-    // Sum constraints
-    if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0
-        || (tuple.w + m as i32) % 2 != 0 { return None; }
-    let x_pos = ((tuple.x + n as i32) / 2) as usize;
-    let y_pos = ((tuple.y + n as i32) / 2) as usize;
-    let w_pos = ((tuple.w + m as i32) / 2) as usize;
-    let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
-    let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
-    let w_lits: Vec<i32> = (0..m).map(|i| w_var(i)).collect();
-    enc.encode_cardinality_eq(&mut solver, &x_lits, x_pos);
-    enc.encode_cardinality_eq(&mut solver, &y_lits, y_pos);
-    enc.encode_cardinality_eq(&mut solver, &w_lits, w_pos);
-
-    // Precompute Z autocorrelations (constants)
-    let z_autocorr: Vec<i32> = (0..n).map(|s| {
-        if s == 0 { 0 } else {
-            (0..(n - s)).map(|i| (z_values[i] as i32) * (z_values[i + s] as i32)).sum()
-        }
-    }).collect();
-
-    // Autocorrelation constraints: N_X(k) + N_Y(k) + 2*N_Z(k) + 2*N_W(k) = 0
-    // Z is fixed, so 2*N_Z(k) is a constant.
-    // N_X(k) + N_Y(k) + 2*N_W(k) = -2*N_Z(k)
-    // agree_X(k) + agree_Y(k) + 2*agree_W(k) = (2*(n-k) + w_overlap) + N_Z(k)
-    //   where w_overlap = max(0, m-k)
-    // Wait, let me derive carefully:
-    // N_X + N_Y + 2*N_W = -2*N_Z
-    // N_X = 2*agX - (n-k), N_Y = 2*agY - (n-k), N_W = 2*agW - w_overlap
-    // 2*agX + 2*agY + 4*agW - 2*(n-k) - 2*w_overlap = -2*N_Z
-    // agX + agY + 2*agW = (2*(n-k) + 2*w_overlap - 2*N_Z) / 2 = (n-k) + w_overlap - N_Z
-    for k in 1..n {
-        let w_overlap = if k < m { m - k } else { 0 };
-        let target_i = (n - k) as i32 + w_overlap as i32 - z_autocorr[k];
-        if target_i < 0 || target_i as usize > 2 * (n - k) + 2 * w_overlap {
-            return None; // infeasible
-        }
-        let target = target_i as usize;
-
-        // XY agrees (weight 1)
-        let mut xy_lits = Vec::new();
-        for i in 0..(n - k) {
-            xy_lits.push(enc.encode_xnor(&mut solver, x_var(i), x_var(i + k)));
-        }
-        for i in 0..(n - k) {
-            xy_lits.push(enc.encode_xnor(&mut solver, y_var(i), y_var(i + k)));
-        }
-
-        // W agrees (weight 2) — use selector approach
-        let mut w_agree_lits = Vec::new();
-        for i in 0..w_overlap {
-            w_agree_lits.push(enc.encode_xnor(&mut solver, w_var(i), w_var(i + k)));
-        }
-
-        if !enc.encode_weighted_agree_eq(&mut solver, &xy_lits, &w_agree_lits, target) {
-            return None;
-        }
-    }
-
-    if verbose {
-        eprintln!("  SAT X/Y/W: {} vars, z_sum={}", enc.next_var - 1, tuple.z);
-    }
-
-    match solver.solve() {
-        Some(true) => {
-            let x = extract_seq(&solver, x_var, n);
-            let y = extract_seq(&solver, y_var, n);
-            let w = extract_seq(&solver, w_var, m);
-            Some((x, y, w))
-        }
-        _ => None,
-    }
-}
-
-/// Given fixed W, find Z candidates via SAT with range constraints per lag.
-///
-/// For each lag k: N_X(k) + N_Y(k) + 2*N_Z(k) + 2*N_W(k) = 0
-/// W is fixed → 2*N_W(k) is known. N_Z(k) = 2*agZ - (n-k).
-/// We need -(2*N_Z(k) + 2*N_W(k)) = N_X(k) + N_Y(k) to be achievable,
-/// i.e. |2*N_Z(k) + 2*N_W(k)| ≤ 2*(n-k), giving a range for agZ.
-///
-/// Returns multiple Z candidates by blocking previous solutions.
-#[allow(dead_code)]
-fn sat_find_z_candidates(
-    problem: Problem,
-    z_sum: i32,
-    w_values: &[i8],
-    max_candidates: usize,
-) -> Vec<PackedSeq> {
-    let n = problem.n;
-    let m = problem.m();
-
-    if (z_sum + n as i32) % 2 != 0 { return Vec::new(); }
-    let z_pos = ((z_sum + n as i32) / 2) as usize;
-
-    let mut enc = SatEncoder { n: 0, m: 0, next_var: (n + 1) as i32, xnor_triples: Vec::new() };
-    let mut solver: radical::Solver = Default::default();
-
-    let z_var = |i: usize| -> i32 { (i + 1) as i32 };
-
-    // Symmetry breaking: z[0] = +1
-    solver.add_clause([z_var(0)]);
-
-    // Sum constraint
-    let z_lits: Vec<i32> = (0..n).map(|i| z_var(i)).collect();
-    enc.encode_cardinality_eq(&mut solver, &z_lits, z_pos);
-
-    // Precompute W autocorrelations
-    let w_autocorr: Vec<i32> = (0..n).map(|s| {
-        if s == 0 || s >= m { 0 } else {
-            (0..(m - s)).map(|i| (w_values[i] as i32) * (w_values[i + s] as i32)).sum()
-        }
-    }).collect();
-
-    // Per-lag range constraints on Z autocorrelation.
-    // N_X(k) + N_Y(k) = -(2*N_Z(k) + 2*N_W(k))
-    // |N_X(k) + N_Y(k)| ≤ 2*(n-k)  (since each contributes at most n-k)
-    // → -2*(n-k) ≤ -(2*N_Z(k) + 2*N_W(k)) ≤ 2*(n-k)
-    // → -2*(n-k) - 2*N_W(k) ≤ 2*N_Z(k) ≤ 2*(n-k) - 2*N_W(k)
-    // → -(n-k) - N_W(k) ≤ N_Z(k) ≤ (n-k) - N_W(k)
-    // N_Z(k) = 2*agZ(k) - (n-k), so agZ(k) ∈ [lo, hi]:
-    //   lo = max(0, ceil(((n-k) + (-(n-k) - N_W(k))) / 2)) = max(0, ceil(-N_W(k) / 2))
-    //   hi = min(n-k, floor(((n-k) + ((n-k) - N_W(k))) / 2)) = min(n-k, floor((2*(n-k) - N_W(k)) / 2))
-    //   = min(n-k, (2*(n-k) - N_W(k)) / 2)  [integer division]
-    for k in 1..n {
-        let pairs = n - k;
-        let nw = w_autocorr[k];
-
-        // agZ range from the XY feasibility constraint
-        let lo = ((-nw) as f64 / 2.0).ceil().max(0.0) as usize;
-        let hi_val = (2 * pairs as i32 - nw) as f64 / 2.0;
-        let hi = (hi_val.floor() as usize).min(pairs);
-
-        if lo > hi { return Vec::new(); } // infeasible
-
-        // Build agree-count for Z at lag k
-        let mut z_agree_lits = Vec::with_capacity(pairs);
-        for i in 0..pairs {
-            z_agree_lits.push(enc.encode_xnor(&mut solver, z_var(i), z_var(i + k)));
-        }
-
-        // Encode: lo ≤ count(z_agree) ≤ hi
-        let ctr = enc.build_counter(&mut solver, &z_agree_lits);
-        // At least lo: ctr[lo] must be true (if lo > 0)
-        if lo > 0 && lo < ctr.len() && ctr[lo] != 0 {
-            solver.add_clause([ctr[lo]]);
-        } else if lo > 0 {
-            return Vec::new(); // can't achieve minimum
-        }
-        // At most hi: ctr[hi+1] must be false (if hi+1 is valid)
-        if hi + 1 < ctr.len() && ctr[hi + 1] != 0 {
-            solver.add_clause([-ctr[hi + 1]]);
-        }
-    }
-
-    // Find multiple Z by solving + blocking
-    let mut results = Vec::new();
-    for _ in 0..max_candidates {
-        match solver.solve() {
-            Some(true) => {
-                let z: Vec<i8> = (0..n).map(|i| {
-                    if solver.value(z_var(i)) == Some(true) { 1 } else { -1 }
-                }).collect();
-                // Block this solution
-                let block: Vec<i32> = (0..n).map(|i| {
-                    if z[i] == 1 { -z_var(i) } else { z_var(i) }
-                }).collect();
-                solver.add_clause(block);
-                results.push(PackedSeq::from_values(&z));
-            }
-            _ => break,
-        }
-    }
-    results
-}
-
-/// W-enumerate + SAT-Z + Phase C XY pipeline.
-/// For each spectrally-valid W: use SAT to find compatible Z candidates,
-/// then send each (Z, W) pair to the existing XY solver.
 fn run_benchmark(cfg: &SearchConfig) {
     if cfg.stochastic {
         run_stochastic_benchmark(cfg);
@@ -2252,10 +1877,8 @@ fn stochastic_worker(problem: Problem, norm: &[SumTuple], found: &AtomicBool, se
 ///   Z[0..n)   → vars 2n+1..=3n
 ///   W[0..m)   → vars 3n+1..=3n+m
 /// Additional auxiliary variables start at 3n+m+1.
-#[allow(dead_code)]
 struct SatEncoder {
     n: usize,
-    m: usize,
     next_var: i32,
     /// XNOR triples: (aux, a, b) where aux = (a XNOR b)
     xnor_triples: Vec<(i32, i32, i32)>,
@@ -2264,7 +1887,7 @@ struct SatEncoder {
 impl SatEncoder {
     fn new(n: usize) -> Self {
         let m = n - 1;
-        Self { n, m, next_var: (3 * n + m + 1) as i32, xnor_triples: Vec::new() }
+        Self { n, next_var: (3 * n + m + 1) as i32, xnor_triples: Vec::new() }
     }
 
     fn x_var(&self, i: usize) -> i32 { (i + 1) as i32 }
@@ -2631,68 +2254,6 @@ fn sat_encode_quad_pb_unified(
     Some((enc, solver))
 }
 
-#[allow(dead_code)]
-fn sat_search(problem: Problem, tuple: SumTuple, boundary: Option<&BoundaryConfig>, verbose: bool) -> Option<(Vec<i8>, Vec<i8>, Vec<i8>, Vec<i8>)> {
-    let encode_start = Instant::now();
-    let n = problem.n;
-    let m = problem.m();
-    let (enc, mut solver) = sat_encode(problem, tuple);
-
-    // Fix boundary variables if a pre-screened config is provided
-    if let Some(bnd) = boundary {
-        let k = bnd.k;
-        for i in 0..k {
-            let lit = enc.x_var(i);
-            solver.add_clause([if (bnd.x_bits >> i) & 1 == 1 { lit } else { -lit }]);
-            let lit = enc.x_var(n - k + i);
-            solver.add_clause([if (bnd.x_bits >> (k + i)) & 1 == 1 { lit } else { -lit }]);
-
-            let lit = enc.y_var(i);
-            solver.add_clause([if (bnd.y_bits >> i) & 1 == 1 { lit } else { -lit }]);
-            let lit = enc.y_var(n - k + i);
-            solver.add_clause([if (bnd.y_bits >> (k + i)) & 1 == 1 { lit } else { -lit }]);
-
-            let lit = enc.z_var(i);
-            solver.add_clause([if (bnd.z_bits >> i) & 1 == 1 { lit } else { -lit }]);
-            let lit = enc.z_var(n - k + i);
-            solver.add_clause([if (bnd.z_bits >> (k + i)) & 1 == 1 { lit } else { -lit }]);
-
-            let lit = enc.w_var(i);
-            solver.add_clause([if (bnd.w_bits >> i) & 1 == 1 { lit } else { -lit }]);
-            let lit = enc.w_var(m - k + i);
-            solver.add_clause([if (bnd.w_bits >> (k + i)) & 1 == 1 { lit } else { -lit }]);
-        }
-    }
-
-    let encode_elapsed = encode_start.elapsed();
-    if verbose {
-        println!("SAT encoding: n={}, tuple={}, {} vars, encoded in {:.3?}, solving...", n, tuple, enc.next_var - 1, encode_elapsed);
-    }
-
-    let solve_start = Instant::now();
-    let result = solver.solve();
-    let solve_elapsed = solve_start.elapsed();
-    if verbose {
-        println!("  solve: {:.3?}, conflicts={}, clauses={}", solve_elapsed, solver.num_conflicts(), solver.num_clauses());
-    }
-    match result {
-        Some(true) => {
-            let x = extract_vals(&solver, |i| enc.x_var(i), n);
-            let y = extract_vals(&solver, |i| enc.y_var(i), n);
-            let z = extract_vals(&solver, |i| enc.z_var(i), n);
-            let w = extract_vals(&solver, |i| enc.w_var(i), m);
-            Some((x, y, z, w))
-        }
-        Some(false) => {
-            if verbose { println!("UNSAT for tuple {} in {:.3?}", tuple, solve_elapsed); }
-            None
-        }
-        None => {
-            if verbose { println!("UNKNOWN for tuple {} in {:.3?}", tuple, solve_elapsed); }
-            None
-        }
-    }
-}
 
 /// Generic 4-way MDD walker. Walks from `nid` at `level` down to `depth`,
 /// accumulating two bit-packed values (a_acc, b_acc) for branches (low bit, high bit).
@@ -2774,8 +2335,9 @@ enum PipelineWork {
     SolveWZ(SolveWZWork),
     /// Stage 2: SAT-solve Z given boundary + W. Enumerate Z with blocking clauses.
     SolveZ(SolveZWork),
-    /// Stage 3: SAT-solve XY given boundary + Z + W.
-    #[allow(dead_code)]
+    /// Stage 3: run the XY SAT fast path for a fully-specified (Z, W)
+    /// candidate. Cross mode's producer pushes these directly after
+    /// Phase B enumeration + spectral pair filtering.
     SolveXY(SolveXYWork),
     Shutdown,
 }
@@ -2831,15 +2393,6 @@ struct SolveXYWork {
     item: SatWorkItem,
 }
 
-/// A subtree of the MDD to be processed by a Phase B worker.
-#[derive(Clone)]
-#[allow(dead_code)]
-struct SubtreeWork {
-    subtree_root: u32,
-    z_acc: u32,
-    w_acc: u32,
-}
-
 /// Navigate the MDD along a deterministic path to reach one boundary.
 /// Returns (z_bits, w_bits, xy_root) or None if the path hits DEAD.
 fn mdd_navigate_path(
@@ -2863,66 +2416,19 @@ fn mdd_navigate_path(
     Some((z_acc, w_acc, nid))
 }
 
-/// Partition the ZW half of the MDD into subtrees at the given depth.
-/// Returns a list of (subtree_root, z_acc, w_acc) for independent processing.
-#[allow(dead_code)]
-fn partition_mdd_subtrees(
-    root: u32, depth: usize, zw_depth: usize,
-    pos_order: &[usize], nodes: &[[u32; 4]],
-) -> Vec<SubtreeWork> {
-    let mut subtrees = Vec::new();
-    fn collect(
-        nid: u32, level: usize, target_depth: usize, zw_depth: usize,
-        z_acc: u32, w_acc: u32,
-        pos_order: &[usize], nodes: &[[u32; 4]],
-        out: &mut Vec<SubtreeWork>,
-    ) {
-        if nid == mdd_reorder::DEAD { return; }
-        if level == target_depth || level == zw_depth {
-            out.push(SubtreeWork { subtree_root: nid, z_acc, w_acc });
-            return;
-        }
-        if nid == mdd_reorder::LEAF {
-            // All branches are valid — expand
-            let pos = pos_order[level];
-            for branch in 0u32..4 {
-                let z_val = branch & 1;
-                let w_val = (branch >> 1) & 1;
-                collect(mdd_reorder::LEAF, level + 1, target_depth, zw_depth,
-                    z_acc | (z_val << pos), w_acc | (w_val << pos),
-                    pos_order, nodes, out);
-            }
-            return;
-        }
-        let pos = pos_order[level];
-        for branch in 0u32..4 {
-            let child = nodes[nid as usize][branch as usize];
-            if child == mdd_reorder::DEAD { continue; }
-            let z_val = branch & 1;
-            let w_val = (branch >> 1) & 1;
-            collect(child, level + 1, target_depth, zw_depth,
-                z_acc | (z_val << pos), w_acc | (w_val << pos),
-                pos_order, nodes, out);
-        }
-    }
-    collect(root, 0, depth, zw_depth, 0, 0, pos_order, nodes, &mut subtrees);
-    subtrees
-}
-
-/// Read-only context shared across all Phase B workers (via Arc).
+/// Read-only context shared across all workers (via Arc). Populated
+/// once in `run_mdd_sat_search` before spawning workers and read-only
+/// thereafter.
 struct PhaseBContext {
     mdd: Arc<mdd_reorder::Mdd4>,
-    #[allow(dead_code)]
-    pos_order: Vec<usize>,     // subtree-adjusted for ZW walk (partition_depth..)
     xy_pos_order: Vec<usize>,  // full pos_order for XY sub-MDD walk
     tuples: Vec<SumTuple>,
     w_tmpl: sat_z_middle::LagTemplate,
     z_tmpl: sat_z_middle::LagTemplate,
     problem: Problem,
     k: usize,
-    #[allow(dead_code)]
-    zw_depth: usize,        // subtree-adjusted for ZW walk
-    xy_zw_depth: usize,     // full 2*k for XY sub-MDD walk
+    zw_depth: usize,         // full 2*k — matches the MDD's ZW half depth
+    xy_zw_depth: usize,      // full 2*k for XY sub-MDD walk
     middle_n: usize,
     middle_m: usize,
     max_bnd_sum: i32,
@@ -2941,179 +2447,6 @@ struct PhaseBContext {
     found: Arc<AtomicBool>,
 }
 
-/*  Dead code — PhaseBWorker replaced by unified pipeline.
-impl PhaseBWorker_ {
-    fn new(seed: u64, ctx: &PhaseBContext) -> Self {
-        let spectral_z = SpectralFilter::new(ctx.problem.n, ctx.theta);
-        let spectral_w = SpectralFilter::new(ctx.problem.m(), ctx.theta);
-        PhaseBWorker {
-            w_bases: HashMap::new(),
-            z_bases: HashMap::new(),
-            stats: SearchStats::default(),
-            total_items: 0,
-            total_zw: 0,
-            rng: seed,
-            fft_buf_w: Vec::with_capacity(spectral_w.fft_size),
-            fft_buf_z: Vec::with_capacity(spectral_z.fft_size),
-            spectral_z,
-            spectral_w,
-        }
-    }
-
-    fn next_rng(&mut self) -> u64 {
-        self.rng ^= self.rng << 13;
-        self.rng ^= self.rng >> 7;
-        self.rng ^= self.rng << 17;
-        self.rng
-    }
-
-    /// Process one MDD subtree: walk remaining ZW levels, for each boundary
-    /// do SAT W → spectral → SAT Z → walk XY → emit Phase C items.
-    /// Process one MDD subtree: walk remaining ZW levels, for each boundary
-    /// do SAT W → spectral → SAT Z → walk XY → emit Phase C items.
-    ///
-    /// Uses raw recursive walk to avoid borrow-checker conflict between
-    /// walk_mdd_4way's &mut callback and &mut self in process_boundary.
-    fn process_subtree(
-        &mut self,
-        ctx: &PhaseBContext,
-        subtree: &SubtreeWork,
-        tx: &std::sync::mpsc::SyncSender<ZxyWork>,
-        walked_counter: &std::sync::atomic::AtomicU64,
-        b_produced: &std::sync::atomic::AtomicU64,
-    ) {
-        self.walk_and_process(
-            subtree.subtree_root, 0, ctx.zw_depth,
-            subtree.z_acc, subtree.w_acc,
-            ctx, tx, walked_counter, b_produced,
-        );
-    }
-
-    fn walk_and_process(
-        &mut self,
-        nid: u32, level: usize, depth: usize,
-        z_acc: u32, w_acc: u32,
-        ctx: &PhaseBContext,
-        tx: &std::sync::mpsc::SyncSender<ZxyWork>,
-        walked_counter: &std::sync::atomic::AtomicU64,
-        b_produced: &std::sync::atomic::AtomicU64,
-    ) {
-        if nid == mdd_reorder::DEAD { return; }
-        if ctx.found.load(AtomicOrdering::Relaxed) { return; }
-        if level == depth {
-            self.process_boundary(ctx, z_acc, w_acc, nid, tx, walked_counter, b_produced);
-            return;
-        }
-        if nid == mdd_reorder::LEAF {
-            let pos = ctx.pos_order[level];
-            for branch in 0u32..4 {
-                let z_val = branch & 1;
-                let w_val = (branch >> 1) & 1;
-                self.walk_and_process(
-                    mdd_reorder::LEAF, level + 1, depth,
-                    z_acc | (z_val << pos), w_acc | (w_val << pos),
-                    ctx, tx, walked_counter, b_produced,
-                );
-            }
-            return;
-        }
-        let pos = ctx.pos_order[level];
-        for branch in 0u32..4 {
-            let child = ctx.mdd.nodes[nid as usize][branch as usize];
-            if child == mdd_reorder::DEAD { continue; }
-            let z_val = branch & 1;
-            let w_val = (branch >> 1) & 1;
-            self.walk_and_process(
-                child, level + 1, depth,
-                z_acc | (z_val << pos), w_acc | (w_val << pos),
-                ctx, tx, walked_counter, b_produced,
-            );
-        }
-    }
-
-    fn process_boundary(
-        &mut self,
-        ctx: &PhaseBContext,
-        z_bits: u32, w_bits: u32, xy_root: u32,
-        tx: &std::sync::mpsc::SyncSender<ZxyWork>,
-        walked_counter: &std::sync::atomic::AtomicU64,
-        b_produced: &std::sync::atomic::AtomicU64,
-    ) {
-        if ctx.found.load(AtomicOrdering::Relaxed) { return; }
-        let k = ctx.k;
-        let n = ctx.problem.n;
-        let m = ctx.problem.m();
-        self.total_zw += 1;
-        walked_counter.fetch_add(1, AtomicOrdering::Relaxed);
-
-        let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - ctx.max_bnd_sum;
-        let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - ctx.max_bnd_sum;
-
-        for &tuple in &ctx.tuples {
-            if ctx.found.load(AtomicOrdering::Relaxed) { return; }
-
-            let z_mid_sum = tuple.z - z_bnd_sum;
-            if z_mid_sum.abs() > ctx.middle_n as i32 || (z_mid_sum + ctx.middle_n as i32) % 2 != 0 { continue; }
-            let w_mid_sum = tuple.w - w_bnd_sum;
-            if w_mid_sum.abs() > ctx.middle_m as i32 || (w_mid_sum + ctx.middle_m as i32) % 2 != 0 { continue; }
-
-            // Build W boundary
-            let (w_prefix, w_suffix) = expand_boundary_bits(w_bits, k);
-            let mut w_boundary = vec![0i8; m];
-            w_boundary[..k].copy_from_slice(&w_prefix);
-            w_boundary[m-k..].copy_from_slice(&w_suffix);
-
-            // Enumerate multiple W solutions with blocking clauses
-            let mut w_solver = self.w_bases.remove(&w_mid_sum).unwrap_or_else(||
-                ctx.w_tmpl.build_base_solver(ctx.middle_m, w_mid_sum)
-            );
-            let w_cp = w_solver.save_checkpoint();
-            sat_z_middle::fill_w_solver(&mut w_solver, &ctx.w_tmpl, m, &w_boundary);
-            if let Some(ref wtab) = ctx.w_spectral_tables {
-                w_solver.spectral = Some(radical::SpectralConstraint::from_tables(
-                    wtab, &w_boundary, ctx.individual_bound,
-                ));
-            }
-
-            loop {
-                if ctx.found.load(AtomicOrdering::Relaxed) { break; }
-                let w_phases: Vec<bool> = (0..ctx.middle_m)
-                    .map(|_| self.next_rng() & 1 == 1).collect();
-                w_solver.set_phase(&w_phases);
-                if w_solver.solve() != Some(true) { break; }
-                self.stats.w_generated += 1;
-
-                let w_mid = extract_vals(&w_solver, |i| ctx.w_mid_vars[i], ctx.middle_m);
-                let mut w_vals = w_boundary.clone();
-                w_vals[k..k+ctx.middle_m].copy_from_slice(&w_mid);
-
-                // Block this W
-                let w_block: Vec<i32> = ctx.w_mid_vars.iter().map(|&v| {
-                    if w_solver.value(v) == Some(true) { -v } else { v }
-                }).collect();
-                w_solver.add_clause(w_block);
-
-                let Some(w_spectrum) = spectrum_if_ok(&w_vals, &self.spectral_w, ctx.individual_bound, &mut self.fft_buf_w) else { continue; };
-                self.stats.w_spectral_ok += 1;
-
-                // Emit ZxyWork — Phase C worker will enumerate Z, Phase D does XY SAT
-                self.total_items += 1;
-                b_produced.fetch_add(1, AtomicOrdering::Relaxed);
-                let _ = tx.send(ZxyWork {
-                    tuple,
-                    z_bits, w_bits,
-                    w_vals,
-                    w_spectrum,
-                    xy_root,
-                    z_mid_sum,
-                });
-            }
-            w_solver.spectral = None;
-            w_solver.restore_checkpoint(w_cp);
-            self.w_bases.insert(w_mid_sum, w_solver);
-        }
-    }
-} // end dead code */
 
 /// MDD pipeline search: unified priority queue with stages MDD→W→Z→XY.
 /// All workers are identical — they grab the highest-stage item from the queue.
@@ -3186,7 +2519,6 @@ fn run_mdd_sat_search(
     // Shared read-only context for all workers
     let ctx = Arc::new(PhaseBContext {
         mdd: Arc::clone(&mdd),
-        pos_order: full_pos_order.clone(),
         xy_pos_order: full_pos_order.clone(),
         tuples: tuples.to_vec(),
         w_tmpl: sat_z_middle::LagTemplate::new(m, k),
@@ -3415,11 +2747,7 @@ fn run_mdd_sat_search(
 
         handles.push(std::thread::spawn(move || {
             let mut template_cache: HashMap<(i32, i32, i32, i32), SatXYTemplate> = HashMap::new();
-            let mut warm = WarmStartState {
-                clauses: Vec::new(), phase: None,
-                max_clauses: 100, max_lbd: 2,
-                inject_clauses: false, inject_phase: true,
-            };
+            let mut warm = WarmStartState { phase: None, inject_phase: true };
             let mut w_bases: HashMap<i32, radical::Solver> = HashMap::new();
             let mut z_bases: HashMap<i32, radical::Solver> = HashMap::new();
             let mut ext_cache: HashMap<u128, bool> = HashMap::new();
@@ -3780,9 +3108,7 @@ fn run_mdd_sat_search(
                             let template = template_cache.entry(tuple_key).or_insert_with(||
                                 SatXYTemplate::build(problem, swz.tuple, &sat_config).unwrap()
                             );
-                            let candidate = CandidateZW {
-                                z: z_seq.clone(), w: w_seq.clone(), zw_autocorr,
-                            };
+                            let candidate = CandidateZW { zw_autocorr };
                             if let Some(mut xy_solver) = template.prepare_candidate_solver(&candidate) {
                                 if n > 30 { xy_solver.set_conflict_limit(5000); }
                                 walk_xy_sub_mdd(
@@ -3981,120 +3307,63 @@ fn run_mdd_sat_search(
                             let template = template_cache.entry(tuple_key).or_insert_with(||
                                 SatXYTemplate::build(problem, sz.tuple, &sat_config).unwrap()
                             );
-                            let candidate = CandidateZW {
-                                z: z_seq.clone(), w: w_seq.clone(), zw_autocorr,
-                            };
-                            // Native MDD constraint: solver explores all valid XY
-                            // boundaries in a single solve() call. Experimental path
-                            // kept as an alternative under XY_MODE=mdd — NOT equivalent
-                            // to the shared solve_xy_via_source fast path.
-                            let use_mdd_solve = std::env::var("XY_MODE").ok().map_or(false, |v| v == "mdd");
-                            if use_mdd_solve {
-                                if let Some(mut xy_solver) = template.prepare_candidate_solver(&candidate) {
-                                    let level_x: Vec<i32> = (0..ctx.xy_zw_depth).map(|l| {
-                                        let pos = ctx.xy_pos_order[l];
-                                        if pos < k { (pos + 1) as i32 } else { (n - 2*k + pos + 1) as i32 }
-                                    }).collect();
-                                    let level_y: Vec<i32> = (0..ctx.xy_zw_depth).map(|l| {
-                                        let pos = ctx.xy_pos_order[l];
-                                        if pos < k { (n + pos + 1) as i32 } else { (n + n - 2*k + pos + 1) as i32 }
-                                    }).collect();
-                                    xy_solver.add_mdd_constraint(
-                                        &ctx.mdd.nodes, sz.xy_root, ctx.xy_zw_depth,
-                                        &level_x, &level_y,
-                                    );
-                                    // Suppress boundary variable activity: let MDD propagation
-                                    // handle boundary navigation, solver focuses on middle vars
-                                    for l in 0..ctx.xy_zw_depth {
-                                        let pos = ctx.xy_pos_order[l];
-                                        let xv = if pos < k { (pos + 1) as i32 } else { (n - 2*k + pos + 1) as i32 };
-                                        let yv = if pos < k { (n + pos + 1) as i32 } else { (n + n - 2*k + pos + 1) as i32 };
-                                        xy_solver.set_var_activity(xv, 0.0);
-                                        xy_solver.set_var_activity(yv, 0.0);
-                                    }
-                                    let xy_limit: u64 = std::env::var("XY_LIMIT").ok()
-                                        .and_then(|s| s.parse().ok()).unwrap_or(5000);
-                                    if n > 30 { xy_solver.set_conflict_limit(xy_limit); }
-                                    if warm.inject_phase {
-                                        if let Some(ref ph) = warm.phase { xy_solver.set_phase(ph); }
-                                    }
-                                    stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                    let result = xy_solver.solve();
-                                    items_completed.fetch_add(1, AtomicOrdering::Relaxed);
-                                    stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                    match result {
-                                        Some(true) => flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed),
-                                        Some(false) => flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed),
-                                        None => flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed),
-                                    };
-                                    if result == Some(true) {
-                                        let (x, y) = template.extract_xy(&xy_solver);
-                                        if verify_tt(problem, &x, &y, &z_seq, &w_seq) {
-                                            ctx.found.store(true, AtomicOrdering::Relaxed);
-                                            let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
-                                        }
-                                    }
-                                    warm.phase = Some(xy_solver.get_phase());
-                                } else {
-                                    flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                            let candidate = CandidateZW { zw_autocorr };
+                            // Shared XY SAT fast path: clone the per-tuple
+                            // template, attach GJ/lag pre-filters and quad
+                            // PB term-state injection, then walk the XY
+                            // sub-MDD running `try_candidate` for each
+                            // surviving (x_bits, y_bits). The extension
+                            // pre-filter is interleaved inside the walk
+                            // callback.
+                            if let Some(mut state) = SolveXyPerCandidate::new(
+                                problem, &candidate, template, k,
+                            ) {
+                                if n > 30 { state.solver.set_conflict_limit(5000); }
+                                if warm.inject_phase {
+                                    if let Some(ref ph) = warm.phase { state.solver.set_phase(ph); }
                                 }
-                            } else {
-                                // Default XY stage: use the shared solve_xy_via_source
-                                // fast path — the same setup + GJ/lag pre-filters +
-                                // quad PB term-state injection that the hybrid pipeline
-                                // uses. Inlined here (instead of calling the function
-                                // directly) so we can interleave the MDD extension
-                                // pre-filter and per-candidate pipeline counters.
-                                if let Some(mut state) = SolveXyPerCandidate::new(
-                                    problem, &candidate, template, k,
-                                ) {
-                                    if n > 30 { state.solver.set_conflict_limit(5000); }
-                                    if warm.inject_phase {
-                                        if let Some(ref ph) = warm.phase { state.solver.set_phase(ph); }
-                                    }
 
-                                    walk_xy_sub_mdd(
-                                        sz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
-                                        &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
-                                        ctx.middle_n as i32, sz.tuple,
-                                        &mut |x_bits, y_bits| {
-                                            if ctx.found.load(AtomicOrdering::Relaxed) { return; }
-                                            // E1: Extension filter with cache.
-                                            if ctx.mdd_extend > 0 {
-                                                let cache_key = (sz.z_bits as u128) | ((sz.w_bits as u128) << 32)
-                                                              | ((x_bits as u128) << 64) | ((y_bits as u128) << 96);
-                                                let ext_ok = *ext_cache.entry(cache_key).or_insert_with(||
-                                                    mdd_zw_first::has_extension(
-                                                        k, k + ctx.mdd_extend,
-                                                        sz.z_bits, sz.w_bits, x_bits, y_bits,
-                                                    )
-                                                );
-                                                if !ext_ok {
-                                                    extensions_pruned.fetch_add(1, AtomicOrdering::Relaxed);
-                                                    return;
-                                                }
+                                walk_xy_sub_mdd(
+                                    sz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
+                                    &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
+                                    ctx.middle_n as i32, sz.tuple,
+                                    &mut |x_bits, y_bits| {
+                                        if ctx.found.load(AtomicOrdering::Relaxed) { return; }
+                                        // E1: Extension filter with cache.
+                                        if ctx.mdd_extend > 0 {
+                                            let cache_key = (sz.z_bits as u128) | ((sz.w_bits as u128) << 32)
+                                                          | ((x_bits as u128) << 64) | ((y_bits as u128) << 96);
+                                            let ext_ok = *ext_cache.entry(cache_key).or_insert_with(||
+                                                mdd_zw_first::has_extension(
+                                                    k, k + ctx.mdd_extend,
+                                                    sz.z_bits, sz.w_bits, x_bits, y_bits,
+                                                )
+                                            );
+                                            if !ext_ok {
+                                                extensions_pruned.fetch_add(1, AtomicOrdering::Relaxed);
+                                                return;
                                             }
-                                            stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                            let result = state.try_candidate(x_bits, y_bits);
-                                            items_completed.fetch_add(1, AtomicOrdering::Relaxed);
-                                            stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                            match &result {
-                                                XyTryResult::Sat(_, _) => { flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed); }
-                                                XyTryResult::Unsat | XyTryResult::Pruned => { flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
-                                                XyTryResult::Timeout => { flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed); }
-                                            };
-                                            if let XyTryResult::Sat(x, y) = result {
-                                                if verify_tt(problem, &x, &y, &z_seq, &w_seq) {
-                                                    ctx.found.store(true, AtomicOrdering::Relaxed);
-                                                    let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
-                                                }
+                                        }
+                                        stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
+                                        let result = state.try_candidate(x_bits, y_bits);
+                                        items_completed.fetch_add(1, AtomicOrdering::Relaxed);
+                                        stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
+                                        match &result {
+                                            XyTryResult::Sat(_, _) => { flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed); }
+                                            XyTryResult::Unsat | XyTryResult::Pruned => { flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
+                                            XyTryResult::Timeout => { flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed); }
+                                        };
+                                        if let XyTryResult::Sat(x, y) = result {
+                                            if verify_tt(problem, &x, &y, &z_seq, &w_seq) {
+                                                ctx.found.store(true, AtomicOrdering::Relaxed);
+                                                let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
                                             }
-                                        },
-                                    );
-                                    warm.phase = Some(state.solver.get_phase());
-                                } else {
-                                    flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                                }
+                                        }
+                                    },
+                                );
+                                warm.phase = Some(state.solver.get_phase());
+                            } else {
+                                flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
                             }
                         }
                         if trace_z {
@@ -4117,10 +3386,7 @@ fn run_mdd_sat_search(
                         let item = xy.item;
                         let z_seq = item.z.clone();
                         let w_seq = item.w.clone();
-                        let zw_autocorr = item.zw_autocorr.clone();
-                        let candidate = CandidateZW {
-                            z: z_seq.clone(), w: w_seq.clone(), zw_autocorr,
-                        };
+                        let candidate = CandidateZW { zw_autocorr: item.zw_autocorr.clone() };
 
                         // Extract (z_bits, w_bits) from the boundary of each
                         // sequence and navigate the ZW half of the MDD to the
@@ -5069,7 +4335,7 @@ fn main() {
         let zs = z.sum();
         let ws = w.sum();
         let zw_autocorr = compute_zw_autocorr(p, &z, &w);
-        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr };
+        let candidate = CandidateZW { zw_autocorr };
         // Try all sum tuples that match this Z/W
         let mut tuples = phase_a_tuples(p, cfg.test_tuple.as_ref());
         tuples.retain(|t| t.z == zs && t.w == ws);
@@ -5524,7 +4790,7 @@ mod tests {
     #[test]
     fn cardinality_encoding_exactly_2_of_4() {
         // Test: exactly 2 of 4 variables must be true
-        let mut enc = SatEncoder { n: 0, m: 0, next_var: 5, xnor_triples: Vec::new() };
+        let mut enc = SatEncoder { n: 0, next_var: 5, xnor_triples: Vec::new() };
         let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3, 4];
         enc.encode_cardinality_eq(&mut solver, &lits, 2);
@@ -5537,7 +4803,7 @@ mod tests {
 
     #[test]
     fn cardinality_encoding_exactly_0_of_3() {
-        let mut enc = SatEncoder { n: 0, m: 0, next_var: 4, xnor_triples: Vec::new() };
+        let mut enc = SatEncoder { n: 0, next_var: 4, xnor_triples: Vec::new() };
         let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3];
         enc.encode_cardinality_eq(&mut solver, &lits, 0);
@@ -5549,7 +4815,7 @@ mod tests {
 
     #[test]
     fn cardinality_encoding_exactly_3_of_3() {
-        let mut enc = SatEncoder { n: 0, m: 0, next_var: 4, xnor_triples: Vec::new() };
+        let mut enc = SatEncoder { n: 0, next_var: 4, xnor_triples: Vec::new() };
         let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3];
         enc.encode_cardinality_eq(&mut solver, &lits, 3);
@@ -5561,7 +4827,7 @@ mod tests {
 
     #[test]
     fn xnor_encoding_correct() {
-        let mut enc = SatEncoder { n: 0, m: 0, next_var: 3, xnor_triples: Vec::new() };
+        let mut enc = SatEncoder { n: 0, next_var: 3, xnor_triples: Vec::new() };
         let mut solver: radical::Solver = Default::default();
         // a=1, b=2, test all 4 combos
         let aux = enc.encode_xnor(&mut solver, 1, 2);
@@ -5574,7 +4840,7 @@ mod tests {
 
     #[test]
     fn build_counter_exactly_2_of_3() {
-        let mut enc = SatEncoder { n: 0, m: 0, next_var: 4, xnor_triples: Vec::new() };
+        let mut enc = SatEncoder { n: 0, next_var: 4, xnor_triples: Vec::new() };
         let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3];
         let ctr = enc.build_counter(&mut solver, &lits);
@@ -5652,7 +4918,7 @@ mod tests {
             let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
             *slot = 2 * nz + 2 * nw;
         }
-        let candidate = CandidateZW { z, w, zw_autocorr: zw };
+        let candidate = CandidateZW { zw_autocorr: zw };
         let tuple = SumTuple { x: 0, y: 6, z: 8, w: 5 };
         let _stats = SearchStats::default();
         // Test 1: can the SAT solver find X/Y from scratch?
@@ -5729,7 +4995,7 @@ mod tests {
     #[test]
     fn sat_counter_with_xnor_hardcoded() {
         // Minimal test: hardcode X=[1,1,1,1], check XY agree at lag 3 = exactly 2
-        let mut enc = SatEncoder { n: 4, m: 3, next_var: 9, xnor_triples: Vec::new() }; // vars 1-4=X, 5-8=Y
+        let mut enc = SatEncoder { n: 4, next_var: 9, xnor_triples: Vec::new() }; // vars 1-4=X, 5-8=Y
         let mut solver: radical::Solver = Default::default();
         // X = [T,T,T,T], Y = [T,F,T,T]
         for v in 1..=4 { solver.add_clause([v]); } // all X = true
@@ -6047,7 +5313,7 @@ mod tests {
             let nw = if s < p.m() { w.autocorrelation(s) } else { 0 };
             zw[s] = 2 * nz + 2 * nw;
         }
-        let candidate = CandidateZW { z: z.clone(), w: w.clone(), zw_autocorr: zw };
+        let candidate = CandidateZW { zw_autocorr: zw };
         let template = SatXYTemplate::build(p, tuple, &radical::SolverConfig::default());
         assert!(template.is_some(), "Template should build for n=2");
         let result = template.unwrap().solve_for(&candidate);
