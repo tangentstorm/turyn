@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 /// Number of spectral frequencies for the SAT solver's built-in spectral constraint.
 /// Prime number, dense enough to make the post-hoc FFT check redundant.
-const SPECTRAL_FREQS: usize = 64;
+const SPECTRAL_FREQS: usize = 167;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -3524,7 +3524,15 @@ fn run_mdd_sat_search(
         middle_n,
         middle_m,
         max_bnd_sum,
-        max_z: cfg.max_z,
+        // Cap Z enumeration per SolveZ item. The post-hoc FFT pair check
+        // rejects >99.99% of Z solutions at small k; trying more than a
+        // handful per item wastes SAT time without improving coverage.
+        // Measured sweep at n=26 k=3 (boundaries walked in 20s):
+        //   max_z=1:  14   max_z=10: 15   max_z=100: 11   max_z=200000: 9
+        // A small cap lets workers move on to fresh (z_boundary, W) pairs
+        // faster, which matters more than exhaustively enumerating Z for
+        // one pair.
+        max_z: cfg.max_z.min(10),
         individual_bound: problem.spectral_bound(),
         pair_bound: cfg.max_spectral.unwrap_or(problem.spectral_bound()),
         theta: cfg.theta_samples,
