@@ -23,7 +23,7 @@ def combinedPeriodic {n : Nat} (G : GSData n) (s : Fin n) : Int :=
 /-- Certified GS input: sign quadruple with vanishing combined periodic autocorrelation
 away from zero. -/
 structure CertifiedGSData (n : Nat) extends GSData n where
-  periodic_vanishing : ∀ s : Fin n, s ≠ 0 → combinedPeriodic toGSData s = 0
+  periodic_vanishing : ∀ s : Fin n, s.1 ≠ 0 → combinedPeriodic toGSData s = 0
 
 /-- Typed transpose-twisted circulant block, corresponding to `Aᵀ R = R A`. -/
 def trCirculant {n : Nat} (x : IntVec n) : IntMat n :=
@@ -253,10 +253,38 @@ theorem gsBlockMatrix_pmOne {n : Nat} (G : GSData n) :
             simpa [gsBlockMatrix] using trCirculant_pmOne G.x2_pm i j
         · simpa [gsBlockMatrix, gsA] using circulant_pmOne G.x1_pm i j
 
+/-- Step 1 of the typed GS block proof: each diagonal `n × n` block of
+`gsBlockMatrix * gsBlockMatrixᵀ` is `(4 * n) • 1`. -/
+theorem gsBlockMatrix_diag_blocks {n : Nat} (G : CertifiedGSData n) :
+    let M := gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ
+    Matrix.toBlocks₁₁ (Matrix.toBlocks₁₁ M) = (4 * n : Int) • (1 : IntMat n) ∧
+    Matrix.toBlocks₂₂ (Matrix.toBlocks₁₁ M) = (4 * n : Int) • (1 : IntMat n) ∧
+    Matrix.toBlocks₁₁ (Matrix.toBlocks₂₂ M) = (4 * n : Int) • (1 : IntMat n) ∧
+    Matrix.toBlocks₂₂ (Matrix.toBlocks₂₂ M) = (4 * n : Int) • (1 : IntMat n) := by
+  sorry
+
+/-- Step 2 of the typed GS block proof: the upper-right 2×2 block of
+`gsBlockMatrix * gsBlockMatrixᵀ` vanishes. -/
+theorem gsBlockMatrix_upper_right_zero {n : Nat} (G : CertifiedGSData n) :
+    Matrix.toBlocks₁₂ (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ) = 0 := by
+  sorry
+
+/-- Step 3 of the typed GS block proof: the lower-left 2×2 block of
+`gsBlockMatrix * gsBlockMatrixᵀ` vanishes. -/
+theorem gsBlockMatrix_lower_left_zero {n : Nat} (G : CertifiedGSData n) :
+    Matrix.toBlocks₂₁ (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ) = 0 := by
+  sorry
+
+/-- Step 4 of the typed GS block proof: the full block product collapses to
+`(4 * n) • 1`. -/
+theorem gsBlockMatrix_target_from_blocks {n : Nat} (G : CertifiedGSData n) :
+    GSBlockTarget G.toGSData := by
+  sorry
+
 /-- Block-matrix GS orthogonality theorem in the right algebraic form. -/
 theorem gsBlockMatrix_target {n : Nat} (G : CertifiedGSData n) :
-    GSBlockTarget G := by
-  sorry
+    GSBlockTarget G.toGSData := by
+  exact gsBlockMatrix_target_from_blocks G
 
 /-- The typed GS matrix is Hadamard once the matrix-algebra target identity is proved. -/
 theorem gsTarget_implies_hadamard {n : Nat} (G : GSData n) (h : GSTarget G) :
@@ -267,12 +295,12 @@ theorem gsTarget_implies_hadamard {n : Nat} (G : GSData n) (h : GSTarget G) :
 
 /-- Typed GS orthogonality target, isolated as the remaining matrix-algebra theorem. -/
 theorem gsMatrix_target {n : Nat} (G : CertifiedGSData n) :
-    GSTarget G := by
+    GSTarget G.toGSData := by
   sorry
 
 /-- Final typed GS Hadamard theorem. -/
 theorem gsMatrix_isHadamard {n : Nat} (G : CertifiedGSData n) :
-    IsHadamardMat (gsMatrix G) := by
-  exact gsTarget_implies_hadamard G (gsMatrix_target G)
+    IsHadamardMat (gsMatrix G.toGSData) := by
+  exact gsTarget_implies_hadamard G.toGSData (gsMatrix_target G)
 
 end Turyn
