@@ -292,9 +292,12 @@ pub struct SpectralTables {
     /// Precomputed omega values for boundary DFT
     #[allow(dead_code)]
     omega: Vec<f64>,
-    /// Precomputed cos/sin for ALL positions (for boundary DFT)
-    pos_cos: Vec<f64>,  // [pos * num_freqs + fi]
-    pos_sin: Vec<f64>,
+    /// Precomputed cos/sin for ALL positions (for boundary DFT).
+    /// Indexed as pos_cos[pos * num_freqs + fi] where pos in 0..seq_len,
+    /// fi in 0..num_freqs. Public so callers can compute W's DFT at the
+    /// SAT frequency grid without redoing the trig.
+    pub pos_cos: Vec<f64>,
+    pub pos_sin: Vec<f64>,
 }
 
 impl SpectralTables {

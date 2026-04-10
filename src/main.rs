@@ -4120,13 +4120,19 @@ fn run_mdd_sat_search(
                             let mut z_spec = radical::SpectralConstraint::from_tables(
                                 ztab, &z_boundary, ctx.pair_bound,
                             );
-                            let mut pfb = vec![ctx.pair_bound; z_spec.num_freqs];
-                            for fi in 0..z_spec.num_freqs {
-                                let omega = (fi as f64 + 1.0) / (z_spec.num_freqs as f64 + 1.0) * std::f64::consts::PI;
+                            // Compute per-frequency W DFT using the precomputed
+                            // pos_cos/pos_sin tables from ztab (indexed by position
+                            // in the full-length sequence). This avoids ~4000 cos/sin
+                            // calls per SolveZ item at n=26 k=3 — previously the
+                            // dominant per-item cost.
+                            let nf = z_spec.num_freqs;
+                            let mut pfb = vec![ctx.pair_bound; nf];
+                            for fi in 0..nf {
                                 let (mut w_re, mut w_im) = (0.0f64, 0.0f64);
                                 for (j, &wv) in sz.w_vals.iter().enumerate() {
-                                    w_re += wv as f64 * (omega * j as f64).cos();
-                                    w_im += wv as f64 * (omega * j as f64).sin();
+                                    let wv = wv as f64;
+                                    w_re += wv * ztab.pos_cos[j * nf + fi];
+                                    w_im += wv * ztab.pos_sin[j * nf + fi];
                                 }
                                 pfb[fi] = (ctx.pair_bound - w_re*w_re - w_im*w_im).max(0.0);
                             }
