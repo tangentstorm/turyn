@@ -253,10 +253,6 @@ struct SearchConfig {
     benchmark_repeats: usize,
     stochastic: bool,
     stochastic_seconds: u64,
-    sat: bool,
-    sat_xy: bool,
-    z_sat: bool,
-    w_sat: bool,
     /// London §5.1: restrict spectral pair sum to ≤ max_spectral.
     /// If None, uses the default spectral_bound (= (6n-2)/2).
     /// Setting this lower than spectral_bound trades completeness for speed.
@@ -272,22 +268,13 @@ struct SearchConfig {
     test_tuple: Option<SumTuple>,
     /// Run only Phase A (print tuples) or Phase B (print Z/W pairs).
     phase_only: Option<String>,
-    /// Path to XY boundary table file for table-based Phase C.
-    /// Defaults to "./xy-table-k7.bin".
-    xy_table_path: Option<String>,
-    /// Run without XY boundary table (slower).
-    no_table: bool,
-    /// Which XY boundary enumerator to use in the hybrid path.
-    /// "table" (default, flat on-disk XY table) or "mdd" (walk a k-MDD
-    /// sub-tree at runtime — proven equivalent at the same k).
-    xy_enum: String,
     /// Dump DIMACS CNF to this path instead of solving.
     dump_dimacs: Option<String>,
     /// SAT solver feature flags.
     sat_config: radical::SolverConfig,
-    /// Time limit in seconds for --sat mode (0 = unlimited).
+    /// Time limit in seconds for the hybrid / MDD search (0 = unlimited).
     sat_secs: u64,
-    /// Use quad PB encoding instead of totalizer in --sat cubed mode.
+    /// Use quad PB encoding instead of totalizer.
     quad_pb: bool,
     /// Use MDD-based boundary enumeration instead of flat table.
     use_mdd: bool,
@@ -307,19 +294,12 @@ impl Default for SearchConfig {
             benchmark_repeats: 0,
             stochastic: false,
             stochastic_seconds: 0,
-            sat: false,
-            sat_xy: false,
-            z_sat: false,
-            w_sat: false,
             max_spectral: None,
             verify_seqs: None,
             test_zw: None,
             conflict_limit: 0,
             test_tuple: None,
             phase_only: None,
-            xy_table_path: None,
-            no_table: false,
-            xy_enum: "table".to_string(),
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
             sat_secs: 0,
@@ -1785,68 +1765,58 @@ struct SatWorkItem {
 /// Owned XY candidate source: either the flat on-disk table or an MDD
 /// whose sub-trees we walk at runtime. Held at the worker level and
 /// handed to `solve_xy_via_source` as a borrowed `XyCandidateSource`.
+/// XY boundary enumerator shared by every search mode. Holds a k-MDD and
+/// the walking parameters its sub-trees need; the `source_for` method
+/// navigates to the `xy_root` for a given (Z, W) candidate and returns a
+/// borrowed `XyCandidateSource` ready for `solve_xy_via_source`.
 #[derive(Clone)]
-enum XyOwner {
-    Table(Arc<XYBoundaryTable>),
-    Mdd {
-        mdd: Arc<mdd_reorder::Mdd4>,
-        pos_order: Arc<Vec<usize>>,
-        xy_depth: usize,
-    },
+struct XyOwner {
+    mdd: Arc<mdd_reorder::Mdd4>,
+    pos_order: Arc<Vec<usize>>,
+    xy_depth: usize,
 }
 
 impl XyOwner {
-    fn k(&self) -> usize {
-        match self {
-            XyOwner::Table(t) => t.k,
-            XyOwner::Mdd { mdd, .. } => mdd.k,
-        }
-    }
-    /// Given a (Z, W) candidate, return a borrowed XyCandidateSource
-    /// suitable for `solve_xy_via_source`. For the MDD variant this
-    /// navigates the ZW half of the MDD to the `xy_root` node that the
-    /// XY sub-tree is anchored at. Returns None if the boundary isn't
-    /// live in the MDD (shouldn't happen if the table/MDD agree).
+    #[allow(dead_code)]
+    fn k(&self) -> usize { self.mdd.k }
+
+    /// Given a (Z, W) candidate, navigate the ZW half of the MDD to the
+    /// `xy_root` node that anchors the XY sub-tree, and return the source
+    /// wrapper. Returns None if the boundary isn't live in the MDD.
     fn source_for<'a>(&'a self, problem: Problem, candidate: &CandidateZW) -> Option<XyCandidateSource<'a>> {
-        match self {
-            XyOwner::Table(t) => Some(XyCandidateSource::Table(t)),
-            XyOwner::Mdd { mdd, pos_order, xy_depth } => {
-                // Extract z_bits, w_bits from the candidate (prefix+suffix
-                // bit layout as in solve_xy_via_source).
-                let n = problem.n;
-                let m = n - 1;
-                let k = mdd.k;
-                let mut z_bits = 0u32;
-                let mut w_bits = 0u32;
-                for i in 0..k {
-                    if candidate.z.get(i) == 1 { z_bits |= 1 << i; }
-                    if candidate.z.get(n - k + i) == 1 { z_bits |= 1 << (k + i); }
-                    if candidate.w.get(i) == 1 { w_bits |= 1 << i; }
-                    if candidate.w.get(m - k + i) == 1 { w_bits |= 1 << (k + i); }
-                }
-                // Navigate the ZW half to find xy_root. Each level branches
-                // on (z, w) at position pos_order[level].
-                let zw_depth = 2 * k;
-                let mut nid = mdd.root;
-                for level in 0..zw_depth {
-                    if nid == mdd_reorder::DEAD { return None; }
-                    let pos = pos_order[level];
-                    let z_val = (z_bits >> pos) & 1;
-                    let w_val = (w_bits >> pos) & 1;
-                    let branch = (z_val | (w_val << 1)) as usize;
-                    if nid != mdd_reorder::LEAF {
-                        nid = mdd.nodes[nid as usize][branch];
-                    }
-                }
-                if nid == mdd_reorder::DEAD { return None; }
-                Some(XyCandidateSource::Mdd {
-                    mdd,
-                    xy_root: nid,
-                    pos_order: pos_order.as_slice(),
-                    xy_depth: *xy_depth,
-                })
+        // Extract z_bits, w_bits from the candidate (prefix+suffix layout).
+        let n = problem.n;
+        let m = n - 1;
+        let k = self.mdd.k;
+        let mut z_bits = 0u32;
+        let mut w_bits = 0u32;
+        for i in 0..k {
+            if candidate.z.get(i) == 1 { z_bits |= 1 << i; }
+            if candidate.z.get(n - k + i) == 1 { z_bits |= 1 << (k + i); }
+            if candidate.w.get(i) == 1 { w_bits |= 1 << i; }
+            if candidate.w.get(m - k + i) == 1 { w_bits |= 1 << (k + i); }
+        }
+        // Navigate the ZW half to find xy_root. Each level branches on
+        // (z, w) at position self.pos_order[level].
+        let zw_depth = 2 * k;
+        let mut nid = self.mdd.root;
+        for level in 0..zw_depth {
+            if nid == mdd_reorder::DEAD { return None; }
+            let pos = self.pos_order[level];
+            let z_val = (z_bits >> pos) & 1;
+            let w_val = (w_bits >> pos) & 1;
+            let branch = (z_val | (w_val << 1)) as usize;
+            if nid != mdd_reorder::LEAF {
+                nid = self.mdd.nodes[nid as usize][branch];
             }
         }
+        if nid == mdd_reorder::DEAD { return None; }
+        Some(XyCandidateSource {
+            mdd: &self.mdd,
+            xy_root: nid,
+            pos_order: self.pos_order.as_slice(),
+            xy_depth: self.xy_depth,
+        })
     }
 }
 
@@ -2274,6 +2244,7 @@ fn sat_solve_xyw(
 /// i.e. |2*N_Z(k) + 2*N_W(k)| ≤ 2*(n-k), giving a range for agZ.
 ///
 /// Returns multiple Z candidates by blocking previous solutions.
+#[allow(dead_code)]
 fn sat_find_z_candidates(
     problem: Problem,
     z_sum: i32,
@@ -2370,94 +2341,6 @@ fn sat_find_z_candidates(
 /// W-enumerate + SAT-Z + Phase C XY pipeline.
 /// For each spectrally-valid W: use SAT to find compatible Z candidates,
 /// then send each (Z, W) pair to the existing XY solver.
-fn run_w_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
-    let problem = cfg.problem;
-    let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
-    // Group tuples by w_sum
-    let mut tuples_by_w: HashMap<i32, Vec<SumTuple>> = HashMap::new();
-    for &tuple in &tuples {
-        tuples_by_w.entry(tuple.w).or_default().push(tuple);
-    }
-    if verbose {
-        eprintln!("{} sum-tuples, {} distinct w_sums", tuples.len(), tuples_by_w.len());
-    }
-    let theta = cfg.theta_samples;
-    let max_w = cfg.max_w;
-    run_parallel_search(problem, None, cfg.sat_config.clone(), move |tx, found| {
-        let spectral_w = SpectralFilter::new(problem.m(), theta);
-        let mut stats = SearchStats::default();
-        let individual_bound = problem.spectral_bound();
-        let max_z_per_w = 10;
-        let mut fft_buf = FftScratch::new(&spectral_w);
-        for (&w_sum, w_tuples) in &tuples_by_w {
-            if found.load(AtomicOrdering::Relaxed) { break; }
-            generate_sequences_permuted(problem.m(), w_sum, true, false, max_w, |w_values| {
-                if found.load(AtomicOrdering::Relaxed) { return false; }
-                stats.w_generated += 1;
-                if spectrum_if_ok(w_values, &spectral_w, individual_bound, &mut fft_buf).is_none() {
-                    return true;
-                }
-                stats.w_spectral_ok += 1;
-                let pw = PackedSeq::from_values(w_values);
-                for &tuple in w_tuples {
-                    if (tuple.y + problem.n as i32) % 2 != 0 { continue; }
-                    let z_candidates = sat_find_z_candidates(problem, tuple.z, w_values, max_z_per_w);
-                    for z_seq in &z_candidates {
-                        let zw_autocorr = compute_zw_autocorr(problem, z_seq, &pw);
-                        let _ = tx.send(SatWorkItem {
-                            tuple, x: SeqInput::Blank, y: SeqInput::Blank,
-                            z: SeqInput::Fixed(z_seq.clone()),
-                            w: SeqInput::Fixed(pw.clone()),
-                            zw_autocorr: Some(zw_autocorr), priority: 0.0,
-                            boundary: None,
-                        });
-                    }
-                }
-                true
-            });
-        }
-        stats
-    }, verbose, "W-enum + SAT Z + SAT XY", 0, cfg.quad_pb)
-}
-
-/// Hybrid Z-DFS + SAT X/Y/W search. Generates Z candidates via DFS with
-/// spectral filtering, then uses SAT to find X/Y/W for each Z.
-fn run_z_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
-    let problem = cfg.problem;
-    let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
-    if verbose {
-        eprintln!("{} sum-tuples", tuples.len());
-    }
-    let theta = cfg.theta_samples;
-    let max_z = cfg.max_z;
-    run_parallel_search(problem, None, cfg.sat_config.clone(), move |tx, found| {
-        let spectral_z = SpectralFilter::new(problem.n, theta);
-        let mut stats = SearchStats::default();
-        let individual_bound = problem.spectral_bound();
-        for tuple in &tuples {
-            if found.load(AtomicOrdering::Relaxed) { break; }
-            let mut fft_buf = FftScratch::new(&spectral_z);
-            generate_sequences_permuted(problem.n, tuple.z, true, true, max_z, |z_values| {
-                if found.load(AtomicOrdering::Relaxed) { return false; }
-                stats.z_generated += 1;
-                if spectrum_if_ok(z_values, &spectral_z, individual_bound, &mut fft_buf).is_none() {
-                    return true;
-                }
-                stats.z_spectral_ok += 1;
-                let z = PackedSeq::from_values(z_values);
-                let _ = tx.send(SatWorkItem {
-                    tuple: *tuple, x: SeqInput::Blank, y: SeqInput::Blank,
-                    z: SeqInput::Fixed(z), w: SeqInput::Blank,
-                    zw_autocorr: None, priority: 0.0,
-                    boundary: None,
-                });
-                true
-            });
-        }
-        stats
-    }, verbose, "Z-DFS + SAT XYW", 0, cfg.quad_pb)
-}
-
 fn run_benchmark(cfg: &SearchConfig) {
     if cfg.stochastic {
         run_stochastic_benchmark(cfg);
@@ -4962,592 +4845,25 @@ fn any_valid_xy(
     false
 }
 
-fn run_sat_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
-    let problem = cfg.problem;
-    let tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
-    if verbose {
-        eprintln!("{} sum-tuples", tuples.len());
-        print_search_space(problem, &tuples);
-    }
 
-    let n = problem.n;
-    let m = problem.m();
-
-    // MDD-based boundary enumeration (--mdd flag)
-    if cfg.use_mdd {
-        let mdd_k = cfg.mdd_k.min((n - 1) / 2);
-        return run_mdd_sat_search(problem, &tuples, cfg, verbose, mdd_k);
-    }
-
-    // Try to load XY boundary table for larger k
-    let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table-k7.bin".to_string());
-    let xy_table: Option<XYBoundaryTable> = if cfg.no_table || n < 14 {
-        None
-    } else {
-        XYBoundaryTable::load(&table_path).and_then(|t| {
-            if n >= 2 * t.k { Some(t) } else { None }
-        })
-    };
-
-    // Choose cubing depth: k positions from each end of each sequence.
-    // Use table's k if available, otherwise fall back to k=6.
-    let k = if cfg.no_table || n < 8 {
-        0 // no cubing, monolithic SAT
-    } else if let Some(ref tbl) = xy_table {
-        let max_k = (n - 1) / 2;
-        tbl.k.min(max_k)
-    } else {
-        let max_k = (n - 1) / 2;
-        6usize.min(max_k)
-    };
-
-    if k == 0 {
-        // Monolithic SAT: one big problem per tuple
-        run_parallel_search(problem, None, cfg.sat_config.clone(), move |tx, found| {
-            let stats = SearchStats::default();
-            for tuple in tuples {
-                if found.load(AtomicOrdering::Relaxed) { break; }
-                let _ = tx.send(SatWorkItem {
-                    tuple, x: SeqInput::Blank, y: SeqInput::Blank,
-                    z: SeqInput::Blank, w: SeqInput::Blank,
-                    zw_autocorr: None, priority: 0.0,
-                    boundary: None,
-                });
-            }
-            stats
-        }, verbose, "pure SAT", 0, cfg.quad_pb)
-    } else {
-        // On-the-fly boundary enumeration: compute exact-lag constraints directly
-        // and enumerate all valid 4-sequence boundary configs as SAT cubes.
-        //
-        // Build exact-lag bit pairs (same math as gen_table).
-        // For lag index j (0..k), the absolute lag is s = n-k+j.
-        // X/Y/Z (length n): pairs (i, k+i+j) for i = 0..k-j-1
-        // W (length n-1): pairs (i, k+i+j+1) for i = 0..k-j-2 (only when j < k-1)
-        struct ExactLag {
-            xy_pairs: Vec<(u32, u32)>,
-            z_pairs: Vec<(u32, u32)>,
-            w_pairs: Vec<(u32, u32)>,
-        }
-        let mut exact_lags: Vec<ExactLag> = Vec::new();
-        for j in 0..k {
-            let xy_pairs: Vec<(u32, u32)> = (0..k-j)
-                .map(|i| (i as u32, (k + i + j) as u32))
-                .collect();
-            let z_pairs = xy_pairs.clone();
-            let w_pairs: Vec<(u32, u32)> = if j < k - 1 {
-                (0..k-j-1).map(|i| (i as u32, (k + i + j + 1) as u32)).collect()
-            } else {
-                Vec::new()
-            };
-            exact_lags.push(ExactLag { xy_pairs, z_pairs, w_pairs });
-        }
-
-        let middle_n = n - 2 * k;
-        let middle_m = m - 2 * k;
-        let max_bnd_sum = (2 * k) as i32;
-
-        // Helper: compute boundary autocorrelation contribution for one bit pattern
-        let bnd_autocorr = |bits: u32, pairs: &[(u32, u32)]| -> i32 {
-            let mut val = 0i32;
-            for &(bi, bj) in pairs {
-                val += 1 - 2 * (((bits >> bi) ^ (bits >> bj)) & 1) as i32;
-            }
-            val
-        };
-
-        // Symmetry breaking: fix a[0]=+1 for all four sequences.
-        // Negation of any sequence preserves autocorrelation, so bit 0 is always 1.
-        let x_configs = 1u32 << (2 * k - 1); // x[0] fixed, 2k-1 free bits
-        let y_configs = 1u32 << (2 * k - 1); // y[0] fixed, 2k-1 free bits
-        let z_configs = 1u32 << (2 * k - 1); // z[0] fixed, 2k-1 free bits
-        let w_configs = 1u32 << (2 * k - 1); // w[0] fixed, 2k-1 free bits
-
-        let use_table = xy_table.is_some();
-        if verbose {
-            if use_table {
-                eprintln!("Table-based cubing k={}: Z({})*W({}) boundary configs, XY from table",
-                    k, z_configs, w_configs);
-            } else {
-                eprintln!("On-the-fly cubing k={}: enumerating X({})*Y({})*Z({})*W({}) boundary configs",
-                    k, x_configs, y_configs, z_configs, w_configs);
-            }
-        }
-
-        // On-the-fly XY precomputation (only when table not available)
-        let xy_by_sig_sum: HashMap<u64, Vec<(u32, u32)>> = if use_table {
-            HashMap::new() // not used — table provides XY lookup
-        } else {
-            if verbose {
-                eprintln!("Precomputing X/Y boundary signatures...");
-            }
-            let pack_key = |sig: &[i16], x_sum: i32, y_sum: i32| -> u64 {
-                let mut key: u64 = 0;
-                for (i, &v) in sig.iter().enumerate() {
-                    key |= ((v as i64 + 64) as u64 & 0x7F) << (i * 7);
-                }
-                key |= ((x_sum as i64 + 64) as u64 & 0x7F) << (sig.len() * 7);
-                key |= ((y_sum as i64 + 64) as u64 & 0x7F) << ((sig.len() + 1) * 7);
-                key
-            };
-
-            let num_lags = exact_lags.len();
-            let mut x_autocorr: Vec<Vec<i16>> = Vec::with_capacity(x_configs as usize);
-            for xr in 0..x_configs {
-                let x_bits = (xr << 1) | 1;
-                let vals: Vec<i16> = exact_lags.iter()
-                    .map(|el| bnd_autocorr(x_bits, &el.xy_pairs) as i16)
-                    .collect();
-                x_autocorr.push(vals);
-            }
-            let mut y_autocorr: Vec<Vec<i16>> = Vec::with_capacity(y_configs as usize);
-            for yr in 0..y_configs {
-                let y_bits = (yr << 1) | 1;
-                let vals: Vec<i16> = exact_lags.iter()
-                    .map(|el| bnd_autocorr(y_bits, &el.xy_pairs) as i16)
-                    .collect();
-                y_autocorr.push(vals);
-            }
-
-            let mut map: HashMap<u64, Vec<(u32, u32)>> = HashMap::new();
-            let mut sig_buf = vec![0i16; num_lags];
-            for xr in 0..x_configs {
-                let x_bits = (xr << 1) | 1;
-                let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
-                let x_ac = &x_autocorr[xr as usize];
-                for yr in 0..y_configs {
-                    let y_bits = (yr << 1) | 1;
-                    let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
-                    let y_ac = &y_autocorr[yr as usize];
-                    for j in 0..num_lags {
-                        sig_buf[j] = x_ac[j] + y_ac[j];
-                    }
-                    let key = pack_key(&sig_buf, x_bnd_sum, y_bnd_sum);
-                    map.entry(key).or_default().push((x_bits, y_bits));
-                }
-            }
-            if verbose {
-                let total_xy: usize = map.values().map(|v| v.len()).sum();
-                eprintln!("  {} XY buckets, {} total entries", map.len(), total_xy);
-            }
-            map
-        };
-
-        // Parallel solve: each worker iterates a slice of z_bits, computes matching
-        // configs on the fly, and solves them immediately. No pre-enumeration needed.
-        let run_start = Instant::now();
-        let workers = std::thread::available_parallelism()
-            .map(|w| w.get()).unwrap_or(1).max(1);
-        if verbose {
-            eprintln!("TT({}): SAT cubed k={}, {} threads",
-                n, k, workers);
-        }
-        let found = Arc::new(AtomicBool::new(false));
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let items_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let sat_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let unsat_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let xy_matches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let w_scanned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let total_conflicts = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let z_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let time_limit_secs = cfg.sat_secs;
-        let conflict_limit = cfg.conflict_limit;
-        let xy_by_sig_sum = Arc::new(xy_by_sig_sum);
-        let xy_table = Arc::new(xy_table);
-
-        // Pre-build SAT encoding templates (one per tuple, clone per config)
-        let use_quad_pb = cfg.quad_pb;
-        let templates: Vec<(SatEncoder, radical::Solver)> = tuples.iter()
-            .map(|&tuple| {
-                let (enc, mut solver) = if use_quad_pb {
-                    sat_encode_quad_pb_unified(problem, tuple, None, None, None, None)
-                        .expect("quad PB encoding infeasible for tuple")
-                } else {
-                    sat_encode(problem, tuple)
-                };
-                solver.config.vivification = true;
-                solver.config.chrono_bt = true;
-                (enc, solver)
-            })
-            .collect();
-        let templates = Arc::new(templates);
-        let tuples = Arc::new(tuples);
-
-        let mut handles = Vec::new();
-        for _tid in 0..workers {
-            let found = Arc::clone(&found);
-            let timed_out = Arc::clone(&timed_out);
-            let items_done = Arc::clone(&items_done);
-            let sat_count = Arc::clone(&sat_count);
-            let unsat_count = Arc::clone(&unsat_count);
-            let xy_matches = Arc::clone(&xy_matches);
-            let w_scanned = Arc::clone(&w_scanned);
-            let total_conflicts = Arc::clone(&total_conflicts);
-            let z_idx = Arc::clone(&z_idx);
-            let xy_by_sig_sum = Arc::clone(&xy_by_sig_sum);
-            let xy_table = Arc::clone(&xy_table);
-            let templates = Arc::clone(&templates);
-            let tuples = Arc::clone(&tuples);
-            let exact_lags_clone: Vec<(Vec<(u32, u32)>, Vec<(u32, u32)>, Vec<(u32, u32)>)> = exact_lags.iter()
-                .map(|el| (el.xy_pairs.clone(), el.z_pairs.clone(), el.w_pairs.clone()))
-                .collect();
-
-            handles.push(std::thread::spawn(move || {
-                let bnd_autocorr = |bits: u32, pairs: &[(u32, u32)]| -> i32 {
-                    let mut val = 0i32;
-                    for &(bi, bj) in pairs {
-                        val += 1 - 2 * (((bits >> bi) ^ (bits >> bj)) & 1) as i32;
-                    }
-                    val
-                };
-
-                // Warm-start state: phase-only transfer (clause transfer is harmful per testing)
-                let mut warm_phase: Vec<bool> = Vec::new();
-
-                let should_stop = || found.load(AtomicOrdering::Relaxed) || timed_out.load(AtomicOrdering::Relaxed);
-                loop {
-                    if should_stop() { break; }
-                    let zr = z_idx.fetch_add(1, AtomicOrdering::Relaxed) as u32;
-                    if zr >= z_configs { break; }
-                    let z_bits = (zr << 1) | 1; // z[0] = +1
-
-                    let z_bnd_sum = 2 * (z_bits.count_ones() as i32) - max_bnd_sum;
-
-                    for wr in 0..w_configs {
-                        let w_bits = (wr << 1) | 1; // w[0] = +1
-                        if should_stop() { break; }
-                        w_scanned.fetch_add(1, AtomicOrdering::Relaxed);
-                        let w_bnd_sum = 2 * (w_bits.count_ones() as i32) - max_bnd_sum;
-
-                        // Compute ZW signature for on-the-fly path (skip if table available)
-                        let num_lags = exact_lags_clone.len();
-                        let mut req_sig = vec![0i16; num_lags];
-                        if xy_table.is_none() {
-                            for (j, (_, z_pairs, w_pairs)) in exact_lags_clone.iter().enumerate() {
-                                let z_val = bnd_autocorr(z_bits, z_pairs);
-                                let w_val = bnd_autocorr(w_bits, w_pairs);
-                                req_sig[j] = -(2 * z_val + 2 * w_val) as i16;
-                            }
-                        }
-
-                        for (ti, tuple) in tuples.iter().enumerate() {
-                            let z_mid = tuple.z - z_bnd_sum;
-                            if z_mid.abs() > middle_n as i32 || (z_mid + middle_n as i32) % 2 != 0 { continue; }
-                            let w_mid = tuple.w - w_bnd_sum;
-                            if w_mid.abs() > middle_m as i32 || (w_mid + middle_m as i32) % 2 != 0 { continue; }
-
-                            for x_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
-                                let x_mid = tuple.x - x_bnd_sum;
-                                if x_mid.abs() > middle_n as i32 || (x_mid + middle_n as i32) % 2 != 0 { continue; }
-                                for y_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
-                                    let y_mid = tuple.y - y_bnd_sum;
-                                    if y_mid.abs() > middle_n as i32 || (y_mid + middle_n as i32) % 2 != 0 { continue; }
-
-                                    // Look up XY boundary configs: table (O(1)) or HashMap
-                                    let xy_slice: &[(u32, u32)];
-                                    let xy_vec_holder: Vec<(u32, u32)>;
-                                    if let Some(ref tbl) = *xy_table {
-                                        xy_slice = tbl.get_xy_entries(z_bits, w_bits, x_bnd_sum, y_bnd_sum);
-                                    } else {
-                                        let key = {
-                                            let mut k: u64 = 0;
-                                            for (i, &v) in req_sig.iter().enumerate() {
-                                                k |= ((v as i64 + 64) as u64 & 0x7F) << (i * 7);
-                                            }
-                                            k |= ((x_bnd_sum as i64 + 64) as u64 & 0x7F) << (num_lags * 7);
-                                            k |= ((y_bnd_sum as i64 + 64) as u64 & 0x7F) << ((num_lags + 1) * 7);
-                                            k
-                                        };
-                                        xy_vec_holder = Vec::new(); // lifetime anchor
-                                        xy_slice = match xy_by_sig_sum.get(&key) {
-                                            Some(v) => v.as_slice(),
-                                            None => &xy_vec_holder,
-                                        };
-                                    }
-                                    if !xy_slice.is_empty() {
-                                        xy_matches.fetch_add(xy_slice.len(), AtomicOrdering::Relaxed);
-
-                                        // Clone once per (z_bits, w_bits, tuple) group.
-                                        // Add Z/W boundary as permanent unit clauses,
-                                        // then iterate XY configs using assumptions.
-                                        let (ref enc, ref template_solver) = templates[ti];
-                                        let mut solver = template_solver.clone();
-                                        // Warm-start: phase-only transfer
-                                        if !warm_phase.is_empty() {
-                                            solver.set_phase(&warm_phase);
-                                        }
-
-                                        // Fix Z/W boundary (permanent — same for all XY configs)
-                                        // Batch all 4*k unit clauses with a single propagation pass.
-                                        let mut zw_units: Vec<i32> = Vec::with_capacity(4 * k);
-                                        for i in 0..k {
-                                            zw_units.push(if (z_bits >> i) & 1 == 1 { enc.z_var(i) } else { -enc.z_var(i) });
-                                            zw_units.push(if (z_bits >> (k + i)) & 1 == 1 { enc.z_var(n - k + i) } else { -enc.z_var(n - k + i) });
-                                            zw_units.push(if (w_bits >> i) & 1 == 1 { enc.w_var(i) } else { -enc.w_var(i) });
-                                            zw_units.push(if (w_bits >> (k + i)) & 1 == 1 { enc.w_var(m - k + i) } else { -enc.w_var(m - k + i) });
-                                        }
-                                        solver.add_unit_clauses_batch(&zw_units);
-
-                                        // If Z/W boundary caused contradiction, skip all XY configs
-                                        if !solver.is_ok() {
-                                            let skip_count = xy_slice.len();
-                                            unsat_count.fetch_add(skip_count, AtomicOrdering::Relaxed);
-                                            items_done.fetch_add(skip_count, AtomicOrdering::Relaxed);
-                                            continue;
-                                        }
-
-                                        let mut xy_assumptions: Vec<i32> = Vec::with_capacity(4 * k);
-                                        for &(x_bits, y_bits) in xy_slice {
-                                            if should_stop() { break; }
-
-                                            if conflict_limit > 0 {
-                                                solver.set_conflict_budget(conflict_limit);
-                                            }
-
-                                            // XY boundary as assumptions (temporary per solve)
-                                            xy_assumptions.clear();
-                                            for i in 0..k {
-                                                xy_assumptions.push(if (x_bits >> i) & 1 == 1 { enc.x_var(i) } else { -enc.x_var(i) });
-                                                xy_assumptions.push(if (x_bits >> (k + i)) & 1 == 1 { enc.x_var(n - k + i) } else { -enc.x_var(n - k + i) });
-                                                xy_assumptions.push(if (y_bits >> i) & 1 == 1 { enc.y_var(i) } else { -enc.y_var(i) });
-                                                xy_assumptions.push(if (y_bits >> (k + i)) & 1 == 1 { enc.y_var(n - k + i) } else { -enc.y_var(n - k + i) });
-                                            }
-
-                                            let conflicts_before = solver.num_conflicts();
-                                            let result = solver.solve_with_assumptions(&xy_assumptions);
-                                            let nc = solver.num_conflicts() - conflicts_before;
-                                            total_conflicts.fetch_add(nc, AtomicOrdering::Relaxed);
-                                            // Save phase for warm-start
-                                            solver.copy_phase_into(&mut warm_phase);
-
-                                            if result == Some(true) {
-                                                let x = extract_seq(&solver, |i| enc.x_var(i), n);
-                                                let y = extract_seq(&solver, |i| enc.y_var(i), n);
-                                                let z = extract_seq(&solver, |i| enc.z_var(i), n);
-                                                let w = extract_seq(&solver, |i| enc.w_var(i), m);
-                                                solver.reset(); // backtrack for next solve
-
-                                                if verify_tt(problem, &x, &y, &z, &w) {
-                                                    found.store(true, AtomicOrdering::Relaxed);
-                                                    print_solution("TT SOLUTION", &x, &y, &z, &w);
-                                                }
-                                                sat_count.fetch_add(1, AtomicOrdering::Relaxed);
-                                            } else {
-                                                unsat_count.fetch_add(1, AtomicOrdering::Relaxed);
-                                            }
-                                            items_done.fetch_add(1, AtomicOrdering::Relaxed);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }));
-        }
-
-        // Progress reporting
-        let total_z = z_configs as usize;
-        let total_zw = total_z * w_configs as usize;
-        let mut prev_done = 0usize;
-        let mut prev_time = run_start.elapsed().as_secs_f64();
-        while !found.load(AtomicOrdering::Relaxed)
-            && !timed_out.load(AtomicOrdering::Relaxed)
-            && z_idx.load(AtomicOrdering::Relaxed) < total_z
-        {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            // Check time limit
-            if time_limit_secs > 0 && run_start.elapsed().as_secs() >= time_limit_secs {
-                timed_out.store(true, AtomicOrdering::Relaxed);
-            }
-            let done = items_done.load(AtomicOrdering::Relaxed);
-            let sats = sat_count.load(AtomicOrdering::Relaxed);
-            let unsats = unsat_count.load(AtomicOrdering::Relaxed);
-            let matches = xy_matches.load(AtomicOrdering::Relaxed);
-            let w_done = w_scanned.load(AtomicOrdering::Relaxed);
-            let conflicts = total_conflicts.load(AtomicOrdering::Relaxed);
-            let z_done = z_idx.load(AtomicOrdering::Relaxed).min(total_z);
-            let elapsed = run_start.elapsed().as_secs_f64();
-            let rate = done as f64 / elapsed;
-            let dt = elapsed - prev_time;
-            let recent_rate = if dt > 0.0 { (done - prev_done) as f64 / dt } else { 0.0 };
-            let avg_conflicts = if done > 0 { conflicts / done as u64 } else { 0 };
-            let zw_pct = if total_zw > 0 { 100.0 * w_done as f64 / total_zw as f64 } else { 0.0 };
-            if verbose {
-                eprintln!("[{:.0}s] SAT cubed k={} | z {}/{} | zw {:.1}% | SAT {}/{} ({}sat {}unsat) | xy_match {} | {:.1}/s (recent {:.1}/s) | avg {:.0} conflicts",
-                    elapsed, k, z_done, total_z, zw_pct, done, matches, sats, unsats, matches, rate, recent_rate, avg_conflicts);
-            }
-            prev_done = done;
-            prev_time = elapsed;
-        }
-
-        for h in handles { let _ = h.join(); }
-
-        // Final summary
-        let done = items_done.load(AtomicOrdering::Relaxed);
-        let sats = sat_count.load(AtomicOrdering::Relaxed);
-        let unsats = unsat_count.load(AtomicOrdering::Relaxed);
-        let matches = xy_matches.load(AtomicOrdering::Relaxed);
-        let w_done = w_scanned.load(AtomicOrdering::Relaxed);
-        let conflicts = total_conflicts.load(AtomicOrdering::Relaxed);
-        let elapsed = run_start.elapsed().as_secs_f64();
-        let avg_conflicts = if done > 0 { conflicts / done as u64 } else { 0 };
-        if verbose {
-            eprintln!("\n--- SAT cubed k={} final ---", k);
-            eprintln!("  Elapsed:        {:.1}s", elapsed);
-            eprintln!("  ZW scanned:     {} / {} ({:.1}%)", w_done, total_zw, 100.0 * w_done as f64 / total_zw as f64);
-            eprintln!("  XY matches:     {}", matches);
-            eprintln!("  SAT solves:     {} ({} SAT, {} UNSAT)", done, sats, unsats);
-            eprintln!("  Rate:           {:.2} solves/s", done as f64 / elapsed);
-            eprintln!("  Avg conflicts:  {}", avg_conflicts);
-            eprintln!("  Total conflicts:{}", conflicts);
-            if timed_out.load(AtomicOrdering::Relaxed) {
-                eprintln!("  (stopped: time limit {}s)", time_limit_secs);
-            }
-        }
-
-        SearchReport {
-            stats: SearchStats::default(),
-            elapsed: run_start.elapsed(),
-            found_solution: found.load(AtomicOrdering::Relaxed),
-        }
-    }
-}
-
-// ==================== Prefix/suffix table for fast X/Y completion ====================
-
-/// Pre-computed table of valid X/Y boundary configurations.
-/// Grouped by (x_bnd_sum, y_bnd_sum, high_lag_signature) for fast lookup.
-struct XYBoundaryTable {
-    k: usize,
-    w_dim: usize,          // 2^(2k) — W bits dimension
-    sum_dim: usize,        // 2k+1 — distinct sum values per axis
-    zw_index: Vec<u32>,    // sig_id per Z/W config (0xFFFFFFFF = empty)
-    sig_offsets: Vec<u32>, // offset into xy_data per signature
-    // Per-sig sub-index: [num_sigs * sum_dim^2] of (offset_within_sig, count)
-    // Indexed by sig_id * sum_dim^2 + x_sum_idx * sum_dim + y_sum_idx
-    sub_index: Vec<(u32, u32)>,
-    xy_data: Vec<(u32, u32)>, // all unique (x_bits, y_bits) pairs, sorted by sum within each sig
-}
-
-impl XYBoundaryTable {
-    fn load(path: &str) -> Option<Self> {
-        use std::io::Read;
-        let mut file = std::fs::File::open(path).ok()?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf).ok()?;
-
-        let u32_at = |off: usize| u32::from_le_bytes(buf[off..off+4].try_into().unwrap());
-        assert!(&buf[0..4] == b"XYTT", "bad table magic");
-
-        // Header (24 bytes): "XYTT" version k zw_dim num_sigs sum_dim
-        let k = u32_at(8) as usize;
-        let zw_dim = u32_at(12) as usize;
-        let num_sigs = u32_at(16) as usize;
-        let sum_dim = u32_at(20) as usize;
-        let w_dim = 1usize << (2 * k);
-
-        let mut off = 24;
-
-        let mut zw_index = vec![0u32; zw_dim];
-        for i in 0..zw_dim { zw_index[i] = u32_at(off + i * 4); }
-        off += zw_dim * 4;
-
-        let mut sig_offsets = vec![0u32; num_sigs];
-        for i in 0..num_sigs { sig_offsets[i] = u32_at(off + i * 8); }
-        off += num_sigs * 8;
-
-        let sub_idx_entries = num_sigs * sum_dim * sum_dim;
-        let mut sub_index = Vec::with_capacity(sub_idx_entries);
-        for i in 0..sub_idx_entries {
-            sub_index.push((u32_at(off + i * 8), u32_at(off + i * 8 + 4)));
-        }
-        off += sub_idx_entries * 8;
-
-        let num_xy = (buf.len() - off) / 8;
-        let mut xy_data = Vec::with_capacity(num_xy);
-        for i in 0..num_xy {
-            xy_data.push((u32_at(off + i * 8), u32_at(off + i * 8 + 4)));
-        }
-
-        let ram = (zw_dim * 4 + sub_index.len() * 8 + xy_data.len() * 8) as f64 / 1_048_576.0;
-        eprintln!("  {} sigs, {} XY entries, {:.1} MB in RAM", num_sigs, xy_data.len(), ram);
-
-        Some(Self { k, w_dim, sum_dim, zw_index, sig_offsets, sub_index, xy_data })
-    }
-
-    /// Get (x_bits, y_bits) pairs for a given Z/W boundary AND sum pair. O(1).
-    #[inline]
-    fn get_xy_entries(&self, z_bits: u32, w_bits: u32, x_bnd_sum: i32, y_bnd_sum: i32) -> &[(u32, u32)] {
-        let idx = z_bits as usize * self.w_dim + w_bits as usize;
-        if idx >= self.zw_index.len() { return &[]; }
-        let sig_id = self.zw_index[idx];
-        if sig_id == 0xFFFFFFFF { return &[]; }
-        let si = sig_id as usize;
-        let sig_start = self.sig_offsets[si] as usize;
-
-        // Sub-index: jump to the right (x_sum, y_sum) bucket within this sig
-        let k = self.k;
-        let xi = ((x_bnd_sum + 2 * k as i32) / 2) as usize;
-        let yi = ((y_bnd_sum + 2 * k as i32) / 2) as usize;
-        if xi >= self.sum_dim || yi >= self.sum_dim { return &[]; }
-        let sub_bi = si * self.sum_dim * self.sum_dim + xi * self.sum_dim + yi;
-        let (within_off, count) = self.sub_index[sub_bi];
-        if count == 0 { return &[]; }
-        let start = sig_start + within_off as usize;
-        &self.xy_data[start..start + count as usize]
-    }
-
-    /// Expand boundary bits into full sequence values at boundary positions.
-    #[allow(dead_code)]
-    fn expand_boundary(&self, bits: u32, seq: &mut [i8]) {
-        let k = self.k;
-        let n = seq.len();
-        for i in 0..k {
-            seq[i] = if (bits >> i) & 1 == 1 { 1 } else { -1 };
-        }
-        for i in 0..k {
-            seq[n - k + i] = if (bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-        }
-    }
-
-    fn solve_xy_with_sat(
-        &self, problem: Problem, tuple: SumTuple,
-        candidate: &CandidateZW, template: &SatXYTemplate,
-    ) -> Option<(PackedSeq, PackedSeq)> {
-        let source = XyCandidateSource::Table(self);
-        solve_xy_via_source(problem, tuple, candidate, template, source)
-    }
-}
-
-// ---- Shared XY candidate enumerator and per-candidate filtering logic ----
 
 struct LagFilter { s: usize, pairs: Vec<(u32, u32)>, max_unknown: i32, num_bnd_pairs: i32 }
 struct TermBndInfo { var_a: usize, var_b: usize, neg_a: bool, neg_b: bool, both_bnd: bool }
 
-/// Abstracts over the two ways we enumerate (x_bits, y_bits) candidates:
-///   - the flat on-disk XY boundary table, keyed by (z_bits, w_bits, x_sum, y_sum)
-///   - a runtime walk through the MDD's XY sub-tree rooted at xy_root
-///
-/// Both enforce the same k "exact" lags (proven by `table_vs_mdd_same_k_agree`).
-/// The walker's callback is driven by `for_each`; the caller returns early via
-/// a mutable `found` flag captured in the closure.
-enum XyCandidateSource<'a> {
-    Table(&'a XYBoundaryTable),
-    /// xy_root and the MDD walking parameters for `walk_xy_sub_mdd`.
-    Mdd {
-        mdd: &'a mdd_reorder::Mdd4,
-        xy_root: u32,
-        pos_order: &'a [usize],
-        xy_depth: usize,
-    },
+/// A walkable XY sub-tree anchored at `xy_root` in a k-MDD. Produced by
+/// `XyOwner::source_for` for a given (Z, W) candidate and consumed by
+/// `solve_xy_via_source`.
+struct XyCandidateSource<'a> {
+    mdd: &'a mdd_reorder::Mdd4,
+    xy_root: u32,
+    pos_order: &'a [usize],
+    xy_depth: usize,
 }
 
-/// Shared body of the table- and MDD-driven XY SAT paths. Builds the
-/// per-(Z,W) filter state (GJ equalities, lag filters, term-state templates)
-/// once, then iterates all (x_bits, y_bits) candidates from the chosen
-/// source and SAT-solves each one that survives the bitwise pre-filters.
+/// Shared XY SAT path. Builds the per-(Z,W) filter state (GJ equalities,
+/// lag filters, quad PB term-state templates) once, then walks the XY
+/// sub-MDD rooted at `source.xy_root` and SAT-solves each (x_bits, y_bits)
+/// candidate that survives the bitwise pre-filters.
 fn solve_xy_via_source(
     problem: Problem,
     tuple: SumTuple,
@@ -5556,11 +4872,7 @@ fn solve_xy_via_source(
     source: XyCandidateSource<'_>,
 ) -> Option<(PackedSeq, PackedSeq)> {
     let n = problem.n;
-    let m = n - 1;
-    let k = match source {
-        XyCandidateSource::Table(t) => t.k,
-        XyCandidateSource::Mdd { mdd, .. } => mdd.k,
-    };
+    let k = source.mdd.k;
     let middle_len = n - 2 * k;
     let x_var = |i: usize| -> i32 { (i + 1) as i32 };
     let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
@@ -5598,16 +4910,6 @@ fn solve_xy_via_source(
         qpb_term_info.push(infos);
     }
 
-    // Extract Z/W boundary bits from the candidate (for the table lookup key).
-    let mut z_bits = 0u32;
-    let mut w_bits = 0u32;
-    for i in 0..k {
-        if candidate.z.get(i) == 1 { z_bits |= 1 << i; }
-        if candidate.z.get(n - k + i) == 1 { z_bits |= 1 << (k + i); }
-        if candidate.w.get(i) == 1 { w_bits |= 1 << i; }
-        if candidate.w.get(m - k + i) == 1 { w_bits |= 1 << (k + i); }
-    }
-
     // Partial-lag autocorrelation filter (cheap bitwise pre-filter).
     let pos_to_bit = |pos: usize| -> u32 {
         if pos < k { pos as u32 } else { (k + pos - (n - k)) as u32 }
@@ -5634,7 +4936,7 @@ fn solve_xy_via_source(
 
     // Inner body: given (x_bits, y_bits), run GJ + lag pre-filters, then
     // SAT-solve XY. Returns Some((x, y)) on SAT success, None otherwise.
-    let mut try_candidate = |
+    let try_candidate = |
         x_bits: u32, y_bits: u32,
         solver: &mut radical::Solver,
         term_state_buf: &mut [u8],
@@ -5727,41 +5029,22 @@ fn solve_xy_via_source(
     };
 
     let max_bnd_sum = (2 * k) as i32;
-    match source {
-        XyCandidateSource::Table(table) => {
-            for x_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
-                let x_mid = tuple.x - x_bnd_sum;
-                if x_mid.abs() > middle_len as i32 || (x_mid + middle_len as i32) % 2 != 0 { continue; }
-                for y_bnd_sum in (-max_bnd_sum..=max_bnd_sum).step_by(2) {
-                    let y_mid = tuple.y - y_bnd_sum;
-                    if y_mid.abs() > middle_len as i32 || (y_mid + middle_len as i32) % 2 != 0 { continue; }
-                    for &(x_bits, y_bits) in table.get_xy_entries(z_bits, w_bits, x_bnd_sum, y_bnd_sum) {
-                        if let Some(sol) = try_candidate(x_bits, y_bits, &mut solver, &mut term_state_buf, &mut configs_tested) {
-                            return Some(sol);
-                        }
-                    }
-                }
+    // Walk the XY sub-MDD from xy_root. `walk_xy_sub_mdd` enforces the
+    // tuple's x_mid/y_mid parity/range constraints internally, so the
+    // closure only has to run the cheap bitwise pre-filters and the SAT.
+    let mut found: Option<(PackedSeq, PackedSeq)> = None;
+    walk_xy_sub_mdd(
+        source.xy_root, 0, source.xy_depth, 0, 0,
+        source.pos_order, &source.mdd.nodes,
+        max_bnd_sum, middle_len as i32, tuple,
+        &mut |x_bits, y_bits| {
+            if found.is_some() { return; }
+            if let Some(sol) = try_candidate(x_bits, y_bits, &mut solver, &mut term_state_buf, &mut configs_tested) {
+                found = Some(sol);
             }
-            None
-        }
-        XyCandidateSource::Mdd { mdd, xy_root, pos_order, xy_depth } => {
-            // Walk the XY sub-MDD; walk_xy_sub_mdd already enforces the
-            // tuple's x_mid/y_mid parity/range constraints internally,
-            // which matches what the Table branch's outer loops do.
-            let mut found: Option<(PackedSeq, PackedSeq)> = None;
-            walk_xy_sub_mdd(
-                xy_root, 0, xy_depth, 0, 0, pos_order, &mdd.nodes,
-                max_bnd_sum, middle_len as i32, tuple,
-                &mut |x_bits, y_bits| {
-                    if found.is_some() { return; }
-                    if let Some(sol) = try_candidate(x_bits, y_bits, &mut solver, &mut term_state_buf, &mut configs_tested) {
-                        found = Some(sol);
-                    }
-                },
-            );
-            found
-        }
-    }
+        },
+    );
+    found
 }
 
 /// Hybrid search: Phase A+B (sum tuples, Z/W generation, spectral filtering)
@@ -5780,75 +5063,39 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
         tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
     }
 
-    // Load XY boundary enumerator: either the flat table (default) or
-    // a k-MDD sub-tree walker. Both are equivalent at the same k (proven
-    // by the ignored test `table_vs_mdd_same_k_agree`).
-    let xy_owner: Option<XyOwner> = if cfg.no_table || problem.n < 14 {
-        if !cfg.no_table && problem.n < 14 && verbose {
-            eprintln!("Note: n={} < 14 (2*k for k=7), running without XY enumerator", problem.n);
+    // Load the k-MDD that drives XY candidate enumeration. Memory: ~1 MB
+    // at k=7 (vs ~1.9 GB for the old flat table, which was proven
+    // equivalent at the same k by `table_vs_mdd_same_k_agree`).
+    let mdd_k: usize = 7;
+    let xy_owner: Option<XyOwner> = if problem.n < 2 * mdd_k {
+        if verbose {
+            eprintln!("Note: n={} < {} (2k for MDD k={}), running without XY enumerator", problem.n, 2 * mdd_k, mdd_k);
         }
         None
-    } else if cfg.xy_enum == "mdd" {
-        // Walk a k=7 MDD at runtime. Memory: ~1 MB vs the ~1.9 GB flat table.
-        let mdd_k: usize = 7;
+    } else {
         match load_best_mdd(mdd_k, verbose) {
             Some(m) => {
-                if problem.n < 2 * m.k {
-                    if verbose {
-                        eprintln!("Note: n={} < {} (2*k for MDD k={}), running without XY enumerator",
-                            problem.n, 2 * m.k, m.k);
-                    }
-                    None
-                } else {
-                    let pos_order: Vec<usize> = {
-                        let mut v = Vec::with_capacity(2 * m.k);
-                        for t in 0..m.k { v.push(t); v.push(2 * m.k - 1 - t); }
-                        v
-                    };
-                    let xy_depth = 2 * m.k;
-                    Some(XyOwner::Mdd {
-                        mdd: Arc::new(m),
-                        pos_order: Arc::new(pos_order),
-                        xy_depth,
-                    })
-                }
+                let pos_order: Vec<usize> = {
+                    let mut v = Vec::with_capacity(2 * m.k);
+                    for t in 0..m.k { v.push(t); v.push(2 * m.k - 1 - t); }
+                    v
+                };
+                let xy_depth = 2 * m.k;
+                Some(XyOwner {
+                    mdd: Arc::new(m),
+                    pos_order: Arc::new(pos_order),
+                    xy_depth,
+                })
             }
             None => {
                 eprintln!("Error: MDD file mdd-{}.bin not found. Run: target/release/gen_mdd {}", mdd_k, mdd_k);
                 std::process::exit(1);
             }
         }
-    } else {
-        // Default: flat table.
-        let table_path = cfg.xy_table_path.clone().unwrap_or_else(|| "./xy-table-k7.bin".to_string());
-        match XYBoundaryTable::load(&table_path) {
-            Some(t) => {
-                if problem.n < 2 * t.k {
-                    if verbose {
-                        eprintln!("Note: n={} < {} (2*k for k={} table), running without table",
-                            problem.n, 2 * t.k, t.k);
-                    }
-                    None
-                } else {
-                    if verbose { eprintln!("Loaded XY boundary table from {} (k={}, {} sigs, {} XY entries)", table_path, t.k, t.sig_offsets.len(), t.xy_data.len()); }
-                    Some(XyOwner::Table(Arc::new(t)))
-                }
-            }
-            None => {
-                eprintln!("Error: XY boundary table not found at '{}'", table_path);
-                eprintln!("Generate it once with: cargo build --release --bin gen_table && target/release/gen_table");
-                eprintln!("Or run with --no-table to skip (slower).");
-                std::process::exit(1);
-            }
-        }
     };
 
     if verbose {
-        let method = match &xy_owner {
-            Some(XyOwner::Table(_)) => "flat table+SAT",
-            Some(XyOwner::Mdd { .. }) => "MDD walk+SAT",
-            None => "SAT X/Y only",
-        };
+        let method = if xy_owner.is_some() { "MDD walk+SAT" } else { "SAT X/Y only" };
         eprintln!("{} normalized tuples, Phase C: {}", tuples.len(), method);
         print_search_space(problem, &tuples);
     }
@@ -5900,9 +5147,11 @@ fn print_help() {
     eprintln!("  --n=<N>                  Sequence length to search (required)");
     eprintln!();
     eprintln!("SEARCH MODE (pick one, default is hybrid):");
-    eprintln!("  (default)                Hybrid: enumerate Z/W, then solve X/Y with SAT");
-    eprintln!("                           Uses precomputed XY boundary table for n >= 14");
-    eprintln!("  --sat                    Pure SAT: encode all four sequences into one SAT problem");
+    eprintln!("  (default)                Hybrid: enumerate Z/W via Phase B, then solve X/Y");
+    eprintln!("                           with SAT. Uses an on-disk MDD (mdd-<k>.bin) to");
+    eprintln!("                           enumerate XY boundary candidates (k=7 default).");
+    eprintln!("  --mdd                    MDD pipeline: navigate boundaries from an MDD and");
+    eprintln!("                           SAT-solve middles inline. Alternative to the default.");
     eprintln!("  --stochastic             Stochastic local search over all four sequences");
     eprintln!("  --stochastic-secs=<S>    Stochastic search, stop after S seconds (default: 10)");
     eprintln!();
@@ -5915,17 +5164,7 @@ fn print_help() {
     eprintln!("                           prune more aggressively (faster but may miss solutions)");
     eprintln!("  --conflict-limit=<N>     Max CDCL conflicts per SAT call before giving up on");
     eprintln!("                           that candidate; 0 = unlimited (default: 0)");
-    eprintln!("  --sat-secs=<N>           Time limit in seconds for --sat mode; stops and reports");
-    eprintln!("                           stats when reached; 0 = unlimited (default: 0)");
-    eprintln!();
-    eprintln!("SAT VARIANT FLAGS:");
-    eprintln!("  --z-sat, --xyz-sat       Solve Z via SAT instead of enumeration");
-    eprintln!("  --w-sat                  Solve W via SAT instead of enumeration");
-    eprintln!();
-    eprintln!("XY BOUNDARY TABLE:");
-    eprintln!("  --xy-table=<PATH>        Path to precomputed table (default: ./xy-table-k7.bin)");
-    eprintln!("                           Generate with: gen_table 7 xy-table-k7.bin");
-    eprintln!("  --no-table               Skip table lookup, solve X/Y from scratch (slower)");
+    eprintln!("  --sat-secs=<N>           Time limit in seconds for the search; 0 = unlimited");
     eprintln!();
     eprintln!("SAT SOLVER TUNING:");
     eprintln!("  --no-xor                 Disable GF(2) XOR propagation in SAT solver");
@@ -5950,8 +5189,8 @@ fn print_help() {
     eprintln!("  -h, --help               Show this help message");
     eprintln!();
     eprintln!("EXAMPLES:");
-    eprintln!("  turyn --n=26                          # search for TT(26)");
-    eprintln!("  turyn --n=26 --no-table                # same, without precomputed table");
+    eprintln!("  turyn --n=26                           # search for TT(26)");
+    eprintln!("  turyn --n=26 --mdd --mdd-k=7           # use the MDD-driven pipeline");
     eprintln!("  turyn --n=16 --benchmark=3             # benchmark Phase B throughput");
     eprintln!("  turyn --verify=++--+-,+-+-++,+++-,+-+- # verify a candidate solution");
 }
@@ -5986,15 +5225,6 @@ fn parse_args() -> SearchConfig {
         } else if let Some(v) = arg.strip_prefix("--stochastic-secs=") {
             cfg.stochastic_seconds = v.parse().unwrap_or(10);
             cfg.stochastic = true;
-        } else if arg == "--sat" {
-            cfg.sat = true;
-        } else if arg == "--sat-xy" {
-            // Legacy alias — hybrid is now the default
-            cfg.sat_xy = true;
-        } else if arg == "--z-sat" || arg == "--xyz-sat" {
-            cfg.z_sat = true;
-        } else if arg == "--w-sat" {
-            cfg.w_sat = true;
         } else if let Some(v) = arg.strip_prefix("--max-spectral=") {
             cfg.max_spectral = Some(v.parse().unwrap_or(0.0));
         } else if let Some(v) = arg.strip_prefix("--verify=") {
@@ -6029,18 +5259,6 @@ fn parse_args() -> SearchConfig {
             if parts.len() == 4 {
                 cfg.test_tuple = Some(SumTuple { x: parts[0], y: parts[1], z: parts[2], w: parts[3] });
             }
-        } else if let Some(v) = arg.strip_prefix("--xy-table=") {
-            cfg.xy_table_path = Some(v.to_string());
-        } else if let Some(v) = arg.strip_prefix("--xy-enum=") {
-            match v {
-                "table" | "mdd" => cfg.xy_enum = v.to_string(),
-                other => {
-                    eprintln!("--xy-enum: unknown value '{}'. expected 'table' or 'mdd'", other);
-                    std::process::exit(1);
-                }
-            }
-        } else if arg == "--no-table" {
-            cfg.no_table = true;
         } else if arg == "--quad-pb" {
             cfg.quad_pb = true;
         } else if arg == "--no-quad-pb" {
@@ -6376,15 +5594,6 @@ fn main() {
     }
     if cfg.benchmark_repeats > 0 {
         run_benchmark(&cfg);
-    } else if cfg.w_sat {
-        let report = run_w_sat_search(&cfg, true);
-        println!("W-SAT search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
-    } else if cfg.z_sat {
-        let report = run_z_sat_search(&cfg, true);
-        println!("XYZ-SAT search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
-    } else if cfg.sat {
-        let report = run_sat_search(&cfg, true);
-        println!("SAT search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     } else if cfg.stochastic {
         let report = stochastic_search(cfg.problem, cfg.test_tuple.as_ref(), true, cfg.stochastic_seconds);
         println!("Stochastic search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
@@ -6394,7 +5603,8 @@ fn main() {
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, true, mdd_k);
         println!("MDD hybrid search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     } else {
-        // Default: hybrid search (Phase B → SAT X/Y). Use --sat or --stochastic to override.
+        // Default: hybrid search (Phase B → SAT X/Y) using MDD XY enumerator.
+        // Use --mdd or --stochastic to override.
         let report = run_hybrid_search(&cfg, true);
         println!("Hybrid search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
     }
@@ -6457,19 +5667,12 @@ mod tests {
             benchmark_repeats: 1,
             stochastic: false,
             stochastic_seconds: 0,
-            sat: false,
-            sat_xy: false,
-            z_sat: false,
-            w_sat: false,
             max_spectral: None,
             verify_seqs: None,
             test_zw: None,
             conflict_limit: 0,
             test_tuple: None,
             phase_only: None,
-            xy_table_path: None,
-            no_table: true,
-            xy_enum: "table".to_string(),
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
             sat_secs: 0,
@@ -6630,10 +5833,12 @@ mod tests {
     }
 
     #[test]
-    fn sat_finds_tt6() {
-        let cfg = SearchConfig { problem: Problem::new(6), no_table: true, ..Default::default() };
-        let report = run_sat_search(&cfg, true);
-        assert!(report.found_solution, "SAT should find TT(6)");
+    fn hybrid_finds_tt6() {
+        // Small-n sanity check via the default hybrid path (n=6 is below
+        // the 2*k=14 threshold, so it runs without an XY enumerator).
+        let cfg = SearchConfig { problem: Problem::new(6), ..Default::default() };
+        let report = run_hybrid_search(&cfg, true);
+        assert!(report.found_solution, "Hybrid should find TT(6)");
     }
 
     #[test]
@@ -6676,223 +5881,6 @@ mod tests {
         // Sum-squared invariant (6n-2 = 154 at n=26).
         let ss = x.sum() * x.sum() + y.sum() * y.sum() + 2 * z.sum() * z.sum() + 2 * w.sum() * w.sum();
         assert_eq!(ss, 154);
-    }
-
-    #[test]
-    #[ignore] // requires mdd-7.bin and xy-table-k7.bin on disk
-    fn table_vs_mdd_same_k_agree() {
-        // Compare the two XY boundary enumerators at the same k=7 for a
-        // handful of (z_bits, w_bits, tuple) samples. The flat table only
-        // enforces the Turyn identity at the k "exact" lags; the MDD also
-        // tracks non-exact lags with middle-slack budgets, so its output
-        // should be a strict subset of the table's for any given query.
-        use crate::mdd_reorder;
-
-        let mdd = match mdd_reorder::Mdd4::load("mdd-7.bin") {
-            Some(m) => m,
-            None => { eprintln!("skip: mdd-7.bin not found"); return; }
-        };
-        let table = match XYBoundaryTable::load("xy-table-k7.bin") {
-            Some(t) => t,
-            None => { eprintln!("skip: xy-table-k7.bin not found"); return; }
-        };
-        assert_eq!(mdd.k, 7);
-        assert_eq!(table.k, 7);
-        let k = 7;
-        let zw_depth = 2 * k; // 14
-        let xy_depth = 2 * k; // 14
-        // Full bouncing pos_order that the MDD was built with.
-        let pos_order: Vec<usize> = {
-            let mut v = Vec::with_capacity(2 * k);
-            for t in 0..k { v.push(t); v.push(2 * k - 1 - t); }
-            v
-        };
-
-        // Walk xy sub-MDD from a given xy_root and collect all (x_bits, y_bits)
-        // leaves that match the tuple's sum constraints. (n is inferred via
-        // middle_n = n - 2k.)
-        fn walk(
-            nid: u32, level: usize, xy_depth: usize, x_acc: u32, y_acc: u32,
-            pos_order: &[usize], nodes: &[[u32; 4]],
-            max_bnd_sum: i32, middle_n: i32, tuple: SumTuple,
-            out: &mut std::collections::HashSet<(u32, u32)>,
-        ) {
-            if nid == mdd_reorder::DEAD { return; }
-            if level == xy_depth {
-                let x_bnd_sum = 2 * (x_acc.count_ones() as i32) - max_bnd_sum;
-                let y_bnd_sum = 2 * (y_acc.count_ones() as i32) - max_bnd_sum;
-                let x_mid = tuple.x - x_bnd_sum;
-                if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return; }
-                let y_mid = tuple.y - y_bnd_sum;
-                if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return; }
-                out.insert((x_acc, y_acc));
-                return;
-            }
-            if nid == mdd_reorder::LEAF {
-                // Unused at xy_depth level; ignore.
-                return;
-            }
-            let pos = pos_order[level];
-            for branch in 0u32..4 {
-                let child = nodes[nid as usize][branch as usize];
-                if child == mdd_reorder::DEAD { continue; }
-                let a_val = (branch >> 0) & 1;
-                let b_val = (branch >> 1) & 1;
-                walk(
-                    child, level + 1, xy_depth,
-                    x_acc | (a_val << pos), y_acc | (b_val << pos),
-                    pos_order, nodes, max_bnd_sum, middle_n, tuple, out,
-                );
-            }
-        }
-
-        // Collect the table's (x_bits, y_bits) set for a given (z_bits,
-        // w_bits, tuple) by iterating over all feasible (x_bnd_sum, y_bnd_sum)
-        // pairs and merging the per-bucket lists.
-        fn table_entries(
-            table: &XYBoundaryTable, z_bits: u32, w_bits: u32,
-            middle_n: i32, tuple: SumTuple,
-        ) -> std::collections::HashSet<(u32, u32)> {
-            let mut out = std::collections::HashSet::new();
-            let max_bnd_sum = 2 * table.k as i32;
-            let mut xs = -max_bnd_sum;
-            while xs <= max_bnd_sum {
-                let x_mid = tuple.x - xs;
-                if x_mid.abs() <= middle_n && (x_mid + middle_n) % 2 == 0 {
-                    let mut ys = -max_bnd_sum;
-                    while ys <= max_bnd_sum {
-                        let y_mid = tuple.y - ys;
-                        if y_mid.abs() <= middle_n && (y_mid + middle_n) % 2 == 0 {
-                            for &(xb, yb) in table.get_xy_entries(z_bits, w_bits, xs, ys) {
-                                out.insert((xb, yb));
-                            }
-                        }
-                        ys += 2;
-                    }
-                }
-                xs += 2;
-            }
-            out
-        }
-
-        // Navigate the MDD to the xy_root for a specific (z_bits, w_bits)
-        // pair, then walk the sub-tree.
-        fn xy_root_of(
-            mdd: &mdd_reorder::Mdd4, pos_order: &[usize], zw_depth: usize,
-            z_bits: u32, w_bits: u32,
-        ) -> Option<u32> {
-            let mut nid = mdd.root;
-            for level in 0..zw_depth {
-                if nid == mdd_reorder::DEAD { return None; }
-                let pos = pos_order[level];
-                let z_val = (z_bits >> pos) & 1;
-                let w_val = (w_bits >> pos) & 1;
-                let branch = (z_val | (w_val << 1)) as usize;
-                if nid == mdd_reorder::LEAF { continue; }
-                nid = mdd.nodes[nid as usize][branch];
-            }
-            if nid == mdd_reorder::DEAD { None } else { Some(nid) }
-        }
-
-        // Samples to check. Walk the MDD with a few LCG-scrambled paths
-        // to get live (z_bits, w_bits) pairs, then probe each with a few
-        // tuples. Also include the known TT(26) boundary at k=7.
-        let n: i32 = 26;
-        let middle_n: i32 = n - 2 * k as i32;
-        let max_bnd_sum: i32 = 2 * k as i32;
-        let mut samples: Vec<(u32, u32, SumTuple)> = Vec::new();
-        let known_tuple = SumTuple { x: 6, y: 6, z: 4, w: 5 };
-        samples.push((9495, 11183, known_tuple)); // known TT(26) at k=7
-        // LCG-scrambled MDD paths to get live samples (same LCG as monitor).
-        let lcg_mult: u64 = 0x5851F42D4C957F2D;
-        let total_paths: u64 = 1u64 << (2 * zw_depth);
-        let lcg_mask: u64 = total_paths - 1;
-        for idx in 0..32u64 {
-            let path = idx.wrapping_mul(lcg_mult) & lcg_mask;
-            let mut nid = mdd.root;
-            let mut z_acc = 0u32;
-            let mut w_acc = 0u32;
-            let mut dead = false;
-            for level in 0..zw_depth {
-                if nid == mdd_reorder::DEAD { dead = true; break; }
-                let branch = ((path >> (2 * level)) & 3) as usize;
-                let pos = pos_order[level];
-                z_acc |= ((branch & 1) as u32) << pos;
-                w_acc |= (((branch >> 1) & 1) as u32) << pos;
-                if nid != mdd_reorder::LEAF {
-                    nid = mdd.nodes[nid as usize][branch];
-                }
-            }
-            if dead || nid == mdd_reorder::DEAD { continue; }
-            for tuple in [
-                SumTuple { x: 6, y: 6, z: 4, w: 5 },
-                SumTuple { x: 2, y: 2, z: 8, w: 3 },
-                SumTuple { x: 0, y: 12, z: 2, w: 1 },
-            ] {
-                samples.push((z_acc, w_acc, tuple));
-            }
-        }
-
-        let mut n_mdd_empty = 0;
-        let mut n_checked = 0;
-        let mut n_same = 0;
-        let mut n_mdd_subset = 0;
-        for (zb, wb, tuple) in &samples {
-            let xy_root = match xy_root_of(&mdd, &pos_order, zw_depth, *zb, *wb) {
-                Some(r) => r,
-                None => continue,
-            };
-            let mut mdd_set = std::collections::HashSet::new();
-            walk(
-                xy_root, 0, xy_depth, 0, 0,
-                &pos_order, &mdd.nodes, max_bnd_sum, middle_n, *tuple,
-                &mut mdd_set,
-            );
-            let table_set = table_entries(&table, *zb, *wb, middle_n, *tuple);
-            n_checked += 1;
-            if mdd_set.is_empty() { n_mdd_empty += 1; }
-            if mdd_set == table_set { n_same += 1; }
-            if mdd_set.is_subset(&table_set) { n_mdd_subset += 1; }
-            eprintln!(
-                "  z_bits={} w_bits={} tuple=({},{},{},{}): mdd={} table={} mdd⊆table={}",
-                zb, wb, tuple.x, tuple.y, tuple.z, tuple.w,
-                mdd_set.len(), table_set.len(),
-                mdd_set.is_subset(&table_set),
-            );
-        }
-        eprintln!(
-            "Checked {} samples: {} same, {} mdd⊆table, {} mdd-empty",
-            n_checked, n_same, n_mdd_subset, n_mdd_empty,
-        );
-        // The claim (verified empirically): at the same k the MDD XY sub-tree
-        // walk and the flat table enforce exactly the same constraint (the
-        // k "exact" lags). So MDD == Table for every query.
-        assert_eq!(n_same, n_checked, "MDD should equal table for all samples");
-        assert_eq!(n_mdd_subset, n_checked, "MDD should be subset of table for all samples");
-
-        // Sanity check: the known TT(26)'s (x_bits=6675, y_bits=3415) must
-        // appear in the candidate set for the known TT(26) boundary
-        // (z_bits=9495, w_bits=11183, tuple=(6,6,4,5)) at k=7.
-        let xy_root = xy_root_of(&mdd, &pos_order, zw_depth, 9495, 11183)
-            .expect("known TT(26) boundary should be live");
-        let mut known_set = std::collections::HashSet::new();
-        walk(
-            xy_root, 0, xy_depth, 0, 0,
-            &pos_order, &mdd.nodes, max_bnd_sum, middle_n, known_tuple,
-            &mut known_set,
-        );
-        assert!(
-            known_set.contains(&(6675u32, 3415u32)),
-            "known TT(26) x_bits=6675 y_bits=3415 should be in MDD's candidate set (size {})",
-            known_set.len(),
-        );
-        let tbl_set = table_entries(&table, 9495, 11183, middle_n, known_tuple);
-        assert!(
-            tbl_set.contains(&(6675u32, 3415u32)),
-            "known TT(26) x_bits=6675 y_bits=3415 should be in table's candidate set (size {})",
-            tbl_set.len(),
-        );
-        eprintln!("✓ known TT(26) (x=6675, y=3415) is in both enumerators' candidate sets");
     }
 
     #[test]
@@ -7034,10 +6022,10 @@ mod tests {
     }
 
     #[test]
-    fn sat_finds_tt4() {
-        let cfg = SearchConfig { problem: Problem::new(4), no_table: true, ..Default::default() };
-        let report = run_sat_search(&cfg, false);
-        assert!(report.found_solution, "SAT should find TT(4)");
+    fn hybrid_finds_tt4() {
+        let cfg = SearchConfig { problem: Problem::new(4), ..Default::default() };
+        let report = run_hybrid_search(&cfg, false);
+        assert!(report.found_solution, "Hybrid should find TT(4)");
     }
 
     #[test]
