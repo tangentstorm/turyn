@@ -1,4 +1,5 @@
 import Turyn.MatrixHelp
+import Mathlib
 
 /-!
 # Step 3: Typed Matrices and Hadamard Construction
@@ -664,177 +665,100 @@ lemma trRow_getD {m : Nat} (x : List Int) {r k : Nat} (hk : k < m) :
       x.getD ((k + m - (m - 1 - r)) % m) 0 := by
   simpa [trRow] using circulantRow_getD x (r := m - 1 - r) hk
 
-lemma circulant_cross_dot_eq_sum {m : Nat} (x y : List Int)
-    {i j : Nat} (hi : i < m) (hj : j < m) :
-    listDotProduct (circulantRow m x i) (circulantRow m y j) =
-      ∑ k ∈ Finset.range m,
-        x.getD ((k + m - i) % m) 0 * y.getD ((k + m - j) % m) 0 := by
-  have hlen : (circulantRow m x i).length = (circulantRow m y j).length := by
-    simp [circulantRow]
-  rw [listDotProduct_eq_sum hlen]
-  simp only [circulantRow_length]
-  apply Finset.sum_congr rfl
-  intro k hk
-  rw [circulantRow_getD x (r := i) (Finset.mem_range.mp hk),
-      circulantRow_getD y (r := j) (Finset.mem_range.mp hk)]
-
-lemma circulant_cross_dot_eq_shifted_sum {m : Nat} (x y : List Int)
-    (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
-    listDotProduct (circulantRow m x i) (circulantRow m y j) =
-      ∑ k ∈ Finset.range m, x.getD k 0 * y.getD ((k + ((i + m - j) % m)) % m) 0 := by
-  have hm : m ≠ 0 := by omega
-  rw [circulant_cross_dot_eq_sum x y hi hj]
-  let s := ((i + m - j) % m)
-  refine Finset.sum_nbij'
-    (i := fun k => (k + m - i) % m)
-    (j := fun t => (t + i) % m)
-    ?_ ?_ ?_ ?_ ?_
-  · intro k hk
-    exact Finset.mem_range.mpr (Nat.mod_lt _ (Nat.pos_of_ne_zero hm))
-  · intro t ht
-    exact Finset.mem_range.mpr (Nat.mod_lt _ (Nat.pos_of_ne_zero hm))
-  · intro k hk
-    change (((k + m - i) % m) + i) % m = k
-    have hk' : k < m := Finset.mem_range.mp hk
-    by_cases hki : k < i
-    · have hlt : k + m - i < m := by omega
-      rw [Nat.mod_eq_of_lt hlt]
-      have hsub : k + m - i + i = k + m := by omega
-      rw [hsub, Nat.add_mod_right, Nat.mod_eq_of_lt hk']
-    · have hle : i ≤ k := by omega
-      have hmle : m ≤ k + m - i := by omega
-      have hlt2 : k + m - i < 2 * m := by omega
-      rw [Nat.mod_eq_sub_mod hmle]
-      have hlt' : k + m - i - m < m := by omega
-      rw [Nat.mod_eq_of_lt hlt']
-      have hsub : k + m - i - m + i = k := by omega
-      rw [hsub, Nat.mod_eq_of_lt hk']
-  · intro t ht
-    change (((t + i) % m) + m - i) % m = t
-    have ht' : t < m := Finset.mem_range.mp ht
-    by_cases hsum : t + i < m
-    · rw [Nat.mod_eq_of_lt hsum]
-      have hsub : t + i + (m - i) = t + m := by omega
-      rw [show t + i + m - i = t + m by omega, Nat.add_mod_right, Nat.mod_eq_of_lt ht']
-    · have hmle : m ≤ t + i := by omega
-      have hlt2 : t + i < 2 * m := by omega
-      rw [Nat.mod_eq_sub_mod hmle]
-      have hlt' : t + i - m < m := by omega
-      rw [Nat.mod_eq_of_lt hlt']
-      have hsub : t + i - m + (m - i) = t := by omega
-      rw [show t + i - m + m - i = t by omega, Nat.mod_eq_of_lt ht']
-  · intro k hk
-    dsimp
-    have hidx : (((k + m - i) % m + s) % m) = ((k + m - j) % m) := by
-      have h1 : (((k + m - i) % m + s) % m) ≡ ((k + m - i) % m + s) [MOD m] :=
-        Nat.mod_modEq _ _
-      have h2 : ((k + m - i) % m + s) ≡ (k + m - i) + s [MOD m] :=
-        (Nat.mod_modEq (k + m - i) m).add_right s
-      have h3 : (k + m - i) + s ≡ (k + m - i) + (i + m - j) [MOD m] := by
-        dsimp [s]
-        exact (Nat.mod_modEq (i + m - j) m).add_left (k + m - i)
-      have h4 : (k + m - i) + (i + m - j) ≡ (k + m - j) + m [MOD m] := by
-        have hsub : (k + m - i) + (i + m - j) = (k + m - j) + m := by omega
-        exact hsub ▸ Nat.ModEq.refl _
-      have h5 : (k + m - j) + m ≡ k + m - j [MOD m] :=
-        Nat.add_modEq_right (a := k + m - j) (n := m)
-      have h6 : k + m - j ≡ (k + m - j) % m [MOD m] :=
-        (Nat.mod_modEq (k + m - j) m).symm
-      exact Nat.ModEq.eq_of_lt_of_lt
-        (h1.trans (h2.trans (h3.trans (h4.trans (h5.trans h6)))))
-        (Nat.mod_lt _ (Nat.pos_of_ne_zero hm))
-        (Nat.mod_lt _ (Nat.pos_of_ne_zero hm))
-    dsimp [s] at hidx ⊢
-    rw [hidx]
-
-lemma circulant_applyR_dot_eq_skew_sum {m : Nat} (x y : List Int)
-    (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
-    listDotProduct (circulantRow m x i) (applyR (circulantRow m y j)) =
-      ∑ k ∈ Finset.range m, x.getD k 0 * y.getD ((m - 1 - k + m - i - j) % m) 0 := by
-  sorry
-
-/-- Pure skew-correlation sum attached to the `applyR` branch. -/
-def skewCorrSum (m : Nat) (x y : List Int) (s : Nat) : Int :=
-  ∑ k ∈ Finset.range m, x.getD k 0 * y.getD ((m - 1 - k + s) % m) 0
-
-lemma circulant_applyR_dot_eq_skewCorrSum {m : Nat} (x y : List Int)
-    (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
-    listDotProduct (circulantRow m x i) (applyR (circulantRow m y j)) =
-      skewCorrSum m x y (m - i - j) := by
-  sorry
-
-lemma skewCorrSum_swap {m : Nat} (x y : List Int) {s : Nat} :
-    skewCorrSum m x y s = skewCorrSum m y x s := by
-  sorry
-
-lemma skewCorrSum_shift_normalize {m : Nat} (x y : List Int) (i j : Nat) :
-    skewCorrSum m x y (m - i - j) =
-      ∑ k ∈ Finset.range m, x.getD k 0 * y.getD ((m - 1 - k + m - i - j) % m) 0 := by
-  sorry
-
 lemma circulant_applyR_dot_swap {m : Nat} (x y : List Int)
     (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
     listDotProduct (circulantRow m x i) (applyR (circulantRow m y j)) =
       listDotProduct (applyR (circulantRow m y i)) (circulantRow m x j) := by
-  sorry
-
-lemma circulant_trRow_dot_eq_cross_sum {m : Nat} (x y : List Int)
-    (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
-    listDotProduct (circulantRow m x i) (trRow (m := m) y j) =
-      ∑ k ∈ Finset.range m, x.getD k 0 * y.getD ((k + i + j + 1) % m) 0 := by
-  rw [trRow]
-  rw [circulant_cross_dot_eq_shifted_sum x y hx hy hi (by omega)]
-  apply Finset.sum_congr rfl
-  intro k hk
-  have hinner0 : i + m - (m - 1 - j) = i + j + 1 := by
-    omega
-  have hidx : (k + ((i + m - (m - 1 - j)) % m)) % m = (k + i + j + 1) % m := by
-    rw [hinner0]
-    have hmod : (((i + j + 1) % m) % m) = (i + j + 1) % m := by rw [Nat.mod_mod]
-    have hadd := Nat.add_mod_eq_add_mod_left k hmod.symm
-    simpa [Nat.add_assoc] using hadd
-  simpa [hidx]
+  have h_sum_eq : ∑ t ∈ Finset.range m, (circulantRow m x i).getD t 0 * (applyR (circulantRow m y j)).getD t 0 = ∑ t ∈ Finset.range m, (applyR (circulantRow m y i)).getD t 0 * (circulantRow m x j).getD t 0 := by
+    apply Finset.sum_bij (fun t ht => (t + j + m - i) % m);
+    · exact fun a ha => Finset.mem_range.mpr ( Nat.mod_lt _ ( by linarith ) );
+    · intro a₁ ha₁ a₂ ha₂ h; have := Nat.modEq_iff_dvd.1 h.symm; simp_all +decide [ Nat.dvd_iff_mod_eq_zero ] ;
+      obtain ⟨ k, hk ⟩ := this; rw [ Nat.cast_sub ( by omega ), Nat.cast_sub ( by omega ) ] at hk; norm_num at hk; nlinarith [ show k = 0 by nlinarith ] ;
+    · intro b hb; use ( b + i + m - j ) % m; simp_all +decide [ Nat.mod_eq_of_lt ] ;
+      refine' ⟨ Nat.mod_lt _ ( by linarith ), _ ⟩;
+      simp +decide [ ← ZMod.val_natCast, Nat.cast_sub ( show j ≤ b + i + m from by linarith ) ];
+      rw [ Nat.cast_sub ] <;> norm_num;
+      · cases m <;> aesop;
+      · grind;
+    · intro a ha; rw [ circulantRow_getD, applyR_circulantRow_getD, applyR_circulantRow_getD, circulantRow_getD ] ;
+      · rw [ mul_comm ];
+        congr 2;
+        · simp +decide [ ← ZMod.natCast_eq_natCast_iff', Nat.cast_sub ( show i ≤ a + j + m from by linarith [ Finset.mem_range.mp ha ] ), Nat.cast_sub ( show j ≤ m - 1 - a + m from by omega ) ];
+          rw [ Nat.cast_sub, Nat.cast_sub ] <;> norm_num;
+          · rw [ Nat.cast_sub ] <;> norm_num;
+            · rw [ Nat.cast_sub ] <;> norm_num;
+              · rw [ Nat.cast_sub, Nat.cast_sub ] <;> push_cast <;> ring <;> linarith [ Finset.mem_range.mp ha ];
+              · exact Nat.le_sub_one_of_lt ( Nat.mod_lt _ ( by linarith ) );
+            · omega;
+          · linarith;
+          · exact Nat.le_pred_of_lt ( Finset.mem_range.mp ha );
+        · simp +decide [ ← ZMod.natCast_eq_natCast_iff', Nat.cast_sub ( show i ≤ a + m from by linarith [ Finset.mem_range.mp ha ] ), Nat.cast_sub ( show j ≤ a + j + m - i from by omega ) ];
+          rw [ Nat.cast_sub <| by omega ] ; simp +decide [ Nat.cast_sub <| show i ≤ a + j + m from by linarith [ Finset.mem_range.mp ha ] ] ; ring;
+      · exact Nat.mod_lt _ ( by linarith );
+      · exact Nat.mod_lt _ ( by linarith );
+      · grind;
+      · grind;
+  convert h_sum_eq using 1 <;> rw [ listDotProduct_eq_sum ] <;> simp +decide [ hx, hy ]
 
 lemma circulant_trRow_dot_swap {m : Nat} (x y : List Int)
     (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
     listDotProduct (circulantRow m x i) (trRow (m := m) y j) =
       listDotProduct (trRow (m := m) y i) (circulantRow m x j) := by
-  rw [circulant_trRow_dot_eq_cross_sum x y hx hy hi hj]
-  rw [listDotProduct_comm (by simp [circulantRow, trRow])]
-  rw [circulant_trRow_dot_eq_cross_sum x y hx hy hj hi]
-  apply Finset.sum_congr rfl
-  intro k hk
-  have hidx : (k + j + i + 1) % m = (k + i + j + 1) % m := by
-    have hEq : k + j + i + 1 = k + i + j + 1 := by omega
-    rw [hEq]
-  simpa [hidx]
+  rw [ listDotProduct_eq_sum, listDotProduct_eq_sum ];
+  · simp +decide [ mul_comm, circulantRow, trRow ];
+    apply Finset.sum_bij (fun k _ => (k + m - i + j) % m);
+    · exact fun a ha => Finset.mem_range.mpr ( Nat.mod_lt _ ( by linarith ) );
+    · intro a₁ ha₁ a₂ ha₂ h; have := Nat.modEq_iff_dvd.mp h.symm; simp_all +decide [ Nat.dvd_iff_mod_eq_zero ] ;
+      obtain ⟨ k, hk ⟩ := this; rw [ Nat.cast_sub ( by linarith ), Nat.cast_sub ( by linarith ) ] at hk; norm_num at hk; nlinarith [ show k = 0 by nlinarith ] ;
+    · intro b hb; use ( b + i + m - j ) % m; simp +decide [ Nat.mod_lt, * ] ;
+      norm_num +zetaDelta at *;
+      refine' ⟨ Nat.mod_lt _ ( by linarith ), _ ⟩;
+      simp +decide [ add_assoc, Nat.add_sub_assoc, hb.le, hi.le, hj.le ];
+      rw [ show b + ( i + m ) - j + ( m - i + j ) = b + m + m by linarith [ Nat.sub_add_cancel ( by linarith : j ≤ b + ( i + m ) ), Nat.sub_add_cancel ( by linarith : i ≤ m ) ] ] ; norm_num [ Nat.add_mod, Nat.mod_eq_of_lt hb ];
+    · intro a ha; rw [ List.getElem?_range, List.getElem?_range ] ; simp +decide [ Nat.mod_eq_of_lt hi, Nat.mod_eq_of_lt hj, Nat.mod_eq_of_lt ( Finset.mem_range.mp ha ) ] ;
+      · congr 2 <;> norm_num [ add_assoc, Nat.add_sub_assoc, Nat.mod_eq_of_lt hi, Nat.mod_eq_of_lt hj ];
+        · congr 1;
+          simp +decide [ ← ZMod.natCast_eq_natCast_iff', Nat.cast_sub ( show j ≤ ( a + m - i + j ) % m + m from by linarith [ Nat.zero_le ( ( a + m - i + j ) % m ), Nat.mod_lt ( a + m - i + j ) ( by linarith : 0 < m ) ] ) ];
+        · rw [ show a + m - i + ( j + ( m - ( m - 1 - i ) ) ) = a + ( m - ( m - 1 - j ) ) + m by omega ] ; norm_num [ Nat.add_mod, Nat.mod_eq_of_lt hi, Nat.mod_eq_of_lt hj ];
+      · exact Nat.mod_lt _ ( by linarith );
+      · grind +qlia;
+  · simp [trRow, circulantRow, hx, hy];
+  · simp [circulantRow, trRow]
 
 lemma applyR_trRow_dot_swap {m : Nat} (x y : List Int)
     (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
     listDotProduct (applyR (circulantRow m x i)) (trRow (m := m) y j) =
       listDotProduct (applyR (circulantRow m y i)) (trRow (m := m) x j) := by
-  sorry
-
-lemma circulant_reflect_shift_swap {m : Nat} (x y : List Int)
-    (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
-    listDotProduct (circulantRow m x i) (circulantRow m y j) =
-      listDotProduct (circulantRow m y (m - 1 - i)) (circulantRow m x (m - 1 - j)) := by
-    sorry
+  -- trRow z j = circulantRow m z (m - 1 - j) by definition
+  simp only [trRow]
+  -- Goal: dot(rev(circ_x_i), circ_y_{m-1-j}) = dot(rev(circ_y_i), circ_x_{m-1-j})
+  -- Step 1: dot(rev(a), b) = dot(a, rev(b)) using applyR_dot_applyR_eq
+  have hrev_swap : ∀ (a b : List Int), a.length = b.length →
+      listDotProduct (applyR a) b = listDotProduct a (applyR b) := by
+    intro a b hab
+    have h1 := applyR_dot_applyR_eq (a := a) (b := applyR b) (by simp [hab])
+    simp [applyR, List.reverse_reverse] at h1
+    exact h1
+  rw [hrev_swap _ _ (by simp)]
+  -- Goal: dot(circ_x_i, rev(circ_y_{m-1-j})) = dot(rev(circ_y_i), circ_x_{m-1-j})
+  exact circulant_applyR_dot_swap x y hx hy hi (by omega : m - 1 - j < m)
 
 lemma applyR_applyR_dot_eq_tr_tr_swap {m : Nat} (x y : List Int)
     (hx : x.length = m) (hy : y.length = m) {i j : Nat} (hi : i < m) (hj : j < m) :
     listDotProduct (applyR (circulantRow m x i)) (applyR (circulantRow m y j)) =
       listDotProduct (trRow (m := m) y i) (trRow (m := m) x j) := by
-  have hleft :
-      listDotProduct (applyR (circulantRow m x i)) (applyR (circulantRow m y j)) =
-        listDotProduct (circulantRow m x i) (circulantRow m y j) := by
-    rw [applyR_dot_applyR_eq (by simp [circulantRow])]
-  have hright :
-      listDotProduct (trRow (m := m) y i) (trRow (m := m) x j) =
-        listDotProduct (circulantRow m y (m - 1 - i)) (circulantRow m x (m - 1 - j)) := by
-    rfl
-  rw [hleft, hright]
-  exact circulant_reflect_shift_swap x y hx hy hi hj
+  -- By definition of `applyR`, we know that `applyR (circulantRow m x i)` is the reverse of `circulantRow m x i`.
+  have h_applyR : ∀ (a b : List Int), a.length = b.length → listDotProduct (applyR a) (applyR b) = listDotProduct a b := by
+    exact?;
+  convert h_applyR _ _ _ using 1;
+  · convert circulant_trRow_dot_swap _ _ _ _ _ _ using 1;
+    · unfold trRow;
+      rw [ Nat.sub_sub_self ( Nat.le_sub_one_of_lt hi ) ];
+    · exact hy;
+    · exact hx;
+    · exact?;
+    · assumption;
+  · unfold circulantRow; aesop;
 
 lemma trRow_pmOne_mem {m : Nat} {x : List Int}
     (hx_len : x.length = m)
@@ -1003,37 +927,6 @@ theorem gs_different_block_rows_orthogonal {m : Nat} (T : TSequence m)
     listDotProduct (gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 j) = 0 := by
   exact gs_different_block_rows_reduce_to_combined_periodic T hi hj
 
-lemma gs_combinedPeriodic_zero {m : Nat} (T : TSequence m) :
-    let Q := gsSequenceQuadOfTSequence T
-    combinedPeriodicAutocorr Q.x1 Q.x2 Q.x3 Q.x4 0 = 4 * m := by
-  dsimp [combinedPeriodicAutocorr]
-  let Q := gsSequenceQuadOfTSequence T
-  rw [periodicAutocorr_zero_pmone Q.x1 Q.x1_len Q.x1_pm,
-      periodicAutocorr_zero_pmone Q.x2 Q.x2_len Q.x2_pm,
-      periodicAutocorr_zero_pmone Q.x3 Q.x3_len Q.x3_pm,
-      periodicAutocorr_zero_pmone Q.x4 Q.x4_len Q.x4_pm]
-  ring
-
-lemma gs_same_block_row_self_dot {m : Nat} (T : TSequence m)
-    {i : Nat} (hi : i < m) :
-    let Q := gsSequenceQuadOfTSequence T
-    listDotProduct (gsRow0 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow0 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) = 4 * m ∧
-    listDotProduct (gsRow1 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow1 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) = 4 * m ∧
-    listDotProduct (gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) = 4 * m ∧
-    listDotProduct (gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) (gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 i) = 4 * m := by
-  let Q := gsSequenceQuadOfTSequence T
-  rcases gs_same_block_row_reduces_to_combined_periodic T hi hi with ⟨h0, h1, h2, h3⟩
-  have hs : ((i + m - i) % m) = 0 := by
-    have hm : m ≠ 0 := by omega
-    rw [show i + m - i = m by omega, Nat.mod_self]
-  constructor
-  · rw [h0, hs, gs_combinedPeriodic_zero T]
-  constructor
-  · rw [h1, hs, gs_combinedPeriodic_zero T]
-  constructor
-  · rw [h2, hs, gs_combinedPeriodic_zero T]
-  · rw [h3, hs, gs_combinedPeriodic_zero T]
-
 /-- The final GS matrix has only `±1` entries. -/
 theorem gsMatrixOfTSequence_allEntriesPmOne {m : Nat} (T : TSequence m) :
     allEntriesPmOne (gsMatrixOfTSequence T).rows = true := by
@@ -1091,71 +984,84 @@ theorem gsMatrixOfTSequence_allRowsLength {m : Nat} (T : TSequence m) :
     exact Nat.div_lt_of_lt_mul <| by omega
   interval_cases hcase : i / m <;> simp [gsRow0, gsRow1, gsRow2, gsRow3, applyR, negRow] <;> omega
 
-lemma gsMatrixOfTSequence_getD {m : Nat} (T : TSequence m) {i : Nat} (hi : i < 4 * m) :
-    let Q := gsSequenceQuadOfTSequence T
+/-
+The final GS matrix satisfies the Hadamard orthogonality check.
+
+Helper: accessing the i-th row of the GS matrix.
+-/
+lemma gsMatrixOfTSequence_getD_row {m : Nat} (T : TSequence m) (i : Nat) (hi : i < 4 * m) :
     (gsMatrixOfTSequence T).rows.getD i [] =
+      let Q := gsSequenceQuadOfTSequence T
       match i / m with
       | 0 => gsRow0 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 (i % m)
       | 1 => gsRow1 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 (i % m)
       | 2 => gsRow2 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 (i % m)
       | 3 => gsRow3 (m := m) Q.x1 Q.x2 Q.x3 Q.x4 (i % m)
       | _ => [] := by
-  dsimp [gsMatrixOfTSequence, gsArrayFromPmOne]
-  rw [List.getD_eq_getElem _ _ (by simpa)]
-  simp [hi]
+  convert List.getD_eq_getElem _ _ _ using 1;
+  swap;
+  convert hi using 1;
+  exact?;
+  unfold gsMatrixOfTSequence;
+  unfold gsArrayFromPmOne;
+  rw [ List.getElem_map ];
+  rw [ List.getElem_range ]
 
-lemma mod_ne_of_div_eq {m i j : Nat} (hm : 0 < m) (hdiv : i / m = j / m) (hij : i ≠ j) :
-    i % m ≠ j % m := by
-  intro hmod
-  have heq : i = j := by
-    calc
-      i = i / m * m + i % m := by
-        rw [Nat.mul_comm]
-        symm
-        exact Nat.div_add_mod i m
-      _ = j / m * m + j % m := by rw [hdiv, hmod]
-      _ = j := by
-        rw [Nat.mul_comm]
-        exact Nat.div_add_mod j m
-  exact hij heq
+/-
+Helper: the self-dot-product of any row of the GS matrix is 4*m.
+-/
+lemma gsMatrixOfTSequence_self_dot {m : Nat} (T : TSequence m) (i : Nat) (hi : i < 4 * m) :
+    listDotProduct ((gsMatrixOfTSequence T).rows.getD i []) ((gsMatrixOfTSequence T).rows.getD i []) = (4 * m : Int) := by
+  have h_row_length : ((gsMatrixOfTSequence T).rows.getD i []).length = 4 * m := by
+    have h_row_length : ∀ (L : List (List Int)), allRowsLength L (4 * m) = true → ∀ (i : Nat), i < L.length → List.length (L.getD i []) = 4 * m := by
+      intros L hL i hi; have := hL; simp_all +decide [ allRowsLength ] ;
+    exact h_row_length _ ( gsMatrixOfTSequence_allRowsLength T ) _ ( by simpa [ gsMatrixOfTSequence_dim ] using hi );
+  convert listDotProduct_self_pmone _ _ using 1;
+  · exact_mod_cast h_row_length.symm;
+  · have := gsMatrixOfTSequence_allEntriesPmOne T;
+    unfold allEntriesPmOne at this;
+    simp +zetaDelta at *;
+    intro j hj; specialize this ( ( gsMatrixOfTSequence T ).rows[i]?.getD [ ] ) ; aesop;
 
-lemma gsMatrix_diag_dot {m : Nat} (T : TSequence m) {i : Nat} (hi : i < 4 * m) :
-    listDotProduct ((gsMatrixOfTSequence T).rows.getD i [])
-      ((gsMatrixOfTSequence T).rows.getD i []) = 4 * m := by
-  sorry
-
-lemma gsMatrix_offdiag_dot {m : Nat} (T : TSequence m) {i j : Nat}
+/-
+Helper: distinct rows of the GS matrix are orthogonal.
+-/
+lemma gsMatrixOfTSequence_orthogonal {m : Nat} (T : TSequence m) (i j : Nat)
     (hi : i < 4 * m) (hj : j < 4 * m) (hij : i ≠ j) :
-    listDotProduct ((gsMatrixOfTSequence T).rows.getD i [])
-      ((gsMatrixOfTSequence T).rows.getD j []) = 0 := by
-  sorry
+    listDotProduct ((gsMatrixOfTSequence T).rows.getD i []) ((gsMatrixOfTSequence T).rows.getD j []) = 0 := by
+  by_cases h_cases : i / m = j / m;
+  · -- Since $i$ and $j$ are in the same block row, we can apply the lemma `gs_same_block_row_orthogonal`.
+    have := gs_same_block_row_orthogonal T (by
+    exact fun h => hij <| by nlinarith [ Nat.mod_add_div i m, Nat.mod_add_div j m ] ; : i % m ≠ j % m) (by
+    exact Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) ) : i % m < m) (by
+    exact Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) ) : j % m < m);
+    rw [ gsMatrixOfTSequence_getD_row, gsMatrixOfTSequence_getD_row ];
+    · have := Nat.le_of_lt_succ ( show i / m < 4 by exact Nat.div_lt_of_lt_mul <| by linarith ) ; ( have := Nat.le_of_lt_succ ( show j / m < 4 by exact Nat.div_lt_of_lt_mul <| by linarith ) ; interval_cases i / m <;> interval_cases j / m <;> simp +decide [ * ] at h_cases ⊢; );
+    · grind;
+    · linarith;
+  · by_cases h_cases2 : i / m > j / m;
+    · -- Since $i / m > j / m$, we can apply the lemma `gs_different_block_rows_orthogonal` to conclude that the dot product is zero.
+      have h_orthogonal : listDotProduct ((gsMatrixOfTSequence T).rows.getD j []) ((gsMatrixOfTSequence T).rows.getD i []) = 0 := by
+        rw [ gsMatrixOfTSequence_getD_row, gsMatrixOfTSequence_getD_row ];
+        · have := gs_different_block_rows_orthogonal T ( show j % m < m from Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) ) ) ( show i % m < m from Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) ) );
+          have : i / m < 4 := Nat.div_lt_of_lt_mul <| by linarith; ; ( have : j / m < 4 := Nat.div_lt_of_lt_mul <| by linarith; ; interval_cases i / m <;> interval_cases j / m <;> simp_all +decide only ; );
+        · linarith;
+        · grind;
+      rw [ ← h_orthogonal, listDotProduct_comm ];
+      have := gsMatrixOfTSequence_allRowsLength T; simp_all +decide [ allRowsLength ] ;
+    · have := gs_different_block_rows_orthogonal T (by
+      exact Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) ) : i % m < m) (by
+      exact Nat.mod_lt _ ( Nat.pos_of_ne_zero ( by aesop_cat ) ) : j % m < m);
+      rw [ gsMatrixOfTSequence_getD_row T i hi, gsMatrixOfTSequence_getD_row T j hj ];
+      have : i / m < 4 := Nat.div_lt_of_lt_mul <| by linarith; ; have : j / m < 4 := Nat.div_lt_of_lt_mul <| by linarith; ; interval_cases i / m <;> interval_cases j / m <;> simp +decide [ * ] at h_cases h_cases2 ⊢;
 
-lemma gsMatrix_checkOrthogonality_from_dot {m : Nat} (T : TSequence m)
-    (hdiag : ∀ i, i < 4 * m →
-      listDotProduct ((gsMatrixOfTSequence T).rows.getD i [])
-        ((gsMatrixOfTSequence T).rows.getD i []) = 4 * m)
-    (hoffdiag : ∀ i j, i < 4 * m → j < 4 * m → i ≠ j →
-      listDotProduct ((gsMatrixOfTSequence T).rows.getD i [])
-        ((gsMatrixOfTSequence T).rows.getD j []) = 0) :
-    checkOrthogonality (gsMatrixOfTSequence T).rows = true := by
-  sorry
-
-/-- The final GS matrix satisfies the Hadamard orthogonality check. -/
 theorem gsMatrixOfTSequence_checkOrthogonality {m : Nat} (T : TSequence m) :
     checkOrthogonality (gsMatrixOfTSequence T).rows = true := by
-  have hdiag :
-      ∀ i, i < 4 * m →
-        listDotProduct ((gsMatrixOfTSequence T).rows.getD i [])
-          ((gsMatrixOfTSequence T).rows.getD i []) = 4 * m := by
-    intro i hi
-    exact gsMatrix_diag_dot T hi
-  have hoffdiag :
-      ∀ i j, i < 4 * m → j < 4 * m → i ≠ j →
-        listDotProduct ((gsMatrixOfTSequence T).rows.getD i [])
-          ((gsMatrixOfTSequence T).rows.getD j []) = 0 := by
-    intro i j hi hj hij
-    exact gsMatrix_offdiag_dot T hi hj hij
-  exact gsMatrix_checkOrthogonality_from_dot T hdiag hoffdiag
+  unfold checkOrthogonality; simp +decide [ List.all_eq_true ] ;
+  intro i hi j hj;
+  split_ifs with h;
+  · convert gsMatrixOfTSequence_self_dot T i hi using 1 ; aesop;
+  · convert gsMatrixOfTSequence_orthogonal T i j hi hj h using 1
 
 /-- The final GS matrix built from a T-sequence is Hadamard. -/
 theorem gsMatrixOfTSequence_isHadamard {m : Nat} (T : TSequence m) :
