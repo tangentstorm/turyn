@@ -4461,7 +4461,9 @@ fn run_mdd_sat_search(
         if verbose && last_progress.elapsed().as_secs() >= 10 {
             let elapsed = run_start.elapsed().as_secs_f64();
             let done = items_completed.load(AtomicOrdering::Relaxed);
-            let walked = boundaries_walked.load(AtomicOrdering::Relaxed);
+            // Use completed boundaries (stage 0 exit) not pushed, so TTE
+            // reflects real throughput.
+            let walked = stage_exit[0].load(AtomicOrdering::Relaxed);
             // Per-stage queue depths
             let mut depths = [0i64; 4];
             for i in 0..4 {
@@ -4505,7 +4507,14 @@ fn run_mdd_sat_search(
 
     let elapsed = run_start.elapsed();
     let done = items_completed.load(AtomicOrdering::Relaxed);
-    let walked = boundaries_walked.load(AtomicOrdering::Relaxed);
+    // TTE must be based on boundaries actually COMPLETED (stage 0 exit),
+    // not boundaries pushed to the queue. The old counter measured pushes,
+    // which inflates TTE when the monitor front-loads boundaries but workers
+    // can't drain them in the time window. stage_exit[0] is the true count
+    // of boundaries whose ZW->W->Z->XY work has finished.
+    let completed_bnd = stage_exit[0].load(AtomicOrdering::Relaxed);
+    let walked = completed_bnd;
+    let pushed = boundaries_walked.load(AtomicOrdering::Relaxed);
 
     if verbose {
         println!("\n--- MDD pipeline k={} ({} workers) ---", k, workers);
@@ -4516,7 +4525,7 @@ fn run_mdd_sat_search(
         let ext_pruned = extensions_pruned.load(AtomicOrdering::Relaxed);
         println!("  XY solves:                {:>10}", done);
         println!("  Extensions pruned:        {:>10}", ext_pruned);
-        println!("  Boundaries walked:        {:>10}", walked);
+        println!("  Boundaries walked:        {:>10} (pushed: {})", walked, pushed);
         // Coverage metrics
         let secs = elapsed.as_secs_f64();
         let walked_f = walked as f64;
