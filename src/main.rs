@@ -506,6 +506,26 @@ fn compute_spectrum(
     (0..half).map(|k| fft_buf[k].norm_sqr()).collect()
 }
 
+/// Write the spectrum into `out` (reusable buffer) instead of allocating.
+fn compute_spectrum_into(
+    values: &[i8],
+    filter: &SpectralFilter,
+    fft_buf: &mut Vec<Complex<f64>>,
+    out: &mut Vec<f64>,
+) {
+    let m = filter.fft_size;
+    fft_buf.clear();
+    for &v in values { fft_buf.push(Complex::new(v as f64, 0.0)); }
+    fft_buf.resize(m, Complex::new(0.0, 0.0));
+    filter.fft.process(fft_buf);
+    let half = m / 2 + 1;
+    out.clear();
+    out.reserve(half);
+    for k in 0..half {
+        out.push(fft_buf[k].norm_sqr());
+    }
+}
+
 fn spectrum_if_ok(
     values: &[i8],
     filter: &SpectralFilter,
@@ -3782,6 +3802,9 @@ fn run_mdd_sat_search(
             let spectral_z = SpectralFilter::new(ctx.problem.n, ctx.theta);
             let mut fft_buf_w = Vec::with_capacity(spectral_w.fft_size);
             let mut fft_buf_z = Vec::with_capacity(spectral_z.fft_size);
+            // Reusable spectrum output buffer for the post-hoc Z pair check.
+            // Avoids allocating a fresh Vec<f64> per Z solution.
+            let mut z_spectrum_buf: Vec<f64> = Vec::new();
             let mut rng: u64 = 0x517cc1b727220a95 ^ (tid as u64 * 0x9e3779b97f4a7c15);
             macro_rules! next_rng { () => {{ rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng }} }
             let k = ctx.k;
@@ -4219,12 +4242,14 @@ fn run_mdd_sat_search(
                             z_solver.add_clause(z_block);
 
                             // Individual spectral already enforced by solver (167 freqs).
-                            // Just compute spectrum for pair check.
-                            let z_spectrum = compute_spectrum(&z_vals, &spectral_z, &mut fft_buf_z);
+                            // Just compute spectrum for pair check, into a reusable
+                            // buffer (the spectrum is only consumed by the bool-valued
+                            // pair check below — no need to allocate a fresh Vec per
+                            // Z solution).
+                            compute_spectrum_into(&z_vals, &spectral_z, &mut fft_buf_z, &mut z_spectrum_buf);
 
-                            let _pair_power = spectral_pair_max_power(&z_spectrum, &sz.w_spectrum);
                             if ctx.middle_n <= 20 {
-                                if !spectral_pair_ok(&z_spectrum, &sz.w_spectrum, ctx.pair_bound) {
+                                if !spectral_pair_ok(&z_spectrum_buf, &sz.w_spectrum, ctx.pair_bound) {
                                     flow_z_pair_fail.fetch_add(1, AtomicOrdering::Relaxed);
                                     if trace_z { eprintln!("TRACE:   Z solution #{} FAILED pair check", z_count); }
                                     continue;
