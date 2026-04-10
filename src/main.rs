@@ -3757,6 +3757,11 @@ fn run_mdd_sat_search(
                         // Check sum feasibility for each tuple, emit SolveW items
                         let z_bnd_sum = 2 * (bnd.z_bits.count_ones() as i32) - ctx.max_bnd_sum;
                         let w_bnd_sum = 2 * (bnd.w_bits.count_ones() as i32) - ctx.max_bnd_sum;
+                        // Batch all SolveW (or SolveWZ) items from this boundary so
+                        // we pay the queue lock cost once per boundary, not once per
+                        // tuple. For a boundary with ~10 tuples and many boundaries
+                        // per second, this cuts mutex pressure by ~10x.
+                        let mut bnd_batch: Vec<PipelineWork> = Vec::with_capacity(ctx.tuples.len());
                         for &tuple in &ctx.tuples {
                             let z_mid_sum = tuple.z - z_bnd_sum;
                             if z_mid_sum.abs() > ctx.middle_n as i32 || (z_mid_sum + ctx.middle_n as i32) % 2 != 0 {
@@ -3772,16 +3777,19 @@ fn run_mdd_sat_search(
                             }
                             stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
                             if use_wz_mode {
-                                wq.push(PipelineWork::SolveWZ(SolveWZWork {
+                                bnd_batch.push(PipelineWork::SolveWZ(SolveWZWork {
                                     tuple, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
                                     xy_root: bnd.xy_root, z_mid_sum, w_mid_sum,
                                 }));
                             } else {
-                                wq.push(PipelineWork::SolveW(SolveWWork {
+                                bnd_batch.push(PipelineWork::SolveW(SolveWWork {
                                     tuple, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
                                     xy_root: bnd.xy_root, z_mid_sum, w_mid_sum,
                                 }));
                             }
+                        }
+                        if !bnd_batch.is_empty() {
+                            wq.push_batch(bnd_batch);
                         }
                         stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
                     }
@@ -3800,6 +3808,11 @@ fn run_mdd_sat_search(
                         let mut trace_w_total = 0u64;
                         let mut trace_w_pass = 0u64;
                         if ctx.middle_m <= 20 {
+                            // Collect all passing W candidates into a batch so we push
+                            // them to the queue with a single lock. This eliminates
+                            // per-W mutex contention when middle_m is small and many
+                            // W candidates pass the spectral filter.
+                            let mut batch: Vec<PipelineWork> = Vec::new();
                             generate_sequences_permuted(ctx.middle_m, sw.w_mid_sum, false, false, 200_000, |w_mid| {
                                 if ctx.found.load(AtomicOrdering::Relaxed) { return false; }
                                 let mut w_vals = w_boundary.clone();
@@ -3811,7 +3824,7 @@ fn run_mdd_sat_search(
                                     flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
                                     w_found_any = true;
                                     stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
-                                    wq.push(PipelineWork::SolveZ(SolveZWork {
+                                    batch.push(PipelineWork::SolveZ(SolveZWork {
                                         tuple: sw.tuple, z_bits: sw.z_bits, w_bits: sw.w_bits,
                                         w_vals, w_spectrum, xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
                                     }));
@@ -3820,6 +3833,9 @@ fn run_mdd_sat_search(
                                 }
                                 true
                             });
+                            if !batch.is_empty() {
+                                wq.push_batch(batch);
+                            }
                         } else {
                             // SAT-based W generation
                             let mut w_solver = w_bases.remove(&sw.w_mid_sum).unwrap_or_else(||
@@ -3833,6 +3849,9 @@ fn run_mdd_sat_search(
                                 ));
                             }
 
+                            // Collect passing W candidates into a batch to reduce
+                            // queue lock contention, same as the brute-force path above.
+                            let mut batch: Vec<PipelineWork> = Vec::new();
                             loop {
                                 if ctx.found.load(AtomicOrdering::Relaxed) { break; }
                                 let phases: Vec<bool> = (0..ctx.middle_m)
@@ -3859,10 +3878,13 @@ fn run_mdd_sat_search(
                                 w_found_any = true;
 
                                 stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
-                                wq.push(PipelineWork::SolveZ(SolveZWork {
+                                batch.push(PipelineWork::SolveZ(SolveZWork {
                                     tuple: sw.tuple, z_bits: sw.z_bits, w_bits: sw.w_bits,
                                     w_vals, w_spectrum, xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
                                 }));
+                            }
+                            if !batch.is_empty() {
+                                wq.push_batch(batch);
                             }
                             w_solver.spectral = None;
                             w_solver.restore_checkpoint(w_cp);
