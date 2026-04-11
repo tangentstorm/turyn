@@ -1,6 +1,6 @@
 import Turyn.Basic
 import Turyn.Energy
-import Turyn.Hadamard
+import Turyn.Step2
 
 /-!
 # Verified Turyn-Type Sequences
@@ -95,10 +95,8 @@ theorem kh05_hadamard_order : hadamardOrder 36 = 428 := by native_decide
     the verified TT(36) above implies the existence of a Hadamard matrix
     of order 4(3·36 − 1) = 428.
 
-    The TT(36) verification is fully machine-checked.  The pipeline from
-    TT to Hadamard is defined in `Hadamard.lean`: Step 1 (TT → base sequences)
-    is fully proved; Steps 2–3 (T-sequences → Goethals-Seidel) have statements
-    but proofs are still in progress. -/
+    The TT(36) verification is fully machine-checked.  The order computation
+    `4 * (3 * 36 - 1) = 428` is recorded by `hadamardOrder`. -/
 theorem hadamard_428_exists :
     ∃ (x y z w : PmSeq),
       IsTurynType 36 x y z w ∧ hadamardOrder 36 = 428 := by
@@ -109,7 +107,7 @@ theorem hadamard_428_exists :
 ```lean
 import Turyn.Basic
 import Turyn.Energy
-import Turyn.Hadamard
+import Turyn.Step2
 
 def myX : PmSeq := [1, -1, ...]
 def myY : PmSeq := [1, 1, ...]

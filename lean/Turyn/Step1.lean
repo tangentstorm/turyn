@@ -39,6 +39,12 @@ def IsTurynType.toTyped {n : Nat} {x y z w : PmSeq}
 /-- Negate every entry in a sequence. -/
 def negSeq (a : List Int) : List Int := a.map (· * (-1))
 
+/-- Base sequences from TT(n) = (X, Y, Z, W):
+    A = Z ++ W, B = Z ++ (-W), C = X, D = Y. -/
+def baseSequences (x y z w : PmSeq) :
+    PmSeq × PmSeq × PmSeq × PmSeq :=
+  (z ++ w, z ++ negSeq w, x, y)
+
 /-- Typed base-sequence data for Step 1. -/
 structure BaseSeqData (n : Nat) where
   a : SignedSeq (2 * n - 1)
@@ -181,6 +187,31 @@ lemma concat_neg_autocorr_sum' (z w : List Int) (s : Nat) :
                2 * (w.getD i 0 * w.getD (i + s) 0)
           congr 1; congr 1 <;> (congr 1; omega)
 
+/-- Cross-term cancellation:
+    `N_{Z++W}(s) + N_{Z++(-W)}(s) = 2·N_Z(s) + 2·N_W(s)`. -/
+lemma concat_neg_autocorr_sum (z w : PmSeq) (s : Nat) :
+    aperiodicAutocorr (z ++ w) s + aperiodicAutocorr (z ++ negSeq w) s =
+    2 * aperiodicAutocorr z s + 2 * aperiodicAutocorr w s :=
+  concat_neg_autocorr_sum' z w s
+
+/-- Base-sequence theorem (KTR2005, Theorem 1). -/
+theorem base_seq_vanishing_prop {n : Nat} {x y z w : PmSeq}
+    (htt : IsTurynTypeProp n x y z w) (_hn : n ≥ 1)
+    {s : Nat} (hs1 : 1 ≤ s) :
+    aperiodicAutocorr (z ++ w) s + aperiodicAutocorr (z ++ negSeq w) s +
+    aperiodicAutocorr x s + aperiodicAutocorr y s = 0 := by
+  rw [concat_neg_autocorr_sum]
+  by_cases hsn : s < n
+  · have hvan := htt.vanishing s hs1 hsn
+    unfold combinedAutocorr at hvan
+    linarith
+  · simp only [not_lt] at hsn
+    rw [aperiodicAutocorr_zero_of_ge' z s (by rw [htt.z_len]; omega),
+        aperiodicAutocorr_zero_of_ge' w s (by rw [htt.w_len]; omega),
+        aperiodicAutocorr_zero_of_ge' x s (by rw [htt.x_len]; omega),
+        aperiodicAutocorr_zero_of_ge' y s (by rw [htt.y_len]; omega)]
+    ring
+
 /-- Step 1 interface: every typed Turyn quadruple yields typed base sequences. -/
 def step1 {n : Nat} (T : TurynType n) : BaseSeqData n :=
   { a := ⟨T.z.data ++ T.w.data,
@@ -193,7 +224,7 @@ def step1 {n : Nat} (T : TurynType n) : BaseSeqData n :=
     d := T.y
     vanishing := by
       intro s hs
-      rw [concat_neg_autocorr_sum']
+      rw [concat_neg_autocorr_sum]
       by_cases hsn : s < n
       · have := T.vanishing s hs hsn
         unfold combinedAutocorr at this

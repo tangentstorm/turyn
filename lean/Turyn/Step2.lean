@@ -33,6 +33,19 @@ def combinedPeriodicAutocorr (a b c d : List Int) (s : Nat) : Int :=
   periodicAutocorr a s + periodicAutocorr b s +
   periodicAutocorr c s + periodicAutocorr d s
 
+/-- Construct the four T-sequences from TT(n) = (X, Y, Z, W). -/
+def tSequences (x y z w : PmSeq) :
+    List Int × List Int × List Int × List Int :=
+  let (bsA, bsB, bsC, bsD) := baseSequences x y z w
+  let n := x.length
+  (seqSumHalf bsA bsB ++ zeroSeq n,
+   seqDiffHalf bsA bsB ++ zeroSeq n,
+   zeroSeq (2 * n - 1) ++ seqSumHalf bsC bsD,
+   zeroSeq (2 * n - 1) ++ seqDiffHalf bsC bsD)
+
+/-- The Hadamard order produced by the Turyn pipeline. -/
+def hadamardOrder (n : Nat) : Nat := 4 * (3 * n - 1)
+
 /-- Honest Step 2 output: a typed T-sequence object of length `m`. -/
 structure TSequence (m : Nat) where
   a : List Int
@@ -302,17 +315,15 @@ lemma step2_aperiodic_vanishing {n : Nat} (T : TurynType n) (s : Nat)
     (hs : 1 ≤ s) (hsm : s < 3 * n - 1) :
     aperiodicAutocorr (step2a T) s + aperiodicAutocorr (step2b T) s +
     aperiodicAutocorr (step2c T) s + aperiodicAutocorr (step2d T) s = 0 := by
-  -- Simplify each T-sequence's aperiodic autocorrelation
   simp only [step2a, step2b, step2c, step2d]
-  rw [aperiodicAutocorr_append_zeros, -- step2a: z ++ zeros → z
-      aperiodicAutocorr_prepend_zeros, -- step2b: zeros ++ (w ++ zeros) → w ++ zeros
-      aperiodicAutocorr_append_zeros, -- w ++ zeros → w
-      aperiodicAutocorr_prepend_zeros, -- step2c: zeros ++ sumHalf → sumHalf
-      aperiodicAutocorr_prepend_zeros] -- step2d: zeros ++ diffHalf → diffHalf
-  -- Now goal: N_z(s) + N_w(s) + N_{(x+y)/2}(s) + N_{(x-y)/2}(s) = 0
+  rw [aperiodicAutocorr_append_zeros,
+      aperiodicAutocorr_prepend_zeros,
+      aperiodicAutocorr_append_zeros,
+      aperiodicAutocorr_prepend_zeros,
+      aperiodicAutocorr_prepend_zeros]
   have hxy : T.x.data.length = T.y.data.length := by rw [T.x.len, T.y.len]
   have hXY := sumHalf_diffHalf_autocorr T.x.data T.y.data s hxy T.x.pm T.y.pm
-  have hbase := concat_neg_autocorr_sum' T.z.data T.w.data s
+  have hbase := concat_neg_autocorr_sum T.z.data T.w.data s
   by_cases hsn : s < n
   · have := T.vanishing s hs hsn
     unfold combinedAutocorr at this
@@ -322,10 +333,16 @@ lemma step2_aperiodic_vanishing {n : Nat} (T : TurynType n) (s : Nat)
         aperiodicAutocorr_zero_of_ge T.w.data s (by rw [T.w.len]; omega)]
     have : aperiodicAutocorr (seqSumHalf T.x.data T.y.data) s = 0 := by
       apply aperiodicAutocorr_zero_of_ge
-      rw [seqSumHalf_length]; simp only [hxy, Nat.min_self]; rw [T.y.len]; omega
+      rw [seqSumHalf_length]
+      simp only [hxy, Nat.min_self]
+      rw [T.y.len]
+      omega
     have : aperiodicAutocorr (seqDiffHalf T.x.data T.y.data) s = 0 := by
       apply aperiodicAutocorr_zero_of_ge
-      rw [seqDiffHalf_length]; simp only [hxy, Nat.min_self]; rw [T.y.len]; omega
+      rw [seqDiffHalf_length]
+      simp only [hxy, Nat.min_self]
+      rw [T.y.len]
+      omega
     linarith
 
 /-- Step 2 periodic vanishing: combined periodic autocorrelation of T-sequences vanishes. -/
