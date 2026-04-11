@@ -21,6 +21,34 @@ every nonzero shift:
 /-- A ±1 sequence, represented as a `List Int` with entries restricted to {1, −1}. -/
 abbrev PmSeq := List Int
 
+/-- Convert a sign character into the corresponding `±1` value. -/
+def charToPm? (c : Char) : Option Int :=
+  if c = '+' then some 1
+  else if c = '-' then some (-1)
+  else none
+
+/-- Parse a string of `+` and `-` characters into a `PmSeq`. -/
+def pmSeq? (s : String) : Option PmSeq :=
+  s.data.foldr
+    (fun c acc =>
+      match charToPm? c, acc with
+      | some x, some xs => some (x :: xs)
+      | _, _ => none)
+    (some [])
+
+/-- Parse a string literal of `+` and `-` characters into a `PmSeq`.
+    Invalid characters raise an error when the definition is evaluated. -/
+def pmSeq! (s : String) : PmSeq :=
+  match pmSeq? s with
+  | some xs => xs
+  | none => panic! s!"invalid PmSeq literal: {s}"
+
+/-- String literal notation for `PmSeq` values, e.g. `pm! "++--"`. -/
+syntax "pm! " str : term
+
+macro_rules
+  | `(pm! $s:str) => `(pmSeq! $s)
+
 /-- Check that every entry of a sequence is ±1. -/
 def allPmOne (a : PmSeq) : Bool :=
   a.all fun v => v == 1 || v == -1

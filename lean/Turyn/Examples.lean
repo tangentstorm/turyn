@@ -24,10 +24,10 @@ theorem my_solution_is_turyn : IsTurynType n myX myY myZ myW := by
 
 /-! ## TT(6): A small example -/
 
-def tt6X : PmSeq := [-1, -1, -1, -1, 1, -1]
-def tt6Y : PmSeq := [-1, -1, -1, 1, -1, -1]
-def tt6Z : PmSeq := [-1, -1, 1, -1, 1, 1]
-def tt6W : PmSeq := [-1, 1, 1, 1, -1]
+def tt6X : PmSeq := pm! "----+-"
+def tt6Y : PmSeq := pm! "---+--"
+def tt6Z : PmSeq := pm! "--+-++"
+def tt6W : PmSeq := pm! "-+++-"
 
 /-- TT(6) is a valid Turyn-type sequence.
     Verified by compiling the Boolean check to native code. -/
@@ -58,25 +58,10 @@ the smallest order for which no Hadamard matrix was previously known.
 Reference: Kharaghani, H. & Tayfeh-Rezaie, B. (2005).
 "A Hadamard matrix of order 428." *J. Combin. Des.* 13(6), 435–440. -/
 
-def kh05X : PmSeq := [
-  1, 1, 1, -1, -1, -1, -1, 1, 1, -1, 1, -1,
-  1, -1, -1, -1, -1, -1, 1, 1, 1, 1, -1, 1,
-  1, -1, 1, 1, 1, 1, -1, -1, -1, -1, 1, -1]
-
-def kh05Y : PmSeq := [
-  1, -1, 1, 1, 1, 1, 1, -1, -1, 1, -1, 1,
-  -1, -1, 1, -1, -1, 1, 1, -1, -1, 1, 1, 1,
-  1, -1, 1, 1, 1, 1, -1, -1, -1, 1, 1, -1]
-
-def kh05Z : PmSeq := [
-  1, -1, 1, 1, 1, 1, 1, -1, 1, -1, -1, 1,
-  1, 1, 1, -1, 1, 1, 1, -1, 1, 1, -1, -1,
-  1, 1, 1, -1, 1, -1, -1, 1, -1, -1, -1, 1]
-
-def kh05W : PmSeq := [
-  1, 1, 1, -1, 1, -1, -1, -1, -1, -1, 1, 1,
-  -1, -1, 1, -1, 1, 1, 1, -1, -1, 1, -1, 1,
-  -1, 1, 1, 1, -1, 1, 1, 1, 1, -1, 1]
+def kh05X : PmSeq := pm! "+++----++-+-+-----++++-++-++++----+-"
+def kh05Y : PmSeq := pm! "+-+++++--+-+--+--++--++++-++++---++-"
+def kh05Z : PmSeq := pm! "+-+++++-+--++++-+++-++--+++-+--+---+"
+def kh05W : PmSeq := pm! "+++-+-----++--+-+++--+-+-+++-++++-+"
 
 /-- **Kharaghani–Tayfeh-Rezaie TT(36) is a valid Turyn-type sequence.**
 
