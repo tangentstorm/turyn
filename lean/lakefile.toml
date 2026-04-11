@@ -1,5 +1,6 @@
 name = "turyn"
 version = "0.1.0"
+defaultTargets = ["Turyn"]
 
 [leanOptions]
 autoImplicit = false
@@ -7,7 +8,6 @@ autoImplicit = false
 [[lean_lib]]
 name = "Turyn"
 roots = ["Turyn"]
-defaultFacets = ["all"]
 
 [[require]]
 name = "mathlib"

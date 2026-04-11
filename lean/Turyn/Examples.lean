@@ -3,6 +3,8 @@ import Turyn.Energy
 import Turyn.TSequence
 import Turyn.Hadamard
 
+open Turyn
+
 /-!
 # Verified Turyn-Type Sequences
 
