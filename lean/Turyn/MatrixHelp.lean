@@ -1,4 +1,4 @@
-import Turyn.Step2
+import Turyn.TSequence
 
 open Finset
 open BigOperators

@@ -1,6 +1,6 @@
-import Turyn.Basic
+import Turyn.TurynType
 import Turyn.Energy
-import Turyn.Step2
+import Turyn.TSequence
 
 /-!
 # Verified Turyn-Type Sequences
@@ -105,9 +105,9 @@ theorem hadamard_428_exists :
 /-! ## Template for publishing your own results
 
 ```lean
-import Turyn.Basic
+import Turyn.TurynType
 import Turyn.Energy
-import Turyn.Step2
+import Turyn.TSequence
 
 def myX : PmSeq := [1, -1, ...]
 def myY : PmSeq := [1, 1, ...]

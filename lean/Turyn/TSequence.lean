@@ -1,4 +1,4 @@
-import Turyn.Step1
+import Turyn.BaseSequence
 import Mathlib
 
 open Finset

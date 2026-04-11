@@ -1,4 +1,5 @@
-import Turyn.Basic
+import Turyn.TurynType
+import Turyn.BaseSequence
+import Turyn.TSequence
 import Turyn.Energy
-import Turyn.Hadamard
 import Turyn.Examples

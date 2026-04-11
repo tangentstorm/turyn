@@ -1,4 +1,4 @@
-import Turyn.Basic
+import Turyn.TurynType
 
 /-!
 # Step 1: Typed Turyn Data and Base Sequences

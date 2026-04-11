@@ -1,5 +1,5 @@
 import Turyn.Step3
-import Turyn.GSTyped
+import Turyn.GoethalsSeidel
 
 namespace Turyn
 

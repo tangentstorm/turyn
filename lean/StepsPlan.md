@@ -7,8 +7,8 @@ pipeline
 
 It is meant to match the structure of
 
-- [Step1.lean](/C:/ver/turyn/lean/Turyn/Step1.lean)
-- [Step2.lean](/C:/ver/turyn/lean/Turyn/Step2.lean)
+- [BaseSequence.lean](/C:/ver/turyn/lean/Turyn/BaseSequence.lean)
+- [TSequence.lean](/C:/ver/turyn/lean/Turyn/TSequence.lean)
 - [Step3.lean](/C:/ver/turyn/lean/Turyn/Step3.lean)
 
 without relying on [Hadamard.lean](/C:/ver/turyn/lean/Turyn/Hadamard.lean).

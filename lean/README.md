@@ -40,7 +40,7 @@ simplification and lag regrouping; the second is linearity of `Finset.sum`.
 
 ```
 Turyn/
-├── Basic.lean      Core definitions: aperiodic autocorrelation, IsTurynType
+├── TurynType.lean      Core definitions: aperiodic autocorrelation, IsTurynType
 │                   (Bool + Prop), rangeSum helper, AllPmOne, decidability.
 │                   Fully proved: IsTurynType.toProp, rangeSum lemmas.
 ├── Energy.lean     Energy identity x² + y² + 2z² + 2w² = 6n − 2.
@@ -56,7 +56,7 @@ Turyn/
 After the turyn solver finds a TT(n), add a new file:
 
 ```lean
-import Turyn.Basic
+import Turyn.TurynType
 import Turyn.Energy
 import Turyn.Hadamard
 
