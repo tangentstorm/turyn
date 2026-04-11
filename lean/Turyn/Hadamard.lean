@@ -1,5 +1,12 @@
 import Turyn.GSArrayBridge
 
+/-!
+# Constructive Hadamard Output
+
+Top-level constructive interface from Turyn-type sequences, or an
+`IsTurynType` certificate, to an explicit Hadamard matrix.
+-/
+
 namespace Turyn
 
 /-- Construct the Hadamard matrix attached to a typed Turyn-type sequence. -/

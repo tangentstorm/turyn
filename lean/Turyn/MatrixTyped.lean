@@ -3,6 +3,13 @@ import Mathlib
 open Matrix
 open BigOperators
 
+/-!
+# Typed Matrix Infrastructure
+
+Typed vectors, matrices, circulants, reversal matrices, and matrix lemmas used
+by the Goethals-Seidel construction.
+-/
+
 namespace Turyn
 
 /-- Typed integer vectors indexed by `Fin n`. -/

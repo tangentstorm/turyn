@@ -1,10 +1,12 @@
 import Turyn.TurynType
 
 /-!
-# Step 1: Typed Turyn Data and Base Sequences
+# Base Sequences
 
-This file is standalone and does not depend on `Turyn.Hadamard`.
-It introduces typed wrappers for signed sequences and Turyn quadruples.
+Typed signed-sequence wrappers, typed Turyn-type input, and the standard
+construction of base sequences `(A,B,C,D)` from a Turyn-type sequence. The
+main theorem in this file proves that these base sequences satisfy the required
+combined aperiodic autocorrelation identity.
 -/
 
 /-- A length-indexed `±1` sequence. -/

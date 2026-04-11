@@ -5,10 +5,12 @@ open Finset
 open BigOperators
 
 /-!
-# Step 2: Typed T-Sequences
+# T-Sequences
 
-This file is standalone and does not depend on `Turyn.Hadamard`.
-It introduces a typed T-sequence object and the Step 2 construction.
+Typed T-sequences and the standard construction from base sequences. The main
+results show that the constructed sequences have disjoint `{0, ±1}` support and
+vanishing combined periodic autocorrelation, making them ready for the final
+Goethals-Seidel step.
 -/
 
 /-- Element-wise sum divided by `2`. -/

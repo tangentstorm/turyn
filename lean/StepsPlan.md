@@ -3,13 +3,14 @@
 This note gives an informal, mathematician-readable proof of the standalone
 pipeline
 
-`TurynType n -> TSequence (3*n - 1) -> HadamardMatrix (4*(3*n - 1))`.
+`TurynType n -> TSequence (3*n - 1) -> IntMat (4*(3*n - 1))`.
 
 It is meant to match the structure of
 
 - [BaseSequence.lean](/C:/ver/turyn/lean/Turyn/BaseSequence.lean)
 - [TSequence.lean](/C:/ver/turyn/lean/Turyn/TSequence.lean)
-- [Step3.lean](/C:/ver/turyn/lean/Turyn/Step3.lean)
+- [GoethalsSeidel.lean](/C:/ver/turyn/lean/Turyn/GoethalsSeidel.lean)
+- [GSArrayBridge.lean](/C:/ver/turyn/lean/Turyn/GSArrayBridge.lean)
 
 without relying on [Hadamard.lean](/C:/ver/turyn/lean/Turyn/Hadamard.lean).
 

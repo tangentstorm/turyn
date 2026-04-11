@@ -2,6 +2,13 @@ import Turyn.MatrixTyped
 
 open Matrix
 
+/-!
+# Goethals-Seidel Construction
+
+The typed Goethals-Seidel array, together with the matrix-algebra proof that
+certified GS data produces a Hadamard matrix.
+-/
+
 namespace Turyn
 
 /-- Typed sign-quad input for the Goethals-Seidel construction. -/
