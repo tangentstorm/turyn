@@ -1,10 +1,3 @@
-/-!
-# Turyn Library Exports
-
-Top-level exports for the constructive Turyn-to-Hadamard pipeline and the
-supporting theory files.
--/
-
 import Turyn.TurynType
 import Turyn.BaseSequence
 import Turyn.TSequence
@@ -14,3 +7,10 @@ import Turyn.GSArrayBridge
 import Turyn.Hadamard
 import Turyn.Energy
 import Turyn.Examples
+
+/-!
+# Turyn Library Exports
+
+Top-level exports for the constructive Turyn-to-Hadamard pipeline and the
+supporting theory files.
+-/

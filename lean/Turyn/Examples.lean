@@ -1,6 +1,7 @@
 import Turyn.TurynType
 import Turyn.Energy
 import Turyn.TSequence
+import Turyn.Hadamard
 
 /-!
 # Verified Turyn-Type Sequences
@@ -39,6 +40,15 @@ theorem tt6_energy : checkEnergy 6 tt6X tt6Y tt6Z tt6W = true := by native_decid
 theorem tt6_sums :
     seqSum tt6X = -4 ∧ seqSum tt6Y = -4 ∧ seqSum tt6Z = 0 ∧ seqSum tt6W = 1 := by
   native_decide
+
+/-- The constructive pipeline produces a Hadamard matrix of order `68` from TT(6). -/
+def tt6_hadamard : IntMat 68 :=
+  ofIsTurynTypeMatrix tt6_valid
+
+/-- The constructive TT(6) matrix satisfies the Hadamard property. -/
+theorem tt6_hadamard_isHadamard :
+    IsHadamardMat tt6_hadamard := by
+  exact ofIsTurynTypeMatrix_isHadamard tt6_valid
 
 /-! ## TT(36): Kharaghani & Tayfeh-Rezaie (2005), Hadamard matrix of order 428
 
