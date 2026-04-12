@@ -11,11 +11,11 @@ Goethals-Seidel input and expose the resulting constructive Hadamard matrix.
 namespace Turyn
 
 /-- Convert a length-`n` list into a typed vector on `Fin n`. -/
-def listToIntVec {n : Nat} (xs : List Int) (hxs : xs.length = n) : IntVec n :=
+def listToIntVec {n : Nat} (xs : List Int) : IntVec n :=
   fun i => xs.getD i.1 0
 
-@[simp] theorem listToIntVec_apply {n : Nat} (xs : List Int) (hxs : xs.length = n) (i : Fin n) :
-    listToIntVec xs hxs i = xs.getD i.1 0 := rfl
+@[simp] theorem listToIntVec_apply {n : Nat} (xs : List Int) (i : Fin n) :
+    listToIntVec xs i = xs.getD i.1 0 := rfl
 
 /-! ### `±1` sequences extracted from a T-sequence -/
 
@@ -55,25 +55,25 @@ def tseqCombine4 {m : Nat} (T : TSequence m) : List Int :=
     (tseqCombine1 T).getD j 0 =
       T.a.getD j 0 + T.b.getD j 0 + T.c.getD j 0 + T.d.getD j 0 := by
   rw [List.getD_eq_getElem _ _ (by simpa [tseqCombine1] using hj)]
-  simp [tseqCombine1, hj]
+  simp [tseqCombine1]
 
 @[simp] lemma tseqCombine2_getD {m : Nat} (T : TSequence m) {j : Nat} (hj : j < m) :
     (tseqCombine2 T).getD j 0 =
       T.a.getD j 0 + T.b.getD j 0 - T.c.getD j 0 - T.d.getD j 0 := by
   rw [List.getD_eq_getElem _ _ (by simpa [tseqCombine2] using hj)]
-  simp [tseqCombine2, hj]
+  simp [tseqCombine2]
 
 @[simp] lemma tseqCombine3_getD {m : Nat} (T : TSequence m) {j : Nat} (hj : j < m) :
     (tseqCombine3 T).getD j 0 =
       T.a.getD j 0 - T.b.getD j 0 + T.c.getD j 0 - T.d.getD j 0 := by
   rw [List.getD_eq_getElem _ _ (by simpa [tseqCombine3] using hj)]
-  simp [tseqCombine3, hj]
+  simp [tseqCombine3]
 
 @[simp] lemma tseqCombine4_getD {m : Nat} (T : TSequence m) {j : Nat} (hj : j < m) :
     (tseqCombine4 T).getD j 0 =
       T.a.getD j 0 - T.b.getD j 0 - T.c.getD j 0 + T.d.getD j 0 := by
   rw [List.getD_eq_getElem _ _ (by simpa [tseqCombine4] using hj)]
-  simp [tseqCombine4, hj]
+  simp [tseqCombine4]
 
 lemma tseqCombine1_pmOne {m : Nat} (T : TSequence m) :
     ∀ j, j < m → (tseqCombine1 T).getD j 0 = 1 ∨ (tseqCombine1 T).getD j 0 = -1 := by
@@ -264,7 +264,7 @@ def gsSequenceQuadOfTSequence {m : Nat} (T : TSequence m) : GSSequenceQuad m :=
     periodic_vanishing := tseqCombine_periodic_vanishing T }
 
 lemma typed_periodicAutocorr_eq_list {n : Nat} (xs : List Int) (hxs : xs.length = n) (s : Fin n) :
-    Turyn.periodicAutocorr (listToIntVec xs hxs) s = _root_.periodicAutocorr xs s.1 := by
+    Turyn.periodicAutocorr (listToIntVec xs) s = _root_.periodicAutocorr xs s.1 := by
   by_cases hn : n = 0
   · subst hn
     exact (Nat.not_lt_zero _ s.2).elim
@@ -281,10 +281,10 @@ lemma typed_periodicAutocorr_eq_list {n : Nat} (xs : List Int) (hxs : xs.length 
         (f := fun i : Nat => xs.getD i 0 * xs.getD ((i + s.1) % n) 0))
 
 lemma typed_combinedPeriodic_eq_list {m : Nat} (Q : GSSequenceQuad m) (s : Fin m) :
-    Turyn.periodicAutocorr (listToIntVec Q.x1 Q.x1_len) s +
-      Turyn.periodicAutocorr (listToIntVec Q.x2 Q.x2_len) s +
-      Turyn.periodicAutocorr (listToIntVec Q.x3 Q.x3_len) s +
-      Turyn.periodicAutocorr (listToIntVec Q.x4 Q.x4_len) s =
+    Turyn.periodicAutocorr (listToIntVec Q.x1) s +
+    Turyn.periodicAutocorr (listToIntVec Q.x2) s +
+    Turyn.periodicAutocorr (listToIntVec Q.x3) s +
+    Turyn.periodicAutocorr (listToIntVec Q.x4) s =
       _root_.combinedPeriodicAutocorr Q.x1 Q.x2 Q.x3 Q.x4 s.1 := by
   unfold _root_.combinedPeriodicAutocorr
   rw [typed_periodicAutocorr_eq_list Q.x1 Q.x1_len s,
@@ -294,10 +294,10 @@ lemma typed_combinedPeriodic_eq_list {m : Nat} (Q : GSSequenceQuad m) (s : Fin m
 
 /-- Turn the standalone `GSSequenceQuad` data into certified typed GS input. -/
 def gsDataOfQuad {m : Nat} (Q : GSSequenceQuad m) : CertifiedGSData m :=
-  { x1 := listToIntVec Q.x1 Q.x1_len
-    x2 := listToIntVec Q.x2 Q.x2_len
-    x3 := listToIntVec Q.x3 Q.x3_len
-    x4 := listToIntVec Q.x4 Q.x4_len
+  { x1 := listToIntVec Q.x1
+    x2 := listToIntVec Q.x2
+    x3 := listToIntVec Q.x3
+    x4 := listToIntVec Q.x4
     x1_pm := by
       intro i
       simpa [listToIntVec] using Q.x1_pm i.1 i.2
@@ -315,10 +315,10 @@ def gsDataOfQuad {m : Nat} (Q : GSSequenceQuad m) : CertifiedGSData m :=
       have hs1 : 1 ≤ s.1 := by omega
       have hslt : s.1 < m := s.2
       change
-        Turyn.periodicAutocorr (listToIntVec Q.x1 Q.x1_len) s +
-          Turyn.periodicAutocorr (listToIntVec Q.x2 Q.x2_len) s +
-          Turyn.periodicAutocorr (listToIntVec Q.x3 Q.x3_len) s +
-          Turyn.periodicAutocorr (listToIntVec Q.x4 Q.x4_len) s = 0
+        Turyn.periodicAutocorr (listToIntVec Q.x1) s +
+          Turyn.periodicAutocorr (listToIntVec Q.x2) s +
+          Turyn.periodicAutocorr (listToIntVec Q.x3) s +
+          Turyn.periodicAutocorr (listToIntVec Q.x4) s = 0
       rw [typed_combinedPeriodic_eq_list Q s]
       simpa using Q.periodic_vanishing s.1 hs1 hslt }
 

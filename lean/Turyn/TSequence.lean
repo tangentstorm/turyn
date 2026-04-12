@@ -226,8 +226,7 @@ private lemma aperiodicAutocorr_zero_of_ge (a : List Int) (s : Nat) (h : s ≥ a
   unfold aperiodicAutocorr; exact if_pos h
 
 /-- Periodic autocorrelation decomposes into aperiodic at lag s plus aperiodic at lag m-s. -/
-lemma periodic_eq_aperiodic_sum (a : List Int) (s : Nat) (hs : 0 < s) (hsm : s < a.length)
-    (hm : a.length > 0) :
+lemma periodic_eq_aperiodic_sum (a : List Int) (s : Nat) (hs : 0 < s) (hsm : s < a.length) :
     periodicAutocorr a s =
       aperiodicAutocorr a s + aperiodicAutocorr a (a.length - s) := by
   set m := a.length with hm_def
@@ -252,7 +251,7 @@ lemma periodic_eq_aperiodic_sum (a : List Int) (s : Nat) (hs : 0 < s) (hsm : s <
     rw [show (m - s + i + s) % m = i from by
       rw [show m - s + i + s = i + m from by omega, Nat.add_mod_right]
       exact Nat.mod_eq_of_lt (by omega)]
-    ring
+    ring_nf
 
 /-
 Appending zeros does not change the aperiodic autocorrelation.
@@ -260,7 +259,7 @@ Appending zeros does not change the aperiodic autocorrelation.
 lemma aperiodicAutocorr_append_zeros (a : List Int) (k s : Nat) :
     aperiodicAutocorr (a ++ zeroSeq k) s = aperiodicAutocorr a s := by
   unfold aperiodicAutocorr;
-  split_ifs <;> simp_all +decide [ List.getD_append ];
+  split_ifs <;> simp_all +decide;
   · linarith;
   · rw [ Finset.sum_eq_zero ] ; intros ; simp_all +decide [ List.getElem?_append, zeroSeq ];
     grind +revert;
@@ -283,7 +282,7 @@ lemma aperiodicAutocorr_prepend_zeros (a : List Int) (k s : Nat) :
     grind;
   · rw [ show k + a.length - s = ( a.length - s ) + k by omega, add_comm, Finset.sum_range_add ];
     simp +decide [ List.getElem?_append, List.getElem?_replicate ];
-    simp +decide [ add_assoc, Nat.add_sub_assoc ];
+    simp +decide [add_assoc];
     exact Finset.sum_eq_zero fun x hx => by aesop;
 
 /-
@@ -299,7 +298,7 @@ lemma sumHalf_diffHalf_autocorr (a b : List Int) (s : Nat)
   rw [ ← Finset.sum_add_distrib, ← Finset.sum_add_distrib ];
   rw [ Finset.mul_sum _ _ _ ];
   refine' Finset.sum_congr rfl fun i hi => _;
-  by_cases hi' : i < a.length <;> by_cases hi'' : i + s < a.length <;> simp_all +decide [ List.getElem?_eq_none ];
+  by_cases hi' : i < a.length <;> by_cases hi'' : i + s < a.length <;> simp_all +decide;
   have := ha ( a[i] ) ( by simp ) ; have := hb ( b[i] ) ( by simp ) ; have := ha ( a[i + s] ) ( by simp ) ; have := hb ( b[i + s] ) ( by simp ) ; aesop
 
 /-- Length of seqSumHalf. -/
@@ -313,8 +312,7 @@ lemma sumHalf_diffHalf_autocorr (a b : List Int) (s : Nat)
   simp [seqDiffHalf, List.length_zipWith]
 
 /-- Combined aperiodic autocorrelation of the step2 sequences vanishes. -/
-lemma step2_aperiodic_vanishing {n : Nat} (T : TurynType n) (s : Nat)
-    (hs : 1 ≤ s) (hsm : s < 3 * n - 1) :
+lemma step2_aperiodic_vanishing {n : Nat} (T : TurynType n) (s : Nat) (hs : 1 ≤ s) :
     aperiodicAutocorr (step2a T) s + aperiodicAutocorr (step2b T) s +
     aperiodicAutocorr (step2c T) s + aperiodicAutocorr (step2d T) s = 0 := by
   simp only [step2a, step2b, step2c, step2d]
@@ -365,13 +363,13 @@ theorem step2_periodic {n : Nat} (T : TurynType n) :
   have hd_len : (step2d T).length = m := by
     simp [step2d, zeroSeq, seqDiffHalf, List.length_zipWith, T.x.len, T.y.len]; omega
   have hm : m > 0 := by omega
-  rw [periodic_eq_aperiodic_sum _ s (by omega) (by rw [ha_len]; omega) (by rw [ha_len]; omega),
-      periodic_eq_aperiodic_sum _ s (by omega) (by rw [hb_len]; omega) (by rw [hb_len]; omega),
-      periodic_eq_aperiodic_sum _ s (by omega) (by rw [hc_len]; omega) (by rw [hc_len]; omega),
-      periodic_eq_aperiodic_sum _ s (by omega) (by rw [hd_len]; omega) (by rw [hd_len]; omega)]
+  rw [periodic_eq_aperiodic_sum _ s (by omega) (by rw [ha_len]; omega),
+      periodic_eq_aperiodic_sum _ s (by omega) (by rw [hb_len]; omega),
+      periodic_eq_aperiodic_sum _ s (by omega) (by rw [hc_len]; omega),
+      periodic_eq_aperiodic_sum _ s (by omega) (by rw [hd_len]; omega)]
   rw [ha_len, hb_len, hc_len, hd_len]
-  have h1 := step2_aperiodic_vanishing T s hs1 hs2
-  have h2 := step2_aperiodic_vanishing T (m - s) (by omega) (by omega)
+  have h1 := step2_aperiodic_vanishing T s hs1
+  have h2 := step2_aperiodic_vanishing T (m - s) (by omega)
   linarith
 
 /-- Step 2 as a typed function from Turyn data to a certified T-sequence. -/

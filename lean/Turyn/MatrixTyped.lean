@@ -131,11 +131,11 @@ theorem reversalMatrix_mul_reversalMatrix {n : Nat} :
         have : b = revFin j := revFin_eq_iff.mp h1.symm
         contradiction
       · simp [reversalMatrix, h1]
-    · simp [reversalMatrix, hij]
+    · simp [reversalMatrix]
 
 theorem circulant_mul_transpose_apply {n : Nat} (x y : IntVec n) (i j : Fin n) :
     (circulant x * (circulant y)ᵀ) i j = ∑ k : Fin n, x (k - i) * y (k - j) := by
-  simp [Matrix.mul_apply, circulant, sub_eq_add_neg, mul_comm, mul_left_comm, mul_assoc]
+  simp [Matrix.mul_apply, circulant]
 
 theorem reversal_conjugates_circulant_apply {n : Nat} (x : IntVec n) (i j : Fin n) :
     (reversalMatrix n * circulant x * reversalMatrix n) i j = x (revFin j - revFin i) := by

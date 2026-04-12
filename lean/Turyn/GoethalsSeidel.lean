@@ -231,40 +231,40 @@ def GSBlockTarget {n : Nat} (G : GSData n) : Prop :=
 
 /-! ### Helper lemmas for block entry extraction -/
 
-private lemma div_block0 {n : Nat} (i : Fin n) (hn : n ≠ 0) :
+private lemma div_block0 {n : Nat} (i : Fin n) :
     (gsBlockEquiv n (Sum.inl (Sum.inl i))).1 / n = 0 := by
   rw [gsBlockEquiv_block0]; exact Nat.div_eq_of_lt i.2
 
-private lemma div_block1 {n : Nat} (i : Fin n) (hn : n ≠ 0) :
+private lemma div_block1 {n : Nat} (i : Fin n) :
     (gsBlockEquiv n (Sum.inl (Sum.inr i))).1 / n = 1 := by
   rw [gsBlockEquiv_block1]
   exact Nat.div_eq_of_lt_le (by omega) (by omega)
 
-private lemma div_block2 {n : Nat} (i : Fin n) (hn : n ≠ 0) :
+private lemma div_block2 {n : Nat} (i : Fin n) :
     (gsBlockEquiv n (Sum.inr (Sum.inl i))).1 / n = 2 := by
   rw [gsBlockEquiv_block2]
   exact Nat.div_eq_of_lt_le (by omega) (by omega)
 
-private lemma div_block3 {n : Nat} (i : Fin n) (hn : n ≠ 0) :
+private lemma div_block3 {n : Nat} (i : Fin n) :
     (gsBlockEquiv n (Sum.inr (Sum.inr i))).1 / n = 3 := by
   rw [gsBlockEquiv_block3]
   exact Nat.div_eq_of_lt_le (by omega) (by omega)
 
-private lemma mod_block0 {n : Nat} (i : Fin n) (hn : n ≠ 0) :
+private lemma mod_block0 {n : Nat} (i : Fin n) :
     (gsBlockEquiv n (Sum.inl (Sum.inl i))).1 % n = i.1 := by
   rw [gsBlockEquiv_block0]; exact Nat.mod_eq_of_lt i.2
 
-private lemma mod_block1 {n : Nat} (i : Fin n) (hn : n ≠ 0) :
+private lemma mod_block1 {n : Nat} (i : Fin n) :
     (gsBlockEquiv n (Sum.inl (Sum.inr i))).1 % n = i.1 := by
   rw [gsBlockEquiv_block1]; rw [Nat.add_mod_right]; exact Nat.mod_eq_of_lt i.2
 
-private lemma mod_block2 {n : Nat} (i : Fin n) (hn : n ≠ 0) :
+private lemma mod_block2 {n : Nat} (i : Fin n) :
     (gsBlockEquiv n (Sum.inr (Sum.inl i))).1 % n = i.1 := by
   rw [gsBlockEquiv_block2]
   rw [show i.1 + (n + n) = i.1 + 2 * n from by ring, Nat.add_mul_mod_self_right]
   exact Nat.mod_eq_of_lt i.2
 
-private lemma mod_block3 {n : Nat} (i : Fin n) (hn : n ≠ 0) :
+private lemma mod_block3 {n : Nat} (i : Fin n) :
     (gsBlockEquiv n (Sum.inr (Sum.inr i))).1 % n = i.1 := by
   rw [gsBlockEquiv_block3]
   rw [show i.1 + n + (n + n) = i.1 + 3 * n from by ring, Nat.add_mul_mod_self_right]
@@ -282,9 +282,9 @@ theorem gsMatrix_eq_reindex_gsBlockMatrix {n : Nat} (G : GSData n) :
     rcases p with ((p | p) | (p | p)) <;> rcases q with ((q | q) | (q | q)) <;>
     simp only [gsMatrix, gsMatrixEntry, gsBlockMatrix, Matrix.submatrix_apply,
       Equiv.symm_apply_apply, Matrix.fromBlocks_apply₁₁, Matrix.fromBlocks_apply₁₂,
-      Matrix.fromBlocks_apply₂₁, Matrix.fromBlocks_apply₂₂, div_block0 _ hn, div_block1 _ hn,
-      div_block2 _ hn, div_block3 _ hn, mod_block0 _ hn, mod_block1 _ hn, mod_block2 _ hn,
-      mod_block3 _ hn]
+      Matrix.fromBlocks_apply₂₁, Matrix.fromBlocks_apply₂₂, div_block0 _, div_block1 _,
+      div_block2 _, div_block3 _, mod_block0 _, mod_block1 _, mod_block2 _,
+      mod_block3 _]
 
 /-! ### Core algebraic helper lemmas -/
 

@@ -29,7 +29,7 @@ def charToPm? (c : Char) : Option Int :=
 
 /-- Parse a string of `+` and `-` characters into a `PmSeq`. -/
 def pmSeq? (s : String) : Option PmSeq :=
-  s.data.foldr
+  s.toList.foldr
     (fun c acc =>
       match charToPm? c, acc with
       | some x, some xs => some (x :: xs)
