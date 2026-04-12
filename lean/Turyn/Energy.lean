@@ -18,22 +18,22 @@ the sums x = Σ Xᵢ, y = Σ Yᵢ, z = Σ Zᵢ, w = Σ Wᵢ satisfy:
 
 The proof follows from two facts:
 
-**Fact 1 (Sum-autocorrelation identity):**
+Fact 1 (Sum-autocorrelation identity):
 For any ±1 sequence `a` of length `k`:
 
-    (Σᵢ aᵢ)² = k + 2 · Σ_{s=1}^{k-1} N_a(s)
+    (Σᵢ aᵢ)² = k + 2 · Σ (s=1…k−1) Nₐ(s)
 
-*Proof:*  Expand (Σᵢ aᵢ)² = Σᵢ aᵢ² + 2·Σ_{i<j} aᵢaⱼ.
-Since aᵢ ∈ {±1}, we have aᵢ² = 1, so Σᵢ aᵢ² = k.
-The cross terms group by lag: Σ_{i<j} aᵢaⱼ = Σ_{s=1}^{k-1} N_a(s).
+Proof: Expand (Σᵢ aᵢ)² = Σᵢ aᵢ² + 2·Σ (i < j) aᵢaⱼ.
+Since aᵢ = ±1, we have aᵢ² = 1, so Σᵢ aᵢ² = k.
+The cross terms group by lag: Σ (i < j) aᵢaⱼ = Σ (s=1…k−1) Nₐ(s).
 
-**Fact 2 (Turyn vanishing):**
+Fact 2 (Turyn vanishing):
 N_X(s) + N_Y(s) + 2·N_Z(s) + 2·N_W(s) = 0 for all s ≥ 1.
 
-**Combining:**
+Combining:
     x² + y² + 2z² + 2w²
   = (n + 2·Σ N_X(s)) + (n + 2·Σ N_Y(s))
-    + 2·(n + 2·Σ N_Z(s)) + 2·((n-1) + 2·Σ N_W(s))
+    + 2·(n + 2·Σ N_Z(s)) + 2·((n−1) + 2·Σ N_W(s))
   = (6n − 2) + 2 · 0 = 6n − 2                                □
 -/
 
