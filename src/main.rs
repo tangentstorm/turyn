@@ -3796,18 +3796,36 @@ fn run_mdd_sat_search(
         // Progress display
         if verbose && last_progress.elapsed().as_secs() >= 10 {
             let elapsed = run_start.elapsed().as_secs_f64();
-            let done = items_completed.load(AtomicOrdering::Relaxed);
             if wz_mode == WzMode::Cross {
                 // Cross mode: the MDD-centric depth bars are meaningless
                 // (the monitor doesn't walk paths and stages 0-2 stay at
                 // zero). Report producer progress instead: how many
                 // tuples have been enumerated, the gold queue depth, and
-                // the individual-XY-candidate throughput.
+                // the individual-XY-candidate throughput. TTC is
+                // extrapolated from tuple progress: estimate the total
+                // XY candidates as `pushed × tuples_total / tuples_done`.
                 let gold_depth = work_queue.gold_len();
-                let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+                let xy_pushed  = stage_enter[3].load(AtomicOrdering::Relaxed);
+                let xy_done_eff = effective_xy_done(
+                    flow_xy_sat.load(AtomicOrdering::Relaxed),
+                    flow_xy_unsat.load(AtomicOrdering::Relaxed),
+                    flow_xy_timeout.load(AtomicOrdering::Relaxed),
+                    flow_xy_timeout_cov_micro.load(AtomicOrdering::Relaxed),
+                );
+                let est_total = cross_estimated_total_xy(
+                    xy_pushed, cross_tuple_idx, tuples.len(), cross_done,
+                );
+                let rate = if elapsed > 0.0 { xy_done_eff / elapsed } else { 0.0 };
+                let ttc = if rate > 0.0 { (est_total - xy_done_eff).max(0.0) / rate } else { f64::INFINITY };
+                let ttc_str = if ttc < 60.0 { format!("{:.0}s", ttc) }
+                             else if ttc < 3600.0 { format!("{:.0}m", ttc / 60.0) }
+                             else if ttc < 86400.0 { format!("{:.1}h", ttc / 3600.0) }
+                             else { format!("{:.0}d", ttc / 86400.0) };
+                let pct = if est_total > 0.0 { xy_done_eff / est_total * 100.0 } else { 0.0 };
                 eprintln!(
-                    "[{:>3.0}s] --wz=cross  tuples {}/{}  gold queue {}  XY candidates {}  {:.0}/s",
-                    elapsed, cross_tuple_idx, tuples.len(), gold_depth, done, rate,
+                    "[{:>3.0}s] --wz=cross  tuples {}/{}  gold {}  XY {:.0}/{:.0} ({:.1}%)  {:.0}/s  cover:{}",
+                    elapsed, cross_tuple_idx, tuples.len(), gold_depth,
+                    xy_done_eff, est_total, pct, rate, ttc_str,
                 );
             } else {
                 // MDD modes: boundary walker drives everything, so the
@@ -3916,19 +3934,43 @@ fn run_mdd_sat_search(
         // For a run with no XY timeouts, `eff == walked` exactly, so the
         // formula reduces to the prior path-rate-based TTC.
         let xy_timeout_cov_micro = flow_xy_timeout_cov_micro.load(AtomicOrdering::Relaxed);
-        let eff = effective_coverage_metric(
-            walked, xy_sat_count, xy_unsat_count, xy_timeout_count, xy_timeout_cov_micro,
-        );
+        // Pick the right denominator for this mode. Apart/Together walk
+        // MDD boundaries — total work = `live_zw_paths`, effective done =
+        // `walked × (1 - shortfall_per_xy)`. Cross enumerates (Z, W) pairs
+        // and pushes them straight to XY, so total work = total XY
+        // candidate solves (extrapolated from tuple progress while the
+        // producer is still running).
+        let (eff, total_label, total_value, rate_unit) = if wz_mode == WzMode::Cross {
+            let xy_pushed = stage_enter[3].load(AtomicOrdering::Relaxed);
+            let est_total = cross_estimated_total_xy(
+                xy_pushed, cross_tuple_idx, tuples.len(), cross_done,
+            );
+            let xy_done_eff = effective_xy_done(
+                xy_sat_count, xy_unsat_count, xy_timeout_count, xy_timeout_cov_micro,
+            );
+            (xy_done_eff, "XY candidates", est_total, "XY/s")
+        } else {
+            let eff = effective_coverage_metric(
+                walked, xy_sat_count, xy_unsat_count, xy_timeout_count, xy_timeout_cov_micro,
+            );
+            (eff, "live ZW paths", live_zw_paths, "eff bnd/s")
+        };
         let cover_rate = if secs > 0.0 { eff / secs } else { 0.0 };
-        let ttc = if cover_rate > 0.0 { (live_zw_paths - eff).max(0.0) / cover_rate } else { f64::INFINITY };
+        let ttc = if cover_rate > 0.0 { (total_value - eff).max(0.0) / cover_rate } else { f64::INFINITY };
         let ttc_str = if ttc < 60.0 { format!("{:.0}s", ttc) }
                      else if ttc < 3600.0 { format!("{:.1}m", ttc / 60.0) }
                      else if ttc < 86400.0 { format!("{:.1}h", ttc / 3600.0) }
                      else { format!("{:.1}d", ttc / 86400.0) };
-        println!("  Time to cover:            {} ({:.2} eff bnd/s, {:.0} live ZW paths)",
-            ttc_str, cover_rate, live_zw_paths);
-        println!("  Progress:                 {:.4}% ({:.1} effective of {:.0}, {} walked)",
-            eff / live_zw_paths * 100.0, eff, live_zw_paths, walked);
+        println!("  Time to cover:            {} ({:.2} {}, {:.0} {})",
+            ttc_str, cover_rate, rate_unit, total_value, total_label);
+        let pct = if total_value > 0.0 { eff / total_value * 100.0 } else { 0.0 };
+        if wz_mode == WzMode::Cross {
+            println!("  Progress:                 {:.4}% ({:.1} effective of {:.0} estimated; cross_done={})",
+                pct, eff, total_value, cross_done);
+        } else {
+            println!("  Progress:                 {:.4}% ({:.1} effective of {:.0}, {} walked)",
+                pct, eff, total_value, walked);
+        }
         println!("  XY timeout:               {:.1}%", timeout_frac * 100.0);
         println!("  Wall-clock:               {:>10.3?}", elapsed);
 
@@ -4120,6 +4162,39 @@ fn xy_cover_micro(result: Option<bool>, decisions: u64, free_vars: u64) -> u64 {
     }
 }
 
+/// Effective number of XY candidate solves completed, weighted for
+/// timeouts. Each fully-resolved (SAT or UNSAT) XY solve contributes
+/// 1.0; each timeout contributes its `cover_frac`. Used as the
+/// numerator in the cross-mode TTC formula and as the basis for the
+/// MDD-mode `effective_coverage_metric` shortfall calculation.
+fn effective_xy_done(
+    xy_sat: u64, xy_unsat: u64, xy_timeout: u64,
+    xy_timeout_cov_micro: u64,
+) -> f64 {
+    let normal_done = (xy_sat + xy_unsat) as f64;
+    let timeout_credit = xy_timeout_cov_micro as f64 / 1_000_000.0;
+    // Sanity: timeout_credit should always be ≤ xy_timeout, but clamp
+    // defensively in case a bogus solve over-credited.
+    normal_done + timeout_credit.min(xy_timeout as f64)
+}
+
+/// Cross-mode TTC denominator: estimated total XY candidate solves
+/// once enumeration completes. Extrapolates from tuple progress while
+/// the producer is still running; collapses to `xy_pushed` exactly
+/// once `cross_done` is true.
+fn cross_estimated_total_xy(
+    xy_pushed: u64, tuples_done: usize, tuples_total: usize, cross_done: bool,
+) -> f64 {
+    let xy_pushed = xy_pushed as f64;
+    if cross_done || tuples_done == 0 || tuples_total == 0 {
+        return xy_pushed;
+    }
+    // Extrapolation: assume remaining tuples produce XY candidates at
+    // the same average rate as the tuples seen so far. Crude but the
+    // best we can do without re-running the SpectralIndex enumeration.
+    xy_pushed * (tuples_total as f64) / (tuples_done as f64)
+}
+
 /// Effective number of boundaries covered, weighted by per-XY-solve
 /// coverage. Each fully-resolved boundary contributes 1.0; XY timeouts
 /// dock the boundary's contribution by `(1 - cover_frac) /
@@ -4141,8 +4216,9 @@ fn effective_coverage_metric(
     if xy_total == 0 || xy_timeout == 0 {
         return walked as f64;
     }
-    let shortfall_micro = (xy_timeout * 1_000_000).saturating_sub(xy_timeout_cov_micro);
-    let shortfall_per_xy = shortfall_micro as f64 / (xy_total as f64 * 1_000_000.0);
+    let xy_done_eff = effective_xy_done(xy_sat, xy_unsat, xy_timeout, xy_timeout_cov_micro);
+    // Per-XY shortfall as fraction of one XY solve, then scale to boundaries.
+    let shortfall_per_xy = (xy_total as f64 - xy_done_eff) / xy_total as f64;
     walked as f64 * (1.0 - shortfall_per_xy).max(0.0)
 }
 
