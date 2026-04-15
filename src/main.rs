@@ -6419,6 +6419,70 @@ mod tests {
         assert_eq!(result2, Some(true), "Known Z middle should satisfy Z SAT constraints");
     }
 
+    /// Sanity check: PbSetEq-based W middle SAT accepts the canonical
+    /// TT(18) W middle when the boundary is hardcoded and V_w covers
+    /// both signs of σ_W.
+    #[test]
+    fn pbseteq_w_middle_accepts_canonical_tt18() {
+        let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
+        let w = parse("++----+--+--+++-+");
+        let n = 18usize; let m = n - 1; let k = 5usize;
+        let middle_m = m - 2 * k;
+        let mut w_boundary = vec![0i8; m];
+        w_boundary[..k].copy_from_slice(&w[..k]);
+        w_boundary[m-k..].copy_from_slice(&w[m-k..]);
+        let w_bnd_sum: i32 = w_boundary.iter().map(|&v| v as i32).sum();
+        // |σ_W| = 1 for canonical TT(18); V_w covers +1 and -1.
+        let abs_w = 1i32;
+        let counts: Vec<u32> = [abs_w, -abs_w].iter()
+            .filter_map(|&s| sigma_full_to_cnt(s, w_bnd_sum, middle_m))
+            .collect::<Vec<_>>();
+        eprintln!("σ_W_bnd = {}, V_w = {:?}", w_bnd_sum, counts);
+
+        let w_tmpl = sat_z_middle::LagTemplate::new(m, k);
+        let mut solver = w_tmpl.build_base_solver_pb_set(middle_m, &counts);
+        sat_z_middle::fill_w_solver(&mut solver, &w_tmpl, m, &w_boundary);
+
+        // Hardcode canonical W middle.
+        let mid_lits: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
+        for (i, &v) in w[k..k+middle_m].iter().enumerate() {
+            solver.add_clause([if v == 1 { mid_lits[i] } else { -mid_lits[i] }]);
+        }
+        assert_eq!(solver.solve(), Some(true), "W middle SAT should accept canonical middle");
+    }
+
+    /// Same for Z middle.
+    #[test]
+    fn pbseteq_z_middle_accepts_canonical_tt18() {
+        let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
+        let z = parse("++-+++----+-+-++--");
+        let w = parse("++----+--+--+++-+");
+        let n = 18usize; let m = n - 1; let k = 5usize;
+        let middle_n = n - 2 * k;
+        let mut z_boundary = vec![0i8; n];
+        z_boundary[..k].copy_from_slice(&z[..k]);
+        z_boundary[n-k..].copy_from_slice(&z[n-k..]);
+        let z_bnd_sum: i32 = z_boundary.iter().map(|&v| v as i32).sum();
+        // |σ_Z| = 0 for canonical; single target.
+        let abs_z = 0i32;
+        let counts: Vec<u32> = if abs_z == 0 {
+            sigma_full_to_cnt(0, z_bnd_sum, middle_n).into_iter().collect()
+        } else {
+            [abs_z, -abs_z].iter().filter_map(|&s| sigma_full_to_cnt(s, z_bnd_sum, middle_n)).collect()
+        };
+        eprintln!("σ_Z_bnd = {}, V_z = {:?}", z_bnd_sum, counts);
+
+        let z_tmpl = sat_z_middle::LagTemplate::new(n, k);
+        let mut solver = z_tmpl.build_base_solver_quad_pb_pb_set(middle_n, &counts);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut solver, &z_tmpl, n, m, middle_n, &z_boundary, &w);
+
+        let mid_lits: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
+        for (i, &v) in z[k..k+middle_n].iter().enumerate() {
+            solver.add_clause([if v == 1 { mid_lits[i] } else { -mid_lits[i] }]);
+        }
+        assert_eq!(solver.solve(), Some(true), "Z middle SAT should accept canonical middle");
+    }
+
     /// Sanity check: build the XY template with the unsigned n=18 canonical
     /// tuple, hardcode the canonical X/Y as unit clauses, and assert the
     /// solver finds it.  Guards against regressions in the PbSetEq-based
