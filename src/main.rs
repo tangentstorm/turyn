@@ -6825,7 +6825,7 @@ mod tests {
         }
 
         // Run try_candidate — exactly what the pipeline does.
-        let result = state.try_candidate(x_bits, y_bits);
+        let (result, _stats) = state.try_candidate(x_bits, y_bits);
         match result {
             XyTryResult::Sat(found_x, found_y) => {
                 // Extract values and verify.
