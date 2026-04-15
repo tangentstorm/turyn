@@ -27,8 +27,13 @@
 //! Usage:
 //!   target/release/tseq --n=167 --secs=600
 //!   target/release/tseq --n=8              # quick correctness smoke
+//!   target/release/tseq --n=50 --secs=30 --memo
+//!                                          # enable failure-state memo experiment
 
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
+
+use rustc_hash::{FxHashSet, FxHasher};
 
 fn bouncing_order(n: usize) -> Vec<usize> {
     let mut order = Vec::with_capacity(n);
@@ -61,10 +66,17 @@ struct Search {
     solution: Option<(Vec<u8>, Vec<i8>)>,
     // Per-depth node counters (for progress diagnostics)
     depth_nodes: Vec<u64>,
+    // Optional exact-key failure memo (--memo).
+    memo_enabled: bool,
+    memo_cap: usize,
+    fail_memo: FxHashSet<u64>,
+    memo_hits: u64,
+    memo_inserts: u64,
+    memo_evictions: u64,
 }
 
 impl Search {
-    fn new(n: usize, deadline: Instant) -> Self {
+    fn new(n: usize, deadline: Instant, memo_enabled: bool, memo_cap: usize) -> Self {
         let order = bouncing_order(n);
         // remaining_cap[s] = number of (i, i+s) pairs with both endpoints in [0, n).
         // For s in [1, n-1]: n - s pairs.  Index 0 unused.
@@ -90,7 +102,32 @@ impl Search {
             stop: false,
             solution: None,
             depth_nodes: vec![0; n + 1],
+            memo_enabled,
+            memo_cap,
+            fail_memo: FxHashSet::default(),
+            memo_hits: 0,
+            memo_inserts: 0,
+            memo_evictions: 0,
         }
+    }
+
+    /// Exact-key state fingerprint at depth `t`.  Captures full partial
+    /// autocorrelation vector plus (channel, sign) of every placed position.
+    /// In bouncing-order DFS this is a complete characterization of the node.
+    #[inline]
+    fn state_hash(&self, t: usize) -> u64 {
+        let mut h = FxHasher::default();
+        // N(s) for s in 1..n
+        for &v in &self.n_lag[1..] {
+            v.hash(&mut h);
+        }
+        // placed (channel, sign) in step order (bouncing)
+        for step in 0..t {
+            let p = self.order[step];
+            self.channels[p].hash(&mut h);
+            self.signs[p].hash(&mut h);
+        }
+        h.finish()
     }
 
     #[inline]
@@ -132,6 +169,23 @@ impl Search {
             self.found = true;
             return;
         }
+
+        // Failure-memo check.  Only useful if *different* DFS paths can reach
+        // the same (N, assignments) state; in pure bouncing-order DFS this is
+        // exactly the experiment we want to quantify.  Hit rate is logged at
+        // the end.
+        let hash_opt = if self.memo_enabled && t >= 1 && t + 1 < self.n {
+            let h = self.state_hash(t);
+            if self.fail_memo.contains(&h) {
+                self.memo_hits += 1;
+                return;
+            }
+            Some(h)
+        } else {
+            None
+        };
+
+        let nodes_before = self.nodes;
 
         let p = self.order[t];
 
@@ -196,6 +250,17 @@ impl Search {
                 }
             }
         }
+
+        // All children explored without finding a solution.  Record this
+        // state as a failure for future branches.
+        if let Some(h) = hash_opt {
+            if self.nodes > nodes_before && self.fail_memo.len() < self.memo_cap {
+                self.fail_memo.insert(h);
+                self.memo_inserts += 1;
+            } else if self.fail_memo.len() >= self.memo_cap {
+                self.memo_evictions += 1;
+            }
+        }
     }
 }
 
@@ -208,6 +273,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n: usize = parse_flag(&args, "--n=").unwrap_or(167);
     let secs: u64 = parse_flag(&args, "--secs=").unwrap_or(600);
+    let memo_enabled = args.iter().any(|s| s == "--memo");
+    let memo_cap: usize = parse_flag(&args, "--memo-cap=").unwrap_or(16_000_000);
 
     if n < 2 {
         eprintln!("Need n >= 2.");
@@ -215,11 +282,18 @@ fn main() {
     }
 
     eprintln!(
-        "T-sequence search: n={}, budget={}s (8-way branching, bouncing order)",
-        n, secs
+        "T-sequence search: n={}, budget={}s (8-way, bouncing{}){}",
+        n,
+        secs,
+        if memo_enabled {
+            format!(", memo on (cap={})", memo_cap)
+        } else {
+            "".to_string()
+        },
+        ""
     );
     let deadline = Instant::now() + Duration::from_secs(secs);
-    let mut search = Search::new(n, deadline);
+    let mut search = Search::new(n, deadline, memo_enabled, memo_cap);
     search.dfs(0);
 
     let el = search.start.elapsed().as_secs_f64();
@@ -241,6 +315,30 @@ fn main() {
                 eprintln!("  depth {:>3}: {}", d, c);
             }
         }
+    }
+
+    if search.memo_enabled {
+        let total_internal = search
+            .depth_nodes
+            .iter()
+            .enumerate()
+            .filter(|(d, _)| *d >= 1 && *d + 1 < n)
+            .map(|(_, c)| *c)
+            .sum::<u64>();
+        let hit_pct = if total_internal > 0 {
+            100.0 * search.memo_hits as f64 / total_internal as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "Memo: size={} (cap={}), inserts={}, hits={} ({:.4}% of internal nodes), evictions={}",
+            search.fail_memo.len(),
+            search.memo_cap,
+            search.memo_inserts,
+            search.memo_hits,
+            hit_pct,
+            search.memo_evictions
+        );
     }
 
     if let Some((channels, signs)) = search.solution {
