@@ -64,7 +64,7 @@ An additional consequence of the full rule set: **`c[n] = -1` for `n > 1`.**
 | (v)     | MDD pipeline: `SolveW` / `SolveWZ`   | boundary pre-filter + brute-force W full-sequence canonicality check |
 | (vi)    | `build_sat_xy_clauses`, `sat_encode` | 5 clauses encoding the conditional X↔Y swap break |
 | (vi)    | `walk_xy_sub_mdd` pre-filter          | boundary-only check: forbid `(x[1]=-1, y[1]=+1)`; when `x[1]=y[1]`, require `x[n-2]=+1` and `y[n-2]=-1` |
-| tuple-level | `SumTuple::norm_key`             | `|σ_X|, |σ_Y|, |σ_Z|, |σ_W|` only (no X↔Y sort — rule (vi) breaks T4). Factor 16. |
+| tuple-level | `SumTuple::norm_key`             | identity key `(σ_X, σ_Y, σ_Z, σ_W)` (signed).  Rules (i)–(vi) break every coordinate-level symmetry of the tuple, so dedup by `|·|` is *unsound*: at n=6 it silently misses 2 of the 4 BDKR orbits (whose canonical reps happen to have `σ_W = -1` and `σ_Y = -2`).  See "Tuple-level correctness" below. |
 
 The palindromic/alternation/swap-break encoding is shared across the
 XY template and the legacy full encoder via `add_palindromic_break`,
@@ -72,6 +72,43 @@ XY template and the legacy full encoder via `add_palindromic_break`,
 `src/main.rs`.  Aux vars are allocated contiguously above the
 sequence variable block so they don't collide with XNOR / quad-PB
 aux blocks.
+
+### Tuple-level correctness
+
+Empirical investigation (Python exhaustive enumeration at n=6):
+
+|                                      | orbits  | reachable by signed-tuple search | reachable by `|·|`-tuple search |
+|--------------------------------------|--------:|---------------------------------:|--------------------------------:|
+| Total BDKR orbits                    | 4       | 4                                | 2                               |
+| Orbits with all `σ ≥ 0`              | 2       | 2                                | 2                               |
+| Orbits with at least one `σ < 0`     | 2       | 2                                | **0**  ← missed                  |
+
+Concretely the n=6 orbits and their canonical sums are:
+
+| `(σ_X, σ_Y, σ_Z, σ_W)`   | `|·|` bucket    | reachable pre-fix? |
+|--------------------------|-----------------|--------------------|
+| `(+4, +4,  0, -1)`       | `(4, 4, 0, 1)`  | no                 |
+| `(+4,  0,  0, +3)`       | `(4, 0, 0, 3)`  | yes                |
+| `(+2, +2, +2, +3)`       | `(2, 2, 2, 3)`  | yes                |
+| `(+2, -2, +2, +3)`       | `(2, 2, 2, 3)`  | no  (collides)     |
+
+The pre-fix `norm_key` collapsed each component by `abs()`.  That
+would have been valid only if T1 (negate any one sequence) were a
+free symmetry of the canonical-form search, but rule (i)
+**unconditionally pins** `x[0]=x[n-1]=y[0]=y[n-1]=z[0]=w[0]=+1` —
+every single-sequence T1 image flips one of those pinned bits, so
+T1 is **fully broken** by the rule set.  Other operators don't help
+either: T2 doesn't move tuples (sums invariant), T4 is broken by
+rule (vi), and T3 changes sums non-simply (no cheap tuple key).
+The only sound key is therefore the signed tuple itself.
+
+The cost is real: at n=18 throughput drops from ~8000 to ~900
+paths/s in the `--wz=apart --mdd-k=5` smoke test.  The tuple
+enumerator now has to try every signed combination satisfying the
+energy equation rather than collapsing to `|·|` representatives, so
+the per-boundary tuple count grows roughly 5–9× depending on how
+many `σ` components are non-zero (each non-zero σ contributes a
+factor 2).  This is the price of completeness.
 
 ### Test-suite status
 

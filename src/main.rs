@@ -213,25 +213,31 @@ impl SumTuple {
     ///
     /// The Turyn symmetry group (Best–Đoković–Kharaghani–Ramp 2012) has
     /// four generators:
-    ///   T1 negate any one of X, Y, Z, W  → flips the sign of that sum
-    ///   T2 reverse any one of X, Y, Z, W → preserves the sum
-    ///   T3 alternate all four (a[i] ↦ (-1)^i·a[i]) → changes sums in a
-    ///      non-simple way (depends on σ_even − σ_odd), so it is *not*
-    ///      detectable at the tuple level.
-    ///   T4 interchange X ↔ Y — **broken by rule (vi)** in the SAT
-    ///      encoder (when n > 2), so at the tuple level we do *not*
-    ///      collapse (σ_X, σ_Y) ↔ (σ_Y, σ_X).
+    ///   T1 negate any one of X, Y, Z, W
+    ///   T2 reverse any one of X, Y, Z, W
+    ///   T3 alternate all four simultaneously (a[i] ↦ (-1)^i·a[i])
+    ///   T4 interchange X ↔ Y
     ///
-    /// We therefore canonicalise by `|·|` on every component only.
-    /// (T1 is safe because negating a whole sequence flips its sum,
-    /// and for each orbit a unique representative with all sums
-    /// non-negative exists — rule (i) then picks the right signs at
-    /// the position level.)  T2 is invisible (sums invariant) and T3
-    /// cannot be normalised cheaply.
+    /// **Rules (i)–(vi) break T1 entirely:** rule (i) pins
+    /// `x[0]=x[n-1]=y[0]=y[n-1]=z[0]=w[0]=+1`, so negating any one
+    /// sequence flips one of these pinned bits and is no longer a
+    /// symmetry of the canonical-form search.  T4 is broken by rule
+    /// (vi); T2 by rules (ii)/(iii) (palindromic-break) and (iv)/(v);
+    /// T3 changes sums non-simply and cannot be normalised cheaply
+    /// at the tuple level either.
     ///
-    /// Tuple-level reduction: factor 16 (2^4 independent sign flips).
+    /// Therefore *no* tuple-level coordinate transform survives the
+    /// rule-(i) canonical form, and the only safe key is the signed
+    /// tuple itself.
+    ///
+    /// Verified empirically at n=6: 4 distinct BDKR orbits exist;
+    /// 2 of them have at least one negative sum in their canonical
+    /// representation.  An older `|·|`-based key collapsed those into
+    /// the all-positive bucket and the SAT search returned UNSAT for
+    /// the orbits whose canonical signs disagreed — silently missing
+    /// half the n=6 orbits.
     fn norm_key(&self) -> (i32, i32, i32, i32) {
-        (self.x.abs(), self.y.abs(), self.z.abs(), self.w.abs())
+        (self.x, self.y, self.z, self.w)
     }
 
 }
