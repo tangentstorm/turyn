@@ -2637,12 +2637,19 @@ struct SolveWZWork {
 }
 
 struct SolveWWork {
+    /// Representative tuple (for trace/cache keys).  Under the multi-tuple
+    /// pipeline the *real* surviving tuple set is `candidate_tuples`.
     tuple: SumTuple,
     z_bits: u32,
     w_bits: u32,
     xy_root: u32,
     z_mid_sum: i32,
     w_mid_sum: i32,
+    /// All unsigned tuples this boundary is compatible with.  The W SAT
+    /// is built with a `PbSetEq` over the union of their ±|σ_W| counts;
+    /// each solved W middle decodes to a specific σ_W which narrows this
+    /// list for the next stage (SolveZ).
+    candidate_tuples: Vec<SumTuple>,
 }
 
 struct SolveZWork {
@@ -2653,6 +2660,12 @@ struct SolveZWork {
     w_spectrum: Vec<f64>,
     xy_root: u32,
     z_mid_sum: i32,
+    /// Tuples surviving the σ_W narrowing (|σ_W| of candidate matches
+    /// the W the solver locked in).  The Z SAT is built with a
+    /// `PbSetEq` over the union of their ±|σ_Z| counts.
+    candidate_tuples: Vec<SumTuple>,
+    /// The signed σ_W locked in by SolveW (for rule-aware narrowing).
+    sigma_w_full: i32,
 }
 
 struct SolveXYWork {
@@ -2804,7 +2817,12 @@ fn run_mdd_sat_search(
         // A small cap lets workers move on to fresh (z_boundary, W) pairs
         // faster, which matters more than exhaustively enumerating Z for
         // one pair.
-        max_z: cfg.max_z.min(1),
+        // Enumerate a small number of Z middles per (Z boundary, W middle)
+        // to tolerate the SAT's decision ordering (PbSetEq's multi-target
+        // structure sometimes picks a non-canonical Z first, whose pair
+        // check fails).  Previously hardcoded to 1 because the PbEq-based
+        // SAT happened to pick the canonical first by luck of ordering.
+        max_z: cfg.max_z.min(8),
         individual_bound: problem.spectral_bound(),
         pair_bound: cfg.max_spectral.unwrap_or(problem.spectral_bound()),
         theta: cfg.theta_samples,
@@ -3099,23 +3117,28 @@ fn run_mdd_sat_search(
                         // Check sum feasibility for each tuple, emit SolveW items
                         let z_bnd_sum = 2 * (bnd.z_bits.count_ones() as i32) - ctx.max_bnd_sum;
                         let w_bnd_sum = 2 * (bnd.w_bits.count_ones() as i32) - ctx.max_bnd_sum;
-                        // Batch all SolveW (or SolveWZ) items from this boundary so
-                        // we pay the queue lock cost once per boundary, not once per
-                        // tuple. For a boundary with ~10 tuples and many boundaries
-                        // per second, this cuts mutex pressure by ~10x.
-                        let mut bnd_batch: Vec<PipelineWork> = Vec::with_capacity(ctx.tuples.len());
+                        // Collect all tuples this boundary is compatible with
+                        // (at least one sign of σ_W, σ_Z in range + right parity,
+                        // and the XY sub-MDD has a matching leaf).  Emit ONE
+                        // SolveW (or SolveWZ) carrying the whole candidate
+                        // list — the stage builds V_w as the union of
+                        // ±|σ_W|-counts over candidate tuples and lets the
+                        // SAT pick any of them.  Downstream stages narrow
+                        // the list by the decoded σ.
+                        let mut candidate_tuples: Vec<SumTuple> = Vec::with_capacity(ctx.tuples.len());
                         for &tuple in &ctx.tuples {
-                            let z_mid_sum = tuple.z - z_bnd_sum;
-                            if z_mid_sum.abs() > ctx.middle_n as i32 || (z_mid_sum + ctx.middle_n as i32) % 2 != 0 {
+                            // Both ±|σ_W|, ±|σ_Z| allowed — feasible if AT
+                            // LEAST ONE sign of each is in range and parity.
+                            let z_feas = [tuple.z.abs(), -tuple.z.abs()].iter().any(|&s| {
+                                sigma_full_to_cnt(s, z_bnd_sum, ctx.middle_n).is_some()
+                            });
+                            let w_feas = [tuple.w.abs(), -tuple.w.abs()].iter().any(|&s| {
+                                sigma_full_to_cnt(s, w_bnd_sum, ctx.middle_m).is_some()
+                            });
+                            if !z_feas || !w_feas {
                                 flow_bnd_sum_fail.fetch_add(1, AtomicOrdering::Relaxed); continue;
                             }
-                            let w_mid_sum = tuple.w - w_bnd_sum;
-                            if w_mid_sum.abs() > ctx.middle_m as i32 || (w_mid_sum + ctx.middle_m as i32) % 2 != 0 {
-                                flow_bnd_sum_fail.fetch_add(1, AtomicOrdering::Relaxed); continue;
-                            }
-                            // MDD-guided fail-fast: skip tuples whose XY sub-tree
-                            // has no (x,y) leaf matching the tuple's sum
-                            // constraints. Short-circuiting DFS.
+                            // MDD-guided fail-fast on XY sub-tree compatibility.
                             if !any_valid_xy(
                                 bnd.xy_root, 0, ctx.xy_zw_depth, 0, 0,
                                 &ctx.xy_pos_order, &ctx.mdd.nodes,
@@ -3124,26 +3147,32 @@ fn run_mdd_sat_search(
                                 flow_bnd_sum_fail.fetch_add(1, AtomicOrdering::Relaxed);
                                 continue;
                             }
-                            if trace_bnd && tuple.z == 8 && tuple.w == 1 {
-                                eprintln!("TRACE: emitting SolveW for tuple ({},{},{},{}) z_mid_sum={} w_mid_sum={}",
-                                    tuple.x, tuple.y, tuple.z, tuple.w, z_mid_sum, w_mid_sum);
-                            }
-                            stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
-                            if use_wz_mode {
-                                bnd_batch.push(PipelineWork::SolveWZ(SolveWZWork {
-                                    tuple, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
-                                    xy_root: bnd.xy_root, z_mid_sum, w_mid_sum,
-                                }));
-                            } else {
-                                bnd_batch.push(PipelineWork::SolveW(SolveWWork {
-                                    tuple, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
-                                    xy_root: bnd.xy_root, z_mid_sum, w_mid_sum,
-                                }));
-                            }
+                            candidate_tuples.push(tuple);
                         }
-                        if !bnd_batch.is_empty() {
-                            wq.push_batch(bnd_batch);
+                        if candidate_tuples.is_empty() {
+                            stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
+                            continue;
                         }
+                        // Use the first candidate as the representative for
+                        // legacy fields (z_mid_sum, w_mid_sum, tuple).
+                        let rep = candidate_tuples[0];
+                        let z_mid_sum = rep.z.abs() - z_bnd_sum; // +|σ_Z| case; field is legacy
+                        let w_mid_sum = rep.w.abs() - w_bnd_sum;
+                        stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
+                        let work = if use_wz_mode {
+                            PipelineWork::SolveWZ(SolveWZWork {
+                                tuple: rep, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
+                                xy_root: bnd.xy_root, z_mid_sum, w_mid_sum,
+                            })
+                        } else {
+                            PipelineWork::SolveW(SolveWWork {
+                                tuple: rep, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
+                                xy_root: bnd.xy_root, z_mid_sum, w_mid_sum,
+                                candidate_tuples,
+                            })
+                        };
+                        if trace_bnd { eprintln!("TRACE: emitting ONE SolveW for canonical TT(18) boundary"); }
+                        wq.push_batch(vec![work]);
                         stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
                     }
 
@@ -3162,19 +3191,21 @@ fn run_mdd_sat_search(
                             continue;
                         }
 
-                        // Compute the set V_w of valid W middle counts under
-                        // this boundary.  With the unsigned tuple convention
-                        // `sw.tuple.w = |σ_W|`, both σ_W = +|σ_W| and
-                        // σ_W = −|σ_W| are candidate; each maps to a count
-                        // in [0, middle_m] (or is filtered by parity/range).
+                        // Compute V_w = union over `sw.candidate_tuples` of
+                        // {cnt(+|σ_W|), cnt(-|σ_W|)}.  One SAT call per
+                        // boundary finds any W middle landing on any valid
+                        // σ_W — the decoded count then narrows the tuple
+                        // list for SolveZ.
                         let w_bnd_sum_local: i32 = w_boundary.iter().map(|&v| v as i32).sum();
-                        let abs_w = sw.tuple.w.abs();
                         let w_counts: Vec<u32> = {
-                            let mut cs: Vec<u32> = Vec::with_capacity(2);
-                            let signs: &[i32] = if abs_w == 0 { &[0] } else { &[1, -1] };
-                            for &sg in signs {
-                                if let Some(c) = sigma_full_to_cnt(sg * abs_w, w_bnd_sum_local, ctx.middle_m) {
-                                    if !cs.contains(&c) { cs.push(c); }
+                            let mut cs: Vec<u32> = Vec::new();
+                            for t in &sw.candidate_tuples {
+                                let abs_w = t.w.abs();
+                                let signs: &[i32] = if abs_w == 0 { &[0] } else { &[1, -1] };
+                                for &sg in signs {
+                                    if let Some(c) = sigma_full_to_cnt(sg * abs_w, w_bnd_sum_local, ctx.middle_m) {
+                                        if !cs.contains(&c) { cs.push(c); }
+                                    }
                                 }
                             }
                             cs.sort_unstable();
@@ -3224,10 +3255,19 @@ fn run_mdd_sat_search(
                                     if trace_w { trace_w_pass += 1; }
                                     flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
                                     w_found_any = true;
+                                    // Decode σ_W and narrow the tuple list.
+                                    let sigma_w_full: i32 = w_vals.iter().map(|&v| v as i32).sum();
+                                    let narrowed: Vec<SumTuple> = sw.candidate_tuples.iter()
+                                        .copied()
+                                        .filter(|t| t.w.abs() == sigma_w_full.abs())
+                                        .collect();
+                                    if narrowed.is_empty() { return true; }
                                     stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
+                                    let rep = narrowed[0];
                                     batch.push(PipelineWork::SolveZ(SolveZWork {
-                                        tuple: sw.tuple, z_bits: sw.z_bits, w_bits: sw.w_bits,
+                                        tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
                                         w_vals, w_spectrum: spec_buf.clone(), xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
+                                        candidate_tuples: narrowed, sigma_w_full,
                                     }));
                                 } else {
                                     flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
@@ -3302,10 +3342,18 @@ fn run_mdd_sat_search(
                                 flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
                                 w_found_any = true;
 
+                                let sigma_w_full: i32 = w_vals.iter().map(|&v| v as i32).sum();
+                                let narrowed: Vec<SumTuple> = sw.candidate_tuples.iter()
+                                    .copied()
+                                    .filter(|t| t.w.abs() == sigma_w_full.abs())
+                                    .collect();
+                                if narrowed.is_empty() { continue; }
                                 stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
+                                let rep = narrowed[0];
                                 batch.push(PipelineWork::SolveZ(SolveZWork {
-                                    tuple: sw.tuple, z_bits: sw.z_bits, w_bits: sw.w_bits,
+                                    tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
                                     w_vals, w_spectrum, xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
+                                    candidate_tuples: narrowed, sigma_w_full,
                                 }));
                             }
                             if !batch.is_empty() {
@@ -3634,19 +3682,18 @@ fn run_mdd_sat_search(
                             continue;
                         }
 
-                        // Compute V_z = valid Z middle counts given |σ_Z| and
-                        // boundary.  Both σ_Z signs are admissible at this
-                        // stage — the chosen W has fixed σ_W but σ_Z is
-                        // determined only by the energy equation, which is
-                        // sign-symmetric, so we let the SAT pick.
+                        // Compute V_z = union of ±|σ_Z|-counts over the
+                        // tuples surviving the σ_W-narrowing in SolveW.
                         let z_bnd_sum_local: i32 = z_boundary.iter().map(|&v| v as i32).sum();
-                        let abs_z = sz.tuple.z.abs();
                         let z_counts: Vec<u32> = {
-                            let mut cs: Vec<u32> = Vec::with_capacity(2);
-                            let signs: &[i32] = if abs_z == 0 { &[0] } else { &[1, -1] };
-                            for &sg in signs {
-                                if let Some(c) = sigma_full_to_cnt(sg * abs_z, z_bnd_sum_local, ctx.middle_n) {
-                                    if !cs.contains(&c) { cs.push(c); }
+                            let mut cs: Vec<u32> = Vec::new();
+                            for t in &sz.candidate_tuples {
+                                let abs_z = t.z.abs();
+                                let signs: &[i32] = if abs_z == 0 { &[0] } else { &[1, -1] };
+                                for &sg in signs {
+                                    if let Some(c) = sigma_full_to_cnt(sg * abs_z, z_bnd_sum_local, ctx.middle_n) {
+                                        if !cs.contains(&c) { cs.push(c); }
+                                    }
                                 }
                             }
                             cs.sort_unstable();
