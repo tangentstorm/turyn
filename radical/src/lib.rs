@@ -653,6 +653,10 @@ pub struct Solver {
     restart_limit: u64,
     luby_index: u32,
 
+    // Search stats (plain u64 — Solver is per-thread; aggregation at caller)
+    decisions: u64,
+    propagations: u64,
+
     // Restart (EMA) — glucose-style adaptive restarts
     ema_lbd_fast: f64,   // fast EMA of recent LBD (α ≈ 1/32)
     ema_lbd_slow: f64,   // slow EMA of global LBD (α ≈ 1/4096)
@@ -741,6 +745,8 @@ impl Solver {
             conflicts: 0,
             restart_limit: 100,
             luby_index: 0,
+            decisions: 0,
+            propagations: 0,
             ema_lbd_fast: 0.0,
             ema_lbd_slow: 0.0,
             ema_restart_block: 0,
@@ -1425,6 +1431,17 @@ impl Solver {
     }
     /// Number of conflicts so far.
     pub fn num_conflicts(&self) -> u64 { self.conflicts }
+    /// Number of branching decisions made so far.
+    pub fn num_decisions(&self) -> u64 { self.decisions }
+    /// Number of variable assignments forced by propagation (clause BCP, PB,
+    /// quad PB, XOR, MDD, spectral). Excludes branching decisions.
+    pub fn num_propagations(&self) -> u64 { self.propagations }
+    /// Number of variables currently assigned at decision level 0 (the
+    /// "forced prefix"). Diff before/after a solve to see how many vars
+    /// became permanently forced by initial propagation of assumptions.
+    pub fn num_level0_vars(&self) -> usize {
+        self.trail_lim.first().copied().unwrap_or(self.trail.len())
+    }
 
     /// Write all clauses in DIMACS CNF format to the given writer.
     /// Note: PB and quad-PB constraints are not included (DIMACS only supports CNF).
@@ -2330,6 +2347,7 @@ impl Solver {
                 // Make a decision
                 let lit = self.pick_branching_var();
                 self.new_decision_level();
+                self.decisions += 1;
                 self.enqueue(lit, Reason::Decision);
             }
         }
@@ -2374,6 +2392,9 @@ impl Solver {
         self.level[v] = self.decision_level();
         self.reason[v] = reason;
         self.trail.push(TrailEntry { lit, level: self.decision_level(), reason });
+        if !matches!(reason, Reason::Decision) {
+            self.propagations += 1;
+        }
     }
 
     /// BCP + PB propagation. Returns conflict reason or None.
@@ -3717,6 +3738,67 @@ mod tests {
         s.add_clause([-1, 2]);
         s.add_clause([-1, -2]);
         assert_eq!(s.solve(), Some(false));
+    }
+
+    #[test]
+    fn search_stats_pure_propagation() {
+        // Two unit clauses force both vars at add_clause time (level 0).
+        // No branching should be needed at solve.
+        let mut s = Solver::new();
+        s.add_clause([1]);
+        s.add_clause([2]);
+        // Both vars already forced at root before solve.
+        assert_eq!(s.num_level0_vars(), 2);
+        let d_before = s.num_decisions();
+        assert_eq!(s.solve(), Some(true));
+        assert_eq!(s.num_decisions(), d_before, "no branching needed for pure unit propagation");
+    }
+
+    #[test]
+    fn search_stats_assumption_propagates_at_level_1() {
+        // Implication: x → y. With assumption [x], y becomes forced at level 1
+        // (not level 0), so num_level0_vars stays at 0.
+        let mut s = Solver::new();
+        s.add_clause([-1, 2]); // ¬x ∨ y
+        assert_eq!(s.num_level0_vars(), 0);
+        let p_before = s.num_propagations();
+        assert_eq!(s.solve_with_assumptions(&[1]), Some(true));
+        // y is forced by propagation under the assumption.
+        assert!(s.num_propagations() > p_before,
+            "assumption [x] should force y via propagation");
+        // Level-0 stays at 0 — assumptions live at level 1.
+        assert_eq!(s.num_level0_vars(), 0);
+    }
+
+    #[test]
+    fn search_stats_decisions_bounded() {
+        // 4-var instance where every assignment is feasible (no constraints).
+        // The solver branches until all vars assigned. decisions <= num_vars.
+        let mut s = Solver::new();
+        for v in 1..=4 { s.ensure_var(v); }
+        assert_eq!(s.solve(), Some(true));
+        let n = s.num_vars() as u64;
+        assert!(s.num_decisions() <= n,
+            "decisions={} exceeds num_vars={}", s.num_decisions(), n);
+        // assignments accounted for: decisions + propagations + level-0 forced
+        // should sum to at most the trail length (= num_vars when SAT).
+        let total = s.num_decisions() + s.num_propagations();
+        assert!(total <= n, "decisions+propagations={} exceeds num_vars={}", total, n);
+    }
+
+    #[test]
+    fn search_stats_monotonic_across_solves() {
+        // Counters accumulate across multiple solves on the same Solver.
+        let mut s = Solver::new();
+        s.add_clause([1, 2]);
+        s.add_clause([-1, 2]);
+        let _ = s.solve();
+        let d1 = s.num_decisions();
+        let p1 = s.num_propagations();
+        // solve again with an extra assumption — counters should not decrease.
+        let _ = s.solve_with_assumptions(&[1]);
+        assert!(s.num_decisions() >= d1);
+        assert!(s.num_propagations() >= p1);
     }
 
     #[test]

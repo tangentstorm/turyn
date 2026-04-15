@@ -149,9 +149,9 @@ producers share identical XY SAT behaviour once they reach that
 stage. They differ only in how they *get* to the point of having a
 `(Z, W, xy_root)` triple.
 
-### Measured TTE at `n=26` (4 threads)
+### Measured TTC at `n=26` (4 threads)
 
-| Mode | TTE | Notes |
+| Mode | TTC | Notes |
 |---|---|---|
 | `--wz=cross` | ~1 h (extrapolated) | SpectralIndex cross-matching prunes aggressively |
 | `--wz=apart` | ~7.7 h | direct MDD path walk, ~371 paths/s |
