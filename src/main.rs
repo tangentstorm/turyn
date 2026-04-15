@@ -1499,9 +1499,15 @@ fn add_swap_break<F, G, S>(
 
 /// Build SAT XY template with PB constraints for sum constraints
 /// and quadratic PB agree pairs per lag. No XNOR auxiliary variables.
-fn build_sat_xy_clauses(
+/// Multi-tuple variant of `build_sat_xy_clauses`.  Builds V_x and V_y
+/// as the union of `{cnt(+|σ|), cnt(-|σ|)}` over the given tuples, so
+/// a single XY SAT call covers every unsigned (σ_X, σ_Y) combination
+/// in the list.  Rule-(i)..(vi) clauses are unchanged (they're
+/// position-level, not tuple-level).  Returns `None` if every tuple is
+/// infeasible (parity mismatch on both X and Y).
+fn build_sat_xy_clauses_multi(
     problem: Problem,
-    tuple: SumTuple,
+    tuples: &[SumTuple],
     solver: &mut impl SatSolver,
 ) -> Option<(Vec<LagPairs>, usize)> {
     let n = problem.n;
@@ -1509,76 +1515,81 @@ fn build_sat_xy_clauses(
     let x_var = |i: usize| -> i32 { (i + 1) as i32 };
     let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
 
-    // Symmetry breaking (BDKR 2012 rule i): under the full symmetry group
-    // {negate, reverse, alternate, X↔Y swap}, every orbit has a canonical
-    // representative with x[0]=x[n-1]=y[0]=y[n-1]=+1.  Reverse-then-negate
-    // lets us pin x[n-1] independently of x[0].  See docs/CANONICAL.md.
-    solver.add_clause([x_var(0)]);     // x[0] = +1
-    solver.add_clause([y_var(0)]);     // y[0] = +1
-    solver.add_clause([x_var(n - 1)]); // x[n-1] = +1  (rule i)
-    solver.add_clause([y_var(n - 1)]); // y[n-1] = +1  (rule i)
+    // Symmetry breaking (rule i).
+    solver.add_clause([x_var(0)]);
+    solver.add_clause([y_var(0)]);
+    solver.add_clause([x_var(n - 1)]);
+    solver.add_clause([y_var(n - 1)]);
 
-    // BDKR rules (ii)/(iii): palindromic-break chains on X and Y.
-    // At the least pair index j where x[j] ≠ x[n-1-j], force x[j]=+1
-    // (and symmetrically for Y).  Requires fresh aux vars beyond the
-    // x,y block.  We skip j=0 since x[0]=x[n-1]=+1 already makes that
-    // pair palindromic.
+    // Rules (ii)/(iii)/(vi): palindromic-break chains + swap break.
     let mut next_var = (2 * n + 1) as i32;
     add_palindromic_break(solver, n, x_var, false, 1, &mut next_var);
     add_palindromic_break(solver, n, y_var, false, 1, &mut next_var);
-
-    // BDKR rule (vi): conditional X↔Y swap break.
     add_swap_break(solver, x_var, y_var, n);
 
-    // Sum constraints via PbSetEq.  The tuple's (x, y) fields are now
-    // |σ|; each sequence's sum is allowed to land on either +|σ_X| or
-    // −|σ_X| (resp. Y) — the SAT picks the sign consistent with the
-    // rule-(i)..(vi) canonicalisation clauses above.  Parity of `|σ|+n`
-    // must be even (odd parity means the tuple is infeasible).
-    if (tuple.x.abs() + n as i32) % 2 != 0 || (tuple.y.abs() + n as i32) % 2 != 0 {
-        return None;
-    }
+    // Sum constraints via PbSetEq over the union across `tuples`.
     let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
     let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
-    let x_values: Vec<u32> = [tuple.x.abs(), -tuple.x.abs()].iter()
-        .filter_map(|&s| sigma_full_to_cnt(s, 0, n))
-        .collect::<Vec<_>>();
-    let y_values: Vec<u32> = [tuple.y.abs(), -tuple.y.abs()].iter()
-        .filter_map(|&s| sigma_full_to_cnt(s, 0, n))
-        .collect::<Vec<_>>();
+    let mut x_values: Vec<u32> = Vec::new();
+    let mut y_values: Vec<u32> = Vec::new();
+    for t in tuples {
+        let abs_x = t.x.abs();
+        let abs_y = t.y.abs();
+        for &sx in if abs_x == 0 { &[0i32] as &[i32] } else { &[1, -1] } {
+            if let Some(c) = sigma_full_to_cnt(sx * abs_x, 0, n) {
+                if !x_values.contains(&c) { x_values.push(c); }
+            }
+        }
+        for &sy in if abs_y == 0 { &[0i32] as &[i32] } else { &[1, -1] } {
+            if let Some(c) = sigma_full_to_cnt(sy * abs_y, 0, n) {
+                if !y_values.contains(&c) { y_values.push(c); }
+            }
+        }
+    }
     if x_values.is_empty() || y_values.is_empty() { return None; }
+    x_values.sort_unstable();
+    y_values.sort_unstable();
     solver.add_pb_set_eq(&x_lits, &x_values);
     solver.add_pb_set_eq(&y_lits, &y_values);
 
-    // Build agree pair lists per lag (no aux variables!)
-    // agree(a, b) = a*b + ¬a*¬b = (both true) + (both false)
+    // Shared lag-pair construction (same as single-tuple path).
+    build_xy_lag_pairs(n)
+}
+
+/// Extracted lag-pair construction used by both the single-tuple and
+/// multi-tuple XY template builders.
+fn build_xy_lag_pairs(n: usize) -> Option<(Vec<LagPairs>, usize)> {
+    let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+    let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
     let mut lag_pairs = Vec::with_capacity(n);
-    lag_pairs.push(LagPairs { lits_a: Vec::new(), lits_b: Vec::new() }); // lag 0 unused
+    lag_pairs.push(LagPairs { lits_a: Vec::new(), lits_b: Vec::new() });
     for s in 1..n {
         let mut lits_a = Vec::with_capacity(4 * (n - s));
         let mut lits_b = Vec::with_capacity(4 * (n - s));
-
-        // X pairs: agree(x_i, x_{i+s})
         for i in 0..(n - s) {
-            // Both-true term: x_i * x_{i+s}
             lits_a.push(x_var(i));
             lits_b.push(x_var(i + s));
-            // Both-false term: ¬x_i * ¬x_{i+s}
             lits_a.push(-x_var(i));
             lits_b.push(-x_var(i + s));
         }
-        // Y pairs: agree(y_i, y_{i+s})
         for i in 0..(n - s) {
             lits_a.push(y_var(i));
             lits_b.push(y_var(i + s));
             lits_a.push(-y_var(i));
             lits_b.push(-y_var(i + s));
         }
-
         lag_pairs.push(LagPairs { lits_a, lits_b });
     }
-
     Some((lag_pairs, n))
+}
+
+fn build_sat_xy_clauses(
+    problem: Problem,
+    tuple: SumTuple,
+    solver: &mut impl SatSolver,
+) -> Option<(Vec<LagPairs>, usize)> {
+    // Single-tuple path = multi-tuple path with a one-element slice.
+    build_sat_xy_clauses_multi(problem, std::slice::from_ref(&tuple), solver)
 }
 
 /// Trait abstracting over radical::Solver and cadical::Solver.
@@ -1659,13 +1670,20 @@ impl SatSolver for cadical::Solver {
 
 impl SatXYTemplate {
     fn build(problem: Problem, tuple: SumTuple, sat_config: &radical::SolverConfig) -> Option<Self> {
+        Self::build_multi(problem, std::slice::from_ref(&tuple), sat_config)
+    }
+
+    /// Multi-tuple template: `PbSetEq` on X and Y unions the ±|σ| counts
+    /// across every tuple in `tuples`.  A single solver covers every
+    /// unsigned (σ_X, σ_Y) pair in the list — the SAT picks a
+    /// rule-(i)..(vi)-consistent sign combination at solve time.
+    fn build_multi(problem: Problem, tuples: &[SumTuple], sat_config: &radical::SolverConfig) -> Option<Self> {
         #[cfg(not(feature = "cadical"))]
         let mut solver: radical::Solver = { let mut s = radical::Solver::new(); s.config = sat_config.clone(); s };
         #[cfg(feature = "cadical")]
         let mut solver: cadical::Solver = Default::default();
 
-        let (lag_pairs, n) = build_sat_xy_clauses(problem, tuple, &mut solver)?;
-        // Pre-allocate for expected search size (reduces realloc during solve)
+        let (lag_pairs, n) = build_sat_xy_clauses_multi(problem, tuples, &mut solver)?;
         #[cfg(not(feature = "cadical"))]
         solver.reserve_for_search(200);
         Some(Self { solver, lag_pairs, n })
@@ -2628,12 +2646,18 @@ struct BoundaryWork {
 }
 
 struct SolveWZWork {
+    /// Representative tuple (for trace / cache keys).  The real candidate
+    /// set is `candidate_tuples`.
     tuple: SumTuple,
     z_bits: u32,
     w_bits: u32,
     xy_root: u32,
     z_mid_sum: i32,
     w_mid_sum: i32,
+    /// All tuples this boundary is compatible with; the combined SAT
+    /// sees `V_w` = union of ±|σ_W| counts and `V_z` = union of ±|σ_Z|
+    /// counts across this list.
+    candidate_tuples: Vec<SumTuple>,
 }
 
 struct SolveWWork {
@@ -2817,13 +2841,16 @@ fn run_mdd_sat_search(
         // A small cap lets workers move on to fresh (z_boundary, W) pairs
         // faster, which matters more than exhaustively enumerating Z for
         // one pair.
-        // The cap is 1 by default; PbSetEq-based SolveZ can shuffle the
-        // decision ordering relative to PbEq and produce a non-pair-
-        // passing Z first (the in-SAT and external spectral filters are
-        // intentionally on different frequency grids).  If open n=18
-        // search stops finding after PbSetEq changes, the user can bump
-        // `--max-z` to enumerate more Zs per (Z boundary, W middle).
-        max_z: cfg.max_z.min(1),
+        // The cap used to be 1: old PbEq-based SolveZ happened to pick
+        // a Z whose (Z, W) pair passed the external spectral filter by
+        // luck of decision ordering.  Under PbSetEq the decision order
+        // changes and 1 Z per pair isn't reliable — the in-SAT and
+        // external spectral filters are on different frequency grids
+        // by design, so the SAT may legitimately pick a Z that passes
+        // its own in-SAT spectral but fails the external pair check.
+        // Enumerate up to 16 Zs per (Z boundary, W middle) to recover.
+        // User can still override via `--max-z`.
+        max_z: cfg.max_z.min(16),
         individual_bound: problem.spectral_bound(),
         pair_bound: cfg.max_spectral.unwrap_or(problem.spectral_bound()),
         theta: cfg.theta_samples,
@@ -3070,7 +3097,10 @@ fn run_mdd_sat_search(
         let sat_config = sat_config.clone();
 
         handles.push(std::thread::spawn(move || {
-            let mut template_cache: HashMap<(i32, i32, i32, i32), SatXYTemplate> = HashMap::new();
+            // Keyed by the sorted tuple list (each entry = signed tuple);
+            // templates differ only in their `V_x`/`V_y` PbSetEq values,
+            // which are derived from this list.
+            let mut template_cache: HashMap<Vec<(i32, i32, i32, i32)>, SatXYTemplate> = HashMap::new();
             let mut warm = WarmStartState { phase: None, inject_phase: true };
             let mut w_bases: HashMap<i32, radical::Solver> = HashMap::new();
             let mut z_bases: HashMap<i32, radical::Solver> = HashMap::new();
@@ -3164,6 +3194,7 @@ fn run_mdd_sat_search(
                             PipelineWork::SolveWZ(SolveWZWork {
                                 tuple: rep, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
                                 xy_root: bnd.xy_root, z_mid_sum, w_mid_sum,
+                                candidate_tuples,
                             })
                         } else {
                             PipelineWork::SolveW(SolveWWork {
@@ -3392,18 +3423,7 @@ fn run_mdd_sat_search(
                         let z_var = |i: usize| -> i32 { (ctx.middle_m + i + 1) as i32 };
                         let total_vars = ctx.middle_m + ctx.middle_n;
 
-                        // Sum constraints
-                        let w_ones = ((swz.w_mid_sum + ctx.middle_m as i32) / 2) as u32;
-                        let w_lits: Vec<i32> = (0..ctx.middle_m).map(|i| w_var(i)).collect();
-                        let ones_w: Vec<u32> = vec![1; ctx.middle_m];
-                        solver.add_pb_eq(&w_lits, &ones_w, w_ones);
-
-                        let z_ones = ((swz.z_mid_sum + ctx.middle_n as i32) / 2) as u32;
-                        let z_lits: Vec<i32> = (0..ctx.middle_n).map(|i| z_var(i)).collect();
-                        let ones_z: Vec<u32> = vec![1; ctx.middle_n];
-                        solver.add_pb_eq(&z_lits, &ones_z, z_ones);
-
-                        // Expand boundaries
+                        // Expand boundaries (needed to build V_w and V_z).
                         let (w_prefix, w_suffix) = expand_boundary_bits(swz.w_bits, k);
                         let mut w_boundary = vec![0i8; m];
                         w_boundary[..k].copy_from_slice(&w_prefix);
@@ -3413,6 +3433,34 @@ fn run_mdd_sat_search(
                             z_boundary[i] = if (swz.z_bits >> i) & 1 == 1 { 1 } else { -1 };
                             z_boundary[n-k+i] = if (swz.z_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
                         }
+
+                        // Sum constraints via PbSetEq: union of ±|σ_W| (resp. ±|σ_Z|)
+                        // counts across all `candidate_tuples`.
+                        let w_bnd_sum_local: i32 = w_boundary.iter().map(|&v| v as i32).sum();
+                        let z_bnd_sum_local: i32 = z_boundary.iter().map(|&v| v as i32).sum();
+                        let mut w_counts: Vec<u32> = Vec::new();
+                        let mut z_counts: Vec<u32> = Vec::new();
+                        for t in &swz.candidate_tuples {
+                            let abs_w = t.w.abs();
+                            for &sg in if abs_w == 0 { &[0i32] as &[i32] } else { &[1, -1] } {
+                                if let Some(c) = sigma_full_to_cnt(sg * abs_w, w_bnd_sum_local, ctx.middle_m) {
+                                    if !w_counts.contains(&c) { w_counts.push(c); }
+                                }
+                            }
+                            let abs_z = t.z.abs();
+                            for &sg in if abs_z == 0 { &[0i32] as &[i32] } else { &[1, -1] } {
+                                if let Some(c) = sigma_full_to_cnt(sg * abs_z, z_bnd_sum_local, ctx.middle_n) {
+                                    if !z_counts.contains(&c) { z_counts.push(c); }
+                                }
+                            }
+                        }
+                        w_counts.sort_unstable();
+                        z_counts.sort_unstable();
+                        if w_counts.is_empty() || z_counts.is_empty() { continue; }
+                        let w_lits: Vec<i32> = (0..ctx.middle_m).map(|i| w_var(i)).collect();
+                        let z_lits: Vec<i32> = (0..ctx.middle_n).map(|i| z_var(i)).collect();
+                        solver.add_pb_set_eq(&w_lits, &w_counts);
+                        solver.add_pb_set_eq(&z_lits, &z_counts);
 
                         // BDKR rules (iv)/(v) boundary pre-filter.
                         let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
@@ -3582,7 +3630,10 @@ fn run_mdd_sat_search(
                             let w_seq = PackedSeq::from_values(&w_vals);
                             let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
 
-                            let tuple_key = (swz.tuple.x, swz.tuple.y, swz.tuple.z, swz.tuple.w);
+                            // SolveWZ currently carries a single tuple; lift it to a
+                            // 1-element list so we share the Vec-keyed cache with SolveZ.
+                            let tuple_key: Vec<(i32, i32, i32, i32)> = vec![(
+                                swz.tuple.x, swz.tuple.y, swz.tuple.z, swz.tuple.w)];
                             let template = template_cache.entry(tuple_key).or_insert_with(||
                                 SatXYTemplate::build(problem, swz.tuple, &sat_config).unwrap()
                             );
@@ -3869,9 +3920,14 @@ fn run_mdd_sat_search(
                             // Solve XY inline using solve_with_assumptions for each boundary.
                             // This reuses the same solver across boundaries: learnt clauses
                             // from one boundary transfer to the next, and no clone per boundary.
-                            let tuple_key = (sz.tuple.x, sz.tuple.y, sz.tuple.z, sz.tuple.w);
+                            // Cache key: the sorted list of candidate (σ_X, σ_Y, σ_Z, σ_W)
+                            // — same set of tuples ⇒ same XY template (rule clauses +
+                            // V_x/V_y are derived from the tuple list).
+                            let mut tuple_key: Vec<(i32, i32, i32, i32)> = sz.candidate_tuples.iter()
+                                .map(|t| (t.x, t.y, t.z, t.w)).collect();
+                            tuple_key.sort_unstable();
                             let template = template_cache.entry(tuple_key).or_insert_with(||
-                                SatXYTemplate::build(problem, sz.tuple, &sat_config).unwrap()
+                                SatXYTemplate::build_multi(problem, &sz.candidate_tuples, &sat_config).unwrap()
                             );
                             let candidate = CandidateZW { zw_autocorr };
                             // Shared XY SAT fast path: clone the per-tuple
@@ -4014,7 +4070,8 @@ fn run_mdd_sat_search(
                         }
                         let xy_root = nid;
 
-                        let tuple_key = (item.tuple.x, item.tuple.y, item.tuple.z, item.tuple.w);
+                        let tuple_key: Vec<(i32, i32, i32, i32)> = vec![(
+                            item.tuple.x, item.tuple.y, item.tuple.z, item.tuple.w)];
                         let template = template_cache.entry(tuple_key).or_insert_with(||
                             SatXYTemplate::build(ctx.problem, item.tuple, &sat_config).unwrap()
                         );
