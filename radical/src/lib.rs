@@ -1008,10 +1008,22 @@ impl Solver {
 
     /// Propagate a PbSetEq constraint.  Returns `Some(Reason::PbSetEq(pi))`
     /// when the constraint is infeasible under the current assignment.
+    ///
+    /// NOTE (2026-04-15): always recount from the trail.  The incremental
+    /// `(num_true, num_undef)` counters updated by the main propagate loop
+    /// only reflect the single variable currently being processed — they
+    /// can lag behind the real assignment state when prior propagators in
+    /// the same iteration (e.g. QuadPb, or this PbSetEq's own
+    /// `force_pb_set_eq_dir`) enqueued additional lits that haven't yet
+    /// been picked up by the main loop.  Trusting the incremental counters
+    /// here produced false-UNSAT conclusions (V_alive empty) when reality
+    /// had plenty of valid counts.  Mirrors the XOR propagator's "recount
+    /// unknowns from scratch" fix.
     fn propagate_pb_set_eq(&mut self, pi: u32) -> Option<Reason> {
-        if self.pb_set_eq_constraints[pi as usize].stale {
-            self.recompute_pb_set_eq(pi);
-        }
+        // Unconditional recount.  O(|lits|) per call; acceptable because
+        // PbSetEq constraints are small (≤ 2n lits) and propagate fires
+        // infrequently.
+        self.recompute_pb_set_eq(pi);
         let pc = &self.pb_set_eq_constraints[pi as usize];
         let cnt_lo = pc.num_true;
         let cnt_hi = pc.num_true + pc.num_undef;
@@ -4862,5 +4874,123 @@ mod tests {
         s.restore_checkpoint(cp);
         assert_eq!(s.solve(), Some(true));
         assert_eq!(s.value(1), Some(true));
+    }
+
+    /// Regression test (currently failing) for the n=18 turyn XY regression.
+    /// Hardcoded data reproducing the smallest known instance where
+    /// `add_pb_set_eq` + `add_quad_pb_eq` jointly return UNSAT while each
+    /// subset is SAT and an explicit satisfying assignment exists.
+    ///
+    /// Construction:
+    /// - 36 variables: X = vars 1..=18, Y = vars 19..=36 (1-based).
+    /// - PbSetEq over X with V_x = {14}: exactly 14 of the X vars are true.
+    /// - PbSetEq over Y with V_y = {8}:  exactly 8  of the Y vars are true.
+    /// - For each lag s in 1..=17, a `add_quad_pb_eq` over
+    ///   `{(x_i, x_{i+s}), (¬x_i, ¬x_{i+s}), (y_i, y_{i+s}), (¬y_i, ¬y_{i+s})}`
+    ///   for i in 0..(18-s), with target chosen to match the canonical Turyn
+    ///   (X, Y, Z, W) at n=18.
+    /// - Boundary unit clauses: X and Y positions 0..=4 and 13..=17 pinned
+    ///   to the canonical values.
+    /// - Middle positions 5..=12 left free for the SAT.
+    ///
+    /// Expected: SAT (the canonical middle is a valid completion).
+    /// Actual:   UNSAT (soundness bug in PbSetEq + QuadPb interaction).
+    ///
+    /// Diagnostic data points (from the turyn test suite):
+    /// - Replace `add_pb_set_eq([14])` with `add_pb_eq` target 14 → SAT.
+    /// - Remove PbSetEq entirely → SAT.
+    /// - Keep PbSetEq, use only lags [1..=11] of quad_pb → SAT.
+    /// - Keep PbSetEq, use only lags [1..=12] of quad_pb → UNSAT.
+    ///
+    /// So the bug triggers when PbSetEq is combined with ≥12 quad_pb
+    /// constraints.  Individual lags in isolation are SAT.
+    ///
+    /// Root cause (fixed 2026-04-15): `propagate_pb_set_eq` trusted the
+    /// incremental `(num_true, num_undef)` counters, but those only
+    /// reflect the single lit currently being processed by the main
+    /// propagate loop.  When prior propagators in the same iteration
+    /// (QuadPb, or this PbSetEq's own `force_pb_set_eq_dir`) had already
+    /// enqueued additional lits, their effect was not yet in the
+    /// counters — the propagator saw a stale `(num_true, num_undef)` and
+    /// concluded V_alive = ∅ even though the real assignment had plenty
+    /// of valid counts.  Fix: always recompute from the trail.  Same
+    /// workaround the XOR propagator already used.
+    #[test]
+    fn pb_set_eq_plus_quad_pb_tt18_regression() {
+        let n = 18usize;
+        // Canonical TT(18).  X[i] = +1 if bit i is 1.
+        let x_vals: [i8; 18] = [ 1,  1, -1,  1,  1,  1,  1,  1,  1,  1,  1,  1, -1,  1, -1, -1,  1,  1];
+        let y_vals: [i8; 18] = [ 1,  1, -1, -1, -1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1,  1, -1,  1];
+        let z_vals: [i8; 18] = [ 1,  1, -1,  1,  1,  1, -1, -1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1];
+        let w_vals: [i8; 17] = [ 1,  1, -1, -1, -1, -1,  1, -1, -1,  1, -1, -1,  1,  1,  1, -1,  1];
+
+        // zw_autocorr[s] = 2 * N_Z(s) + 2 * N_W(s), where N_A(s) = Σ A[i]*A[i+s]
+        let mut zw_autocorr = vec![0i32; n];
+        for s in 1..n {
+            let mut nz = 0i32;
+            for i in 0..(n - s) { nz += (z_vals[i] as i32) * (z_vals[i + s] as i32); }
+            let mut nw = 0i32;
+            if s < 17 {
+                for i in 0..(17 - s) { nw += (w_vals[i] as i32) * (w_vals[i + s] as i32); }
+            }
+            zw_autocorr[s] = 2 * nz + 2 * nw;
+        }
+        // Verify Turyn identity for X, Y: N_X + N_Y + zw = 0 for s >= 1.
+        for s in 1..n {
+            let mut nx = 0i32;
+            for i in 0..(n - s) { nx += (x_vals[i] as i32) * (x_vals[i + s] as i32); }
+            let mut ny = 0i32;
+            for i in 0..(n - s) { ny += (y_vals[i] as i32) * (y_vals[i + s] as i32); }
+            assert_eq!(nx + ny + zw_autocorr[s], 0,
+                "Turyn identity fails at s={s}: N_X={nx}, N_Y={ny}, zw_autocorr={}",
+                zw_autocorr[s]);
+        }
+
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };          // 1..=18
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };       // 19..=36
+
+        let mut s = Solver::new();
+        // Ensure all 36 vars exist.
+        for v in 1..=(2 * n) as i32 { s.add_clause([v, -v]); }
+
+        // PbSetEq on X: exactly 14 true.  Canonical σ_X = +10, so count = 14.
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        s.add_pb_set_eq(&x_lits, &[14]);
+        // PbSetEq on Y: exactly 8 true.  Canonical σ_Y = -2, so count = 8.
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        s.add_pb_set_eq(&y_lits, &[8]);
+
+        // quad_pb for each lag s in 1..n.  target = (2(n-s) - zw[s]) / 2.
+        for lag in 1..n {
+            let target_raw = 2 * (n - lag) as i32 - zw_autocorr[lag];
+            assert!(target_raw >= 0 && target_raw % 2 == 0);
+            let target = (target_raw / 2) as u32;
+            let mut lits_a: Vec<i32> = Vec::with_capacity(4 * (n - lag));
+            let mut lits_b: Vec<i32> = Vec::with_capacity(4 * (n - lag));
+            for i in 0..(n - lag) {
+                lits_a.push(x_var(i)); lits_b.push(x_var(i + lag));
+                lits_a.push(-x_var(i)); lits_b.push(-x_var(i + lag));
+            }
+            for i in 0..(n - lag) {
+                lits_a.push(y_var(i)); lits_b.push(y_var(i + lag));
+                lits_a.push(-y_var(i)); lits_b.push(-y_var(i + lag));
+            }
+            let ones: Vec<u32> = vec![1; lits_a.len()];
+            s.add_quad_pb_eq(&lits_a, &lits_b, &ones, target);
+        }
+
+        // Boundary unit clauses: pin first 5 and last 5 of both X and Y.
+        let k = 5usize;
+        for i in 0..k {
+            s.add_clause([if x_vals[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            s.add_clause([if x_vals[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+            s.add_clause([if y_vals[i] == 1 { y_var(i) } else { -y_var(i) }]);
+            s.add_clause([if y_vals[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+        }
+
+        let result = s.solve();
+        assert_eq!(result, Some(true),
+            "PbSetEq + quad_pb + canonical boundary should be SAT — the canonical middle X, Y is a valid completion.  \
+             This is the n=18 turyn open-search regression manifesting as a pure radical-level test.");
     }
 }
