@@ -548,6 +548,157 @@ pub fn fill_w_spectral(
     }
 }
 
+/// Result of a boundary-side rule (iv)/(v) check.  Used by the Z and W
+/// middle SAT builders to fold rule (iv)/(v) into the SAT encoding, and
+/// by the MDD walker as an O(k) pre-filter that avoids spinning up the
+/// middle SAT at all when the boundary already violates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryRuleState {
+    /// The rule's first-violation index is strictly inside the boundary
+    /// AND the boundary value at that index is correct (+1).  The rule
+    /// is already satisfied; no middle-SAT clauses need to be emitted.
+    SatisfiedAtBoundary,
+    /// The rule's first-violation index is strictly inside the boundary
+    /// AND the boundary value at that index is wrong (-1).  The whole
+    /// boundary is infeasible — middle SAT should not be built.
+    ViolatedAtBoundary,
+    /// No first-violation index falls inside the boundary.  The rule
+    /// may still fire at a middle index, so the middle SAT must emit
+    /// its own first-violation clauses for the middle pairs.
+    DeferredToMiddle,
+}
+
+/// BDKR rule (iv) — Z palindromic-equality break, applied to the
+/// boundary only (O(k)).  Scans pair indices `j = 0..k-1` in order
+/// and returns the first-violation state of the boundary.
+pub fn check_z_boundary_rule_iv(n: usize, k: usize, z_boundary: &[i8]) -> BoundaryRuleState {
+    let last_j = (n - 2) / 2;
+    let bnd_end = k.min(last_j + 1);
+    for j in 0..bnd_end {
+        if z_boundary[j] == z_boundary[n - 1 - j] {
+            return if z_boundary[j] == 1 {
+                BoundaryRuleState::SatisfiedAtBoundary
+            } else {
+                BoundaryRuleState::ViolatedAtBoundary
+            };
+        }
+    }
+    BoundaryRuleState::DeferredToMiddle
+}
+
+/// BDKR rule (v) — W alternation break, applied to the boundary only.
+/// d[m-1] is in the suffix boundary so its sign is known; the first-
+/// violation at a boundary pair k < K is thus fully determined.
+pub fn check_w_boundary_rule_v(m: usize, k: usize, w_boundary: &[i8]) -> BoundaryRuleState {
+    if m < 3 { return BoundaryRuleState::DeferredToMiddle; }
+    let last_p = (m - 2) / 2;
+    let tail = w_boundary[m - 1];
+    let bnd_end = k.min(last_p + 1);
+    for p in 0..bnd_end {
+        let prod = (w_boundary[p] as i32) * (w_boundary[m - 1 - p] as i32);
+        if prod as i8 != tail {
+            return if w_boundary[p] == 1 {
+                BoundaryRuleState::SatisfiedAtBoundary
+            } else {
+                BoundaryRuleState::ViolatedAtBoundary
+            };
+        }
+    }
+    BoundaryRuleState::DeferredToMiddle
+}
+
+/// Emit rule-(iv) middle-pair clauses into the Z-middle solver.  Only
+/// called when `check_z_boundary_rule_iv` returns `DeferredToMiddle`,
+/// i.e., every boundary palindrome pair has diff=T (non-palindromic),
+/// so boundary literals contribute nothing to the disjunction.
+///
+/// `next_var` is advanced by the number of aux vars consumed.
+pub fn add_rule_iv_middle_clauses(
+    solver: &mut radical::Solver,
+    n: usize,
+    k: usize,
+    next_var: &mut i32,
+) {
+    let last_j = (n - 2) / 2;
+    if k > last_j { return; }
+    let mid_start = k;
+    let mid_end = last_j;
+    let n_aux = mid_end - mid_start + 1;
+    let base = *next_var;
+    *next_var += n_aux as i32;
+    let diff = |jf: usize| base + (jf - mid_start) as i32;
+    let mid_var = |jf: usize| -> i32 { (jf - k + 1) as i32 };
+    for j in mid_start..=mid_end {
+        let a = mid_var(j);
+        let b = mid_var(n - 1 - j);
+        solver.add_clause([-diff(j),  a,  b]);
+        solver.add_clause([-diff(j), -a, -b]);
+        solver.add_clause([ diff(j),  a, -b]);
+        solver.add_clause([ diff(j), -a,  b]);
+    }
+    for i in mid_start..=mid_end {
+        let mut clause: Vec<i32> = Vec::with_capacity(i - mid_start + 2);
+        for j in mid_start..i { clause.push(-diff(j)); }
+        clause.push(diff(i));
+        clause.push(mid_var(i));
+        solver.add_clause(clause);
+    }
+}
+
+/// Emit rule-(v) middle-pair clauses into the W-middle solver.  Only
+/// called when `check_w_boundary_rule_v` returns `DeferredToMiddle`.
+/// `d[m-1]` is a boundary constant, which folds into the XOR
+/// definition — v_k depends only on the two middle vars when the tail
+/// is +1, and is negated when the tail is -1.
+pub fn add_rule_v_middle_clauses(
+    solver: &mut radical::Solver,
+    m: usize,
+    k: usize,
+    w_boundary: &[i8],
+    next_var: &mut i32,
+) {
+    if m < 3 { return; }
+    let last_p = (m - 2) / 2;
+    if k > last_p { return; }
+    let mid_start = k;
+    let mid_end = last_p;
+    let n_aux = mid_end - mid_start + 1;
+    let base_u = *next_var;
+    *next_var += n_aux as i32;
+    let base_v = *next_var;
+    *next_var += n_aux as i32;
+    let u = |p: usize| base_u + (p - mid_start) as i32;
+    let v = |p: usize| base_v + (p - mid_start) as i32;
+    let mid_var = |pf: usize| -> i32 { (pf - k + 1) as i32 };
+    let tail_sign = w_boundary[m - 1];
+    for p in mid_start..=mid_end {
+        let a = mid_var(p);
+        let b = mid_var(m - 1 - p);
+        // u_p ↔ a XOR b
+        solver.add_clause([-u(p),  a,  b]);
+        solver.add_clause([-u(p), -a, -b]);
+        solver.add_clause([ u(p),  a, -b]);
+        solver.add_clause([ u(p), -a,  b]);
+        // v_p ↔ u_p XOR tail.  tail is a constant ±1; when tail=+1,
+        // v_p = u_p; when tail=-1, v_p = ¬u_p.
+        if tail_sign == 1 {
+            // v_p ↔ u_p  (unit clauses v_p↔u_p)
+            solver.add_clause([-v(p),  u(p)]);
+            solver.add_clause([ v(p), -u(p)]);
+        } else {
+            solver.add_clause([-v(p), -u(p)]);
+            solver.add_clause([ v(p),  u(p)]);
+        }
+    }
+    for i in mid_start..=mid_end {
+        let mut clause: Vec<i32> = Vec::with_capacity(i - mid_start + 2);
+        for j in mid_start..i { clause.push(-v(j)); }
+        clause.push(v(i));
+        clause.push(mid_var(i));
+        solver.add_clause(clause);
+    }
+}
+
 /// Legacy: build Z middle solver from scratch (no template).
 /// Kept for the `--phase-b --wz=apart` diagnostic path.
 pub fn build_z_middle_solver(

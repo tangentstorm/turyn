@@ -1374,9 +1374,11 @@ fn add_palindromic_break<F, S>(
 
 /// BDKR rule (v) — alternation-break for W.  Defines `v_k` aux vars via
 ///    v_k ↔ d[k] XOR d[m-1-k] XOR d[m-1]
-/// where `m = seq_len` (= n-1 for W), then emits the same
-/// "first-violation" chain as rule (ii): at the least `k` with `v_k = T`
-/// force `d[k] = +1`.
+/// where `m = seq_len`.  Truth-table shows this `v_k` is `alt_k` — the
+/// boolean "the product d[k]·d[m-1-k] equals d[m-1]", i.e. "no
+/// violation at k".  The rule wants the *least* k with alt_k = F
+/// (violation), so the first-violation chain uses the same polarity
+/// as rule (iv): negate earlier and keep current positive.
 fn add_alternation_break<F, S>(
     solver: &mut S,
     seq_len: usize,
@@ -1396,13 +1398,16 @@ fn add_alternation_break<F, S>(
     for k in 0..=last_k {
         // u_k ↔ d[k] XOR d[m-1-k]
         encode_xor_def(solver, u(k), seq_var(k), seq_var(seq_len - 1 - k));
-        // v_k ↔ u_k XOR d[m-1]
+        // v_k ↔ u_k XOR d[m-1]   (so v_k = alt_k = "no violation at k")
         encode_xor_def(solver, v(k), u(k), tail);
     }
+    // First-violation chain (same polarity as rule iv).  Premise at i:
+    //   (all j<i have v_j = T, i.e., no earlier violation) AND (v_i = F, violation here)
+    // ⇒ d[i] = +1.  CNF clause: (∨_{j<i} ¬v_j) ∨ v_i ∨ d[i].
     for i in 0..=last_k {
         let mut clause: Vec<i32> = Vec::with_capacity(i + 2);
-        for j in 0..i { clause.push(v(j)); }
-        clause.push(-v(i));
+        for j in 0..i { clause.push(-v(j)); }
+        clause.push(v(i));
         clause.push(seq_var(i));
         solver.add_clause(clause);
     }
@@ -3074,6 +3079,13 @@ fn run_mdd_sat_search(
                         w_boundary[..k].copy_from_slice(&w_prefix);
                         w_boundary[m-k..].copy_from_slice(&w_suffix);
 
+                        // BDKR rule (v) boundary pre-filter.  Skip this
+                        // SolveW if the W boundary already fails rule (v).
+                        let rule_v_state = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
+                        if rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary {
+                            continue;
+                        }
+
                         // For small middle: brute-force W enumeration (proven to find solutions).
                         // For large middle: SAT-based W generation (handles big search spaces).
                         let mut w_found_any = false;
@@ -3095,6 +3107,15 @@ fn run_mdd_sat_search(
                                 w_vals[k..k+ctx.middle_m].copy_from_slice(w_mid);
                                 flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
                                 if trace_w { trace_w_total += 1; }
+                                // BDKR rule (v): check the full W sequence.
+                                // `check_w_boundary_rule_v` works for any
+                                // prefix extent; using the full m here
+                                // catches violations in the middle too.
+                                if sat_z_middle::check_w_boundary_rule_v(m, m, &w_vals)
+                                    == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
+                                {
+                                    return true; // skip non-canonical w_mid
+                                }
                                 if spectrum_into_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w, &mut spec_buf) {
                                     if trace_w { trace_w_pass += 1; }
                                     flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
@@ -3119,6 +3140,12 @@ fn run_mdd_sat_search(
                             );
                             let w_cp = w_solver.save_checkpoint();
                             sat_z_middle::fill_w_solver(&mut w_solver, &ctx.w_tmpl, m, &w_boundary);
+                            // Rule (v) middle clauses when boundary left
+                            // the rule DeferredToMiddle.
+                            if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
+                                let mut nv = (w_solver.num_vars() + 1) as i32;
+                                sat_z_middle::add_rule_v_middle_clauses(&mut w_solver, m, k, &w_boundary, &mut nv);
+                            }
                             if let Some(ref wtab) = ctx.w_spectral_tables {
                                 w_solver.spectral = Some(radical::SpectralConstraint::from_tables(
                                     wtab, &w_boundary, ctx.individual_bound,
@@ -3224,6 +3251,19 @@ fn run_mdd_sat_search(
                             z_boundary[i] = if (swz.z_bits >> i) & 1 == 1 { 1 } else { -1 };
                             z_boundary[n-k+i] = if (swz.z_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
                         }
+
+                        // BDKR rules (iv)/(v) boundary pre-filter.
+                        let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
+                        let rule_v_state  = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
+                        if rule_iv_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
+                           || rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
+                        {
+                            continue;
+                        }
+                        // Middle clauses in the combined SAT: rule (iv) on
+                        // Z's middle vars (z_var) and rule (v) on W's
+                        // middle vars (w_var).  For the combined solver
+                        // these go after the per-sequence setup below.
 
                         // Combined WZ spectral: 2|W(ω)|² + 2|Z(ω)|² ≤ pair_bound.
                         // Uses two-sequence SpectralConstraint with separate DFT tracking.
@@ -3455,6 +3495,15 @@ fn run_mdd_sat_search(
                             z_boundary[n - k + i] = if (sz.z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
                         }
 
+                        // BDKR rule (iv) boundary pre-filter.  If the
+                        // first palindromic pair falls inside the Z
+                        // boundary with the wrong sign, no middle Z
+                        // can fix it — skip building the SAT entirely.
+                        let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
+                        if rule_iv_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary {
+                            continue;
+                        }
+
                         let mut z_solver = z_bases.remove(&sz.z_mid_sum).unwrap_or_else(||
                             ctx.z_tmpl.build_base_solver_quad_pb(ctx.middle_n, sz.z_mid_sum)
                         );
@@ -3484,6 +3533,12 @@ fn run_mdd_sat_search(
                             z_prep_z_bits = Some(sz.z_bits);
                         }
                         sat_z_middle::fill_z_solver_quad_pb(&mut z_solver, &ctx.z_tmpl, n, m, ctx.middle_n, &z_prep, &sz.w_vals);
+                        // Rule (iv) middle clauses — only needed when
+                        // the boundary left the rule DeferredToMiddle.
+                        if rule_iv_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
+                            let mut nv = (z_solver.num_vars() + 1) as i32;
+                            sat_z_middle::add_rule_iv_middle_clauses(&mut z_solver, n, k, &mut nv);
+                        }
                         if let Some(ref ztab) = ctx.z_spectral_tables {
                             // Build the SpectralConstraint manually, reusing
                             // the cached z_boundary DFT instead of recomputing
