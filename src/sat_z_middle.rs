@@ -612,11 +612,17 @@ pub fn check_w_boundary_rule_v(m: usize, k: usize, w_boundary: &[i8]) -> Boundar
 /// i.e., every boundary palindrome pair has diff=T (non-palindromic),
 /// so boundary literals contribute nothing to the disjunction.
 ///
+/// `mid_var` maps a full-sequence position (in the middle range
+/// `[k, n-k-1]`) to a SAT variable ID.  This lets the same helper
+/// work for the separate Z-middle SAT (`mid_var(jf) = jf - k + 1`)
+/// and the combined W+Z SolveWZ SAT (`mid_var(jf) = middle_m + jf - k + 1`).
+///
 /// `next_var` is advanced by the number of aux vars consumed.
 pub fn add_rule_iv_middle_clauses(
     solver: &mut radical::Solver,
     n: usize,
     k: usize,
+    mid_var: impl Fn(usize) -> i32,
     next_var: &mut i32,
 ) {
     let last_j = (n - 2) / 2;
@@ -627,7 +633,6 @@ pub fn add_rule_iv_middle_clauses(
     let base = *next_var;
     *next_var += n_aux as i32;
     let diff = |jf: usize| base + (jf - mid_start) as i32;
-    let mid_var = |jf: usize| -> i32 { (jf - k + 1) as i32 };
     for j in mid_start..=mid_end {
         let a = mid_var(j);
         let b = mid_var(n - 1 - j);
@@ -650,11 +655,15 @@ pub fn add_rule_iv_middle_clauses(
 /// `d[m-1]` is a boundary constant, which folds into the XOR
 /// definition — v_k depends only on the two middle vars when the tail
 /// is +1, and is negated when the tail is -1.
+///
+/// `mid_var` maps a full-sequence position to a SAT var, same
+/// convention as `add_rule_iv_middle_clauses`.
 pub fn add_rule_v_middle_clauses(
     solver: &mut radical::Solver,
     m: usize,
     k: usize,
     w_boundary: &[i8],
+    mid_var: impl Fn(usize) -> i32,
     next_var: &mut i32,
 ) {
     if m < 3 { return; }
@@ -669,7 +678,6 @@ pub fn add_rule_v_middle_clauses(
     *next_var += n_aux as i32;
     let u = |p: usize| base_u + (p - mid_start) as i32;
     let v = |p: usize| base_v + (p - mid_start) as i32;
-    let mid_var = |pf: usize| -> i32 { (pf - k + 1) as i32 };
     let tail_sign = w_boundary[m - 1];
     for p in mid_start..=mid_end {
         let a = mid_var(p);
@@ -682,7 +690,6 @@ pub fn add_rule_v_middle_clauses(
         // v_p ↔ u_p XOR tail.  tail is a constant ±1; when tail=+1,
         // v_p = u_p; when tail=-1, v_p = ¬u_p.
         if tail_sign == 1 {
-            // v_p ↔ u_p  (unit clauses v_p↔u_p)
             solver.add_clause([-v(p),  u(p)]);
             solver.add_clause([ v(p), -u(p)]);
         } else {

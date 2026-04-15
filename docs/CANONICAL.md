@@ -107,10 +107,11 @@ diminishing returns:
   Same idea, but on `build_zw_dfs`.  Currently the Z/W middle SAT
   handles these via boundary pre-filter + middle clauses; structural
   pruning would make the ZW MDD smaller still.
-- **Rules (iv)/(v) middle clauses in the combined `SolveWZ` SAT.**
-  The separate-W-Z pipeline (`SolveW` → `SolveZ`) already emits the
-  middle clauses; the combined solver uses distinct z/w var
-  closures and the helpers would need a generic var-closure API.
+- **MDD walker boundary-pair pre-filters for rules (iv)/(v).**
+  `check_z_boundary_rule_iv` / `check_w_boundary_rule_v` run inside
+  `SolveZ`/`SolveW`/`SolveWZ`; you could move them one step
+  earlier, at `Boundary` emission, to prune non-canonical boundaries
+  before they multiply out over tuples.
 
 ### Original encoding sketches (for the record)
 

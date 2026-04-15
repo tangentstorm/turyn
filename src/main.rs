@@ -3144,7 +3144,11 @@ fn run_mdd_sat_search(
                             // the rule DeferredToMiddle.
                             if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
                                 let mut nv = (w_solver.num_vars() + 1) as i32;
-                                sat_z_middle::add_rule_v_middle_clauses(&mut w_solver, m, k, &w_boundary, &mut nv);
+                                sat_z_middle::add_rule_v_middle_clauses(
+                                    &mut w_solver, m, k, &w_boundary,
+                                    |pf| (pf - k + 1) as i32,
+                                    &mut nv,
+                                );
                             }
                             if let Some(ref wtab) = ctx.w_spectral_tables {
                                 w_solver.spectral = Some(radical::SpectralConstraint::from_tables(
@@ -3260,10 +3264,27 @@ fn run_mdd_sat_search(
                         {
                             continue;
                         }
-                        // Middle clauses in the combined SAT: rule (iv) on
-                        // Z's middle vars (z_var) and rule (v) on W's
-                        // middle vars (w_var).  For the combined solver
-                        // these go after the per-sequence setup below.
+                        // Rule (iv) / (v) middle clauses in the combined
+                        // SolveWZ solver.  The separate helpers take a
+                        // full-seq-pos → SAT-var closure; here the W
+                        // middle occupies vars 1..middle_m and the Z
+                        // middle occupies middle_m+1..middle_m+middle_n.
+                        let total_existing_vars = total_vars;
+                        let mut nv_combined = (total_existing_vars + 1) as i32;
+                        if rule_iv_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
+                            sat_z_middle::add_rule_iv_middle_clauses(
+                                &mut solver, n, k,
+                                |jf| z_var(jf - k),
+                                &mut nv_combined,
+                            );
+                        }
+                        if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
+                            sat_z_middle::add_rule_v_middle_clauses(
+                                &mut solver, m, k, &w_boundary,
+                                |pf| w_var(pf - k),
+                                &mut nv_combined,
+                            );
+                        }
 
                         // Combined WZ spectral: 2|W(ω)|² + 2|Z(ω)|² ≤ pair_bound.
                         // Uses two-sequence SpectralConstraint with separate DFT tracking.
@@ -3537,7 +3558,11 @@ fn run_mdd_sat_search(
                         // the boundary left the rule DeferredToMiddle.
                         if rule_iv_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
                             let mut nv = (z_solver.num_vars() + 1) as i32;
-                            sat_z_middle::add_rule_iv_middle_clauses(&mut z_solver, n, k, &mut nv);
+                            sat_z_middle::add_rule_iv_middle_clauses(
+                                &mut z_solver, n, k,
+                                |jf| (jf - k + 1) as i32,
+                                &mut nv,
+                            );
                         }
                         if let Some(ref ztab) = ctx.z_spectral_tables {
                             // Build the SpectralConstraint manually, reusing
