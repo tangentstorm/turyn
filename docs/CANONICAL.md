@@ -46,17 +46,29 @@ An additional consequence of the full rule set: **`c[n] = -1` for `n > 1`.**
 
 ### Currently enforced (post-2026-04 update)
 
-| Rule(s) | Site                                 | Clauses added                                   |
-|---------|--------------------------------------|-------------------------------------------------|
-| (i)     | `build_sat_xy_clauses` (`src/main.rs`) | `x[0]=x[n-1]=y[0]=y[n-1]=+1`                 |
-| (i)     | `sat_encode` (`src/main.rs`)           | `x[0]=x[n-1]=y[0]=y[n-1]=z[0]=w[0]=+1`       |
-| (i)     | `sat_encode_quad_pb_unified` (`src/main.rs`) | same as above, gated on `fixed.is_none()` |
-| (i)     | MDD builder (`src/mdd_zw_first.rs`)    | position-0 branch restricted to `0b11` (z[0]=w[0]=+1) |
-| tuple-level | `SumTuple::norm_key` (`src/main.rs`) | `|σ_X|, |σ_Y|, |σ_Z|, |σ_W|` + sort(σ_X, σ_Y) → factor 32 |
+| Rule(s) | Site                                 | What is added                                  |
+|---------|--------------------------------------|------------------------------------------------|
+| (i)     | `build_sat_xy_clauses`               | `x[0]=x[n-1]=y[0]=y[n-1]=+1` unit clauses       |
+| (i)     | `sat_encode`                         | same, plus `z[0]=w[0]=+1`                       |
+| (i)     | `sat_encode_quad_pb_unified`         | same as above, gated on `fixed.is_none()`       |
+| (i)     | MDD builder (`src/mdd_zw_first.rs`)  | XY sub-MDD: branch `0b11` pinned at positions `0` and `2k-1` (⇒ `x[0]=y[0]=x[n-1]=y[n-1]=+1`); ZW half: position 0 pinned (⇒ `z[0]=w[0]=+1`) |
+| (ii)    | `build_sat_xy_clauses`, `sat_encode` | palindromic-break chain on X via aux `diff_j ↔ x[j]⊕x[n-1-j]`, start `j=1` |
+| (iii)   | `build_sat_xy_clauses`, `sat_encode` | palindromic-break chain on Y (same shape as ii) |
+| (iv)    | `sat_encode`                         | palindromic-EQ-break chain on Z (equality polarity, start `j=0`) |
+| (v)     | `sat_encode`                         | alternation-break chain on W via `v_k ↔ d[k]⊕d[m-1-k]⊕d[m-1]` |
+| (vi)    | `build_sat_xy_clauses`, `sat_encode` | 5 clauses encoding the conditional X↔Y swap break |
+| tuple-level | `SumTuple::norm_key`             | `|σ_X|, |σ_Y|, |σ_Z|, |σ_W|` only (no X↔Y sort — rule (vi) breaks T4). Factor 16. |
+
+The palindromic/alternation/swap-break encoding is shared across the
+XY template and the legacy full encoder via `add_palindromic_break`,
+`add_alternation_break`, and `add_swap_break` helpers near the top of
+`src/main.rs`.  Aux vars are allocated contiguously above the
+sequence variable block so they don't collide with XNOR / quad-PB
+aux blocks.
 
 ### Test-suite status
 
-All 26 tests pass under rule (i).  Five tests were adjusted to operate
+All 26 tests pass under the full rule set (i)–(vi).  Five tests were adjusted to operate
 on canonical-orbit data:
 
 - `sat_solves_tt2`: uses the T3-alternated canonical form
@@ -72,9 +84,22 @@ on canonical-orbit data:
   the Apart (MDD-walker) path uses per-lag SAT constraints and
   recovers the canonical TT cleanly.
 
-### TODO (rules ii, iii, iv, v, vi)
+### Follow-up work
 
-These require non-trivial SAT encoding work.  Sketches:
+Rules (ii), (iii), (iv), (v), (vi) are now wired into the SAT
+encoders.  What's still *not* done:
+
+- **Rules (iv)/(v) in the MDD middle-SAT solvers** (`src/sat_z_middle.rs`,
+  `src/sat_w_middle.rs`).  The middle solver only sees middle vars,
+  so boundary-boundary palindrome pairs must be enforced at MDD-walk
+  time and boundary-middle propagation would need threading through
+  the `LagTemplate`.  A more mechanical refactor.
+- **MDD pruning for rules (ii)/(iii) at boundary positions.**  For
+  palindrome pairs (j, n-1-j) that fall wholly inside the boundary
+  (j < k), the first-violation rule can be evaluated at MDD gen
+  time.  Could shrink the XY sub-MDD further.
+
+### Original encoding sketches (for the record)
 
 #### Rules (ii), (iii), (iv) — palindromic-break chain
 

@@ -218,20 +218,20 @@ impl SumTuple {
     ///   T3 alternate all four (a[i] ↦ (-1)^i·a[i]) → changes sums in a
     ///      non-simple way (depends on σ_even − σ_odd), so it is *not*
     ///      detectable at the tuple level.
-    ///   T4 interchange X ↔ Y  → swaps σ_X and σ_Y
+    ///   T4 interchange X ↔ Y — **broken by rule (vi)** in the SAT
+    ///      encoder (when n > 2), so at the tuple level we do *not*
+    ///      collapse (σ_X, σ_Y) ↔ (σ_Y, σ_X).
     ///
-    /// At the tuple level, the symmetries visible as simple coordinate
-    /// transforms are T1 (sign-flip each of σ_X, σ_Y, σ_Z, σ_W
-    /// independently) and T4 (swap σ_X, σ_Y).  T2 is invisible (sums
-    /// invariant) and T3 cannot be normalised cheaply.  We therefore
-    /// canonicalise by |·| on every component and sort (σ_X, σ_Y).
+    /// We therefore canonicalise by `|·|` on every component only.
+    /// (T1 is safe because negating a whole sequence flips its sum,
+    /// and for each orbit a unique representative with all sums
+    /// non-negative exists — rule (i) then picks the right signs at
+    /// the position level.)  T2 is invisible (sums invariant) and T3
+    /// cannot be normalised cheaply.
     ///
-    /// This gives a factor 32 reduction at the tuple level:
-    ///   2^4 (independent sign flips) × 2 (swap when σ_X ≠ σ_Y).
+    /// Tuple-level reduction: factor 16 (2^4 independent sign flips).
     fn norm_key(&self) -> (i32, i32, i32, i32) {
-        let (xa, ya) = (self.x.abs(), self.y.abs());
-        let (xx, yy) = if xa <= ya { (xa, ya) } else { (ya, xa) };
-        (xx, yy, self.z.abs(), self.w.abs())
+        (self.x.abs(), self.y.abs(), self.z.abs(), self.w.abs())
     }
 
 }
@@ -1316,6 +1316,124 @@ struct LagPairs {
     lits_b: Vec<i32>,
 }
 
+/// 4-clause encoding of `d ↔ (a XOR b)`.  Uses only `add_clause` so it
+/// works against the generic `SatSolver` trait (radical's native
+/// `add_xor` would be faster, but not every path has the concrete
+/// solver type).
+fn encode_xor_def(solver: &mut impl SatSolver, d: i32, a: i32, b: i32) {
+    solver.add_clause([-d,  a,  b]);
+    solver.add_clause([-d, -a, -b]);
+    solver.add_clause([ d,  a, -b]);
+    solver.add_clause([ d, -a,  b]);
+}
+
+/// Allocate fresh aux vars and emit BDKR "first-violation" palindromic-
+/// break clauses (rules ii, iii, iv).
+///
+/// For each valid pair index `j` in `start_j ..= (seq_len - 2) / 2`,
+/// introduce `diff_j` aux iff `seq[j] XOR seq[seq_len-1-j]` and add
+///
+///   clause@i = (∨_{j<i} lit_earlier(diff_j)) ∨ lit_current(diff_i) ∨ seq(i)
+///
+/// where the `lit_*` helpers select the polarity encoding the rule
+/// ("first differ" for equality=false, "first equal" for equality=true).
+/// Returns the number of aux vars consumed (so callers can keep
+/// `next_var` in sync).
+fn add_palindromic_break<F, S>(
+    solver: &mut S,
+    seq_len: usize,
+    seq_var: F,
+    equality: bool,
+    start_j: usize,
+    next_var: &mut i32,
+) where F: Fn(usize) -> i32, S: SatSolver {
+    if seq_len < 2 { return; }
+    let last_j = (seq_len - 2) / 2;
+    if start_j > last_j { return; }
+    let n_aux = last_j - start_j + 1;
+    let base = *next_var;
+    *next_var += n_aux as i32;
+    let diff = |k: usize| base + (k - start_j) as i32; // diff var for pair index k
+    // XOR definitions: diff_k ↔ seq[k] XOR seq[seq_len-1-k].
+    for k in start_j..=last_j {
+        encode_xor_def(solver, diff(k), seq_var(k), seq_var(seq_len - 1 - k));
+    }
+    // First-violation clauses.  For equality=false (rule ii/iii) the
+    // "violation" literal is diff_k (pair differs); for equality=true
+    // (rule iv) it is ¬diff_k (pair is palindromic).
+    for i in start_j..=last_j {
+        let mut clause: Vec<i32> = Vec::with_capacity(i - start_j + 2);
+        for j in start_j..i {
+            if equality { clause.push(-diff(j)); } else { clause.push(diff(j)); }
+        }
+        if equality { clause.push(diff(i)); } else { clause.push(-diff(i)); }
+        clause.push(seq_var(i));
+        solver.add_clause(clause);
+    }
+}
+
+/// BDKR rule (v) — alternation-break for W.  Defines `v_k` aux vars via
+///    v_k ↔ d[k] XOR d[m-1-k] XOR d[m-1]
+/// where `m = seq_len` (= n-1 for W), then emits the same
+/// "first-violation" chain as rule (ii): at the least `k` with `v_k = T`
+/// force `d[k] = +1`.
+fn add_alternation_break<F, S>(
+    solver: &mut S,
+    seq_len: usize,
+    seq_var: F,
+    next_var: &mut i32,
+) where F: Fn(usize) -> i32, S: SatSolver {
+    if seq_len < 3 { return; }
+    let last_k = (seq_len - 2) / 2;
+    let tail = seq_var(seq_len - 1);
+    // Allocate v_k aux vars and an inner aux u_k for the two-step XOR.
+    let base_v = *next_var;
+    *next_var += (last_k + 1) as i32;
+    let base_u = *next_var;
+    *next_var += (last_k + 1) as i32;
+    let v = |k: usize| base_v + k as i32;
+    let u = |k: usize| base_u + k as i32;
+    for k in 0..=last_k {
+        // u_k ↔ d[k] XOR d[m-1-k]
+        encode_xor_def(solver, u(k), seq_var(k), seq_var(seq_len - 1 - k));
+        // v_k ↔ u_k XOR d[m-1]
+        encode_xor_def(solver, v(k), u(k), tail);
+    }
+    for i in 0..=last_k {
+        let mut clause: Vec<i32> = Vec::with_capacity(i + 2);
+        for j in 0..i { clause.push(v(j)); }
+        clause.push(-v(i));
+        clause.push(seq_var(i));
+        solver.add_clause(clause);
+    }
+}
+
+/// BDKR rule (vi) — conditional X↔Y swap break (requires n > 2).
+///
+///   if a[2] != b[2] ⇒ a[2] = +1
+///   else           ⇒ a[n-1] = +1 AND b[n-1] = -1
+///
+/// In 0-indexed vars: `a[2]→x_var(1)`, `a[n-1]→x_var(n-2)` (and same
+/// for b).  Encoded as five binary/ternary clauses; see
+/// docs/CANONICAL.md.
+fn add_swap_break<F, G, S>(
+    solver: &mut S,
+    x_var: F,
+    y_var: G,
+    n: usize,
+) where F: Fn(usize) -> i32, G: Fn(usize) -> i32, S: SatSolver {
+    if n <= 2 { return; }
+    let x1 = x_var(1);
+    let y1 = y_var(1);
+    let x_last = x_var(n - 2);
+    let y_last = y_var(n - 2);
+    solver.add_clause([x1, -y1]);              // forbid (x[1]=-1 ∧ y[1]=+1)
+    solver.add_clause([x1,  x_last]);          // NOT case 2  ⇒  x[n-2] = +1  (i)
+    solver.add_clause([-y1, x_last]);          //                             (ii)
+    solver.add_clause([x1, -y_last]);          // NOT case 2  ⇒  y[n-2] = -1  (i)
+    solver.add_clause([-y1, -y_last]);         //                             (ii)
+}
+
 /// Build SAT XY template with PB constraints for sum constraints
 /// and quadratic PB agree pairs per lag. No XNOR auxiliary variables.
 fn build_sat_xy_clauses(
@@ -1334,8 +1452,20 @@ fn build_sat_xy_clauses(
     // lets us pin x[n-1] independently of x[0].  See docs/CANONICAL.md.
     solver.add_clause([x_var(0)]);     // x[0] = +1
     solver.add_clause([y_var(0)]);     // y[0] = +1
-    solver.add_clause([x_var(n - 1)]); // x[n-1] = +1  (new: rule i)
-    solver.add_clause([y_var(n - 1)]); // y[n-1] = +1  (new: rule i)
+    solver.add_clause([x_var(n - 1)]); // x[n-1] = +1  (rule i)
+    solver.add_clause([y_var(n - 1)]); // y[n-1] = +1  (rule i)
+
+    // BDKR rules (ii)/(iii): palindromic-break chains on X and Y.
+    // At the least pair index j where x[j] ≠ x[n-1-j], force x[j]=+1
+    // (and symmetrically for Y).  Requires fresh aux vars beyond the
+    // x,y block.  We skip j=0 since x[0]=x[n-1]=+1 already makes that
+    // pair palindromic.
+    let mut next_var = (2 * n + 1) as i32;
+    add_palindromic_break(solver, n, x_var, false, 1, &mut next_var);
+    add_palindromic_break(solver, n, y_var, false, 1, &mut next_var);
+
+    // BDKR rule (vi): conditional X↔Y swap break.
+    add_swap_break(solver, x_var, y_var, n);
 
     // Sum constraints via PB
     if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0 {
@@ -2119,10 +2249,26 @@ fn sat_encode(problem: Problem, tuple: SumTuple) -> (SatEncoder, radical::Solver
     // docs/CANONICAL.md).
     solver.add_clause([enc.x_var(0)]);        // x[0]   = +1  (rule i)
     solver.add_clause([enc.y_var(0)]);        // y[0]   = +1  (rule i)
-    solver.add_clause([enc.x_var(n - 1)]);    // x[n-1] = +1  (rule i, new)
-    solver.add_clause([enc.y_var(n - 1)]);    // y[n-1] = +1  (rule i, new)
+    solver.add_clause([enc.x_var(n - 1)]);    // x[n-1] = +1  (rule i)
+    solver.add_clause([enc.y_var(n - 1)]);    // y[n-1] = +1  (rule i)
     solver.add_clause([enc.z_var(0)]);        // z[0]   = +1  (rule i)
     solver.add_clause([enc.w_var(0)]);        // w[0]   = +1  (rule i)
+
+    // BDKR rules (ii)/(iii)/(iv)/(v)/(vi): fold the remaining
+    // canonicalisation rules into the SAT encoding.  Aux vars are
+    // allocated contiguously above the sequence vars (4n-1 of them)
+    // via `enc.fresh()`, so they don't collide with xnor aux.
+    let xv = |i: usize| enc.x_var(i);
+    let yv = |i: usize| enc.y_var(i);
+    let zv = |i: usize| enc.z_var(i);
+    let wv = |i: usize| enc.w_var(i);
+    let mut next_var = enc.next_var;
+    add_palindromic_break(&mut solver, n, xv, /*equality=*/false, 1, &mut next_var);
+    add_palindromic_break(&mut solver, n, yv, /*equality=*/false, 1, &mut next_var);
+    add_palindromic_break(&mut solver, n, zv, /*equality=*/true,  0, &mut next_var);
+    add_alternation_break(&mut solver, m, wv, &mut next_var);
+    add_swap_break(&mut solver, xv, yv, n);
+    enc.next_var = next_var;
 
     // Sum constraints: encode that exactly (sum+len)/2 variables are true (=+1)
     let x_pos = ((tuple.x + n as i32) / 2) as usize;
@@ -5365,20 +5511,25 @@ mod tests {
         // T3 preserves the Turyn identity (N_·(s) ↦ (-1)^s·N_·(s), and
         // the sum at each lag acquires the same factor, so the identity
         // still vanishes).
+        // Canonical TT(36) under the full BDKR rule set (i)..(vi) —
+        // produced by orbit-enumerating the Kharaghani–Tayfeh-Rezaie
+        // (2005) representative and picking the unique form that
+        // satisfies every rule.  The transformation used: negate X,
+        // reverse X, reverse W, alternate all four, swap X↔Y.
+        // Verified externally; every rule-(i..vi) predicate holds and
+        // the Turyn identity vanishes at every lag.
         let p = Problem::new(36);
-        let z_raw: Vec<i8> = vec![1,-1,1,1,1,1,1,-1,1,-1,-1,1,1,1,1,-1,1,1,1,-1,1,1,-1,-1,1,1,1,-1,1,-1,-1,1,-1,-1,-1,1];
-        let w_raw: Vec<i8> = vec![1,1,1,-1,1,-1,-1,-1,-1,-1,1,1,-1,-1,1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,1,-1,1,1,1,1,-1,1];
-        let known_x_raw: Vec<i8> = vec![1,1,1,-1,-1,-1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,1,1,1,-1,1,1,-1,1,1,1,1,-1,-1,-1,-1,1,-1];
-        let known_y_raw: Vec<i8> = vec![1,-1,1,1,1,1,1,-1,-1,1,-1,1,-1,-1,1,-1,-1,1,1,-1,-1,1,1,1,1,-1,1,1,1,1,-1,-1,-1,1,1,-1];
-        let alt = |v: &[i8]| -> Vec<i8> {
-            v.iter().enumerate().map(|(i, &x)| if i % 2 == 0 { x } else { -x }).collect()
+        let parse = |s: &str| -> Vec<i8> {
+            s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect()
         };
-        let z_vals = alt(&z_raw);
-        let w_vals = alt(&w_raw);
-        let known_x = alt(&known_x_raw);
-        let known_y = alt(&known_y_raw);
+        let known_x = parse("+++-+-++-----+++--++--+-+++-+--+--++");
+        let known_y = parse("+++-+--+-+++---+-++-+-++++++--+-++-+");
+        let z_vals  = parse("+++-+-++++--+-+++-+++--++-++++---+--");
+        let w_vals  = parse("+++-+---+------++-++++--++-+-++++-+");
         assert_eq!(known_x[0], 1);    assert_eq!(known_x[35], 1);
         assert_eq!(known_y[0], 1);    assert_eq!(known_y[35], 1);
+        assert_eq!(z_vals[0], 1);
+        assert_eq!(w_vals[0], 1);
         let z = PackedSeq::from_values(&z_vals);
         let w = PackedSeq::from_values(&w_vals);
         let mut zw = vec![0; 36];

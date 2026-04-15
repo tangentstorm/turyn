@@ -100,6 +100,47 @@ Correctness notes:
 - The n=18 smoke test finds a TT(18) whose X and Y both end in +1,
   confirming rule (i) is satisfied on the primary benchmark path.
 
+## BDKR rules (ii)–(vi) in the SAT encoders (April 2026)
+
+Following on from rule (i), we wired the remaining BDKR 2012
+canonicalisation rules into every SAT encoder (`build_sat_xy_clauses`
+and `sat_encode`) via shared helpers:
+
+- `add_palindromic_break` for rules (ii) [on X], (iii) [on Y], (iv) [on Z]
+  — rule (iv) uses the "equality polarity" (first-palindromic ⇒ +1).
+- `add_alternation_break` for rule (v) on W.
+- `add_swap_break` for rule (vi) — 5 binary/ternary clauses on
+  `x[1], y[1], x[n-2], y[n-2]`.
+
+Rule (vi) breaks T4 (X↔Y swap), so `SumTuple::norm_key` no longer
+sorts σ_X, σ_Y — tuples `(σ_X, σ_Y, σ_Z, σ_W)` and `(σ_Y, σ_X, …)`
+are now distinct.  For each such pair only one typically has a
+canonical TT; the other produces UNSAT quickly.
+
+### Measurement (n=18 --wz=apart --mdd-k=5, 5 runs)
+
+Throughput: **~3800 paths/s** (median, consistent with the rule-(i)-
+only state).  Live ZW paths unchanged at 33208 because the MDD still
+only enforces rule (i) — rules (ii)–(vi) are a SAT-side filter that
+unit-propagates away inside the XY / full SAT calls.
+
+The main benefit of rules (ii)–(vi) at this n is that *searches now
+land on a canonical representative that the test suite's
+`known_solutions.txt` can be hardcoded against*.  We rewrote all 16
+entries of `known_solutions.txt` via an orbit-search pass so every
+recorded TT(n) satisfies all six rules.  The SAT-level constraints
+also become important at larger n, where orbits are bigger and the
+search rejects more wrong-orbit branches.
+
+### Correctness
+
+- All 26 tests pass.  `sat_xy_solves_known_tt36_zw` uses a newly
+  computed canonical TT(36) (orbit-enumerated from the
+  Kharaghani–Tayfeh-Rezaie 2005 representative via neg-X, rev-X,
+  rev-W, alternate-all, swap-XY).
+- `known_solutions.txt` verified via a Python harness: every entry
+  verifies the Turyn identity *and* satisfies rules (i)–(vi).
+
 ## MDD Pipeline throughput optimizations (April 2026)
 
 Baseline: n=56 mdd-k=10, 60s, ~40K XY solves (pre-optimization).
