@@ -2712,6 +2712,29 @@ fn run_mdd_sat_search(
     let flow_xy_sat = Arc::new(std::sync::atomic::AtomicU64::new(0));             // XY SAT result = SAT
     let flow_xy_unsat = Arc::new(std::sync::atomic::AtomicU64::new(0));           // XY SAT result = UNSAT (proved)
     let flow_xy_timeout = Arc::new(std::sync::atomic::AtomicU64::new(0));         // XY SAT result = None (conflict limit)
+    // Per-stage SAT search stats: aggregate decisions/propagations/forced/free over all solves.
+    // Incremented by workers via diffing radical::Solver counters before/after each solve.
+    let flow_w_solves = Arc::new(std::sync::atomic::AtomicU64::new(0));           // count of W SAT solves
+    let flow_w_decisions = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let flow_w_propagations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let flow_w_root_forced = Arc::new(std::sync::atomic::AtomicU64::new(0));      // sum of vars newly forced at level 0
+    let flow_w_free_sum = Arc::new(std::sync::atomic::AtomicU64::new(0));         // sum of "free vars after forcing"
+    let flow_z_solves = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let flow_z_decisions = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let flow_z_propagations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let flow_z_root_forced = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let flow_z_free_sum = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let flow_xy_solves = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let flow_xy_decisions = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let flow_xy_propagations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let flow_xy_root_forced = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let flow_xy_free_sum = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Sum of `cover_frac × 1_000_000` across XY timeout solves only.
+    // Used to derive effective coverage from aggregate counters in the TTC
+    // formula: a timeout that explored fraction f contributes f instead of 1.0
+    // to the boundary's coverage. (W and Z solves don't time out today, so
+    // partial-credit machinery applies only to XY.)
+    let flow_xy_timeout_cov_micro = Arc::new(std::sync::atomic::AtomicU64::new(0));
     // Per-stage enter/exit counters: depth = enter - exit.
     let stage_enter: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let stage_exit: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
@@ -2745,6 +2768,22 @@ fn run_mdd_sat_search(
         let flow_xy_sat = Arc::clone(&flow_xy_sat);
         let flow_xy_unsat = Arc::clone(&flow_xy_unsat);
         let flow_xy_timeout = Arc::clone(&flow_xy_timeout);
+        let flow_w_solves = Arc::clone(&flow_w_solves);
+        let flow_w_decisions = Arc::clone(&flow_w_decisions);
+        let flow_w_propagations = Arc::clone(&flow_w_propagations);
+        let flow_w_root_forced = Arc::clone(&flow_w_root_forced);
+        let flow_w_free_sum = Arc::clone(&flow_w_free_sum);
+        let flow_z_solves = Arc::clone(&flow_z_solves);
+        let flow_z_decisions = Arc::clone(&flow_z_decisions);
+        let flow_z_propagations = Arc::clone(&flow_z_propagations);
+        let flow_z_root_forced = Arc::clone(&flow_z_root_forced);
+        let flow_z_free_sum = Arc::clone(&flow_z_free_sum);
+        let flow_xy_solves = Arc::clone(&flow_xy_solves);
+        let flow_xy_decisions = Arc::clone(&flow_xy_decisions);
+        let flow_xy_propagations = Arc::clone(&flow_xy_propagations);
+        let flow_xy_root_forced = Arc::clone(&flow_xy_root_forced);
+        let flow_xy_free_sum = Arc::clone(&flow_xy_free_sum);
+        let flow_xy_timeout_cov_micro = Arc::clone(&flow_xy_timeout_cov_micro);
         let stage_enter: Vec<_> = stage_enter.iter().map(Arc::clone).collect();
         let stage_exit: Vec<_> = stage_exit.iter().map(Arc::clone).collect();
         let sat_config = sat_config.clone();
@@ -2905,6 +2944,15 @@ fn run_mdd_sat_search(
                                 ));
                             }
 
+                            // Snapshot solver search stats before the enumeration
+                            // loop. We diff against post-loop values to get this
+                            // boundary's contribution to the W-stage diagnostics
+                            // (decisions, propagations, level-0 forced, free vars).
+                            let w_d0 = w_solver.num_decisions();
+                            let w_p0 = w_solver.num_propagations();
+                            let w_l0 = w_solver.num_level0_vars();
+                            let w_nv = w_solver.num_vars();
+
                             // Collect passing W candidates into a batch to reduce
                             // queue lock contention, same as the brute-force path above.
                             let mut batch: Vec<PipelineWork> = Vec::new();
@@ -2942,6 +2990,21 @@ fn run_mdd_sat_search(
                             if !batch.is_empty() {
                                 wq.push_batch(batch);
                             }
+
+                            // Aggregate W-stage SAT search stats for this boundary.
+                            // Record level-0 forced count from the pre-solve snapshot
+                            // (constraint propagation pruning) — this is what gets
+                            // displayed as "vars forced before SAT runs".
+                            let w_decisions    = w_solver.num_decisions().saturating_sub(w_d0);
+                            let w_propagations = w_solver.num_propagations().saturating_sub(w_p0);
+                            let w_pre_forced   = w_l0 as u64;
+                            let w_free_vars    = w_nv.saturating_sub(w_l0) as u64;
+                            flow_w_solves.fetch_add(1, AtomicOrdering::Relaxed);
+                            flow_w_decisions.fetch_add(w_decisions, AtomicOrdering::Relaxed);
+                            flow_w_propagations.fetch_add(w_propagations, AtomicOrdering::Relaxed);
+                            flow_w_root_forced.fetch_add(w_pre_forced, AtomicOrdering::Relaxed);
+                            flow_w_free_sum.fetch_add(w_free_vars, AtomicOrdering::Relaxed);
+
                             w_solver.spectral = None;
                             w_solver.restore_checkpoint(w_cp);
                             w_bases.insert(sw.w_mid_sum, w_solver);
@@ -3062,6 +3125,17 @@ fn run_mdd_sat_search(
                             });
                         }
 
+                        // Snapshot search stats for the combined SAT enumeration.
+                        // Combined WZ does the work of both the W and Z stages, so
+                        // we credit its decisions/propagations to BOTH stage
+                        // counters — each stage's "per-solve average" stays
+                        // interpretable, at the cost of a small overcount in the
+                        // grand total.
+                        let wz_d0 = solver.num_decisions();
+                        let wz_p0 = solver.num_propagations();
+                        let wz_l0 = solver.num_level0_vars();
+                        let wz_nv = solver.num_vars();
+
                         // Enumerate WZ solutions
                         let mut wz_count = 0usize;
                         loop {
@@ -3131,13 +3205,33 @@ fn run_mdd_sat_search(
                                             assumptions.push(if (y_bits >> i) & 1 == 1 { y_var(i) } else { -y_var(i) });
                                             assumptions.push(if (y_bits >> (k + i)) & 1 == 1 { y_var(n - k + i) } else { -y_var(n - k + i) });
                                         }
+                                        // Snapshot search stats around the SAT call.
+                                        let xy_d0 = xy_solver.num_decisions();
+                                        let xy_p0 = xy_solver.num_propagations();
+                                        let xy_l0 = xy_solver.num_level0_vars();
+                                        let xy_nv = xy_solver.num_vars();
                                         let result = xy_solver.solve_with_assumptions(&assumptions);
                                         items_completed.fetch_add(1, AtomicOrdering::Relaxed);
                                         stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
+
+                                        let xy_decisions    = xy_solver.num_decisions().saturating_sub(xy_d0);
+                                        let xy_propagations = xy_solver.num_propagations().saturating_sub(xy_p0);
+                                        let xy_pre_forced   = xy_l0 as u64;
+                                        let xy_free_vars    = xy_nv.saturating_sub(xy_l0) as u64;
+                                        flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
+                                        flow_xy_decisions.fetch_add(xy_decisions, AtomicOrdering::Relaxed);
+                                        flow_xy_propagations.fetch_add(xy_propagations, AtomicOrdering::Relaxed);
+                                        flow_xy_root_forced.fetch_add(xy_pre_forced, AtomicOrdering::Relaxed);
+                                        flow_xy_free_sum.fetch_add(xy_free_vars, AtomicOrdering::Relaxed);
+
                                         match result {
                                             Some(true) => flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed),
                                             Some(false) => flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed),
-                                            None => flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed),
+                                            None => {
+                                                let cover = xy_cover_micro(result, xy_decisions, xy_free_vars);
+                                                flow_xy_timeout_cov_micro.fetch_add(cover, AtomicOrdering::Relaxed);
+                                                flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed)
+                                            }
                                         };
                                         if result == Some(true) {
                                             let (x, y) = template.extract_xy(&xy_solver);
@@ -3150,6 +3244,24 @@ fn run_mdd_sat_search(
                                 );
                             }
                         }
+
+                        // Aggregate combined-WZ stats into both W and Z stage
+                        // counters (see comment at snapshot site above).
+                        let wz_decisions    = solver.num_decisions().saturating_sub(wz_d0);
+                        let wz_propagations = solver.num_propagations().saturating_sub(wz_p0);
+                        let wz_pre_forced   = wz_l0 as u64;
+                        let wz_free_vars    = wz_nv.saturating_sub(wz_l0) as u64;
+                        flow_w_solves.fetch_add(1, AtomicOrdering::Relaxed);
+                        flow_w_decisions.fetch_add(wz_decisions, AtomicOrdering::Relaxed);
+                        flow_w_propagations.fetch_add(wz_propagations, AtomicOrdering::Relaxed);
+                        flow_w_root_forced.fetch_add(wz_pre_forced, AtomicOrdering::Relaxed);
+                        flow_w_free_sum.fetch_add(wz_free_vars, AtomicOrdering::Relaxed);
+                        flow_z_solves.fetch_add(1, AtomicOrdering::Relaxed);
+                        flow_z_decisions.fetch_add(wz_decisions, AtomicOrdering::Relaxed);
+                        flow_z_propagations.fetch_add(wz_propagations, AtomicOrdering::Relaxed);
+                        flow_z_root_forced.fetch_add(wz_pre_forced, AtomicOrdering::Relaxed);
+                        flow_z_free_sum.fetch_add(wz_free_vars, AtomicOrdering::Relaxed);
+
                         stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
                     }
 
@@ -3251,6 +3363,15 @@ fn run_mdd_sat_search(
                         }
 
                         let w_seq = PackedSeq::from_values(&sz.w_vals);
+
+                        // Snapshot Z-stage SAT search stats. Diff against
+                        // post-loop values for this (Z,W) pair's contribution
+                        // to the Z-stage diagnostics.
+                        let z_d0 = z_solver.num_decisions();
+                        let z_p0 = z_solver.num_propagations();
+                        let z_l0 = z_solver.num_level0_vars();
+                        let z_nv = z_solver.num_vars();
+
                         let mut z_count = 0usize;
                         loop {
                             if ctx.found.load(AtomicOrdering::Relaxed) { break; }
@@ -3349,14 +3470,26 @@ fn run_mdd_sat_search(
                                             }
                                         }
                                         stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                        let result = state.try_candidate(x_bits, y_bits);
+                                        let (result, stats) = state.try_candidate(x_bits, y_bits);
                                         items_completed.fetch_add(1, AtomicOrdering::Relaxed);
                                         stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
                                         match &result {
                                             XyTryResult::Sat(_, _) => { flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed); }
                                             XyTryResult::Unsat | XyTryResult::Pruned => { flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
-                                            XyTryResult::Timeout => { flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed); }
+                                            XyTryResult::Timeout => {
+                                                flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed);
+                                                flow_xy_timeout_cov_micro.fetch_add(stats.cover_micro, AtomicOrdering::Relaxed);
+                                            }
                                         };
+                                        // Pruned candidates skip the SAT solver, so their stats are zero —
+                                        // don't pollute per-stage averages with an extra "0-decision" sample.
+                                        if !matches!(result, XyTryResult::Pruned) {
+                                            flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
+                                            flow_xy_decisions.fetch_add(stats.decisions, AtomicOrdering::Relaxed);
+                                            flow_xy_propagations.fetch_add(stats.propagations, AtomicOrdering::Relaxed);
+                                            flow_xy_root_forced.fetch_add(stats.vars_pre_forced, AtomicOrdering::Relaxed);
+                                            flow_xy_free_sum.fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
+                                        }
                                         if let XyTryResult::Sat(x, y) = result {
                                             if verify_tt(problem, &x, &y, &z_seq, &w_seq) {
                                                 ctx.found.store(true, AtomicOrdering::Relaxed);
@@ -3375,6 +3508,21 @@ fn run_mdd_sat_search(
                             let z_pf = flow_z_pair_fail.load(AtomicOrdering::Relaxed);
                             eprintln!("TRACE: SolveZ done for target: {} Z found (global z_spec_fail={}, z_pair_fail={})", z_count, z_sf, z_pf);
                         }
+
+                        // Aggregate Z-stage SAT search stats for this (Z,W) pair.
+                        // Pre-solve level-0 count captures vars forced by constraint
+                        // setup (post fill_z_solver, pre solve()) — the meaningful
+                        // "constraint pruning" measurement for the Z stage.
+                        let z_decisions    = z_solver.num_decisions().saturating_sub(z_d0);
+                        let z_propagations = z_solver.num_propagations().saturating_sub(z_p0);
+                        let z_pre_forced   = z_l0 as u64;
+                        let z_free_vars    = z_nv.saturating_sub(z_l0) as u64;
+                        flow_z_solves.fetch_add(1, AtomicOrdering::Relaxed);
+                        flow_z_decisions.fetch_add(z_decisions, AtomicOrdering::Relaxed);
+                        flow_z_propagations.fetch_add(z_propagations, AtomicOrdering::Relaxed);
+                        flow_z_root_forced.fetch_add(z_pre_forced, AtomicOrdering::Relaxed);
+                        flow_z_free_sum.fetch_add(z_free_vars, AtomicOrdering::Relaxed);
+
                         z_solver.spectral = None;
                         z_solver.restore_checkpoint(z_cp);
                         z_bases.insert(sz.z_mid_sum, z_solver);
@@ -3445,14 +3593,24 @@ fn run_mdd_sat_search(
                                 &mut |x_bits, y_bits| {
                                     if ctx.found.load(AtomicOrdering::Relaxed) { return; }
                                     stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                    let result = state.try_candidate(x_bits, y_bits);
+                                    let (result, stats) = state.try_candidate(x_bits, y_bits);
                                     items_completed.fetch_add(1, AtomicOrdering::Relaxed);
                                     stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
                                     match &result {
                                         XyTryResult::Sat(_, _) => { flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed); }
                                         XyTryResult::Unsat | XyTryResult::Pruned => { flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
-                                        XyTryResult::Timeout => { flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed); }
+                                        XyTryResult::Timeout => {
+                                            flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed);
+                                            flow_xy_timeout_cov_micro.fetch_add(stats.cover_micro, AtomicOrdering::Relaxed);
+                                        }
                                     };
+                                    if !matches!(result, XyTryResult::Pruned) {
+                                        flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
+                                        flow_xy_decisions.fetch_add(stats.decisions, AtomicOrdering::Relaxed);
+                                        flow_xy_propagations.fetch_add(stats.propagations, AtomicOrdering::Relaxed);
+                                        flow_xy_root_forced.fetch_add(stats.vars_pre_forced, AtomicOrdering::Relaxed);
+                                        flow_xy_free_sum.fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
+                                    }
                                     if let XyTryResult::Sat(x, y) = result {
                                         if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
                                             ctx.found.store(true, AtomicOrdering::Relaxed);
@@ -3638,18 +3796,36 @@ fn run_mdd_sat_search(
         // Progress display
         if verbose && last_progress.elapsed().as_secs() >= 10 {
             let elapsed = run_start.elapsed().as_secs_f64();
-            let done = items_completed.load(AtomicOrdering::Relaxed);
             if wz_mode == WzMode::Cross {
                 // Cross mode: the MDD-centric depth bars are meaningless
                 // (the monitor doesn't walk paths and stages 0-2 stay at
                 // zero). Report producer progress instead: how many
                 // tuples have been enumerated, the gold queue depth, and
-                // the individual-XY-candidate throughput.
+                // the individual-XY-candidate throughput. TTC is
+                // extrapolated from tuple progress: estimate the total
+                // XY candidates as `pushed × tuples_total / tuples_done`.
                 let gold_depth = work_queue.gold_len();
-                let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+                let xy_pushed  = stage_enter[3].load(AtomicOrdering::Relaxed);
+                let xy_done_eff = effective_xy_done(
+                    flow_xy_sat.load(AtomicOrdering::Relaxed),
+                    flow_xy_unsat.load(AtomicOrdering::Relaxed),
+                    flow_xy_timeout.load(AtomicOrdering::Relaxed),
+                    flow_xy_timeout_cov_micro.load(AtomicOrdering::Relaxed),
+                );
+                let est_total = cross_estimated_total_xy(
+                    xy_pushed, cross_tuple_idx, tuples.len(), cross_done,
+                );
+                let rate = if elapsed > 0.0 { xy_done_eff / elapsed } else { 0.0 };
+                let ttc = if rate > 0.0 { (est_total - xy_done_eff).max(0.0) / rate } else { f64::INFINITY };
+                let ttc_str = if ttc < 60.0 { format!("{:.0}s", ttc) }
+                             else if ttc < 3600.0 { format!("{:.0}m", ttc / 60.0) }
+                             else if ttc < 86400.0 { format!("{:.1}h", ttc / 3600.0) }
+                             else { format!("{:.0}d", ttc / 86400.0) };
+                let pct = if est_total > 0.0 { xy_done_eff / est_total * 100.0 } else { 0.0 };
                 eprintln!(
-                    "[{:>3.0}s] --wz=cross  tuples {}/{}  gold queue {}  XY candidates {}  {:.0}/s",
-                    elapsed, cross_tuple_idx, tuples.len(), gold_depth, done, rate,
+                    "[{:>3.0}s] --wz=cross  tuples {}/{}  gold {}  XY {:.0}/{:.0} ({:.1}%)  {:.0}/s  cover:{}",
+                    elapsed, cross_tuple_idx, tuples.len(), gold_depth,
+                    xy_done_eff, est_total, pct, rate, ttc_str,
                 );
             } else {
                 // MDD modes: boundary walker drives everything, so the
@@ -3669,17 +3845,28 @@ fn run_mdd_sat_search(
                 };
                 let bnd_rate = if elapsed > 0.0 { walked as f64 / elapsed } else { 0.0 };
                 let pct_done = if live_zw_paths > 0.0 { walked as f64 / live_zw_paths * 100.0 } else { 0.0 };
-                let tte = if bnd_rate > 0.0 { live_zw_paths / bnd_rate } else { f64::INFINITY };
-                let tte_str = if tte < 60.0 { format!("{:.0}s", tte) }
-                             else if tte < 3600.0 { format!("{:.0}m", tte / 60.0) }
-                             else if tte < 86400.0 { format!("{:.1}h", tte / 3600.0) }
-                             else { format!("{:.0}d", tte / 86400.0) };
-                eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}bnd/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5}  {:.2}% exhaust:{}",
+                // Effective coverage: each fully-resolved boundary counts as 1.0,
+                // each XY-timeout shaves off (1 - cover_frac) / xy_per_boundary.
+                // See `effective_coverage_metric` for the derivation.
+                let eff = effective_coverage_metric(
+                    walked,
+                    flow_xy_sat.load(AtomicOrdering::Relaxed),
+                    flow_xy_unsat.load(AtomicOrdering::Relaxed),
+                    flow_xy_timeout.load(AtomicOrdering::Relaxed),
+                    flow_xy_timeout_cov_micro.load(AtomicOrdering::Relaxed),
+                );
+                let cover_rate = if elapsed > 0.0 { eff / elapsed } else { 0.0 };
+                let ttc = if cover_rate > 0.0 { (live_zw_paths - eff).max(0.0) / cover_rate } else { f64::INFINITY };
+                let ttc_str = if ttc < 60.0 { format!("{:.0}s", ttc) }
+                             else if ttc < 3600.0 { format!("{:.0}m", ttc / 60.0) }
+                             else if ttc < 86400.0 { format!("{:.1}h", ttc / 3600.0) }
+                             else { format!("{:.0}d", ttc / 86400.0) };
+                eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}bnd/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5}  {:.2}% cover:{}",
                     elapsed,
                     bar(depths[0]), bar(depths[1]), bar(depths[2]), bar(depths[3]),
                     bnd_rate,
                     depths[0], depths[1], depths[2], depths[3],
-                    pct_done, tte_str);
+                    pct_done, ttc_str);
             }
             last_progress = Instant::now();
         }
@@ -3696,9 +3883,9 @@ fn run_mdd_sat_search(
 
     let elapsed = run_start.elapsed();
     let done = items_completed.load(AtomicOrdering::Relaxed);
-    // TTE must be based on boundaries actually COMPLETED (stage 0 exit),
+    // TTC must be based on boundaries actually COMPLETED (stage 0 exit),
     // not boundaries pushed to the queue. The old counter measured pushes,
-    // which inflates TTE when the monitor front-loads boundaries but workers
+    // which inflates TTC when the monitor front-loads boundaries but workers
     // can't drain them in the time window. stage_exit[0] is the true count
     // of boundaries whose ZW->W->Z->XY work has finished.
     let completed_bnd = stage_exit[0].load(AtomicOrdering::Relaxed);
@@ -3717,19 +3904,11 @@ fn run_mdd_sat_search(
         println!("  Boundaries walked:        {:>10} (pushed: {})", walked, pushed);
         // Coverage metrics
         let secs = elapsed.as_secs_f64();
-        let walked_f = walked as f64;
         let xy_timeout_count = flow_xy_timeout.load(AtomicOrdering::Relaxed);
         let xy_unsat_count = flow_xy_unsat.load(AtomicOrdering::Relaxed);
         let xy_sat_count = flow_xy_sat.load(AtomicOrdering::Relaxed);
         let xy_total_solves = xy_timeout_count + xy_unsat_count + xy_sat_count;
         let timeout_frac = if xy_total_solves > 0 { xy_timeout_count as f64 / xy_total_solves as f64 } else { 0.0 };
-        let z_reaching_xy = flow_z_solutions.load(AtomicOrdering::Relaxed)
-            .saturating_sub(flow_z_spec_fail.load(AtomicOrdering::Relaxed)
-                + flow_z_pair_fail.load(AtomicOrdering::Relaxed)
-                + flow_z_prep_fail.load(AtomicOrdering::Relaxed));
-        let fully_resolved = if xy_timeout_count == 0 { walked_f } else {
-            walked_f - z_reaching_xy as f64 * timeout_frac
-        };
 
         // Search progress metric.
         // The MDD at width k partitions the boundary space into 4^(4k) full paths
@@ -3741,7 +3920,6 @@ fn run_mdd_sat_search(
         let live_paths = mdd.count_live_paths();
         let total_paths = 4.0f64.powi(mdd.depth as i32);
         let mdd_pruned_frac = 1.0 - live_paths / total_paths;
-        let resolved_per_sec = if secs > 0.0 { fully_resolved / secs } else { 0.0 };
         // Each live path is a subcube of 2^subcube_bits configs.
         // MDD already eliminated (total - live) × 2^subcube_bits configs.
         // Runtime resolves walked boundaries: each ZW boundary covers
@@ -3750,18 +3928,62 @@ fn run_mdd_sat_search(
             (total_paths - live_paths).log2() + subcube_bits as f64
         } else { 0.0 };
 
-        // Headline metric: time to exhaustion
-        let tte = if resolved_per_sec > 0.0 { live_zw_paths / resolved_per_sec } else { f64::INFINITY };
-        let tte_str = if tte < 60.0 { format!("{:.0}s", tte) }
-                     else if tte < 3600.0 { format!("{:.1}m", tte / 60.0) }
-                     else if tte < 86400.0 { format!("{:.1}h", tte / 3600.0) }
-                     else { format!("{:.1}d", tte / 86400.0) };
-        println!("  Time to exhaustion:       {} ({:.0} paths/s, {:.0} live ZW paths)",
-            tte_str, resolved_per_sec, live_zw_paths);
-        println!("  Progress:                 {:.4}% ({} walked of {:.0})",
-            walked as f64 / live_zw_paths * 100.0, walked, live_zw_paths);
+        // Headline metric: time to cover. Each fully-resolved boundary
+        // contributes 1.0 to `eff`; XY timeouts contribute fractionally
+        // based on how much of their sub-problem they actually explored.
+        // For a run with no XY timeouts, `eff == walked` exactly, so the
+        // formula reduces to the prior path-rate-based TTC.
+        let xy_timeout_cov_micro = flow_xy_timeout_cov_micro.load(AtomicOrdering::Relaxed);
+        // Pick the right denominator for this mode. Apart/Together walk
+        // MDD boundaries — total work = `live_zw_paths`, effective done =
+        // `walked × (1 - shortfall_per_xy)`. Cross enumerates (Z, W) pairs
+        // and pushes them straight to XY, so total work = total XY
+        // candidate solves (extrapolated from tuple progress while the
+        // producer is still running).
+        let (eff, total_label, total_value, rate_unit) = if wz_mode == WzMode::Cross {
+            let xy_pushed = stage_enter[3].load(AtomicOrdering::Relaxed);
+            let est_total = cross_estimated_total_xy(
+                xy_pushed, cross_tuple_idx, tuples.len(), cross_done,
+            );
+            let xy_done_eff = effective_xy_done(
+                xy_sat_count, xy_unsat_count, xy_timeout_count, xy_timeout_cov_micro,
+            );
+            (xy_done_eff, "XY candidates", est_total, "XY/s")
+        } else {
+            let eff = effective_coverage_metric(
+                walked, xy_sat_count, xy_unsat_count, xy_timeout_count, xy_timeout_cov_micro,
+            );
+            (eff, "live ZW paths", live_zw_paths, "eff bnd/s")
+        };
+        let cover_rate = if secs > 0.0 { eff / secs } else { 0.0 };
+        let ttc = if cover_rate > 0.0 { (total_value - eff).max(0.0) / cover_rate } else { f64::INFINITY };
+        let ttc_str = if ttc < 60.0 { format!("{:.0}s", ttc) }
+                     else if ttc < 3600.0 { format!("{:.1}m", ttc / 60.0) }
+                     else if ttc < 86400.0 { format!("{:.1}h", ttc / 3600.0) }
+                     else { format!("{:.1}d", ttc / 86400.0) };
+        println!("  Time to cover:            {} ({:.2} {}, {:.0} {})",
+            ttc_str, cover_rate, rate_unit, total_value, total_label);
+        let pct = if total_value > 0.0 { eff / total_value * 100.0 } else { 0.0 };
+        if wz_mode == WzMode::Cross {
+            println!("  Progress:                 {:.4}% ({:.1} effective of {:.0} estimated; cross_done={})",
+                pct, eff, total_value, cross_done);
+        } else {
+            println!("  Progress:                 {:.4}% ({:.1} effective of {:.0}, {} walked)",
+                pct, eff, total_value, walked);
+        }
         println!("  XY timeout:               {:.1}%", timeout_frac * 100.0);
         println!("  Wall-clock:               {:>10.3?}", elapsed);
+
+        // Per-stage SAT pruning diagnostics: averages over all SAT solves
+        // at each stage, derived from the per-stage flow_*_decisions etc.
+        // counters that workers update by diffing radical::Solver counters
+        // before/after each solve.
+        print_stage_pruning_block(
+            ("W", &flow_w_solves, &flow_w_decisions, &flow_w_propagations, &flow_w_root_forced, &flow_w_free_sum, None, None),
+            ("Z", &flow_z_solves, &flow_z_decisions, &flow_z_propagations, &flow_z_root_forced, &flow_z_free_sum, None, None),
+            ("XY", &flow_xy_solves, &flow_xy_decisions, &flow_xy_propagations, &flow_xy_root_forced, &flow_xy_free_sum, Some(&flow_xy_timeout), Some(&flow_xy_timeout_cov_micro)),
+        );
+
         if !found_solution { println!("No solution found."); }
 
         // Pipeline flow funnel
@@ -3899,6 +4121,147 @@ enum XyTryResult {
     Timeout,
 }
 
+/// Per-solve search stats captured around `try_candidate`'s SAT call.
+/// Zero when the candidate was pruned before invoking SAT.
+#[derive(Default, Clone, Copy)]
+struct XyStats {
+    /// Branching decisions made by the SAT solver during this call.
+    decisions: u64,
+    /// Variable assignments forced by propagation (clause BCP, PB, quad
+    /// PB, XOR, MDD, spectral). Excludes branching decisions.
+    propagations: u64,
+    /// Variables already forced at decision level 0 BEFORE this SAT call
+    /// runs — i.e., pruned by constraint setup + initial propagation.
+    /// For XY this captures GJ equalities + quad PB initial unit
+    /// propagation; the remaining `free_vars` is the actual search space.
+    vars_pre_forced: u64,
+    /// Variables free to search (num_vars - vars_pre_forced) at solve
+    /// start. Decisions/free_vars indicates how deep the SAT search went
+    /// relative to the theoretical sub-problem tree height.
+    free_vars: u64,
+    /// Cover fraction × 1_000_000. Represents the share of this XY
+    /// sub-problem's search space that the solve actually proved or
+    /// explored. UNSAT/SAT contribute 1.0 (== 1_000_000); timeouts
+    /// contribute the partial fraction `log2(decisions+1)/free_vars`,
+    /// clamped to [0, 1].
+    cover_micro: u64,
+}
+
+/// Compute the cover fraction (× 1_000_000) for a single SAT result.
+/// SAT/UNSAT mean the sub-problem is fully accounted for; on timeout,
+/// estimate the explored fraction from decisions vs. tree height.
+fn xy_cover_micro(result: Option<bool>, decisions: u64, free_vars: u64) -> u64 {
+    match result {
+        Some(_) => 1_000_000, // SAT or UNSAT — full coverage of this sub-problem
+        None => {
+            let tree_log2 = (free_vars as f64).max(1.0);
+            let explored_log2 = ((decisions as f64) + 1.0).log2();
+            let frac = (explored_log2 / tree_log2).clamp(0.0, 1.0);
+            (frac * 1_000_000.0) as u64
+        }
+    }
+}
+
+/// Effective number of XY candidate solves completed, weighted for
+/// timeouts. Each fully-resolved (SAT or UNSAT) XY solve contributes
+/// 1.0; each timeout contributes its `cover_frac`. Used as the
+/// numerator in the cross-mode TTC formula and as the basis for the
+/// MDD-mode `effective_coverage_metric` shortfall calculation.
+fn effective_xy_done(
+    xy_sat: u64, xy_unsat: u64, xy_timeout: u64,
+    xy_timeout_cov_micro: u64,
+) -> f64 {
+    let normal_done = (xy_sat + xy_unsat) as f64;
+    let timeout_credit = xy_timeout_cov_micro as f64 / 1_000_000.0;
+    // Sanity: timeout_credit should always be ≤ xy_timeout, but clamp
+    // defensively in case a bogus solve over-credited.
+    normal_done + timeout_credit.min(xy_timeout as f64)
+}
+
+/// Cross-mode TTC denominator: estimated total XY candidate solves
+/// once enumeration completes. Extrapolates from tuple progress while
+/// the producer is still running; collapses to `xy_pushed` exactly
+/// once `cross_done` is true.
+fn cross_estimated_total_xy(
+    xy_pushed: u64, tuples_done: usize, tuples_total: usize, cross_done: bool,
+) -> f64 {
+    let xy_pushed = xy_pushed as f64;
+    if cross_done || tuples_done == 0 || tuples_total == 0 {
+        return xy_pushed;
+    }
+    // Extrapolation: assume remaining tuples produce XY candidates at
+    // the same average rate as the tuples seen so far. Crude but the
+    // best we can do without re-running the SpectralIndex enumeration.
+    xy_pushed * (tuples_total as f64) / (tuples_done as f64)
+}
+
+/// Effective number of boundaries covered, weighted by per-XY-solve
+/// coverage. Each fully-resolved boundary contributes 1.0; XY timeouts
+/// dock the boundary's contribution by `(1 - cover_frac) /
+/// xy_solves_per_boundary`. Derivation (without per-boundary state):
+///
+///   shortfall_per_xy_solve = (xy_timeout_count - sum_cover_frac_timeout)
+///                            / xy_total_solves
+///   eff = walked × (1 - shortfall_per_xy_solve)
+///
+/// Returns `walked` exactly when there are no timeouts (or no XY work
+/// yet), so the metric reduces to the prior path-rate-based TTC for
+/// healthy runs.
+fn effective_coverage_metric(
+    walked: u64,
+    xy_sat: u64, xy_unsat: u64, xy_timeout: u64,
+    xy_timeout_cov_micro: u64,
+) -> f64 {
+    let xy_total = xy_sat + xy_unsat + xy_timeout;
+    if xy_total == 0 || xy_timeout == 0 {
+        return walked as f64;
+    }
+    let xy_done_eff = effective_xy_done(xy_sat, xy_unsat, xy_timeout, xy_timeout_cov_micro);
+    // Per-XY shortfall as fraction of one XY solve, then scale to boundaries.
+    let shortfall_per_xy = (xy_total as f64 - xy_done_eff) / xy_total as f64;
+    walked as f64 * (1.0 - shortfall_per_xy).max(0.0)
+}
+
+/// Print the per-stage SAT pruning diagnostics block. Each tuple is
+/// (label, solves, decisions, propagations, root_forced, free_sum,
+///  optional_timeout_count, optional_timeout_cov_micro).
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn print_stage_pruning_block(
+    w_row:  (&str, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, Option<&Arc<std::sync::atomic::AtomicU64>>, Option<&Arc<std::sync::atomic::AtomicU64>>),
+    z_row:  (&str, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, Option<&Arc<std::sync::atomic::AtomicU64>>, Option<&Arc<std::sync::atomic::AtomicU64>>),
+    xy_row: (&str, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, Option<&Arc<std::sync::atomic::AtomicU64>>, Option<&Arc<std::sync::atomic::AtomicU64>>),
+) {
+    println!("  SAT pruning per stage:");
+    println!("    stage    solves    pre-forced/free   dec/solve  prop/dec  timeout%(avg cov)");
+    for row in [w_row, z_row, xy_row] {
+        let (label, solves, decisions, propagations, root_forced, free_sum, timeout, timeout_cov) = row;
+        let n = solves.load(AtomicOrdering::Relaxed);
+        if n == 0 {
+            println!("    {:<6}  {:>7}  (no solves)", label, 0);
+            continue;
+        }
+        let dec    = decisions.load(AtomicOrdering::Relaxed);
+        let prop   = propagations.load(AtomicOrdering::Relaxed);
+        let forced = root_forced.load(AtomicOrdering::Relaxed);
+        let free   = free_sum.load(AtomicOrdering::Relaxed);
+        let avg_forced = forced as f64 / n as f64;
+        let avg_free   = free as f64 / n as f64;
+        let avg_dec    = dec as f64 / n as f64;
+        let avg_prop_per_dec = if dec > 0 { prop as f64 / dec as f64 } else { 0.0 };
+        let timeout_str = match (timeout, timeout_cov) {
+            (Some(to), Some(cov)) => {
+                let to_n = to.load(AtomicOrdering::Relaxed);
+                let to_pct = if n > 0 { to_n as f64 / n as f64 * 100.0 } else { 0.0 };
+                let avg_cov = if to_n > 0 { (cov.load(AtomicOrdering::Relaxed) as f64 / 1_000_000.0) / to_n as f64 } else { 1.0 };
+                format!("{:>5.1}%({:.2})", to_pct, avg_cov)
+            }
+            _ => "    n/a   ".to_string(),
+        };
+        println!("    {:<6}  {:>7}  {:>10.1}/{:<5.1}  {:>9.1}  {:>8.2}  {}",
+            label, n, avg_forced, avg_free, avg_dec, avg_prop_per_dec, timeout_str);
+    }
+}
+
 /// Per-(Z,W) prepared state for shared XY SAT solving. Built once per
 /// candidate via `SolveXyPerCandidate::new`, consulted via `try_candidate`
 /// for each XY boundary `(x_bits, y_bits)` encountered during the
@@ -3994,8 +4357,9 @@ impl SolveXyPerCandidate {
 
     /// Try one XY boundary `(x_bits, y_bits)`: run the GJ + lag pre-
     /// filters, inject the quad PB term state, then SAT-solve with the
-    /// boundary literals as assumptions. Returns the outcome.
-    fn try_candidate(&mut self, x_bits: u32, y_bits: u32) -> XyTryResult {
+    /// boundary literals as assumptions. Returns the outcome plus
+    /// per-solve search stats (zeroed on pre-filter pruning).
+    fn try_candidate(&mut self, x_bits: u32, y_bits: u32) -> (XyTryResult, XyStats) {
         let n = self.n;
         let k = self.k;
         let is_bnd = |pos: usize| -> bool { pos < k || pos >= n - k };
@@ -4014,7 +4378,7 @@ impl SolveXyPerCandidate {
             let ba = if va < n { (x_bits >> pos_to_bit(pa)) & 1 } else { (y_bits >> pos_to_bit(pa)) & 1 };
             let bb = if vb < n { (x_bits >> pos_to_bit(pb)) & 1 } else { (y_bits >> pos_to_bit(pb)) & 1 };
             let need_xor = (a < 0) as u32 ^ (b < 0) as u32 ^ (!equal) as u32;
-            if (ba ^ bb) != need_xor { return XyTryResult::Pruned; }
+            if (ba ^ bb) != need_xor { return (XyTryResult::Pruned, XyStats::default()); }
         }
         // Partial-lag autocorrelation pre-filter.
         for lf in &self.lag_filters {
@@ -4024,7 +4388,7 @@ impl SolveXyPerCandidate {
                 disagree += ((y_bits >> bi) ^ (y_bits >> bj)) & 1;
             }
             let kn = lf.num_bnd_pairs - 2 * disagree as i32;
-            if (self.targets[lf.s] - kn).abs() > lf.max_unknown { return XyTryResult::Pruned; }
+            if (self.targets[lf.s] - kn).abs() > lf.max_unknown { return (XyTryResult::Pruned, XyStats::default()); }
         }
 
         // Expand boundary bits and inject quad PB term states.
@@ -4076,8 +4440,25 @@ impl SolveXyPerCandidate {
             assumptions.push(if xv[p] == 1 { x_var(p) } else { -x_var(p) });
             assumptions.push(if yv[p] == 1 { y_var(p) } else { -y_var(p) });
         }
+        // Snapshot solver search stats before this SAT call. The pre-solve
+        // level-0 count captures vars already forced by constraint setup
+        // (GJ equalities + quad PB initial propagation); free_vars is the
+        // remaining search space the SAT solver actually navigates.
+        let d0 = self.solver.num_decisions();
+        let p0 = self.solver.num_propagations();
+        let vars_pre_forced = self.solver.num_level0_vars() as u64;
+        let free_vars = (self.solver.num_vars() as u64).saturating_sub(vars_pre_forced);
+
         let result = self.solver.solve_with_assumptions(&assumptions);
-        match result {
+
+        let stats = {
+            let decisions    = self.solver.num_decisions().saturating_sub(d0);
+            let propagations = self.solver.num_propagations().saturating_sub(p0);
+            let cover_micro  = xy_cover_micro(result, decisions, free_vars);
+            XyStats { decisions, propagations, vars_pre_forced, free_vars, cover_micro }
+        };
+
+        let outcome = match result {
             Some(true) => {
                 let x = extract_seq(&self.solver, x_var, n);
                 let y = extract_seq(&self.solver, y_var, n);
@@ -4097,7 +4478,8 @@ impl SolveXyPerCandidate {
                 }
                 XyTryResult::Timeout
             }
-        }
+        };
+        (outcome, stats)
     }
 }
 
