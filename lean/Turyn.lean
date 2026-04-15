@@ -6,6 +6,7 @@ import Turyn.GoethalsSeidel
 import Turyn.GSArrayBridge
 import Turyn.Hadamard
 import Turyn.Energy
+import Turyn.Equivalence
 import Turyn.Examples
 
 /-!
