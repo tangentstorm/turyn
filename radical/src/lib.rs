@@ -62,22 +62,33 @@ struct PbConstraint {
 /// A "sum is in a set" constraint: `#{i : lit_i true} ∈ V` where `V` is a
 /// sorted, deduplicated set of non-negative integer cardinality targets.
 ///
-/// Propagation tracks `(num_true, num_undef)` incrementally, with a `stale`
-/// flag set on backtrack.  Let `cnt_lo = num_true`, `cnt_hi = num_true +
-/// num_undef`.  Binary-search V for `V_alive = V ∩ [cnt_lo, cnt_hi]`:
+/// Propagation recounts `(num_true, num_undef)` from the trail on every
+/// call (see `propagate_pb_set_eq`).  Let `cnt_lo = num_true`,
+/// `cnt_hi = num_true + num_undef`.  Binary-search V for
+/// `V_alive = V ∩ [cnt_lo, cnt_hi]`:
 ///   - `V_alive == ∅` ⇒ conflict.
 ///   - `V_alive == {v}` and `v == cnt_lo` ⇒ force all unassigned lits false.
 ///   - `V_alive == {v}` and `v == cnt_hi` ⇒ force all unassigned lits true.
 ///   - `|V_alive| > 1` and `cnt_lo == max(V_alive)` ⇒ force all unassigned false.
 ///   - `|V_alive| > 1` and `cnt_hi == min(V_alive)` ⇒ force all unassigned true.
 ///   - otherwise ⇒ no propagation (the SAT will branch).
+///
+/// No incremental counter is maintained: a previous attempt at
+/// incremental bookkeeping was unsound because prior propagators in
+/// the same propagate-loop iteration (QuadPb, or this constraint's own
+/// `force_pb_set_eq_dir`) can enqueue literals whose state change is
+/// not reflected in the incremental until the main loop eventually
+/// picks them up.  See `pb_set_eq_plus_quad_pb_tt18_regression`.
 #[derive(Clone, Debug)]
 struct PbSetEqConstraint {
     lits: Vec<Lit>,
     values: Vec<u32>, // sorted ascending, unique, all in 0..=lits.len()
+    // `num_true` and `num_undef` are scratch fields set by
+    // `recompute_pb_set_eq` at the start of every `propagate_pb_set_eq`
+    // call; they are *not* a persistent incremental count.  Do not
+    // read them outside `propagate_pb_set_eq`.
     num_true: u32,
     num_undef: u32,
-    stale: bool,
 }
 
 /// An XOR (GF(2)) constraint: XOR of variables = parity.
@@ -978,9 +989,8 @@ impl Solver {
         self.pb_set_eq_constraints.push(PbSetEqConstraint {
             lits: lits.to_vec(),
             values: vals,
-            num_true: 0,
-            num_undef: lits.len() as u32,
-            stale: true, // recompute from trail on first propagation
+            num_true: 0,    // scratch — recomputed by propagate_pb_set_eq
+            num_undef: 0,   // scratch — recomputed by propagate_pb_set_eq
         });
         if self.propagate_pb_set_eq(pi).is_some() {
             self.ok = false;
@@ -988,6 +998,7 @@ impl Solver {
     }
 
     /// Recompute `(num_true, num_undef)` from the current assignment.
+    /// Called unconditionally at the start of every `propagate_pb_set_eq`.
     fn recompute_pb_set_eq(&mut self, pi: u32) {
         let n_lits = self.pb_set_eq_constraints[pi as usize].lits.len();
         let mut nt: u32 = 0;
@@ -1003,7 +1014,6 @@ impl Solver {
         let pc = &mut self.pb_set_eq_constraints[pi as usize];
         pc.num_true = nt;
         pc.num_undef = nu;
-        pc.stale = false;
     }
 
     /// Propagate a PbSetEq constraint.  Returns `Some(Reason::PbSetEq(pi))`
@@ -2240,19 +2250,14 @@ impl Solver {
             }
         }
 
-        // Remove post-checkpoint PbSetEq constraints and their watch entries
+        // Remove post-checkpoint PbSetEq constraints and their watch entries.
+        // No counter reset needed: `propagate_pb_set_eq` recomputes from the
+        // trail on every call.
         if n_pbseq < self.pb_set_eq_constraints.len() {
             self.pb_set_eq_constraints.truncate(n_pbseq);
             for wl in &mut self.pb_set_eq_var_watches {
                 wl.retain(|&pi| (pi as usize) < n_pbseq);
             }
-        }
-        // Level-0 bulk reset for surviving PbSetEq constraints: all vars are
-        // now Undef after the backtrack(0) above, so counters zero out.
-        for pc in &mut self.pb_set_eq_constraints {
-            pc.num_true = 0;
-            pc.num_undef = pc.lits.len() as u32;
-            pc.stale = false;
         }
 
         // Reset spectral constraint to boundary-only state
@@ -2683,29 +2688,14 @@ impl Solver {
                 }
             }
             // PbSetEq propagation: `#{i : lit_i true} ∈ V`.
-            // Incremental: this variable just transitioned undef → assigned;
-            // update num_true/num_undef if the constraint's counters are fresh.
+            // `propagate_pb_set_eq` recomputes the counters from the trail
+            // on entry; no incremental bookkeeping is needed (and a prior
+            // attempt at incremental was unsound — prior propagators in
+            // the same iteration can enqueue lits this block would miss).
             if !self.pb_set_eq_constraints.is_empty() {
                 let v = var_of(lit);
-                let var_is_true = self.assigns[v] == LBool::True;
                 for idx in 0..self.pb_set_eq_var_watches[v].len() {
                     let pi = self.pb_set_eq_var_watches[v][idx];
-                    {
-                        let pc = &mut self.pb_set_eq_constraints[pi as usize];
-                        if !pc.stale {
-                            // Find this var's literal in pc.lits and update counters.
-                            // A var appears at most once; break on first hit.
-                            for &cl in &pc.lits {
-                                if var_of(cl) == v {
-                                    // Did the literal land on "true" under its polarity?
-                                    let lit_sat = (cl > 0) == var_is_true;
-                                    if pc.num_undef > 0 { pc.num_undef -= 1; }
-                                    if lit_sat { pc.num_true += 1; }
-                                    break;
-                                }
-                            }
-                        }
-                    }
                     if let Some(conflict) = self.propagate_pb_set_eq(pi) {
                         return Some(conflict);
                     }
@@ -3532,12 +3522,8 @@ impl Solver {
                     self.quad_pb_constraints[qi as usize].stale = true;
                 }
             }
-            // Mark PbSetEq constraints watching this var as stale; the
-            // propagator recomputes num_true/num_undef lazily on next entry.
-            for idx in 0..self.pb_set_eq_var_watches[v].len() {
-                let pi = self.pb_set_eq_var_watches[v][idx];
-                self.pb_set_eq_constraints[pi as usize].stale = true;
-            }
+            // No PbSetEq invalidation needed: `propagate_pb_set_eq`
+            // recomputes counters from the trail on every call.
             self.heap_insert(v);
         }
         self.trail_lim.truncate(level as usize);
