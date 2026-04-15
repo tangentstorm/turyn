@@ -211,33 +211,23 @@ struct SumTuple {
 impl SumTuple {
     /// Normalization key for tuple deduplication in hybrid search.
     ///
-    /// The Turyn symmetry group (Best–Đoković–Kharaghani–Ramp 2012) has
-    /// four generators:
-    ///   T1 negate any one of X, Y, Z, W
-    ///   T2 reverse any one of X, Y, Z, W
-    ///   T3 alternate all four simultaneously (a[i] ↦ (-1)^i·a[i])
-    ///   T4 interchange X ↔ Y
+    /// Unsigned and X↔Y-sorted: `(max(|σ_X|,|σ_Y|), min(|σ_X|,|σ_Y|),
+    /// |σ_Z|, |σ_W|)`.  This folds T1 (per-sequence negation) and T4
+    /// (X↔Y swap) into the tuple key.  Sign freedom is restored per
+    /// sequence inside the SAT via `PbSetEq`, whose `V` is built from
+    /// `{+|σ|, -|σ|}` of the stored tuple (and, for the MDD pipeline's
+    /// middle SATs, shifted by the boundary contribution).  Rule (vi)
+    /// still breaks T4 at the position level so the SAT picks X vs. Y
+    /// correctly once it sees both `σ_X` and `σ_Y` options.
     ///
-    /// **Rules (i)–(vi) break T1 entirely:** rule (i) pins
-    /// `x[0]=x[n-1]=y[0]=y[n-1]=z[0]=w[0]=+1`, so negating any one
-    /// sequence flips one of these pinned bits and is no longer a
-    /// symmetry of the canonical-form search.  T4 is broken by rule
-    /// (vi); T2 by rules (ii)/(iii) (palindromic-break) and (iv)/(v);
-    /// T3 changes sums non-simply and cannot be normalised cheaply
-    /// at the tuple level either.
-    ///
-    /// Therefore *no* tuple-level coordinate transform survives the
-    /// rule-(i) canonical form, and the only safe key is the signed
-    /// tuple itself.
-    ///
-    /// Verified empirically at n=6: 4 distinct BDKR orbits exist;
+    /// Verified empirically at n=6: 4 distinct BDKR orbits exist and
     /// 2 of them have at least one negative sum in their canonical
-    /// representation.  An older `|·|`-based key collapsed those into
-    /// the all-positive bucket and the SAT search returned UNSAT for
-    /// the orbits whose canonical signs disagreed — silently missing
-    /// half the n=6 orbits.
+    /// representative.  Under this unsigned key + `PbSetEq` sum
+    /// encoding, all 4 orbits are reachable via a single tuple each.
     fn norm_key(&self) -> (i32, i32, i32, i32) {
-        (self.x, self.y, self.z, self.w)
+        let (ax, ay) = (self.x.abs(), self.y.abs());
+        let (hi, lo) = if ax >= ay { (ax, ay) } else { (ay, ax) };
+        (hi, lo, self.z.abs(), self.w.abs())
     }
 
 }
@@ -430,6 +420,68 @@ impl SpectralFilter {
     }
 }
 
+
+/// Convert a signed full-sequence sum to the SAT cardinality count over a
+/// middle slice with a fixed boundary contribution.  Returns `None` if the
+/// resulting mid_sum is out of range or has the wrong parity.
+///
+///   σ_mid = σ_full − σ_bnd
+///   cnt   = (σ_mid + L_mid) / 2
+#[inline]
+fn sigma_full_to_cnt(sigma_full: i32, sigma_bnd: i32, l_mid: usize) -> Option<u32> {
+    let mid_sum = sigma_full - sigma_bnd;
+    if mid_sum.unsigned_abs() as usize > l_mid { return None; }
+    let shifted = mid_sum + l_mid as i32;
+    if shifted & 1 != 0 { return None; }
+    Some((shifted / 2) as u32)
+}
+
+/// Build the sorted-deduped set V of valid middle-count SAT targets for a
+/// sequence, across a list of **unsigned** tuples.  Every tuple contributes
+/// both `+|σ|` and `−|σ|` as candidate signed full sums (or just 0 when
+/// `|σ| = 0`); each is mapped to the corresponding middle count via
+/// `sigma_full_to_cnt`, skipping out-of-range / wrong-parity candidates.
+///
+/// `sigma_abs_of` extracts the unsigned σ magnitude for a tuple (e.g.,
+/// `|t| t.w.unsigned_abs() as i32`).
+///
+/// Also returns the inverse map `count → [(tuple_idx, signed_sigma_full)]`
+/// so callers can narrow the surviving tuple list once the SAT locks in a
+/// specific count.
+fn valid_mid_counts<F>(
+    tuples: &[SumTuple],
+    sigma_abs_of: F,
+    sigma_bnd: i32,
+    l_mid: usize,
+) -> (Vec<u32>, Vec<(u32, usize, i32)>)
+where F: Fn(&SumTuple) -> i32,
+{
+    let mut entries: Vec<(u32, usize, i32)> = Vec::new();
+    for (ti, t) in tuples.iter().enumerate() {
+        let abs_s = sigma_abs_of(t);
+        let signs: &[i32] = if abs_s == 0 { &[0] } else { &[1, -1] };
+        for &sign in signs {
+            let sigma = sign * abs_s;
+            if let Some(cnt) = sigma_full_to_cnt(sigma, sigma_bnd, l_mid) {
+                entries.push((cnt, ti, sigma));
+            }
+        }
+    }
+    // Dedup-and-sort the distinct counts.
+    let mut counts: Vec<u32> = entries.iter().map(|e| e.0).collect();
+    counts.sort_unstable();
+    counts.dedup();
+    (counts, entries)
+}
+
+/// Given the solved middle bits and the boundary contribution, return the
+/// signed full-sequence sum σ_full.
+#[inline]
+#[allow(dead_code)]
+fn decode_sigma_full(mid_bits: &[i8], sigma_bnd: i32) -> i32 {
+    let mid_sum: i32 = mid_bits.iter().map(|&b| b as i32).sum();
+    sigma_bnd + mid_sum
+}
 
 fn enumerate_sum_tuples(problem: Problem) -> Vec<SumTuple> {
     let mut out = Vec::new();
@@ -1478,17 +1530,25 @@ fn build_sat_xy_clauses(
     // BDKR rule (vi): conditional X↔Y swap break.
     add_swap_break(solver, x_var, y_var, n);
 
-    // Sum constraints via PB
-    if (tuple.x + n as i32) % 2 != 0 || (tuple.y + n as i32) % 2 != 0 {
+    // Sum constraints via PbSetEq.  The tuple's (x, y) fields are now
+    // |σ|; each sequence's sum is allowed to land on either +|σ_X| or
+    // −|σ_X| (resp. Y) — the SAT picks the sign consistent with the
+    // rule-(i)..(vi) canonicalisation clauses above.  Parity of `|σ|+n`
+    // must be even (odd parity means the tuple is infeasible).
+    if (tuple.x.abs() + n as i32) % 2 != 0 || (tuple.y.abs() + n as i32) % 2 != 0 {
         return None;
     }
-    let x_pos = ((tuple.x + n as i32) / 2) as usize;
-    let y_pos = ((tuple.y + n as i32) / 2) as usize;
     let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
     let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
-    let ones: Vec<u32> = vec![1; n];
-    solver.add_pb_eq(&x_lits, &ones, x_pos as u32);
-    solver.add_pb_eq(&y_lits, &ones, y_pos as u32);
+    let x_values: Vec<u32> = [tuple.x.abs(), -tuple.x.abs()].iter()
+        .filter_map(|&s| sigma_full_to_cnt(s, 0, n))
+        .collect::<Vec<_>>();
+    let y_values: Vec<u32> = [tuple.y.abs(), -tuple.y.abs()].iter()
+        .filter_map(|&s| sigma_full_to_cnt(s, 0, n))
+        .collect::<Vec<_>>();
+    if x_values.is_empty() || y_values.is_empty() { return None; }
+    solver.add_pb_set_eq(&x_lits, &x_values);
+    solver.add_pb_set_eq(&y_lits, &y_values);
 
     // Build agree pair lists per lag (no aux variables!)
     // agree(a, b) = a*b + ¬a*¬b = (both true) + (both false)
@@ -1526,6 +1586,7 @@ fn build_sat_xy_clauses(
 trait SatSolver {
     fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I);
     fn add_pb_eq(&mut self, lits: &[i32], coeffs: &[u32], target: u32);
+    fn add_pb_set_eq(&mut self, lits: &[i32], values: &[u32]);
     fn add_quad_pb_eq(&mut self, lits_a: &[i32], lits_b: &[i32], coeffs: &[u32], target: u32);
     fn add_xor_constraint(&mut self, aux: i32, a: i32, b: i32);
     fn solve_with_assumptions(&mut self, assumptions: &[i32]) -> Option<bool>;
@@ -1540,6 +1601,9 @@ impl SatSolver for radical::Solver {
     }
     fn add_pb_eq(&mut self, lits: &[i32], coeffs: &[u32], target: u32) {
         self.add_pb_eq(lits, coeffs, target);
+    }
+    fn add_pb_set_eq(&mut self, lits: &[i32], values: &[u32]) {
+        self.add_pb_set_eq(lits, values);
     }
     fn add_quad_pb_eq(&mut self, lits_a: &[i32], lits_b: &[i32], coeffs: &[u32], target: u32) {
         self.add_quad_pb_eq(lits_a, lits_b, coeffs, target);
@@ -1569,6 +1633,9 @@ impl SatSolver for cadical::Solver {
     }
     fn add_pb_eq(&mut self, _lits: &[i32], _coeffs: &[u32], _target: u32) {
         unimplemented!("CaDiCaL backend uses clause-based encoding, not PB");
+    }
+    fn add_pb_set_eq(&mut self, _lits: &[i32], _values: &[u32]) {
+        unimplemented!("CaDiCaL backend uses clause-based encoding, not PbSetEq");
     }
     fn add_quad_pb_eq(&mut self, _a: &[i32], _b: &[i32], _c: &[u32], _t: u32) {
         unimplemented!("CaDiCaL backend uses clause-based encoding, not quad PB");
@@ -2281,21 +2348,24 @@ fn sat_encode(problem: Problem, tuple: SumTuple) -> (SatEncoder, radical::Solver
     add_swap_break(&mut solver, xv, yv, n);
     enc.next_var = next_var;
 
-    // Sum constraints: encode that exactly (sum+len)/2 variables are true (=+1)
-    let x_pos = ((tuple.x + n as i32) / 2) as usize;
-    let y_pos = ((tuple.y + n as i32) / 2) as usize;
-    let z_pos = ((tuple.z + n as i32) / 2) as usize;
-    let w_pos = ((tuple.w + m as i32) / 2) as usize;
-
+    // Sum constraints via PbSetEq.  Tuples are unsigned (|σ|), so each
+    // sequence's sum may land on either +|σ| or −|σ|; rules (ii)..(vi)
+    // above resolve which sign is consistent with the canonical form.
     let x_lits: Vec<i32> = (0..n).map(|i| enc.x_var(i)).collect();
     let y_lits: Vec<i32> = (0..n).map(|i| enc.y_var(i)).collect();
     let z_lits: Vec<i32> = (0..n).map(|i| enc.z_var(i)).collect();
     let w_lits: Vec<i32> = (0..m).map(|i| enc.w_var(i)).collect();
-
-    enc.encode_cardinality_eq(&mut solver, &x_lits, x_pos);
-    enc.encode_cardinality_eq(&mut solver, &y_lits, y_pos);
-    enc.encode_cardinality_eq(&mut solver, &z_lits, z_pos);
-    enc.encode_cardinality_eq(&mut solver, &w_lits, w_pos);
+    let sum_values = |abs_s: i32, len: usize| -> Vec<u32> {
+        if abs_s == 0 {
+            sigma_full_to_cnt(0, 0, len).into_iter().collect()
+        } else {
+            [abs_s, -abs_s].iter().filter_map(|&s| sigma_full_to_cnt(s, 0, len)).collect()
+        }
+    };
+    solver.add_pb_set_eq(&x_lits, &sum_values(tuple.x.abs(), n));
+    solver.add_pb_set_eq(&y_lits, &sum_values(tuple.y.abs(), n));
+    solver.add_pb_set_eq(&z_lits, &sum_values(tuple.z.abs(), n));
+    solver.add_pb_set_eq(&w_lits, &sum_values(tuple.w.abs(), m));
 
     for k in 1..n {
         let w_overlap = if k < m { m - k } else { 0 };
@@ -3079,7 +3149,7 @@ fn run_mdd_sat_search(
 
                     PipelineWork::SolveW(sw) => {
                         let trace_w = sw.z_bits == 43 && sw.w_bits == 47 && sw.tuple.z == 8 && sw.tuple.w == 1;
-                        if trace_w { eprintln!("TRACE: SolveW for target boundary, w_mid_sum={}", sw.w_mid_sum); }
+                        if trace_w { eprintln!("TRACE: SolveW for target boundary, |σ_W|={}", sw.tuple.w); }
                         let (w_prefix, w_suffix) = expand_boundary_bits(sw.w_bits, k);
                         let mut w_boundary = vec![0i8; m];
                         w_boundary[..k].copy_from_slice(&w_prefix);
@@ -3089,6 +3159,29 @@ fn run_mdd_sat_search(
                         // SolveW if the W boundary already fails rule (v).
                         let rule_v_state = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
                         if rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary {
+                            continue;
+                        }
+
+                        // Compute the set V_w of valid W middle counts under
+                        // this boundary.  With the unsigned tuple convention
+                        // `sw.tuple.w = |σ_W|`, both σ_W = +|σ_W| and
+                        // σ_W = −|σ_W| are candidate; each maps to a count
+                        // in [0, middle_m] (or is filtered by parity/range).
+                        let w_bnd_sum_local: i32 = w_boundary.iter().map(|&v| v as i32).sum();
+                        let abs_w = sw.tuple.w.abs();
+                        let w_counts: Vec<u32> = {
+                            let mut cs: Vec<u32> = Vec::with_capacity(2);
+                            let signs: &[i32] = if abs_w == 0 { &[0] } else { &[1, -1] };
+                            for &sg in signs {
+                                if let Some(c) = sigma_full_to_cnt(sg * abs_w, w_bnd_sum_local, ctx.middle_m) {
+                                    if !cs.contains(&c) { cs.push(c); }
+                                }
+                            }
+                            cs.sort_unstable();
+                            cs
+                        };
+                        if w_counts.is_empty() {
+                            stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
                             continue;
                         }
 
@@ -3107,7 +3200,12 @@ fn run_mdd_sat_search(
                             // owned Vec at push time, so failed candidates (~85%)
                             // never allocate a Vec<f64>.
                             let mut spec_buf: Vec<f64> = Vec::new();
-                            generate_sequences_permuted(ctx.middle_m, sw.w_mid_sum, false, false, 200_000, |w_mid| {
+                            // Iterate each count in V_w (one per feasible sign of σ_W).
+                            // generate_sequences_permuted takes a signed mid_sum
+                            // target — decode it from the count as 2·cnt − middle_m.
+                            for &cnt in &w_counts {
+                              let mid_sum_iter = 2 * cnt as i32 - ctx.middle_m as i32;
+                              generate_sequences_permuted(ctx.middle_m, mid_sum_iter, false, false, 200_000, |w_mid| {
                                 if ctx.found.load(AtomicOrdering::Relaxed) { return false; }
                                 let mut w_vals = w_boundary.clone();
                                 w_vals[k..k+ctx.middle_m].copy_from_slice(w_mid);
@@ -3135,14 +3233,19 @@ fn run_mdd_sat_search(
                                     flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
                                 }
                                 true
-                            });
+                              });
+                            } // end for &cnt
                             if !batch.is_empty() {
                                 wq.push_batch(batch);
                             }
                         } else {
-                            // SAT-based W generation
-                            let mut w_solver = w_bases.remove(&sw.w_mid_sum).unwrap_or_else(||
-                                ctx.w_tmpl.build_base_solver(ctx.middle_m, sw.w_mid_sum)
+                            // SAT-based W generation.  Build with a PbSetEq
+                            // so the SAT may pick any count in V_w (i.e.,
+                            // either sign of σ_W).  Cache key is 0 — we
+                            // don't reuse the solver across boundaries
+                            // because V_w depends on the boundary.
+                            let mut w_solver = w_bases.remove(&0i32).unwrap_or_else(||
+                                ctx.w_tmpl.build_base_solver_pb_set(ctx.middle_m, &w_counts)
                             );
                             let w_cp = w_solver.save_checkpoint();
                             sat_z_middle::fill_w_solver(&mut w_solver, &ctx.w_tmpl, m, &w_boundary);
@@ -3225,7 +3328,7 @@ fn run_mdd_sat_search(
 
                             w_solver.spectral = None;
                             w_solver.restore_checkpoint(w_cp);
-                            w_bases.insert(sw.w_mid_sum, w_solver);
+                            w_bases.insert(0i32, w_solver);
                         }
                         if !w_found_any { flow_w_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
                         if trace_w { eprintln!("TRACE: SolveW done: {} W middles checked, {} passed spectral", trace_w_total, trace_w_pass); }
@@ -3531,8 +3634,31 @@ fn run_mdd_sat_search(
                             continue;
                         }
 
-                        let mut z_solver = z_bases.remove(&sz.z_mid_sum).unwrap_or_else(||
-                            ctx.z_tmpl.build_base_solver_quad_pb(ctx.middle_n, sz.z_mid_sum)
+                        // Compute V_z = valid Z middle counts given |σ_Z| and
+                        // boundary.  Both σ_Z signs are admissible at this
+                        // stage — the chosen W has fixed σ_W but σ_Z is
+                        // determined only by the energy equation, which is
+                        // sign-symmetric, so we let the SAT pick.
+                        let z_bnd_sum_local: i32 = z_boundary.iter().map(|&v| v as i32).sum();
+                        let abs_z = sz.tuple.z.abs();
+                        let z_counts: Vec<u32> = {
+                            let mut cs: Vec<u32> = Vec::with_capacity(2);
+                            let signs: &[i32] = if abs_z == 0 { &[0] } else { &[1, -1] };
+                            for &sg in signs {
+                                if let Some(c) = sigma_full_to_cnt(sg * abs_z, z_bnd_sum_local, ctx.middle_n) {
+                                    if !cs.contains(&c) { cs.push(c); }
+                                }
+                            }
+                            cs.sort_unstable();
+                            cs
+                        };
+                        if z_counts.is_empty() {
+                            stage_exit[2].fetch_add(1, AtomicOrdering::Relaxed);
+                            continue;
+                        }
+
+                        let mut z_solver = z_bases.remove(&0i32).unwrap_or_else(||
+                            ctx.z_tmpl.build_base_solver_quad_pb_pb_set(ctx.middle_n, &z_counts)
                         );
                         let z_cp = z_solver.save_checkpoint();
                         // Reuse z_boundary-dependent fill prep across SolveZ items
@@ -3792,7 +3918,7 @@ fn run_mdd_sat_search(
 
                         z_solver.spectral = None;
                         z_solver.restore_checkpoint(z_cp);
-                        z_bases.insert(sz.z_mid_sum, z_solver);
+                        z_bases.insert(0i32, z_solver);
                         stage_exit[2].fetch_add(1, AtomicOrdering::Relaxed);
                     }
 
@@ -6291,6 +6417,42 @@ mod tests {
         let result2 = z_solver2.solve_with_assumptions(&assumptions);
         eprintln!("Z SAT with known Z middle assumptions: {:?}", result2);
         assert_eq!(result2, Some(true), "Known Z middle should satisfy Z SAT constraints");
+    }
+
+    /// Sanity check: build the XY template with the unsigned n=18 canonical
+    /// tuple, hardcode the canonical X/Y as unit clauses, and assert the
+    /// solver finds it.  Guards against regressions in the PbSetEq-based
+    /// sum encoding in `build_sat_xy_clauses`.
+    #[test]
+    fn pbseteq_xy_accepts_canonical_tt18() {
+        let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
+        let x = parse("++-+++++++++-+--++");
+        let y = parse("++----++-+---+-+-+");
+        let z = parse("++-+++----+-+-++--");
+        let w = parse("++----+--+--+++-+");
+        let n = 18usize;
+        let m = n - 1;
+        let tuple = SumTuple { x: 10, y: 2, z: 0, w: 1 };
+        let pz = PackedSeq::from_values(&z);
+        let pw = PackedSeq::from_values(&w);
+        let mut zw = vec![0i32; n];
+        for s in 1..n {
+            let nz = pz.autocorrelation(s);
+            let nw = if s < m { pw.autocorrelation(s) } else { 0 };
+            zw[s] = 2 * nz + 2 * nw;
+        }
+        let candidate = CandidateZW { zw_autocorr: zw };
+        let template = SatXYTemplate::build(Problem::new(n), tuple, &radical::SolverConfig::default())
+            .expect("template should build");
+        assert!(template.is_feasible(&candidate));
+        let mut solver = template.prepare_candidate_solver(&candidate).expect("prepare");
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        for i in 0..n {
+            solver.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+        }
+        assert_eq!(solver.solve(), Some(true), "hardcoded canonical TT(18) should be SAT-consistent with PbSetEq XY template");
     }
 
 }

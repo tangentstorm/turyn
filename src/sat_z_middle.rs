@@ -116,6 +116,44 @@ impl LagTemplate {
     pub fn true_var(&self, middle_len: usize) -> i32 {
         (middle_len + 1) as i32
     }
+
+    /// Like `build_base_solver` but replaces the single-target sum PB with a
+    /// `PbSetEq` over multiple valid counts.  Used by the multi-σ W middle
+    /// SAT — the SAT may then pick either sign of σ_W (or any σ_W compatible
+    /// with the `valid_counts` set).
+    pub fn build_base_solver_pb_set(&self, middle_len: usize, valid_counts: &[u32]) -> radical::Solver {
+        let mut solver = radical::Solver::new();
+        let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let lits: Vec<i32> = (0..middle_len).map(mid_var).collect();
+        solver.add_pb_set_eq(&lits, valid_counts);
+        // Legacy XNOR aux clauses for all mid×mid pairs — matches the
+        // non-quad-pb path in `build_base_solver_inner`.
+        for lag in &self.lags {
+            for (qi, &(mid_a, mid_b)) in lag.mid_mid.iter().enumerate() {
+                let a = mid_var(mid_a);
+                let b = mid_var(mid_b);
+                let aux = lag.aux_base + qi as i32;
+                solver.add_clause([-aux, -a, b]);
+                solver.add_clause([-aux, a, -b]);
+                solver.add_clause([a, b, aux]);
+                solver.add_clause([-a, -b, aux]);
+            }
+        }
+        solver
+    }
+
+    /// Like `build_base_solver_quad_pb` but with a `PbSetEq` middle-sum
+    /// constraint.  Used by the multi-σ Z middle SAT.
+    pub fn build_base_solver_quad_pb_pb_set(&self, middle_len: usize, valid_counts: &[u32]) -> radical::Solver {
+        let mut solver = radical::Solver::new();
+        let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let lits: Vec<i32> = (0..middle_len).map(mid_var).collect();
+        solver.add_pb_set_eq(&lits, valid_counts);
+        // Quad PB mode: "true" helper var.
+        let true_var = (middle_len + 1) as i32;
+        solver.add_clause([true_var]);
+        solver
+    }
 }
 
 /// Fill a cloned base solver with boundary-specific constraints.
