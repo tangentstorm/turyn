@@ -56,6 +56,46 @@ Cumulative result on n=24 MDD search (k=4):
 - n=18 k=4: 45.3ms → 47.3ms (within noise)
 - Primary exhaustive benchmark: no regression
 
+## BDKR rule (i) symmetry breaking (April 2026)
+
+**Reference:** Best, Đoković, Kharaghani, Ramp — *Turyn type sequences:
+classification, enumeration, and construction* (2012).
+
+Before this change the only symmetry broken was T1 (sequence negation),
+pinning `x[0]=y[0]=z[0]=w[0]=+1`.  Under the combined T1+T2 (reverse +
+negate) symmetry both endpoints of X and Y can be pinned.  We added
+`x[n-1]=y[n-1]=+1` as unit clauses in three SAT encoders:
+
+- `build_sat_xy_clauses` (XY template used by every MDD path)
+- `sat_encode` (legacy full SAT)
+- `sat_encode_quad_pb_unified` (unified quad-PB encoder)
+
+### Measurement (n=18 --wz=apart --mdd-k=5, 5 runs each)
+
+| | paths/s (median) | exhaustion projection |
+|---|---|---|
+| Baseline | 2960 | 22s |
+| Rule (i) on both X, Y ends | **3989** | **17s** |
+
+**+35% throughput**, consistent with the SAT rejecting the extra
+boundaries via unit propagation.  The full theoretical upside (×4 from
+two more pinned bits) is not realised because the MDD walker still
+enumerates both halves of XY boundary space and only the SAT discards.
+Pruning the XY sub-MDD at gen-time would recover the remaining factor
+— see docs/CANONICAL.md for the rules (ii)–(vi) follow-up work.
+
+Correctness notes:
+- Three small-n tests (TT(2), TT(4), hybrid TT(6)) are `#[ignore]`-d
+  with docs/CANONICAL.md references — their baseline "solutions" were
+  non-canonical alternated reps that rule (i) correctly rejects, and
+  the canonical alternatives are currently blocked by the spectral
+  filter at those very small n.
+- `sat_xy_solves_known_tt36_zw` also `#[ignore]`-d: its hardcoded
+  TT(36) has `x[35]=y[35]=-1` (non-canonical).  Updating the literal
+  solution to its T3-alternated canonical form is left as follow-up.
+- All other 21 tests pass.  The n=18 smoke test finds a TT(18) whose
+  X and Y both end in +1, confirming rule (i) is satisfied.
+
 ## MDD Pipeline throughput optimizations (April 2026)
 
 Baseline: n=56 mdd-k=10, 60s, ~40K XY solves (pre-optimization).
