@@ -53,10 +53,17 @@ An additional consequence of the full rule set: **`c[n] = -1` for `n > 1`.**
 | (i)     | `sat_encode_quad_pb_unified`         | same as above, gated on `fixed.is_none()`       |
 | (i)     | MDD builder (`src/mdd_zw_first.rs`)  | XY sub-MDD: branch `0b11` pinned at positions `0` and `2k-1` (⇒ `x[0]=y[0]=x[n-1]=y[n-1]=+1`); ZW half: position 0 pinned (⇒ `z[0]=w[0]=+1`) |
 | (ii)    | `build_sat_xy_clauses`, `sat_encode` | palindromic-break chain on X via aux `diff_j ↔ x[j]⊕x[n-1-j]`, start `j=1` |
+| (ii)    | `walk_xy_sub_mdd` pre-filter          | boundary-only check: reject any emitted (x_bits,y_bits) where the first in-boundary non-palindromic pair has x[j]=-1 |
 | (iii)   | `build_sat_xy_clauses`, `sat_encode` | palindromic-break chain on Y (same shape as ii) |
+| (iii)   | `walk_xy_sub_mdd` pre-filter          | symmetric boundary-only check on Y              |
 | (iv)    | `sat_encode`                         | palindromic-EQ-break chain on Z (equality polarity, start `j=0`) |
+| (iv)    | Z-middle SAT (`sat_z_middle::add_rule_iv_middle_clauses`) | boundary pre-filter (`check_z_boundary_rule_iv`) rejects ViolatedAtBoundary outright; middle clauses emitted only when DeferredToMiddle |
+| (iv)    | MDD pipeline: `SolveZ` / `SolveWZ`   | boundary pre-filter skips the stage when rule (iv) fires at a boundary Z[j]=-1 palindrome |
 | (v)     | `sat_encode`                         | alternation-break chain on W via `v_k ↔ d[k]⊕d[m-1-k]⊕d[m-1]` |
+| (v)     | W-middle SAT (`sat_z_middle::add_rule_v_middle_clauses`) | boundary pre-filter (`check_w_boundary_rule_v`) + conditional middle clauses (tail d[m-1] folded into v_k's XOR as a constant) |
+| (v)     | MDD pipeline: `SolveW` / `SolveWZ`   | boundary pre-filter + brute-force W full-sequence canonicality check |
 | (vi)    | `build_sat_xy_clauses`, `sat_encode` | 5 clauses encoding the conditional X↔Y swap break |
+| (vi)    | `walk_xy_sub_mdd` pre-filter          | boundary-only check: forbid `(x[1]=-1, y[1]=+1)`; when `x[1]=y[1]`, require `x[n-2]=+1` and `y[n-2]=-1` |
 | tuple-level | `SumTuple::norm_key`             | `|σ_X|, |σ_Y|, |σ_Z|, |σ_W|` only (no X↔Y sort — rule (vi) breaks T4). Factor 16. |
 
 The palindromic/alternation/swap-break encoding is shared across the
@@ -86,18 +93,24 @@ on canonical-orbit data:
 
 ### Follow-up work
 
-Rules (ii), (iii), (iv), (v), (vi) are now wired into the SAT
-encoders.  What's still *not* done:
+All six rules are wired into the XY SAT / full SAT / Z-middle SAT /
+W-middle SAT / MDD-gen / MDD-walker layers.  Remaining items, by
+diminishing returns:
 
-- **Rules (iv)/(v) in the MDD middle-SAT solvers** (`src/sat_z_middle.rs`,
-  `src/sat_w_middle.rs`).  The middle solver only sees middle vars,
-  so boundary-boundary palindrome pairs must be enforced at MDD-walk
-  time and boundary-middle propagation would need threading through
-  the `LagTemplate`.  A more mechanical refactor.
-- **MDD pruning for rules (ii)/(iii) at boundary positions.**  For
-  palindrome pairs (j, n-1-j) that fall wholly inside the boundary
-  (j < k), the first-violation rule can be evaluated at MDD gen
-  time.  Could shrink the XY sub-MDD further.
+- **Stateful MDD-build pruning for rules (ii)/(iii) on the XY sub-MDD.**
+  Would require adding a 1-bit "rule already fired" flag to each
+  `build_xy_dfs` state key (4× memo entries).  The current
+  boundary-only post-walk filter in `walk_xy_sub_mdd` captures most
+  of the benefit without touching memoization; the structural
+  version would additionally shrink the on-disk XY sub-MDD.
+- **Stateful MDD-build pruning for rules (iv)/(v) on the ZW top half.**
+  Same idea, but on `build_zw_dfs`.  Currently the Z/W middle SAT
+  handles these via boundary pre-filter + middle clauses; structural
+  pruning would make the ZW MDD smaller still.
+- **Rules (iv)/(v) middle clauses in the combined `SolveWZ` SAT.**
+  The separate-W-Z pipeline (`SolveW` → `SolveZ`) already emits the
+  middle clauses; the combined solver uses distinct z/w var
+  closures and the helpers would need a generic var-closure API.
 
 ### Original encoding sketches (for the record)
 

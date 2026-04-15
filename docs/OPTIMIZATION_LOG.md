@@ -100,6 +100,23 @@ Correctness notes:
 - The n=18 smoke test finds a TT(18) whose X and Y both end in +1,
   confirming rule (i) is satisfied on the primary benchmark path.
 
+## BDKR rules (ii)–(vi) end-to-end (April 2026)
+
+Cumulative measurement on the n=18 --wz=apart --mdd-k=5 smoke test
+(median paths/s of 5 runs):
+
+| Milestone | paths/s | exhaustion |
+|-----------|---------|------------|
+| pre-canonicalisation (T1 only) | 2960 | 22s |
+| rule (i) SAT only              | 3989 | 17s |
+| + rule (i) at MDD gen time     | 3900 |  8s |
+| + rules (ii)–(vi) in SAT       | 3800 |  9s |
+| + rules (iv)/(v) in middle SAT + pre-filter | 7440 |  5s |
+| + rules (ii)/(iii)/(vi) XY walker pre-filter | **8014** | **4s** |
+
+Cumulative end-to-end: **~2.7× throughput, ~5.5× faster exhaustion,
+half the live path count**.  All 26 tests pass.
+
 ## BDKR rules (ii)–(vi) in the SAT encoders (April 2026)
 
 Following on from rule (i), we wired the remaining BDKR 2012

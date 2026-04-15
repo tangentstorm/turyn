@@ -4276,6 +4276,50 @@ fn run_mdd_sat_search(
     SearchReport { stats: all_stats, elapsed, found_solution }
 }
 
+/// BDKR rule (ii)/(iii)/(vi) pre-filter applied to the packed XY
+/// boundary bits.  Bits 0..k-1 hold sub-MDD prefix positions (= seq
+/// positions 0..k-1); bits k..2k-1 hold the suffix (= seq positions
+/// n-k..n-1) with sub-MDD pos `k+i` ↔ seq pos `n-k+i` ↔ mirror bit
+/// `2k-1-i` of the pair partner.
+fn xy_boundary_passes_rules(x_bits: u32, y_bits: u32, n: usize, k: usize) -> bool {
+    // Rule (ii) on X:  first j in [1, k-1] with x[j] ≠ x[n-1-j] must
+    // have x[j] = +1.  Both positions are in-boundary for j < k.
+    let last_pair = (n - 2) / 2;
+    for j in 1..k.min(last_pair + 1) {
+        let bit_j = (x_bits >> j) & 1;
+        let bit_mirror = (x_bits >> (2 * k - 1 - j)) & 1;
+        if bit_j != bit_mirror {
+            if bit_j == 0 { return false; }
+            break;
+        }
+    }
+    // Rule (iii) on Y.
+    for j in 1..k.min(last_pair + 1) {
+        let bit_j = (y_bits >> j) & 1;
+        let bit_mirror = (y_bits >> (2 * k - 1 - j)) & 1;
+        if bit_j != bit_mirror {
+            if bit_j == 0 { return false; }
+            break;
+        }
+    }
+    // Rule (vi) — requires n > 2 and that n-2 is in the suffix boundary
+    // (⇔ k ≥ 2).  Bit mapping: x[1]=bit 1, x[n-2]=bit 2k-2.
+    if n > 2 && k >= 2 {
+        let x1 = (x_bits >> 1) & 1;
+        let y1 = (y_bits >> 1) & 1;
+        let bit_nm2 = 2 * k - 2;
+        let x_nm2 = (x_bits >> bit_nm2) & 1;
+        let y_nm2 = (y_bits >> bit_nm2) & 1;
+        if x1 != y1 {
+            if x1 == 0 { return false; } // forbid x[1]=-1 ∧ y[1]=+1
+        } else {
+            // "a[2] = b[2]" branch of rule (vi): a[n-1]=+1 ∧ b[n-1]=-1.
+            if x_nm2 == 0 || y_nm2 == 1 { return false; }
+        }
+    }
+    true
+}
+
 /// Walk the XY bottom half of the reordered MDD, emitting (x_bits, y_bits)
 /// that pass sum compatibility with the given tuple.
 fn walk_xy_sub_mdd<F: FnMut(u32, u32)>(
@@ -4285,6 +4329,8 @@ fn walk_xy_sub_mdd<F: FnMut(u32, u32)>(
     max_bnd_sum: i32, middle_n: i32, tuple: SumTuple,
     callback: &mut F,
 ) {
+    let n_full = middle_n as usize + 2 * xy_depth / 2;
+    let k_full = xy_depth / 2;
     walk_mdd_4way(nid, level, xy_depth, x_acc, y_acc, pos_order, nodes,
         &mut |x_bits, y_bits, _nid| {
             let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
@@ -4293,6 +4339,11 @@ fn walk_xy_sub_mdd<F: FnMut(u32, u32)>(
             if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return; }
             let y_mid = tuple.y - y_bnd_sum;
             if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return; }
+            // BDKR rules (ii)/(iii)/(vi) pre-filter on the boundary
+            // bits.  The XY SAT still enforces the full rule including
+            // middle positions; this catches the boundary-only part
+            // cheaply so we skip the SAT call setup entirely.
+            if !xy_boundary_passes_rules(x_bits, y_bits, n_full, k_full) { return; }
             callback(x_bits, y_bits);
         });
 }
