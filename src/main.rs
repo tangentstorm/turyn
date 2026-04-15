@@ -6524,6 +6524,164 @@ mod tests {
         assert_eq!(result2, Some(true), "Known Z middle should satisfy Z SAT constraints");
     }
 
+    /// Check every spectral filter the n=18 pipeline applies against
+    /// the canonical TT(18).  If any of them rejects the canonical
+    /// that's a bug (the user's standing rule: filters can only reject
+    /// bad candidates, never valid TTs).  Also enumerate Zs from the
+    /// multi-σ SAT and verify (a) they're all distinct and (b) the
+    /// canonical Z is eventually among them.
+    #[test]
+    fn spectral_filters_accept_canonical_tt18() {
+        let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
+        let z = parse("++-+++----+-+-++--");
+        let w = parse("++----+--+--+++-+");
+        let n = 18usize;
+        let m = n - 1;
+        let k = 5usize;
+        let middle_n = n - 2 * k;
+        let middle_m = m - 2 * k;
+        let problem = Problem::new(n);
+
+        // Sanity: canonical TT(18) verifies the Turyn identity.
+        let xs = parse("++-+++++++++-+--++");
+        let ys = parse("++----++-+---+-+-+");
+        let pz = PackedSeq::from_values(&z);
+        let pw = PackedSeq::from_values(&w);
+        assert!(verify_tt(
+            problem,
+            &PackedSeq::from_values(&xs),
+            &PackedSeq::from_values(&ys),
+            &pz,
+            &pw,
+        ));
+
+        // -----------------------------------------------------------------
+        // (1) Individual W spectral filter (`spectral_w`, theta_samples=128).
+        let spectral_w = SpectralFilter::new(m, 128);
+        let individual_bound = problem.spectral_bound();
+        let mut fft_buf_w = FftScratch::new(&spectral_w);
+        let w_spectrum = spectrum_if_ok(&w, &spectral_w, individual_bound, &mut fft_buf_w)
+            .expect("canonical W must pass individual spectral filter");
+
+        // -----------------------------------------------------------------
+        // (2) External Z spectral pair filter (`spectral_z`, same theta grid).
+        let spectral_z = SpectralFilter::new(n, 128);
+        let mut fft_buf_z = FftScratch::new(&spectral_z);
+        let mut z_spectrum = vec![0.0; w_spectrum.len()];
+        compute_spectrum_into(&z, &spectral_z, &mut fft_buf_z, &mut z_spectrum);
+        let pair_bound = problem.spectral_bound();
+        assert!(
+            spectral_pair_ok(&z_spectrum, &w_spectrum, pair_bound),
+            "canonical (Z,W) must pass external spectral_pair_ok; max |Z|²+|W|² over the \
+             128-FFT grid exceeded bound {pair_bound}: z={:?} w={:?}",
+             z_spectrum, w_spectrum,
+        );
+
+        // -----------------------------------------------------------------
+        // (3) In-SAT per-freq spectral.  Build the exact SolveZ solver
+        // configuration and hardcode the canonical Z middle; SAT must
+        // return SAT.  This catches the case where the SAT's 167-freq
+        // per-freq bound incorrectly rejects the canonical middle.
+        let z_tmpl = sat_z_middle::LagTemplate::new(n, k);
+        let mut z_boundary = vec![0i8; n];
+        z_boundary[..k].copy_from_slice(&z[..k]);
+        z_boundary[n-k..].copy_from_slice(&z[n-k..]);
+        let z_bnd_sum: i32 = z_boundary.iter().map(|&v| v as i32).sum();
+        let abs_z = 0i32;
+        let z_counts: Vec<u32> = if abs_z == 0 {
+            sigma_full_to_cnt(0, z_bnd_sum, middle_n).into_iter().collect()
+        } else {
+            [abs_z, -abs_z].iter()
+                .filter_map(|&s| sigma_full_to_cnt(s, z_bnd_sum, middle_n))
+                .collect()
+        };
+        let mut z_solver = z_tmpl.build_base_solver_quad_pb_pb_set(middle_n, &z_counts);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+            &mut z_solver, &z_tmpl, n, m, middle_n, &z_boundary, &w);
+
+        // Attach the same per-freq spectral constraint SolveZ uses.
+        let ztab = radical::SpectralTables::new(n, k, SPECTRAL_FREQS);
+        let mut z_spec = radical::SpectralConstraint::from_tables(
+            &ztab, &z_boundary, pair_bound);
+        // Per-freq bound: pair_bound − |W(ω)|² computed at ztab's 167 freqs.
+        let nf = ztab.num_freqs;
+        let mut w_re = vec![0.0f64; nf];
+        let mut w_im = vec![0.0f64; nf];
+        for (pos, &wv) in w.iter().enumerate() {
+            let base = pos * nf;
+            let cos_slice = &ztab.pos_cos[base..base + nf];
+            let sin_slice = &ztab.pos_sin[base..base + nf];
+            if wv > 0 {
+                for fi in 0..nf { w_re[fi] += cos_slice[fi]; w_im[fi] += sin_slice[fi]; }
+            } else {
+                for fi in 0..nf { w_re[fi] -= cos_slice[fi]; w_im[fi] -= sin_slice[fi]; }
+            }
+        }
+        let pfb: Vec<f64> = (0..nf).map(|fi|
+            (pair_bound - w_re[fi]*w_re[fi] - w_im[fi]*w_im[fi]).max(0.0)
+        ).collect();
+        // Check: the canonical Z's |Z(ω)|² at each ω must be ≤ pfb[ω].
+        // If not, the in-SAT per-freq bound rejects canonical — a bug
+        // since `spectral_pair_ok` above already passed.
+        let mut z_full_re = vec![0.0f64; nf];
+        let mut z_full_im = vec![0.0f64; nf];
+        for (pos, &zv) in z.iter().enumerate() {
+            let base = pos * nf;
+            let cos_slice = &ztab.pos_cos[base..base + nf];
+            let sin_slice = &ztab.pos_sin[base..base + nf];
+            if zv > 0 {
+                for fi in 0..nf { z_full_re[fi] += cos_slice[fi]; z_full_im[fi] += sin_slice[fi]; }
+            } else {
+                for fi in 0..nf { z_full_re[fi] -= cos_slice[fi]; z_full_im[fi] -= sin_slice[fi]; }
+            }
+        }
+        for fi in 0..nf {
+            let zmag2 = z_full_re[fi]*z_full_re[fi] + z_full_im[fi]*z_full_im[fi];
+            assert!(
+                zmag2 <= pfb[fi] + 1e-6,
+                "in-SAT per-freq bound rejects canonical Z at freq {fi}: \
+                 |Z|²={zmag2} > pfb={}",
+                 pfb[fi],
+            );
+        }
+        z_spec.per_freq_bound = Some(pfb);
+        z_solver.spectral = Some(z_spec);
+
+        // Enumerate up to 32 Zs with blocking clauses; verify (a) they
+        // are all distinct (blocking actually works) and (b) the
+        // canonical Z middle appears within the first few dozen.
+        let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
+        let mut seen_mids: std::collections::HashSet<Vec<i8>> = std::collections::HashSet::new();
+        let mut canonical_found_at: Option<usize> = None;
+        let canonical_mid: Vec<i8> = z[k..k+middle_n].to_vec();
+        for i in 0..64 {
+            let r = z_solver.solve();
+            if r != Some(true) { break; }
+            let z_mid = extract_vals(&z_solver, |idx| z_mid_vars[idx], middle_n);
+            assert!(seen_mids.insert(z_mid.clone()), "SAT returned duplicate Z middle at iteration {i}");
+            if z_mid == canonical_mid && canonical_found_at.is_none() {
+                canonical_found_at = Some(i);
+            }
+            // Blocking clause.
+            let blk: Vec<i32> = z_mid_vars.iter().map(|&v| {
+                if z_solver.value(v) == Some(true) { -v } else { v }
+            }).collect();
+            z_solver.reset();
+            z_solver.add_clause(blk);
+        }
+        eprintln!(
+            "enumerated {} distinct Z middles; canonical found at iter {:?}",
+            seen_mids.len(), canonical_found_at,
+        );
+        assert!(
+            canonical_found_at.is_some(),
+            "canonical Z middle not found in first {} SAT solutions — either \
+             the in-SAT spectral rejects it (shouldn't, given (3) above passed) \
+             or the SAT never reaches it",
+             seen_mids.len(),
+        );
+    }
+
     /// Sanity check: PbSetEq-based W middle SAT accepts the canonical
     /// TT(18) W middle when the boundary is hardcoded and V_w covers
     /// both signs of σ_W.
@@ -6622,6 +6780,457 @@ mod tests {
             solver.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
         }
         assert_eq!(solver.solve(), Some(true), "hardcoded canonical TT(18) should be SAT-consistent with PbSetEq XY template");
+    }
+
+    /// Narrows the n=18 open-search regression to a soundness bug in
+    /// `add_pb_set_eq` + `add_quad_pb_eq` interaction.  This test does
+    /// *not* go through the XY template; it builds the exact same SAT
+    /// state manually and verifies the canonical middle is reachable.
+    ///
+    /// Status: **documents a known bug**.  With `#[ignore]` because the
+    /// underlying radical bug is not yet fixed — see `docs/CANONICAL.md`
+    /// "Open issues".
+    ///
+    /// Key data points (see commit history for full diagnostic trace):
+    /// - `rules + quad_pb(all lags) + boundary` (NO PbSetEq):  **SAT** ✓
+    /// - `rules + add_pb_eq(14) + add_pb_eq(8) + quad_pb + boundary`:  **SAT** ✓
+    /// - `rules + add_pb_set_eq([14]) + add_pb_set_eq([8]) + quad_pb + boundary`:
+    ///   **UNSAT** ✗  (same semantics as PbEq, but wrong)
+    /// - `PbSetEq + quad_pb lags [1..=11] + boundary`: SAT
+    /// - `PbSetEq + quad_pb lags [1..=12] + boundary`: UNSAT
+    ///   (single lag 12 alone is SAT; the bug requires ≥12 quad_pb
+    ///   constraints combined with PbSetEq)
+    #[test]
+    #[ignore]
+    fn pbeq_xy_boundary_only_finds_canonical_tt18() {
+        let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
+        let x = parse("++-+++++++++-+--++");
+        let y = parse("++----++-+---+-+-+");
+        let z = parse("++-+++----+-+-++--");
+        let w = parse("++----+--+--+++-+");
+        let n = 18usize;
+        let m = n - 1;
+        let k = 5usize;
+
+        // Build an XY template manually with PbEq (single target) instead of PbSetEq.
+        let pz = PackedSeq::from_values(&z);
+        let pw = PackedSeq::from_values(&w);
+        let mut zw = vec![0i32; n];
+        for s in 1..n {
+            let nz = pz.autocorrelation(s);
+            let nw = if s < m { pw.autocorrelation(s) } else { 0 };
+            zw[s] = 2 * nz + 2 * nw;
+        }
+        let candidate = CandidateZW { zw_autocorr: zw };
+
+        let mut solver: radical::Solver = { let mut s = radical::Solver::new(); s.config = radical::SolverConfig::default(); s };
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        // Rule (i)
+        solver.add_clause([x_var(0)]); solver.add_clause([y_var(0)]);
+        solver.add_clause([x_var(n - 1)]); solver.add_clause([y_var(n - 1)]);
+        // Rules (ii)/(iii)/(vi)
+        let mut next_var = (2 * n + 1) as i32;
+        add_palindromic_break(&mut solver, n, x_var, false, 1, &mut next_var);
+        add_palindromic_break(&mut solver, n, y_var, false, 1, &mut next_var);
+        add_swap_break(&mut solver, x_var, y_var, n);
+        // PbEq with single targets: σ_X=+10 → count=14, σ_Y=+2 → count=10.
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        let ones: Vec<u32> = vec![1; n];
+        // PbSetEq with both signs (V_x = {4, 14}, V_y = {8, 10}),
+        // matching what `build_sat_xy_clauses_multi` produces.
+        // Canonical σ_X = +10 (count 14), σ_Y = -2 (count 8).
+        solver.add_pb_set_eq(&x_lits, &[4, 14]);
+        solver.add_pb_set_eq(&y_lits, &[8, 10]);
+        let lag_pairs = build_xy_lag_pairs(n).expect("lag_pairs").0;
+        let mut template = SatXYTemplate { solver, lag_pairs, n };
+        // Disable XOR so prepare_candidate_solver doesn't add XOR constraints.
+        template.solver.config.xor_propagation = false;
+
+        let mut state = SolveXyPerCandidate::new(Problem::new(n), &candidate, &template, k)
+            .expect("SolveXyPerCandidate::new should succeed");
+
+        let mut x_bits = 0u32;
+        let mut y_bits = 0u32;
+        for i in 0..k {
+            if x[i] == 1 { x_bits |= 1 << i; }
+            if x[n - k + i] == 1 { x_bits |= 1 << (k + i); }
+            if y[i] == 1 { y_bits |= 1 << i; }
+            if y[n - k + i] == 1 { y_bits |= 1 << (k + i); }
+        }
+        // Before try_candidate, sanity-check: the solver (with GJ + quad_pb
+        // + rules + PbEq) should be SAT-feasible with NO boundary
+        // assumptions.  If this is UNSAT, the template is broken.
+        eprintln!("Testing solver with zero assumptions...");
+        let no_assume_result = state.solver.solve_with_assumptions(&[]);
+        eprintln!("Zero-assumption solve: {:?}", no_assume_result);
+        assert_eq!(no_assume_result, Some(true), "Template solver (rules+GJ+quad_pb+PbEq) is UNSAT with no assumptions — template itself is broken");
+
+        // Narrow: template + boundary ONLY (no GJ, no quad_pb).
+        let mut solver3 = template.solver.clone();
+        for i in 0..k {
+            solver3.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver3.add_clause([if x[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+            solver3.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+            solver3.add_clause([if y[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+        }
+        let bare_result = solver3.solve();
+        eprintln!("template (rules+PbEq, no GJ/quad_pb) + boundary: {:?}", bare_result);
+
+        // Narrow: add GJ equalities only.
+        let equalities = gj_candidate_equalities(n, &candidate).expect("gj");
+        eprintln!("Number of GJ equalities: {}", equalities.len());
+        let mut solver4 = template.solver.clone();
+        for &(a, b, equal) in &equalities {
+            if equal { solver4.add_clause([-a, b]); solver4.add_clause([a, -b]); }
+            else { solver4.add_clause([-a, -b]); solver4.add_clause([a, b]); }
+        }
+        for i in 0..k {
+            solver4.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver4.add_clause([if x[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+            solver4.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+            solver4.add_clause([if y[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+        }
+        let gj_result = solver4.solve();
+        eprintln!("template + GJ + boundary (no quad_pb): {:?}", gj_result);
+
+        // Narrow: add quad_pb only (no GJ).
+        let mut solver5 = template.solver.clone();
+        for s in 1..n {
+            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
+            let lp = &template.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver5.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+        }
+        for i in 0..k {
+            solver5.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver5.add_clause([if x[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+            solver5.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+            solver5.add_clause([if y[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+        }
+        let qpb_result = solver5.solve();
+        eprintln!("template + quad_pb + boundary (no GJ): {:?}", qpb_result);
+
+        // Rules only (no PbSetEq, no GJ) + quad_pb + boundary.
+        let mut solver_no_pb: radical::Solver = { let mut s = radical::Solver::new(); s.config = radical::SolverConfig::default(); s.config.xor_propagation = false; s };
+        solver_no_pb.add_clause([x_var(0)]); solver_no_pb.add_clause([y_var(0)]);
+        solver_no_pb.add_clause([x_var(n - 1)]); solver_no_pb.add_clause([y_var(n - 1)]);
+        let mut nv = (2 * n + 1) as i32;
+        add_palindromic_break(&mut solver_no_pb, n, x_var, false, 1, &mut nv);
+        add_palindromic_break(&mut solver_no_pb, n, y_var, false, 1, &mut nv);
+        add_swap_break(&mut solver_no_pb, x_var, y_var, n);
+        for s in 1..n {
+            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
+            let lp = &template.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver_no_pb.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+        }
+        for i in 0..k {
+            solver_no_pb.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver_no_pb.add_clause([if x[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+            solver_no_pb.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+            solver_no_pb.add_clause([if y[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+        }
+        let no_pb_result = solver_no_pb.solve();
+        eprintln!("rules + quad_pb + boundary (NO PbSetEq, NO GJ): {:?}", no_pb_result);
+
+        // PbSetEq only (no rules, no GJ) + quad_pb + boundary.
+        let mut solver_pb_only: radical::Solver = { let mut s = radical::Solver::new(); s.config = radical::SolverConfig::default(); s.config.xor_propagation = false; s };
+        // Allocate 2n vars.
+        for v in 1..=(2 * n) as i32 { solver_pb_only.add_clause([v, -v]); }
+        let x_lits_pb: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        let y_lits_pb: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        solver_pb_only.add_pb_set_eq(&x_lits_pb, &[4, 14]);
+        solver_pb_only.add_pb_set_eq(&y_lits_pb, &[8, 10]);
+        for s in 1..n {
+            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
+            let lp = &template.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver_pb_only.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+        }
+        for i in 0..k {
+            solver_pb_only.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver_pb_only.add_clause([if x[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+            solver_pb_only.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+            solver_pb_only.add_clause([if y[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+        }
+        let pb_only_result = solver_pb_only.solve();
+        eprintln!("PbSetEq + quad_pb + boundary (NO rules, NO GJ): {:?}", pb_only_result);
+
+        // PbSetEq with single-value V (equivalent to PbEq) + quad_pb + boundary.
+        let mut solver_pb_single: radical::Solver = { let mut s = radical::Solver::new(); s.config = radical::SolverConfig::default(); s.config.xor_propagation = false; s };
+        for v in 1..=(2 * n) as i32 { solver_pb_single.add_clause([v, -v]); }
+        solver_pb_single.add_pb_set_eq(&x_lits_pb, &[14]);
+        solver_pb_single.add_pb_set_eq(&y_lits_pb, &[8]);
+        for s in 1..n {
+            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
+            let lp = &template.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver_pb_single.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+        }
+        for i in 0..k {
+            solver_pb_single.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver_pb_single.add_clause([if x[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+            solver_pb_single.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+            solver_pb_single.add_clause([if y[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+        }
+        let pb_single_result = solver_pb_single.solve();
+        eprintln!("PbSetEq V={{14}},{{8}} (single) + quad_pb + boundary: {:?}", pb_single_result);
+
+        // Only one quad_pb lag (s=1) + PbSetEq.
+        let mut solver_s1: radical::Solver = { let mut s = radical::Solver::new(); s.config = radical::SolverConfig::default(); s.config.xor_propagation = false; s };
+        for v in 1..=(2 * n) as i32 { solver_s1.add_clause([v, -v]); }
+        solver_s1.add_pb_set_eq(&x_lits_pb, &[14]);
+        solver_s1.add_pb_set_eq(&y_lits_pb, &[8]);
+        // Only lag s=1
+        let target_s1 = xy_agree_target(n, 1, &candidate.zw_autocorr).unwrap();
+        let lp_s1 = &template.lag_pairs[1];
+        let ones_s1: Vec<u32> = vec![1; lp_s1.lits_a.len()];
+        solver_s1.add_quad_pb_eq(&lp_s1.lits_a, &lp_s1.lits_b, &ones_s1, target_s1 as u32);
+        for i in 0..k {
+            solver_s1.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver_s1.add_clause([if x[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+            solver_s1.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+            solver_s1.add_clause([if y[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+        }
+        let s1_result = solver_s1.solve();
+        eprintln!("PbSetEq + ONE quad_pb (lag s=1) + boundary: {:?}", s1_result);
+
+        // Same ONE quad_pb but with PbEq (equiv single value).
+        let mut solver_s1_pbeq: radical::Solver = { let mut s = radical::Solver::new(); s.config = radical::SolverConfig::default(); s.config.xor_propagation = false; s };
+        for v in 1..=(2 * n) as i32 { solver_s1_pbeq.add_clause([v, -v]); }
+        let ones18: Vec<u32> = vec![1; n];
+        solver_s1_pbeq.add_pb_eq(&x_lits_pb, &ones18, 14);
+        solver_s1_pbeq.add_pb_eq(&y_lits_pb, &ones18, 8);
+        solver_s1_pbeq.add_quad_pb_eq(&lp_s1.lits_a, &lp_s1.lits_b, &ones_s1, target_s1 as u32);
+        for i in 0..k {
+            solver_s1_pbeq.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver_s1_pbeq.add_clause([if x[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+            solver_s1_pbeq.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+            solver_s1_pbeq.add_clause([if y[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+        }
+        let s1_pbeq_result = solver_s1_pbeq.solve();
+        eprintln!("PbEq + ONE quad_pb (lag s=1) + boundary: {:?}", s1_pbeq_result);
+
+        // Test with reversed order: add quad_pb constraints FIRST, then PbSetEq.
+        let mut solver_rev: radical::Solver = { let mut s = radical::Solver::new(); s.config = radical::SolverConfig::default(); s.config.xor_propagation = false; s };
+        for v in 1..=(2 * n) as i32 { solver_rev.add_clause([v, -v]); }
+        // quad_pb first
+        for s in 1..n {
+            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
+            let lp = &template.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver_rev.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+        }
+        // PbSetEq second
+        solver_rev.add_pb_set_eq(&x_lits_pb, &[4, 14]);
+        solver_rev.add_pb_set_eq(&y_lits_pb, &[8, 10]);
+        // Boundary
+        for i in 0..k {
+            solver_rev.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver_rev.add_clause([if x[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+            solver_rev.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+            solver_rev.add_clause([if y[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+        }
+        let rev_result = solver_rev.solve();
+        eprintln!("REVERSED order: quad_pb then PbSetEq then boundary: {:?}", rev_result);
+
+        // Test the same but with PbEq (same semantics) for lags up to 12.
+        for max_lag in [12] {
+            let mut sb: radical::Solver = { let mut s = radical::Solver::new(); s.config = radical::SolverConfig::default(); s.config.xor_propagation = false; s };
+            for v in 1..=(2 * n) as i32 { sb.add_clause([v, -v]); }
+            let ones18v: Vec<u32> = vec![1; n];
+            sb.add_pb_eq(&x_lits_pb, &ones18v, 14);
+            sb.add_pb_eq(&y_lits_pb, &ones18v, 8);
+            for s_lag in 1..=max_lag.min(n-1) {
+                let target = xy_agree_target(n, s_lag, &candidate.zw_autocorr).unwrap();
+                let lp = &template.lag_pairs[s_lag];
+                let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+                sb.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+            }
+            for i in 0..k {
+                sb.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+                sb.add_clause([if x[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+                sb.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+                sb.add_clause([if y[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+            }
+            let r = sb.solve();
+            eprintln!("PbEq (target=14,8) + quad_pb lags [1..={max_lag}] + boundary: {:?}", r);
+        }
+
+        // Test ONLY lag 12 (no other lags) + PbSetEq.
+        for only_lag in [11, 12, 13] {
+            let mut sb: radical::Solver = { let mut s = radical::Solver::new(); s.config = radical::SolverConfig::default(); s.config.xor_propagation = false; s };
+            for v in 1..=(2 * n) as i32 { sb.add_clause([v, -v]); }
+            sb.add_pb_set_eq(&x_lits_pb, &[14]);
+            sb.add_pb_set_eq(&y_lits_pb, &[8]);
+            let target = xy_agree_target(n, only_lag, &candidate.zw_autocorr).unwrap();
+            let lp = &template.lag_pairs[only_lag];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            sb.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+            for i in 0..k {
+                sb.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+                sb.add_clause([if x[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+                sb.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+                sb.add_clause([if y[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+            }
+            let r = sb.solve();
+            eprintln!("PbSetEq + ONLY lag {only_lag} quad_pb + boundary: {:?}", r);
+        }
+
+        // Hardcode ALL X, Y (canonical middle too) + quad_pb.  Must be SAT.
+        let mut solver6 = template.solver.clone();
+        for s in 1..n {
+            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
+            let lp = &template.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver6.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+        }
+        for i in 0..n {
+            solver6.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver6.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+        }
+        let full_qpb_result = solver6.solve();
+        eprintln!("template + quad_pb + FULL canonical X,Y (all positions): {:?}", full_qpb_result);
+
+        // Bare quad_pb only: fresh solver, no rules, no PbEq, just quad_pb + hardcoded X,Y.
+        let mut solver_bare: radical::Solver = radical::Solver::new();
+        // Allocate 2n vars via add_clause on one dummy tautology (solver may lazy-alloc).
+        for v in 1..=(2 * n) as i32 { solver_bare.add_clause([v, -v]); }
+        for s in 1..n {
+            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
+            let lp = &template.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver_bare.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+        }
+        for i in 0..n {
+            solver_bare.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver_bare.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+        }
+        let bare_qpb_result = solver_bare.solve();
+        eprintln!("bare quad_pb + FULL canonical X,Y (no rules, no PbEq): {:?}", bare_qpb_result);
+
+        // Template (rules + PbEq) + FULL canonical X,Y, no quad_pb, no GJ.
+        let mut solver8 = template.solver.clone();
+        for i in 0..n {
+            solver8.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver8.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+        }
+        let template_full_result = solver8.solve();
+        eprintln!("template (rules+PbEq) + FULL canonical X,Y, no quad_pb: {:?}", template_full_result);
+
+        // If above is SAT but `template+quad_pb+FULL canonical`is UNSAT,
+        // the bug is in the interaction: extra variables/clauses from
+        // rule-encoding conflict with quad_pb's aux/term-state layout.
+        // Check num_vars progression.
+        eprintln!("template.solver.num_vars = {}", template.solver.num_vars());
+        eprintln!("solver6 num_vars after quad_pb = {}", solver6.num_vars());
+
+        // One middle position unfixed: fix all except x[8]; it should find x[8]=+1.
+        let mut solver7 = template.solver.clone();
+        for s in 1..n {
+            let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
+            let lp = &template.lag_pairs[s];
+            let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+            solver7.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+        }
+        for i in 0..n {
+            if i == 8 { continue; } // leave x[8] free
+            solver7.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver7.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+        }
+        // Don't unit y[8] either — both unbound
+        let one_free_result = solver7.solve();
+        eprintln!("template + quad_pb + hardcode all except x[8]: {:?}", one_free_result);
+
+        // Last resort: full prepare_candidate_solver (rules + GJ + quad_pb + XOR)
+        let mut solver2 = template.prepare_candidate_solver(&candidate).expect("prepare_candidate_solver");
+        for i in 0..k {
+            solver2.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            solver2.add_clause([if x[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+            solver2.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
+            solver2.add_clause([if y[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+        }
+        let prepared_result = solver2.solve();
+        eprintln!("full prepare_candidate_solver + boundary: {:?}", prepared_result);
+
+        assert_eq!(bare_result, Some(true), "even rules+PbEq is UNSAT — bug in rules or PbEq");
+        assert_eq!(gj_result, Some(true), "rules+PbEq+GJ UNSAT — GJ equalities inconsistent with canonical boundary");
+        assert_eq!(qpb_result, Some(true), "rules+PbEq+quad_pb UNSAT — quad_pb inconsistent with canonical boundary");
+        assert_eq!(prepared_result, Some(true), "full prepare_candidate_solver UNSAT");
+
+        let result = state.try_candidate(x_bits, y_bits);
+        match result {
+            XyTryResult::Sat(_, _) => {},
+            XyTryResult::Unsat => panic!("PbEq (single σ_X=10, σ_Y=2) also UNSAT — bug is NOT in PbSetEq"),
+            XyTryResult::Pruned => panic!("PbEq pruned at GJ/lag pre-filter"),
+            XyTryResult::Timeout => panic!("PbEq timed out"),
+        }
+    }
+
+    /// The pipeline's XY path: build template, prepare_candidate_solver,
+    /// inject ONLY boundary (x_bits, y_bits) assumptions — leave the
+    /// middle positions for the SAT to find.  Regression test for the
+    /// n=18 open-search failure: 6863 XY SATs all returned UNSAT because
+    /// `add_pb_set_eq` has a soundness bug when combined with ≥12
+    /// `add_quad_pb_eq` constraints — see `pbeq_xy_boundary_only_finds_canonical_tt18`.
+    ///
+    /// Status: **ignored** pending PbSetEq fix in radical.
+    #[test]
+    #[ignore]
+    fn pbseteq_xy_boundary_only_finds_canonical_tt18() {
+        let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
+        let x = parse("++-+++++++++-+--++");
+        let y = parse("++----++-+---+-+-+");
+        let z = parse("++-+++----+-+-++--");
+        let w = parse("++----+--+--+++-+");
+        let n = 18usize;
+        let m = n - 1;
+        let k = 5usize;
+        let tuple = SumTuple { x: 10, y: 2, z: 0, w: 1 };
+        let pz = PackedSeq::from_values(&z);
+        let pw = PackedSeq::from_values(&w);
+        let mut zw = vec![0i32; n];
+        for s in 1..n {
+            let nz = pz.autocorrelation(s);
+            let nw = if s < m { pw.autocorrelation(s) } else { 0 };
+            zw[s] = 2 * nz + 2 * nw;
+        }
+        let candidate = CandidateZW { zw_autocorr: zw };
+        let template = SatXYTemplate::build(Problem::new(n), tuple, &radical::SolverConfig::default())
+            .expect("template should build");
+        let mut state = SolveXyPerCandidate::new(Problem::new(n), &candidate, &template, k)
+            .expect("SolveXyPerCandidate::new should succeed");
+
+        // Canonical (x_bits, y_bits) encoded from the canonical X/Y.
+        let mut x_bits = 0u32;
+        let mut y_bits = 0u32;
+        for i in 0..k {
+            if x[i] == 1 { x_bits |= 1 << i; }
+            if x[n - k + i] == 1 { x_bits |= 1 << (k + i); }
+            if y[i] == 1 { y_bits |= 1 << i; }
+            if y[n - k + i] == 1 { y_bits |= 1 << (k + i); }
+        }
+
+        // Run try_candidate — exactly what the pipeline does.
+        let result = state.try_candidate(x_bits, y_bits);
+        match result {
+            XyTryResult::Sat(found_x, found_y) => {
+                // Extract values and verify.
+                for i in 0..n {
+                    assert_eq!(found_x.get(i), x[i], "X[{}] mismatch", i);
+                    assert_eq!(found_y.get(i), y[i], "Y[{}] mismatch", i);
+                }
+            }
+            XyTryResult::Unsat => panic!(
+                "try_candidate returned UNSAT for canonical TT(18) (tuple=(10,2,0,1), canonical Z/W, canonical x_bits=0b{:b}, y_bits=0b{:b}). \
+                 This is the n=18 open-search bug.",
+                x_bits, y_bits,
+            ),
+            XyTryResult::Pruned => panic!("try_candidate pruned canonical TT(18) at GJ/lag pre-filter"),
+            XyTryResult::Timeout => panic!("try_candidate timed out on canonical TT(18)"),
+        }
     }
 
 }

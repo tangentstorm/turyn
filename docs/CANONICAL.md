@@ -128,6 +128,47 @@ on canonical-orbit data:
   the Apart (MDD-walker) path uses per-lag SAT constraints and
   recovers the canonical TT cleanly.
 
+### Known bugs
+
+**PbSetEq + quad_pb soundness bug (open).** At n=18, the open search
+reaches the XY stage 6863 times but every XY solve returns UNSAT.  The
+bug is reproduced by two ignored regression tests at the top of the
+`tests` module in `src/main.rs`:
+
+- `spectral_filters_accept_canonical_tt18` — passes: no spectral filter
+  rejects the canonical, SolveZ emits canonical Z first with blocking
+  clauses enumerating distinct middles.  Rules out filter bugs.
+- `pbseteq_xy_accepts_canonical_tt18` — passes: with *all* 36 X/Y
+  positions hardcoded, the XY template + PbSetEq + GJ + quad_pb is SAT.
+- `pbseteq_xy_boundary_only_finds_canonical_tt18` (ignored, fails):
+  same template, only 20 boundary X/Y positions hardcoded, middle left
+  for SAT to find — returns UNSAT.
+- `pbeq_xy_boundary_only_finds_canonical_tt18` (ignored, fails):
+  narrowing diagnostic.  Shows the bug isolates to **PbSetEq +
+  add_quad_pb_eq**: replacing `add_pb_set_eq([14])`/`([8])` with
+  `add_pb_eq(14)`/`add_pb_eq(8)` (same semantics) returns SAT.  The
+  bug requires ≥12 quad_pb constraints combined with ≥1 PbSetEq;
+  individual quad_pb lags in isolation are fine.  All 8 PbSetEq unit
+  tests pass.
+
+Suspected root cause: `Reason::PbSetEq` reason-clause generation over-
+approximates the set of assigned literals in a way that's consistent
+when consumed by other PbSetEq entries but inconsistent with how
+`Reason::QuadPb` reasons consume it during CDCL conflict analysis —
+learnt clauses become unsound and eventually derive an empty clause.
+
+Workarounds (pick one for correctness):
+1. Revert `norm_key` to *not* fold T1 (only fold T4 swap).  Each tuple
+   is fully signed, each PbEq target is single-valued, never triggers
+   PbSetEq.  Cost: 2^(number of non-zero σ components) ≈ 4–8× more
+   tuples per boundary at n=18.
+2. Special-case `add_pb_set_eq` to delegate to `add_pb_eq` when
+   `|V| == 1`.  Partial fix (the diagnostic shows the bug with `|V|==1`
+   too via `add_pb_set_eq([14])`, so this alone doesn't help).
+3. Fix radical's `Reason::PbSetEq` analyze/minimize to produce reasons
+   consistent with QuadPb's (probably needs to include the same
+   trail-position filtering semantics QuadPb uses).
+
 ### Follow-up work
 
 All six rules are wired into the XY SAT / full SAT / Z-middle SAT /
