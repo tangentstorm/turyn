@@ -2817,12 +2817,13 @@ fn run_mdd_sat_search(
         // A small cap lets workers move on to fresh (z_boundary, W) pairs
         // faster, which matters more than exhaustively enumerating Z for
         // one pair.
-        // Enumerate a small number of Z middles per (Z boundary, W middle)
-        // to tolerate the SAT's decision ordering (PbSetEq's multi-target
-        // structure sometimes picks a non-canonical Z first, whose pair
-        // check fails).  Previously hardcoded to 1 because the PbEq-based
-        // SAT happened to pick the canonical first by luck of ordering.
-        max_z: cfg.max_z.min(8),
+        // The cap is 1 by default; PbSetEq-based SolveZ can shuffle the
+        // decision ordering relative to PbEq and produce a non-pair-
+        // passing Z first (the in-SAT and external spectral filters are
+        // intentionally on different frequency grids).  If open n=18
+        // search stops finding after PbSetEq changes, the user can bump
+        // `--max-z` to enumerate more Zs per (Z boundary, W middle).
+        max_z: cfg.max_z.min(1),
         individual_bound: problem.spectral_bound(),
         pair_bound: cfg.max_spectral.unwrap_or(problem.spectral_bound()),
         theta: cfg.theta_samples,
