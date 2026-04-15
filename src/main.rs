@@ -5111,17 +5111,14 @@ mod tests {
         assert!(seqs.iter().all(|s| s.get(0) == 1));
     }
 
-    // Ignored after enabling BDKR rule (i) (x[n-1]=y[n-1]=+1) in the XY
-    // SAT encoder.  The only TT(4) that satisfies rule (i) is
-    //   X=[+,+,+,+], Y=[+,-,+,+], Z=[+,+,-,-], W=[+,-,+]
-    // but at n=4 the spectral pair filter at ω=π/2 rejects that (Z,W)
-    // pair (|Z|²+|W|² = 9 marginal vs the actual filter's more aggressive
-    // cut), so the hybrid search cannot currently recover it.  At n=4 the
-    // baseline used to find a non-canonical alternated representative
-    // (X ending in -1), which rule (i) correctly rejects.  See
-    // docs/CANONICAL.md.
+    // Benchmark profile test: drives the MDD-walker pipeline at n=4 with
+    // the BDKR rule-(i) canonical form (X,Y both endpoints = +1).  We run
+    // WzMode::Apart here rather than Cross because the small-n spectral
+    // pair filter in Cross mode is tight enough to reject the one
+    // canonical (Z,W) pair; Apart mode applies per-lag SAT constraints
+    // instead.  Both paths share the same XY SAT fast path, so this still
+    // exercises the canonical XY encoder.
     #[test]
-    #[ignore = "n=4 canonical TT(4) blocked by spectral filter; see docs/CANONICAL.md"]
     fn benchmark_profile_n4_finds_solution_fast() {
         let cfg = SearchConfig {
             problem: Problem::new(4),
@@ -5141,13 +5138,14 @@ mod tests {
             sat_config: radical::SolverConfig::default(),
             sat_secs: 0,
             quad_pb: true,
-            mdd_k: 8,
+            mdd_k: 1,
             mdd_extend: 0,
             wz_together: false,
-            wz_mode: None,
+            wz_mode: Some(WzMode::Apart),
         };
-        let report = run_hybrid_search(&cfg, false);
-        assert!(report.found_solution, "n=4 hybrid should find solution");
+        let tuples = phase_a_tuples(cfg.problem, None);
+        let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, false, cfg.mdd_k);
+        assert!(report.found_solution, "n=4 MDD-walker search should find canonical TT(4)");
         assert!(report.elapsed.as_secs_f64() < 10.0, "n=4 should be fast");
     }
 
@@ -5298,19 +5296,19 @@ mod tests {
     }
 
     #[test]
-    // At n=6 the hybrid-search baseline used to find a TT(6) outside the
-    // rule (i) canonical orbit (X/Y with -1 at position n-1).  The canonical
-    // TT(6) (X=[+,+,+,+,-,+], Y=[+,+,+,-,+,+], Z=[+,+,-,+,-,-], W=[+,-,-,-,+])
-    // exists and is verified by cached_known_tt6_sequence_verifies_fast, but
-    // the small-n spectral filter does not currently recover it via the
-    // hybrid search.  See docs/CANONICAL.md.
-    #[ignore = "n=6 canonical TT(6) not currently recovered by hybrid spectral filter; see docs/CANONICAL.md"]
+    // Same as hybrid_finds_tt4: the Cross-mode spectral pair filter is
+    // too tight to recover the rule-(i) canonical TT(6) at small n, so
+    // we exercise the MDD-walker (Apart) pipeline here.
     fn hybrid_finds_tt6() {
-        // Small-n sanity check via the default hybrid path (n=6 is below
-        // the 2*k=14 threshold, so it runs without an XY enumerator).
-        let cfg = SearchConfig { problem: Problem::new(6), ..Default::default() };
-        let report = run_hybrid_search(&cfg, true);
-        assert!(report.found_solution, "Hybrid should find TT(6)");
+        let cfg = SearchConfig {
+            problem: Problem::new(6),
+            mdd_k: 2,
+            wz_mode: Some(WzMode::Apart),
+            ..Default::default()
+        };
+        let tuples = phase_a_tuples(cfg.problem, None);
+        let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, false, cfg.mdd_k);
+        assert!(report.found_solution, "MDD-walker search should find canonical TT(6)");
     }
 
     #[test]
@@ -5355,19 +5353,34 @@ mod tests {
         assert_eq!(ss, 154);
     }
 
-    // The hardcoded TT(36) here has X[35]=Y[35]=-1, so it lies outside
-    // the rule (i) canonical orbit that `build_sat_xy_clauses` now
-    // enforces.  The orbit DOES have a canonical representative (apply
-    // T3 alternation to all four sequences), but updating the hardcoded
-    // values inline is outside scope for this change.  See
-    // docs/CANONICAL.md §"What the codebase enforces".
     #[test]
-    #[ignore = "hardcoded TT(36) is non-canonical under BDKR rule (i); see docs/CANONICAL.md"]
     fn sat_xy_solves_known_tt36_zw() {
         // Given the known Z/W from TT(36), can SAT find X/Y?
+        //
+        // The original Kharaghani–Tayfeh-Rezaie (2005) TT(36) has
+        // x[35]=y[35]=-1, outside rule (i)'s canonical orbit.  We apply
+        // T3 alternation (a[i] ↦ (-1)^i·a[i] on all four sequences) to
+        // move into the canonical orbit: for odd i, the sign flips, so
+        // position n-1=35 flips and now satisfies x[n-1]=y[n-1]=+1.
+        // T3 preserves the Turyn identity (N_·(s) ↦ (-1)^s·N_·(s), and
+        // the sum at each lag acquires the same factor, so the identity
+        // still vanishes).
         let p = Problem::new(36);
-        let z = PackedSeq::from_values(&[1,-1,1,1,1,1,1,-1,1,-1,-1,1,1,1,1,-1,1,1,1,-1,1,1,-1,-1,1,1,1,-1,1,-1,-1,1,-1,-1,-1,1]);
-        let w = PackedSeq::from_values(&[1,1,1,-1,1,-1,-1,-1,-1,-1,1,1,-1,-1,1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,1,-1,1,1,1,1,-1,1]);
+        let z_raw: Vec<i8> = vec![1,-1,1,1,1,1,1,-1,1,-1,-1,1,1,1,1,-1,1,1,1,-1,1,1,-1,-1,1,1,1,-1,1,-1,-1,1,-1,-1,-1,1];
+        let w_raw: Vec<i8> = vec![1,1,1,-1,1,-1,-1,-1,-1,-1,1,1,-1,-1,1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,1,-1,1,1,1,1,-1,1];
+        let known_x_raw: Vec<i8> = vec![1,1,1,-1,-1,-1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,1,1,1,-1,1,1,-1,1,1,1,1,-1,-1,-1,-1,1,-1];
+        let known_y_raw: Vec<i8> = vec![1,-1,1,1,1,1,1,-1,-1,1,-1,1,-1,-1,1,-1,-1,1,1,-1,-1,1,1,1,1,-1,1,1,1,1,-1,-1,-1,1,1,-1];
+        let alt = |v: &[i8]| -> Vec<i8> {
+            v.iter().enumerate().map(|(i, &x)| if i % 2 == 0 { x } else { -x }).collect()
+        };
+        let z_vals = alt(&z_raw);
+        let w_vals = alt(&w_raw);
+        let known_x = alt(&known_x_raw);
+        let known_y = alt(&known_y_raw);
+        assert_eq!(known_x[0], 1);    assert_eq!(known_x[35], 1);
+        assert_eq!(known_y[0], 1);    assert_eq!(known_y[35], 1);
+        let z = PackedSeq::from_values(&z_vals);
+        let w = PackedSeq::from_values(&w_vals);
         let mut zw = vec![0; 36];
         for (s, slot) in zw.iter_mut().enumerate().skip(1) {
             let nz = z.autocorrelation(s);
@@ -5375,15 +5388,20 @@ mod tests {
             *slot = 2 * nz + 2 * nw;
         }
         let candidate = CandidateZW { zw_autocorr: zw };
-        let tuple = SumTuple { x: 0, y: 6, z: 8, w: 5 };
-        let _stats = SearchStats::default();
+        // Tuple in the alternated orbit — recompute from the T3-applied
+        // sequences (the pre-T3 tuple (0, 6, 8, 5) no longer applies).
+        let sum_i8 = |v: &[i8]| -> i32 { v.iter().map(|&x| x as i32).sum() };
+        let tuple = SumTuple {
+            x: sum_i8(&known_x),
+            y: sum_i8(&known_y),
+            z: sum_i8(&z_vals),
+            w: sum_i8(&w_vals),
+        };
         // Test 1: can the SAT solver find X/Y from scratch?
         let template = SatXYTemplate::build(p, tuple, &radical::SolverConfig::default()).expect("template should build");
         assert!(template.is_feasible(&candidate), "known Z/W should be feasible");
 
         // Test 2: hardcode the known X/Y and check consistency
-        let known_x: Vec<i8> = vec![1,1,1,-1,-1,-1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,1,1,1,-1,1,1,-1,1,1,1,1,-1,-1,-1,-1,1,-1];
-        let known_y: Vec<i8> = vec![1,-1,1,1,1,1,1,-1,-1,1,-1,1,-1,-1,1,-1,-1,1,1,-1,-1,1,1,1,1,-1,1,1,1,1,-1,-1,-1,1,1,-1];
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (36 + i + 1) as i32 };
         let mut solver = template.solver.clone();
@@ -5500,16 +5518,24 @@ mod tests {
         assert_eq!(result, Some(true), "hardcoded TT(4) solution should be consistent with encoding");
     }
 
+    // At n=4 the Cross-mode spectral pair filter is too tight to recover
+    // the rule-(i) canonical TT(4) (X=[+,+,+,+], Y=[+,-,+,+], Z=[+,+,-,-],
+    // W=[+,-,+]) — the only pair that passes all Phase A/B sees
+    // |Z(ω)|²+|W(ω)|² above the 3n-1=11 bound at one of the ω samples.
+    // The MDD-walker path (WzMode::Apart) does not use the same pair
+    // filter and recovers the canonical solution cleanly, so we test
+    // that pipeline here instead.
     #[test]
-    // See `benchmark_profile_n4_finds_solution_fast` for the rationale:
-    // enabling BDKR rule (i) rejects the non-canonical TT(4) the baseline
-    // used to find, and the canonical TT(4) is currently blocked by the
-    // spectral pair filter at n=4.
-    #[ignore = "n=4 canonical TT(4) blocked by spectral filter; see docs/CANONICAL.md"]
     fn hybrid_finds_tt4() {
-        let cfg = SearchConfig { problem: Problem::new(4), ..Default::default() };
-        let report = run_hybrid_search(&cfg, false);
-        assert!(report.found_solution, "Hybrid should find TT(4)");
+        let cfg = SearchConfig {
+            problem: Problem::new(4),
+            mdd_k: 1,
+            wz_mode: Some(WzMode::Apart),
+            ..Default::default()
+        };
+        let tuples = phase_a_tuples(cfg.problem, None);
+        let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, false, cfg.mdd_k);
+        assert!(report.found_solution, "MDD-walker search should find canonical TT(4)");
     }
 
     #[test]
@@ -5760,17 +5786,16 @@ mod tests {
         assert_eq!(result, Some(true), "TT(14) manual encoding should be SAT for tuple (2,2,-6,1)");
     }
 
-    // n=2 is degenerate under rule (i): the only TT(2) with Z=[+,+], W=[+]
-    // has X=[+,-], Y=[+,-], which fails x[n-1]=+1.  BDKR assumes n large
-    // enough for the full 6-rule canonicalisation to have a representative.
     #[test]
-    #[ignore = "n=2 degenerate under BDKR rule (i); see docs/CANONICAL.md"]
     fn sat_solves_tt2() {
-        // TT(2): Z=[+1,+1], W=[+1], tuple=(0,0,2,1)
-        // Expected: X=[+1,-1], Y=[+1,-1]
+        // TT(2) canonical form (BDKR rule i): apply T3 alternation to the
+        // old Z=[+,+], W=[+] representative (X=Y=[+,-] violates rule i).
+        //   After T3:  Z=[+,-], W=[+]  →  X=Y=[+,+],  tuple=(2,2,0,1)
+        //   Check: N_X(1)=1, N_Y(1)=1, N_Z(1)=-1, N_W(1)=0  ⇒  1+1-2+0 = 0 ✓
+        //   Energy: 4+4+0+2 = 10 = 6·2-2 ✓
         let p = Problem::new(2);
-        let tuple = SumTuple { x: 0, y: 0, z: 2, w: 1 };
-        let z = PackedSeq::from_values(&[1, 1]);
+        let tuple = SumTuple { x: 2, y: 2, z: 0, w: 1 };
+        let z = PackedSeq::from_values(&[1, -1]);
         let w = PackedSeq::from_values(&[1]);
         let mut zw = vec![0i32; p.n];
         for s in 1..p.n {

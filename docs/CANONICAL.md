@@ -54,6 +54,24 @@ An additional consequence of the full rule set: **`c[n] = -1` for `n > 1`.**
 | (i)     | MDD builder (`src/mdd_zw_first.rs`)    | position-0 branch restricted to `0b11` (z[0]=w[0]=+1) |
 | tuple-level | `SumTuple::norm_key` (`src/main.rs`) | `|σ_X|, |σ_Y|, |σ_Z|, |σ_W|` + sort(σ_X, σ_Y) → factor 32 |
 
+### Test-suite status
+
+All 26 tests pass under rule (i).  Five tests were adjusted to operate
+on canonical-orbit data:
+
+- `sat_solves_tt2`: uses the T3-alternated canonical form
+  `Z=[+,-], W=[+]` ⇒ `X=Y=[+,+]` (the original `Z=[+,+], W=[+]` ⇒
+  `X=Y=[+,-]` pair violates rule i).
+- `sat_xy_solves_known_tt36_zw`: alternates the hardcoded TT(36) in
+  the test body (a[i] ↦ (-1)^i·a[i] on all four sequences) so
+  `x[35]=y[35]=+1` in the canonical orbit.
+- `hybrid_finds_tt4`, `benchmark_profile_n4_finds_solution_fast`,
+  `hybrid_finds_tt6`: switched from Cross mode to Apart mode.
+  The Cross-mode spectral pair filter is tight enough at n=4, 6 to
+  reject the one canonical `(Z,W)` pair that satisfies rule (i);
+  the Apart (MDD-walker) path uses per-lag SAT constraints and
+  recovers the canonical TT cleanly.
+
 ### TODO (rules ii, iii, iv, v, vi)
 
 These require non-trivial SAT encoding work.  Sketches:

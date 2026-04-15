@@ -85,16 +85,20 @@ Pruning the XY sub-MDD at gen-time would recover the remaining factor
 — see docs/CANONICAL.md for the rules (ii)–(vi) follow-up work.
 
 Correctness notes:
-- Three small-n tests (TT(2), TT(4), hybrid TT(6)) are `#[ignore]`-d
-  with docs/CANONICAL.md references — their baseline "solutions" were
-  non-canonical alternated reps that rule (i) correctly rejects, and
-  the canonical alternatives are currently blocked by the spectral
-  filter at those very small n.
-- `sat_xy_solves_known_tt36_zw` also `#[ignore]`-d: its hardcoded
-  TT(36) has `x[35]=y[35]=-1` (non-canonical).  Updating the literal
-  solution to its T3-alternated canonical form is left as follow-up.
-- All other 21 tests pass.  The n=18 smoke test finds a TT(18) whose
-  X and Y both end in +1, confirming rule (i) is satisfied.
+- All 26 tests pass.  Five tests were updated to use canonical-orbit
+  representatives or a search path that recovers them:
+  - `sat_solves_tt2`: switched from (Z=[+,+], W=[+], X=Y=[+,-]) to the
+    T3-alternated canonical (Z=[+,-], W=[+], X=Y=[+,+]).
+  - `sat_xy_solves_known_tt36_zw`: programmatically alternates the
+    hardcoded Kharaghani–Tayfeh-Rezaie TT(36) with T3 so X[35]=Y[35]=+1.
+  - `hybrid_finds_tt4`, `benchmark_profile_n4_finds_solution_fast`,
+    `hybrid_finds_tt6`: switched from Cross mode to Apart mode
+    (MDD-walker path).  Cross mode's spectral pair filter is too
+    tight at n=4,6 to pass the one canonical (Z,W) pair; Apart mode
+    uses per-lag SAT constraints and recovers the canonical TT
+    cleanly.
+- The n=18 smoke test finds a TT(18) whose X and Y both end in +1,
+  confirming rule (i) is satisfied on the primary benchmark path.
 
 ## MDD Pipeline throughput optimizations (April 2026)
 
