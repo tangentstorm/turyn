@@ -338,6 +338,10 @@ pub struct SpectralTables {
 
 impl SpectralTables {
     /// Build once per (seq_len, k, num_freqs). Reuse across boundaries.
+    ///
+    /// Frequency grid: `ω_fi = (fi + 1) / (num_freqs + 1) · π` for
+    /// `fi ∈ 0..num_freqs`, i.e., `num_freqs` equally-spaced interior
+    /// samples of `(0, π)` excluding both endpoints.
     pub fn new(seq_len: usize, k: usize, num_freqs: usize) -> Self {
         let middle_len = seq_len - 2 * k;
         let mut cos_table = vec![0.0f32; middle_len * num_freqs];
@@ -2718,7 +2722,7 @@ impl Solver {
             if self.spectral.is_some() {
                 let v = var_of(lit);
                 let spec = self.spectral.as_mut().unwrap();
-                if v < spec.num_seq_vars {
+                if v < spec.num_seq_vars && !spec.assigned[v] {
                     let val: i8 = if lit > 0 { 1 } else { -1 };
                     spec.assign(v, val);
                     if spec.check_conflict().is_some() {

@@ -3512,9 +3512,40 @@ fn run_mdd_sat_search(
                                 w_solver.reset(); // backtrack before blocking clause
                                 w_solver.add_clause(w_block);
 
-                                let Some(w_spectrum) = spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) else {
-                                    flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                                    continue;
+                                let w_spectrum = match spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) {
+                                    Some(s) => s,
+                                    None => {
+                                        flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                                        if std::env::var("TRACE_SPEC").is_ok() && flow_w_spec_fail.load(AtomicOrdering::Relaxed) <= 3 {
+                                            // Direct re-compute both: in-SAT-style DFT on the full W
+                                            // and external FFT, report peak |W|² at aligned ω.
+                                            let mut external = vec![0.0; 129];
+                                            compute_spectrum_into(&w_vals, &spectral_w, &mut fft_buf_w, &mut external);
+                                            use std::f64::consts::PI;
+                                            let mut insat = vec![0.0; 129];
+                                            for fi in 0..129 {
+                                                let om = fi as f64 * PI / 128.0;
+                                                let mut re = 0.0; let mut im = 0.0;
+                                                for (pos, &wv) in w_vals.iter().enumerate() {
+                                                    re += wv as f64 * (om * pos as f64).cos();
+                                                    im += wv as f64 * (om * pos as f64).sin();
+                                                }
+                                                insat[fi] = re*re + im*im;
+                                            }
+                                            let max_ext = external.iter().cloned().fold(0.0, f64::max);
+                                            let max_ins = insat.iter().cloned().fold(0.0, f64::max);
+                                            let ext_violating: Vec<usize> = (0..129).filter(|&i| external[i] > ctx.individual_bound).collect();
+                                            eprintln!("[TRACE_SPEC] W failed: {} chars, max_ext={:.4}, max_insat={:.4}, bound={:.1}",
+                                                w_vals.iter().map(|&v| if v>0 {'+'} else {'-'}).collect::<String>(),
+                                                max_ext, max_ins, ctx.individual_bound);
+                                            eprintln!("  external violates at bins: {:?}", ext_violating);
+                                            for &fi in ext_violating.iter().take(3) {
+                                                eprintln!("  bin {fi} (ω={:.4}π): external={:.4}, in-SAT-style={:.4}",
+                                                    fi as f64 / 128.0, external[fi], insat[fi]);
+                                            }
+                                        }
+                                        continue;
+                                    }
                                 };
                                 flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
                                 w_found_any = true;
@@ -3932,17 +3963,14 @@ fn run_mdd_sat_search(
                             }
                             z_prep_z_bits = Some(sz.z_bits);
                         }
-                        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver, &ctx.z_tmpl, n, m, ctx.middle_n, &z_prep, &sz.w_vals);
-                        // Rule (iv) middle clauses — only needed when
-                        // the boundary left the rule DeferredToMiddle.
-                        if rule_iv_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
-                            let mut nv = (z_solver.num_vars() + 1) as i32;
-                            sat_z_middle::add_rule_iv_middle_clauses(
-                                &mut z_solver, n, k,
-                                |jf| (jf - k + 1) as i32,
-                                &mut nv,
-                            );
-                        }
+                        // Attach spectral BEFORE fill_z_solver_quad_pb so that
+                        // any level-0 middle-var assignments forced by quad_pb
+                        // propagation feed through the normal propagate path
+                        // (which calls spec.assign).  Setting spectral AFTER
+                        // fill was a long-standing bug: those level-0 assignments
+                        // bypassed spectral, leaving re/im incomplete and
+                        // causing the in-SAT check to pass Z's that the
+                        // external FFT pair filter correctly rejected.
                         if let Some(ref ztab) = ctx.z_spectral_tables {
                             // Build the SpectralConstraint manually, reusing
                             // the cached z_boundary DFT instead of recomputing
@@ -4002,6 +4030,46 @@ fn run_mdd_sat_search(
                             z_solver.spectral = Some(z_spec);
                         }
 
+                        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver, &ctx.z_tmpl, n, m, ctx.middle_n, &z_prep, &sz.w_vals);
+                        // Rule (iv) middle clauses — only needed when
+                        // the boundary left the rule DeferredToMiddle.
+                        if rule_iv_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
+                            let mut nv = (z_solver.num_vars() + 1) as i32;
+                            sat_z_middle::add_rule_iv_middle_clauses(
+                                &mut z_solver, n, k,
+                                |jf| (jf - k + 1) as i32,
+                                &mut nv,
+                            );
+                        }
+                        // Retroactively feed middle vars that fill_z_solver
+                        // forced at level 0 into the spectral constraint.
+                        // `add_quad_pb_eq` / `add_pb_atleast` inside fill
+                        // enqueue lits via their own propagators, bypassing
+                        // main propagate() — so spectral never saw them.
+                        // The `!spec.assigned[v]` guard in propagate's
+                        // spectral block prevents double-counting when these
+                        // same vars later pass through the main loop.
+                        // Need to split borrow: read assignments from solver,
+                        // then mutate spectral.
+                        if z_solver.spectral.is_some() {
+                            let nsv = z_solver.spectral.as_ref().unwrap().num_seq_vars;
+                            let mut pending: Vec<(usize, i8)> = Vec::new();
+                            for vi in 0..nsv {
+                                let lit = ctx.z_mid_vars[vi];
+                                if let Some(b) = z_solver.value(lit) {
+                                    let sp = z_solver.spectral.as_ref().unwrap();
+                                    if !sp.assigned[vi] {
+                                        pending.push((vi, if b { 1 } else { -1 }));
+                                    }
+                                }
+                            }
+                            if let Some(ref mut sp) = z_solver.spectral {
+                                for (vi, val) in pending {
+                                    sp.assign(vi, val);
+                                }
+                            }
+                        }
+
                         let w_seq = PackedSeq::from_values(&sz.w_vals);
 
                         // Snapshot Z-stage SAT search stats. Diff against
@@ -4028,6 +4096,12 @@ fn run_mdd_sat_search(
                             flow_z_solutions.fetch_add(1, AtomicOrdering::Relaxed);
 
                             let z_mid = extract_vals(&z_solver, |i| ctx.z_mid_vars[i], ctx.middle_n);
+
+                            // BEFORE reset: capture spectral state for diagnostics.
+                            let _spec_snap = if std::env::var("TRACE_SPEC").is_ok() {
+                                z_solver.spectral.as_ref().map(|sp| (sp.re.clone(), sp.im.clone(), sp.per_freq_bound.clone(), sp.values.clone(), sp.assigned.clone()))
+                            } else { None };
+
                             let mut z_vals = Vec::with_capacity(n);
                             z_vals.extend_from_slice(&z_boundary[..k]);
                             z_vals.extend_from_slice(&z_mid);
@@ -4057,6 +4131,49 @@ fn run_mdd_sat_search(
                                 if !spectral_pair_ok(&z_spectrum_buf, &sz.w_spectrum, ctx.pair_bound) {
                                     flow_z_pair_fail.fetch_add(1, AtomicOrdering::Relaxed);
                                     if trace_z { eprintln!("TRACE:   Z solution #{} FAILED pair check", z_count); }
+                                    if std::env::var("TRACE_SPEC").is_ok()
+                                        && flow_z_pair_fail.load(AtomicOrdering::Relaxed) <= 1
+                                    {
+                                        // In-SAT's spectral state just before the SAT returned
+                                        // `sat` for this Z.  Compare to external.
+                                        let (insat_re, insat_im, insat_pfb, insat_values, insat_assigned): (Vec<f64>, Vec<f64>, Vec<f64>, Vec<i8>, Vec<bool>) =
+                                            if let Some((ref re, ref im, ref pfb, ref vals, ref asgn)) = _spec_snap {
+                                                (re.clone(), im.clone(),
+                                                 pfb.clone().unwrap_or_default(),
+                                                 vals.clone(), asgn.clone())
+                                            } else { (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()) };
+                                        let insat_mid_str: String = insat_values.iter()
+                                            .map(|&v| if v == 1 { '+' } else if v == -1 { '-' } else { '0' })
+                                            .collect();
+                                        let insat_assigned_count = insat_assigned.iter().filter(|&&b| b).count();
+                                        eprintln!(
+                                            "  SpectralConstraint's internal middle: {:?} ({}/{} assigned)",
+                                            insat_mid_str, insat_assigned_count, insat_values.len()
+                                        );
+                                        eprintln!(
+                                            "  Actual extracted z_mid:               {:?}",
+                                            z_mid.iter().map(|&v| if v>0 {'+'} else {'-'}).collect::<String>()
+                                        );
+                                        let fail_bins: Vec<usize> = (0..z_spectrum_buf.len())
+                                            .filter(|&i| z_spectrum_buf[i] + sz.w_spectrum[i] > ctx.pair_bound)
+                                            .collect();
+                                        eprintln!("[TRACE_SPEC] Z pair fail: z_mid={} bound={}",
+                                            z_mid.iter().map(|&v| if v>0 {'+'} else {'-'}).collect::<String>(),
+                                            ctx.pair_bound);
+                                        for &fi in fail_bins.iter().take(3) {
+                                            let insat_zmag2 = if fi < insat_re.len() {
+                                                insat_re[fi]*insat_re[fi] + insat_im[fi]*insat_im[fi]
+                                            } else { f64::NAN };
+                                            let pfb_fi = if fi < insat_pfb.len() { insat_pfb[fi] } else { f64::NAN };
+                                            eprintln!(
+                                                "  bin {fi} (ω={:.4}π): ext |Z|²={:.4} + |W|²={:.4} = {:.4} > bound={}; \
+                                                 in-SAT |Z|²={:.4} vs pfb[{fi}]={:.4}  → should have triggered conflict",
+                                                fi as f64 / 128.0,
+                                                z_spectrum_buf[fi], sz.w_spectrum[fi],
+                                                z_spectrum_buf[fi] + sz.w_spectrum[fi], ctx.pair_bound,
+                                                insat_zmag2, pfb_fi);
+                                        }
+                                    }
                                     continue;
                                 }
                             }
