@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 /// Number of spectral frequencies for the SAT solver's built-in spectral constraint.
 /// Prime number, dense enough to make the post-hoc FFT check redundant.
-const SPECTRAL_FREQS: usize = 17;
+const SPECTRAL_FREQS: usize = 563;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -3338,6 +3338,8 @@ fn run_mdd_sat_search(
     let flow_wz_sat_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));         // number of solver.solve() calls
     let flow_wz_first_unsat = Arc::new(std::sync::atomic::AtomicU64::new(0));       // first solve returned UNSAT (no (W,Z) at all)
     let flow_wz_solutions = Arc::new(std::sync::atomic::AtomicU64::new(0));         // WZ pairs produced (total, across enum)
+    let flow_wz_exhausted = Arc::new(std::sync::atomic::AtomicU64::new(0));         // SolveWZ attempts that ran to SAT-UNSAT (not budget-hit)
+    let flow_wz_budget_hit = Arc::new(std::sync::atomic::AtomicU64::new(0));        // SolveWZ attempts whose solve() returned None (conflict-limit)
     // Per-stage enter/exit counters: depth = enter - exit.
     let stage_enter: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let stage_exit: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
@@ -3392,6 +3394,8 @@ fn run_mdd_sat_search(
         let flow_wz_sat_calls = Arc::clone(&flow_wz_sat_calls);
         let flow_wz_first_unsat = Arc::clone(&flow_wz_first_unsat);
         let flow_wz_solutions = Arc::clone(&flow_wz_solutions);
+        let flow_wz_exhausted = Arc::clone(&flow_wz_exhausted);
+        let flow_wz_budget_hit = Arc::clone(&flow_wz_budget_hit);
         let stage_enter: Vec<_> = stage_enter.iter().map(Arc::clone).collect();
         let stage_exit: Vec<_> = stage_exit.iter().map(Arc::clone).collect();
         let sat_config = sat_config.clone();
@@ -4037,7 +4041,13 @@ fn run_mdd_sat_search(
                         // first-attempt SolveWZ), so the MDD is covered
                         // once before we retry hard boundaries.
                         let mut wz_count = 0usize;
-                        let conflict_budget: u64 = (20u64 << swz.attempt.min(4)).min(200);
+                        // Per-attempt conflict budget doubles each retry so
+                        // hard boundaries eventually get enough SAT effort to
+                        // reach a decisive result (UNSAT or SAT).  Cap at 1M
+                        // per attempt to bound memory; re-queue beyond that
+                        // still happens (see below) so we defer but never
+                        // cancel.
+                        let conflict_budget: u64 = (5_000u64 << swz.attempt.min(7)).min(1_000_000);
                         solver.set_conflict_limit(conflict_budget);
                         // Tracks whether the enumeration was cut off with
                         // more WZ solutions possibly remaining (None from
@@ -4069,6 +4079,7 @@ fn run_mdd_sat_search(
                             if sat_res == None {
                                 // Conflict limit hit — more solutions may exist.
                                 more_possible = true;
+                                flow_wz_budget_hit.fetch_add(1, AtomicOrdering::Relaxed);
                                 if wz_count == 0 {
                                     flow_wz_first_unsat.fetch_add(1, AtomicOrdering::Relaxed);
                                 }
@@ -4077,6 +4088,7 @@ fn run_mdd_sat_search(
                             if sat_res == Some(false) {
                                 // Fully enumerated: every assignment has been
                                 // blocked.  No point re-queuing.
+                                flow_wz_exhausted.fetch_add(1, AtomicOrdering::Relaxed);
                                 if wz_count == 0 {
                                     flow_wz_first_unsat.fetch_add(1, AtomicOrdering::Relaxed);
                                 }
@@ -4229,21 +4241,30 @@ fn run_mdd_sat_search(
                         // Re-queue: if the enumeration was cut short (conflict
                         // limit hit, or max_z cap reached) and we haven't
                         // found a TT, push this item back with attempt+1 at
-                        // a lower priority.  Caps at MAX_WZ_ATTEMPTS so a
-                        // genuinely hard boundary eventually gives up.
-                        const MAX_WZ_ATTEMPTS: u32 = 5;
+                        // a lower priority.  NO CAP on attempts — we defer
+                        // hard boundaries to lower priority slots but never
+                        // abandon them.  The per-attempt budget doubles each
+                        // retry (see conflict_budget above) so every boundary
+                        // eventually gets enough effort for SAT/UNSAT.
                         if more_possible
                             && !ctx.found.load(AtomicOrdering::Relaxed)
-                            && swz.attempt + 1 < MAX_WZ_ATTEMPTS
                         {
-                            // Priority: (1.0 = fresh SolveWZ) −
-                            //   0.1·(attempt+1) so successive retries go to
-                            //   progressively deeper slots, but all retries
-                            //   stay above boundaries at stage 0 only if
-                            //   (attempt+1) < 10 — for attempt ≥ 9 they drop
-                            //   below boundaries.  Clamp to keep them just
-                            //   above 0 so retries still run.
-                            let priority = (1.0 - 0.1 * (swz.attempt + 1) as f64).max(0.05);
+                            // Priority: re-queued SolveWZ items must sit
+                            // BELOW stage 0 (fresh MDD boundaries, priority
+                            // 0.0) so fresh boundaries are always preferred
+                            // over retries.  Without this, re-queued items
+                            // at attempt=0's priority 0.9 starve the walker:
+                            // we'd cycle 18 boundaries forever instead of
+                            // covering the whole space.
+                            //
+                            // Each retry drops priority by 0.001 so retries
+                            // within themselves are FIFO by fewest attempts
+                            // (gentler retries get priority over harder
+                            // ones).  This implements "defer but never
+                            // cancel": we walk every fresh boundary first,
+                            // then work through retries in order of
+                            // accumulated budget.
+                            let priority = -0.001 * (swz.attempt + 1) as f64;
                             stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
                             wq.push_with_priority(
                                 PipelineWork::SolveWZ(SolveWZWork {
@@ -5202,6 +5223,8 @@ fn run_mdd_sat_search(
         let wz_calls = flow_wz_sat_calls.load(AtomicOrdering::Relaxed);
         let wz_first_unsat = flow_wz_first_unsat.load(AtomicOrdering::Relaxed);
         let wz_sols = flow_wz_solutions.load(AtomicOrdering::Relaxed);
+        let wz_exhausted = flow_wz_exhausted.load(AtomicOrdering::Relaxed);
+        let wz_budget = flow_wz_budget_hit.load(AtomicOrdering::Relaxed);
         if wz_empty + wz_rule + wz_calls > 0 {
             println!("\n  --- SolveWZ Flow (wz=together) ---");
             println!("    V_w or V_z empty (early skip): {}", wz_empty);
@@ -5209,6 +5232,8 @@ fn run_mdd_sat_search(
             println!("    solver.solve() calls:           {}", wz_calls);
             println!("      first-call UNSAT:             {} ({})", wz_first_unsat, pct(wz_first_unsat, wz_calls));
             println!("      WZ solutions produced:        {}", wz_sols);
+            println!("      attempts exhausted (UNSAT):   {} ({})", wz_exhausted, pct(wz_exhausted, wz_calls));
+            println!("      attempts budget-hit (defer):  {} ({})", wz_budget, pct(wz_budget, wz_calls));
             let wz_items = wz_empty + wz_rule + wz_first_unsat;
             if wz_items > 0 {
                 let reach_sat = wz_calls.saturating_sub(wz_sols);
