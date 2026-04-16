@@ -205,13 +205,27 @@ fn print_solution(label: &str, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &
 /// encoding used by `expand_boundary_bits`: bit `i` of the prefix/suffix
 /// word is position `i` of the corresponding k-length prefix/suffix,
 /// with LSB = leftmost position.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct OutfixSpec {
+    /// MDD-boundary Z bits (packed as in `expand_boundary_bits`): bits
+    /// 0..k-1 = prefix Z[0..k], bits k..2k-1 = suffix Z[n-k..n].
     z_bits: u32,
+    /// Same for W.
     w_bits: u32,
     /// Optional XY pinning (same encoding as z_bits/w_bits).  When set,
     /// the XY search is restricted to this single (x_bits, y_bits).
     xy_bits: Option<(u32, u32)>,
+    /// Middle-position pins for Z: `(middle_idx, value)` where
+    /// `middle_idx ∈ 0..middle_n` indexes `Z[k+middle_idx]` and `value`
+    /// is ±1.  Forces the corresponding SAT var in SolveWZ.
+    z_middle_pins: Vec<(usize, i8)>,
+    /// Same for W (indexing `W[k+middle_idx]` with `middle_idx ∈ 0..middle_m`).
+    w_middle_pins: Vec<(usize, i8)>,
+    /// Same for X (full sequence position `k+middle_idx`).  Used by the
+    /// XY SAT to pin middle bits via assumptions.
+    x_middle_pins: Vec<(usize, i8)>,
+    /// Same for Y.
+    y_middle_pins: Vec<(usize, i8)>,
 }
 
 /// Parse `--outfix=<prefHex>...<sufHex>`.  BDKR hex encoding: each hex
@@ -244,71 +258,149 @@ fn parse_outfix(s: &str, n: usize, k: usize) -> Result<OutfixSpec, String> {
     }
     let pref_hex = parts[0].trim_start_matches("0x");
     let suf_hex = parts[1].trim_start_matches("0x");
-    if pref_hex.len() != k {
-        return Err(format!("--outfix: prefix has {} hex digits, expected k={k}", pref_hex.len()));
+    // Minimum: k prefix digits (the MDD boundary).  Maximum: up to n
+    // (full sequence pinned).  Longer prefixes pin middle Z/W/X/Y
+    // positions via unit clauses added at SAT build time.
+    if pref_hex.len() < k {
+        return Err(format!("--outfix: prefix has {} hex digits, need at least k={k}", pref_hex.len()));
     }
-    if suf_hex.len() != k + 1 {
-        return Err(format!("--outfix: suffix has {} hex digits, expected k+1={}", suf_hex.len(), k + 1));
+    // Suffix minimum is k+1 (the MDD boundary + h_{n-1-k}); maximum is
+    // n-pref_len (so pref+suf don't overlap).
+    if suf_hex.len() < k + 1 {
+        return Err(format!("--outfix: suffix has {} hex digits, need at least k+1={}", suf_hex.len(), k + 1));
+    }
+    if pref_hex.len() + suf_hex.len() > n + 1 {
+        return Err(format!("--outfix: prefix ({}) + suffix ({}) hex digits exceed n+1={}",
+            pref_hex.len(), suf_hex.len(), n + 1));
     }
     fn hex_digit(c: char) -> Result<u32, String> {
         c.to_digit(16).ok_or_else(|| format!("--outfix: '{c}' is not a hex digit"))
     }
-    // BDKR: bit polarity 0=+1, 1=-1.  Internal expand_boundary_bits:
-    // bit 1 = +1.  So internal_bit = 1 - bdkr_bit = !bdkr_bit.
+    // BDKR: bit polarity 0=+1, 1=-1.  For boundary bits we use the
+    // packed u32 convention (`expand_boundary_bits`): internal bit 1 = +1.
     let set = |bits: &mut u32, pos: usize, bdkr_bit: u32| {
         if bdkr_bit == 0 {
             *bits |= 1 << pos;
         }
     };
+    // Convert BDKR polarity bit to ±1 value.
+    let polarity_val = |bdkr_bit: u32| -> i8 { if bdkr_bit == 0 { 1 } else { -1 } };
+
     let (mut x_bits, mut y_bits, mut z_bits, mut w_bits) = (0u32, 0u32, 0u32, 0u32);
-    // Prefix: h_0..h_{k-1}, all 4-bit.
+    let mut z_middle_pins: Vec<(usize, i8)> = Vec::new();
+    let mut w_middle_pins: Vec<(usize, i8)> = Vec::new();
+    let mut x_middle_pins: Vec<(usize, i8)> = Vec::new();
+    let mut y_middle_pins: Vec<(usize, i8)> = Vec::new();
+
+    // Prefix: h_0..h_{len_pref-1}.  For i < k, this is boundary (packed
+    // into x/y/z/w_bits).  For i >= k, this pins the middle position
+    // k + (i - k) = i for all four sequences.  Middle index is (i - k).
     for (i, c) in pref_hex.chars().enumerate() {
         let d = hex_digit(c)?;
-        set(&mut x_bits, i, (d >> 3) & 1);
-        set(&mut y_bits, i, (d >> 2) & 1);
-        set(&mut z_bits, i, (d >> 1) & 1);
-        set(&mut w_bits, i, d & 1);
-    }
-    // Suffix: k+1 digits covering positions n-1-k..n-1.
-    // - Digit 0 (h_{n-1-k}) is 4-bit.  We take ONLY its D bit (W[n-1-k]).
-    //   X/Y/Z values at position n-1-k are middle (not boundary).
-    //   Internal w_bits suffix starts at bit k (position 0 of the suffix).
-    // - Digits 1..k-1 (h_{n-k}..h_{n-2}) are 4-bit.  Full 4-sequence.
-    //   Internal suffix bit = k + i (where i is the digit index among 1..k).
-    //   X/Y/Z suffix starts at digit 1; internal suffix bit for digit (1+j) = k + j.
-    //   W suffix for digit (1+j) corresponds to internal w suffix bit k + (1+j-1) = k + j.
-    //   Hmm — but W suffix internal bit k corresponds to W[n-1-k] (digit 0); bit k+1 to W[n-k] (digit 1); etc.
-    //   So W suffix digit i (0..k) → internal w bit k + i.
-    // - Digit k (h_{n-1}) is 3-bit.  No W.  X/Y/Z at position n-1 → X/Y/Z suffix internal bit 2k-1.
-    let suf_chars: Vec<char> = suf_hex.chars().collect();
-    for (i, &c) in suf_chars.iter().enumerate() {
-        let d = hex_digit(c)?;
-        if i == 0 {
-            // h_{n-1-k}: only W's bit matters for the boundary.
-            if d > 0xf { return Err(format!("--outfix: suffix digit 0 '{c}' > f")); }
-            set(&mut w_bits, k, d & 1);
-        } else if i < k {
-            // h_{n-k+(i-1)} = h_{n-1-k+i}: 4-bit.  XYZ map to position (i-1) of the XYZ suffix.
-            // Internal bit: for XYZ, suffix bit (i-1), so absolute bit k + (i-1).
-            //               for W, suffix bit i, so absolute bit k + i.
-            if d > 0xf { return Err(format!("--outfix: suffix digit {i} '{c}' > f")); }
-            set(&mut x_bits, k + (i - 1), (d >> 3) & 1);
-            set(&mut y_bits, k + (i - 1), (d >> 2) & 1);
-            set(&mut z_bits, k + (i - 1), (d >> 1) & 1);
-            set(&mut w_bits, k + i, d & 1);
+        if d > 0xf { return Err(format!("--outfix: prefix digit {i} '{c}' > f")); }
+        if i < k {
+            set(&mut x_bits, i, (d >> 3) & 1);
+            set(&mut y_bits, i, (d >> 2) & 1);
+            set(&mut z_bits, i, (d >> 1) & 1);
+            set(&mut w_bits, i, d & 1);
         } else {
-            // i == k, last digit h_{n-1}: 3-bit, only A, B, C.
-            if d > 0x7 { return Err(format!("--outfix: last suffix digit '{c}' > 7 (must be 3-bit)")); }
-            set(&mut x_bits, k + (i - 1), (d >> 2) & 1);
-            set(&mut y_bits, k + (i - 1), (d >> 1) & 1);
-            set(&mut z_bits, k + (i - 1), d & 1);
+            let mid = i - k;
+            x_middle_pins.push((mid, polarity_val((d >> 3) & 1)));
+            y_middle_pins.push((mid, polarity_val((d >> 2) & 1)));
+            z_middle_pins.push((mid, polarity_val((d >> 1) & 1)));
+            w_middle_pins.push((mid, polarity_val(d & 1)));
         }
     }
-    // Silence unused-variable warnings when n is only used for validation.
-    let _ = n;
+
+    // Suffix: covers positions (n - suf_len)..n-1 for X/Y/Z and a
+    // W-shifted-by-one range for W.  See the function-level doc for the
+    // BDKR suffix alignment.
+    //
+    //   - Digit 0 of suffix (`h_{n-1-suf_len+1}` = position n - suf_len):
+    //     only W uses the D bit (W's suffix starts one position earlier
+    //     than X/Y/Z's, since len(W) = n-1 < len(X)=n).  Whether X/Y/Z
+    //     at this position is middle or boundary depends on suf_len:
+    //     if suf_len - 1 <= k, it's strictly middle; otherwise X/Y/Z's
+    //     A/B/C bits are ignored here (they're handled at the matching
+    //     position via pref or later suffix digits).
+    //   - Digits 1..suf_len-1: 4-bit, cover position n - suf_len + i
+    //     for X/Y/Z and W (shifted).
+    //   - Last digit: 3-bit, position n-1 for X/Y/Z only (no W).
+    //
+    // To keep things simple we honor the legacy convention: the first
+    // suffix digit pins W only, the middle digits pin all four, and the
+    // last digit pins XYZ only.  A suffix of exactly k+1 reproduces the
+    // boundary-only encoding; a longer suffix adds middle pins going
+    // inward (toward the center of the sequence).
+    let suf_chars: Vec<char> = suf_hex.chars().collect();
+    let suf_len = suf_chars.len();
+    for (i, &c) in suf_chars.iter().enumerate() {
+        let d = hex_digit(c)?;
+        // W's position for this suffix digit: positions m-suf_len..m-1
+        // where m = n-1.  Digit i ↔ W position (n - suf_len + i).  When
+        // the W-pos falls in the boundary range [m-k..m-1], write to
+        // w_bits; else pin the middle.
+        let w_pos_abs: Option<usize> = Some(n - suf_len + i);
+        // XYZ position for this suffix digit: positions n-suf_len+1..n-1
+        // (shifted by one because digit 0 of suffix has no XYZ).  For
+        // i == 0, XYZ is skipped.  For i > 0, digit i ↔ XYZ position
+        // (n - suf_len + i).
+        let xyz_pos_abs: Option<usize> = if i == 0 { None } else { Some(n - suf_len + i) };
+
+        if i == 0 {
+            // Only W at this digit.  Other 3 bits must be zero (A=B=C=0).
+            if (d >> 1) != 0 {
+                return Err(format!("--outfix: suffix digit 0 '{c}' has X/Y/Z bits set — must be 0..1 (only D bit / W used)"));
+            }
+        } else if i == suf_len - 1 {
+            // Last digit: 3-bit (no W).
+            if d > 0x7 { return Err(format!("--outfix: last suffix digit '{c}' > 7 (must be 3-bit)")); }
+        }
+
+        if let Some(wp) = w_pos_abs {
+            let m = n - 1;
+            // W boundary suffix occupies positions [m-k, m).  Internal
+            // bit: k + (wp - (m - k)) = wp - m + 2k.
+            if wp >= m - k && wp < m {
+                set(&mut w_bits, k + (wp - (m - k)), d & 1);
+            } else if wp < m - k {
+                // W middle position wp, which is index (wp - k) within
+                // the middle range [k, m-k).
+                if i != suf_len - 1 {  // last digit has no W anyway
+                    w_middle_pins.push((wp - k, polarity_val(d & 1)));
+                }
+            }
+            // wp == m is out of range (W has no position m).
+        }
+        if let Some(xp) = xyz_pos_abs {
+            // Last digit is 3-bit (no W, so A=bit 2, B=bit 1, C=bit 0).
+            // Other digits are 4-bit (A=bit 3, B=bit 2, C=bit 1, D=bit 0).
+            let is_last_3bit = i == suf_len - 1;
+            let (x_b, y_b, z_b) = if is_last_3bit {
+                ((d >> 2) & 1, (d >> 1) & 1, d & 1)
+            } else {
+                ((d >> 3) & 1, (d >> 2) & 1, (d >> 1) & 1)
+            };
+            if xp >= n - k && xp < n {
+                // Boundary suffix: internal bit = k + (xp - (n - k)) = xp - n + 2k.
+                set(&mut x_bits, k + (xp - (n - k)), x_b);
+                set(&mut y_bits, k + (xp - (n - k)), y_b);
+                set(&mut z_bits, k + (xp - (n - k)), z_b);
+            } else if xp >= k && xp < n - k {
+                // Middle.
+                let mid = xp - k;
+                x_middle_pins.push((mid, polarity_val(x_b)));
+                y_middle_pins.push((mid, polarity_val(y_b)));
+                z_middle_pins.push((mid, polarity_val(z_b)));
+            }
+        }
+    }
+
     Ok(OutfixSpec {
         z_bits, w_bits,
         xy_bits: Some((x_bits, y_bits)),
+        z_middle_pins, w_middle_pins,
+        x_middle_pins, y_middle_pins,
     })
 }
 
@@ -2916,6 +3008,14 @@ struct PhaseBContext {
     /// walk to this single (x_bits, y_bits).  `None` means enumerate
     /// the whole sub-MDD normally.
     outfix_xy: Option<(u32, u32)>,
+    /// Middle-position pins from `--outfix` (longer than k digits).
+    /// Each `(middle_idx, ±1)` forces the corresponding SAT var in
+    /// SolveWZ / SolveW / SolveZ / XY stages as a unit clause.  Empty
+    /// when the outfix only covers the boundary.
+    outfix_z_mid_pins: Vec<(usize, i8)>,
+    outfix_w_mid_pins: Vec<(usize, i8)>,
+    outfix_x_mid_pins: Vec<(usize, i8)>,
+    outfix_y_mid_pins: Vec<(usize, i8)>,
 }
 
 
@@ -3036,6 +3136,10 @@ fn run_mdd_sat_search(
         } else { None },
         found: Arc::new(AtomicBool::new(false)),
         outfix_xy: cfg.test_outfix.as_ref().and_then(|o| o.xy_bits),
+        outfix_z_mid_pins: cfg.test_outfix.as_ref().map(|o| o.z_middle_pins.clone()).unwrap_or_default(),
+        outfix_w_mid_pins: cfg.test_outfix.as_ref().map(|o| o.w_middle_pins.clone()).unwrap_or_default(),
+        outfix_x_mid_pins: cfg.test_outfix.as_ref().map(|o| o.x_middle_pins.clone()).unwrap_or_default(),
+        outfix_y_mid_pins: cfg.test_outfix.as_ref().map(|o| o.y_middle_pins.clone()).unwrap_or_default(),
     });
 
     let run_start = Instant::now();
@@ -3861,6 +3965,22 @@ fn run_mdd_sat_search(
                         // counters — each stage's "per-solve average" stays
                         // interpretable, at the cost of a small overcount in the
                         // grand total.
+                        // --outfix middle pins: force Z/W middle positions to
+                        // the canonical values via unit clauses.  Let the SAT
+                        // decide the remaining middle bits.
+                        for &(mid, val) in &ctx.outfix_z_mid_pins {
+                            if mid < ctx.middle_n {
+                                let lit = if val > 0 { z_var(mid) } else { -z_var(mid) };
+                                solver.add_clause([lit]);
+                            }
+                        }
+                        for &(mid, val) in &ctx.outfix_w_mid_pins {
+                            if mid < ctx.middle_m {
+                                let lit = if val > 0 { w_var(mid) } else { -w_var(mid) };
+                                solver.add_clause([lit]);
+                            }
+                        }
+
                         let wz_d0 = solver.num_decisions();
                         let wz_p0 = solver.num_propagations();
                         let wz_l0 = solver.num_level0_vars();
@@ -3923,12 +4043,18 @@ fn run_mdd_sat_search(
                             let w_seq = PackedSeq::from_values(&w_vals);
                             let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
 
-                            // SolveWZ currently carries a single tuple; lift it to a
-                            // 1-element list so we share the Vec-keyed cache with SolveZ.
-                            let tuple_key: Vec<(i32, i32, i32, i32)> = vec![(
-                                swz.tuple.x, swz.tuple.y, swz.tuple.z, swz.tuple.w)];
+                            // Multi-tuple XY template: the SolveWZ boundary is
+                            // compatible with *all* candidate_tuples.  Use
+                            // build_multi so the XY SAT's V_x/V_y cover every
+                            // compatible |σ_X|/|σ_Y| across those tuples, and
+                            // narrow post-hoc by the W+Z sums we just decoded
+                            // (via zw_autocorr → lag PB ranges) and by the
+                            // candidate magnitudes.
+                            let mut tuple_key: Vec<(i32, i32, i32, i32)> = swz.candidate_tuples.iter()
+                                .map(|t| (t.x, t.y, t.z, t.w)).collect();
+                            tuple_key.sort_unstable();
                             let template = template_cache.entry(tuple_key).or_insert_with(||
-                                SatXYTemplate::build(problem, swz.tuple, &sat_config).unwrap()
+                                SatXYTemplate::build_multi(problem, &swz.candidate_tuples, &sat_config).unwrap()
                             );
                             let candidate = CandidateZW { zw_autocorr };
                             if let Some(mut xy_solver) = template.prepare_candidate_solver(&candidate) {
@@ -3945,12 +4071,25 @@ fn run_mdd_sat_search(
                                         stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
                                         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
                                         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
-                                        let mut assumptions = Vec::with_capacity(4 * k);
+                                        let mut assumptions = Vec::with_capacity(4 * k + ctx.outfix_x_mid_pins.len() + ctx.outfix_y_mid_pins.len());
                                         for i in 0..k {
                                             assumptions.push(if (x_bits >> i) & 1 == 1 { x_var(i) } else { -x_var(i) });
                                             assumptions.push(if (x_bits >> (k + i)) & 1 == 1 { x_var(n - k + i) } else { -x_var(n - k + i) });
                                             assumptions.push(if (y_bits >> i) & 1 == 1 { y_var(i) } else { -y_var(i) });
                                             assumptions.push(if (y_bits >> (k + i)) & 1 == 1 { y_var(n - k + i) } else { -y_var(n - k + i) });
+                                        }
+                                        // --outfix middle pins for X/Y: force middle positions too.
+                                        for &(mid, val) in &ctx.outfix_x_mid_pins {
+                                            if mid < ctx.middle_n {
+                                                let lit = if val > 0 { x_var(k + mid) } else { -x_var(k + mid) };
+                                                assumptions.push(lit);
+                                            }
+                                        }
+                                        for &(mid, val) in &ctx.outfix_y_mid_pins {
+                                            if mid < ctx.middle_n {
+                                                let lit = if val > 0 { y_var(k + mid) } else { -y_var(k + mid) };
+                                                assumptions.push(lit);
+                                            }
                                         }
                                         // Snapshot search stats around the SAT call.
                                         let xy_d0 = xy_solver.num_decisions();
