@@ -79,5 +79,6 @@ TURYN_THREADS=8 target/release/turyn --n=56 --wz=apart --mdd-k=10 --sat-secs=30
 
 - `docs/OPTIMIZATION_LOG.md`: Measured before/after for every optimization
 - `docs/MDD-OPTIMIZATION-LOG.md`: MDD generation optimizations
+- `docs/CANONICAL.md`: Turyn symmetry group (T1..T4) and BDKR 2012 canonicalization rules (i..vi). Summarizes what the code currently enforces (rule i) and TODO encodings for rules (ii..vi).
 - `IDEAS.md`: Tried and untried optimization ideas with results
 - `toc-ideas.md`: Theory of Constraints analysis of the MDD pipeline
