@@ -1503,6 +1503,21 @@ struct LagPairs {
 /// works against the generic `SatSolver` trait (radical's native
 /// `add_xor` would be faster, but not every path has the concrete
 /// solver type).
+/// Encode `aux ↔ (a == b)` (XNOR / agree indicator).
+/// aux is true when a and b have the same value.
+fn encode_xnor_agree(solver: &mut impl SatSolver, aux: i32, a: i32, b: i32) {
+    // aux ↔ ¬(a XOR b) = aux ↔ (a == b)
+    solver.add_clause([-aux, -a, -b]); // aux → (a ∧ b) ∨ (¬a ∧ ¬b) [part 1: ¬aux ∨ ¬a ∨ ¬b would be wrong]
+    // Actually: aux true ↔ (a=b). Clauses:
+    // aux → (a → b): -aux ∨ -a ∨ b
+    // aux → (b → a): -aux ∨ a ∨ -b
+    // ¬aux → (a XOR b): aux ∨ -a ∨ -b  AND  aux ∨ a ∨ b
+    solver.add_clause([-aux, -a,  b]);
+    solver.add_clause([-aux,  a, -b]);
+    solver.add_clause([ aux, -a, -b]);
+    solver.add_clause([ aux,  a,  b]);
+}
+
 fn encode_xor_def(solver: &mut impl SatSolver, d: i32, a: i32, b: i32) {
     solver.add_clause([-d,  a,  b]);
     solver.add_clause([-d, -a, -b]);
@@ -3666,6 +3681,71 @@ fn run_mdd_sat_search(
                                 |pf| w_var(pf - k),
                                 &mut nv_combined,
                             );
+                        }
+
+                        // Combined per-lag autocorrelation: for each lag s,
+                        //   N_Z(s) + N_W(s) ∈ [-(n-s), n-s]  (Turyn identity coupling)
+                        // Encoded as PB-range on the UNION of W and Z agree lits
+                        // (bnd×mid + mid×mid XNOR aux for both sequences).
+                        {
+                            let mut next_aux = (solver.num_vars() + 1) as i32;
+                            for s in 1..n {
+                                let max_nzw = (n - s) as i32;
+                                let nw_pairs = if s < m { (m - s) as i32 } else { 0 };
+                                let nz_pairs = (n - s) as i32;
+                                let total_pairs = nw_pairs + nz_pairs;
+                                let combined_lo = ((total_pairs - max_nzw) / 2).max(0) as u32;
+                                let combined_hi = ((total_pairs + max_nzw) / 2).min(total_pairs) as u32;
+
+                                let mut agree_const = 0u32;
+                                let mut agree_lits: Vec<i32> = Vec::new();
+                                // W pairs
+                                if s < m {
+                                    let w_lag = &ctx.w_tmpl.lags[s - 1];
+                                    for &(i, j) in &w_lag.bnd_bnd {
+                                        if w_boundary[i] == w_boundary[j] { agree_const += 1; }
+                                    }
+                                    for &(bnd_pos, mid_idx) in &w_lag.bnd_mid {
+                                        if w_boundary[bnd_pos] == 1 { agree_lits.push(w_var(mid_idx)); }
+                                        else { agree_lits.push(-w_var(mid_idx)); }
+                                    }
+                                    for &(i, j) in &w_lag.mid_mid {
+                                        let aux = next_aux; next_aux += 1;
+                                        encode_xnor_agree(&mut solver, aux, w_var(i), w_var(j));
+                                        agree_lits.push(aux);
+                                    }
+                                }
+                                // Z pairs
+                                if s < n {
+                                    let z_lag = &ctx.z_tmpl.lags[s - 1];
+                                    for &(i, j) in &z_lag.bnd_bnd {
+                                        if z_boundary[i] == z_boundary[j] { agree_const += 1; }
+                                    }
+                                    for &(bnd_pos, mid_idx) in &z_lag.bnd_mid {
+                                        if z_boundary[bnd_pos] == 1 { agree_lits.push(z_var(mid_idx)); }
+                                        else { agree_lits.push(-z_var(mid_idx)); }
+                                    }
+                                    for &(i, j) in &z_lag.mid_mid {
+                                        let aux = next_aux; next_aux += 1;
+                                        encode_xnor_agree(&mut solver, aux, z_var(i), z_var(j));
+                                        agree_lits.push(aux);
+                                    }
+                                }
+
+                                let adj_lo = combined_lo.saturating_sub(agree_const);
+                                let adj_hi = combined_hi.saturating_sub(agree_const);
+                                let n_lits = agree_lits.len() as u32;
+                                if adj_lo > n_lits { solver.add_clause(std::iter::empty::<i32>()); break; }
+                                if adj_lo == 0 && adj_hi >= n_lits { continue; }
+                                let ones: Vec<u32> = vec![1; agree_lits.len()];
+                                if adj_lo > 0 {
+                                    solver.add_pb_atleast(&agree_lits, &ones, adj_lo);
+                                }
+                                if adj_hi < n_lits {
+                                    let neg: Vec<i32> = agree_lits.iter().map(|&l| -l).collect();
+                                    solver.add_pb_atleast(&neg, &ones, n_lits - adj_hi);
+                                }
+                            }
                         }
 
                         // Combined WZ spectral: 2|W(ω)|² + 2|Z(ω)|² ≤ pair_bound.
