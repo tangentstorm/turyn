@@ -859,11 +859,11 @@ wall-clock to find solution (currently ~29s).
   93× speedup. Moved to `docs/OPTIMIZATION_LOG.md`. Budget lowered
   from 5k/50k to 20/200.
 
-- **F7: Drop attempt re-queue entirely**: The re-queue mechanism
-  (commit ce47c9d) keeps re-pushing the same boundary up to 5 times,
-  monopolising a worker on hard cases. Together with F6 this might
-  recover wz=apart-style "fast fail and move on" behaviour.
-  Single commit: cap MAX_WZ_ATTEMPTS = 1, don't re-queue.
+- **F7: Drop attempt re-queue entirely** — TRIED, rejected. With
+  MAX_WZ_ATTEMPTS = 1 (no re-queue), n=26 bnd/s jumps to 3320 but n=20
+  finding rate drops from 5/5 to 1/5. The re-queue provides diversity
+  (different random phases on each attempt) that's essential when the
+  conflict budget (after F6) is only 20. Reverted.
 
 - **F8: Coalesce small per-lag constraints into one**: For very-small
   lags (s near n) the constraint has 0 or 1 terms — trivial. For very
