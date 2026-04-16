@@ -769,3 +769,28 @@ The CDCL search learns from conflicts across boundaries (clause transfer).
 - When all MDD paths dead → conflict with explanation from assigned boundary vars
 - This is the right approach: combines the 10x solution-finding speedup with
   the scalability of native constraint propagation.
+
+## SolveWZ enumeration ideas (not yet tried)
+
+- **Hand off timed-out SAT state to `--stochastic` worker**: When SolveWZ's
+  `solver.solve()` returns `None` (conflict limit hit), the solver has a
+  partial assignment representing its last exploration frontier. We could
+  extract the learnt clauses + current trail as a seed for a stochastic
+  local-search worker (e.g. one of the `TURYN_THREADS` workers running a
+  completely different algorithm on the same boundary).  The stochastic
+  worker operates on full ±1 sequences, so it'd need a bridge: read the
+  partial assignment → fill unassigned middle positions with random ±1 →
+  run WalkSAT-style local search.
+- **Seed blind SAT with `--stochastic` output**: Before `--wz=together`
+  starts, run `--stochastic` for a short budget (say 10s) to collect a
+  handful of candidate (W, Z) pairs at the canonical boundary.  Feed
+  those as blocking-clause seeds or initial-phase hints to each SolveWZ
+  SAT — the solver's first few decisions would then align with the
+  stochastic's best guess, dramatically improving hit rate on the
+  canonical pair.  Downside: `--stochastic` has no concept of the MDD
+  boundary, so we'd need to filter its output by boundary bits.
+- **Branch heuristic bias**: instead of random phases on every retry,
+  initialise the phase vector to match the "all +1" canonical prefix
+  (BDKR rule i pins x[0]=y[0]=z[0]=w[0]=+1, and similar tail pins).
+  The SAT would then explore canonical-biased region first, possibly
+  finding canonical TT in the first solve.
