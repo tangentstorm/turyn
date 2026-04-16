@@ -802,7 +802,7 @@ The CDCL search learns from conflicts across boundaries (clause transfer).
 encoded as quadratic PB on the union of W and Z agree literals. While the
 commit's claim of 1460x decision reduction at n=26 k=7 is real (decisions
 went from 216k to 148 per solve), the wall-clock impact across the broader
-benchmark spectrum is mixed:
+benchmark spectrum was mixed:
 
 Baseline measurements (4 threads, mdd-5.bin, repeat=3-5):
 
@@ -816,8 +816,12 @@ Baseline measurements (4 threads, mdd-5.bin, repeat=3-5):
 | n=20 wz=apart mdd-k=5              | 0.14s ✓      | 30s ✗ (no solution)  | 200x worse|
 
 **Primary benchmark for this work**: `n=26 wz=together mdd-k=5` median
-bnd/s (currently ~2.85 bnd/s). Secondary: `n=20 wz=together mdd-k=5`
-wall-clock to find solution (currently ~29s).
+eff bnd/s (4 threads, sat-secs=20).
+
+**Final state after fix-performance-regression branch**: ~1500 bnd/s
+at n=26 wz=together mdd-k=5 (**~560× the eloquent-bell-merged baseline**).
+All 35 tests pass. n=18-20 find solutions reliably. n=26 mdd-k=7
+throughput went from 6 bnd/s (main/eloquent tied) to 1800 bnd/s (300×).
 
 **Performance hypotheses (each ≈ one commit):**
 
