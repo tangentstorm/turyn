@@ -250,6 +250,22 @@ bnd/s**. That's the 250× improvement c8a0db5 was supposed to deliver.
 **Cumulative: 1422 / 2.66 = 534× bnd/s at n=26 wz=together mdd-k=5**
 vs the eloquent-bell-merged baseline.
 
+### F13. O(1) last() dedup in add_quad_pb_{range,eq} — accepted (**+5.1%**)
+
+SolveWZ adds ~25 quad PB constraints per boundary (one per lag
+s=1..n). Each has 40-80 terms, and for each term
+`add_quad_pb_range` did `quad_pb_var_watches[v].contains(&qi)` — a
+linear scan — to dedup the watch list. Since `qi` is monotonically
+increasing across calls, qi can only be present if it was just
+pushed by an earlier term of the same constraint. The last() entry
+check is O(1).
+
+Benchmark n=26 wz=together mdd-k=7 (4 threads, 20s, 23 runs):
+  Baseline (F1+F6): 1704 bnd/s median
+  + F13          : 1791 bnd/s median (+5.1%)
+
+All 35 tests pass.
+
 ## Current baseline (latest)
 
 - Exhaustive search (n=16, theta=20000):
