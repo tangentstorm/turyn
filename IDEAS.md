@@ -892,9 +892,12 @@ wall-clock to find solution (currently ~29s).
   (after building the term lists).
   Single commit: move the trivial-satisfaction check earlier.
 
-- **F11: Remove rules (iv)/(v) middle clauses for small n**: At n ≤ 22
-  these may add overhead without filtering enough. Gate on `n >= 24`.
-  Single commit: conditional rule (iv)/(v) addition.
+- **F11: Remove rules (iv)/(v) middle clauses for small n** — TRIED,
+  rejected. Skipping rule iv/v middle clauses at n=26 k=7 gives 1778 bnd/s
+  (vs 1791 baseline, within noise) and helps n=20 finding time (1-11s vs
+  9-20s) but n=22 finding rate unchanged at 2/10. Canonical clauses add
+  little cost so no measurable bnd/s gain. Not worth the canonical-form
+  semantic change. Reverted.
 
 - **F12: Re-use combined SolveWZ solver via checkpoint/restore**: The
   per-lag constraints, rules, and spectral tables don't depend on
