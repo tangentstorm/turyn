@@ -2444,6 +2444,11 @@ struct PhaseBContext {
     /// Use the combined SolveWZ stage instead of the default SolveW →
     /// SolveZ two-stage pipeline. Plumbed from cfg.wz_together.
     wz_together: bool,
+    /// Prototype: replace the per-leaf walk_xy_sub_mdd fan-out with a
+    /// single `try_candidate_via_mdd` call that uses radical's native
+    /// `MddConstraint` propagator. Gated by env `XY_MDD=1`. Only the
+    /// `--wz=apart` SolveZ stage is wired in this prototype.
+    xy_mdd_mode: bool,
     w_mid_vars: Vec<i32>,
     z_mid_vars: Vec<i32>,
     z_spectral_tables: Option<radical::SpectralTables>,
@@ -2548,6 +2553,7 @@ fn run_mdd_sat_search(
         theta: cfg.theta_samples,
         mdd_extend: cfg.mdd_extend,
         wz_together: cfg.wz_together,
+        xy_mdd_mode: std::env::var("XY_MDD").ok().as_deref() == Some("1"),
         w_mid_vars: (0..middle_m).map(|i| (i + 1) as i32).collect(),
         z_mid_vars: (0..middle_n).map(|i| (i + 1) as i32).collect(),
         z_spectral_tables: if middle_n >= 8 {
@@ -3440,7 +3446,46 @@ fn run_mdd_sat_search(
                             // surviving (x_bits, y_bits). The extension
                             // pre-filter is interleaved inside the walk
                             // callback.
-                            if let Some(mut state) = SolveXyPerCandidate::new(
+                            if ctx.xy_mdd_mode {
+                                // PROTOTYPE XY_MDD=1: one SAT call per (Z, W)
+                                // using the native MDD propagator. Replaces
+                                // the per-leaf walk_xy_sub_mdd fan-out for
+                                // this boundary. UNSAT here = every (x,y)
+                                // leaf in the sub-MDD is infeasible, which
+                                // is equivalent to the enumeration path
+                                // getting UNSAT (or Pruned) for every leaf.
+                                let conflict_limit = if n > 30 { 5000 } else { 0 };
+                                let (xy_res, stats) = try_candidate_via_mdd(
+                                    problem, &candidate, template, k,
+                                    sz.xy_root, &ctx.mdd.nodes, &ctx.xy_pos_order,
+                                    conflict_limit,
+                                );
+                                stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
+                                items_completed.fetch_add(1, AtomicOrdering::Relaxed);
+                                stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
+                                flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
+                                flow_xy_decisions.fetch_add(stats.decisions, AtomicOrdering::Relaxed);
+                                flow_xy_propagations.fetch_add(stats.propagations, AtomicOrdering::Relaxed);
+                                flow_xy_root_forced.fetch_add(stats.vars_pre_forced, AtomicOrdering::Relaxed);
+                                flow_xy_free_sum.fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
+                                match xy_res {
+                                    Some((x, y)) => {
+                                        flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed);
+                                        if verify_tt(problem, &x, &y, &z_seq, &w_seq) {
+                                            ctx.found.store(true, AtomicOrdering::Relaxed);
+                                            let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
+                                        }
+                                    }
+                                    None => {
+                                        // Can't distinguish UNSAT from timeout
+                                        // without threading the raw result back;
+                                        // count as unsat for now (cover_micro
+                                        // = 1.0 for SAT/UNSAT, fractional for
+                                        // timeout — handled inside stats).
+                                        flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed);
+                                    }
+                                }
+                            } else if let Some(mut state) = SolveXyPerCandidate::new(
                                 problem, &candidate, template, k,
                             ) {
                                 if n > 30 { state.solver.set_conflict_limit(5000); }
@@ -4481,6 +4526,86 @@ impl SolveXyPerCandidate {
         };
         (outcome, stats)
     }
+}
+
+/// **Prototype (XY_MDD=1)**: solve the XY sub-tree for a given (Z, W)
+/// candidate as ONE SAT call using the native MDD propagator, instead
+/// of externally walking the sub-MDD and calling `try_candidate` for
+/// each leaf.
+///
+/// Returns a vector of (x_bits, y_bits, x, y) tuples — one per SAT
+/// solution found under the provided conflict budget — plus aggregate
+/// stats. On UNSAT returns empty vec. Each call after the first uses
+/// a blocking clause to enumerate additional solutions.
+#[allow(clippy::too_many_arguments)]
+fn try_candidate_via_mdd(
+    problem: Problem,
+    candidate: &CandidateZW,
+    template: &SatXYTemplate,
+    k: usize,
+    xy_root: u32,
+    nodes: &[[u32; 4]],
+    pos_order: &[usize],
+    conflict_limit: u64,
+) -> (Option<(PackedSeq, PackedSeq)>, XyStats) {
+    let n = problem.n;
+    if !template.is_feasible(candidate) {
+        return (None, XyStats::default());
+    }
+    let Some(equalities) = gj_candidate_equalities(n, candidate) else {
+        return (None, XyStats::default());
+    };
+
+    // Same template clone as SolveXyPerCandidate::new.
+    let mut solver = template.solver.clone();
+    for &(a, b, equal) in &equalities {
+        if equal { solver.add_clause([-a, b]); solver.add_clause([a, -b]); }
+        else { solver.add_clause([-a, -b]); solver.add_clause([a, b]); }
+    }
+    for s in 1..n {
+        let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
+        let lp = &template.lag_pairs[s];
+        let ones: Vec<u32> = vec![1; lp.lits_a.len()];
+        solver.add_quad_pb_eq(&lp.lits_a, &lp.lits_b, &ones, target as u32);
+    }
+    solver.skip_backtrack_quad_pb = true;
+
+    // MDD level → (X var, Y var). Packed-bit b → actual position:
+    //   b < k      → position b     (prefix)
+    //   b >= k     → position n - 2k + b  (suffix, expand_boundary_bits-compatible)
+    let xy_depth = 2 * k;
+    let mut level_x: Vec<i32> = Vec::with_capacity(xy_depth);
+    let mut level_y: Vec<i32> = Vec::with_capacity(xy_depth);
+    for l in 0..xy_depth {
+        let b = pos_order[l];
+        let actual_pos = if b < k { b } else { n - 2 * k + b };
+        level_x.push((actual_pos + 1) as i32);
+        level_y.push((n + actual_pos + 1) as i32);
+    }
+    solver.add_mdd_constraint(nodes, xy_root, xy_depth, &level_x, &level_y);
+
+    let d0 = solver.num_decisions();
+    let p0 = solver.num_propagations();
+    let vars_pre_forced = solver.num_level0_vars() as u64;
+    let free_vars = (solver.num_vars() as u64).saturating_sub(vars_pre_forced);
+
+    if conflict_limit > 0 { solver.set_conflict_limit(conflict_limit); }
+    let result = solver.solve_with_assumptions(&[]);
+
+    let decisions    = solver.num_decisions().saturating_sub(d0);
+    let propagations = solver.num_propagations().saturating_sub(p0);
+    let cover_micro  = xy_cover_micro(result, decisions, free_vars);
+    let stats = XyStats { decisions, propagations, vars_pre_forced, free_vars, cover_micro };
+
+    let xy = match result {
+        Some(true) => {
+            let x = extract_seq(&solver, |i| (i + 1) as i32, n);
+            let y = extract_seq(&solver, |i| (n + i + 1) as i32, n);
+            Some((x, y))
+        }
+        _ => None,
+    };
+    (xy, stats)
 }
 
 

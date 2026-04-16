@@ -1145,19 +1145,21 @@ impl Solver {
             },
             dirty_level: 0,
         });
-        // Count reachable nodes for diagnostic
-        let mdd = self.mdd.as_ref().unwrap();
-        let mut count = 0;
-        let mut stack = vec![mdd.root];
-        let mut seen = std::collections::HashSet::new();
-        while let Some(nid) = stack.pop() {
-            if nid == 0 || nid == u32::MAX { continue; }
-            if !seen.insert(nid) { continue; }
-            count += 1;
-            for &c in &mdd.nodes[nid as usize] { stack.push(c); }
+        // Diagnostic (enable with MDD_DEBUG=1)
+        if std::env::var("MDD_DEBUG").ok().as_deref() == Some("1") {
+            let mdd = self.mdd.as_ref().unwrap();
+            let mut count = 0;
+            let mut stack = vec![mdd.root];
+            let mut seen = std::collections::HashSet::new();
+            while let Some(nid) = stack.pop() {
+                if nid == 0 || nid == u32::MAX { continue; }
+                if !seen.insert(nid) { continue; }
+                count += 1;
+                for &c in &mdd.nodes[nid as usize] { stack.push(c); }
+            }
+            eprintln!("[MDD] root={} depth={} reachable_nodes={} x_vars={:?} y_vars={:?}",
+                mdd.root, mdd.depth, count, &mdd.level_x_var[..mdd.depth.min(4)], &mdd.level_y_var[..mdd.depth.min(4)]);
         }
-        eprintln!("[MDD] root={} depth={} reachable_nodes={} x_vars={:?} y_vars={:?}",
-            root, depth, count, &mdd.level_x_var[..depth.min(4)], &mdd.level_y_var[..depth.min(4)]);
     }
 
     /// Propagate MDD constraint. Returns conflict reason if dead-end, None otherwise.
@@ -3079,7 +3081,14 @@ impl Solver {
                 }
                 Reason::Decision => {
                     // Reached a decision variable — MDD explanation over-approximate.
-                    learnt[0] = negate(p);
+                    // Unit learnt clause: just negate(p). Handles the empty-learnt
+                    // case that showed up the first time this path was actually
+                    // exercised against the XY MDD (commit TODO).
+                    if learnt.is_empty() {
+                        learnt.push(negate(p));
+                    } else {
+                        learnt[0] = negate(p);
+                    }
                     return (learnt, bt_level);
                 }
             }
