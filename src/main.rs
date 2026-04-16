@@ -3815,10 +3815,31 @@ fn run_mdd_sat_search(
 
                         // Combined per-lag autocorrelation: for each lag s,
                         //   N_Z(s) + N_W(s) ∈ [-(n-s), n-s]  (Turyn identity coupling)
-                        // Encoded as PB-range on the UNION of W and Z agree lits
-                        // (bnd×mid + mid×mid XNOR aux for both sequences).
+                        //
+                        // Expressed as a quadratic PB range on the combined W+Z
+                        // agree terms.  Each "pair agrees" is encoded as a quad
+                        // term x AND y (with coeff 1) — bnd×mid terms use a
+                        // pinned true_var so that `lit_a AND true_var = lit_a`;
+                        // mid×mid terms add TWO quad terms `(a,b)` and `(-a,-b)`
+                        // (matching the XNOR definition `a==b ⇔ ab ∨ ¬a¬b`).
+                        //
+                        // This replaces the older encoding that built an
+                        // explicit auxiliary var per mid×mid pair via
+                        // `encode_xnor_agree` + `add_pb_atleast`.  Using
+                        // `add_quad_pb_range` directly matches the encoding in
+                        // SolveZ's `fill_z_solver_quad_pb` — the quad_pb
+                        // propagator prunes much earlier than the XNOR-aux
+                        // formulation, cutting conflicts-per-solve roughly by
+                        // half at n=26 k=5.
                         {
-                            let mut next_aux = (solver.num_vars() + 1) as i32;
+                            // Pin a "true" helper variable for the bnd×mid
+                            // terms' second literal.  Allocated as the very
+                            // next var after the existing W/Z middles and the
+                            // rules (iv)/(v) aux vars (counted in nv_combined).
+                            let true_var = nv_combined;
+                            nv_combined += 1;
+                            solver.add_clause([true_var]);
+
                             for s in 1..n {
                                 let max_nzw = (n - s) as i32;
                                 let nw_pairs = if s < m { (m - s) as i32 } else { 0 };
@@ -3828,7 +3849,8 @@ fn run_mdd_sat_search(
                                 let combined_hi = ((total_pairs + max_nzw) / 2).min(total_pairs) as u32;
 
                                 let mut agree_const = 0u32;
-                                let mut agree_lits: Vec<i32> = Vec::new();
+                                let mut lits_a: Vec<i32> = Vec::new();
+                                let mut lits_b: Vec<i32> = Vec::new();
                                 // W pairs
                                 if s < m {
                                     let w_lag = &ctx.w_tmpl.lags[s - 1];
@@ -3836,13 +3858,14 @@ fn run_mdd_sat_search(
                                         if w_boundary[i] == w_boundary[j] { agree_const += 1; }
                                     }
                                     for &(bnd_pos, mid_idx) in &w_lag.bnd_mid {
-                                        if w_boundary[bnd_pos] == 1 { agree_lits.push(w_var(mid_idx)); }
-                                        else { agree_lits.push(-w_var(mid_idx)); }
+                                        let lit = if w_boundary[bnd_pos] == 1 { w_var(mid_idx) } else { -w_var(mid_idx) };
+                                        lits_a.push(lit);
+                                        lits_b.push(true_var);
                                     }
                                     for &(i, j) in &w_lag.mid_mid {
-                                        let aux = next_aux; next_aux += 1;
-                                        encode_xnor_agree(&mut solver, aux, w_var(i), w_var(j));
-                                        agree_lits.push(aux);
+                                        // agree(a,b) = (a AND b) OR (-a AND -b)
+                                        lits_a.push( w_var(i)); lits_b.push( w_var(j));
+                                        lits_a.push(-w_var(i)); lits_b.push(-w_var(j));
                                     }
                                 }
                                 // Z pairs
@@ -3852,29 +3875,29 @@ fn run_mdd_sat_search(
                                         if z_boundary[i] == z_boundary[j] { agree_const += 1; }
                                     }
                                     for &(bnd_pos, mid_idx) in &z_lag.bnd_mid {
-                                        if z_boundary[bnd_pos] == 1 { agree_lits.push(z_var(mid_idx)); }
-                                        else { agree_lits.push(-z_var(mid_idx)); }
+                                        let lit = if z_boundary[bnd_pos] == 1 { z_var(mid_idx) } else { -z_var(mid_idx) };
+                                        lits_a.push(lit);
+                                        lits_b.push(true_var);
                                     }
                                     for &(i, j) in &z_lag.mid_mid {
-                                        let aux = next_aux; next_aux += 1;
-                                        encode_xnor_agree(&mut solver, aux, z_var(i), z_var(j));
-                                        agree_lits.push(aux);
+                                        lits_a.push( z_var(i)); lits_b.push( z_var(j));
+                                        lits_a.push(-z_var(i)); lits_b.push(-z_var(j));
                                     }
                                 }
 
+                                let max_variable = lits_a.len() as u32;
                                 let adj_lo = combined_lo.saturating_sub(agree_const);
                                 let adj_hi = combined_hi.saturating_sub(agree_const);
-                                let n_lits = agree_lits.len() as u32;
-                                if adj_lo > n_lits { solver.add_clause(std::iter::empty::<i32>()); break; }
-                                if adj_lo == 0 && adj_hi >= n_lits { continue; }
-                                let ones: Vec<u32> = vec![1; agree_lits.len()];
-                                if adj_lo > 0 {
-                                    solver.add_pb_atleast(&agree_lits, &ones, adj_lo);
+                                if adj_lo > max_variable { solver.add_clause(std::iter::empty::<i32>()); break; }
+                                if adj_lo == 0 && adj_hi >= max_variable { continue; }
+                                if lits_a.is_empty() {
+                                    // No variable-dependent terms; agree_const
+                                    // alone must already satisfy the range
+                                    // (checked by the adj_lo/adj_hi guards above).
+                                    continue;
                                 }
-                                if adj_hi < n_lits {
-                                    let neg: Vec<i32> = agree_lits.iter().map(|&l| -l).collect();
-                                    solver.add_pb_atleast(&neg, &ones, n_lits - adj_hi);
-                                }
+                                let coeffs: Vec<u32> = vec![1; lits_a.len()];
+                                solver.add_quad_pb_range(&lits_a, &lits_b, &coeffs, adj_lo, adj_hi);
                             }
                         }
 
