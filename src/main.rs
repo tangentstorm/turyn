@@ -561,6 +561,86 @@ impl SearchConfig {
     fn effective_wz_mode(&self) -> WzMode {
         self.wz_mode.unwrap_or(WzMode::Cross)
     }
+
+    /// Apply the auto-defaults that the unified search branch in `main`
+    /// would otherwise apply lazily: pick `--wz=together` when an
+    /// `mdd-k.bin` is present, fall back to `--wz=cross` with `mdd_k=7`
+    /// otherwise, then clamp `mdd_k` against `n` / `m`.  Returns the
+    /// final `(mode, mdd_k)` so callers can print them.
+    fn resolve_for_unified_search(&mut self) -> (WzMode, usize) {
+        if self.wz_mode.is_none() {
+            let default_k = self.mdd_k == SearchConfig::default().mdd_k;
+            let try_k = if default_k { 5 } else { self.mdd_k };
+            let max_k = try_k.min((self.problem.n - 1) / 2);
+            let has_mdd = (1..=max_k).rev().any(|k| std::path::Path::new(&format!("mdd-{}.bin", k)).exists());
+            if has_mdd {
+                self.wz_mode = Some(WzMode::Together);
+                if default_k { self.mdd_k = 5; }
+                if self.mdd_extend == 0 { self.mdd_extend = 1; }
+            }
+        }
+        let mode = self.effective_wz_mode();
+        if mode == WzMode::Cross && self.mdd_k == SearchConfig::default().mdd_k {
+            self.mdd_k = 7;
+        }
+        self.wz_together = matches!(mode, WzMode::Together);
+        let m = self.problem.m();
+        let mdd_k = self.mdd_k.min((self.problem.n - 1) / 2).min(m / 2);
+        (mode, mdd_k)
+    }
+
+    /// Render the resolved CLI configuration as a single-line summary.
+    /// Includes both user-supplied values and auto-defaults so the user
+    /// can see exactly what the run is doing.
+    fn settings_line(&self, mode: Option<WzMode>, mdd_k: Option<usize>) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(format!("--n={}", self.problem.n));
+        if let Some(m) = mode {
+            let label = match m {
+                WzMode::Cross => "cross",
+                WzMode::Together => "together",
+                WzMode::Apart => "apart",
+            };
+            parts.push(format!("--wz={label}"));
+        }
+        if let Some(k) = mdd_k { parts.push(format!("--mdd-k={k}")); }
+        parts.push(format!("--mdd-extend={}", self.mdd_extend));
+        parts.push(format!("--theta={}", self.theta_samples));
+        parts.push(format!("--max-z={}", self.max_z));
+        parts.push(format!("--max-w={}", self.max_w));
+        if let Some(s) = self.max_spectral { parts.push(format!("--max-spectral={s}")); }
+        parts.push(format!("--conflict-limit={}", self.conflict_limit));
+        if self.sat_secs > 0 { parts.push(format!("--sat-secs={}", self.sat_secs)); }
+        parts.push(format!("--quad-pb={}", self.quad_pb));
+        if self.sat_config.ema_restarts { parts.push("--ema-restarts".into()); }
+        if self.sat_config.probing { parts.push("--probing".into()); }
+        if self.sat_config.rephasing { parts.push("--rephasing".into()); }
+        if self.sat_config.xor_propagation { parts.push("--xor-propagation".into()); }
+        if self.stochastic {
+            parts.push("--stochastic".into());
+            if self.stochastic_seconds > 0 {
+                parts.push(format!("--stochastic-secs={}", self.stochastic_seconds));
+            }
+        }
+        if self.benchmark_repeats > 0 { parts.push(format!("--benchmark={}", self.benchmark_repeats)); }
+        if let Some(t) = self.test_tuple.as_ref() { parts.push(format!("--tuple={t}")); }
+        if let Some(p) = self.phase_only.as_ref() { parts.push(format!("--{p}")); }
+        if let Some(d) = self.dump_dimacs.as_ref() { parts.push(format!("--dump-dimacs={d}")); }
+        let threads = std::env::var("TURYN_THREADS").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(num_cpus_or_one);
+        format!("turyn settings: {}  (threads={threads})", parts.join(" "))
+    }
+}
+
+/// Best-effort parallelism count: prefer `RAYON_NUM_THREADS`, then
+/// `std::thread::available_parallelism`, then 1. Matches the worker
+/// count rayon spawns by default.
+fn num_cpus_or_one() -> usize {
+    if let Ok(v) = std::env::var("RAYON_NUM_THREADS") {
+        if let Ok(n) = v.parse() { return n; }
+    }
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 /// A (Z, W) candidate reduced to everything the XY SAT stage actually
@@ -1591,26 +1671,12 @@ struct LagPairs {
     lits_b: Vec<i32>,
 }
 
-/// 4-clause encoding of `d ↔ (a XOR b)`.  Uses only `add_clause` so it
-/// works against the generic `SatSolver` trait (radical's native
-/// `add_xor` would be faster, but not every path has the concrete
-/// solver type).
-/// Encode `aux ↔ (a == b)` (XNOR / agree indicator).
-/// aux is true when a and b have the same value.
+/// Encode `aux ↔ (a == b)` (XNOR / agree indicator). Only referenced
+/// from the regression test that pins down all four input combinations;
+/// the production code path inlines the same four clauses where it
+/// builds quadratic-PB lag constraints.
+#[cfg(test)]
 fn encode_xnor_agree(solver: &mut impl SatSolver, aux: i32, a: i32, b: i32) {
-    // aux ↔ (a == b)  (i.e., aux ↔ ¬(a XOR b))
-    //
-    // Truth table:
-    //   a=T, b=T → aux=T
-    //   a=T, b=F → aux=F
-    //   a=F, b=T → aux=F
-    //   a=F, b=F → aux=T
-    //
-    // Four clauses exactly cover this definition:
-    //   aux →  (a → b) :  ¬aux ∨ ¬a ∨  b   — rules out (aux=T, a=T, b=F)
-    //   aux →  (b → a) :  ¬aux ∨  a ∨ ¬b   — rules out (aux=T, a=F, b=T)
-    //   ¬aux → (a ∨ b) :   aux ∨  a ∨  b   — rules out (aux=F, a=F, b=F)
-    //   ¬aux → (¬a ∨ ¬b):  aux ∨ ¬a ∨ ¬b   — rules out (aux=F, a=T, b=T)
     solver.add_clause([-aux, -a,  b]);
     solver.add_clause([-aux,  a, -b]);
     solver.add_clause([ aux,  a,  b]);
@@ -3876,7 +3942,6 @@ fn run_mdd_sat_search(
                             // next var after the existing W/Z middles and the
                             // rules (iv)/(v) aux vars (counted in nv_combined).
                             let true_var = nv_combined;
-                            nv_combined += 1;
                             solver.add_clause([true_var]);
 
                             for s in 1..n {
@@ -4868,7 +4933,6 @@ fn run_mdd_sat_search(
 
     loop {
         // Feed the queue when depth is low.
-        let work_depth = work_queue.work_len();
         let gold_depth = work_queue.gold_len();
         let pending_bnd = pending_boundaries.load(AtomicOrdering::Relaxed) as usize;
         if wz_mode == WzMode::Cross {
@@ -6068,7 +6132,29 @@ fn run_info() -> String {
 }
 
 fn main() {
-    let cfg = parse_args();
+    let mut cfg = parse_args();
+    // Resolve auto-defaults up-front so we can echo the fully-filled-in
+    // settings as the very first line of output. Only the unified search
+    // branch picks --wz / --mdd-k automatically; the other branches
+    // (verify, phase-only, dump-dimacs, benchmark, stochastic) just use
+    // what the user passed.
+    let going_to_unified_search = cfg.verify_seqs.is_none()
+        && cfg.test_zw.is_none()
+        && cfg.phase_only.is_none()
+        && cfg.dump_dimacs.is_none()
+        && cfg.benchmark_repeats == 0
+        && !cfg.stochastic;
+    let resolved_mode_k = if going_to_unified_search {
+        let (mode, mdd_k) = cfg.resolve_for_unified_search();
+        Some((mode, mdd_k))
+    } else {
+        None
+    };
+    println!("{}", cfg.settings_line(
+        resolved_mode_k.map(|(m, _)| m),
+        resolved_mode_k.map(|(_, k)| k),
+    ));
+    let cfg = cfg;
     if let Some(ref seqs) = cfg.verify_seqs {
         let x = parse_seq(&seqs[0]);
         let y = parse_seq(&seqs[1]);
@@ -6358,36 +6444,15 @@ fn main() {
         // The runner's monitor thread either enumerates Z × W pairs
         // (--wz=cross) or walks MDD boundaries (--wz=apart|together),
         // feeding the same DualQueue + worker loop + XY SAT stage.
-        let mut cfg = cfg.clone();
-        // Auto-upgrade: when the user didn't pick a --wz mode and an
-        // MDD file is available, default to Together.  Measured times
-        // with `--wz=together --mdd-k=5` at commit 92959bd:
+        // Auto-defaults already applied at the top of `main` so we can
+        // echo the resolved settings line first; just unpack them here.
+        // Measured times with `--wz=together --mdd-k=5` at commit 92959bd:
         //   n=16:   23ms      n=18:    172ms     n=20:  880ms
         //   n=22:   16.8s     n=24:    98s       n=26:  open
         // `--wz=cross` is currently broken for n>=6 (pre-existing bug
         // on main).  `--wz=apart` works for n<=20 but regresses at n=22.
-        // `--wz=together` is the reliable default.  Use mdd_k=5 unless
-        // the user overrode --mdd-k.
-        if cfg.wz_mode.is_none() {
-            let default_k = cfg.mdd_k == SearchConfig::default().mdd_k;
-            let try_k = if default_k { 5 } else { cfg.mdd_k };
-            let max_k = try_k.min((cfg.problem.n - 1) / 2);
-            let has_mdd = (1..=max_k).rev().any(|k| std::path::Path::new(&format!("mdd-{}.bin", k)).exists());
-            if has_mdd {
-                cfg.wz_mode = Some(WzMode::Together);
-                if default_k { cfg.mdd_k = 5; }
-                if cfg.mdd_extend == 0 {
-                    cfg.mdd_extend = 1;
-                }
-            }
-        }
-        let mode = cfg.effective_wz_mode();
-        // Cross mode historically used k=7 for XY enumeration; preserve
-        // that default when the user hasn't passed an explicit --mdd-k.
-        if mode == WzMode::Cross && cfg.mdd_k == SearchConfig::default().mdd_k {
-            cfg.mdd_k = 7;
-        }
-        cfg.wz_together = matches!(mode, WzMode::Together);
+        // `--wz=together` is the reliable default.
+        let (mode, mdd_k) = resolved_mode_k.expect("unified search branch must have resolved mode");
         // Heuristic tuple ordering (was previously inside run_hybrid_search).
         let mut tuples = phase_a_tuples(cfg.problem, cfg.test_tuple.as_ref());
         if mode == WzMode::Cross {
@@ -6397,9 +6462,6 @@ fn main() {
                 tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
             }
         }
-        // Clamp k: must have 2k ≤ n (Z boundary) and 2k ≤ m (W boundary).
-        let m = cfg.problem.m();
-        let mdd_k = cfg.mdd_k.min((cfg.problem.n - 1) / 2).min(m / 2);
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, true, mdd_k);
         let label = match mode {
             WzMode::Cross => "cross",
@@ -7419,7 +7481,6 @@ mod tests {
         let m = n - 1;
         let k = 5usize;
         let middle_n = n - 2 * k;
-        let middle_m = m - 2 * k;
         let problem = Problem::new(n);
 
         // Sanity: canonical TT(18) verifies the Turyn identity.
