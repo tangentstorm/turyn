@@ -2498,6 +2498,62 @@ fn run_mdd_sat_search(
         v
     };
 
+    // FULL_MDD=1 prototype: skip the boundary→W→Z→XY pipeline entirely.
+    // For each tuple, build a single SAT problem covering all 4 sequences
+    // with the full ZW+XY MDD as a native constraint, and solve once.
+    if std::env::var("FULL_MDD").ok().as_deref() == Some("1") {
+        let run_start = Instant::now();
+        let conflict_limit: u64 = std::env::var("FULL_MDD_CONFLICTS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        if verbose {
+            eprintln!("FULL_MDD=1: single-solve-per-tuple over {} tuples, k={} (depth={}) conflict_limit={}",
+                tuples.len(), k, mdd.depth, conflict_limit);
+        }
+        let mut found: Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq, SumTuple)> = None;
+        let mut total_decisions = 0u64;
+        let mut total_propagations = 0u64;
+        let sat_secs = cfg.sat_secs;
+        for (i, &tuple) in tuples.iter().enumerate() {
+            if sat_secs > 0 && run_start.elapsed().as_secs() >= sat_secs { break; }
+            let (xyzw, stats) = try_full_turyn_via_mdd(
+                problem, tuple, k, &mdd.nodes, mdd.root, mdd.depth,
+                &full_pos_order, &cfg.sat_config, conflict_limit,
+            );
+            total_decisions += stats.decisions;
+            total_propagations += stats.propagations;
+            if verbose {
+                eprintln!("  tuple {}/{} {:?}: {} dec, {} prop, {}",
+                    i + 1, tuples.len(), tuple, stats.decisions, stats.propagations,
+                    if xyzw.is_some() { "SAT" } else { "UNSAT/timeout" });
+            }
+            if let Some((x, y, z, w)) = xyzw {
+                if verify_tt(problem, &x, &y, &z, &w) {
+                    found = Some((x, y, z, w, tuple));
+                    break;
+                } else if verbose {
+                    eprintln!("    SAT but verify_tt failed for tuple {:?}", tuple);
+                }
+            }
+        }
+        let elapsed = run_start.elapsed();
+        if verbose {
+            println!("\nFULL_MDD=1 summary: {} total decisions, {} propagations, elapsed={:?}",
+                total_decisions, total_propagations, elapsed);
+        }
+        let found_solution = found.is_some();
+        if let Some((x, y, z, w, _tuple)) = found {
+            if verbose {
+                println!("\nFOUND! x={} y={} z={} w={}",
+                    colored_pm(&x), colored_pm(&y), colored_pm(&z), colored_pm(&w));
+            }
+        }
+        return SearchReport {
+            stats: SearchStats::default(),
+            elapsed,
+            found_solution,
+        };
+    }
+
     // Pull-based MDD feeding: monitor navigates paths on demand.
     let total_paths: u64 = 4u64.pow(zw_depth as u32);
     let lcg_mult: u64 = 0x5851F42D4C957F2D; // odd, full-period LCG for power-of-2
@@ -4606,6 +4662,166 @@ fn try_candidate_via_mdd(
         _ => None,
     };
     (xy, stats)
+}
+
+/// **Prototype (FULL_MDD=1)**: solve all four Turyn sequences (X, Y, Z, W)
+/// in ONE SAT call per tuple, with the full ZW+XY MDD as a native
+/// constraint. Replaces the entire boundary→W→Z→XY pipeline for one tuple.
+///
+/// SAT variable layout (1-based):
+///   X[0..n]   -> 1..=n
+///   Y[0..n]   -> n+1..=2n
+///   Z[0..n]   -> 2n+1..=3n
+///   W[0..m]   -> 3n+1..=3n+m   (m = n-1)
+///
+/// Constraints added:
+///   - Symmetry: x[0]=y[0]=z[0]=w[0]=+1 (TT(n) closed under per-sequence
+///     negation; this is a valid 16x reduction).
+///   - 4 sum PB constraints encoding tuple sums.
+///   - n-1 quad PB constraints encoding the full Turyn identity at each
+///     lag s: agree_X(s) + agree_Y(s) + 2*agree_Z(s) + 2*agree_W(s) =
+///     3n - 3s - 1  (for s < m); for s = m..n-1 the W term drops and
+///     target becomes 2(n-s).
+///   - Native MDD constraint over all 4k boundary positions (Z, W, X, Y
+///     interleaved per the MDD's level structure: 0..2k = ZW, 2k..4k = XY).
+///
+/// No spectral constraint in this prototype — the SAT is sound without
+/// it but slower than it could be. Adding spectral requires multi-
+/// sequence support in `radical::SpectralConstraint`.
+#[allow(clippy::too_many_arguments)]
+fn try_full_turyn_via_mdd(
+    problem: Problem,
+    tuple: SumTuple,
+    k: usize,
+    mdd_nodes: &[[u32; 4]],
+    mdd_root: u32,
+    mdd_depth: usize,           // = 4*k
+    pos_order: &[usize],        // length = 2*k, used twice (once for ZW, once for XY)
+    sat_config: &radical::SolverConfig,
+    conflict_limit: u64,
+) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, XyStats) {
+    let n = problem.n;
+    let m = problem.m();
+    let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+    let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+    let z_var = |i: usize| -> i32 { (2 * n + i + 1) as i32 };
+    let w_var = |i: usize| -> i32 { (3 * n + i + 1) as i32 };
+
+    let mut solver: radical::Solver = {
+        let mut s = radical::Solver::new();
+        s.config = sat_config.clone();
+        s
+    };
+
+    // Symmetry breaking — first position of each sequence forced to +1.
+    solver.add_clause([x_var(0)]);
+    solver.add_clause([y_var(0)]);
+    solver.add_clause([z_var(0)]);
+    solver.add_clause([w_var(0)]);
+
+    // Sum PB constraints: sum of x_var(i) (true=+1) must equal (tuple.* + len) / 2.
+    let parity_ok = (tuple.x + n as i32) % 2 == 0
+                 && (tuple.y + n as i32) % 2 == 0
+                 && (tuple.z + n as i32) % 2 == 0
+                 && (tuple.w + m as i32) % 2 == 0;
+    if !parity_ok { return (None, XyStats::default()); }
+    let x_pos = ((tuple.x + n as i32) / 2) as usize;
+    let y_pos = ((tuple.y + n as i32) / 2) as usize;
+    let z_pos = ((tuple.z + n as i32) / 2) as usize;
+    let w_pos = ((tuple.w + m as i32) / 2) as usize;
+    let ones_n: Vec<u32> = vec![1; n];
+    let ones_m: Vec<u32> = vec![1; m];
+    let x_lits: Vec<i32> = (0..n).map(x_var).collect();
+    let y_lits: Vec<i32> = (0..n).map(y_var).collect();
+    let z_lits: Vec<i32> = (0..n).map(z_var).collect();
+    let w_lits: Vec<i32> = (0..m).map(w_var).collect();
+    solver.add_pb_eq(&x_lits, &ones_n, x_pos as u32);
+    solver.add_pb_eq(&y_lits, &ones_n, y_pos as u32);
+    solver.add_pb_eq(&z_lits, &ones_n, z_pos as u32);
+    solver.add_pb_eq(&w_lits, &ones_m, w_pos as u32);
+
+    // Quad PB: full Turyn identity per lag.
+    for s in 1..n {
+        let mut lits_a: Vec<i32> = Vec::new();
+        let mut lits_b: Vec<i32> = Vec::new();
+        let mut coeffs: Vec<u32> = Vec::new();
+        // agree(X[i], X[i+s]) — coeff 1 (both-true + both-false form)
+        for i in 0..(n - s) {
+            lits_a.push(x_var(i));   lits_b.push(x_var(i + s));   coeffs.push(1);
+            lits_a.push(-x_var(i));  lits_b.push(-x_var(i + s));  coeffs.push(1);
+            lits_a.push(y_var(i));   lits_b.push(y_var(i + s));   coeffs.push(1);
+            lits_a.push(-y_var(i));  lits_b.push(-y_var(i + s));  coeffs.push(1);
+        }
+        // agree(Z[i], Z[i+s]) — coeff 2 (Z contributes double in identity)
+        for i in 0..(n - s) {
+            lits_a.push(z_var(i));   lits_b.push(z_var(i + s));   coeffs.push(2);
+            lits_a.push(-z_var(i));  lits_b.push(-z_var(i + s));  coeffs.push(2);
+        }
+        // agree(W[i], W[i+s]) — coeff 2, only when s < m
+        if s < m {
+            for i in 0..(m - s) {
+                lits_a.push(w_var(i));   lits_b.push(w_var(i + s));   coeffs.push(2);
+                lits_a.push(-w_var(i));  lits_b.push(-w_var(i + s));  coeffs.push(2);
+            }
+        }
+        // Target derived from energy identity. For ±1 sequences:
+        //   N_S(s) = 2*agree_S(s) - len_S(s)
+        // Substituting into N_X + N_Y + 2*N_Z + 2*N_W = 0 and dividing by 2:
+        //   agree_X(s) + agree_Y(s) + 2*agree_Z(s) + 2*agree_W(s) = 3n - 3s - 1
+        // (assuming m = n-1 so the W contribution is 2*agree_W with len m-s).
+        // For s >= m, the W term drops:
+        //   agree_X(s) + agree_Y(s) + 2*agree_Z(s) = 2(n-s)
+        // The encoded LHS is exactly that (1 unit per X/Y agree term, 2 per Z/W).
+        let target = if s < m { (3 * n as i32 - 3 * s as i32 - 1) as u32 }
+                     else { (2 * (n - s)) as u32 };
+        solver.add_quad_pb_eq(&lits_a, &lits_b, &coeffs, target);
+    }
+
+    // MDD constraint over the full ZW+XY boundary.
+    // Levels 0..2k branch on (Z, W); levels 2k..4k branch on (X, Y).
+    // pos_order is reused for both halves.
+    let mut level_a: Vec<i32> = Vec::with_capacity(mdd_depth);
+    let mut level_b: Vec<i32> = Vec::with_capacity(mdd_depth);
+    for l in 0..2 * k {
+        let b = pos_order[l];
+        let z_pos = if b < k { b } else { n - 2 * k + b };
+        // For W (length m=n-1), the suffix bit k+i maps to position m-k+i = n-1-k+i.
+        let w_pos = if b < k { b } else { (n - 1) - 2 * k + b };
+        level_a.push(z_var(z_pos));
+        level_b.push(w_var(w_pos));
+    }
+    for l in 0..2 * k {
+        let b = pos_order[l];
+        let xy_pos = if b < k { b } else { n - 2 * k + b };
+        level_a.push(x_var(xy_pos));
+        level_b.push(y_var(xy_pos));
+    }
+    solver.add_mdd_constraint(mdd_nodes, mdd_root, mdd_depth, &level_a, &level_b);
+
+    let d0 = solver.num_decisions();
+    let p0 = solver.num_propagations();
+    let vars_pre_forced = solver.num_level0_vars() as u64;
+    let free_vars = (solver.num_vars() as u64).saturating_sub(vars_pre_forced);
+
+    if conflict_limit > 0 { solver.set_conflict_limit(conflict_limit); }
+    let result = solver.solve_with_assumptions(&[]);
+
+    let decisions    = solver.num_decisions().saturating_sub(d0);
+    let propagations = solver.num_propagations().saturating_sub(p0);
+    let cover_micro  = xy_cover_micro(result, decisions, free_vars);
+    let stats = XyStats { decisions, propagations, vars_pre_forced, free_vars, cover_micro };
+
+    let xyzw = match result {
+        Some(true) => {
+            let x = extract_seq(&solver, |i| x_var(i), n);
+            let y = extract_seq(&solver, |i| y_var(i), n);
+            let z = extract_seq(&solver, |i| z_var(i), n);
+            let w = extract_seq(&solver, |i| w_var(i), m);
+            Some((x, y, z, w))
+        }
+        _ => None,
+    };
+    (xyzw, stats)
 }
 
 
