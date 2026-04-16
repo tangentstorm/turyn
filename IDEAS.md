@@ -821,16 +821,8 @@ wall-clock to find solution (currently ~29s).
 
 **Performance hypotheses (each ≈ one commit):**
 
-- **F1: SPECTRAL_FREQS reduction**: Eloquent-bell raised this constant from
-  167 to 563 (commit f1e13fa) for "denser in-SAT spectral sampling". Every
-  variable assign/unassign in `SpectralConstraint::assign` does 3 nested
-  loops of length `num_freqs`, so 563 vs 167 is 3.4× more spectral work.
-  The setup cost (cos/sin/amplitude tables) is also 3.4× larger. The
-  commit claimed only 7% TTC improvement at n=26 (3.0h → 2.8h) for this
-  3.4× compute increase — looks like a bad trade. Try 167, 251, 313 and
-  pick the best.
-  Single commit: change `const SPECTRAL_FREQS: usize = 563` back to 167
-  (or whatever benches best).
+- **F1: SPECTRAL_FREQS reduction** — ACCEPTED. 6.2× speedup. Moved to
+  `docs/OPTIMIZATION_LOG.md`. Changed constant from 563 to 17.
 
 - **F2: Cache spectral cos/sin tables across SolveWZ calls**: Per-boundary
   in SolveWZ allocates fresh `cos_table`, `sin_table`, `amplitudes`

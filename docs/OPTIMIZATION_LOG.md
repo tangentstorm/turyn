@@ -178,6 +178,45 @@ Tested and rejected:
 - Fixed-point spectral (London §3.4 i16/i32): 50% regression (modern FPU wins)
 - No-multiply spectral (branch on val sign): regression (code cache pressure)
 
+## SolveWZ throughput recovery from c8a0db5 regression (April 2026)
+
+Commit `c8a0db5` (turyn: add coupled WZ per-lag constraints to --wz=together
+(1460x speedup)) and its follow-ups (`b9d92ac`, `ce47c9d`) claimed a huge
+speedup at n=26 k=7, but when benchmarked end-to-end versus main the
+optimizations stacked on top (especially `f1e13fa`, which raised
+`SPECTRAL_FREQS` from 167 to 563) caused a 5-200x slowdown at smaller n.
+
+Primary benchmark: `n=26 wz=together mdd-k=5` effective bnd/s, 4 threads,
+sat-secs=20, 7 repeats.
+
+Post-merge baseline: 2.66 eff bnd/s (median of 7).
+
+### F1. SPECTRAL_FREQS 563 → 17 — accepted (**+520% / 6.2×**)
+
+`f1e13fa` raised SPECTRAL_FREQS from 167 to 563 for 7% TTC improvement at
+n=26 k=7, but that constant gates the inner loops of
+`SpectralConstraint::assign`/`unassign` (3 nested loops of length
+num_freqs) and the per-boundary cos/sin/amplitude-table allocations
+(total_mid × nf × f32). 3.4× the freqs = 3.4× the per-assign work +
+3.4× the malloc churn.
+
+Swept values at n=26 wz=together mdd-k=5:
+
+| SPECTRAL_FREQS | Median bnd/s | vs baseline | n=20 correctness |
+|----------------|--------------|-------------|-------------------|
+| 563 (baseline) | 2.66         | —           | finds in 25-30s   |
+| 167            | 4.81         | 1.8×        | finds in 12-25s   |
+| 97             | 6.96         | 2.6×        | finds in 9-15s    |
+| 53             | 7.99         | 3.0×        | finds in 10-19s   |
+| 31             | 8.69         | 3.3×        | finds             |
+| **17**         | **16.47**    | **6.2×**    | finds in 9-20s (5/5) |
+| 11             | 38.84        | 14.6× but   | **2/4 miss**      |
+
+Lower bound set by correctness: 17 still rejects all non-canonical Z/W
+pairs at n=20 but 11 lets some through. Accepted at 17. All 35 tests pass.
+
+**Cumulative: 6.2× bnd/s at n=26 wz=together mdd-k=5.**
+
 ## Current baseline (latest)
 
 - Exhaustive search (n=16, theta=20000):
