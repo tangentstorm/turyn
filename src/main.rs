@@ -1506,16 +1506,23 @@ struct LagPairs {
 /// Encode `aux ↔ (a == b)` (XNOR / agree indicator).
 /// aux is true when a and b have the same value.
 fn encode_xnor_agree(solver: &mut impl SatSolver, aux: i32, a: i32, b: i32) {
-    // aux ↔ ¬(a XOR b) = aux ↔ (a == b)
-    solver.add_clause([-aux, -a, -b]); // aux → (a ∧ b) ∨ (¬a ∧ ¬b) [part 1: ¬aux ∨ ¬a ∨ ¬b would be wrong]
-    // Actually: aux true ↔ (a=b). Clauses:
-    // aux → (a → b): -aux ∨ -a ∨ b
-    // aux → (b → a): -aux ∨ a ∨ -b
-    // ¬aux → (a XOR b): aux ∨ -a ∨ -b  AND  aux ∨ a ∨ b
+    // aux ↔ (a == b)  (i.e., aux ↔ ¬(a XOR b))
+    //
+    // Truth table:
+    //   a=T, b=T → aux=T
+    //   a=T, b=F → aux=F
+    //   a=F, b=T → aux=F
+    //   a=F, b=F → aux=T
+    //
+    // Four clauses exactly cover this definition:
+    //   aux →  (a → b) :  ¬aux ∨ ¬a ∨  b   — rules out (aux=T, a=T, b=F)
+    //   aux →  (b → a) :  ¬aux ∨  a ∨ ¬b   — rules out (aux=T, a=F, b=T)
+    //   ¬aux → (a ∨ b) :   aux ∨  a ∨  b   — rules out (aux=F, a=F, b=F)
+    //   ¬aux → (¬a ∨ ¬b):  aux ∨ ¬a ∨ ¬b   — rules out (aux=F, a=T, b=T)
     solver.add_clause([-aux, -a,  b]);
     solver.add_clause([-aux,  a, -b]);
-    solver.add_clause([ aux, -a, -b]);
     solver.add_clause([ aux,  a,  b]);
+    solver.add_clause([ aux, -a, -b]);
 }
 
 fn encode_xor_def(solver: &mut impl SatSolver, d: i32, a: i32, b: i32) {
@@ -3207,6 +3214,12 @@ fn run_mdd_sat_search(
     // to the boundary's coverage. (W and Z solves don't time out today, so
     // partial-credit machinery applies only to XY.)
     let flow_xy_timeout_cov_micro = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // SolveWZ-specific flow counters: diagnose where combined WZ items are lost.
+    let flow_wz_empty_v = Arc::new(std::sync::atomic::AtomicU64::new(0));           // V_w or V_z was empty
+    let flow_wz_rule_viol = Arc::new(std::sync::atomic::AtomicU64::new(0));         // rule (iv)/(v) violated at boundary
+    let flow_wz_sat_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));         // number of solver.solve() calls
+    let flow_wz_first_unsat = Arc::new(std::sync::atomic::AtomicU64::new(0));       // first solve returned UNSAT (no (W,Z) at all)
+    let flow_wz_solutions = Arc::new(std::sync::atomic::AtomicU64::new(0));         // WZ pairs produced (total, across enum)
     // Per-stage enter/exit counters: depth = enter - exit.
     let stage_enter: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let stage_exit: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
@@ -3256,6 +3269,11 @@ fn run_mdd_sat_search(
         let flow_xy_root_forced = Arc::clone(&flow_xy_root_forced);
         let flow_xy_free_sum = Arc::clone(&flow_xy_free_sum);
         let flow_xy_timeout_cov_micro = Arc::clone(&flow_xy_timeout_cov_micro);
+        let flow_wz_empty_v = Arc::clone(&flow_wz_empty_v);
+        let flow_wz_rule_viol = Arc::clone(&flow_wz_rule_viol);
+        let flow_wz_sat_calls = Arc::clone(&flow_wz_sat_calls);
+        let flow_wz_first_unsat = Arc::clone(&flow_wz_first_unsat);
+        let flow_wz_solutions = Arc::clone(&flow_wz_solutions);
         let stage_enter: Vec<_> = stage_enter.iter().map(Arc::clone).collect();
         let stage_exit: Vec<_> = stage_exit.iter().map(Arc::clone).collect();
         let sat_config = sat_config.clone();
@@ -3650,6 +3668,7 @@ fn run_mdd_sat_search(
                         w_counts.sort_unstable();
                         z_counts.sort_unstable();
                         if w_counts.is_empty() || z_counts.is_empty() {
+                            flow_wz_empty_v.fetch_add(1, AtomicOrdering::Relaxed);
                             stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
                             continue;
                         }
@@ -3664,6 +3683,7 @@ fn run_mdd_sat_search(
                         if rule_iv_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
                            || rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
                         {
+                            flow_wz_rule_viol.fetch_add(1, AtomicOrdering::Relaxed);
                             stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
                             continue;
                         }
@@ -3848,9 +3868,8 @@ fn run_mdd_sat_search(
 
                         // Enumerate WZ solutions
                         let mut wz_count = 0usize;
-                        // Conflict limit: at n=26 k=5, middle has only 3+12=15 vars
-                        // plus aux, so SAT/UNSAT should be fast. Cap at 50k conflicts
-                        // to prevent pathological instances from stalling a worker.
+                        // Conflict limit: cap at 50k to prevent pathological
+                        // instances from stalling a worker.
                         solver.set_conflict_limit(50_000);
                         loop {
                             if ctx.found.load(AtomicOrdering::Relaxed) { break; }
@@ -3859,8 +3878,16 @@ fn run_mdd_sat_search(
                             let phases: Vec<bool> = (0..total_vars)
                                 .map(|_| next_rng!() & 1 == 1).collect();
                             solver.set_phase(&phases);
-                            if solver.solve() != Some(true) { break; }
+                            flow_wz_sat_calls.fetch_add(1, AtomicOrdering::Relaxed);
+                            let sat_res = solver.solve();
+                            if sat_res != Some(true) {
+                                if wz_count == 0 {
+                                    flow_wz_first_unsat.fetch_add(1, AtomicOrdering::Relaxed);
+                                }
+                                break;
+                            }
                             wz_count += 1;
+                            flow_wz_solutions.fetch_add(1, AtomicOrdering::Relaxed);
 
                             // Extract W middle
                             let w_mid: Vec<i8> = (0..ctx.middle_m).map(|i| {
@@ -4919,6 +4946,26 @@ fn run_mdd_sat_search(
             }
             if xy_sat > 0 {
                 println!("                  ✓ {} SAT!", xy_sat);
+            }
+        }
+
+        // SolveWZ-specific diagnostics (only populated in --wz=together mode).
+        let wz_empty = flow_wz_empty_v.load(AtomicOrdering::Relaxed);
+        let wz_rule = flow_wz_rule_viol.load(AtomicOrdering::Relaxed);
+        let wz_calls = flow_wz_sat_calls.load(AtomicOrdering::Relaxed);
+        let wz_first_unsat = flow_wz_first_unsat.load(AtomicOrdering::Relaxed);
+        let wz_sols = flow_wz_solutions.load(AtomicOrdering::Relaxed);
+        if wz_empty + wz_rule + wz_calls > 0 {
+            println!("\n  --- SolveWZ Flow (wz=together) ---");
+            println!("    V_w or V_z empty (early skip): {}", wz_empty);
+            println!("    Rule (iv)/(v) violated:         {}", wz_rule);
+            println!("    solver.solve() calls:           {}", wz_calls);
+            println!("      first-call UNSAT:             {} ({})", wz_first_unsat, pct(wz_first_unsat, wz_calls));
+            println!("      WZ solutions produced:        {}", wz_sols);
+            let wz_items = wz_empty + wz_rule + wz_first_unsat;
+            if wz_items > 0 {
+                let reach_sat = wz_calls.saturating_sub(wz_sols);
+                println!("    → {} reached first SAT call; {} returned 0 solutions", reach_sat, wz_first_unsat);
             }
         }
     }
@@ -6242,6 +6289,33 @@ mod tests {
         solver.add_clause([2]);
         assert_eq!(solver.solve(), Some(true));
         assert_eq!(solver.value(aux), Some(true));
+    }
+
+    /// Regression: the standalone `encode_xnor_agree` helper (used by the
+    /// --wz=together coupled per-lag constraints) had a spurious extra
+    /// clause `[-aux, -a, -b]` that forbade (aux=T, a=T, b=T) — making
+    /// `aux ↔ (a==b)` unsatisfiable whenever both inputs were TRUE.
+    /// This silently rejected the canonical TT(26) boundary at k=5,
+    /// driving the WZ pipeline to produce zero solutions. Exercise all 4
+    /// input combinations here.
+    #[test]
+    fn encode_xnor_agree_all_four_combos_sound() {
+        // For each (a, b) ∈ {T, F}², check that the forced aux value matches a==b.
+        for (a_val, b_val) in [(true, true), (true, false), (false, true), (false, false)] {
+            let mut solver: radical::Solver = Default::default();
+            let a = 1i32; let b = 2i32; let aux = 3i32;
+            // encode_xnor_agree uses variables 1, 2, 3 — add a noop clause first
+            // to ensure var 3 exists in the solver's var range.
+            solver.add_clause([aux, -aux]);
+            encode_xnor_agree(&mut solver, aux, a, b);
+            solver.add_clause([if a_val { a } else { -a }]);
+            solver.add_clause([if b_val { b } else { -b }]);
+            assert_eq!(solver.solve(), Some(true),
+                "encode_xnor_agree UNSAT when pinning a={a_val} b={b_val}");
+            let expected = a_val == b_val;
+            assert_eq!(solver.value(aux), Some(expected),
+                "aux should be {expected} when a={a_val} b={b_val}");
+        }
     }
 
     #[test]
