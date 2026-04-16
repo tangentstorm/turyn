@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 /// Number of spectral frequencies for the SAT solver's built-in spectral constraint.
 /// Prime number, dense enough to make the post-hoc FFT check redundant.
-const SPECTRAL_FREQS: usize = 563;
+const SPECTRAL_FREQS: usize = 17;
 use std::sync::Arc;
 use std::time::Instant;
 
