@@ -73,7 +73,7 @@ lemma aperiodicAutocorr_neg (a : PmSeq) (s : Nat) :
 lemma aperiodicAutocorr_rev (a : PmSeq) (s : Nat) :
     aperiodicAutocorr a.reverse s = aperiodicAutocorr a s := by
       unfold aperiodicAutocorr;
-      split_ifs <;> simp_all +decide [ List.getD_eq_default ];
+      split_ifs <;> simp_all +decide;
       rw [ ← Finset.sum_range_reflect ];
       refine' Finset.sum_congr rfl fun i hi => _;
       grind
@@ -84,7 +84,7 @@ lemma aperiodicAutocorr_alt (a : PmSeq) (s : Nat) :
       unfold aperiodicAutocorr Turyn.altSeq;
       split_ifs <;> simp_all +decide [ Finset.mul_sum _ _ _ ];
       refine' Finset.sum_congr rfl fun i hi => _;
-      by_cases hi' : i < List.length a <;> by_cases hi'' : i + s < List.length a <;> simp_all +decide [ Nat.add_mod, Nat.mod_two_of_bodd ];
+      by_cases hi' : i < List.length a <;> by_cases hi'' : i + s < List.length a <;> simp_all +decide [Nat.mod_two_of_bodd];
       rcases Nat.even_or_odd' i with ⟨ k, rfl | rfl ⟩ <;> rcases Nat.even_or_odd' s with ⟨ l, rfl | rfl ⟩ <;> norm_num [ pow_add, pow_mul, Nat.mul_mod, Nat.pow_mod ]
 
 /-! ### IsTurynTypeProp preservation under each elementary transformation -/
@@ -378,7 +378,7 @@ lemma pm_entry_of_getD {X : PmSeq} (hpm : AllPmOne X) {i : Nat} (hi : i < X.leng
 lemma aperiodicAutocorr_last {n : Nat} {a : PmSeq} (ha : a.length = n) (hn : 1 < n) :
     aperiodicAutocorr a (n - 1) = a.getD 0 0 * a.getD (n - 1) 0 := by
       unfold aperiodicAutocorr;
-      rcases n with ( _ | _ | n ) <;> simp_all +decide [ Finset.sum_range_succ' ]
+      rcases n with ( _ | _ | n ) <;> simp_all +decide
 
 lemma endpoint_relation {n : Nat} (hn : 1 < n) (S : TurynTypeSeq n) :
     aAt S 1 * aAt S n + bAt S 1 * bAt S n + 2 * (cAt S 1 * cAt S n) = 0 := by
@@ -438,7 +438,6 @@ theorem equivalent_trans
     Equivalent n S T → Equivalent n T U → Equivalent n S U :=
   Relation.ReflTransGen.trans
 
-set_option maxHeartbeats 800000 in
 /-- Step 1: enforce condition (1) — normalize endpoint signs. -/
 theorem step1_condition1
     (n : Nat) (hn_even : n % 2 = 0) (hn : 2 ≤ n) (S : TurynTypeSeq n) :
@@ -504,7 +503,7 @@ theorem step1_condition1
         · convert hb using 1;
           exact altSeq_getD_zero _ ( by linarith [ S1.isTuryn.x_len, S1.isTuryn.y_len, S1.isTuryn.z_len, S1.isTuryn.w_len ] );
         · unfold bAt at *;
-          unfold altSeq; simp +decide [ *, Nat.even_iff ] ;
+          unfold altSeq; simp +decide [*] ;
           grind +splitImp;
         · simp_all +decide [ aAt, bAt, cAt, dAt, altSeq ];
           grind;
@@ -523,7 +522,6 @@ theorem step1_condition1
           aesop;
         exact ⟨ S1, hS1, ⟨ ha, h_last.1, hb, h_last.2, hc, hd ⟩ ⟩
 
-set_option maxHeartbeats 800000 in
 /-- Step 2: enforce condition (2) by optional reversal of `A`. -/
 theorem step2_condition2
     (n : Nat) (hn : 2 ≤ n) (S : TurynTypeSeq n)
@@ -547,12 +545,12 @@ theorem step2_condition2
       · unfold Canonical1 at *;
         unfold aAt bAt cAt dAt at *;
         cases n <;> simp_all +decide [ TurynTypeSeq.doRevA ];
-        have := S.isTuryn.x_len; simp_all +decide [ List.getElem?_reverse ] ;
+        have := S.isTuryn.x_len; simp_all +decide ;
       · intro j hj₁ hj₂ hj₃ hj₄;
         -- By definition of $doRevA$, we have $aAt S.doRevA j = aAt S (n + 1 - j)$.
         have h_rev : aAt S.doRevA j = aAt S (n + 1 - j) := by
           unfold aAt TurynTypeSeq.doRevA;
-          simp +decide [ List.getD_eq_default, Nat.sub_sub ];
+          simp +decide [Nat.sub_sub];
           rw [ List.getElem?_reverse ];
           · rw [ show List.length S.A = n from S.isTuryn.x_len ];
             rw [ show n - 1 - ( j - 1 ) = n - j from by omega ];
@@ -568,7 +566,7 @@ theorem step2_condition2
           grind;
         · cases lt_or_eq_of_le ( le_of_not_gt h_cases ) <;> simp_all +decide;
           · specialize hj₃ i hi.1 ( by linarith ) ; simp_all +decide [ TurynTypeSeq.doRevA ];
-            unfold aAt at * ; simp_all +decide [ List.getElem?_reverse ];
+            unfold aAt at * ; simp_all +decide;
             rw [ List.getElem?_reverse, List.getElem?_reverse ] at *;
             · rw [ show List.length S.A = n from S.isTuryn.x_len ] at *;
               grind;
@@ -596,20 +594,20 @@ theorem step3_condition3
           · exact .single ( Elementary.revB S );
           · unfold Canonical1 at *;
             unfold aAt bAt cAt dAt at *;
-            simp_all +decide [ List.getD_eq_default ];
+            simp_all +decide;
             rw [ List.getElem?_reverse, List.getElem?_reverse ];
             · have := S.isTuryn; cases this; aesop;
             · grind;
             · linarith [ S.isTuryn.x_len, S.isTuryn.y_len, S.isTuryn.z_len, S.isTuryn.w_len ];
-          · intro j hj1 hj2 hj3 hj4; have := h12.2 j hj1 hj2; simp_all +decide [ TurynTypeSeq.doRevB ] ;
+          · intro j hj1 hj2 hj3 hj4; have := h12.2 j hj1 hj2; simp_all +decide ;
             unfold aAt at *; aesop;
           · intro j hj1 hj2 hj3 hj4; simp_all +decide [ bAt ] ;
             rw [ List.getElem?_reverse, List.getElem?_reverse ] at * ; simp_all +decide [ Nat.sub_sub ];
             · have := S.isTuryn.y_pm; simp_all +decide [ AllPmOne ] ;
               cases this ( S.B[List.length S.B - j]?.getD 0 ) ( by
-                have := S.isTuryn.y_len; simp_all +decide [ Nat.sub_sub ] ;
-                grind +ring ) <;> simp_all +decide [ Nat.sub_sub ];
-              have := S.isTuryn.y_len; simp_all +decide [ Nat.sub_sub ] ;
+                have := S.isTuryn.y_len; simp_all +decide ;
+                grind +ring ) <;> simp_all +decide;
+              have := S.isTuryn.y_len; simp_all +decide ;
               grind +ring;
             · have := S.isTuryn.y_len; simp_all +decide [ Nat.sub_sub ] ;
               exact ⟨ by linarith, by linarith ⟩;
@@ -714,14 +712,14 @@ theorem step5_condition5
           · unfold Canonical1 at *;
             unfold aAt bAt cAt dAt at *;
             rcases n with ( _ | _ | n ) <;> simp_all +decide [ TurynTypeSeq.doRevD ];
-            have := S.isTuryn.w_len; simp_all +decide [ List.getElem?_reverse ] ;
+            have := S.isTuryn.w_len; simp_all +decide ;
           · exact h1234.2.1;
           · exact h1234.2.2.1;
           · exact h1234.2.2.2;
           · intro j hj1 hj2 hj3 hj4;
             -- By definition of `doRevD`, we have `dAt S.doRevD j = dAt S (n - j)`.
             have h_revD : dAt S.doRevD j = dAt S (n - j) := by
-              exact?;
+              exact dAt_doRevD S hj1 hj2;
             by_cases hj5 : j < i;
             · have h_revD : dAt S.doRevD (n - j) = dAt S j := by
                 convert dAt_doRevD S ( show 1 ≤ n - j from Nat.sub_pos_of_lt ( by omega ) ) ( show n - j ≤ n - 1 from Nat.sub_le_sub_left ( by omega ) _ ) using 1;
@@ -846,26 +844,26 @@ theorem step6_condition6
           · refine' ⟨ _, _, _, _, _, _, _ ⟩;
             exact .single ( Elementary.swap S );
             all_goals unfold Canonical1 at *; simp_all +decide [ TurynTypeSeq.doSwap ] ;
-            all_goals unfold aAt bAt cAt dAt at *; simp_all +decide [ TurynTypeSeq ] ;
+            all_goals unfold aAt bAt cAt dAt at *; simp_all +decide
             · grind +locals;
             · exact h12345.2.1;
             · exact h12345.2.2.2.1;
             · exact h12345.2.2.2.2;
-            · rcases n with ( _ | _ | _ | n ) <;> simp_all +decide [ Nat.sub_sub ];
-              have := S.isTuryn; rcases this with ⟨ hA, hB, hC, hD, hA', hB', hC', hD', h ⟩ ; simp_all +decide [ Nat.add_mod, Nat.mod_two_of_bodd ] ;
-              cases hA' ( S.A[n + 1] ) ( by simp ) <;> cases hB' ( S.B[n + 1] ) ( by simp ) <;> simp_all +decide only [Nat.succ_eq_add_one] ;
+            · rcases n with ( _ | _ | _ | n ) <;> simp_all +decide;
+              have := S.isTuryn; rcases this with ⟨ hA, hB, hC, hD, hA', hB', hC', hD', h ⟩ ; simp_all +decide [Nat.mod_two_of_bodd] ;
+              cases hA' ( S.A[n + 1] ) ( by simp ) <;> cases hB' ( S.B[n + 1] ) ( by simp ) <;> simp_all +decide only
               · specialize h ( n + 1 ) ; simp_all +decide [ combinedAutocorr ] ;
-                unfold aperiodicAutocorr at h; simp_all +decide [ List.getElem?_eq_getElem ] ;
+                unfold aperiodicAutocorr at h; simp_all +decide
                 simp_all +decide [ Finset.sum_range_succ ];
-                simp_all +decide [ add_comm 1, add_left_comm 1 ];
+                simp_all +decide [add_comm 1]
                 cases hB' ( S.B[1] ) ( by simp ) <;> cases hC' ( S.C[n + 1] ) ( by simp ) <;> cases hC' ( S.C[1] ) ( by simp ) <;> cases hC' ( S.C[n + 1 + 1] ) ( by simp ) <;> cases hD' ( S.D[n + 1] ) ( by simp ) <;> simp_all ( config := { decide := Bool.true } ) only [ ] ;
               · norm_num;
               · specialize h ( n + 1 ) ; simp_all +decide [ combinedAutocorr ];
-                unfold aperiodicAutocorr at h; simp_all +decide [ List.getElem?_eq_getElem ] ;
+                unfold aperiodicAutocorr at h; simp_all +decide
                 simp_all +decide [ Finset.sum_range_succ ];
-                simp_all +decide [ add_comm 1, add_left_comm 1 ];
-                cases hB' ( S.B[1] ) ( by simp ) <;> cases hC' ( S.C[n + 1] ) ( by simp ) <;> cases hC' ( S.C[n + 1 + 1] ) ( by simp ) <;> cases hD' ( S.D[n + 1] ) ( by simp ) <;> simp_all +decide only [Nat.succ_eq_add_one] ;
-                all_goals cases hC' ( S.C[1] ) ( by simp ) <;> simp_all +decide only [Nat.succ_eq_add_one] ;
+                simp_all +decide [add_comm 1]
+                cases hB' ( S.B[1] ) ( by simp ) <;> cases hC' ( S.C[n + 1] ) ( by simp ) <;> cases hC' ( S.C[n + 1 + 1] ) ( by simp ) <;> cases hD' ( S.D[n + 1] ) ( by simp ) <;> simp_all +decide only
+                all_goals cases hC' ( S.C[1] ) ( by simp ) <;> simp_all +decide only ;
 
 /-- Every equivalence class of Turyn-type sequences has a canonical representative.
 
