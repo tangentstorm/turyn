@@ -824,14 +824,15 @@ wall-clock to find solution (currently ~29s).
 - **F1: SPECTRAL_FREQS reduction** — ACCEPTED. 6.2× speedup. Moved to
   `docs/OPTIMIZATION_LOG.md`. Changed constant from 563 to 17.
 
-- **F2: Cache spectral cos/sin tables across SolveWZ calls**: Per-boundary
-  in SolveWZ allocates fresh `cos_table`, `sin_table`, `amplitudes`
-  (3 × middle_total × SPECTRAL_FREQS f32 = ~210KB each). At ~100
-  boundaries/s/thread that's ~63MB/s of churn. The tables depend only on
-  (n, m, k, total_mid, nf) — all run-time constants. Precompute once,
-  share via `Arc`.
-  Single commit: hoist these allocations into `MddCtx` as `Arc<Vec<f32>>`,
-  read-only at SolveWZ build time.
+- **F2: Cache spectral cos/sin tables across SolveWZ calls** — TRIED,
+  rejected. Implemented `WzCombinedSpectral` struct in `PhaseBContext` with
+  Arc'd cos/sin/amplitudes + boundary-DFT fallback to `{w,z}_spectral_tables.pos_cos`.
+  Result at n=26 wz=together mdd-k=5 (4 threads, 7 runs): 16.43 median
+  eff bnd/s vs F1-only baseline 16.47 median — **neutral** (within noise).
+  After F1 reduced SPECTRAL_FREQS to 17, the per-boundary table allocation
+  is only ~2KB × 3 = 6KB per boundary, and the trig calls are only
+  17 × 31 = ~520. The SAT solve time dominates, so avoiding this setup
+  cost buys nothing. Reverted.
 
 - **F3: Cache trig values for spectral DFT**: The boundary DFT loop
   computes `(omega * pos).cos()` and `(omega * pos).sin()` for every
