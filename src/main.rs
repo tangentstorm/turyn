@@ -5466,10 +5466,11 @@ fn print_help() {
     eprintln!();
     eprintln!("  --n=<N>                  Sequence length to search (required)");
     eprintln!();
-    eprintln!("SEARCH MODE (default is --wz=cross). All three modes load the same MDD");
-    eprintln!("(mdd-<k>.bin) for XY boundary enumeration and feed the same XY SAT fast");
-    eprintln!("path; they differ only in how (Z, W) candidate pairs are generated.");
-    eprintln!("  --wz=cross               (default) Brute-force full Z × full W, spectral-");
+    eprintln!("SEARCH MODE. All three modes load the same MDD (mdd-<k>.bin) for XY boundary");
+    eprintln!("enumeration and feed the same XY SAT fast path; they differ only in how");
+    eprintln!("(Z, W) candidate pairs are generated. Default: --wz=together when n>=24 and");
+    eprintln!("an MDD file exists, otherwise --wz=cross.");
+    eprintln!("  --wz=cross               Brute-force full Z × full W, spectral-");
     eprintln!("                           filter each side, cross-match via SpectralIndex.");
     eprintln!("  --wz=apart               MDD boundary walker + SolveW → SolveZ two-stage SAT");
     eprintln!("                           pipeline. Implied by --mdd-k=N and --mdd-extend=N.");
@@ -5520,7 +5521,8 @@ fn print_help() {
     eprintln!("  -h, --help               Show this help message");
     eprintln!();
     eprintln!("EXAMPLES:");
-    eprintln!("  turyn --n=26                           # search for TT(26) (--wz=cross)");
+    eprintln!("  turyn --n=26                           # auto-selects --wz=together if MDD exists");
+    eprintln!("  turyn --n=26 --wz=cross                # force brute-force Z×W mode");
     eprintln!("  turyn --n=26 --wz=apart --mdd-k=7      # MDD boundary walker, SolveW→SolveZ");
     eprintln!("  turyn --n=26 --wz=together --mdd-k=7   # MDD boundary walker, combined W+Z SAT");
     eprintln!("  turyn --n=18 --mdd-k=5                 # shorthand: implies --wz=apart");
@@ -5968,8 +5970,26 @@ fn main() {
         // The runner's monitor thread either enumerates Z × W pairs
         // (--wz=cross) or walks MDD boundaries (--wz=apart|together),
         // feeding the same DualQueue + worker loop + XY SAT stage.
-        let mode = cfg.effective_wz_mode();
         let mut cfg = cfg.clone();
+        // Auto-upgrade: when the user didn't pick a --wz mode, n >= 24,
+        // and an MDD file is available, default to Together (13× faster
+        // TTC than Cross at n=26 thanks to coupled WZ per-lag constraints).
+        // Use mdd_k=5 for Together (smaller k → fewer boundary positions →
+        // more middle freedom for the coupled WZ SAT to exploit).
+        if cfg.wz_mode.is_none() && cfg.problem.n >= 24 {
+            let default_k = cfg.mdd_k == SearchConfig::default().mdd_k;
+            let try_k = if default_k { 5 } else { cfg.mdd_k };
+            let max_k = try_k.min((cfg.problem.n - 1) / 2);
+            let has_mdd = (1..=max_k).rev().any(|k| std::path::Path::new(&format!("mdd-{}.bin", k)).exists());
+            if has_mdd {
+                cfg.wz_mode = Some(WzMode::Together);
+                if default_k { cfg.mdd_k = 5; }
+                if cfg.mdd_extend == 0 {
+                    cfg.mdd_extend = 1;
+                }
+            }
+        }
+        let mode = cfg.effective_wz_mode();
         // Cross mode historically used k=7 for XY enumeration; preserve
         // that default when the user hasn't passed an explicit --mdd-k.
         if mode == WzMode::Cross && cfg.mdd_k == SearchConfig::default().mdd_k {
