@@ -2904,6 +2904,15 @@ struct SolveWZWork {
     /// boundaries would monopolise the workers and we'd never cover
     /// the space).
     attempt: u32,
+    /// Blocking clauses for (W, Z) pairs already enumerated by earlier
+    /// attempts on this boundary.  Persisting these across re-queues is
+    /// what makes this a true "defer never cancel" search: every attempt
+    /// picks up where the last left off, so eventually SAT proves
+    /// `Some(false)` (no more (W, Z) pairs exist) for every boundary.
+    /// Literals refer to the stable W[0..middle_m] / Z[0..middle_n]
+    /// middle vars (numbered 1..=middle_m+middle_n), which have the
+    /// same IDs in every freshly-built solver for this boundary.
+    prior_blocks: Vec<Vec<i32>>,
 }
 
 struct SolveWWork {
@@ -3343,6 +3352,13 @@ fn run_mdd_sat_search(
     // Per-stage enter/exit counters: depth = enter - exit.
     let stage_enter: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
     let stage_exit: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
+    // Count of Boundary items pending in the work queue OR being processed
+    // by a worker (not yet converted to SolveW/SolveWZ).  Used by the MDD
+    // walker to throttle the push rate — without this it'd either flood
+    // the queue upfront (memory) or (worse) stall when the queue fills
+    // with deferred re-queued SolveWZ items at negative priority, never
+    // making room for fresh boundaries.
+    let pending_boundaries = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let sat_config = cfg.sat_config.clone();
     // SAT config: use defaults (EMA restarts/vivification/chrono BT tested and regressed)
@@ -3398,6 +3414,7 @@ fn run_mdd_sat_search(
         let flow_wz_budget_hit = Arc::clone(&flow_wz_budget_hit);
         let stage_enter: Vec<_> = stage_enter.iter().map(Arc::clone).collect();
         let stage_exit: Vec<_> = stage_exit.iter().map(Arc::clone).collect();
+        let pending_boundaries = Arc::clone(&pending_boundaries);
         let sat_config = sat_config.clone();
 
         handles.push(std::thread::spawn(move || {
@@ -3449,6 +3466,8 @@ fn run_mdd_sat_search(
                         // TRACE: check if this is the known solution's boundary
                         let trace_bnd = bnd.z_bits == 43 && bnd.w_bits == 47;
                         if trace_bnd { eprintln!("TRACE: found target boundary z=43 w=47 xy_root={}", bnd.xy_root); }
+                        // Boundary dequeued — the walker is free to push another.
+                        pending_boundaries.fetch_sub(1, AtomicOrdering::Relaxed);
                         // Check sum feasibility for each tuple, emit SolveW items
                         let z_bnd_sum = 2 * (bnd.z_bits.count_ones() as i32) - ctx.max_bnd_sum;
                         let w_bnd_sum = 2 * (bnd.w_bits.count_ones() as i32) - ctx.max_bnd_sum;
@@ -3498,6 +3517,7 @@ fn run_mdd_sat_search(
                                 xy_root: bnd.xy_root,
                                 candidate_tuples,
                                 attempt: 0,
+                                prior_blocks: Vec::new(),
                             })
                         } else {
                             PipelineWork::SolveW(SolveWWork {
@@ -4023,6 +4043,20 @@ fn run_mdd_sat_search(
                             }
                         }
 
+                        // Inject blocking clauses accumulated from earlier
+                        // attempts on this boundary.  Each block rules out
+                        // one previously-enumerated (W, Z) middle; they use
+                        // stable W/Z middle var IDs (1..=total_vars) so
+                        // they remain valid in this freshly-built solver.
+                        // Persisting these across re-queues is what makes
+                        // the search eventually reach SAT's Some(false)
+                        // rather than redundantly re-enumerating the same
+                        // (W, Z) orbits with different phase RNG each
+                        // attempt.
+                        for block in &swz.prior_blocks {
+                            solver.add_clause(block.iter().copied());
+                        }
+
                         let wz_d0 = solver.num_decisions();
                         let wz_p0 = solver.num_propagations();
                         let wz_l0 = solver.num_level0_vars();
@@ -4054,6 +4088,11 @@ fn run_mdd_sat_search(
                         // solve() = conflict limit, or hit max_z cap),
                         // vs. fully exhausted (Some(false) = UNSAT proved).
                         let mut more_possible = false;
+                        // New blocking clauses produced in THIS attempt.
+                        // If the attempt is deferred via re-queue, these
+                        // plus the prior_blocks get passed forward so the
+                        // next attempt skips already-found (W, Z) pairs.
+                        let mut new_blocks: Vec<Vec<i32>> = Vec::new();
                         loop {
                             if ctx.found.load(AtomicOrdering::Relaxed) { break; }
                             if wz_count >= ctx.max_z {
@@ -4113,12 +4152,16 @@ fn run_mdd_sat_search(
                             z_vals.extend_from_slice(&z_mid);
                             z_vals.extend_from_slice(&z_boundary[n-k..]);
 
-                            // Block this (W,Z) pair
+                            // Block this (W,Z) pair.  Also stash the clause
+                            // in new_blocks so it survives re-queue: the
+                            // next attempt's fresh solver will re-add it
+                            // together with swz.prior_blocks.
                             let block: Vec<i32> = (0..total_vars as i32 + 1).skip(1).map(|v| {
                                 if solver.value(v) == Some(true) { -v } else { v }
                             }).collect();
                             solver.reset();
-                            solver.add_clause(block);
+                            solver.add_clause(block.iter().copied());
+                            new_blocks.push(block);
 
                             // Combined spectral in solver guarantees pair bound.
                             // Compute spectra only for downstream use.
@@ -4266,6 +4309,14 @@ fn run_mdd_sat_search(
                             // accumulated budget.
                             let priority = -0.001 * (swz.attempt + 1) as f64;
                             stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
+                            // Carry prior blocks forward, appending the ones
+                            // produced this attempt.  Without this, the next
+                            // attempt would rebuild a fresh solver that
+                            // doesn't know which (W, Z) pairs have already
+                            // been tried, and would redundantly re-enumerate
+                            // the same orbits with different phase RNG.
+                            let mut carried_blocks = swz.prior_blocks;
+                            carried_blocks.extend(new_blocks);
                             wq.push_with_priority(
                                 PipelineWork::SolveWZ(SolveWZWork {
                                     tuple: swz.tuple,
@@ -4274,6 +4325,7 @@ fn run_mdd_sat_search(
                                     xy_root: swz.xy_root,
                                     candidate_tuples: swz.candidate_tuples.clone(),
                                     attempt: swz.attempt + 1,
+                                    prior_blocks: carried_blocks,
                                 }),
                                 priority,
                             );
@@ -4818,6 +4870,7 @@ fn run_mdd_sat_search(
         // Feed the queue when depth is low.
         let work_depth = work_queue.work_len();
         let gold_depth = work_queue.gold_len();
+        let pending_bnd = pending_boundaries.load(AtomicOrdering::Relaxed) as usize;
         if wz_mode == WzMode::Cross {
             // Cross: process the next tuple and stream its (Z, W) pairs as
             // SolveXY items. Apply backpressure via gold queue depth so we
@@ -4875,9 +4928,13 @@ fn run_mdd_sat_search(
                     cross_done = true;
                 }
             }
-        } else if work_depth < queue_target {
+        } else if pending_bnd < queue_target {
             // Apart/Together: walk MDD paths and push Boundary items when
-            // the work queue is low.
+            // the *pending boundary* count is low.  (We can't gate on the
+            // whole work_queue depth because deferred SolveWZ re-queues at
+            // negative priority pile up and would otherwise starve the
+            // walker of its queue budget, stranding the search on a handful
+            // of boundaries that just cycle through re-queue forever.)
             if let Some(ref outfix) = cfg.test_outfix {
                 // --outfix: restrict the search to one specific boundary.
                 // Navigate directly to it (no MDD path walk), emit once,
@@ -4889,6 +4946,7 @@ fn run_mdd_sat_search(
                         outfix.z_bits, outfix.w_bits,
                     ) {
                         boundaries_walked.fetch_add(1, AtomicOrdering::Relaxed);
+                        pending_boundaries.fetch_add(1, AtomicOrdering::Relaxed);
                         work_queue.push(PipelineWork::Boundary(BoundaryWork {
                             z_bits: outfix.z_bits, w_bits: outfix.w_bits, xy_root,
                         }));
@@ -4912,6 +4970,7 @@ fn run_mdd_sat_search(
                     let bnd = mdd_navigate_path(mdd.root, zw_depth, path, &full_pos_order, &mdd.nodes);
                     if let Some((z_bits, w_bits, xy_root)) = bnd {
                         boundaries_walked.fetch_add(1, AtomicOrdering::Relaxed);
+                        pending_boundaries.fetch_add(1, AtomicOrdering::Relaxed);
                         work_queue.push(PipelineWork::Boundary(BoundaryWork { z_bits, w_bits, xy_root }));
                         fed += 1;
                     }
