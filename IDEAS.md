@@ -834,20 +834,16 @@ wall-clock to find solution (currently ~29s).
   17 × 31 = ~520. The SAT solve time dominates, so avoiding this setup
   cost buys nothing. Reverted.
 
-- **F3: Cache trig values for spectral DFT**: The boundary DFT loop
-  computes `(omega * pos).cos()` and `(omega * pos).sin()` for every
-  boundary position × every frequency × every boundary, even though
-  `pos`, `omega` (= function of fi only), and the trig values are all
-  deterministic. Pre-compute a `pos × freq` cos/sin lookup table once
-  per (n, k) and read from it.
-  Single commit: add `boundary_cos_table[pos * nf + fi]` to MddCtx,
-  replace the per-boundary trig calls with table lookups.
+- **F3: Cache trig values for spectral DFT** — TRIED (as F3a buffer reuse
+  in per-lag loop), within-noise improvement (~2.4%). Not decisive
+  enough to commit. The per-boundary DFT loop is fast after F1
+  (SPECTRAL_FREQS=17).
 
-- **F4: Skip per-lag constraint when problem is small**: For n ≤ 22 the
-  per-lag PB-range constraint adds many quad terms (≈O(n³)) that
-  outweigh the propagation benefits. Make it an `if n >= some_threshold`
-  conditional and benchmark threshold values (20, 22, 24, 26).
-  Single commit: gate the per-lag PB constraint block on `n >= 24`.
+- **F4: Skip per-lag constraint entirely** — TRIED, rejected.
+  Removing the per-lag quadratic PB constraint at n=26 k=7 gives
+  +35% bnd/s (1700 → 2300), but regresses n=22 finding rate from
+  3/10 to 1/10. The per-lag constraint provides real pruning — it
+  just has high setup cost. F9/F12 might be better approaches.
 
 - **F5: Reuse PbSetEq counts via dedup HashSet**: The current
   `if !w_counts.contains(&c) { w_counts.push(c); }` inside a loop is
