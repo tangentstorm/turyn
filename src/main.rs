@@ -200,6 +200,118 @@ fn print_solution(label: &str, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &
     let _ = lock.flush();
 }
 
+/// A specific (Z, W) boundary — optionally also (X, Y) — encoded as hex
+/// prefix/suffix pairs.  Each `*_bits` value follows the internal
+/// encoding used by `expand_boundary_bits`: bit `i` of the prefix/suffix
+/// word is position `i` of the corresponding k-length prefix/suffix,
+/// with LSB = leftmost position.
+#[derive(Clone, Copy, Debug)]
+struct OutfixSpec {
+    z_bits: u32,
+    w_bits: u32,
+    /// Optional XY pinning (same encoding as z_bits/w_bits).  When set,
+    /// the XY search is restricted to this single (x_bits, y_bits).
+    xy_bits: Option<(u32, u32)>,
+}
+
+/// Parse `--outfix=<prefHex>...<sufHex>`.  BDKR hex encoding: each hex
+/// digit packs all four sequences (A, B, C, D) = (X, Y, Z, W) at one
+/// position.  With `+1 → 0, -1 → 1` bit polarity, the digit is
+/// `8·bit(A) + 4·bit(B) + 2·bit(C) + bit(D)`.  The last digit (position
+/// `n-1`) is 3-bit (only A, B, C, since W has length `n-1`).
+///
+/// `prefHex` has `k` digits (positions `0..k`).  `sufHex` has `k+1`
+/// digits (positions `n-1-k..n`): the leading digit picks up `W[n-1-k]`
+/// (the first element of W's boundary suffix, which BDKR places one
+/// digit earlier than X/Y/Z's suffix), the next `k-1` digits fill in
+/// the rest of the 4-bit suffix, and the trailing digit is the 3-bit
+/// `h_{n-1}`.
+///
+/// Example (canonical TT(18) at `k=5`):
+/// ```text
+///   X = "++-+++++++++-+--++"
+///   Y = "++----++-+---+-+-+"
+///   Z = "++-+++----+-+-++--"
+///   W = "++----+--+--+++-+"
+///     h_0..h_4   = 00f55         (prefix, k=5 digits)
+///     h_12..h_17 = c2c961        (suffix, k+1=6 digits; last digit 001=1 is 3-bit)
+///   --outfix=00f55...c2c961
+/// ```
+fn parse_outfix(s: &str, n: usize, k: usize) -> Result<OutfixSpec, String> {
+    let parts: Vec<&str> = s.split("...").collect();
+    if parts.len() != 2 {
+        return Err(format!("--outfix: expected 'prefHex...sufHex', got '{s}'"));
+    }
+    let pref_hex = parts[0].trim_start_matches("0x");
+    let suf_hex = parts[1].trim_start_matches("0x");
+    if pref_hex.len() != k {
+        return Err(format!("--outfix: prefix has {} hex digits, expected k={k}", pref_hex.len()));
+    }
+    if suf_hex.len() != k + 1 {
+        return Err(format!("--outfix: suffix has {} hex digits, expected k+1={}", suf_hex.len(), k + 1));
+    }
+    fn hex_digit(c: char) -> Result<u32, String> {
+        c.to_digit(16).ok_or_else(|| format!("--outfix: '{c}' is not a hex digit"))
+    }
+    // BDKR: bit polarity 0=+1, 1=-1.  Internal expand_boundary_bits:
+    // bit 1 = +1.  So internal_bit = 1 - bdkr_bit = !bdkr_bit.
+    let set = |bits: &mut u32, pos: usize, bdkr_bit: u32| {
+        if bdkr_bit == 0 {
+            *bits |= 1 << pos;
+        }
+    };
+    let (mut x_bits, mut y_bits, mut z_bits, mut w_bits) = (0u32, 0u32, 0u32, 0u32);
+    // Prefix: h_0..h_{k-1}, all 4-bit.
+    for (i, c) in pref_hex.chars().enumerate() {
+        let d = hex_digit(c)?;
+        set(&mut x_bits, i, (d >> 3) & 1);
+        set(&mut y_bits, i, (d >> 2) & 1);
+        set(&mut z_bits, i, (d >> 1) & 1);
+        set(&mut w_bits, i, d & 1);
+    }
+    // Suffix: k+1 digits covering positions n-1-k..n-1.
+    // - Digit 0 (h_{n-1-k}) is 4-bit.  We take ONLY its D bit (W[n-1-k]).
+    //   X/Y/Z values at position n-1-k are middle (not boundary).
+    //   Internal w_bits suffix starts at bit k (position 0 of the suffix).
+    // - Digits 1..k-1 (h_{n-k}..h_{n-2}) are 4-bit.  Full 4-sequence.
+    //   Internal suffix bit = k + i (where i is the digit index among 1..k).
+    //   X/Y/Z suffix starts at digit 1; internal suffix bit for digit (1+j) = k + j.
+    //   W suffix for digit (1+j) corresponds to internal w suffix bit k + (1+j-1) = k + j.
+    //   Hmm — but W suffix internal bit k corresponds to W[n-1-k] (digit 0); bit k+1 to W[n-k] (digit 1); etc.
+    //   So W suffix digit i (0..k) → internal w bit k + i.
+    // - Digit k (h_{n-1}) is 3-bit.  No W.  X/Y/Z at position n-1 → X/Y/Z suffix internal bit 2k-1.
+    let suf_chars: Vec<char> = suf_hex.chars().collect();
+    for (i, &c) in suf_chars.iter().enumerate() {
+        let d = hex_digit(c)?;
+        if i == 0 {
+            // h_{n-1-k}: only W's bit matters for the boundary.
+            if d > 0xf { return Err(format!("--outfix: suffix digit 0 '{c}' > f")); }
+            set(&mut w_bits, k, d & 1);
+        } else if i < k {
+            // h_{n-k+(i-1)} = h_{n-1-k+i}: 4-bit.  XYZ map to position (i-1) of the XYZ suffix.
+            // Internal bit: for XYZ, suffix bit (i-1), so absolute bit k + (i-1).
+            //               for W, suffix bit i, so absolute bit k + i.
+            if d > 0xf { return Err(format!("--outfix: suffix digit {i} '{c}' > f")); }
+            set(&mut x_bits, k + (i - 1), (d >> 3) & 1);
+            set(&mut y_bits, k + (i - 1), (d >> 2) & 1);
+            set(&mut z_bits, k + (i - 1), (d >> 1) & 1);
+            set(&mut w_bits, k + i, d & 1);
+        } else {
+            // i == k, last digit h_{n-1}: 3-bit, only A, B, C.
+            if d > 0x7 { return Err(format!("--outfix: last suffix digit '{c}' > 7 (must be 3-bit)")); }
+            set(&mut x_bits, k + (i - 1), (d >> 2) & 1);
+            set(&mut y_bits, k + (i - 1), (d >> 1) & 1);
+            set(&mut z_bits, k + (i - 1), d & 1);
+        }
+    }
+    // Silence unused-variable warnings when n is only used for validation.
+    let _ = n;
+    Ok(OutfixSpec {
+        z_bits, w_bits,
+        xy_bits: Some((x_bits, y_bits)),
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 struct SumTuple {
     x: i32,
@@ -211,23 +323,28 @@ struct SumTuple {
 impl SumTuple {
     /// Normalization key for tuple deduplication in hybrid search.
     ///
-    /// Unsigned and X↔Y-sorted: `(max(|σ_X|,|σ_Y|), min(|σ_X|,|σ_Y|),
-    /// |σ_Z|, |σ_W|)`.  This folds T1 (per-sequence negation) and T4
-    /// (X↔Y swap) into the tuple key.  Sign freedom is restored per
+    /// Unsigned only (folds T1, per-sequence negation):
+    /// `(|σ_X|, |σ_Y|, |σ_Z|, |σ_W|)`.  Sign freedom is restored per
     /// sequence inside the SAT via `PbSetEq`, whose `V` is built from
     /// `{+|σ|, -|σ|}` of the stored tuple (and, for the MDD pipeline's
-    /// middle SATs, shifted by the boundary contribution).  Rule (vi)
-    /// still breaks T4 at the position level so the SAT picks X vs. Y
-    /// correctly once it sees both `σ_X` and `σ_Y` options.
+    /// middle SATs, shifted by the boundary contribution).
+    ///
+    /// Does **not** fold T4 (X↔Y swap).  Rule (vi) breaks T4 at the
+    /// position level — the canonical representative has a specific
+    /// (σ_X, σ_Y) orientation, and the orbit's T4-image has a
+    /// *different* orientation that fails rule (vi) on the same
+    /// position bits.  Sorting |σ_X|, |σ_Y| here would silently
+    /// exclude orbits whose canonical has max(|σ_X|, |σ_Y|) = |σ_Y|
+    /// (e.g., TT(26) canonical has σ = (−4, +8, −6, +1): σ_Y is the
+    /// max).  We accept the up-to-2× tuple-enumeration cost to keep
+    /// every orbit reachable.
     ///
     /// Verified empirically at n=6: 4 distinct BDKR orbits exist and
     /// 2 of them have at least one negative sum in their canonical
     /// representative.  Under this unsigned key + `PbSetEq` sum
-    /// encoding, all 4 orbits are reachable via a single tuple each.
+    /// encoding, all 4 orbits are reachable.
     fn norm_key(&self) -> (i32, i32, i32, i32) {
-        let (ax, ay) = (self.x.abs(), self.y.abs());
-        let (hi, lo) = if ax >= ay { (ax, ay) } else { (ay, ax) };
-        (hi, lo, self.z.abs(), self.w.abs())
+        (self.x.abs(), self.y.abs(), self.z.abs(), self.w.abs())
     }
 
 }
@@ -264,6 +381,12 @@ struct SearchConfig {
     conflict_limit: u64,
     /// Test a specific sum-tuple (x,y,z,w) only.
     test_tuple: Option<SumTuple>,
+    /// Force the MDD search to only visit one specific (Z, W) boundary.
+    /// Format: `z_pref_hex...z_suf_hex:w_pref_hex...w_suf_hex`.  Each hex
+    /// encodes `k` bits with position 0 as LSB (same encoding as the
+    /// internal `z_bits` / `w_bits`).  E.g., at `k=7`, the canonical
+    /// TT(26) boundary is `--outfix=03...21:5f...51`.
+    test_outfix: Option<OutfixSpec>,
     /// Run only Phase A (print tuples) or Phase B (print Z/W pairs).
     phase_only: Option<String>,
     /// Dump DIMACS CNF to this path instead of solving.
@@ -325,6 +448,7 @@ impl Default for SearchConfig {
             test_zw: None,
             conflict_limit: 0,
             test_tuple: None,
+            test_outfix: None,
             phase_only: None,
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
@@ -448,6 +572,7 @@ fn sigma_full_to_cnt(sigma_full: i32, sigma_bnd: i32, l_mid: usize) -> Option<u3
 /// Also returns the inverse map `count → [(tuple_idx, signed_sigma_full)]`
 /// so callers can narrow the surviving tuple list once the SAT locks in a
 /// specific count.
+#[allow(dead_code)] // reference helper; see `sanity_check_canonical_tt` in tests
 fn valid_mid_counts<F>(
     tuples: &[SumTuple],
     sigma_abs_of: F,
@@ -1583,6 +1708,7 @@ fn build_xy_lag_pairs(n: usize) -> Option<(Vec<LagPairs>, usize)> {
     Some((lag_pairs, n))
 }
 
+#[allow(dead_code)] // kept as a convenience wrapper (single-tuple = 1-element slice)
 fn build_sat_xy_clauses(
     problem: Problem,
     tuple: SumTuple,
@@ -2238,6 +2364,7 @@ impl SatEncoder {
     }
 
     /// Encode exactly `target` of `lits` must be true, using the totalizer.
+    #[allow(dead_code)] // totalizer-based alternative to PbEq; kept for fallback
     fn encode_cardinality_eq(
         &mut self,
         solver: &mut impl SatSolver,
@@ -2652,8 +2779,6 @@ struct SolveWZWork {
     z_bits: u32,
     w_bits: u32,
     xy_root: u32,
-    z_mid_sum: i32,
-    w_mid_sum: i32,
     /// All tuples this boundary is compatible with; the combined SAT
     /// sees `V_w` = union of ±|σ_W| counts and `V_z` = union of ±|σ_Z|
     /// counts across this list.
@@ -2667,8 +2792,6 @@ struct SolveWWork {
     z_bits: u32,
     w_bits: u32,
     xy_root: u32,
-    z_mid_sum: i32,
-    w_mid_sum: i32,
     /// All unsigned tuples this boundary is compatible with.  The W SAT
     /// is built with a `PbSetEq` over the union of their ±|σ_W| counts;
     /// each solved W middle decodes to a specific σ_W which narrows this
@@ -2683,17 +2806,36 @@ struct SolveZWork {
     w_vals: Vec<i8>,
     w_spectrum: Vec<f64>,
     xy_root: u32,
-    z_mid_sum: i32,
     /// Tuples surviving the σ_W narrowing (|σ_W| of candidate matches
     /// the W the solver locked in).  The Z SAT is built with a
     /// `PbSetEq` over the union of their ±|σ_Z| counts.
     candidate_tuples: Vec<SumTuple>,
-    /// The signed σ_W locked in by SolveW (for rule-aware narrowing).
-    sigma_w_full: i32,
 }
 
 struct SolveXYWork {
     item: SatWorkItem,
+}
+
+/// Navigate the MDD to a specific (z_bits, w_bits) boundary, returning
+/// the XY sub-root anchored at that boundary.  Returns `None` if the
+/// boundary does not exist in the MDD (pruned away during gen).
+fn mdd_navigate_to_outfix(
+    root: u32, zw_depth: usize, pos_order: &[usize], nodes: &[[u32; 4]],
+    z_bits: u32, w_bits: u32,
+) -> Option<u32> {
+    let mut nid = root;
+    for level in 0..zw_depth {
+        if nid == mdd_reorder::DEAD { return None; }
+        let pos = pos_order[level];
+        let z_bit = (z_bits >> pos) & 1;
+        let w_bit = (w_bits >> pos) & 1;
+        let branch = (z_bit | (w_bit << 1)) as usize;
+        if nid != mdd_reorder::LEAF {
+            nid = nodes[nid as usize][branch];
+            if nid == mdd_reorder::DEAD { return None; }
+        }
+    }
+    Some(nid)
 }
 
 /// Navigate the MDD along a deterministic path to reach one boundary.
@@ -2748,6 +2890,10 @@ struct PhaseBContext {
     z_spectral_tables: Option<radical::SpectralTables>,
     w_spectral_tables: Option<radical::SpectralTables>,
     found: Arc<AtomicBool>,
+    /// When `--outfix=...:X:Y` is supplied, restrict the XY sub-MDD
+    /// walk to this single (x_bits, y_bits).  `None` means enumerate
+    /// the whole sub-MDD normally.
+    outfix_xy: Option<(u32, u32)>,
 }
 
 
@@ -2865,6 +3011,7 @@ fn run_mdd_sat_search(
             Some(radical::SpectralTables::new(m, k, SPECTRAL_FREQS))
         } else { None },
         found: Arc::new(AtomicBool::new(false)),
+        outfix_xy: cfg.test_outfix.as_ref().and_then(|o| o.xy_bits),
     });
 
     let run_start = Instant::now();
@@ -3187,19 +3334,17 @@ fn run_mdd_sat_search(
                         // Use the first candidate as the representative for
                         // legacy fields (z_mid_sum, w_mid_sum, tuple).
                         let rep = candidate_tuples[0];
-                        let z_mid_sum = rep.z.abs() - z_bnd_sum; // +|σ_Z| case; field is legacy
-                        let w_mid_sum = rep.w.abs() - w_bnd_sum;
                         stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
                         let work = if use_wz_mode {
                             PipelineWork::SolveWZ(SolveWZWork {
                                 tuple: rep, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
-                                xy_root: bnd.xy_root, z_mid_sum, w_mid_sum,
+                                xy_root: bnd.xy_root,
                                 candidate_tuples,
                             })
                         } else {
                             PipelineWork::SolveW(SolveWWork {
                                 tuple: rep, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
-                                xy_root: bnd.xy_root, z_mid_sum, w_mid_sum,
+                                xy_root: bnd.xy_root,
                                 candidate_tuples,
                             })
                         };
@@ -3298,8 +3443,8 @@ fn run_mdd_sat_search(
                                     let rep = narrowed[0];
                                     batch.push(PipelineWork::SolveZ(SolveZWork {
                                         tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
-                                        w_vals, w_spectrum: spec_buf.clone(), xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
-                                        candidate_tuples: narrowed, sigma_w_full,
+                                        w_vals, w_spectrum: spec_buf.clone(), xy_root: sw.xy_root,
+                                        candidate_tuples: narrowed,
                                     }));
                                 } else {
                                     flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
@@ -3384,8 +3529,8 @@ fn run_mdd_sat_search(
                                 let rep = narrowed[0];
                                 batch.push(PipelineWork::SolveZ(SolveZWork {
                                     tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
-                                    w_vals, w_spectrum, xy_root: sw.xy_root, z_mid_sum: sw.z_mid_sum,
-                                    candidate_tuples: narrowed, sigma_w_full,
+                                    w_vals, w_spectrum, xy_root: sw.xy_root,
+                                    candidate_tuples: narrowed,
                                 }));
                             }
                             if !batch.is_empty() {
@@ -3643,9 +3788,12 @@ fn run_mdd_sat_search(
                                 walk_xy_sub_mdd(
                                     swz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
                                     &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
-                                    ctx.middle_n as i32, swz.tuple,
+                                    ctx.middle_n as i32, &swz.candidate_tuples,
                                     &mut |x_bits, y_bits| {
                                         if ctx.found.load(AtomicOrdering::Relaxed) { return; }
+                                        if let Some((fx, fy)) = ctx.outfix_xy {
+                                            if x_bits != fx || y_bits != fy { return; }
+                                        }
                                         stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
                                         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
                                         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
@@ -3948,9 +4096,14 @@ fn run_mdd_sat_search(
                                 walk_xy_sub_mdd(
                                     sz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
                                     &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
-                                    ctx.middle_n as i32, sz.tuple,
+                                    ctx.middle_n as i32, &sz.candidate_tuples,
                                     &mut |x_bits, y_bits| {
                                         if ctx.found.load(AtomicOrdering::Relaxed) { return; }
+                                        // --outfix XY filter: skip everything except the
+                                        // pinned (x_bits, y_bits) when the flag is set.
+                                        if let Some((fx, fy)) = ctx.outfix_xy {
+                                            if x_bits != fx || y_bits != fy { return; }
+                                        }
                                         // E1: Extension filter with cache.
                                         if ctx.mdd_extend > 0 {
                                             let cache_key = (sz.z_bits as u128) | ((sz.w_bits as u128) << 32)
@@ -4087,9 +4240,12 @@ fn run_mdd_sat_search(
                             walk_xy_sub_mdd(
                                 xy_root, 0, ctx.xy_zw_depth, 0, 0,
                                 &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
-                                ctx.middle_n as i32, item.tuple,
+                                ctx.middle_n as i32, std::slice::from_ref(&item.tuple),
                                 &mut |x_bits, y_bits| {
                                     if ctx.found.load(AtomicOrdering::Relaxed) { return; }
+                                    if let Some((fx, fy)) = ctx.outfix_xy {
+                                        if x_bits != fx || y_bits != fy { return; }
+                                    }
                                     stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
                                     let (result, stats) = state.try_candidate(x_bits, y_bits);
                                     items_completed.fetch_add(1, AtomicOrdering::Relaxed);
@@ -4220,17 +4376,43 @@ fn run_mdd_sat_search(
         } else if work_depth < queue_target {
             // Apart/Together: walk MDD paths and push Boundary items when
             // the work queue is low.
-            let batch = queue_target;
-            let mut fed = 0;
-            while fed < batch {
-                let idx = path_counter.fetch_add(1, AtomicOrdering::Relaxed);
-                if idx >= total_paths { break; } // exhausted all paths
-                let path = idx.wrapping_mul(lcg_mult) & lcg_mask;
-                let bnd = mdd_navigate_path(mdd.root, zw_depth, path, &full_pos_order, &mdd.nodes);
-                if let Some((z_bits, w_bits, xy_root)) = bnd {
-                    boundaries_walked.fetch_add(1, AtomicOrdering::Relaxed);
-                    work_queue.push(PipelineWork::Boundary(BoundaryWork { z_bits, w_bits, xy_root }));
-                    fed += 1;
+            if let Some(ref outfix) = cfg.test_outfix {
+                // --outfix: restrict the search to one specific boundary.
+                // Navigate directly to it (no MDD path walk), emit once,
+                // then exhaust the walker so the search terminates when
+                // the pipeline finishes this single boundary.
+                if path_counter.load(AtomicOrdering::Relaxed) == 0 {
+                    if let Some(xy_root) = mdd_navigate_to_outfix(
+                        mdd.root, zw_depth, &full_pos_order, &mdd.nodes,
+                        outfix.z_bits, outfix.w_bits,
+                    ) {
+                        boundaries_walked.fetch_add(1, AtomicOrdering::Relaxed);
+                        work_queue.push(PipelineWork::Boundary(BoundaryWork {
+                            z_bits: outfix.z_bits, w_bits: outfix.w_bits, xy_root,
+                        }));
+                        eprintln!("--outfix: emitted one boundary (z_bits=0x{:x}, w_bits=0x{:x}, xy_root={})",
+                            outfix.z_bits, outfix.w_bits, xy_root);
+                    } else {
+                        eprintln!("--outfix: boundary (z_bits=0x{:x}, w_bits=0x{:x}) not present in the MDD (pruned during gen or rule pre-filter)",
+                            outfix.z_bits, outfix.w_bits);
+                    }
+                    // Mark the walker as fully exhausted: we've emitted
+                    // all we plan to.
+                    path_counter.store(total_paths, AtomicOrdering::Relaxed);
+                }
+            } else {
+                let batch = queue_target;
+                let mut fed = 0;
+                while fed < batch {
+                    let idx = path_counter.fetch_add(1, AtomicOrdering::Relaxed);
+                    if idx >= total_paths { break; } // exhausted all paths
+                    let path = idx.wrapping_mul(lcg_mult) & lcg_mask;
+                    let bnd = mdd_navigate_path(mdd.root, zw_depth, path, &full_pos_order, &mdd.nodes);
+                    if let Some((z_bits, w_bits, xy_root)) = bnd {
+                        boundaries_walked.fetch_add(1, AtomicOrdering::Relaxed);
+                        work_queue.push(PipelineWork::Boundary(BoundaryWork { z_bits, w_bits, xy_root }));
+                        fed += 1;
+                    }
                 }
             }
         }
@@ -4588,19 +4770,33 @@ fn walk_xy_sub_mdd<F: FnMut(u32, u32)>(
     nid: u32, level: usize, xy_depth: usize,
     x_acc: u32, y_acc: u32,
     pos_order: &[usize], nodes: &[[u32; 4]],
-    max_bnd_sum: i32, middle_n: i32, tuple: SumTuple,
+    max_bnd_sum: i32, middle_n: i32, tuples: &[SumTuple],
     callback: &mut F,
 ) {
     let n_full = middle_n as usize + 2 * xy_depth / 2;
     let k_full = xy_depth / 2;
+    // Feasibility test takes ANY tuple in the candidate list — if any
+    // one admits this boundary, we pass it to the SAT.  Using a single
+    // representative tuple would spuriously reject (x_bits, y_bits)
+    // pairs valid for another tuple in the set (e.g., a T4-swap image).
+    let feasible = |val: i32, middle_n: i32| -> bool {
+        val.abs() <= middle_n && (val + middle_n) % 2 == 0
+    };
     walk_mdd_4way(nid, level, xy_depth, x_acc, y_acc, pos_order, nodes,
         &mut |x_bits, y_bits, _nid| {
             let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
             let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
-            let x_mid = tuple.x - x_bnd_sum;
-            if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return; }
-            let y_mid = tuple.y - y_bnd_sum;
-            if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return; }
+            let ok = tuples.iter().any(|t| {
+                // Try both signs of σ_X / σ_Y (PbSetEq lets the SAT pick
+                // either).
+                let x_abs = t.x.abs();
+                let y_abs = t.y.abs();
+                let x_signs: &[i32] = if x_abs == 0 { &[0] } else { &[1, -1] };
+                let y_signs: &[i32] = if y_abs == 0 { &[0] } else { &[1, -1] };
+                x_signs.iter().any(|&sx| feasible(sx * x_abs - x_bnd_sum, middle_n))
+                    && y_signs.iter().any(|&sy| feasible(sy * y_abs - y_bnd_sum, middle_n))
+            });
+            if !ok { return; }
             // BDKR rules (ii)/(iii)/(vi) pre-filter on the boundary
             // bits.  The XY SAT still enforces the full rule including
             // middle positions; this catches the boundary-only part
@@ -4620,20 +4816,25 @@ fn any_valid_xy(
     pos_order: &[usize], nodes: &[[u32; 4]],
     max_bnd_sum: i32, middle_n: i32, tuple: SumTuple,
 ) -> bool {
-    if nid == mdd_reorder::DEAD { return false; }
-    if level == xy_depth {
+    // Magnitude-based feasibility (tries both σ signs, matching walk_xy_sub_mdd).
+    let feasible = |val: i32, middle_n: i32| -> bool {
+        val.abs() <= middle_n && (val + middle_n) % 2 == 0
+    };
+    let check_leaf = |x_acc: u32, y_acc: u32| -> bool {
         let x_bnd_sum = 2 * (x_acc.count_ones() as i32) - max_bnd_sum;
         let y_bnd_sum = 2 * (y_acc.count_ones() as i32) - max_bnd_sum;
-        let x_mid = tuple.x - x_bnd_sum;
-        if x_mid.abs() > middle_n || (x_mid + middle_n) % 2 != 0 { return false; }
-        let y_mid = tuple.y - y_bnd_sum;
-        if y_mid.abs() > middle_n || (y_mid + middle_n) % 2 != 0 { return false; }
-        return true;
+        let x_abs = tuple.x.abs();
+        let y_abs = tuple.y.abs();
+        let x_signs: &[i32] = if x_abs == 0 { &[0] } else { &[1, -1] };
+        let y_signs: &[i32] = if y_abs == 0 { &[0] } else { &[1, -1] };
+        x_signs.iter().any(|&sx| feasible(sx * x_abs - x_bnd_sum, middle_n))
+            && y_signs.iter().any(|&sy| feasible(sy * y_abs - y_bnd_sum, middle_n))
+    };
+    if nid == mdd_reorder::DEAD { return false; }
+    if level == xy_depth {
+        return check_leaf(x_acc, y_acc);
     }
     if nid == mdd_reorder::LEAF {
-        // Below the current MDD depth — all remaining positions free.
-        // Accept as long as the sum parity/range works out at SOME completion.
-        // For our purposes (at the true xy_depth) this branch is unreachable.
         return true;
     }
     let pos = pos_order[level];
@@ -5103,6 +5304,14 @@ fn print_help() {
     eprintln!("                           Example: --verify=++--+-,+-+-++,+++-,+-+-");
     eprintln!("  --test-zw=<Z,W>          Fix Z/W and only run Phase C (SAT X/Y) on them");
     eprintln!("  --tuple=<x,y,z,w>        Restrict search to one sum-tuple (4 integers)");
+    eprintln!("  --outfix=<prefHex>...<sufHex>  Force MDD+XY search to a single outfix");
+    eprintln!("                           (apart/together only).  BDKR-style hex: each digit");
+    eprintln!("                           packs X/Y/Z/W at one position as 8·X + 4·Y + 2·Z + W");
+    eprintln!("                           with +1→0, -1→1.  Prefix has k digits (positions");
+    eprintln!("                           0..k-1); suffix has k+1 digits (positions n-1-k..n-1,");
+    eprintln!("                           last digit is 3-bit since W has length n-1).");
+    eprintln!("                           Example (canonical TT(18) at k=5):");
+    eprintln!("                             --outfix=00f55...c2c961");
     eprintln!("  --phase-a                Print all sum-tuples for n, then exit");
     eprintln!("  --phase-b                Run Phases A+B, print Z/W pairs, then exit");
     eprintln!("  --dump-dimacs=<PATH>     Write the SAT encoding to a DIMACS CNF file");
@@ -5186,6 +5395,19 @@ fn parse_args() -> SearchConfig {
             if parts.len() == 4 {
                 cfg.test_tuple = Some(SumTuple { x: parts[0], y: parts[1], z: parts[2], w: parts[3] });
             }
+        } else if let Some(v) = arg.strip_prefix("--outfix=") {
+            // Requires both `--n=` and `--mdd-k=` to be parsed first so
+            // we know how many hex digits to expect.  CLI loop processes
+            // args in order; if `--outfix=` comes first, the user will
+            // see a nice error.
+            if cfg.problem.n == 0 {
+                eprintln!("error: --outfix requires --n=<N> first");
+                std::process::exit(2);
+            }
+            cfg.test_outfix = match parse_outfix(v, cfg.problem.n, cfg.mdd_k) {
+                Ok(spec) => Some(spec),
+                Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+            };
         } else if arg == "--quad-pb" {
             cfg.quad_pb = true;
         } else if arg == "--no-quad-pb" {
@@ -5647,6 +5869,7 @@ mod tests {
             test_zw: None,
             conflict_limit: 0,
             test_tuple: None,
+            test_outfix: None,
             phase_only: None,
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
@@ -5827,44 +6050,63 @@ mod tests {
 
     #[test]
     fn known_tt36_verifies() {
-        // Known TT(36) from Kharaghani & Tayfeh-Rezaie (2005), Hadamard 428.
+        // Known TT(36), **canonical form** (rules (i)-(vi)).
+        // Derived from Kharaghani & Tayfeh-Rezaie (2005) TT(36) by applying
+        // the BDKR symmetry group and picking the unique orbit member
+        // satisfying all 6 rules.
+        //
+        // X =: '+++-+-++-----+++--++--+-+++-+--+--++'  sum 2
+        // Y =: '+++-+--+-+++---+-++-+-++++++--+-++-+'  sum 8
+        // Z =: '+++-+-++++--+-+++-+++--++-++++---+--'  sum 8
+        // W =: '+++-+---+------++-++++--++-+-++++-+'   sum 3
         let p = Problem::new(36);
-        let x = PackedSeq::from_values(&[1,1,1,-1,-1,-1,-1,1,1,-1,1,-1,1,-1,-1,-1,-1,-1,1,1,1,1,-1,1,1,-1,1,1,1,1,-1,-1,-1,-1,1,-1]);
-        let y = PackedSeq::from_values(&[1,-1,1,1,1,1,1,-1,-1,1,-1,1,-1,-1,1,-1,-1,1,1,-1,-1,1,1,1,1,-1,1,1,1,1,-1,-1,-1,1,1,-1]);
-        let z = PackedSeq::from_values(&[1,-1,1,1,1,1,1,-1,1,-1,-1,1,1,1,1,-1,1,1,1,-1,1,1,-1,-1,1,1,1,-1,1,-1,-1,1,-1,-1,-1,1]);
-        let w = PackedSeq::from_values(&[1,1,1,-1,1,-1,-1,-1,-1,-1,1,1,-1,-1,1,-1,1,1,1,-1,-1,1,-1,1,-1,1,1,1,-1,1,1,1,1,-1,1]);
-        assert!(verify_tt(p, &x, &y, &z, &w), "Known TT(36) should verify");
-        assert_eq!(x.sum(), 0);
-        assert_eq!(y.sum(), 6);
+        let x = PackedSeq::from_values(&[1,1,1,-1,1,-1,1,1,-1,-1,-1,-1,-1,1,1,1,-1,-1,1,1,-1,-1,1,-1,1,1,1,-1,1,-1,-1,1,-1,-1,1,1]);
+        let y = PackedSeq::from_values(&[1,1,1,-1,1,-1,-1,1,-1,1,1,1,-1,-1,-1,1,-1,1,1,-1,1,-1,1,1,1,1,1,1,-1,-1,1,-1,1,1,-1,1]);
+        let z = PackedSeq::from_values(&[1,1,1,-1,1,-1,1,1,1,1,-1,-1,1,-1,1,1,1,-1,1,1,1,-1,-1,1,1,-1,1,1,1,1,-1,-1,-1,1,-1,-1]);
+        let w = PackedSeq::from_values(&[1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,-1,1,1,1,1,-1,-1,1,1,-1,1,-1,1,1,1,1,-1,1]);
+        assert!(verify_tt(p, &x, &y, &z, &w), "Canonical TT(36) should verify");
+        assert_eq!(x.sum(), 2);
+        assert_eq!(y.sum(), 8);
         assert_eq!(z.sum(), 8);
-        assert_eq!(w.sum(), 5);
+        assert_eq!(w.sum(), 3);
+        // Sum-squared invariant (6n-2 = 214 at n=36).
+        let ss = x.sum() * x.sum() + y.sum() * y.sum() + 2 * z.sum() * z.sum() + 2 * w.sum() * w.sum();
+        assert_eq!(ss, 214);
     }
 
     #[test]
     fn known_tt26_verifies() {
-        // Known TT(26). Verified against the Turyn identity
-        // N_X(s) + N_Y(s) + 2 N_Z(s) + 2 N_W(s) = 0 for all s ≥ 1,
-        // and the sum-squared invariant σ_X² + σ_Y² + 2σ_Z² + 2σ_W² = 6n - 2 = 154.
-        // Source: found on main branch (commit 88aae1a) by the hybrid Phase B + SAT XY
-        // path at 16 threads in ~161 s wall-clock.
+        // Known TT(26), **canonical form** (satisfies BDKR rules (i)-(vi)).
+        // Obtained by applying the BDKR symmetry group (T1 negate, T2 reverse,
+        // T3 alternate-all, T4 swap X↔Y) to the original TT(26) from commit
+        // 88aae1a (X sum 6, Y sum 6, Z sum 4, W sum 5) and picking the unique
+        // orbit member satisfying all 6 canonicalisation rules.
         //
-        // X =: '++--+--+++++++-+-++--+-++-'  sum 6
-        // Y =: '+++-+-++++++-++-+---+-++--'  sum 6
-        // Z =: '+++-+--++++++--++---+-+--+'  sum 4
-        // W =: '++++-+---+--+++--++++-+-+'   sum 5
+        // X =: '++----++-----+-+-+--+++--+'  sum -4
+        // Y =: '+-+++++-+-+---++++-++++--+'  sum  8
+        // Z =: '++-----+--++--+-+-++----+-'  sum -6
+        // W =: '+++++-+--++-++---+----+-+'   sum  1
         let p = Problem::new(26);
-        let x = PackedSeq::from_values(&[1,1,-1,-1,1,-1,-1,1,1,1,1,1,1,1,-1,1,-1,1,1,-1,-1,1,-1,1,1,-1]);
-        let y = PackedSeq::from_values(&[1,1,1,-1,1,-1,1,1,1,1,1,1,-1,1,1,-1,1,-1,-1,-1,1,-1,1,1,-1,-1]);
-        let z = PackedSeq::from_values(&[1,1,1,-1,1,-1,-1,1,1,1,1,1,1,-1,-1,1,1,-1,-1,-1,1,-1,1,-1,-1,1]);
-        let w = PackedSeq::from_values(&[1,1,1,1,-1,1,-1,-1,-1,1,-1,-1,1,1,1,-1,-1,1,1,1,1,-1,1,-1,1]);
-        assert!(verify_tt(p, &x, &y, &z, &w), "Known TT(26) should verify the Turyn identity");
-        assert_eq!(x.sum(), 6);
-        assert_eq!(y.sum(), 6);
-        assert_eq!(z.sum(), 4);
-        assert_eq!(w.sum(), 5);
+        let x = PackedSeq::from_values(&[1,1,-1,-1,-1,-1,1,1,-1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,1,-1,-1,1]);
+        let y = PackedSeq::from_values(&[1,-1,1,1,1,1,1,-1,1,-1,1,-1,-1,-1,1,1,1,1,-1,1,1,1,1,-1,-1,1]);
+        let z = PackedSeq::from_values(&[1,1,-1,-1,-1,-1,-1,1,-1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,-1,-1,1,-1]);
+        let w = PackedSeq::from_values(&[1,1,1,1,1,-1,1,-1,-1,1,1,-1,1,1,-1,-1,-1,1,-1,-1,-1,-1,1,-1,1]);
+        assert!(verify_tt(p, &x, &y, &z, &w), "Canonical TT(26) should verify the Turyn identity");
+        assert_eq!(x.sum(), -4);
+        assert_eq!(y.sum(), 8);
+        assert_eq!(z.sum(), -6);
+        assert_eq!(w.sum(), 1);
         // Sum-squared invariant (6n-2 = 154 at n=26).
         let ss = x.sum() * x.sum() + y.sum() * y.sum() + 2 * z.sum() * z.sum() + 2 * w.sum() * w.sum();
         assert_eq!(ss, 154);
+
+        // Rule (i): x[0]=x[n-1]=y[0]=y[n-1]=z[0]=w[0]=+1.
+        let x_v: Vec<i8> = (0..26).map(|i| x.get(i)).collect();
+        let y_v: Vec<i8> = (0..26).map(|i| y.get(i)).collect();
+        let z_v: Vec<i8> = (0..26).map(|i| z.get(i)).collect();
+        let w_v: Vec<i8> = (0..25).map(|i| w.get(i)).collect();
+        assert_eq!((x_v[0], x_v[25], y_v[0], y_v[25], z_v[0], w_v[0]), (1, 1, 1, 1, 1, 1),
+            "Rule (i): x[0]=x[n-1]=y[0]=y[n-1]=z[0]=w[0]=+1");
     }
 
     #[test]
@@ -6791,17 +7033,209 @@ mod tests {
     /// `pb_set_eq_plus_quad_pb_tt18_regression` in `radical/src/lib.rs`.
     #[test]
     fn pbseteq_xy_boundary_only_finds_canonical_tt18() {
+        sanity_check_canonical_tt(
+            "++-+++++++++-+--++",
+            "++----++-+---+-+-+",
+            "++-+++----+-+-++--",
+            "++----+--+--+++-+",
+            5,
+        );
+    }
+
+    /// Sanity check: canonical TT(26) passes verify_tt, all 6 BDKR rules,
+    /// and the pipeline's XY SAT accepts its (x_bits, y_bits) boundary.
+    #[test]
+    fn sanity_canonical_tt26() {
+        sanity_check_canonical_tt(
+            "++----++-----+-+-+--+++--+",
+            "+-+++++-+-+---++++-++++--+",
+            "++-----+--++--+-+-++----+-",
+            "+++++-+--++-++---+----+-+",
+            7,
+        );
+    }
+
+    /// Same for canonical TT(36).
+    #[test]
+    fn sanity_canonical_tt36() {
+        sanity_check_canonical_tt(
+            "+++-+-++-----+++--++--+-+++-+--+--++",
+            "+++-+--+-+++---+-++-+-++++++--+-++-+",
+            "+++-+-++++--+-+++-+++--++-++++---+--",
+            "+++-+---+------++-++++--++-+-++++-+",
+            10,
+        );
+    }
+
+    /// Reusable end-to-end sanity check: given a TT(n) in canonical form,
+    /// verify
+    ///   (a) verify_tt passes (Turyn identity holds),
+    ///   (b) BDKR rules (i)-(vi) are all satisfied,
+    ///   (c) the pipeline's XY SAT path accepts the canonical
+    ///       (x_bits, y_bits) boundary with the canonical tuple.
+    fn sanity_check_canonical_tt(x_str: &str, y_str: &str, z_str: &str, w_str: &str, k: usize) {
         let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
-        let x = parse("++-+++++++++-+--++");
-        let y = parse("++----++-+---+-+-+");
-        let z = parse("++-+++----+-+-++--");
-        let w = parse("++----+--+--+++-+");
-        let n = 18usize;
+        let x = parse(x_str);
+        let y = parse(y_str);
+        let z = parse(z_str);
+        let w = parse(w_str);
+        let n = x.len();
+        assert_eq!(y.len(), n); assert_eq!(z.len(), n); assert_eq!(w.len(), n - 1);
         let m = n - 1;
-        let k = 5usize;
-        let tuple = SumTuple { x: 10, y: 2, z: 0, w: 1 };
+
+        // (a) Turyn identity.
+        let problem = Problem::new(n);
+        let px = PackedSeq::from_values(&x);
+        let py = PackedSeq::from_values(&y);
         let pz = PackedSeq::from_values(&z);
         let pw = PackedSeq::from_values(&w);
+        assert!(verify_tt(problem, &px, &py, &pz, &pw),
+            "n={n}: canonical TT fails verify_tt");
+
+        // (b) Rules (i)-(vi).
+        assert_eq!((x[0], x[n-1], y[0], y[n-1], z[0], w[0]), (1, 1, 1, 1, 1, 1),
+            "n={n}: rule (i) violated");
+        // Rule (ii): first i with x[i] != x[n-1-i] must have x[i]=+1.
+        for i in 1..n/2 { if x[i] != x[n-1-i] { assert_eq!(x[i], 1, "n={n}: rule (ii) violated at i={i}"); break; } }
+        // Rule (iii): same for y.
+        for i in 1..n/2 { if y[i] != y[n-1-i] { assert_eq!(y[i], 1, "n={n}: rule (iii) violated at i={i}"); break; } }
+        // Rule (iv): first i with z[i] == z[n-1-i] must have z[i]=+1.
+        for i in 1..n/2 { if z[i] == z[n-1-i] { assert_eq!(z[i], 1, "n={n}: rule (iv) violated at i={i}"); break; } }
+        // Rule (v): first i with w[i]*w[m-1-i] != w[m-1] must have w[i]=+1.
+        let tail = w[m-1];
+        for i in 1..(m-1)/2 + 1 { if w[i] * w[m-1-i] != tail { assert_eq!(w[i], 1, "n={n}: rule (v) violated at i={i}"); break; } }
+        // Rule (vi): if x[1]!=y[1] then x[1]=+1; else x[n-2]=+1 AND y[n-2]=-1.
+        if x[1] != y[1] { assert_eq!(x[1], 1, "n={n}: rule (vi) case-1 violated"); }
+        else { assert_eq!(x[n-2], 1, "n={n}: rule (vi) case-2 x[n-2] violated"); assert_eq!(y[n-2], -1, "n={n}: rule (vi) case-2 y[n-2] violated"); }
+
+        let sigma_x: i32 = x.iter().map(|&b| b as i32).sum();
+        let sigma_y: i32 = y.iter().map(|&b| b as i32).sum();
+        let sigma_z: i32 = z.iter().map(|&b| b as i32).sum();
+        let sigma_w: i32 = w.iter().map(|&b| b as i32).sum();
+
+        // (c) Middle boundaries: encode (z_bits, w_bits) and extract middle values.
+        let mut z_boundary = vec![0i8; n];
+        z_boundary[..k].copy_from_slice(&z[..k]);
+        z_boundary[n-k..].copy_from_slice(&z[n-k..]);
+        let mut w_boundary = vec![0i8; m];
+        w_boundary[..k].copy_from_slice(&w[..k]);
+        w_boundary[m-k..].copy_from_slice(&w[m-k..]);
+        let middle_n = n - 2 * k;
+        let middle_m = m - 2 * k;
+        let z_bnd_sum: i32 = z_boundary.iter().map(|&v| v as i32).sum();
+        let w_bnd_sum: i32 = w_boundary.iter().map(|&v| v as i32).sum();
+
+        // (d) Rule-(iv)/(v) boundary pre-filters must not reject canonical.
+        let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
+        assert_ne!(rule_iv_state, sat_z_middle::BoundaryRuleState::ViolatedAtBoundary,
+            "n={n}: rule (iv) boundary pre-filter rejects canonical Z boundary");
+        let rule_v_state = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
+        assert_ne!(rule_v_state, sat_z_middle::BoundaryRuleState::ViolatedAtBoundary,
+            "n={n}: rule (v) boundary pre-filter rejects canonical W boundary");
+
+        // (e) W-middle SAT: V_w covers both σ_W signs of the tuple's |σ_W|.
+        let abs_w = sigma_w.abs();
+        let w_counts: Vec<u32> = if abs_w == 0 {
+            sigma_full_to_cnt(0, w_bnd_sum, middle_m).into_iter().collect()
+        } else {
+            [abs_w, -abs_w].iter()
+                .filter_map(|&s| sigma_full_to_cnt(s, w_bnd_sum, middle_m))
+                .collect::<Vec<_>>()
+        };
+        assert!(!w_counts.is_empty(),
+            "n={n}: sigma_full_to_cnt gives empty V_w for |σ_W|={abs_w}, bnd_sum={w_bnd_sum}");
+        let w_tmpl = sat_z_middle::LagTemplate::new(m, k);
+        let mut w_solver = w_tmpl.build_base_solver_pb_set(middle_m, &w_counts);
+        sat_z_middle::fill_w_solver(&mut w_solver, &w_tmpl, m, &w_boundary);
+        if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
+            let mut nv = (w_solver.num_vars() + 1) as i32;
+            sat_z_middle::add_rule_v_middle_clauses(&mut w_solver, m, k, &w_boundary, |pf| (pf - k + 1) as i32, &mut nv);
+        }
+        // Pin the canonical W middle as unit clauses.
+        let w_mid_lits: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
+        for (i, &v) in w[k..k+middle_m].iter().enumerate() {
+            w_solver.add_clause([if v == 1 { w_mid_lits[i] } else { -w_mid_lits[i] }]);
+        }
+        assert_eq!(w_solver.solve(), Some(true),
+            "n={n}: W-middle SAT rejects canonical W middle (V_w={w_counts:?}, σ_W={sigma_w})");
+
+        // (f) Z-middle SAT (with full canonical W): V_z covers both σ_Z signs.
+        let abs_z = sigma_z.abs();
+        let z_counts: Vec<u32> = if abs_z == 0 {
+            sigma_full_to_cnt(0, z_bnd_sum, middle_n).into_iter().collect()
+        } else {
+            [abs_z, -abs_z].iter()
+                .filter_map(|&s| sigma_full_to_cnt(s, z_bnd_sum, middle_n))
+                .collect::<Vec<_>>()
+        };
+        assert!(!z_counts.is_empty(),
+            "n={n}: sigma_full_to_cnt gives empty V_z for |σ_Z|={abs_z}, bnd_sum={z_bnd_sum}");
+        let z_tmpl = sat_z_middle::LagTemplate::new(n, k);
+        let mut z_solver = z_tmpl.build_base_solver_quad_pb_pb_set(middle_n, &z_counts);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver, &z_tmpl, n, m, middle_n, &z_boundary, &w);
+        let z_mid_lits: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
+        for (i, &v) in z[k..k+middle_n].iter().enumerate() {
+            z_solver.add_clause([if v == 1 { z_mid_lits[i] } else { -z_mid_lits[i] }]);
+        }
+        assert_eq!(z_solver.solve(), Some(true),
+            "n={n}: Z-middle SAT rejects canonical Z middle (V_z={z_counts:?}, σ_Z={sigma_z})");
+
+        // (g) External spectral pair filter must accept canonical (Z, W).
+        let spectral_z = SpectralFilter::new(n, 128);
+        let spectral_w = SpectralFilter::new(m, 128);
+        let mut fft_z = FftScratch::new(&spectral_z);
+        let mut fft_w = FftScratch::new(&spectral_w);
+        let pair_bound = problem.spectral_bound();
+        let w_spec = spectrum_if_ok(&w, &spectral_w, pair_bound, &mut fft_w)
+            .unwrap_or_else(|| panic!("n={n}: canonical W fails individual spectral filter"));
+        let mut z_spec = vec![0.0; w_spec.len()];
+        compute_spectrum_into(&z, &spectral_z, &mut fft_z, &mut z_spec);
+        assert!(spectral_pair_ok(&z_spec, &w_spec, pair_bound),
+            "n={n}: canonical (Z, W) fails external spectral_pair_ok");
+
+        // (g2) In-SAT 167-freq per-freq spectral bound must accept canonical
+        // Z given canonical W.  The pipeline's SolveZ computes pfb[ω] =
+        // pair_bound - |W(ω)|² at 167 frequencies and constrains |Z(ω)|²
+        // ≤ pfb[ω].  Different grid from the external 128-FFT — a
+        // canonical Z that passes the external grid may not pass the
+        // 167-grid if this bound were buggy.
+        let ztab = radical::SpectralTables::new(n, k, SPECTRAL_FREQS);
+        let nf = ztab.num_freqs;
+        let mut w_re = vec![0.0f64; nf];
+        let mut w_im = vec![0.0f64; nf];
+        for (pos, &wv) in w.iter().enumerate() {
+            let base = pos * nf;
+            let cos_slice = &ztab.pos_cos[base..base + nf];
+            let sin_slice = &ztab.pos_sin[base..base + nf];
+            if wv > 0 {
+                for fi in 0..nf { w_re[fi] += cos_slice[fi]; w_im[fi] += sin_slice[fi]; }
+            } else {
+                for fi in 0..nf { w_re[fi] -= cos_slice[fi]; w_im[fi] -= sin_slice[fi]; }
+            }
+        }
+        let pfb: Vec<f64> = (0..nf).map(|fi|
+            (pair_bound - w_re[fi]*w_re[fi] - w_im[fi]*w_im[fi]).max(0.0)
+        ).collect();
+        let mut zr = vec![0.0f64; nf];
+        let mut zi = vec![0.0f64; nf];
+        for (pos, &zv) in z.iter().enumerate() {
+            let base = pos * nf;
+            let cs = &ztab.pos_cos[base..base + nf];
+            let sn = &ztab.pos_sin[base..base + nf];
+            if zv > 0 {
+                for fi in 0..nf { zr[fi] += cs[fi]; zi[fi] += sn[fi]; }
+            } else {
+                for fi in 0..nf { zr[fi] -= cs[fi]; zi[fi] -= sn[fi]; }
+            }
+        }
+        for fi in 0..nf {
+            let zmag2 = zr[fi]*zr[fi] + zi[fi]*zi[fi];
+            assert!(zmag2 <= pfb[fi] + 1e-6,
+                "n={n}: in-SAT 167-freq bound rejects canonical Z at freq {fi}: |Z|²={zmag2} > pfb={}",
+                pfb[fi]);
+        }
+
+        // (h) XY SAT accepts the canonical (x_bits, y_bits).
         let mut zw = vec![0i32; n];
         for s in 1..n {
             let nz = pz.autocorrelation(s);
@@ -6809,12 +7243,12 @@ mod tests {
             zw[s] = 2 * nz + 2 * nw;
         }
         let candidate = CandidateZW { zw_autocorr: zw };
-        let template = SatXYTemplate::build(Problem::new(n), tuple, &radical::SolverConfig::default())
+        let tuple = SumTuple { x: sigma_x, y: sigma_y, z: sigma_z, w: sigma_w };
+        let template = SatXYTemplate::build(problem, tuple, &radical::SolverConfig::default())
             .expect("template should build");
-        let mut state = SolveXyPerCandidate::new(Problem::new(n), &candidate, &template, k)
+        let mut state = SolveXyPerCandidate::new(problem, &candidate, &template, k)
             .expect("SolveXyPerCandidate::new should succeed");
 
-        // Canonical (x_bits, y_bits) encoded from the canonical X/Y.
         let mut x_bits = 0u32;
         let mut y_bits = 0u32;
         for i in 0..k {
@@ -6823,24 +7257,21 @@ mod tests {
             if y[i] == 1 { y_bits |= 1 << i; }
             if y[n - k + i] == 1 { y_bits |= 1 << (k + i); }
         }
-
-        // Run try_candidate — exactly what the pipeline does.
         let (result, _stats) = state.try_candidate(x_bits, y_bits);
         match result {
             XyTryResult::Sat(found_x, found_y) => {
-                // Extract values and verify.
                 for i in 0..n {
-                    assert_eq!(found_x.get(i), x[i], "X[{}] mismatch", i);
-                    assert_eq!(found_y.get(i), y[i], "Y[{}] mismatch", i);
+                    assert_eq!(found_x.get(i), x[i], "n={n}: X[{i}] mismatch");
+                    assert_eq!(found_y.get(i), y[i], "n={n}: Y[{i}] mismatch");
                 }
             }
             XyTryResult::Unsat => panic!(
-                "try_candidate returned UNSAT for canonical TT(18) (tuple=(10,2,0,1), canonical Z/W, canonical x_bits=0b{:b}, y_bits=0b{:b}). \
-                 This is the n=18 open-search bug.",
-                x_bits, y_bits,
+                "n={n}: try_candidate returned UNSAT for canonical TT — rule/template/PbSetEq bug. \
+                 tuple=({}, {}, {}, {}), x_bits=0b{:b}, y_bits=0b{:b}",
+                tuple.x, tuple.y, tuple.z, tuple.w, x_bits, y_bits,
             ),
-            XyTryResult::Pruned => panic!("try_candidate pruned canonical TT(18) at GJ/lag pre-filter"),
-            XyTryResult::Timeout => panic!("try_candidate timed out on canonical TT(18)"),
+            XyTryResult::Pruned => panic!("n={n}: try_candidate pruned canonical at GJ/lag pre-filter"),
+            XyTryResult::Timeout => panic!("n={n}: try_candidate timed out"),
         }
     }
 
