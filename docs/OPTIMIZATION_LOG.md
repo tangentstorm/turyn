@@ -38,6 +38,69 @@ target/release/turyn --n=16 --stochastic-secs=10 --benchmark=3
 - Run both benchmarks for each optimization; an idea may help one and hurt the other.
 - Benchmark runs should target 6–60s each. Under 6s is too noisy; over 60s wastes iteration time.
 
+## Divan bench harness for the README table (April 2026)
+
+Adds `benches/turyn_bench.rs` (divan, `harness = false`) that shells out
+to the release binary with only `--n=N` for every even `n` from 4 to 24,
+plus a standalone `tt26` bench with a 24-hour budget for the frontier.
+
+The key design decision: **time-to-solve is a bad cross-size metric**.
+Observed wall-clock for `target/release/turyn --n=24` over 5 runs:
+`5.4s, 7.7s, 9.4s, 11.9s, 19.9s` — a ~4× spread because thread
+scheduling determines when the worker pool happens to hit a SAT
+boundary. TTC (`total_work / effective_rate`, printed as
+`Time to cover:` by turyn itself) is stable within a few percent
+across runs and has consistent units (seconds) across every `n`.
+
+The harness parses the rate and total-work values out of the summary
+line, accumulates them by `n` across samples, and prints a sorted
+min/median/max/mean TTC table after divan's wall-clock output. n=2 is
+skipped: `mdd_k` clamps to `min(5, (n-1)/2, m/2) = 0` and the binary
+can't load a k=0 table.
+
+Also lands here:
+
+- First line of every `turyn` run is now `turyn settings: ...`,
+  echoing the resolved CLI including auto-filled defaults
+  (`--wz=together --mdd-k=5` when an `mdd-k.bin` is present, else
+  `--wz=cross --mdd-k=7`). Auto-resolution moved into
+  `SearchConfig::resolve_for_unified_search` so the echo can show the
+  values the search is actually going to use.
+- Four compiler warnings cleared: `encode_xnor_agree` moved behind
+  `#[cfg(test)]` (only its regression test still calls it), dropped
+  dead `nv_combined += 1` and `work_depth` reads in the WZ-together
+  builder, removed an unused `middle_m` binding in the TT(18)
+  spectral-filter test.
+
+### Usage
+
+```bash
+cargo bench --bench turyn_bench            # TT(4)..TT(24), sample_count=3
+cargo bench --bench turyn_bench -- tt26    # frontier, sample_count=1
+```
+
+First run auto-builds `turyn` + `gen_mdd` and generates `mdd-{1..5}.bin`.
+
+### Measurement (n=4..24, `--test` mode, 1 sample each)
+
+TTC is monotonic in n (as expected), unlike time-to-solve:
+
+| n | wall-clock (single sample) | TTC |
+|---|---|---|
+| 4 | 125ms | 0.02s |
+| 8 | 45ms | 0.04s |
+| 12 | 57ms | 3.4s |
+| 16 | 49ms | 7.2s |
+| 18 | 89ms | 25s |
+| 20 | 727ms | 53s |
+| 22 | 7.3s | 54s |
+| 24 | 8.2s | 58s |
+
+TT(22) and TT(24) have nearly identical TTC: the live-ZW-path count
+plateaus at 33208 past n=12, so the remaining difference is pure
+per-boundary cost.
+
+
 ## MDD Phase B optimizations (April 2026)
 
 ### SAT-based W middle generation + boundary deduplication
