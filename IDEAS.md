@@ -1,34 +1,168 @@
 # IDEAS
 
-Ideas collected from Grok (credit: Grok for every item below).
+## How to read this file
+
+Every idea below is annotated, where possible, against the project's headline
+metric: **Time to Cover (TTC)** — the wall-clock time a run would need to
+fully cover the search space, given the current pruning and per-boundary
+work rate.
+
+TTC is computed in `src/main.rs`:
+
+- **MDD modes (`--wz=apart|together`)**: `ttc = (live_zw_paths - eff) / (eff/elapsed)`
+  where `live_zw_paths = count_zw(mdd.root)` (live paths through the MDD)
+  and `eff = effective_coverage_metric(walked, xy_sat, xy_unsat, xy_timeout,
+  xy_timeout_cov_micro)`. Each boundary completed contributes 1.0; XY
+  timeouts contribute a fractional `log2(decisions+1)/free_vars` via
+  `xy_cover_micro`. See `effective_coverage_metric` at `src/main.rs:4210`.
+- **Cross mode (`--wz=cross`)**: `ttc = (est_total_xy - xy_done_eff) /
+  (xy_done_eff/elapsed)` where `est_total_xy` is extrapolated from tuple
+  progress via `cross_estimated_total_xy` at `src/main.rs:4185`.
+
+So any optimization changes TTC through one or more of three levers:
+
+1. **Denominator (total work)**: shrink `live_zw_paths` (tighter MDD
+   pruning, larger `k`, stricter spectral filters at boundary-gen time) or
+   `est_total_xy` (fewer tuples enumerated, smaller sum-tuple set).
+2. **Rate (eff done per second)**: make each stage (MDD walk, SolveW,
+   SolveZ, SolveXY) cheaper, add more pruning upstream of SAT, or raise
+   worker utilization.
+3. **Shortfall (timeouts)**: reduce XY SAT timeouts so each walked
+   boundary contributes a full 1.0 to `eff` instead of a fraction. Watched
+   via `flow_xy_timeout` and the per-stage pruning block
+   (`print_stage_pruning_block`, `src/main.rs:4229`).
+
+Per-stage instrumentation (all atomics in `run_mdd_sat_search`):
+
+- `stage_exit[0..3]` — boundaries/W/Z/XY items completed (lines 2740, 3733)
+- `flow_{w,z,xy}_{decisions,propagations,root_forced,free_sum,solves}`
+  — SAT pruning stats captured by diffing `Solver::num_decisions` /
+  `num_propagations` around each solve (lines 2717-2733)
+- `flow_xy_{sat,unsat,timeout,timeout_cov_micro}` — XY outcomes
+- `extensions_pruned` — XY candidates rejected by `has_extension`
+- `flow_{z,w}_{spec_pass,spec_fail,pair_fail,prep_fail}` — spectral/GJ
+  funnel counters shown in the final "Pipeline Flow" block
+
+When an idea below says "detect via X", X is one of these counters.
 
 ## Implemented experiments (measured)
 
-- **SIMD in autocorr and spectrum** *(from Grok)*: Tried a SIMD-friendly step (manual loop unrolling in autocorrelation and XY verification hot loops). On benchmark (`--n=16 --theta=256 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3`) mean improved from `101.115ms` to `97.412ms` (~3.7% faster).
-- **XY backtracker** *(from Grok)*: Implemented a dynamic variable ordering heuristic (pick next unassigned position with the most interactions with already-assigned variables, including mirror effects). On benchmark (`--n=16 --theta=256 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3`) mean improved from `103.510ms` to `88.153ms` (~14.8% faster).
-- **Memory** *(from Grok)*: Added capped per-bucket retention during Z/W generation (`HashMap<BoundarySignature, Vec<...>>` keeps only up to `max_pairs_per_bucket` entries per signature). On benchmark (`--n=16 --theta=256 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3`) mean improved from `88.153ms` to `72.745ms` (~17.5% faster) while reducing peak bucket growth.
+- **SIMD in autocorr and spectrum** *(from Grok)*: Tried a SIMD-friendly
+  step (manual loop unrolling in autocorrelation and XY verification hot
+  loops). Benchmark `--n=16 --theta=256`: 101→97 ms (~3.7% faster).
+  - **TTC mechanism**: rate (faster autocorr in the legacy hybrid path).
+  - **Detection**: `benchmark --n=16 --theta=256` mean/median; would
+    show up in MDD mode as higher `stage_exit[0..3]`/s.
+  - **Status**: the kept version is manual 4x unrolling in the autocorr
+    inner loop used by `autocorrs_from_values` and `spectrum_if_ok`
+    (src/main.rs). Still present, but the hot path in the current
+    pipeline is the SAT solver, not autocorr, so TTC impact is now
+    negligible.
+- **XY backtracker dynamic variable ordering** *(from Grok)*: Pick next
+  unassigned position with the most interactions with already-assigned
+  variables. Benchmark: 103→88 ms (~14.8% faster).
+  - **TTC mechanism**: rate — fewer SAT decisions per candidate, so
+    `flow_xy_decisions/flow_xy_solves` drops.
+  - **Status**: the XY backtracker it targeted was removed when the
+    MDD+SAT pipeline replaced the legacy `run_hybrid_search`
+    backtracker. Obsolete.
+- **Bucket cap during Z/W generation** *(from Grok)*: cap
+  `HashMap<BoundarySignature, Vec<…>>` retention per signature.
+  Benchmark: 88→72 ms (~17.5% faster).
+  - **TTC mechanism**: rate — lower memory pressure in legacy Phase B.
+  - **Status**: legacy hybrid Phase B still uses `push_capped` logic in
+    `stream_zw_candidates` (src/main.rs). Marginal TTC impact at n≥22
+    where SAT dominates.
 
 ## Tried (no meaningful impact yet)
 
-- **FFT for spectrum** *(from Grok)*: Replaced the manual trigonometric loop with an in-tree FFT path for power-of-two grids, with fallback to trig for others. Benchmark (`--n=16 --theta=256 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3`) regressed from mean `91.363ms` (baseline) to `101.115ms` (about 10.7% slower).
-  - **Revisited (2026-03-30)**: Replaced manual DFT with `rustfft` crate (proper dependency). FFT size = max(4n, 2*theta_samples) rounded to power of 2, with reusable buffer. Result: n=14 θ=128 mean 11.09→5.70ms (**-48.6%**), n=16 θ=256 mean 38.25→20.20ms (**-47.2%**). Previous in-tree FFT regressed due to branch overhead; proper `rustfft` avoids this entirely. **Implemented.**
-- **Better Z/W generation** *(from Grok)*: Added tighter global DFS bounds + parity pruning in `generate_sequences_with_sum_visit`. On the same benchmark profile, mean regressed from `97.412ms` to `103.510ms`.
+- **FFT for spectrum** *(from Grok)*: First attempt — in-tree FFT path for
+  power-of-two grids with manual trig fallback — regressed 10.7% due to
+  branch overhead even when inactive.
+  - **Revisited (2026-03-30)**: replaced the manual DFT with `rustfft`
+    (and later `realfft` for real input, commit dd7642f). FFT size =
+    max(4n, 2θ) rounded to a power of 2, reusable buffer. n=14 θ=128:
+    11.09→5.70 ms (**-48.6%**); n=16 θ=256: 38.25→20.20 ms (**-47.2%**).
+  - **TTC mechanism**: rate — the post-hoc pair check and SolveW
+    spectral filter are both O(θ) × O(seq_len) per W/Z; FFT makes
+    them O(M log M).
+  - **Detection**: higher effective bnd/s (`stage_exit[0]/elapsed`)
+    and higher `flow_w_spec_pass/flow_z_spec_pass` per unit time.
+    Also visible in the "Pipeline Flow" funnel.
+  - **Status**: implemented via `SpectralFilter` (src/main.rs:389)
+    using `realfft`; `compute_spectrum_into` is called post-hoc after
+    every Z SAT and the SolveW brute-force path. Active everywhere in
+    the current pipeline.
+- **Better Z/W generation** *(from Grok)*: Tighter global DFS bounds +
+  parity pruning in `generate_sequences_with_sum_visit`. Benchmark:
+  97→103 ms (regression).
+  - **TTC mechanism**: would affect rate if it helped — but the extra
+    branches cost more than the pruning saves on this profile.
+  - **Status**: not merged. `generate_sequences_with_sum_visit`
+    (src/main.rs:627) still uses simple tail-sum feasibility pruning.
 
 ## Ideas from Gemini (credit: Gemini for every item below)
 
-- **Incremental Spectral Pruning in XY backtracker** *(from Gemini)*: Track running DFT sums (re_x, im_x, re_y, im_y) in XYState. Pre-calculate a spectral budget per frequency for each (Z,W) pair: `budget_k = (4n-2) - 2|DFT_Z(ω_k)|² - 2|DFT_W(ω_k)|²`. On each set_pair, update complex sums using SpectralTable. Prune if `|DFT_X_partial|² + |DFT_Y_partial|² > budget_k + ε` at any frequency.
-  - **Tried (2026-03-30)**: Implemented full incremental DFT tracking in XYState with spectral budget pruning. Regression: n=14 10.93→12.15ms (+11%), n=16 37.63→43.26ms (+15%). The standard benchmarks have xy_nodes=0 (backtracking never entered), so pruning adds only overhead. Would only help when Phase C is the bottleneck.
+- **Incremental Spectral Pruning in XY backtracker** *(from Gemini)*:
+  Track running DFT sums in XYState; prune if `|DFT_X_partial|² +
+  |DFT_Y_partial|² > budget_k + ε` at any frequency.
+  - **TTC mechanism**: rate and shortfall — would prune XY candidates
+    before full SAT/backtrack, so `flow_xy_decisions/flow_xy_solves`
+    and `flow_xy_timeout` both go down.
+  - **Tried (2026-03-30)**: regressed +11-15% on the old backtracker;
+    `xy_nodes=0` on standard benchmarks so overhead-only.
+  - **Status now**: the old XY backtracker is gone. The equivalent in
+    the current pipeline is `radical::SpectralConstraint` (radical/src
+    /lib.rs:218) inside the Z SAT solver — that *is* implemented and
+    wired via `z_solver.attach_spectral_constraint` at
+    src/main.rs:3400ish. Its TTC impact is visible as reduced
+    `flow_z_propagations` per decision. Re-doing the same trick inside
+    the XY SAT solver is still an open idea; see "SpectralConstraint
+    for XY" below.
 
-- **SIMD-Accelerated Autocorrelation** *(from Gemini)*: Replace manual 4x loop unrolling in autocorrelation hot loops with explicit SIMD (std::simd or `wide` crate). Store sequences as aligned i8 slices. Use 256-bit vector multiply-and-add to process 32 elements per cycle.
-  - **Tried (2026-03-30)**: Replaced branching in `spectrum_if_ok` with branchless multiply (`v as f64 * cos`) and pre-computed i32/f64 values. On heavy spectral benchmark (n=16, θ=49152, ~8s/run): baseline mean=7820ms, branchless mean=8244ms (**5.4% regression**). The branch predictor handles {±1} sequences well; conditional add/sub avoids multiply latency. Stable Rust lacks `std::simd`; the `wide` crate would add a dependency. Reverted.
+- **SIMD-Accelerated Autocorrelation** *(from Gemini)*: explicit SIMD
+  multiply-and-add via `std::simd` or `wide`.
+  - **TTC mechanism**: rate.
+  - **Tried (2026-03-30)**: branchless multiply regressed 5.4% on
+    heavy spectral profile (branch predictor already handles ±1
+    well). Stable Rust lacks `std::simd`.
+  - **Status**: not merged. The FFT-based `spectrum_if_ok` path and
+    the Z SAT `SpectralConstraint` already use cache-friendly float
+    arithmetic via `rustfft`/`realfft`. TTC-wise, post-FFT transition
+    to SIMD here is low-leverage; the SAT solver dominates at the
+    sizes where TTC matters (n≥22).
 
-- **Douglas-Rachford (DR) Projection Heuristic** *(from Gemini)*: Before expensive backtrack_xy, run a few DR iterations to check if a valid (X,Y) pair is likely. Start with random X,Y in [-1,1]^n, project onto frequency constraints (rescale magnitudes so |X_k|²+|Y_k|²=budget_k via FFT/IFFT), project onto time-domain cube (clamp/signum). If no convergence after ~100 iterations, discard the (Z,W) pair.
-  - **Skipped (2026-03-30)**: Two blockers: (1) Requires FFT/IFFT for the frequency-domain projection, but this project has zero external dependencies and the in-tree FFT path was already tried and reverted (10.7% regression). (2) DR is a pre-filter for backtrack_xy, but in all current benchmark profiles `pair_spec_ok=0` — backtracking is never entered, so DR would never execute. Would only help at large n where many Z/W pairs pass spectral filtering AND backtracking is the bottleneck.
+- **Douglas-Rachford (DR) Projection Heuristic** *(from Gemini)*: Run
+  DR iterations before XY SAT to reject hopeless (Z,W) pairs.
+  - **TTC mechanism**: shortfall + rate — pre-filters (Z,W) before
+    cloning the solver, so `flow_xy_timeout` would drop.
+  - **Skipped (2026-03-30)**: needs FFT (now available) but in all
+    tested profiles `pair_spec_ok=0` so would never execute.
+  - **Status now**: the post-hoc `spectral_pair_ok` check
+    (src/main.rs:590) and the SAT `SpectralConstraint` already reject
+    ~99.996% of Z solutions at small k — the pipeline is not (Z,W)-
+    quality-limited anymore, it is SAT-solve-limited. Retrying DR as
+    an XY-quality pre-filter is possible but the payoff depends on
+    actual XY-timeout rates (`flow_xy_timeout/flow_xy_solves`).
 
-- **Symmetry Breaking** *(from Gemini)*: Force X to be symmetric (x_i = x_{n-1-i}) and Y to be skew-symmetric (y_i = -y_{n-1-i}). Modify backtrack_xy to assign pairs of bits simultaneously, reducing search space from 2^{2n} to ~2^n.
-  - **Rejected (2026-03-30)**: Mathematically invalid for Turyn-type binary sequences. The known TT(6) solution X=[-1,-1,-1,-1,1,-1] is NOT palindromic; Y=[-1,-1,-1,1,-1,-1] is NOT skew-symmetric. Enforcing this would miss valid solutions. The symmetry result applies to continuous-valued sequences, not binary {±1}.
+- **Symmetry Breaking (X palindromic, Y skew-symmetric)** *(from Gemini)*.
+  - **TTC mechanism**: denominator — would shrink the live XY search
+    space by ~2^n.
+  - **Rejected (2026-03-30)**: known TT(6) solution is not palindromic
+    / skew-symmetric, so this would miss valid solutions. Result
+    applies to continuous ±1 relaxations, not discrete ones.
+  - **Status**: do not revive as-is. A weaker, measured symmetry
+    reduction would need TT(n) normalization rules (x[0]=+1,
+    time-reversal/complementation) — these are already exploited in
+    `phase_a_tuples` sum canonicalization (src/main.rs:464).
 
 ## Why backtracking (Phase C) is never triggered on standard benchmarks
+
+*(Historical note: all three `--wz` modes now funnel into
+`SolveXyPerCandidate::try_candidate` SAT instead of the legacy
+backtracker. What follows is preserved for context; the analysis of
+where pairs die still applies — it just happens inside SAT now.)*
+
 
 On all standard benchmark profiles (n=14 θ=128, n=16 θ=256, n=22 θ=192), `pair_spec_ok=0` — the combined spectral pair filter rejects every Z/W pair, so `backtrack_xy` is never called (`xy_nodes=0`). Here's why:
 
@@ -84,21 +218,53 @@ Most generated Z/W candidates have high power (close to the bound) at overlappin
 
 ### Implemented from Grok SAT/CP ideas
 
-- **CaDiCaL SAT solver integration** *(from Grok, "SAT/CP hybrids")*: Added `--sat` mode using the `cadical` crate (CaDiCaL v1.9.5 with Rust bindings). Encodes TT(n) as a SAT instance with: Boolean variables for ±1 sequence positions, XNOR auxiliary variables for agree/disagree at each lag, sequential counter (Sinz 2005) for exact cardinality on sums, and selector-based weighted cardinality for the autocorrelation constraints (separate XY/ZW counters with enumerated valid splits). Iterates over all distinct sum-tuples with x[0]=+1 symmetry breaking. Results: TT(4)–TT(18) all found. TT(18) in 89s vs SA's 580s (**6.5x faster**). **Implemented.**
+- **CaDiCaL SAT solver integration** *(from Grok, "SAT/CP hybrids")*:
+  `--sat` mode using `cadical` v1.9.5 via optional feature flag.
+  Encodes TT(n) with XNOR agree aux vars, sequential counters (Sinz
+  2005), and selector-based weighted cardinality. TT(4)–TT(18) all
+  found; TT(18) in 89s vs SA 580s (**6.5× faster**).
+  - **TTC mechanism**: rate (faster SAT) + denominator (CaDiCaL's BVE
+    preprocessing proves UNSAT earlier without walking the full
+    tree).
+  - **Status**: present behind `--features cadical`
+    (Cargo.toml:11,17). Current default is the in-tree `radical`
+    solver because the live pipeline needs the custom quad-PB and
+    spectral constraints that CaDiCaL does not implement. CaDiCaL is
+    used only for the standalone `--sat` top-level encoding, not
+    per-(Z,W) XY solves, so it doesn't currently feed into TTC.
 
 ### Tried from Grok SAT/CP ideas
 
-- **Z-aware per-frequency W spectral tightening** *(from Grok, "tighter spectral bounds")*: After generating all Z candidates, compute min Z power at each frequency across retained Z. Use `spectral_bound - min_z_power[k]` as tighter per-frequency bound when filtering W. At θ=256 (n=16): reduced w_spec_ok from 2871 to 2668 (**7.1% fewer W candidates**). But at the primary benchmark (θ=20000): w_spec_ok=2662 in both cases — zero additional rejections. The high spectral resolution at large θ already provides tight individual bounds. Exhaustive benchmark: `6092ms → 6325ms` (**3.8% regression** from per-frequency bound overhead). **Reverted.**
+- **Z-aware per-frequency W spectral tightening** *(from Grok)*:
+  use `spectral_bound - min_z_power[k]` when filtering W.
+  - **TTC mechanism**: denominator (fewer W candidates reach
+    SolveZ, so `stage_enter[1]` and all downstream counters shrink
+    proportionally).
+  - **Measurement**: θ=256 reduced w_spec_ok by 7.1%; θ=20000 zero
+    effect; 3.8% wall-clock regression overall.
+  - **Status**: reverted. Not currently in the code. For MDD modes
+    the equivalent per-frequency Z-conditioned bound is now
+    computed *inside* the Z SAT solver via `SpectralConstraint::
+    per_freq_bound` (set from `pair_bound - |Ŵ(ω_fi)|²`); see
+    `src/sat_z_middle.rs`. That's effectively the same trick,
+    applied after W is fixed.
 
-- **Greedy repair near solution** *(from Grok, "geometric repair / Kline 2019")*: When SA defect drops below 4*n, switch to exhaustive steepest-descent: try all O(n²) same-value pair swaps across all 4 sequences, take the best improving one, repeat until stuck. At n=16: flips/sec `32.03M → 30.06M` (**6.1% regression**) because each greedy evaluation is O(n³) total. All runs found solutions (benefit in convergence), but at n=18 defect still stuck at ~40-56 (greedy can't escape local minima deeper than pair swaps). The quadratic constraint structure means nearby solutions aren't reachable by pair swaps alone. **Reverted.**
+*(All four SA items below affect the `--stochastic` mode only. SA
+is not part of the TTC pipeline: it doesn't walk MDD boundaries and
+doesn't emit stage_exit events. TTC is undefined for SA runs. Kept
+here for completeness; tracked in flips/sec.)*
 
-- **Simplified delta-corr computation** *(from Grok, "merit factor optimization")*: Refactored SA inner loop delta computation from multiple multiply-accumulate pairs to a single `-2*vi*nb*weight` formula. Since seq[p]=seq[q]=v (same-value swap), the delta at each lag reduces to `-2v * (sum of 4 non-overlapping neighbors)`. Fewer multiplies and cleaner branch structure. Stochastic benchmark: `32.03M → 34.13M flips/sec` (**+6.6%**). Exhaustive: neutral. **Implemented.**
-
-- **Pre-grouped value indices for O(1) SA partner selection** *(from Grok, "efficient search data structures")*: Pre-build per-sequence lists of indices with value +1 and -1. Partner selection becomes O(1) random index from the matching group, eliminating the random-probe loop (up to seq_len retries). Updates on accept: O(n/2) retain + push. Stochastic benchmark: `34.13M → 41.65M flips/sec` (**+22.0%**). Exhaustive: neutral. **Implemented.**
-
-- **Lag-targeted SA move selection** *(from Grok, "radar/comms merit factor")*: On 25% of SA flips, find the worst lag s* (max |corr[s]|), then pick positions p, q at distance s* for the swap. This ensures swaps directly affect the highest-defect lag. Stochastic benchmark: `32.03M → 29.52M flips/sec` (**7.8% regression**). The O(n) worst-lag scan on 25% of flips plus extra branch overhead and same-value fallback costs more than any convergence benefit. SA's existing random exploration with temperature scheduling already handles lag targeting implicitly through the accept/reject criterion. **Reverted.**
-
-- **Legendre/QR seeding for stochastic search** *(from Grok, "algebraic starters")*: On 50% of SA restarts, seed Z/W with Legendre-symbol sequences (quadratic residues mod nearest prime) with random circular shift and negation, instead of fully random. These have good autocorrelation properties. Stochastic benchmark: flips/sec `29.36M → 27.21M` (**7.3% regression**). The fix_sum step to adjust Legendre sequences to target sums adds per-restart overhead that outweighs any benefit from better starting autocorrelation. Time-to-solution occasionally faster (194ms vs 1.4s best) but median similar. **Reverted.**
+- **Greedy repair near solution** *(from Grok)*: steepest-descent
+  pair swaps when defect <4n. 6.1% regression; stuck at n≥18.
+  Reverted.
+- **Simplified delta-corr computation** *(from Grok)*: SA inner loop
+  refactor, `32.03M → 34.13M flips/sec` (+6.6%). **Kept** in
+  `stochastic_worker` (src/main.rs:1733).
+- **Pre-grouped value indices for O(1) SA partner selection** *(from
+  Grok)*: `34.13M → 41.65M flips/sec` (+22.0%). **Kept**.
+- **Lag-targeted SA move selection** *(from Grok)*: 7.8% regression.
+  Reverted.
+- **Legendre/QR seeding** *(from Grok)*: 7.3% regression. Reverted.
 
 ## Ideas from London thesis (credit: Stephen London, PhD thesis "Constructing New Turyn Type Sequences, T-Sequences and Hadamard Matrices", UIC 2013)
 
@@ -126,19 +292,73 @@ London holds the record for longest known Turyn type sequences (TT(40)). His the
 
 ### Implemented from London thesis
 
-- **Z/W-indexed boundary table** *(London §3.3, Step 1)*: Pre-enumerate all valid X/Y boundary configurations (prefix+suffix of length k) and index them by Z/W boundary bits. At runtime, given a Z/W candidate, extract its boundary bits, do a single O(1) array lookup, and get all compatible (x_bits, y_bits) pairs. The precomputation checks autocorrelation constraints for boundary-only lags (lags where all position pairs fall within the boundary). Deduplicated format: many Z/W configs share the same X/Y signature, so unique (x,y) lists are stored once with indices pointing to shared lists. For k=6: 27K distinct signatures, 4.2M unique X/Y entries, 131MB table. For k=7: table generation is feasible but table is much larger. **Implemented.**
+- **Z/W-indexed boundary table → replaced by MDD** *(London §3.3
+  Step 1)*: pre-enumerate valid (x,y) boundary configs per (z,w).
+  - **TTC mechanism**: denominator (the MDD's `count_live_paths()`
+    counts exactly the post-boundary-filter live space; this was a
+    flat-table version of the same idea).
+  - **Status**: the XYBoundaryTable flat table was deleted in
+    commit 7b1ec5e once `table_vs_mdd_same_k_agree` confirmed the
+    MDD walker returns the identical candidate set. The MDD (1 MB)
+    replaces a 1.9 GB flat table. `Mdd4` in
+    `src/mdd_zw_first.rs`; loaded by `load_best_mdd`
+    (src/mdd_zw_first.rs). Feeds TTC as the denominator via
+    `live_zw_paths` (src/main.rs:2503).
 
-- **Spectral budget restriction (`--max-spectral`)** *(London §5.1)*: Added `--max-spectral=M` CLI parameter. Restricts spectral pair filter to `|Z(ω)|² + |W(ω)|² ≤ M` at every frequency. Individual filtering still uses full spectral_bound. Trades completeness for dramatically reduced search space at larger n. London used M=66 for first TT(32), M=84 for first TT(40). No regression on existing benchmarks (pair filter already rejects everything at n=16). **Implemented.**
+- **Spectral budget restriction (`--max-spectral`)** *(London §5.1)*:
+  `|Z(ω)|² + |W(ω)|² ≤ M` with M < spectral_bound.
+  - **TTC mechanism**: denominator — shrinks the live (Z,W) space
+    by rejecting spectrally "loose" candidates. Trades completeness
+    for TTC. London used M=66 for first TT(32), M=84 for first
+    TT(40).
+  - **Detection**: final "Pipeline Flow" block would show higher
+    `z_pair_fail` / lower `z_xy` counts.
+  - **Status**: implemented; `--max-spectral=M` flag, consumed by
+    `PhaseBContext::pair_bound` (src/main.rs:2547). Not instrumented
+    as a separate TTC lever, but lowers `live_zw_paths` → `eff`
+    arrival rate effectively when set.
 
-- **Early sum feasibility pruning in XY backtracker** *(London §3.3, Step 6)*: Restructured backtrack_xy to set pos first, then pre-check sum feasibility for the mirror position BEFORE the expensive set_pair(mirror) call. Also checks x and y sum bounds independently for xq and yq. Additionally fixed a latent bug where the backtracker would corrupt state when the mirror position was already assigned. Phase C benchmark (n=16, θ=100): xy_nodes `901,772 → 10,368` (**87× reduction**), runtime `1903ms → 17.5ms` (**-99.1%**). Primary exhaustive benchmark (θ=20000): neutral (Phase C not triggered). **Implemented.**
+- **Early sum feasibility pruning in XY backtracker** *(London §3.3
+  Step 6)*: pre-check mirror sum bounds before `set_pair(mirror)`.
+  - **TTC mechanism**: rate (prunes infeasible XY states).
+  - **Measured**: 1903 ms → 17.5 ms (−99.1%) on the old backtracker
+    Phase C benchmark.
+  - **Status now**: the old backtracker is gone. The analogous
+    early-prune in the current pipeline is inside
+    `SolveXyPerCandidate::try_candidate` where the GJ equalities
+    and partial-lag `lag_filters` reject bad (x,y) before the SAT
+    clone. Reflected in `flow_xy_root_forced / flow_xy_free_sum`
+    (higher forced = more pre-filtering).
 
 ### Tried from London thesis (no improvement on current benchmarks)
 
-- **Integer spectral storage** *(London §3.4, item 1)*: Tried storing ⌈power/2⌉ as i16 (1-2 bytes) instead of f64 (8 bytes) for spectrum values. Individual filtering still uses f64; integer storage only for pair comparisons. Exhaustive (θ=20000): `5957 → 6209ms` (**+4.2% regression**). Light (θ=256): `20.9 → 26.5ms` (**+27% regression**). The `(p/2.0).ceil() as i16` conversion in the hot FFT post-processing loop adds overhead without benefit since pair_spec_ok=0 at these benchmark sizes. Memory savings would only matter with millions of stored spectra at larger n. **Reverted.**
+- **Integer spectral storage** *(London §3.4, item 1)*: i16 instead
+  of f64 for pair comparisons.
+  - **TTC mechanism**: rate (cache density).
+  - **Measured**: +4-27% regression at n=16 benchmarks. Modern FPU
+    already wins; bucket reduction would only matter for millions
+    of stored spectra.
+  - **Status**: reverted. Not in code.
 
-- **Pair-based tuple searching** *(London §3.4, item 4)*: Checked whether normalized tuples share (|z|, |w|) sums, which would allow reusing Z/W candidates across tuples. For n=16: all 4 tuples have unique (|z|, |w|) pairs. For n=22: all 10 tuples have unique (|z|, |w|) pairs. No savings possible at current benchmark sizes. **Not implemented.**
+- **Pair-based tuple searching** *(London §3.4, item 4)*: share
+  Z/W candidates across tuples with matching (|z|,|w|).
+  - **TTC mechanism**: rate (amortize Z/W generation) and
+    denominator-ish (fewer unique candidates).
+  - **Measured**: all normalized tuples have unique (|z|,|w|) at
+    n=16 and n=22, so no savings. Unchecked at n≥26. Worth
+    re-auditing: `phase_a_tuples` count grows with n, and the
+    cross-mode `cross_w_cache` (src/main.rs:3653) already caches
+    w_candidates per `tuple.w` sum — a partial implementation.
+  - **Status**: partial (cross mode caches by w-sum only).
 
-- **Optimal theta ≈ 100** *(London §3.4, item 6)*: Tested theta values 50–20000 on both exhaustive and solution-finding benchmarks. Results are configuration-dependent: theta=100 is fastest for Phase B (FFT cost scales with theta) but lets more Z/W pairs through, triggering expensive Phase C at n=16 (1622ms). theta=200+ rejects all pairs at n=16, giving 22ms. London's theta=100 is optimal for his non-FFT spectral computation; for our FFT-based approach, theta=200–256 is the sweet spot for n=16. **Configuration finding, not code change.**
+- **Optimal theta ≈ 100** *(London §3.4, item 6)*.
+  - **TTC mechanism**: rate (lower θ = cheaper FFT) vs. denominator
+    (higher θ = tighter pair bounds = more rejections before XY).
+  - **Status**: with `realfft`, θ=256 chosen as the sweet spot for
+    n=16 exhaustive, but the SAT pipeline uses `SPECTRAL_FREQS =
+    167` (src/main.rs:9) at the SAT's integer grid and θ=256 at
+    the post-hoc FFT grid. Not a simple "pick one θ"; see
+    "Spectral grid sweep" open idea below.
 
 ### Table refinement ideas (not yet implemented)
 
@@ -198,7 +418,10 @@ Benchmarked each Grok change individually on a different machine to identify whi
 
 ## Ideas from Claude: radical SAT solver improvements (credit: Claude)
 
-The Phase C SAT solver (radical) is the bottleneck at n=22, consuming ~96% of compute. CaDiCaL has several techniques that radical lacks. Prioritized by expected impact:
+The Phase C SAT solver (radical) is the bottleneck at n≥22, consuming
+≥95% of compute. Every technique here directly attacks TTC's *rate*
+lever: faster SAT → higher `stage_exit[3]/elapsed` → higher effective
+bnd/s. Many also attack shortfall by reducing `flow_xy_timeout`.
 
 1. **Learnt clause minimization** *(from Claude)*: After 1-UIP conflict analysis, recursively remove redundant literals from the learnt clause. A literal is redundant if its reason clause is entirely subsumed by other literals already in the learnt clause (or at decision level 0). CaDiCaL's `minimize` pass typically shrinks learnt clauses 20-30%, improving propagation efficiency and reducing clause database bloat.
 
@@ -216,21 +439,50 @@ The Phase C SAT solver (radical) is the bottleneck at n=22, consuming ~96% of co
 
 ### Implemented from Claude SAT ideas
 
-- **Assumptions-based incremental solving** *(from Claude, idea 6)*: Switched `SatXYTemplate::solve_for()` from cloning the solver to using `solve_with_assumptions()`. Learnt clauses now persist across Z/W pairs for the same tuple. Benchmark n=22: `21.3s → 19.7s` (**-7.5%**). **Implemented.**
+Each of these was measured against a stand-alone SAT microbench, not
+against TTC directly. All four live in `radical/src/lib.rs` and
+feed TTC through the `flow_xy_*` counters today.
 
-- **Blocker literal in watch lists** *(from Claude, idea 5)*: Changed watch lists from `Vec<u32>` to `Vec<(u32, Lit)>`, storing the other watched literal as a blocker. The blocker check in `propagate_lit` skips satisfied clauses before accessing clause memory. Benchmark n=22: `19.7s → 15.5s` (**-21.3%**). **Implemented.**
+- **Assumptions-based incremental solving** *(from Claude, idea 6)*:
+  `solve_with_assumptions()` persists learnt clauses across Z/W pairs.
+  n=22: 21.3s → 19.7s (**−7.5%**).
+  - **Status**: `Solver::solve_with_assumptions` at
+    `radical/src/lib.rs:1300`. Used by `SolveXyPerCandidate::
+    try_candidate` inside the MDD pipeline.
+  - **TTC feed**: higher `flow_xy_propagations / flow_xy_decisions`
+    ratio (learnt clauses help propagation catch more).
 
-- **Learnt clause minimization** *(from Claude, idea 1)*: Added recursive minimization (MiniSat-style) after 1-UIP analysis. Removes literals whose reason chains are entirely covered by the learnt clause. Initially regressed +5% on the original baseline, but after the blocker literal optimization made propagation cheaper, the balance shifted. Benchmark n=22: `15.5s → 14.7s` (**-5.1%**). **Implemented.**
+- **Blocker literal in watch lists** *(from Claude, idea 5)*:
+  `watches: Vec<Vec<(u32, Lit)>>` (radical/src/lib.rs:612). Blocker
+  check short-circuits satisfied clauses. n=22: 19.7s → 15.5s
+  (**−21.3%**).
 
-- **CaDiCaL backend** *(from Claude, idea 7)*: Added `SatSolver` trait abstracting over radical and CaDiCaL. Compile with `--features cadical` to use CaDiCaL. Benchmark n=22: CaDiCaL `11.8s` vs radical `14.7s`. CaDiCaL is ~20% faster, likely due to BVE preprocessing. **Implemented.**
+- **Learnt clause minimization** *(from Claude, idea 1)*: MiniSat-style
+  recursive minimization in `minimize_learnt`
+  (radical/src/lib.rs:3113). n=22: 15.5s → 14.7s (**−5.1%**).
+
+- **CaDiCaL backend** *(from Claude, idea 7)*: `--features cadical`,
+  behind a `SatSolver` trait abstraction. n=22: CaDiCaL 11.8s vs.
+  radical 14.7s.
+  - **Status**: the CaDiCaL path is still wired via `cadical` crate
+    but is *not* plugged into the MDD pipeline's per-candidate XY
+    solving (which uses radical's custom constraints: MDD, quad PB,
+    spectral). Only the top-level `--sat` encoding goes through
+    CaDiCaL today. Keeping it compiled costs nothing; retiring
+    would simplify.
 
 ### Tried from Claude SAT ideas (rejected)
 
-- **EMA-based restarts** *(from Claude, idea 2)*: Replaced Luby restarts with glucose-style EMA tracking (fast α=1/32, slow α=1/4096, margin=1.25, blocking by trail size). First attempt on original baseline: `21.1s → 21.6s` (+2.3% regression). Second attempt after blocker+minimization: `14.7s → 25.8s` (**+75% regression**). The EMA strategy restarts too aggressively for these instances, undoing productive search. Luby's geometric backoff is a better fit. **Reverted.**
-
-- **Failed literal probing** *(from Claude, idea 3)*: Probed up to 500 most-active unassigned variables before each solve. Negligible impact: `21.1s → 21.2s` (+0.6%, within noise). The cardinality-encoded instances don't have cheap implications to discover via unit propagation alone. May help at larger n with more complex implication graphs. **Reverted.**
-
-- **On-the-fly self-subsumption** *(from Claude, idea 4)*: During conflict analysis, checked if all non-resolvent literals of the reason clause were already `seen`, and if so, strengthened the reason clause by removing the resolved literal. Caused correctness issues (4 test failures on first attempt, 1 on second) due to watch list invariant corruption when strengthening clauses mid-analysis. CaDiCaL handles this via lazy/deferred strengthening. **Reverted.**
+- **EMA-based restarts**: reverted (+75% regression after blocker+
+  minimization; aggressive restarts undo productive search).
+  - **Status**: code path exists behind `config.ema_restarts`
+    (radical/src/lib.rs:563), default `false`, flag `--ema-restarts`.
+    TTC impact untested on current pipeline.
+- **Failed literal probing**: +0.6% noise at the time.
+  - **Status**: code path exists behind `config.probing` (line 564),
+    default `false`, flag `--probing`.
+- **On-the-fly self-subsumption**: correctness bugs, reverted.
+  - **Status**: not in code.
 
 ### Combined results summary (n=22 hybrid search)
 
@@ -245,58 +497,91 @@ The Phase C SAT solver (radical) is the bottleneck at n=22, consuming ~96% of co
 
 ### Tried: Native XNOR propagation (CryptoMiniSat-style)
 
-- **Native XNOR constraints** *(from Claude)*: Replaced the 4-clause XNOR encoding (`aux ↔ (a ↔ b)`) with a native `XnorConstraint` struct that propagates directly. When 2 of the 3 variables are assigned, the third is forced. Watched via per-variable index (static, no updates needed). Benchmark n=22: `12.9s → 17.5s` (**+35% regression**). The 2WL clause encoding with blocker literals is more efficient because the blocker short-circuits most checks without accessing clause memory. The native XNOR adds a second propagation pass on a separate data structure for every enqueued literal. **Reverted.**
+- **Native XNOR constraints**: +35% regression; 2WL+blocker
+  already cheap. Reverted.
+- **CryptoMiniSat-style Gauss-Jordan on XNORs**: the quadratic
+  structure defeats direct elimination. Not implemented.
+  - **However**: a different GF(2) parity track *is* wired via
+    `add_xor` / `XorConstraint` + `preprocess_scc_equivalences`
+    (radical/src/lib.rs:1036, 1523). XOR propagation had a
+    soundness bug in Feb 2026 (commits d337131 → 2ad1bb5 →
+    f0dc681) and is currently default-*enabled* via
+    `config.xor_propagation: true` (line 584) but can be disabled
+    with `--no-xor`. TTC feed: XOR propagation reduces
+    `flow_xy_decisions` per solve.
 
-- **CryptoMiniSat-style Gauss-Jordan elimination** *(idea)*: The XNOR constraints form a system of XOR equations (`aux ⊕ a ⊕ b = 0`). GJ elimination could discover implied variable equalities and reduce the constraint count. However, the XNOR aux variables appear in PB cardinality constraints (agree counts), not directly in clauses, so eliminating them requires rewriting PBs — a non-trivial transformation. The agree count `sum(x_i XNOR x_{i+s})` is quadratic in the original variables, so direct elimination without aux vars isn't possible in the PB framework. **Not implemented.**
-
-See README.md for the full CaDiCaL vs radical feature comparison matrix.
+See README.md for the full CaDiCaL vs. radical feature comparison
+matrix.
 
 ## Next optimization candidates (credit: Claude)
 
 ### 1. Quadratic PB constraints (eliminate XNOR aux vars entirely)
 
-Eliminate all 462 XNOR auxiliary variables by extending radical with quadratic PB constraints: `sum(a_i * b_i) = target`. The agree count `agree(x_i, x_{i+s}) = x_i*x_{i+s} + ¬x_i*¬x_{i+s}` is expressed as product terms directly on primary X/Y variables.
+Express agree counts `agree(x_i, x_{i+s}) = x_i*x_{i+s} + ¬x_i*¬x_{i+s}`
+directly on primary X/Y via `add_quad_pb_eq/range`.
 
-**Implemented.** Propagation generates minimal explanation clauses on-the-fly for CDCL conflict analysis. Problem shrinks from ~506 vars / ~1850 clauses to 44 vars / 2 clauses + PB + quad PB constraints. Benchmark n=22: **~15.3s (neutral)**. The on-the-fly clause generation overhead roughly equals the saved XNOR clause cost. Two rounds of optimization (minimal explanation clauses, removing per-propagation allocations) did not change the picture.
+- **TTC mechanism**: rate — radically shrinks per-candidate solver
+  build cost (44 vars / 2 clauses vs 506/1850) and speeds up clone;
+  also shrinks cache footprint during propagation.
+- **Status**: **Implemented.** `QuadPbConstraint` at
+  `radical/src/lib.rs:182`; `add_quad_pb_eq` line 912;
+  `add_quad_pb_range` line 971; `propagate_quad_pb` line 2798;
+  `recompute_quad_pb` line 2769. Used by the Z SAT builder
+  (`src/sat_z_middle.rs`) and the XY SAT template
+  (`SatXYTemplate::build`, src/main.rs:1438ish).
+- **Benchmark n=22**: ~15.3s (neutral vs totalizer at that size).
+- **TTC benchmark n=56**: 140 → 797 solves/s with `--quad-pb` as
+  default (**+470%**; logged in OPTIMIZATION_LOG.md round 2).
 
 ### 2. BVE preprocessing (bounded variable elimination)
 
-CaDiCaL's main advantage is BVE — resolving away variables that appear in few clauses before search begins. With the quadratic PB approach, there are very few clauses left (just symmetry breaking), so BVE has little to work with. **Skipped** — the quad PB approach made this less relevant.
+- **TTC mechanism**: rate — BVE would shrink clause DB for all
+  solves.
+- **Skipped** — quad PB leaves only 44 primary vars / 2 clauses.
+  Nothing for BVE to eliminate.
 
 ### 3. Tier-based clause retention
 
-CaDiCaL uses 3 tiers: glue ≤ 2 (never delete), glue ≤ 6 (delete 25%), rest (delete 50%). **Tried** with multiple configurations. Benchmark n=22: **~15.8s (+3% regression)**. The original flat glue ≤ 3 threshold was already well-tuned for these instance sizes. **Reverted.**
+- Tried CaDiCaL's 3-tier scheme; +3% regression at n=22. Flat glue≤3
+  already tuned for short-solve + clone pattern. **Reverted.**
 
 ### 4. Expand GJ to partial agree targets (parity constraints)
 
-For each lag s with agree target T, the parity constraint `sum(x_i XOR x_{i+s}) mod 2 = (T+k) mod 2` gives a GF(2) equation over primary variables — valid for ALL lags, not just extreme ones. Full GJ elimination on this system discovers additional variable equivalences.
+- **TTC mechanism**: rate (extra unit propagations from GF(2)
+  equivalences).
+- **Implemented** via `add_xor`/`XorConstraint`/`preprocess_scc_
+  equivalences` (radical/src/lib.rs:1036, 1523). n=22 neutral.
+  Expected to help more at larger n; current TTC feed would show up
+  as higher `flow_xy_root_forced` and fewer decisions per solve.
 
-**Implemented.** Benchmark n=22: **~15.4s (neutral)**. At n=22, the parity equations involve many variables each, so GJ produces few 2-variable rows after elimination. May help more at larger n with denser equation systems.
+### 5. Rephasing / target phases
 
-### 5. Rephasing / target phases *(from Claude)*
+- **TTC mechanism**: shortfall — better phase saving might reduce
+  timeouts on hard XY instances.
+- **Tried**: neutral to +2% at n=22 across configs. **Reverted** —
+  but the `config.rephasing` flag is still present
+  (radical/src/lib.rs:567) behind `--rephasing`.
 
-Periodically reset phase saving to the best-known assignment or random polarities. **Tried** with multiple configurations: every 500/1000/2000 conflicts, every 4th/8th restart, alternating best/random. Benchmark n=22: **neutral to +2% regression** across all configs. Two optimization passes (frequency tuning, save-at-restart-only). Phase saving alone is sufficient for these structured short-solve instances. **Reverted.**
+### 6-8. Clause compaction / subsumption / BVE
 
-### 6. Clause compaction / GC *(from Claude)*
+- All rejected for the same reason: clone-template + short-solve +
+  discard means clause DBs are already small and fresh.
+- **TTC pattern**: these all address *long-running* SAT; the
+  Turyn pipeline is *millions of short solves*. The opportunity
+  isn't inside one solve — it's in amortizing shared structure
+  across solves. See "Assumptions-based incremental solving" and
+  "XY dedup by zw_autocorr" for the ideas that did hit TTC.
 
-Compact `clause_lits` after `reduce_db` by removing deleted entries and remapping indices. **Tried**: full compaction with remap of watches, trail reasons, and variable reasons. Benchmark n=22: **neutral (~15.2s)**. With the quad PB encoding, the template has almost no clauses to fragment. The clone+short-solve pattern means clause databases are fresh each invocation. **Reverted.**
+### 9. Incremental slack tracking for quad PB
 
-### 7. Subsumption / self-subsumption *(from Claude)*
-
-Check learnt clauses for subsumption. **Skipped**: same reasoning as compaction. The clone+short-solve pattern means clause databases are small and fresh. The O(n_clauses * clause_len) subsumption check cost would exceed any BCP savings.
-
-### 8. BVE preprocessing *(from Claude)*
-
-Resolve away variables appearing in few clauses. **Skipped**: with quad PB, there are only 44 primary variables and 2 permanent clauses. Explanation clauses are generated during search and discarded with the solver. No preprocessing opportunity.
-
-### Why remaining CaDiCaL features don't help
-
-All four features (rephasing, compaction, subsumption, BVE) address problems in **long-running solves with large clause databases**. Our usage pattern is fundamentally different: **clone template → add per-candidate PB constraints → short solve → discard**. Each solve starts fresh with a small clause database. The remaining ~25% gap to CaDiCaL is likely from CaDiCaL's optimized C++ implementation (tighter inner loops, SIMD, cache-aligned data structures) rather than missing algorithmic features.
-
-
-### 9. Incremental slack tracking for quad PB *(from Claude)*
-
-Currently `propagate_quad_pb` recomputes `sum_true` and `sum_maybe` from scratch on every call by scanning all ~80 terms. With ~21 constraints checked per variable assignment, this is O(21 * 80) = ~1680 term evaluations per assignment. Incremental tracking would store `sum_true` and `sum_maybe` per constraint and update them delta-style when a variable changes (+/- one term's coefficient). This requires careful bookkeeping during backtrack (restore old values). Expected to reduce the per-assignment cost from O(terms) to O(1) amortized.
+- **TTC mechanism**: rate (cuts per-assignment cost from O(terms) to
+  O(1) amortized).
+- **Status**: partially implemented via the "stale flag" +
+  `recompute_quad_pb` pattern (radical/src/lib.rs:2769). Full
+  delta-style tracking on every assign is not in the code. Profile
+  n=56 `--quad-pb` shows `recompute_quad_pb` at 4.4% of runtime
+  (post-round-2), so expected gain ~1-2% of solver time → ~1% of
+  TTC rate. Low priority.
 
 ## Performance interventions — April 2026 profile-guided round (credit: Claude)
 
@@ -305,7 +590,10 @@ Profiling n=26 with callgrind (tuple 8,8,2,3, 26 Z/W pairs, 78s):
 - `solve_inner` 7%, `propagate_pb` 3%, malloc/free/realloc 6%
 - `clear_learnt` 0.5%, `reset_quad_pb_state` 0.6%
 
-Phase C (SAT) dominates >90% of runtime. The 10 interventions below target allocation reduction, hot loop efficiency, and unnecessary work elimination.
+SAT dominates >90% of runtime. These 10 items all target the TTC *rate*
+lever via the SAT hot path. Instrumentation is indirect — they show up
+as higher `flow_xy_decisions/s` and higher `stage_exit[3]/elapsed` but
+not as their own TTC counters.
 
 ### P1. Reuse `seen` and `stack` allocations in conflict analysis
 
@@ -663,22 +951,47 @@ Substitute equal variables directly into quad PB constraints.
 
 ---
 
-## Boundaries/s paradigm shift (2026-04-09)
+## Boundaries/s → Time to Cover paradigm shift
 
-**Key insight**: The right optimization metric is boundaries/s (how fast we eliminate
-regions of the search space), NOT xy/s (individual XY solve throughput). Pruning a
-dead boundary early is a huge win even if per-boundary overhead increases, because
-it frees workers from wasted W/Z/XY work on that boundary.
+**2026-04-09 insight**: the right optimization metric is boundaries/s
+(eliminate dead regions), NOT xy/s (per-candidate throughput). Pruning
+a dead boundary early is a win even if per-boundary overhead rises.
 
-Previous ideas like --mdd-extend=1 were rejected because they lowered xy/s. That was
-the wrong metric. If an extension check prunes 52% of boundaries at 14us/call, that's
-a massive win in effective search progress.
+**2026-04-15 refinement (this audit)**: bnd/s is still the wrong
+normaliser because it ignores *total work*. TTC = `(live_zw_paths -
+eff) / (eff/s)` is the right metric:
 
-### E1. Restore extension check before XY SAT — **ACCEPTED (+28% bnd/s at n=56)**
-Restored has_extension() in walk_xy_sub_mdd callback with per-worker u128 cache.
-Prunes 44% of XY candidates at n=56 k=10. Median bnd/s: 394→504 (+28%).
-Also eliminates worst-case cliffs (baseline 92 bnd/s, extension 498-538 stable).
-Neutral at n=26 (median 307 both). Commit: ab65d41.
+- Shrinking `live_zw_paths` (larger k, tighter MDD) is credited
+  *even if bnd/s doesn't move*.
+- A boundary that XY-times-out contributes <1.0 via `xy_cover_micro`,
+  so bnd/s overstates progress on hard instances.
+- Cross and MDD modes get directly comparable numbers (same units —
+  wall-clock seconds to finish).
+
+**Practical guidance when evaluating an idea**:
+
+1. Does it change `live_zw_paths`? (MDD-side lever)
+2. Does it change `stage_exit[0]/s`? (pipeline rate lever)
+3. Does it change `flow_xy_timeout / flow_xy_solves`? (shortfall
+   lever)
+4. Ideally all three are examined; none alone is a full picture.
+
+Previous ideas like `--mdd-extend=1` were rejected on xy/s alone —
+TTC retrospect says that was wrong; see E1 below.
+
+### E1. Restore extension check before XY SAT — **ACCEPTED**
+Restored `has_extension()` in `walk_xy_sub_mdd` callback with per-worker
+u128 cache.
+
+- **TTC mechanism**: rate — prunes ~44% of XY candidates at n=56
+  k=10 *before* the SAT clone. Also cuts `flow_xy_timeout` by
+  eliminating the deepest UNSATs.
+- **Measurement**: median bnd/s 394→504 (+28%); worst-case cliff
+  eliminated (92→498–538 stable). Neutral at n=26 (307 both).
+- **Status**: wired at `src/main.rs:3458-3471` behind `cfg.mdd_extend`.
+  Default is `mdd_extend=1` for MDD modes (src/main.rs:4687). TTC
+  feed: `extensions_pruned` atomic counter reported in the final
+  block (src/main.rs:2694).
 
 ### E2. ZW-only boundary autocorrelation bound at stage 0 — **REJECTED**
 Implemented and tested. At n=26 k=7: only 27 out of 8637 boundaries pruned (0.3%).
@@ -744,28 +1057,337 @@ But bnd/s dropped from 538 to 381 (-29%). The Vec cloning overhead for fan-out
 and altered pipeline dynamics (more SolveZ items created simultaneously) cause
 a systematic regression. The W SAT reduction doesn't compensate.
 
-### E12. Encode XY sub-MDD as SAT constraint — **IN PROGRESS (promising direction)**
-Instead of enumerating ~3400 (x,y) boundary candidates and solving independently,
-encode the MDD as a constraint so the solver explores all boundaries in ONE call.
-The CDCL search learns from conflicts across boundaries (clause transfer).
+### E12. Encode XY sub-MDD as SAT constraint — **PARTIALLY DONE,
+NOT WIRED**
 
-**Tseitin encoding (tested, scales poorly):**
-- Introduces auxiliary "reachability" variables per MDD node (100-700 aux vars)
-- Transition clauses link parent→child via boundary variables
-- n=18: **10x faster to find solution** (114ms vs 1.2s) — huge win!
-- n=20: slightly slower (median 10s vs 6.5s)
-- n=22: **regression** — one run failed to find solution in 60s
-- n=56: bnd/s similar to baseline at 5K conflicts, but high variance
-- Problem: aux variables make CDCL search space 2-8x larger
+Instead of enumerating ~3400 (x,y) boundary candidates and solving
+each, encode the MDD as a constraint so one solver call explores all
+boundaries with clause-learning across them.
 
-**Activity boosting (tested, no benefit):**
-- Boost boundary var activities in MDD level order
-- Doesn't help because boundary vars are pinned by assumptions (VSIDS irrelevant)
+**Tseitin encoding** (tested, scales poorly): 10× faster at n=18;
+regressed at n=20+ due to aux-var blowup.
 
-**Native MDD propagator (NOT YET IMPLEMENTED — next step):**
-- Add MDD as a native constraint type in radical (like GJ, PB, spectral, XOR)
-- Zero auxiliary variables — MDD navigated directly during BCP
-- When boundary var assigned → walk MDD forward, prune dead branches, force implied
-- When all MDD paths dead → conflict with explanation from assigned boundary vars
-- This is the right approach: combines the 10x solution-finding speedup with
-  the scalability of native constraint propagation.
+**Activity boosting** (tested, no benefit): boundary vars pinned by
+assumptions, VSIDS moot.
+
+**Native MDD propagator** — **IMPLEMENTED in radical but NOT wired
+into the live pipeline.**
+
+- **TTC mechanism (predicted)**: denominator (one XY solve per
+  boundary replaces thousands) and rate (clause-transfer across
+  candidates within the same boundary). Could dramatically reduce
+  `flow_xy_solves` per boundary, possibly by 10-100×.
+- **Status**: commit 3a0563c added `MddConstraint` at
+  `radical/src/lib.rs:82`, `add_mdd_constraint`
+  (line 1103), and `propagate_mdd` (line 1166). Commit 62396ed
+  attempted to wire this via an `XY_MODE=mdd` env switch.
+  **Verification**: `grep add_mdd_constraint src/main.rs` → no
+  hits. The propagator is not currently called anywhere in the
+  search pipeline. Tests around it are live in radical's unit
+  tests, not in the search.
+- **Action**: this is the #1 candidate to revive. See final report.
+
+## Interventions found only in git log (audit 2026-04-16)
+
+These are either too small to have merited their own IDEAS entry, or
+they landed before TTC existed. All verified by reading the listed
+code locations.
+
+### G1. `max_z` cap from 10 → 1 per SolveZ item (commit b65021d, b65021d)
+- **TTC mechanism**: rate. The post-hoc FFT pair check rejects >99.99%
+  of Z solutions at small k. Enumerating more Z per W wastes SAT time
+  without covering new (z_boundary, W) pairs faster.
+- **Measured**: n=26 k=3 boundaries-walked-in-20s: max_z=1→14,
+  max_z=10→15, max_z=100→11, max_z=200000→9. Picking 1 maximises bnd
+  coverage rate.
+- **Status**: `max_z: cfg.max_z.min(1)` at src/main.rs:2545.
+
+### G2. Skip blocking clause on last Z iteration (9df0881)
+- **TTC mechanism**: rate — saves one SAT incremental step on the Z
+  loop's final iteration since no further solve will use the block.
+
+### G3. Sign-flip instead of multiply in W DFT inner loop (38967d2)
+- **TTC mechanism**: rate — a small constant-factor speedup in the W
+  spectral filter loop. Shows up in SolveW time per W.
+- **Status**: in `sat_z_middle.rs` W fill path.
+
+### G4. SpectralConstraint Arc-share of tables (f7a7864)
+- **TTC mechanism**: rate — avoids O(n×θ) table clones per SolveZ.
+- **Status**: radical/src/lib.rs:284 — `SpectralTables` held in `Arc`.
+
+### G5. Cache z_boundary DFT alongside fill prep (b053c81)
+- **TTC mechanism**: rate — reuses the boundary DFT across all W's
+  for the same z_boundary instead of recomputing per SolveZ.
+- **Status**: `ZBoundaryPrep` in src/sat_z_middle.rs.
+
+### G6. Buffered spectrum reuse in SolveW brute-force (63bda36, 7be4015)
+- **TTC mechanism**: rate — one allocation per worker instead of
+  per-W for the W post-hoc spectrum.
+
+### G7. Batch queue pushes in SolveW / Boundary stages (04f90a6)
+- **TTC mechanism**: rate — fewer lock acquisitions on the shared
+  `work_queue`. Important because workers contend on the queue
+  mutex.
+
+### G8. MDD-guided tuple fail-fast (f2a6ec9)
+- **TTC mechanism**: denominator (skipped tuples ≡ work never
+  issued). If `any_valid_xy(xy_root, tuple)` is empty, that tuple
+  contributes nothing to this boundary.
+- **Status**: in `Boundary` stage handler (src/main.rs:run_mdd_sat_
+  search).
+
+### G9. XY dedup (1 solve per Z/W pair) — critical correctness+rate
+- **TTC mechanism**: denominator — prior code re-solved the same
+  (z_bits, w_bits, x_bits, y_bits) up to 69× per tuple.
+- **Status**: per-worker `ext_cache: HashMap<u128,bool>`
+  (src/main.rs:3459) plus `SolveXyPerCandidate`'s own
+  `configs_tested` counter.
+- **Measured**: 3× boundary throughput at n=18, TT(18) in 148ms.
+
+### G10. Live MDD path counting for denominator (22d119e, 8c6ee56,
+ec7b3bc, 1c846e6)
+- **TTC mechanism**: denominator (this IS the TTC denominator in MDD
+  modes).
+- **Status**: `count_live_paths` in `src/mdd_reorder.rs:25` (walks
+  the MDD counting 4^(depth-level) per LEAF and 0 per DEAD). Live
+  ZW paths computed once at startup (src/main.rs:2503).
+- **TTC feed**: yes — the denominator `live_zw_paths` passed into
+  TTC formula.
+
+### G11. Quad PB + XOR soundness fixes (d337131 → 2ad1bb5 →
+9007880 → f0dc681)
+- **TTC mechanism**: neither rate nor denominator — these are
+  *correctness* fixes. Before them, the solver returned false
+  UNSAT. Having sound UNSAT means `flow_xy_unsat` contributes full
+  1.0 to `eff`; without soundness, walked boundaries that claimed
+  UNSAT were actually unexplored.
+- **Status**: fixed; `XorConstraint` re-counts unknowns from
+  `assigns[]` on each update (radical/src/lib.rs).
+- **Note**: if we ever resurrect native MDD propagator (E12), a
+  similar correctness audit is needed for its `propagate_mdd` path
+  — the propagator passes unit tests but has never been measured
+  against the full Turyn pipeline.
+
+### G12. Native MDD propagator (3a0563c, 62396ed) — see E12 above.
+Not wired.
+
+### G13. Subcube elimination metric (ec7b3bc, 1c846e6, 8c6ee56)
+- Early attempts at denominator-like metrics before TTC was invented.
+  `mdd_elim_log2` in src/main.rs:3927 is computed but gated behind
+  `_mdd_elim_log2 = ...` (underscore-prefixed → unused). Dead code
+  that could be either revived or removed; it estimates
+  "2^subcube × dead_paths" eliminated at MDD build time.
+- **TTC mechanism**: this *would* be a second denominator view —
+  total configs pruned at build time — but TTC already captures
+  this via the live-path count.
+- **Status**: dead code. Safe to remove.
+
+### G14. TTC metric instrumentation (de8ceef, 0203ba3, 8156e6e,
+bc9beb7) — **this is TTC itself**.
+- `stage_exit[0..3]` counters (src/main.rs:2740, 2885, 3014, 3215,
+  3265, 3475) — true completion counts, not queue pushes.
+- `flow_*_decisions/propagations/root_forced/free_sum`
+  (src/main.rs:2717-2733) — per-stage SAT pruning stats.
+- `flow_xy_sat/unsat/timeout/timeout_cov_micro`
+  (src/main.rs:2737) — XY outcome counts and fractional coverage.
+- `effective_coverage_metric` (src/main.rs:4210) — MDD-mode eff.
+- `cross_estimated_total_xy` (src/main.rs:4185) — cross-mode total.
+- `xy_cover_micro` (src/main.rs:4153) — fractional credit for
+  timeouts based on `log2(decisions+1)/free_vars`.
+- `print_stage_pruning_block` (src/main.rs:4229) — diagnostics.
+
+### G15. T-sequence direct finder (2f90864, 01feaee)
+- `src/bin/tseq.rs` and `src/bin/tseq_mdd.rs` are a separate search
+  that does not go through the Turyn pipeline. Memo experiments
+  found 0 cache hits on `--memo` mode; `tseq_mdd --cross-only` has
+  70-90% last-few-level hit rate.
+- **TTC mechanism**: not applicable — tseq doesn't produce the
+  stage_exit counters.
+- **Status**: separate binary, not instrumented for TTC. Open
+  question: should TTC be extended to cover tseq too?
+
+## Idea audit: ideas that should be retried now that TTC exists
+
+(Ideas previously rejected on xy/s grounds that might be wins on
+TTC. Details in the final report.)
+
+- **E2 ZW-only boundary autocorr bound**: rejected on 0.3% prune
+  rate at n=26, but the relevant number for TTC is *shortfall
+  reduction* when XY times out, not just prune rate.
+- **E4 Early W spectral reject**: rejected on analysis showing
+  individual bound is already optimal without Z info. But a
+  Z-conditioned early reject using `min_Z_power` for boundary-
+  compatible Z could work — basically London §3.4 item 1's
+  Z-aware tightening, applied inside SolveW.
+- **E11 Group SolveW by w_mid_sum**: rejected on bnd/s drop; but it
+  reduced W SAT items by 58% (i.e. denominator at the W-stage
+  level). With quad-PB-dominated XY, the W cost may now be small
+  enough that the regression is noise.
+- **DR projection for XY timeout reduction**: ideas like Douglas-
+  Rachford could be re-framed as pre-filters that specifically
+  target reducing `flow_xy_timeout` — the shortfall term, which
+  we never used to measure.
+- **Native MDD propagator (E12)**: already in radical,
+  just not wired.
+
+These are promoted for retest in the report below.
+
+---
+
+## Audit report (2026-04-16): most-important untried & retry candidates
+
+Framed against TTC. Ordered by expected leverage. All location
+references verified in code.
+
+### Tier 1 — ship these next
+
+1. **Wire the native MDD propagator into the XY SAT stage (E12).**
+   - **Why it matters**: the propagator is the single biggest
+     unshipped TTC lever in the repo. It collapses thousands of
+     per-(x_bits,y_bits) solves per boundary into one solve with
+     cross-candidate clause learning — a denominator win at the XY
+     stage *and* a rate win (no per-candidate clone + template
+     rebuild).
+   - **Why it was not shipped**: the Tseitin prototype regressed at
+     n≥20 because aux vars doubled search depth. The native
+     propagator avoids aux vars but was never wired after
+     `SolveXyPerCandidate` unified the XY fast path.
+   - **Code in place**: `MddConstraint` at radical/src/lib.rs:82,
+     `add_mdd_constraint` at 1103, `propagate_mdd` at 1166. All
+     untested against the live pipeline.
+   - **Detection plan**: add an `XY_MODE` switch to
+     `SolveXyPerCandidate::new`. Compare TTC on n=26 --wz=apart k=7
+     at 60s with mode=per-candidate vs mode=mdd-constraint. The
+     expected signal is `flow_xy_solves` dropping ~10-100× while
+     `stage_exit[3]` stays flat; TTC should drop in proportion to
+     the walker rate.
+   - **Risk**: similar-class correctness issue to the XOR
+     soundness bug from Feb 2026. Gate behind an env flag, run the
+     known-TT(26) regression test first.
+
+2. **Boundary-level XY timeout budget.**
+   - **Why it matters**: currently 5K conflicts/XY for n>30.
+     `flow_xy_timeout/flow_xy_solves` at n=56 is nonzero; each
+     timeout is fractional coverage. If we set a *boundary-level*
+     budget (e.g. total conflicts per boundary ≤ N × avg_solve),
+     we trade a small rate drop for a big shortfall cut — TTC net
+     positive because each timed-out boundary credits less than 1
+     today.
+   - **Detection plan**: sweep the budget and plot TTC vs budget.
+     The per-stage block already shows `timeout%` and `avg cov`;
+     add total XY budget as a CLI flag and diff.
+   - **Code**: src/main.rs:3191 and 3584 set
+     `set_conflict_limit(5000)` unconditionally for n>30.
+
+3. **Retire dead TTC-adjacent code** (`_mdd_elim_log2`,
+   unused subcube stats). Keep one denominator (`live_zw_paths`).
+   Makes it easier for future ideas to attribute their effect.
+
+### Tier 2 — retry on TTC
+
+These are ideas that were rejected on bnd/s or xy/s alone and never
+evaluated against TTC. Expected TTC payoff is plausible but
+unmeasured.
+
+4. **E11 group SolveW by w_mid_sum** — 58% fewer W SAT items
+   (denominator at the W stage) was called a −29% bnd/s regression.
+   With quad PB now default, W work is a smaller share; expected
+   TTC is roughly flat or positive.
+
+5. **E4 Z-aware early W spectral reject** — rejected because the
+   individual W bound is already optimal. But a *Z-boundary-
+   conditioned* early reject using `min_Z_power(ω)` restricted to
+   Z candidates compatible with the current MDD sub-tree can
+   tighten beyond the individual bound. Implementation: compute
+   `min_Z_power` once per boundary's live Z sub-MDD, reject W
+   below the tighter bound.
+
+6. **Gemini incremental spectral pruning — in XY SAT**, not the
+   old backtracker. Track `|X(ω)|² + |Y(ω)|² partial` as
+   assignments come in; reject at first frequency where budget
+   exceeds `6n-2 - 2|Z(ω)|² - 2|W(ω)|²`. Today we only enforce
+   this spectrally for Z (via `SpectralConstraint`); doing it for
+   XY is a direct shortfall win on tough boundaries.
+
+7. **Revive London §3.4 item 4 (pair-based tuple search) at n≥26**.
+   The "unique (|z|,|w|) per tuple" finding was at n=16, 22. The
+   cross-mode `cross_w_cache` already caches w_candidates by
+   `tuple.w` — extend to MDD modes and add z-side caching.
+
+### Tier 3 — interventions that may have optimized the wrong thing
+
+These are accepted optimizations where the win is suspect under TTC.
+
+8. **max_z = 1** (forced cap, src/main.rs:2545). Justified on
+   "boundaries walked in 20 s at n=26 k=3". That's a rate-only
+   number. At large n where SolveZ is cheap relative to walking,
+   a slightly higher cap might amortize z_boundary prep better.
+   **Action**: re-sweep `max_z ∈ {1,2,4,8}` at n=56 --wz=apart
+   k=10 with TTC as the metric.
+
+9. **Conflict limit 5000 for n>30** (src/main.rs:3191, 3584).
+   Chosen to recover +112% xy/s. But xy/s-per-solve ≠ TTC:
+   shortening timeouts gives up partial coverage and inflates
+   the TTC denominator through the `xy_cover_micro` term.
+   **Action**: sweep `conflict_limit ∈ {2K, 5K, 10K, 20K, 50K}`
+   at n=56 against TTC (not against xy/s).
+
+10. **Dual queue (gold + work)** — accepted because a single PQ
+    starved the pipeline. Current dual queue uses a coinflip
+    between XY and upstream items. **Risk**: the ratio is hard-
+    coded and never tuned against TTC. A monitor that adapts the
+    coinflip based on `flow_xy_timeout%` might squeeze ~5-10%.
+
+11. **`mdd_extend = 1` hard-coded** for `--wz=apart|together`
+    (src/main.rs:4687). Accepted on +28% bnd/s; `extend=2`
+    rejected on lower bnd/s. But the candidate-prune rate at
+    extend=2 is higher, which would be a denominator win. **Not
+    re-measured under TTC.**
+
+### Tier 4 — cleanup that aids future measurement
+
+12. **TTC for tseq.rs / tseq_mdd.rs** — separate binaries, no
+    stage_exit counters. Either define a tseq-specific coverage
+    metric or mark them as out-of-scope for TTC explicitly.
+
+13. **cadical feature flag** — present but not integrated with
+    the MDD pipeline's custom constraints. Either integrate
+    (adapter that keeps quad PB / spectral / MDD propagators on
+    the radical path) or retire the dependency. Current state is
+    code bloat with no TTC feed.
+
+14. **toc-ideas.md** — the TOC analysis predates TTC and still
+    frames ideas in terms of "quality of (Z,W)". With TTC that
+    frame becomes "shortfall + denominator" — rewrite the
+    document in TTC terms so new ideas land in the right lever.
+
+### Candidates that no longer look effective in hindsight
+
+15. **EMA restarts / rephasing / vivification / chrono BT**:
+    code paths in radical, defaults off, never turned back on.
+    Each was rejected on n=22 rate benchmarks. At n=56 where
+    timeouts dominate, it's plausible that *one* of these helps
+    shortfall — but without a TTC experiment it's impossible to
+    say. **Action**: a single sweep day across all four flags at
+    n=56 would settle whether any deserves to become default.
+
+16. **Round-2 R-series ideas (R1, R5, R7, R9, R10)**: all
+    rejected on `xy/s` at n=56 `--quad-pb` where the solver
+    dominates. If the MDD propagator lands, these profiles shift
+    dramatically and several are worth re-evaluating.
+
+17. **CaDiCaL integration** (CMS8 BVE specifically): rejected
+    because the template has "nothing to eliminate" with quad
+    PB. If we instead passed *expanded* XY constraints to
+    CaDiCaL on a per-boundary basis, BVE might preprocess the
+    whole XY sub-tree at once — a denominator-ish win. Low
+    priority given the propagator option in tier 1.
+
+### Summary
+
+The biggest unshipped TTC win is **wiring `MddConstraint` into the
+XY SAT stage** — code exists, it's just not called. The biggest
+"wrong-metric" regret is that several tuning decisions (`max_z=1`,
+conflict_limit=5K, mdd_extend=1) were made on xy/s or bnd/s and
+have never been retested against TTC; at minimum one sweep of each
+is cheap and either confirms the decision or flips it.

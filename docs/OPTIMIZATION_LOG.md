@@ -2,6 +2,31 @@
 
 This file tracks performance-oriented changes and their measured impact.
 
+## TTC: the universal metric
+
+Every entry in this log is framed against **Time to Cover (TTC)** —
+the wall-clock time to exhaustively cover the live search space under
+the current pipeline. Defined in `src/main.rs`:
+
+```
+MDD modes: TTC = (live_zw_paths - eff) / (eff / elapsed)
+Cross mode: TTC = (est_total_xy - xy_done_eff) / (xy_done_eff / elapsed)
+```
+
+An optimization helps TTC through at least one of:
+
+1. **Denominator**: shrink `live_zw_paths` or `est_total_xy`.
+   Measure: `mdd.count_live_paths()` before vs after; tuple count
+   enumerated; # entries surviving MDD build.
+2. **Rate**: raise `eff / elapsed`. Measure: `stage_exit[0..3]`/s,
+   per-stage `flow_*_decisions/solves` ratios.
+3. **Shortfall**: reduce XY timeouts. Measure: `flow_xy_timeout /
+   flow_xy_solves` and the per-timeout average `xy_cover_micro`.
+
+Benchmark entries below pre-date TTC. Where we have the raw data,
+TTC is inferred; where we only have an xy/s or ms figure, it's
+tagged as a *rate-only* proxy.
+
 ## Benchmark protocol (use this for apples-to-apples comparison)
 
 Build once in release mode. Run both benchmarks. Each should take ~6–10s per run, long enough to avoid system noise.
@@ -32,11 +57,26 @@ target/release/turyn --n=16 --stochastic-secs=10 --benchmark=3
 - When a solution is found, the run stops early but flips/sec is still valid.
 - Stretch goal: once stochastic improvements push TT(18) into range, switch to `--n=18`.
 
+### Tertiary: TTC (end-to-end coverage)
+
+```bash
+target/release/turyn --n=26 --wz=apart --mdd-k=7 --sat-secs=60
+target/release/turyn --n=56 --wz=apart --mdd-k=10 --sat-secs=30
+```
+
+- Compare the `Time to cover:` line in the final block.
+- Also record from that block: `eff bnd/s`, `live ZW paths`, XY
+  timeout %, and per-stage pruning averages.
+- TTC captures all three levers at once. Use this whenever you
+  change an MDD-mode optimization and can't isolate it cleanly.
+
 ### Rules
 
 - Keep all benchmark parameters fixed when comparing two versions.
 - Run both benchmarks for each optimization; an idea may help one and hurt the other.
 - Benchmark runs should target 6–60s each. Under 6s is too noisy; over 60s wastes iteration time.
+- When reporting a TTC delta, report the three underlying levers
+  too (denominator, rate, shortfall) so the win is decomposable.
 
 ## MDD Phase B optimizations (April 2026)
 
@@ -60,23 +100,74 @@ Cumulative result on n=24 MDD search (k=4):
 
 Baseline: n=56 mdd-k=10, 60s, ~40K XY solves (pre-optimization).
 
-| Date | Change | Measured effect |
-|---|---|---|
-| 2026-04-08 | T1: Reusable LBD buffer (eliminate per-conflict Vec alloc) + T5: 5K conflict limit on XY SAT | avg 85K XY solves (+112%) |
-| 2026-04-08 | Quad PB range constraints for Z solver: replace XNOR aux vars with native quad PB | avg 166K XY solves (+95% cumulative) |
-| 2026-04-08 | T17: Batch XY item emission (single lock per Z solve) | avg 182K XY solves (+10%) |
-| 2026-04-08 | Adaptive conflict limit (50K for n≤30, 5K for n>30) | Fixes TT(18) reliability (80%→100%) |
-| 2026-04-08 | **XY dedup: 1 solve per Z/W pair** (was ~69 redundant solves) | 3x more boundaries explored; TT(18) in 148ms |
+These are rate-only ("xy/s") measurements — the pipeline had no TTC
+counter yet. All five are live in the current build; their aggregate
+effect on TTC is visible in current runs via `stage_exit[3]/s` and
+`flow_xy_{decisions,timeout}`.
+
+| Date | Change | Rate effect | TTC lever |
+|---|---|---|---|
+| 2026-04-08 | T1 reusable LBD buf + T5 5K conflict limit | +112% xy/s | rate + shortfall (timeout at 5K caps wasted work) |
+| 2026-04-08 | Quad PB range for Z solver (XNOR → native) | +95% xy/s cumulative | rate (smaller problem, faster clone) |
+| 2026-04-08 | T17 batched XY item emission | +10% xy/s | rate (fewer queue-lock acquisitions) |
+| 2026-04-08 | Adaptive conflict limit (50K ≤30, 5K >30) | 80→100% TT(18) reliability | shortfall (smaller limit for big n reduces dead-end waste) |
+| 2026-04-08 | **XY dedup: 1 solve per (z_bits, w_bits, x_bits, y_bits)** | 3× boundaries explored; TT(18) in 148 ms | denominator (69× fewer redundant XY solves) |
 
 Tested and rejected:
-- EMA restarts/vivification/chrono BT for XY: all regressed
-- XOR propagation for Z solver: 5x regression
-- Fewer spectral frequencies (8): breaks TT(18) (lets through garbage)
-- More spectral frequencies (32): 50x slower Z solver
-- Fixed-point spectral (London §3.4 i16/i32): 50% regression (modern FPU wins)
-- No-multiply spectral (branch on val sign): regression (code cache pressure)
+- EMA restarts / vivification / chrono BT for XY: all regressed.
+  Code paths still exist behind `config.{ema_restarts,vivification,
+  chrono_bt}` flags in radical; defaults `false`. TTC-retest
+  candidate at larger n where timeouts dominate.
+- XOR propagation for Z solver: 5× regression at the time it was
+  tested. Z solver currently does not enable XOR. The XY solver
+  does (default true, can disable with `--no-xor`).
+- Spectral frequency count: 8 too few (lets through garbage →
+  `flow_xy_timeout` spikes), 32 too many (Z solver 50× slower →
+  rate crash). `SPECTRAL_FREQS = 167` (src/main.rs:9) is the
+  current sweet spot; post-hoc FFT uses a 129-point realfft grid.
+- Fixed-point spectral (London §3.4 i16/i32): modern FPU wins.
+- No-multiply spectral (branch on sign): i-cache pressure.
+
+## TTC-era interventions (April 2026, instrumented)
+
+From git log; not all already captured above. All verified in code.
+
+| Commit | Change | TTC lever | Notes |
+|---|---|---|---|
+| 0203ba3 | stage_exit[0] counts *completed* boundaries, not pushed | instrumentation | Without this, TTC was random-garbage over long runs. **This is the reason TTC is trustworthy.** |
+| de8ceef | Per-stage SAT pruning instrumentation (flow_*) | instrumentation | Exposes rate & shortfall levers cleanly |
+| de8ceef | `xy_cover_micro` + `effective_coverage_metric` | shortfall | Gives fractional credit to timeouts; without this, bnd/s over-counts dead boundaries |
+| 8156e6e | Cross-mode TTC uses extrapolated tuple progress | instrumentation | Before: cross mode printed "infd"; after: real TTC |
+| c3170ec | max_z cap 10 per SolveZ | rate | boundaries-walked peaks at max_z=1 |
+| b65021d | max_z cap 1 (from 10) | rate | +7% bnd at n=26 k=3, sampled |
+| 9df0881 | skip blocking clause on last Z iter | rate | small (one incremental solve step) |
+| 38967d2 | sign-flip instead of multiply in W DFT | rate | micro |
+| b053c81 | cache z_boundary DFT with fill prep | rate | amortises across W's for same z_bits |
+| c2941f9 | hoist z_boundary fill prep out of SolveZ | rate | reduces per-SolveZ overhead |
+| 463fe80 | reuse SpectralTables.pos_cos for Z per-freq bound | rate | removes alloc per SolveZ |
+| f7a7864 | Arc-share SpectralTables across constraints | rate | removes clone per attach |
+| e299664 | reuse lit/coeff buffers across lags in `fill_z_solver_quad_pb` | rate | removes per-lag alloc |
+| 7be4015 | reusable buffer for Z post-hoc spectrum | rate | one alloc/worker |
+| 63bda36 | buffered spectrum in SolveW brute-force | rate | one alloc/worker |
+| b62fda5 | swap loop order in W DFT per_freq_bound | rate | cache-friendlier |
+| f2a6ec9 | MDD-guided tuple fail-fast | denominator | skip tuples with empty XY sub-MDD |
+| 04f90a6 | batch queue pushes in SolveW/Boundary | rate | fewer queue lock hits |
+| dd7642f | realfft (real-input FFT) | rate | ~2× FFT speed for real sequences |
+| e70f2c5 | incremental MDD frontier + XY_MODE switch | (unused in prod) | MDD native propagator plumbing; not wired |
+
+All confirmed live except the last row (`add_mdd_constraint` is
+implemented in radical but not called from `src/main.rs`).
 
 ## Current baseline (latest)
+
+- TTC (n=26, `--wz=cross`): ~10 min reported (extrapolated); actual
+  wall-clock first-SAT ~79 s on 4 threads. TTC is still inflated
+  because it measures time-to-cover, not time-to-first-SAT. Commit
+  8156e6e.
+- TTC (n=26, `--wz=apart`, k=7): ~7.7 h on 4 threads (PIPELINE.md).
+- TTC (n=26, `--wz=together`, k=7): ~7.7 h on 4 threads.
+- The ~7-8× gap between cross and MDD producers at n=26 is the
+  (Z, W)-enumeration strategy, not the XY SAT stage.
 
 - Exhaustive search (n=16, theta=20000):
   - Command: `target/release/turyn --n=16 --theta=20000 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3`
@@ -126,6 +217,11 @@ Note: the previous per-idea claims in `IDEAS.md` were not backed by a step-by-st
 
 ## Optimization history
 
+Entries pre-dating TTC instrumentation use legacy metrics (ms, xy/s,
+solves/s, flips/s). All of these are *proxies* for one of the three
+TTC levers. Where the entry's TTC lever is obvious it is tagged in
+the Notes column; otherwise the legacy number is preserved as-is.
+
 | Date (UTC) | Change | Why it helps | Measured effect |
 |---|---|---|---|
 | 2026-04-05 | Quad PB encoding for cubed SAT (--quad-pb): uses 223 primary vars + quad PB constraints instead of 52K-var totalizer. Also fixes stale-state bug in add_quad_pb_eq. | Eliminates 99.6% of variables and 99.9% of clauses. Clone cost becomes negligible. Custom propagator proves UNSAT efficiently for most instances. | n=56 SAT cubed: 202 → 274 solves/s (**+37%**). |
@@ -171,8 +267,21 @@ For each optimization PR/commit:
    - UTC date,
    - concise change summary,
    - one-sentence explanation,
-   - before/after benchmark numbers.
-2. Update **Current baseline (latest)** to the newest measured values.
-3. Keep benchmark command unchanged unless intentionally creating a *new benchmark profile*.
+   - before/after benchmark numbers,
+   - **TTC lever** (denominator / rate / shortfall / instrumentation)
+     and which counter(s) moved.
+2. If it's an MDD-mode change, also record before/after TTC from the
+   tertiary benchmark.
+3. Update **Current baseline (latest)** to the newest measured values.
+4. Keep benchmark command unchanged unless intentionally creating a
+   *new benchmark profile*.
 
-If a new benchmark profile is needed (e.g., TT(56) stress profile), add a separate section with explicit command and keep historical comparisons within the same profile.
+If a new benchmark profile is needed (e.g., TT(56) stress profile),
+add a separate section with explicit command and keep historical
+comparisons within the same profile.
+
+### Anti-pattern to avoid
+
+Do **not** accept or reject an MDD-mode change on `xy/s` alone. An
+idea that halves xy/s but halves `live_zw_paths` is a *net win*.
+Always report the three levers or a direct TTC delta.
