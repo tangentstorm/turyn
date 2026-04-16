@@ -855,12 +855,9 @@ wall-clock to find solution (currently ~29s).
   one shot.
   Single commit: replace the contains-loop with sorted+dedup.
 
-- **F6: Lower per-attempt conflict budget for re-queue**: The current
-  budget is 5k × 2^attempt (max 50k). Empirically the canonical solution
-  is found within the first few hundred decisions when it exists. Try
-  1k or 2k budgets — burning fewer cycles on hopeless boundaries means
-  more boundaries explored per second.
-  Single commit: change `5_000u64 << ...` to `1_000u64 << ...`, benchmark.
+- **F6: Lower per-attempt conflict budget for re-queue** — ACCEPTED.
+  93× speedup. Moved to `docs/OPTIMIZATION_LOG.md`. Budget lowered
+  from 5k/50k to 20/200.
 
 - **F7: Drop attempt re-queue entirely**: The re-queue mechanism
   (commit ce47c9d) keeps re-pushing the same boundary up to 5 times,

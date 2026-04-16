@@ -217,6 +217,39 @@ pairs at n=20 but 11 lets some through. Accepted at 17. All 35 tests pass.
 
 **Cumulative: 6.2× bnd/s at n=26 wz=together mdd-k=5.**
 
+### F6. SolveWZ conflict budget 5k → 20 — accepted (**+9233% / 93×**)
+
+Commit `ce47c9d` added an exponential re-queue budget (5k × 2^attempt,
+max 50k) so workers wouldn't monopolise one boundary. 5k is way too
+generous after F1: typical hopeless boundaries die in <100 conflicts,
+so the first 4900 are wasted. Lowering the budget to
+`20 × 2^attempt (max 200)` keeps the re-queue mechanism but cuts
+wasted SAT work.
+
+Budget sweep at n=26 wz=together mdd-k=5 (4 threads, 7 runs, F1 applied):
+
+| Budget (first/max) | Median bnd/s | vs F1 only | n=20 correctness |
+|--------------------|--------------|-----------|-------------------|
+| 5000 / 50000 (prior) | 15.24      | —         | 5/5 find, 8-25s   |
+| 1000 / 10000         | 35.40      | 2.3×      | 5/5 find          |
+| 500 / 5000           | 72.39      | 4.7×      | 5/5 find, 5-18s   |
+| 200 / 2000           | 174.72     | 11.5×     | 5/5 find, 3-10s   |
+| 50  / 500            | 634.59     | 41.7×     | 5/5 find, 3-13s   |
+| **20  / 200**        | **1422**   | **93×**   | 5/5 find, 0.8-9s  |
+| 5   / 50             | 4843       | 318×      | **1/5 misses n=20** |
+
+Also tested n=22 and n=24 (both previously unreachable even on main):
+the conflict-budget reduction does not change the miss rate at these
+"too hard" sizes — 2-3/10 at n=22 regardless of budget (bottleneck is
+boundary ordering, not per-solve depth).
+
+At n=26 mdd-k=7 (the headline benchmark for c8a0db5's "1460× speedup"
+claim): main = 6 bnd/s, eloquent-bell = 6 bnd/s, this branch = **1500
+bnd/s**. That's the 250× improvement c8a0db5 was supposed to deliver.
+
+**Cumulative: 1422 / 2.66 = 534× bnd/s at n=26 wz=together mdd-k=5**
+vs the eloquent-bell-merged baseline.
+
 ## Current baseline (latest)
 
 - Exhaustive search (n=16, theta=20000):
