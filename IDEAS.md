@@ -1073,10 +1073,22 @@ assumptions, VSIDS moot.
 **Native MDD propagator** — **IMPLEMENTED in radical but NOT wired
 into the live pipeline.**
 
-- **TTC mechanism (predicted)**: denominator (one XY solve per
-  boundary replaces thousands) and rate (clause-transfer across
-  candidates within the same boundary). Could dramatically reduce
-  `flow_xy_solves` per boundary, possibly by 10-100×.
+- **TTC mechanism (predicted)**: denominator — conflict-driven
+  sub-tree pruning. Today's pipeline iterates every (x,y) leaf and
+  calls `try_candidate`; `solve_with_assumptions` already persists
+  learnt clauses across leaves, so it's *not* a "save the clone"
+  story. The actual marginal win is that a conflict can kill many
+  MDD paths at once via a single learnt clause, whereas today each
+  leaf still triggers an enumeration step + short SAT call. Rate
+  also improves marginally (one solve-setup per boundary instead
+  of per leaf), but the denominator effect dominates.
+- **Predicted range**: extrapolating from the n=18 Tseitin
+  result (10×) is optimistic because Tseitin had the aux-var
+  penalty that the native propagator avoids, but Tseitin regressed
+  at n=22 for the same reason. Plausibly 2-10× reduction in
+  `flow_xy_solves/boundary` at n=26; could easily be flat or
+  negative at n=56. **Not a measurement.** Verify before
+  celebrating.
 - **Status**: commit 3a0563c added `MddConstraint` at
   `radical/src/lib.rs:82`, `add_mdd_constraint`
   (line 1103), and `propagate_mdd` (line 1166). Commit 62396ed
@@ -1242,28 +1254,38 @@ references verified in code.
 ### Tier 1 — ship these next
 
 1. **Wire the native MDD propagator into the XY SAT stage (E12).**
-   - **Why it matters**: the propagator is the single biggest
-     unshipped TTC lever in the repo. It collapses thousands of
-     per-(x_bits,y_bits) solves per boundary into one solve with
-     cross-candidate clause learning — a denominator win at the XY
-     stage *and* a rate win (no per-candidate clone + template
-     rebuild).
-   - **Why it was not shipped**: the Tseitin prototype regressed at
-     n≥20 because aux vars doubled search depth. The native
-     propagator avoids aux vars but was never wired after
-     `SolveXyPerCandidate` unified the XY fast path.
-   - **Code in place**: `MddConstraint` at radical/src/lib.rs:82,
-     `add_mdd_constraint` at 1103, `propagate_mdd` at 1166. All
-     untested against the live pipeline.
+   - **Why it's worth trying**: the code already exists
+     (`MddConstraint` at radical/src/lib.rs:82, `add_mdd_constraint`
+     at 1103, `propagate_mdd` at 1166) and the Tseitin precursor
+     showed a measured 10× at n=18 — so there *is* a win to extract
+     somewhere. The native propagator was specifically designed to
+     avoid the aux-var penalty that killed Tseitin at n≥22. Never
+     wired after `SolveXyPerCandidate` unified the XY fast path.
+   - **What I am NOT claiming**: this isn't a "save the clone" win.
+     `SolveXyPerCandidate::new` already clones once per (Z,W) pair,
+     not per (x,y); `try_candidate` uses `solve_with_assumptions`,
+     so learnt clauses already persist across XY candidates in the
+     same boundary. The clone-elimination pitch from earlier drafts
+     was wrong.
+   - **What the actual marginal win looks like**: conflict-driven
+     sub-tree pruning. When the solver discovers a conflict deep in
+     the XY assignment, today we still enumerate every other MDD
+     leaf and call `try_candidate` (fast, but still O(leaves)). A
+     native MDD constraint lets one learnt clause eliminate many
+     leaves at once via BCP.
+   - **Predicted range**: plausibly 2-10× reduction in
+     `flow_xy_solves/boundary` at n=26. Extrapolating from n=18
+     Tseitin to n=56 is speculative — it could be flat or negative
+     there. **This is a prediction, not a measurement.**
    - **Detection plan**: add an `XY_MODE` switch to
      `SolveXyPerCandidate::new`. Compare TTC on n=26 --wz=apart k=7
      at 60s with mode=per-candidate vs mode=mdd-constraint. The
-     expected signal is `flow_xy_solves` dropping ~10-100× while
-     `stage_exit[3]` stays flat; TTC should drop in proportion to
-     the walker rate.
-   - **Risk**: similar-class correctness issue to the XOR
-     soundness bug from Feb 2026. Gate behind an env flag, run the
-     known-TT(26) regression test first.
+     signal to watch is `flow_xy_solves/boundary` (from the final
+     stats block); TTC should drop roughly in proportion.
+   - **Risk**: same soundness-bug class as the XOR false-UNSAT
+     chain from Feb 2026. Gate behind an env flag; run the
+     `known_tt26_verifies` regression test before trusting any
+     speedup number.
 
 2. **Boundary-level XY timeout budget.**
    - **Why it matters**: currently 5K conflicts/XY for n>30.
@@ -1385,9 +1407,13 @@ These are accepted optimizations where the win is suspect under TTC.
 
 ### Summary
 
-The biggest unshipped TTC win is **wiring `MddConstraint` into the
-XY SAT stage** — code exists, it's just not called. The biggest
-"wrong-metric" regret is that several tuning decisions (`max_z=1`,
-conflict_limit=5K, mdd_extend=1) were made on xy/s or bnd/s and
-have never been retested against TTC; at minimum one sweep of each
-is cheap and either confirms the decision or flips it.
+The most *tractable* unshipped experiment is **wiring
+`MddConstraint` into the XY SAT stage** — code exists, it's just
+not called, and the Tseitin precursor gives us ground truth that a
+win of *some* size exists at small n. The actual magnitude at n≥26
+is unmeasured and the pitch needs to be "worth trying" not
+"guaranteed win." The biggest *"wrong-metric" regret* is that
+several tuning decisions (`max_z=1`, conflict_limit=5K,
+mdd_extend=1) were made on xy/s or bnd/s and have never been
+retested against TTC; at minimum one sweep of each is cheap and
+either confirms the decision or flips it.
