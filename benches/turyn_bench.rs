@@ -1,9 +1,12 @@
 //! Turyn benchmark harness (divan).
 //!
 //! Reproduces the README's "Current results" table by shelling out to the
-//! release binary with nothing more than `--n=N`. Wall-clock samples are
-//! what divan reports; each run also prints turyn's own "Time to cover"
-//! (TTC) line so we can track that metric alongside time-to-solve.
+//! release binary with nothing more than `--n=N`. Divan handles sample
+//! orchestration; we parse turyn's own "Time to cover" line from every
+//! run, aggregate it ourselves, and print a TTC summary after divan's
+//! wall-clock table. TTC is the cross-size apples-to-apples metric:
+//! `total_work / effective_rate` is `n`-independent in units (seconds),
+//! whereas paths/sec throughput is not.
 //!
 //! Usage:
 //!   cargo bench --bench turyn_bench                 # TT(4)..TT(24)
@@ -16,13 +19,15 @@
 //! skipped: the clamp drives mdd_k to 0 and the binary can't load a
 //! k=0 table.)
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 fn main() {
     divan::main();
+    print_ttc_summary();
 }
 
 fn project_root() -> PathBuf {
@@ -68,12 +73,32 @@ fn ensure_ready() {
 
 struct TuryRun {
     wall: Duration,
+    /// Parsed `eff_rate × total_work` from the "Time to cover" line:
+    /// `total_work / eff_rate` seconds. `None` if the line is missing or
+    /// unparseable (e.g., the rate is zero for a very short run).
+    ttc: Option<Duration>,
     ttc_line: Option<String>,
     found_solution: bool,
 }
 
+/// Extract TTC as a real `Duration` from the raw summary line. The
+/// format is fixed: `Time to cover: <pretty> (<rate> <unit>, <total> <label>)`.
+/// We compute `total / rate` rather than parsing the pretty string so
+/// we're robust to the s/m/h/d bucket breakpoints.
+fn parse_ttc_seconds(line: &str) -> Option<f64> {
+    let paren = line.split_once('(')?.1;
+    let inside = paren.split_once(')')?.0;
+    let mut parts = inside.split(',');
+    let rate_field = parts.next()?.trim();
+    let total_field = parts.next()?.trim();
+    let rate: f64 = rate_field.split_whitespace().next()?.parse().ok()?;
+    let total: f64 = total_field.split_whitespace().next()?.parse().ok()?;
+    if rate <= 0.0 { return None; }
+    Some(total / rate)
+}
+
 /// Run `target/release/turyn --n=N` once. Returns wall-clock plus the
-/// parsed "Time to cover:" line from the binary's verbose summary.
+/// parsed TTC duration and the raw summary line.
 fn run_turyn(n: usize) -> TuryRun {
     ensure_ready();
     let start = Instant::now();
@@ -98,16 +123,71 @@ fn run_turyn(n: usize) -> TuryRun {
         .lines()
         .find(|l| l.contains("Time to cover:"))
         .map(|l| l.trim().to_string());
+    let ttc = ttc_line.as_deref().and_then(parse_ttc_seconds).map(Duration::from_secs_f64);
     let found_solution = stdout.contains("found_solution=true");
 
-    TuryRun { wall, ttc_line, found_solution }
+    TuryRun { wall, ttc, ttc_line, found_solution }
 }
 
-fn report(tag: &str, r: &TuryRun) {
+// ---------------------------------------------------------------------------
+// TTC collector: accumulate the parsed `Duration` from every sample,
+// keyed by the problem size `n` so the summary sorts numerically. The
+// human-readable label rides along for display. Printed after
+// `divan::main()` returns so the TTC table appears beneath divan's
+// wall-clock table.
+// ---------------------------------------------------------------------------
+struct TtcSeries {
+    label: String,
+    samples: Vec<Duration>,
+}
+static TTC_SAMPLES: Mutex<BTreeMap<usize, TtcSeries>> = Mutex::new(BTreeMap::new());
+
+fn record(n: usize, r: &TuryRun) {
+    let label = format!("TT({n})");
+    let line = r.ttc_line.as_deref().unwrap_or("(no Time-to-cover line)");
     let solved = if r.found_solution { "solved" } else { "NO SOLUTION" };
-    match &r.ttc_line {
-        Some(line) => eprintln!("[{tag}] wall={:>10.3?} {solved} | {line}", r.wall),
-        None => eprintln!("[{tag}] wall={:>10.3?} {solved} | (no Time-to-cover line)", r.wall),
+    eprintln!("[{label}] wall={:>10.3?} {solved} | {line}", r.wall);
+    if let Some(ttc) = r.ttc {
+        let mut map = TTC_SAMPLES.lock().unwrap();
+        map.entry(n)
+            .or_insert_with(|| TtcSeries { label: label.clone(), samples: Vec::new() })
+            .samples.push(ttc);
+    }
+}
+
+fn fmt_duration(d: Duration) -> String {
+    let s = d.as_secs_f64();
+    if s < 60.0 { format!("{s:>6.2}s") }
+    else if s < 3600.0 { format!("{:>6.2}m", s / 60.0) }
+    else if s < 86400.0 { format!("{:>6.2}h", s / 3600.0) }
+    else { format!("{:>6.2}d", s / 86400.0) }
+}
+
+fn print_ttc_summary() {
+    let samples = TTC_SAMPLES.lock().unwrap();
+    if samples.is_empty() { return; }
+    eprintln!();
+    eprintln!("Time to cover (cross-size comparable metric):");
+    eprintln!("  {:<10} {:>7}  {:>7}  {:>7}  {:>7}  samples", "bench", "min", "median", "max", "mean");
+    for series in samples.values() {
+        let mut v = series.samples.clone();
+        v.sort();
+        let n = v.len();
+        if n == 0 { continue; }
+        let min = v[0];
+        let max = v[n - 1];
+        let median = v[n / 2];
+        let sum: Duration = v.iter().sum();
+        let mean = sum / n as u32;
+        eprintln!(
+            "  {:<10} {}  {}  {}  {}  {}",
+            series.label,
+            fmt_duration(min),
+            fmt_duration(median),
+            fmt_duration(max),
+            fmt_duration(mean),
+            n,
+        );
     }
 }
 
@@ -115,9 +195,8 @@ fn report(tag: &str, r: &TuryRun) {
 // Reproduce README table: find TT(n) for each even n from 4 to 24.
 //
 // `sample_count = 3` doubles as "retry / find a solution again" for the
-// fast sizes, where the cost of a rerun is negligible and the variance
-// between runs is interesting on its own. For larger `n` the same three
-// samples just establish a median.
+// fast sizes. Time-to-solve is noisy (thread-scheduling dominated), but
+// TTC is stable — that's the metric we aggregate below.
 // ---------------------------------------------------------------------------
 #[divan::bench(
     args = [4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24],
@@ -128,7 +207,7 @@ fn report(tag: &str, r: &TuryRun) {
 fn tt(bencher: divan::Bencher, n: usize) {
     bencher.bench_local(|| {
         let r = run_turyn(n);
-        report(&format!("TT({n})"), &r);
+        record(n, &r);
         divan::black_box(r.wall);
     });
 }
@@ -145,7 +224,7 @@ fn tt(bencher: divan::Bencher, n: usize) {
 fn tt26(bencher: divan::Bencher) {
     bencher.bench_local(|| {
         let r = run_turyn(26);
-        report("TT(26)", &r);
+        record(26, &r);
         divan::black_box(r.wall);
     });
 }
