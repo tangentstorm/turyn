@@ -735,10 +735,17 @@ pub fn add_rule_v_middle_clauses(
             solver.add_clause([ v(p),  u(p)]);
         }
     }
+    // Rule (v): least i with inequality (w[i]·w[m-1-i] != tail) has
+    // w[i]=+1.  v(p)=TRUE encodes "inequality at p".  The clause says:
+    //   (∃ j<i : inequality at j)  ∨  (no inequality at i)  ∨  w[i]=+1
+    // i.e., "if i is the first inequality then w[i]=+1".  Note the v
+    // literals here are the OPPOSITE sign to rule (iv)'s diff literals,
+    // because rule (iv) watches EQUALITY (diff=FALSE) and rule (v)
+    // watches INEQUALITY (v=TRUE).
     for i in mid_start..=mid_end {
         let mut clause: Vec<i32> = Vec::with_capacity(i - mid_start + 2);
-        for j in mid_start..i { clause.push(-v(j)); }
-        clause.push(v(i));
+        for j in mid_start..i { clause.push(v(j)); }
+        clause.push(-v(i));
         clause.push(mid_var(i));
         solver.add_clause(clause);
     }
