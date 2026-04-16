@@ -7358,6 +7358,20 @@ mod tests {
         );
     }
 
+    /// Same at k=5 — the current auto-default for --wz=together at n>=24.
+    /// Confirms the full Z middle SAT, W middle SAT, and XY SAT all accept
+    /// canonical when the boundary is narrower (fewer pins, more middle vars).
+    #[test]
+    fn sanity_canonical_tt26_k5() {
+        sanity_check_canonical_tt(
+            "++----++-----+-+-+--+++--+",
+            "+-+++++-+-+---++++-++++--+",
+            "++-----+--++--+-+-++----+-",
+            "+++++-+--++-++---+----+-+",
+            5,
+        );
+    }
+
     /// Same for canonical TT(36).
     #[test]
     fn sanity_canonical_tt36() {
