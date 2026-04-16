@@ -1110,14 +1110,14 @@ impl Solver {
 
         let qi = self.quad_pb_constraints.len() as u32;
 
-        // Watch by variable + build term index (dedup via contains, no HashSet alloc)
+        // Dedup watches via O(1) last() check (see add_quad_pb_range).
         for i in 0..lits_a.len() {
             let va = var_of(lits_a[i]);
             let vb = var_of(lits_b[i]);
-            if !self.quad_pb_var_watches[va].contains(&qi) {
+            if self.quad_pb_var_watches[va].last() != Some(&qi) {
                 self.quad_pb_var_watches[va].push(qi);
             }
-            if !self.quad_pb_var_watches[vb].contains(&qi) {
+            if self.quad_pb_var_watches[vb].last() != Some(&qi) {
                 self.quad_pb_var_watches[vb].push(qi);
             }
             self.quad_pb_var_terms[va].push((qi, i as u16, true));
@@ -1174,15 +1174,18 @@ impl Solver {
 
         let qi = self.quad_pb_constraints.len() as u32;
 
-        // Use a Vec<bool> instead of HashSet for dedup (faster for small var counts)
+        // Dedup watches: qi is monotonically increasing across
+        // add_quad_pb_range calls, so within this call qi can only be
+        // present as the LAST entry of watches[v] (added by a prior
+        // term of THIS constraint). An O(1) last() check replaces the
+        // prior O(n) contains() scan.
         for i in 0..lits_a.len() {
             let va = var_of(lits_a[i]);
             let vb = var_of(lits_b[i]);
-            // Check if already watched by scanning (O(n) but small n per constraint)
-            if !self.quad_pb_var_watches[va].contains(&qi) {
+            if self.quad_pb_var_watches[va].last() != Some(&qi) {
                 self.quad_pb_var_watches[va].push(qi);
             }
-            if !self.quad_pb_var_watches[vb].contains(&qi) {
+            if self.quad_pb_var_watches[vb].last() != Some(&qi) {
                 self.quad_pb_var_watches[vb].push(qi);
             }
             self.quad_pb_var_terms[va].push((qi, i as u16, true));
