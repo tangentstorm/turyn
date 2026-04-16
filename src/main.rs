@@ -5772,7 +5772,7 @@ fn print_help() {
     eprintln!();
     eprintln!("SEARCH MODE. All three modes load the same MDD (mdd-<k>.bin) for XY boundary");
     eprintln!("enumeration and feed the same XY SAT fast path; they differ only in how");
-    eprintln!("(Z, W) candidate pairs are generated. Default: --wz=together when n>=24 and");
+    eprintln!("(Z, W) candidate pairs are generated. Default: --wz=together --mdd-k=5 when");
     eprintln!("an MDD file exists, otherwise --wz=cross.");
     eprintln!("  --wz=cross               Brute-force full Z × full W, spectral-");
     eprintln!("                           filter each side, cross-match via SpectralIndex.");
@@ -6275,12 +6275,16 @@ fn main() {
         // (--wz=cross) or walks MDD boundaries (--wz=apart|together),
         // feeding the same DualQueue + worker loop + XY SAT stage.
         let mut cfg = cfg.clone();
-        // Auto-upgrade: when the user didn't pick a --wz mode, n >= 24,
-        // and an MDD file is available, default to Together (13× faster
-        // TTC than Cross at n=26 thanks to coupled WZ per-lag constraints).
-        // Use mdd_k=5 for Together (smaller k → fewer boundary positions →
-        // more middle freedom for the coupled WZ SAT to exploit).
-        if cfg.wz_mode.is_none() && cfg.problem.n >= 24 {
+        // Auto-upgrade: when the user didn't pick a --wz mode and an
+        // MDD file is available, default to Together.  Measured times
+        // with `--wz=together --mdd-k=5` at commit 92959bd:
+        //   n=16:   23ms      n=18:    172ms     n=20:  880ms
+        //   n=22:   16.8s     n=24:    98s       n=26:  open
+        // `--wz=cross` is currently broken for n>=6 (pre-existing bug
+        // on main).  `--wz=apart` works for n<=20 but regresses at n=22.
+        // `--wz=together` is the reliable default.  Use mdd_k=5 unless
+        // the user overrode --mdd-k.
+        if cfg.wz_mode.is_none() {
             let default_k = cfg.mdd_k == SearchConfig::default().mdd_k;
             let try_k = if default_k { 5 } else { cfg.mdd_k };
             let max_k = try_k.min((cfg.problem.n - 1) / 2);
