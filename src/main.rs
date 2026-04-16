@@ -4037,7 +4037,7 @@ fn run_mdd_sat_search(
                         // first-attempt SolveWZ), so the MDD is covered
                         // once before we retry hard boundaries.
                         let mut wz_count = 0usize;
-                        let conflict_budget: u64 = (5_000u64 << swz.attempt.min(4)).min(50_000);
+                        let conflict_budget: u64 = (20u64 << swz.attempt.min(4)).min(200);
                         solver.set_conflict_limit(conflict_budget);
                         // Tracks whether the enumeration was cut off with
                         // more WZ solutions possibly remaining (None from
