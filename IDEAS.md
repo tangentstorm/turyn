@@ -794,3 +794,146 @@ The CDCL search learns from conflicts across boundaries (clause transfer).
   (BDKR rule i pins x[0]=y[0]=z[0]=w[0]=+1, and similar tail pins).
   The SAT would then explore canonical-biased region first, possibly
   finding canonical TT in the first solve.
+
+## Fix performance regression of c8a0db5 (April 2026)
+
+**Context:** Commit `c8a0db5` ("turyn: add coupled WZ per-lag constraints to
+--wz=together (1460x speedup)") added a per-lag autocorrelation constraint
+encoded as quadratic PB on the union of W and Z agree literals. While the
+commit's claim of 1460x decision reduction at n=26 k=7 is real (decisions
+went from 216k to 148 per solve), the wall-clock impact across the broader
+benchmark spectrum is mixed:
+
+Baseline measurements (4 threads, mdd-5.bin, repeat=3-5):
+
+| Benchmark                          | main         | eloquent-bell-merged | Δ        |
+|------------------------------------|--------------|----------------------|----------|
+| n=18 wz=together mdd-k=5           | 0.07-1.6s    | 1.3-3.8s             | 5x worse |
+| n=20 wz=together mdd-k=5           | 0.8-3.3s     | 25-30s               | 8x worse |
+| n=26 wz=together mdd-k=5 (bnd/s)   | 0.3 bnd/s    | 1.85-3.22 bnd/s      | 6-9x better |
+| n=26 wz=together mdd-k=7 (bnd/s)   | 6.0 bnd/s    | 5.7 bnd/s            | neutral  |
+| n=18 wz=apart mdd-k=5              | 0.25-1.7s    | 4-10s (1 miss)       | 5x worse |
+| n=20 wz=apart mdd-k=5              | 0.14s ✓      | 30s ✗ (no solution)  | 200x worse|
+
+**Primary benchmark for this work**: `n=26 wz=together mdd-k=5` median
+bnd/s (currently ~2.85 bnd/s). Secondary: `n=20 wz=together mdd-k=5`
+wall-clock to find solution (currently ~29s).
+
+**Performance hypotheses (each ≈ one commit):**
+
+- **F1: SPECTRAL_FREQS reduction**: Eloquent-bell raised this constant from
+  167 to 563 (commit f1e13fa) for "denser in-SAT spectral sampling". Every
+  variable assign/unassign in `SpectralConstraint::assign` does 3 nested
+  loops of length `num_freqs`, so 563 vs 167 is 3.4× more spectral work.
+  The setup cost (cos/sin/amplitude tables) is also 3.4× larger. The
+  commit claimed only 7% TTC improvement at n=26 (3.0h → 2.8h) for this
+  3.4× compute increase — looks like a bad trade. Try 167, 251, 313 and
+  pick the best.
+  Single commit: change `const SPECTRAL_FREQS: usize = 563` back to 167
+  (or whatever benches best).
+
+- **F2: Cache spectral cos/sin tables across SolveWZ calls**: Per-boundary
+  in SolveWZ allocates fresh `cos_table`, `sin_table`, `amplitudes`
+  (3 × middle_total × SPECTRAL_FREQS f32 = ~210KB each). At ~100
+  boundaries/s/thread that's ~63MB/s of churn. The tables depend only on
+  (n, m, k, total_mid, nf) — all run-time constants. Precompute once,
+  share via `Arc`.
+  Single commit: hoist these allocations into `MddCtx` as `Arc<Vec<f32>>`,
+  read-only at SolveWZ build time.
+
+- **F3: Cache trig values for spectral DFT**: The boundary DFT loop
+  computes `(omega * pos).cos()` and `(omega * pos).sin()` for every
+  boundary position × every frequency × every boundary, even though
+  `pos`, `omega` (= function of fi only), and the trig values are all
+  deterministic. Pre-compute a `pos × freq` cos/sin lookup table once
+  per (n, k) and read from it.
+  Single commit: add `boundary_cos_table[pos * nf + fi]` to MddCtx,
+  replace the per-boundary trig calls with table lookups.
+
+- **F4: Skip per-lag constraint when problem is small**: For n ≤ 22 the
+  per-lag PB-range constraint adds many quad terms (≈O(n³)) that
+  outweigh the propagation benefits. Make it an `if n >= some_threshold`
+  conditional and benchmark threshold values (20, 22, 24, 26).
+  Single commit: gate the per-lag PB constraint block on `n >= 24`.
+
+- **F5: Reuse PbSetEq counts via dedup HashSet**: The current
+  `if !w_counts.contains(&c) { w_counts.push(c); }` inside a loop is
+  O(N²). Use a `HashSet<u32>` or a Vec built then sorted+deduped in
+  one shot.
+  Single commit: replace the contains-loop with sorted+dedup.
+
+- **F6: Lower per-attempt conflict budget for re-queue**: The current
+  budget is 5k × 2^attempt (max 50k). Empirically the canonical solution
+  is found within the first few hundred decisions when it exists. Try
+  1k or 2k budgets — burning fewer cycles on hopeless boundaries means
+  more boundaries explored per second.
+  Single commit: change `5_000u64 << ...` to `1_000u64 << ...`, benchmark.
+
+- **F7: Drop attempt re-queue entirely**: The re-queue mechanism
+  (commit ce47c9d) keeps re-pushing the same boundary up to 5 times,
+  monopolising a worker on hard cases. Together with F6 this might
+  recover wz=apart-style "fast fail and move on" behaviour.
+  Single commit: cap MAX_WZ_ATTEMPTS = 1, don't re-queue.
+
+- **F8: Coalesce small per-lag constraints into one**: For very-small
+  lags (s near n) the constraint has 0 or 1 terms — trivial. For very
+  large lags it can also be tight. The constraint addition overhead
+  (HashSet-style dedup of var watchers) is amortised over many calls,
+  but several lags have only 2-4 terms. Combine all lags' terms into
+  one bigger combined constraint (different `target_lo/hi` per lag is
+  a problem — would need to express as N × max_pairs ≤ ... using a
+  different encoding).
+  Single commit: investigate; may not be feasible without changing
+  constraint semantics.
+
+- **F9: Replace the per-lag quadratic PB-range with a leaner "agree
+  count" derived constraint**: The current encoding adds two quad terms
+  per mid-mid pair `(a,b)` and `(-a,-b)`. The watcher overhead per
+  variable scales with the number of constraints touching that variable.
+  Instead: for each lag s, allocate one fresh aux var per mid-mid pair
+  encoding the XNOR (4 binary clauses), then a single PB constraint on
+  the union. This is what `c8a0db5` originally did before being
+  rewritten in `b9d92ac`. The commit b9d92ac claimed "20× fewer
+  propagations per decision" but also same dec/solve — meaning weaker
+  pruning, more work for VSIDS. Reverting to XNOR aux + PB might
+  recover the lost pruning.
+  Single commit: revert b9d92ac's encoding (or A/B test).
+
+- **F10: Skip the per-lag constraint at lag s where it's trivially
+  satisfied**: Compute `combined_lo` and `combined_hi`. If
+  `combined_lo == 0 AND combined_hi >= max_possible`, skip. Check the
+  current logic — it does have an early-out but maybe too late
+  (after building the term lists).
+  Single commit: move the trivial-satisfaction check earlier.
+
+- **F11: Remove rules (iv)/(v) middle clauses for small n**: At n ≤ 22
+  these may add overhead without filtering enough. Gate on `n >= 24`.
+  Single commit: conditional rule (iv)/(v) addition.
+
+- **F12: Re-use combined SolveWZ solver via checkpoint/restore**: The
+  per-lag constraints, rules, and spectral tables don't depend on
+  per-boundary information for their structure — only the boundary
+  contributes constants (agree_const) and signed bnd-mid lit signs.
+  Precompute the constraint structure once per (n, m, k), then for
+  each boundary push/restore deltas instead of building from scratch.
+  Single commit: add SolveWZ template with checkpoint/restore.
+
+- **F13: Reduce SpectralConstraint per-assign cost via SIMD or by skipping
+  freqs already at zero**: After `assign`, the `re/im` arrays are scanned
+  for conflict. With 563 freqs that's 6 × 563 = 3378 multiplies per
+  assign call. Could vectorise; or, if `mr1[fi] == 0`, the freq is
+  saturated and could be skipped.
+  Single commit: SIMD-vectorise the inner spectral assign loop.
+
+- **F14: SpectralConstraint: store cos/sin as SoA, not interleaved**:
+  Currently `cos_table[var * nf + fi]` — accessing all freqs for one var
+  is sequential, but accessing one freq for all vars strides by nf bytes.
+  The per-assign code does the former (sequential), good. Confirm SoA
+  layout and check cache miss rate.
+  Investigation only.
+
+- **F15: Move outfix pin handling out of hot path**: Currently every
+  SolveWZ iterates `outfix_z_mid_pins` and `outfix_w_mid_pins` even
+  when they're empty. Move into a one-shot vec of (var, lit) prebuilt
+  at MddCtx creation.
+  Single commit: precompute outfix_pins as Vec<i32>.
