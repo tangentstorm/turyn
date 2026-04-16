@@ -2897,6 +2897,13 @@ struct SolveWZWork {
     /// sees `V_w` = union of ±|σ_W| counts and `V_z` = union of ±|σ_Z|
     /// counts across this list.
     candidate_tuples: Vec<SumTuple>,
+    /// Re-enumeration attempt counter.  0 = initial.  Higher attempts
+    /// use different RNG seeds (to pick different random phases) and
+    /// larger conflict budgets, and sit at lower priority so fresh
+    /// boundaries / first-attempt items run first (otherwise stuck
+    /// boundaries would monopolise the workers and we'd never cover
+    /// the space).
+    attempt: u32,
 }
 
 struct SolveWWork {
@@ -3178,6 +3185,13 @@ fn run_mdd_sat_search(
         best_quality: std::sync::atomic::AtomicU64,    // f64 bits of best quality seen
     }
     impl DualQueue {
+        /// Push a non-XY work item with an explicit priority (e.g. for
+        /// re-queued SolveWZ items that should sit below fresh work).
+        fn push_with_priority(&self, item: PipelineWork, priority: f64) {
+            self.work.lock().unwrap().push(PqEntry { priority, work: item });
+            self.condvar.notify_one();
+        }
+
         fn push(&self, item: PipelineWork) {
             match &item {
                 PipelineWork::SolveXY(xy) => {
@@ -3479,6 +3493,7 @@ fn run_mdd_sat_search(
                                 tuple: rep, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
                                 xy_root: bnd.xy_root,
                                 candidate_tuples,
+                                attempt: 0,
                             })
                         } else {
                             PipelineWork::SolveW(SolveWWork {
@@ -4009,21 +4024,59 @@ fn run_mdd_sat_search(
                         let wz_l0 = solver.num_level0_vars();
                         let wz_nv = solver.num_vars();
 
-                        // Enumerate WZ solutions
+                        // Enumerate WZ solutions.
+                        //
+                        // Re-queue strategy: rather than burning a large
+                        // conflict budget on one boundary (which monopolises
+                        // a worker and slows space coverage), use a modest
+                        // budget per attempt and push the item back into the
+                        // queue when the budget is exhausted.  Exponential
+                        // backoff: attempt 0 gets 5k conflicts, attempt 1
+                        // gets 10k, etc., capped at 50k.  Re-queued items
+                        // sit at priority −1 (below fresh boundaries and
+                        // first-attempt SolveWZ), so the MDD is covered
+                        // once before we retry hard boundaries.
                         let mut wz_count = 0usize;
-                        // Conflict limit: cap at 50k to prevent pathological
-                        // instances from stalling a worker.
-                        solver.set_conflict_limit(50_000);
+                        let conflict_budget: u64 = (5_000u64 << swz.attempt.min(4)).min(50_000);
+                        solver.set_conflict_limit(conflict_budget);
+                        // Tracks whether the enumeration was cut off with
+                        // more WZ solutions possibly remaining (None from
+                        // solve() = conflict limit, or hit max_z cap),
+                        // vs. fully exhausted (Some(false) = UNSAT proved).
+                        let mut more_possible = false;
                         loop {
                             if ctx.found.load(AtomicOrdering::Relaxed) { break; }
-                            if wz_count >= ctx.max_z { break; }
-                            // Random phases for both W and Z
+                            if wz_count >= ctx.max_z {
+                                more_possible = true;
+                                break;
+                            }
+                            // Random phases for both W and Z.  Mix the
+                            // attempt number into the RNG so re-queued
+                            // items explore a different region of the
+                            // phase space than their first attempt.
+                            let mut attempt_rng = rng ^ (swz.attempt as u64).wrapping_mul(0x9e3779b97f4a7c15);
                             let phases: Vec<bool> = (0..total_vars)
-                                .map(|_| next_rng!() & 1 == 1).collect();
+                                .map(|_| {
+                                    attempt_rng ^= attempt_rng << 13;
+                                    attempt_rng ^= attempt_rng >> 7;
+                                    attempt_rng ^= attempt_rng << 17;
+                                    attempt_rng & 1 == 1
+                                }).collect();
+                            rng = attempt_rng;
                             solver.set_phase(&phases);
                             flow_wz_sat_calls.fetch_add(1, AtomicOrdering::Relaxed);
                             let sat_res = solver.solve();
-                            if sat_res != Some(true) {
+                            if sat_res == None {
+                                // Conflict limit hit — more solutions may exist.
+                                more_possible = true;
+                                if wz_count == 0 {
+                                    flow_wz_first_unsat.fetch_add(1, AtomicOrdering::Relaxed);
+                                }
+                                break;
+                            }
+                            if sat_res == Some(false) {
+                                // Fully enumerated: every assignment has been
+                                // blocked.  No point re-queuing.
                                 if wz_count == 0 {
                                     flow_wz_first_unsat.fetch_add(1, AtomicOrdering::Relaxed);
                                 }
@@ -4172,6 +4225,38 @@ fn run_mdd_sat_search(
                         flow_z_free_sum.fetch_add(wz_free_vars, AtomicOrdering::Relaxed);
 
                         stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
+
+                        // Re-queue: if the enumeration was cut short (conflict
+                        // limit hit, or max_z cap reached) and we haven't
+                        // found a TT, push this item back with attempt+1 at
+                        // a lower priority.  Caps at MAX_WZ_ATTEMPTS so a
+                        // genuinely hard boundary eventually gives up.
+                        const MAX_WZ_ATTEMPTS: u32 = 5;
+                        if more_possible
+                            && !ctx.found.load(AtomicOrdering::Relaxed)
+                            && swz.attempt + 1 < MAX_WZ_ATTEMPTS
+                        {
+                            // Priority: (1.0 = fresh SolveWZ) −
+                            //   0.1·(attempt+1) so successive retries go to
+                            //   progressively deeper slots, but all retries
+                            //   stay above boundaries at stage 0 only if
+                            //   (attempt+1) < 10 — for attempt ≥ 9 they drop
+                            //   below boundaries.  Clamp to keep them just
+                            //   above 0 so retries still run.
+                            let priority = (1.0 - 0.1 * (swz.attempt + 1) as f64).max(0.05);
+                            stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
+                            wq.push_with_priority(
+                                PipelineWork::SolveWZ(SolveWZWork {
+                                    tuple: swz.tuple,
+                                    z_bits: swz.z_bits,
+                                    w_bits: swz.w_bits,
+                                    xy_root: swz.xy_root,
+                                    candidate_tuples: swz.candidate_tuples.clone(),
+                                    attempt: swz.attempt + 1,
+                                }),
+                                priority,
+                            );
+                        }
                     }
 
                     PipelineWork::SolveZ(sz) => {
