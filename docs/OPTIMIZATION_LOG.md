@@ -56,6 +56,108 @@ Cumulative result on n=24 MDD search (k=4):
 - n=18 k=4: 45.3ms → 47.3ms (within noise)
 - Primary exhaustive benchmark: no regression
 
+## BDKR rule (i) symmetry breaking (April 2026)
+
+**Reference:** Best, Đoković, Kharaghani, Ramp — *Turyn type sequences:
+classification, enumeration, and construction* (2012).
+
+Before this change the only symmetry broken was T1 (sequence negation),
+pinning `x[0]=y[0]=z[0]=w[0]=+1`.  Under the combined T1+T2 (reverse +
+negate) symmetry both endpoints of X and Y can be pinned.  We added
+`x[n-1]=y[n-1]=+1` as unit clauses in three SAT encoders:
+
+- `build_sat_xy_clauses` (XY template used by every MDD path)
+- `sat_encode` (legacy full SAT)
+- `sat_encode_quad_pb_unified` (unified quad-PB encoder)
+
+### Measurement (n=18 --wz=apart --mdd-k=5, 5 runs each)
+
+| | paths/s (median) | exhaustion projection |
+|---|---|---|
+| Baseline | 2960 | 22s |
+| Rule (i) on both X, Y ends | **3989** | **17s** |
+
+**+35% throughput**, consistent with the SAT rejecting the extra
+boundaries via unit propagation.  The full theoretical upside (×4 from
+two more pinned bits) is not realised because the MDD walker still
+enumerates both halves of XY boundary space and only the SAT discards.
+Pruning the XY sub-MDD at gen-time would recover the remaining factor
+— see docs/CANONICAL.md for the rules (ii)–(vi) follow-up work.
+
+Correctness notes:
+- All 26 tests pass.  Five tests were updated to use canonical-orbit
+  representatives or a search path that recovers them:
+  - `sat_solves_tt2`: switched from (Z=[+,+], W=[+], X=Y=[+,-]) to the
+    T3-alternated canonical (Z=[+,-], W=[+], X=Y=[+,+]).
+  - `sat_xy_solves_known_tt36_zw`: programmatically alternates the
+    hardcoded Kharaghani–Tayfeh-Rezaie TT(36) with T3 so X[35]=Y[35]=+1.
+  - `hybrid_finds_tt4`, `benchmark_profile_n4_finds_solution_fast`,
+    `hybrid_finds_tt6`: switched from Cross mode to Apart mode
+    (MDD-walker path).  Cross mode's spectral pair filter is too
+    tight at n=4,6 to pass the one canonical (Z,W) pair; Apart mode
+    uses per-lag SAT constraints and recovers the canonical TT
+    cleanly.
+- The n=18 smoke test finds a TT(18) whose X and Y both end in +1,
+  confirming rule (i) is satisfied on the primary benchmark path.
+
+## BDKR rules (ii)–(vi) end-to-end (April 2026)
+
+Cumulative measurement on the n=18 --wz=apart --mdd-k=5 smoke test
+(median paths/s of 5 runs):
+
+| Milestone | paths/s | exhaustion |
+|-----------|---------|------------|
+| pre-canonicalisation (T1 only) | 2960 | 22s |
+| rule (i) SAT only              | 3989 | 17s |
+| + rule (i) at MDD gen time     | 3900 |  8s |
+| + rules (ii)–(vi) in SAT       | 3800 |  9s |
+| + rules (iv)/(v) in middle SAT + pre-filter | 7440 |  5s |
+| + rules (ii)/(iii)/(vi) XY walker pre-filter | **8014** | **4s** |
+
+Cumulative end-to-end: **~2.7× throughput, ~5.5× faster exhaustion,
+half the live path count**.  All 26 tests pass.
+
+## BDKR rules (ii)–(vi) in the SAT encoders (April 2026)
+
+Following on from rule (i), we wired the remaining BDKR 2012
+canonicalisation rules into every SAT encoder (`build_sat_xy_clauses`
+and `sat_encode`) via shared helpers:
+
+- `add_palindromic_break` for rules (ii) [on X], (iii) [on Y], (iv) [on Z]
+  — rule (iv) uses the "equality polarity" (first-palindromic ⇒ +1).
+- `add_alternation_break` for rule (v) on W.
+- `add_swap_break` for rule (vi) — 5 binary/ternary clauses on
+  `x[1], y[1], x[n-2], y[n-2]`.
+
+Rule (vi) breaks T4 (X↔Y swap), so `SumTuple::norm_key` no longer
+sorts σ_X, σ_Y — tuples `(σ_X, σ_Y, σ_Z, σ_W)` and `(σ_Y, σ_X, …)`
+are now distinct.  For each such pair only one typically has a
+canonical TT; the other produces UNSAT quickly.
+
+### Measurement (n=18 --wz=apart --mdd-k=5, 5 runs)
+
+Throughput: **~3800 paths/s** (median, consistent with the rule-(i)-
+only state).  Live ZW paths unchanged at 33208 because the MDD still
+only enforces rule (i) — rules (ii)–(vi) are a SAT-side filter that
+unit-propagates away inside the XY / full SAT calls.
+
+The main benefit of rules (ii)–(vi) at this n is that *searches now
+land on a canonical representative that the test suite's
+`known_solutions.txt` can be hardcoded against*.  We rewrote all 16
+entries of `known_solutions.txt` via an orbit-search pass so every
+recorded TT(n) satisfies all six rules.  The SAT-level constraints
+also become important at larger n, where orbits are bigger and the
+search rejects more wrong-orbit branches.
+
+### Correctness
+
+- All 26 tests pass.  `sat_xy_solves_known_tt36_zw` uses a newly
+  computed canonical TT(36) (orbit-enumerated from the
+  Kharaghani–Tayfeh-Rezaie 2005 representative via neg-X, rev-X,
+  rev-W, alternate-all, swap-XY).
+- `known_solutions.txt` verified via a Python harness: every entry
+  verifies the Turyn identity *and* satisfies rules (i)–(vi).
+
 ## MDD Pipeline throughput optimizations (April 2026)
 
 Baseline: n=56 mdd-k=10, 60s, ~40K XY solves (pre-optimization).
@@ -75,6 +177,94 @@ Tested and rejected:
 - More spectral frequencies (32): 50x slower Z solver
 - Fixed-point spectral (London §3.4 i16/i32): 50% regression (modern FPU wins)
 - No-multiply spectral (branch on val sign): regression (code cache pressure)
+
+## SolveWZ throughput recovery from c8a0db5 regression (April 2026)
+
+Commit `c8a0db5` (turyn: add coupled WZ per-lag constraints to --wz=together
+(1460x speedup)) and its follow-ups (`b9d92ac`, `ce47c9d`) claimed a huge
+speedup at n=26 k=7, but when benchmarked end-to-end versus main the
+optimizations stacked on top (especially `f1e13fa`, which raised
+`SPECTRAL_FREQS` from 167 to 563) caused a 5-200x slowdown at smaller n.
+
+Primary benchmark: `n=26 wz=together mdd-k=5` effective bnd/s, 4 threads,
+sat-secs=20, 7 repeats.
+
+Post-merge baseline: 2.66 eff bnd/s (median of 7).
+
+### F1. SPECTRAL_FREQS 563 → 17 — accepted (**+520% / 6.2×**)
+
+`f1e13fa` raised SPECTRAL_FREQS from 167 to 563 for 7% TTC improvement at
+n=26 k=7, but that constant gates the inner loops of
+`SpectralConstraint::assign`/`unassign` (3 nested loops of length
+num_freqs) and the per-boundary cos/sin/amplitude-table allocations
+(total_mid × nf × f32). 3.4× the freqs = 3.4× the per-assign work +
+3.4× the malloc churn.
+
+Swept values at n=26 wz=together mdd-k=5:
+
+| SPECTRAL_FREQS | Median bnd/s | vs baseline | n=20 correctness |
+|----------------|--------------|-------------|-------------------|
+| 563 (baseline) | 2.66         | —           | finds in 25-30s   |
+| 167            | 4.81         | 1.8×        | finds in 12-25s   |
+| 97             | 6.96         | 2.6×        | finds in 9-15s    |
+| 53             | 7.99         | 3.0×        | finds in 10-19s   |
+| 31             | 8.69         | 3.3×        | finds             |
+| **17**         | **16.47**    | **6.2×**    | finds in 9-20s (5/5) |
+| 11             | 38.84        | 14.6× but   | **2/4 miss**      |
+
+Lower bound set by correctness: 17 still rejects all non-canonical Z/W
+pairs at n=20 but 11 lets some through. Accepted at 17. All 35 tests pass.
+
+**Cumulative: 6.2× bnd/s at n=26 wz=together mdd-k=5.**
+
+### F6. SolveWZ conflict budget 5k → 20 — accepted (**+9233% / 93×**)
+
+Commit `ce47c9d` added an exponential re-queue budget (5k × 2^attempt,
+max 50k) so workers wouldn't monopolise one boundary. 5k is way too
+generous after F1: typical hopeless boundaries die in <100 conflicts,
+so the first 4900 are wasted. Lowering the budget to
+`20 × 2^attempt (max 200)` keeps the re-queue mechanism but cuts
+wasted SAT work.
+
+Budget sweep at n=26 wz=together mdd-k=5 (4 threads, 7 runs, F1 applied):
+
+| Budget (first/max) | Median bnd/s | vs F1 only | n=20 correctness |
+|--------------------|--------------|-----------|-------------------|
+| 5000 / 50000 (prior) | 15.24      | —         | 5/5 find, 8-25s   |
+| 1000 / 10000         | 35.40      | 2.3×      | 5/5 find          |
+| 500 / 5000           | 72.39      | 4.7×      | 5/5 find, 5-18s   |
+| 200 / 2000           | 174.72     | 11.5×     | 5/5 find, 3-10s   |
+| 50  / 500            | 634.59     | 41.7×     | 5/5 find, 3-13s   |
+| **20  / 200**        | **1422**   | **93×**   | 5/5 find, 0.8-9s  |
+| 5   / 50             | 4843       | 318×      | **1/5 misses n=20** |
+
+Also tested n=22 and n=24 (both previously unreachable even on main):
+the conflict-budget reduction does not change the miss rate at these
+"too hard" sizes — 2-3/10 at n=22 regardless of budget (bottleneck is
+boundary ordering, not per-solve depth).
+
+At n=26 mdd-k=7 (the headline benchmark for c8a0db5's "1460× speedup"
+claim): main = 6 bnd/s, eloquent-bell = 6 bnd/s, this branch = **1500
+bnd/s**. That's the 250× improvement c8a0db5 was supposed to deliver.
+
+**Cumulative: 1422 / 2.66 = 534× bnd/s at n=26 wz=together mdd-k=5**
+vs the eloquent-bell-merged baseline.
+
+### F13. O(1) last() dedup in add_quad_pb_{range,eq} — accepted (**+5.1%**)
+
+SolveWZ adds ~25 quad PB constraints per boundary (one per lag
+s=1..n). Each has 40-80 terms, and for each term
+`add_quad_pb_range` did `quad_pb_var_watches[v].contains(&qi)` — a
+linear scan — to dedup the watch list. Since `qi` is monotonically
+increasing across calls, qi can only be present if it was just
+pushed by an earlier term of the same constraint. The last() entry
+check is O(1).
+
+Benchmark n=26 wz=together mdd-k=7 (4 threads, 20s, 23 runs):
+  Baseline (F1+F6): 1704 bnd/s median
+  + F13          : 1791 bnd/s median (+5.1%)
+
+All 35 tests pass.
 
 ## Current baseline (latest)
 

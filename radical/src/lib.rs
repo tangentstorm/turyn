@@ -59,6 +59,38 @@ struct PbConstraint {
     bound: u32,
 }
 
+/// A "sum is in a set" constraint: `#{i : lit_i true} ∈ V` where `V` is a
+/// sorted, deduplicated set of non-negative integer cardinality targets.
+///
+/// Propagation recounts `(num_true, num_undef)` from the trail on every
+/// call (see `propagate_pb_set_eq`).  Let `cnt_lo = num_true`,
+/// `cnt_hi = num_true + num_undef`.  Binary-search V for
+/// `V_alive = V ∩ [cnt_lo, cnt_hi]`:
+///   - `V_alive == ∅` ⇒ conflict.
+///   - `V_alive == {v}` and `v == cnt_lo` ⇒ force all unassigned lits false.
+///   - `V_alive == {v}` and `v == cnt_hi` ⇒ force all unassigned lits true.
+///   - `|V_alive| > 1` and `cnt_lo == max(V_alive)` ⇒ force all unassigned false.
+///   - `|V_alive| > 1` and `cnt_hi == min(V_alive)` ⇒ force all unassigned true.
+///   - otherwise ⇒ no propagation (the SAT will branch).
+///
+/// No incremental counter is maintained: a previous attempt at
+/// incremental bookkeeping was unsound because prior propagators in
+/// the same propagate-loop iteration (QuadPb, or this constraint's own
+/// `force_pb_set_eq_dir`) can enqueue literals whose state change is
+/// not reflected in the incremental until the main loop eventually
+/// picks them up.  See `pb_set_eq_plus_quad_pb_tt18_regression`.
+#[derive(Clone, Debug)]
+struct PbSetEqConstraint {
+    lits: Vec<Lit>,
+    values: Vec<u32>, // sorted ascending, unique, all in 0..=lits.len()
+    // `num_true` and `num_undef` are scratch fields set by
+    // `recompute_pb_set_eq` at the start of every `propagate_pb_set_eq`
+    // call; they are *not* a persistent incremental count.  Do not
+    // read them outside `propagate_pb_set_eq`.
+    num_true: u32,
+    num_undef: u32,
+}
+
 /// An XOR (GF(2)) constraint: XOR of variables = parity.
 /// Propagation: when exactly one variable is unassigned, force it
 /// to satisfy the parity. Incremental: track count of unknowns and
@@ -201,6 +233,7 @@ enum Reason {
     Xor(u32),     // index into xor_constraints
     Spectral,     // spectral power constraint violation
     Mdd,          // MDD constraint: boundary variables violate MDD path feasibility
+    PbSetEq(u32), // index into pb_set_eq_constraints
 }
 
 /// Trail entry: records an assignment.
@@ -305,6 +338,10 @@ pub struct SpectralTables {
 
 impl SpectralTables {
     /// Build once per (seq_len, k, num_freqs). Reuse across boundaries.
+    ///
+    /// Frequency grid: `ω_fi = (fi + 1) / (num_freqs + 1) · π` for
+    /// `fi ∈ 0..num_freqs`, i.e., `num_freqs` equally-spaced interior
+    /// samples of `(0, π)` excluding both endpoints.
     pub fn new(seq_len: usize, k: usize, num_freqs: usize) -> Self {
         let middle_len = seq_len - 2 * k;
         let mut cos_table = vec![0.0f32; middle_len * num_freqs];
@@ -642,6 +679,12 @@ pub struct Solver {
     xor_constraints: Vec<XorConstraint>,
     xor_var_watches: Vec<Vec<u32>>,  // xor_var_watches[var] = list of XOR constraint indices
 
+    // "Sum is in a set" constraints: #{i : lit_i true} ∈ V (sorted non-negative set).
+    // Propagation: binary-search V for the alive subset under current (cnt_lo, cnt_hi);
+    // conflict when V_alive == ∅; force-all when only one direction remains.
+    pb_set_eq_constraints: Vec<PbSetEqConstraint>,
+    pb_set_eq_var_watches: Vec<Vec<u32>>, // per-variable list of constraint indices
+
     // MDD constraint (at most one, optional)
     pub mdd: Option<MddConstraint>,
 
@@ -729,6 +772,8 @@ impl Solver {
             quad_pb_seen_buf: Vec::new(),
             xor_constraints: Vec::new(),
             xor_var_watches: Vec::new(),
+            pb_set_eq_constraints: Vec::new(),
+            pb_set_eq_var_watches: Vec::new(),
             analyze_seen: Vec::new(),
             analyze_reason_buf: Vec::new(),
             analyze_reason_buf2: Vec::new(),
@@ -781,6 +826,7 @@ impl Solver {
             self.quad_pb_var_watches.push(Vec::new());
             self.quad_pb_var_terms.push(Vec::new());
             self.xor_var_watches.push(Vec::new());
+            self.pb_set_eq_var_watches.push(Vec::new());
             self.heap_pos.push(self.heap.len());
             self.heap.push(idx);
         }
@@ -907,6 +953,145 @@ impl Solver {
         }
     }
 
+    /// Add a "sum is in a set" constraint: `#{i : lit_i true} ∈ V`.
+    ///
+    /// `values` must be deduplicated cardinality targets in `0..=lits.len()`;
+    /// the method sorts its own copy.  Empty `values` immediately marks the
+    /// solver UNSAT (`ok = false`).  Each literal's variable is watched; the
+    /// constraint propagates via binary search over V against the running
+    /// `(cnt_lo, cnt_hi)` bounds (see `PbSetEqConstraint` for the rules).
+    pub fn add_pb_set_eq(&mut self, lits: &[i32], values: &[u32]) {
+        if !self.ok { return; }
+        if values.is_empty() {
+            self.ok = false;
+            return;
+        }
+        // Ensure vars; reject zero literals.
+        for &lit in lits {
+            assert!(lit != 0, "0 is not a valid SAT literal");
+            self.ensure_var(lit.unsigned_abs() as usize);
+        }
+        // Validate / dedupe / sort.
+        let mut vals: Vec<u32> = values.to_vec();
+        vals.sort_unstable();
+        vals.dedup();
+        let l_len = lits.len() as u32;
+        // Drop any out-of-range values (defensive: caller may pass slack).
+        vals.retain(|&v| v <= l_len);
+        if vals.is_empty() {
+            self.ok = false;
+            return;
+        }
+
+        let pi = self.pb_set_eq_constraints.len() as u32;
+        for &lit in lits {
+            let v = var_of(lit);
+            if !self.pb_set_eq_var_watches[v].contains(&pi) {
+                self.pb_set_eq_var_watches[v].push(pi);
+            }
+        }
+        self.pb_set_eq_constraints.push(PbSetEqConstraint {
+            lits: lits.to_vec(),
+            values: vals,
+            num_true: 0,    // scratch — recomputed by propagate_pb_set_eq
+            num_undef: 0,   // scratch — recomputed by propagate_pb_set_eq
+        });
+        if self.propagate_pb_set_eq(pi).is_some() {
+            self.ok = false;
+        }
+    }
+
+    /// Recompute `(num_true, num_undef)` from the current assignment.
+    /// Called unconditionally at the start of every `propagate_pb_set_eq`.
+    fn recompute_pb_set_eq(&mut self, pi: u32) {
+        let n_lits = self.pb_set_eq_constraints[pi as usize].lits.len();
+        let mut nt: u32 = 0;
+        let mut nu: u32 = 0;
+        for i in 0..n_lits {
+            let lit = self.pb_set_eq_constraints[pi as usize].lits[i];
+            match self.lit_value(lit) {
+                LBool::True => nt += 1,
+                LBool::Undef => nu += 1,
+                LBool::False => {}
+            }
+        }
+        let pc = &mut self.pb_set_eq_constraints[pi as usize];
+        pc.num_true = nt;
+        pc.num_undef = nu;
+    }
+
+    /// Propagate a PbSetEq constraint.  Returns `Some(Reason::PbSetEq(pi))`
+    /// when the constraint is infeasible under the current assignment.
+    ///
+    /// NOTE (2026-04-15): always recount from the trail.  The incremental
+    /// `(num_true, num_undef)` counters updated by the main propagate loop
+    /// only reflect the single variable currently being processed — they
+    /// can lag behind the real assignment state when prior propagators in
+    /// the same iteration (e.g. QuadPb, or this PbSetEq's own
+    /// `force_pb_set_eq_dir`) enqueued additional lits that haven't yet
+    /// been picked up by the main loop.  Trusting the incremental counters
+    /// here produced false-UNSAT conclusions (V_alive empty) when reality
+    /// had plenty of valid counts.  Mirrors the XOR propagator's "recount
+    /// unknowns from scratch" fix.
+    fn propagate_pb_set_eq(&mut self, pi: u32) -> Option<Reason> {
+        // Unconditional recount.  O(|lits|) per call; acceptable because
+        // PbSetEq constraints are small (≤ 2n lits) and propagate fires
+        // infrequently.
+        self.recompute_pb_set_eq(pi);
+        let pc = &self.pb_set_eq_constraints[pi as usize];
+        let cnt_lo = pc.num_true;
+        let cnt_hi = pc.num_true + pc.num_undef;
+
+        // V_alive = values ∩ [cnt_lo, cnt_hi] via binary search on sorted values.
+        let lo_idx = pc.values.partition_point(|&v| v < cnt_lo);
+        let hi_idx = pc.values.partition_point(|&v| v <= cnt_hi);
+        if lo_idx >= hi_idx {
+            return Some(Reason::PbSetEq(pi)); // V_alive == ∅
+        }
+        let alive_len = hi_idx - lo_idx;
+        let min_alive = pc.values[lo_idx];
+        let max_alive = pc.values[hi_idx - 1];
+
+        if alive_len == 1 {
+            let v = min_alive;
+            if v == cnt_lo {
+                // all unassigned lits must be false
+                return self.force_pb_set_eq_dir(pi, false);
+            }
+            if v == cnt_hi {
+                // all unassigned lits must be true
+                return self.force_pb_set_eq_dir(pi, true);
+            }
+            // need a mix — no unit propagation, SAT will branch
+            return None;
+        }
+        // |V_alive| > 1: boundary forcings.
+        if cnt_lo == max_alive {
+            return self.force_pb_set_eq_dir(pi, false);
+        }
+        if cnt_hi == min_alive {
+            return self.force_pb_set_eq_dir(pi, true);
+        }
+        None
+    }
+
+    /// Force every **unassigned** literal in the constraint to the given polarity.
+    /// `true_dir = true` ⇒ enqueue the positive literal; `false` ⇒ its negation.
+    /// Already-assigned lits are silently skipped — their contribution is
+    /// already reflected in `(num_true, num_undef)` so they can't re-conflict
+    /// via this path (an actual conflict shows up as empty `V_alive` at the
+    /// next propagate call).
+    fn force_pb_set_eq_dir(&mut self, pi: u32, true_dir: bool) -> Option<Reason> {
+        let n_lits = self.pb_set_eq_constraints[pi as usize].lits.len();
+        for i in 0..n_lits {
+            let lit = self.pb_set_eq_constraints[pi as usize].lits[i];
+            if self.lit_value(lit) != LBool::Undef { continue; }
+            let forced = if true_dir { lit } else { -lit };
+            self.enqueue(forced, Reason::PbSetEq(pi));
+        }
+        None
+    }
+
     /// Add a quadratic PB equality: sum(coeffs[i] * lits_a[i] * lits_b[i]) = target.
     /// Each term is 1 iff both lits_a[i] and lits_b[i] are true (under their polarities).
     pub fn add_quad_pb_eq(&mut self, lits_a: &[i32], lits_b: &[i32], coeffs: &[u32], target: u32) {
@@ -925,14 +1110,14 @@ impl Solver {
 
         let qi = self.quad_pb_constraints.len() as u32;
 
-        // Watch by variable + build term index (dedup via contains, no HashSet alloc)
+        // Dedup watches via O(1) last() check (see add_quad_pb_range).
         for i in 0..lits_a.len() {
             let va = var_of(lits_a[i]);
             let vb = var_of(lits_b[i]);
-            if !self.quad_pb_var_watches[va].contains(&qi) {
+            if self.quad_pb_var_watches[va].last() != Some(&qi) {
                 self.quad_pb_var_watches[va].push(qi);
             }
-            if !self.quad_pb_var_watches[vb].contains(&qi) {
+            if self.quad_pb_var_watches[vb].last() != Some(&qi) {
                 self.quad_pb_var_watches[vb].push(qi);
             }
             self.quad_pb_var_terms[va].push((qi, i as u16, true));
@@ -989,15 +1174,18 @@ impl Solver {
 
         let qi = self.quad_pb_constraints.len() as u32;
 
-        // Use a Vec<bool> instead of HashSet for dedup (faster for small var counts)
+        // Dedup watches: qi is monotonically increasing across
+        // add_quad_pb_range calls, so within this call qi can only be
+        // present as the LAST entry of watches[v] (added by a prior
+        // term of THIS constraint). An O(1) last() check replaces the
+        // prior O(n) contains() scan.
         for i in 0..lits_a.len() {
             let va = var_of(lits_a[i]);
             let vb = var_of(lits_b[i]);
-            // Check if already watched by scanning (O(n) but small n per constraint)
-            if !self.quad_pb_var_watches[va].contains(&qi) {
+            if self.quad_pb_var_watches[va].last() != Some(&qi) {
                 self.quad_pb_var_watches[va].push(qi);
             }
-            if !self.quad_pb_var_watches[vb].contains(&qi) {
+            if self.quad_pb_var_watches[vb].last() != Some(&qi) {
                 self.quad_pb_var_watches[vb].push(qi);
             }
             self.quad_pb_var_terms[va].push((qi, i as u16, true));
@@ -2016,18 +2204,19 @@ impl Solver {
     }
 
     /// Save a checkpoint of the constraint database sizes.
-    /// After calling this, new clauses/PBs/quad PBs/XORs can be added and later undone
-    /// with `restore_checkpoint`. Cheap: just records 6 integers.
-    pub fn save_checkpoint(&self) -> (usize, usize, usize, usize, usize, usize) {
+    /// After calling this, new clauses/PBs/quad PBs/XORs/PbSetEq can be added
+    /// and later undone with `restore_checkpoint`. Cheap: just records 7 integers.
+    pub fn save_checkpoint(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
         (self.clause_meta.len(), self.clause_lits.len(),
          self.pb_constraints.len(), self.num_vars,
-         self.quad_pb_constraints.len(), self.xor_constraints.len())
+         self.quad_pb_constraints.len(), self.xor_constraints.len(),
+         self.pb_set_eq_constraints.len())
     }
 
-    /// Restore the solver to a previous checkpoint, removing all clauses/PBs/quad PBs/XORs
+    /// Restore the solver to a previous checkpoint, removing all clauses/PBs/quad PBs/XORs/PbSetEq
     /// added after the checkpoint. Backtracks, then truncates and rebuilds watches.
-    pub fn restore_checkpoint(&mut self, cp: (usize, usize, usize, usize, usize, usize)) {
-        let (n_clauses, n_lits, n_pbs, _n_vars, n_quad_pbs, n_xors) = cp;
+    pub fn restore_checkpoint(&mut self, cp: (usize, usize, usize, usize, usize, usize, usize)) {
+        let (n_clauses, n_lits, n_pbs, _n_vars, n_quad_pbs, n_xors, n_pbseq) = cp;
         self.backtrack(0);
 
         // Mark post-checkpoint clauses as deleted
@@ -2065,6 +2254,16 @@ impl Solver {
             self.xor_constraints.truncate(n_xors);
             for wl in &mut self.xor_var_watches {
                 wl.retain(|&xi| (xi as usize) < n_xors);
+            }
+        }
+
+        // Remove post-checkpoint PbSetEq constraints and their watch entries.
+        // No counter reset needed: `propagate_pb_set_eq` recomputes from the
+        // trail on every call.
+        if n_pbseq < self.pb_set_eq_constraints.len() {
+            self.pb_set_eq_constraints.truncate(n_pbseq);
+            for wl in &mut self.pb_set_eq_var_watches {
+                wl.retain(|&pi| (pi as usize) < n_pbseq);
             }
         }
 
@@ -2495,6 +2694,20 @@ impl Solver {
                     }
                 }
             }
+            // PbSetEq propagation: `#{i : lit_i true} ∈ V`.
+            // `propagate_pb_set_eq` recomputes the counters from the trail
+            // on entry; no incremental bookkeeping is needed (and a prior
+            // attempt at incremental was unsound — prior propagators in
+            // the same iteration can enqueue lits this block would miss).
+            if !self.pb_set_eq_constraints.is_empty() {
+                let v = var_of(lit);
+                for idx in 0..self.pb_set_eq_var_watches[v].len() {
+                    let pi = self.pb_set_eq_var_watches[v][idx];
+                    if let Some(conflict) = self.propagate_pb_set_eq(pi) {
+                        return Some(conflict);
+                    }
+                }
+            }
             // MDD constraint propagation
             if self.mdd.is_some() {
                 let v = var_of(lit);
@@ -2512,7 +2725,7 @@ impl Solver {
             if self.spectral.is_some() {
                 let v = var_of(lit);
                 let spec = self.spectral.as_mut().unwrap();
-                if v < spec.num_seq_vars {
+                if v < spec.num_seq_vars && !spec.assigned[v] {
                     let val: i8 = if lit > 0 { 1 } else { -1 };
                     spec.assign(v, val);
                     if spec.check_conflict().is_some() {
@@ -3015,6 +3228,32 @@ impl Solver {
                     }
                     self.analyze_reason_buf = buf;
                 }
+                Reason::PbSetEq(pi) => {
+                    // PbSetEq reason: all currently-assigned literals in the
+                    // constraint negated (trail-pos filtered for propagation
+                    // reasons).  Same shape as the Xor arm — over-approximate
+                    // but sound; tightening is a future optimisation.
+                    let mut buf = std::mem::take(&mut self.analyze_reason_buf);
+                    buf.clear();
+                    let pv = if p != 0 { var_of(p) } else { usize::MAX };
+                    let pv_pos = if pv < self.num_vars { self.trail_pos[pv] } else { usize::MAX };
+                    let n_lits = self.pb_set_eq_constraints[pi as usize].lits.len();
+                    for i in 0..n_lits {
+                        let cl = self.pb_set_eq_constraints[pi as usize].lits[i];
+                        let v = var_of(cl);
+                        if v == pv { continue; }
+                        if self.assigns[v] == LBool::Undef { continue; }
+                        if p != 0 && self.trail_pos[v] >= pv_pos { continue; }
+                        // Push the negation of the literal's current truth value.
+                        let cur_true = self.lit_value(cl) == LBool::True;
+                        let neg_lit = if cur_true { -cl } else { cl };
+                        buf.push(neg_lit);
+                    }
+                    for idx in 0..buf.len() {
+                        process_reason_lit!(self, buf[idx], p, counter, learnt, bt_level);
+                    }
+                    self.analyze_reason_buf = buf;
+                }
                 Reason::Spectral => {
                     // Spectral reason: all assigned sequence variables contributed
                     // to the DFT violation. Return them all as the reason.
@@ -3124,7 +3363,7 @@ impl Solver {
             let lit = learnt[i];
             let v = var_of(lit);
             match self.reason[v] {
-                Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) | Reason::Xor(_) | Reason::Spectral | Reason::Mdd => {
+                Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) | Reason::Xor(_) | Reason::Spectral | Reason::Mdd | Reason::PbSetEq(_) => {
                     if self.lit_removable(v) { continue; }
                 }
                 Reason::Decision => {}
@@ -3208,6 +3447,16 @@ impl Solver {
                         if fail { return false; }
                     }
                 }
+                Reason::PbSetEq(pi) => {
+                    let n_lits = self.pb_set_eq_constraints[pi as usize].lits.len();
+                    for i in 0..n_lits {
+                        let lit = self.pb_set_eq_constraints[pi as usize].lits[i];
+                        let u = var_of(lit);
+                        if self.assigns[u] == LBool::Undef { continue; }
+                        check_minimize_var!(self, u, cur, fail);
+                        if fail { return false; }
+                    }
+                }
                 Reason::Spectral => {
                     // Spectral reason: all assigned sequence vars
                     if let Some(ref spec) = self.spectral {
@@ -3280,6 +3529,8 @@ impl Solver {
                     self.quad_pb_constraints[qi as usize].stale = true;
                 }
             }
+            // No PbSetEq invalidation needed: `propagate_pb_set_eq`
+            // recomputes counters from the trail on every call.
             self.heap_insert(v);
         }
         self.trail_lim.truncate(level as usize);
@@ -4519,5 +4770,220 @@ mod tests {
         assert_eq!(s.solve_with_assumptions(&[1]), Some(true));
         s.reset();
         assert_eq!(s.solve_with_assumptions(&[4]), Some(true));
+    }
+
+    // ---- PbSetEq tests --------------------------------------------------
+
+    #[test]
+    fn pb_set_eq_singleton_works_like_pb_eq() {
+        let mut s = Solver::new();
+        s.add_pb_set_eq(&[1, 2, 3, 4], &[2]);
+        assert_eq!(s.solve(), Some(true));
+        let trues = (1..=4).filter(|&v| s.value(v) == Some(true)).count();
+        assert_eq!(trues, 2);
+    }
+
+    #[test]
+    fn pb_set_eq_multi_admits_each_value() {
+        let mut s = Solver::new();
+        s.add_pb_set_eq(&[1, 2, 3, 4], &[1, 3]);
+        assert_eq!(s.solve(), Some(true));
+        let trues = (1..=4).filter(|&v| s.value(v) == Some(true)).count();
+        assert!(trues == 1 || trues == 3, "got {trues}");
+    }
+
+    #[test]
+    fn pb_set_eq_propagates_when_set_collapses() {
+        // V = {1,3} over 4 lits: forcing 2 true leaves only target=3 valid,
+        // so the remaining unassigned lit must be true.
+        let mut s = Solver::new();
+        s.add_pb_set_eq(&[1, 2, 3, 4], &[1, 3]);
+        s.add_clause([1]);
+        s.add_clause([2]);
+        assert_eq!(s.solve(), Some(true));
+        assert_eq!(s.value(4), Some(true));
+    }
+
+    #[test]
+    fn pb_set_eq_unsat_when_set_empty_after_assignment() {
+        // V = {1,3} over 4 lits: force 2 true, others false → #true = 2 ∉ V.
+        let mut s = Solver::new();
+        s.add_pb_set_eq(&[1, 2, 3, 4], &[1, 3]);
+        s.add_clause([1]);
+        s.add_clause([2]);
+        s.add_clause([-3]);
+        s.add_clause([-4]);
+        assert_eq!(s.solve(), Some(false));
+    }
+
+    #[test]
+    fn pb_set_eq_empty_v_is_unsat() {
+        let mut s = Solver::new();
+        s.add_pb_set_eq(&[1, 2], &[]);
+        assert_eq!(s.solve(), Some(false));
+    }
+
+    #[test]
+    fn pb_set_eq_force_all_false_when_at_max() {
+        // V = {2, 5} over 5 lits: if 2 are true already, cnt_lo = 2 = max(V_alive
+        // since 5 would need all remaining true). Force one set to false →
+        // remaining undef must be false too.
+        let mut s = Solver::new();
+        s.add_pb_set_eq(&[1, 2, 3, 4, 5], &[2, 5]);
+        s.add_clause([1]);
+        s.add_clause([2]);
+        s.add_clause([-3]);
+        s.add_clause([-4]);
+        // V_alive collapses to {2}, cnt_lo = 2 ⇒ x5 must be false.
+        assert_eq!(s.solve(), Some(true));
+        assert_eq!(s.value(5), Some(false));
+    }
+
+    #[test]
+    fn pb_set_eq_force_all_true_when_at_min() {
+        // V = {3, 5} over 5 lits: if 3 are true already, V_alive = {3, 5}
+        // but cnt_hi = 3 when only the 3 lits with forced-trues are set and
+        // the rest are forced to undef → force true.  We instead test: force
+        // 2 lits false and let 3 others be decided; V_alive = {3} because
+        // cnt_hi = 3.  Then all remaining undef must be true.
+        let mut s = Solver::new();
+        s.add_pb_set_eq(&[1, 2, 3, 4, 5], &[3, 5]);
+        s.add_clause([-4]);
+        s.add_clause([-5]);
+        assert_eq!(s.solve(), Some(true));
+        assert_eq!(s.value(1), Some(true));
+        assert_eq!(s.value(2), Some(true));
+        assert_eq!(s.value(3), Some(true));
+    }
+
+    #[test]
+    fn pb_set_eq_checkpoint_restore() {
+        let mut s = Solver::new();
+        s.add_clause([1]);
+        let cp = s.save_checkpoint();
+        s.add_pb_set_eq(&[1, 2, 3], &[2]);
+        assert_eq!(s.solve(), Some(true));
+        // After restore the PbSetEq is gone; only x1=+1 remains.
+        s.restore_checkpoint(cp);
+        assert_eq!(s.solve(), Some(true));
+        assert_eq!(s.value(1), Some(true));
+    }
+
+    /// Regression test (currently failing) for the n=18 turyn XY regression.
+    /// Hardcoded data reproducing the smallest known instance where
+    /// `add_pb_set_eq` + `add_quad_pb_eq` jointly return UNSAT while each
+    /// subset is SAT and an explicit satisfying assignment exists.
+    ///
+    /// Construction:
+    /// - 36 variables: X = vars 1..=18, Y = vars 19..=36 (1-based).
+    /// - PbSetEq over X with V_x = {14}: exactly 14 of the X vars are true.
+    /// - PbSetEq over Y with V_y = {8}:  exactly 8  of the Y vars are true.
+    /// - For each lag s in 1..=17, a `add_quad_pb_eq` over
+    ///   `{(x_i, x_{i+s}), (¬x_i, ¬x_{i+s}), (y_i, y_{i+s}), (¬y_i, ¬y_{i+s})}`
+    ///   for i in 0..(18-s), with target chosen to match the canonical Turyn
+    ///   (X, Y, Z, W) at n=18.
+    /// - Boundary unit clauses: X and Y positions 0..=4 and 13..=17 pinned
+    ///   to the canonical values.
+    /// - Middle positions 5..=12 left free for the SAT.
+    ///
+    /// Expected: SAT (the canonical middle is a valid completion).
+    /// Actual:   UNSAT (soundness bug in PbSetEq + QuadPb interaction).
+    ///
+    /// Diagnostic data points (from the turyn test suite):
+    /// - Replace `add_pb_set_eq([14])` with `add_pb_eq` target 14 → SAT.
+    /// - Remove PbSetEq entirely → SAT.
+    /// - Keep PbSetEq, use only lags [1..=11] of quad_pb → SAT.
+    /// - Keep PbSetEq, use only lags [1..=12] of quad_pb → UNSAT.
+    ///
+    /// So the bug triggers when PbSetEq is combined with ≥12 quad_pb
+    /// constraints.  Individual lags in isolation are SAT.
+    ///
+    /// Root cause (fixed 2026-04-15): `propagate_pb_set_eq` trusted the
+    /// incremental `(num_true, num_undef)` counters, but those only
+    /// reflect the single lit currently being processed by the main
+    /// propagate loop.  When prior propagators in the same iteration
+    /// (QuadPb, or this PbSetEq's own `force_pb_set_eq_dir`) had already
+    /// enqueued additional lits, their effect was not yet in the
+    /// counters — the propagator saw a stale `(num_true, num_undef)` and
+    /// concluded V_alive = ∅ even though the real assignment had plenty
+    /// of valid counts.  Fix: always recompute from the trail.  Same
+    /// workaround the XOR propagator already used.
+    #[test]
+    fn pb_set_eq_plus_quad_pb_tt18_regression() {
+        let n = 18usize;
+        // Canonical TT(18).  X[i] = +1 if bit i is 1.
+        let x_vals: [i8; 18] = [ 1,  1, -1,  1,  1,  1,  1,  1,  1,  1,  1,  1, -1,  1, -1, -1,  1,  1];
+        let y_vals: [i8; 18] = [ 1,  1, -1, -1, -1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1,  1, -1,  1];
+        let z_vals: [i8; 18] = [ 1,  1, -1,  1,  1,  1, -1, -1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1];
+        let w_vals: [i8; 17] = [ 1,  1, -1, -1, -1, -1,  1, -1, -1,  1, -1, -1,  1,  1,  1, -1,  1];
+
+        // zw_autocorr[s] = 2 * N_Z(s) + 2 * N_W(s), where N_A(s) = Σ A[i]*A[i+s]
+        let mut zw_autocorr = vec![0i32; n];
+        for s in 1..n {
+            let mut nz = 0i32;
+            for i in 0..(n - s) { nz += (z_vals[i] as i32) * (z_vals[i + s] as i32); }
+            let mut nw = 0i32;
+            if s < 17 {
+                for i in 0..(17 - s) { nw += (w_vals[i] as i32) * (w_vals[i + s] as i32); }
+            }
+            zw_autocorr[s] = 2 * nz + 2 * nw;
+        }
+        // Verify Turyn identity for X, Y: N_X + N_Y + zw = 0 for s >= 1.
+        for s in 1..n {
+            let mut nx = 0i32;
+            for i in 0..(n - s) { nx += (x_vals[i] as i32) * (x_vals[i + s] as i32); }
+            let mut ny = 0i32;
+            for i in 0..(n - s) { ny += (y_vals[i] as i32) * (y_vals[i + s] as i32); }
+            assert_eq!(nx + ny + zw_autocorr[s], 0,
+                "Turyn identity fails at s={s}: N_X={nx}, N_Y={ny}, zw_autocorr={}",
+                zw_autocorr[s]);
+        }
+
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };          // 1..=18
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };       // 19..=36
+
+        let mut s = Solver::new();
+        // Ensure all 36 vars exist.
+        for v in 1..=(2 * n) as i32 { s.add_clause([v, -v]); }
+
+        // PbSetEq on X: exactly 14 true.  Canonical σ_X = +10, so count = 14.
+        let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
+        s.add_pb_set_eq(&x_lits, &[14]);
+        // PbSetEq on Y: exactly 8 true.  Canonical σ_Y = -2, so count = 8.
+        let y_lits: Vec<i32> = (0..n).map(|i| y_var(i)).collect();
+        s.add_pb_set_eq(&y_lits, &[8]);
+
+        // quad_pb for each lag s in 1..n.  target = (2(n-s) - zw[s]) / 2.
+        for lag in 1..n {
+            let target_raw = 2 * (n - lag) as i32 - zw_autocorr[lag];
+            assert!(target_raw >= 0 && target_raw % 2 == 0);
+            let target = (target_raw / 2) as u32;
+            let mut lits_a: Vec<i32> = Vec::with_capacity(4 * (n - lag));
+            let mut lits_b: Vec<i32> = Vec::with_capacity(4 * (n - lag));
+            for i in 0..(n - lag) {
+                lits_a.push(x_var(i)); lits_b.push(x_var(i + lag));
+                lits_a.push(-x_var(i)); lits_b.push(-x_var(i + lag));
+            }
+            for i in 0..(n - lag) {
+                lits_a.push(y_var(i)); lits_b.push(y_var(i + lag));
+                lits_a.push(-y_var(i)); lits_b.push(-y_var(i + lag));
+            }
+            let ones: Vec<u32> = vec![1; lits_a.len()];
+            s.add_quad_pb_eq(&lits_a, &lits_b, &ones, target);
+        }
+
+        // Boundary unit clauses: pin first 5 and last 5 of both X and Y.
+        let k = 5usize;
+        for i in 0..k {
+            s.add_clause([if x_vals[i] == 1 { x_var(i) } else { -x_var(i) }]);
+            s.add_clause([if x_vals[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+            s.add_clause([if y_vals[i] == 1 { y_var(i) } else { -y_var(i) }]);
+            s.add_clause([if y_vals[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+        }
+
+        let result = s.solve();
+        assert_eq!(result, Some(true),
+            "PbSetEq + quad_pb + canonical boundary should be SAT — the canonical middle X, Y is a valid completion.  \
+             This is the n=18 turyn open-search regression manifesting as a pure radical-level test.");
     }
 }

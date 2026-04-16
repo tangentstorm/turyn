@@ -1056,7 +1056,12 @@ pub fn build_xy_dfs(
 
     let mut children = [DEAD; 4];
     for branch in 0u32..4 {
+        // BDKR 2012 rule (i): pin x[0]=y[0]=+1 (sub-MDD position 0) AND
+        // x[n-1]=y[n-1]=+1 (sub-MDD position 2k-1 — the last suffix slot,
+        // mapped to actual sequence position n-1 for any n>=2k).  Both
+        // bits of branch 0b11 are set, meaning x_bit=y_bit=+1 there.
         if ctx.symmetry_break && new_pos == 0 && branch != 0b11 { continue; }
+        if ctx.symmetry_break && new_pos == 2 * ctx.k - 1 && branch != 0b11 { continue; }
         current_vals[new_idx] = branch as u8;
 
         for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.events[level] {
