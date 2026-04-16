@@ -2942,6 +2942,8 @@ fn run_mdd_sat_search(
         }
     };
     let k = mdd.k;
+    assert!(2 * k <= n, "k={} too large for n={}: need 2k <= n", k, n);
+    assert!(2 * k <= m, "k={} too large for m={}: need 2k <= m", k, m);
 
     let middle_n = n - 2 * k;
     let middle_m = m - 2 * k;
@@ -3647,7 +3649,10 @@ fn run_mdd_sat_search(
                         }
                         w_counts.sort_unstable();
                         z_counts.sort_unstable();
-                        if w_counts.is_empty() || z_counts.is_empty() { continue; }
+                        if w_counts.is_empty() || z_counts.is_empty() {
+                            stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
+                            continue;
+                        }
                         let w_lits: Vec<i32> = (0..ctx.middle_m).map(|i| w_var(i)).collect();
                         let z_lits: Vec<i32> = (0..ctx.middle_n).map(|i| z_var(i)).collect();
                         solver.add_pb_set_eq(&w_lits, &w_counts);
@@ -3659,6 +3664,7 @@ fn run_mdd_sat_search(
                         if rule_iv_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
                            || rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
                         {
+                            stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
                             continue;
                         }
                         // Rule (iv) / (v) middle clauses in the combined
@@ -3842,6 +3848,10 @@ fn run_mdd_sat_search(
 
                         // Enumerate WZ solutions
                         let mut wz_count = 0usize;
+                        // Conflict limit: at n=26 k=5, middle has only 3+12=15 vars
+                        // plus aux, so SAT/UNSAT should be fast. Cap at 50k conflicts
+                        // to prevent pathological instances from stalling a worker.
+                        solver.set_conflict_limit(50_000);
                         loop {
                             if ctx.found.load(AtomicOrdering::Relaxed) { break; }
                             if wz_count >= ctx.max_z { break; }
@@ -5451,7 +5461,7 @@ fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchReport {
     if cfg.mdd_k == SearchConfig::default().mdd_k {
         cfg.mdd_k = 7;
     }
-    let mdd_k = cfg.mdd_k.min((problem.n - 1) / 2);
+    let mdd_k = cfg.mdd_k.min((problem.n - 1) / 2).min(problem.m() / 2);
     run_mdd_sat_search(problem, &tuples, &cfg, verbose, mdd_k)
 }
 
@@ -5740,7 +5750,7 @@ fn main() {
             //    with sum constraint + autocorrelation range constraints
             // 3. Post-filter (Z,W) with spectral pair check
             // 4. Each valid pair → report (and later, send to Phase C with XY from MDD)
-            let mdd_k = cfg.mdd_k.min((problem.n - 1) / 2);
+            let mdd_k = cfg.mdd_k.min((problem.n - 1) / 2).min(problem.m() / 2);
             let reordered = match load_best_mdd(mdd_k, true) {
                 Some(m) => m,
                 None => { eprintln!("No MDD file found. Run: target/release/gen_mdd {}", mdd_k); return; }
@@ -6005,7 +6015,9 @@ fn main() {
                 tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
             }
         }
-        let mdd_k = cfg.mdd_k.min((cfg.problem.n - 1) / 2);
+        // Clamp k: must have 2k ≤ n (Z boundary) and 2k ≤ m (W boundary).
+        let m = cfg.problem.m();
+        let mdd_k = cfg.mdd_k.min((cfg.problem.n - 1) / 2).min(m / 2);
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, true, mdd_k);
         let label = match mode {
             WzMode::Cross => "cross",
