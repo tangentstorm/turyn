@@ -1096,13 +1096,10 @@ fn dfs(
         if stats.time_to_first_leaf.is_none() {
             stats.time_to_first_leaf = Some(ctx.start.elapsed().as_secs_f64());
         }
-        // All boundary positions visited. Every bit should be pinned;
-        // running sums must all equal 0 (target of Turyn identity).
         let sums_all_zero = (1..ctx.n).all(|s| state.sums[s] == 0);
         if !sums_all_zero {
             return false;
         }
-        // Validate with SAT: also enforces BDKR canonical rule Tseitin chains.
         let sat = solver.solve_with_assumptions(&state.assumptions);
         if sat == Some(true) {
             let sol = extract_solution(solver, ctx);
@@ -1110,6 +1107,46 @@ fn dfs(
             return true;
         }
         return false;
+    }
+
+    // Meet in the middle: at the halfway point (outer half pinned,
+    // inner half free), hand off to a full SAT call. The solver
+    // handles the inner-half search via CDCL over ~2n center variables
+    // — much faster than the walker's speculative DFS through them.
+    //
+    // Budget: 10k conflicts. If SAT within budget → solution found.
+    // UNSAT → this outer prefix is provably dead, backtrack. Timeout
+    // → the inner half is uncertain; fall through to walker DFS.
+    // Split at 60% depth — empirically balances walker-side pruning
+    // (needs enough levels to prune via capacity + tuple + rules)
+    // against SAT-side inner search (fewer center vars = faster solve).
+    let mitm_level = ctx.depth * 2 / 3;
+    if state.level == mitm_level {
+        stats.leaves_reached += 1;
+        let budget = 10_000u64;
+        solver.set_conflict_limit(solver.num_conflicts() + budget);
+        let sat = solver.solve_with_assumptions(&state.assumptions);
+        solver.set_conflict_limit(0);
+        match sat {
+            Some(true) => {
+                if stats.time_to_first_leaf.is_none() {
+                    stats.time_to_first_leaf = Some(ctx.start.elapsed().as_secs_f64());
+                }
+                let sol = extract_solution(solver, ctx);
+                *found = Some(sol);
+                return true;
+            }
+            Some(false) => {
+                // Proved UNSAT — entire inner half is dead for this prefix.
+                stats.sat_unsat += 1;
+                return false;
+            }
+            None => {
+                // Conflict-limit hit — indeterminate. Fall through to
+                // walker DFS for the remaining levels. The solver's
+                // partial progress (clause learning) persists.
+            }
+        }
     }
 
     let pos = ctx.pos_order[state.level];
