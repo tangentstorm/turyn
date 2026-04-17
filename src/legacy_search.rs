@@ -381,15 +381,19 @@ pub(crate) fn solve_xyzw(
         prod_d[j_prime] = Some(y);
         prod_d[mirror] = Some(y);
     }
+    // Rule (v) main clause at i':
+    //   (∃ j<i', premise(j)) ∨ ¬premise(i') ∨ D[i']=+1
+    // with premise(j) ≡ prod_d[j] = (D[j]·D[m-1-j]·D[m-1] = -1) via
+    // XNOR3 aux.  Previous version had polarities flipped, silently
+    // accepting non-canonical W's that rule (v) should reject.
     for i_prime in 1..mlen {
         let mirror = mlen - 1 - i_prime;
         if mirror <= i_prime { break; }
-        // clause: ¬prod_d[1] ∨ ... ∨ ¬prod_d[i'-1] ∨ prod_d[i'] ∨ D[i']
         let mut clause: Vec<i32> = Vec::with_capacity(i_prime + 1);
         for j_prime in 1..i_prime {
-            if let Some(y) = prod_d[j_prime] { clause.push(-y); }
+            if let Some(y) = prod_d[j_prime] { clause.push(y); }
         }
-        if let Some(y) = prod_d[i_prime] { clause.push(y); }
+        if let Some(y) = prod_d[i_prime] { clause.push(-y); }
         clause.push(w_var(i_prime));
         solver.add_clause(clause);
     }

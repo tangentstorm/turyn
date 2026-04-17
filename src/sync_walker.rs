@@ -333,12 +333,17 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
         prod_d[j] = Some(y);
         prod_d[mirror] = Some(y);
     }
+    // Main clause for rule (v) at index i:
+    //   (∃ j<i, premise(j) holds) ∨ ¬premise(i) ∨ W[i]=+1
+    // where premise(j) = prod_d[j] = (W[j]*W[m-1-j]*W[m-1] = -1) as a
+    // boolean via the XNOR3 aux var above. Positive prod_d[j] in the
+    // clause for j<i, NEGATIVE for j=i.
     for i in 1..mlen {
         let mirror = mlen - 1 - i;
         if mirror <= i { break; }
         let mut clause: Vec<i32> = Vec::with_capacity(i + 1);
-        for j in 1..i { if let Some(y) = prod_d[j] { clause.push(-y); } }
-        if let Some(y) = prod_d[i] { clause.push(y); }
+        for j in 1..i { if let Some(y) = prod_d[j] { clause.push(y); } }
+        if let Some(y) = prod_d[i] { clause.push(-y); }
         clause.push(w_var(i));
         solver.add_clause(clause);
     }
@@ -827,5 +832,33 @@ mod tests {
                     prefix_len, prop_result, full_result);
             }
         }
+    }
+
+    #[test]
+    fn canonical_tt18_propagate_only() {
+        // known_solutions.txt: 18 ++-+++++++++-+--++ ++----++-+---+-+-+ ++-+++----+-+-++-- ++----+--+--+++-+
+        let problem = Problem::new(18);
+        let n = 18;
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        let z_var = |i: usize| -> i32 { (2 * n + i + 1) as i32 };
+        let w_var = |i: usize| -> i32 { (3 * n + i + 1) as i32 };
+
+        let parse = |s: &str| -> Vec<i8> { s.chars().map(|c| if c == '+' { 1i8 } else { -1 }).collect() };
+        let x = parse("++-+++++++++-+--++");
+        let y = parse("++----++-+---+-+-+");
+        let z = parse("++-+++----+-+-++--");
+        let w = parse("++----+--+--+++-+");
+
+        let sat_cfg = radical::SolverConfig::default();
+        let mut solver = build_solver(problem, &sat_cfg);
+        solver.propagate_only(&[]);
+        let mut assums: Vec<i32> = Vec::new();
+        for (i, &v) in x.iter().enumerate() { assums.push(if v > 0 { x_var(i) } else { -x_var(i) }); }
+        for (i, &v) in y.iter().enumerate() { assums.push(if v > 0 { y_var(i) } else { -y_var(i) }); }
+        for (i, &v) in z.iter().enumerate() { assums.push(if v > 0 { z_var(i) } else { -z_var(i) }); }
+        for (i, &v) in w.iter().enumerate() { assums.push(if v > 0 { w_var(i) } else { -w_var(i) }); }
+        let result = solver.propagate_only(&assums);
+        assert_eq!(result, Some(true), "canonical TT(18) rejected by propagate_only");
     }
 }
