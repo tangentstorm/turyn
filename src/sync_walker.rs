@@ -795,6 +795,10 @@ pub(crate) struct SyncStats {
     pub peer_clauses_read: u64,
     /// Count of peer clauses this worker has added to its own solver.
     pub peer_clauses_imported: u64,
+    /// MITM SAT-call outcomes, counted separately from walker DFS.
+    pub mitm_sat: u64,      // Some(true) — solution found.
+    pub mitm_unsat: u64,    // Some(false) — inner provably dead.
+    pub mitm_timeout: u64,  // None — conflict limit hit, fall through.
 }
 
 pub(crate) fn search_sync(
@@ -838,6 +842,7 @@ fn search_sync_parallel(
         time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
         peer_clauses_read: 0, peer_clauses_imported: 0,
+        mitm_sat: 0, mitm_unsat: 0, mitm_timeout: 0,
     }));
     let exchange = Arc::new(ClauseExchange {
         clauses: std::sync::Mutex::new(Vec::new()),
@@ -880,6 +885,9 @@ fn search_sync_parallel(
                 agg.nogood_len_sum += stats.nogood_len_sum;
                 agg.full_nogood_len_sum += stats.full_nogood_len_sum;
                 agg.peer_clauses_imported += stats.peer_clauses_imported;
+                agg.mitm_sat += stats.mitm_sat;
+                agg.mitm_unsat += stats.mitm_unsat;
+                agg.mitm_timeout += stats.mitm_timeout;
                 agg.internal_nodes += stats.internal_nodes;
                 if agg.nodes_by_level.len() < stats.nodes_by_level.len() {
                     agg.nodes_by_level.resize(stats.nodes_by_level.len(), 0);
@@ -912,6 +920,8 @@ fn search_sync_parallel(
             if stats.nogood_len_sum > 0 { stats.full_nogood_len_sum as f64 / stats.nogood_len_sum as f64 } else { 1.0 },
             stats.peer_clauses_imported,
         );
+        eprintln!("sync_walker: mitm_sat={} mitm_unsat={} mitm_timeout={}",
+            stats.mitm_sat, stats.mitm_unsat, stats.mitm_timeout);
         let ttc = project_ttc(&stats, problem.n, elapsed.as_secs_f64(), n_workers);
         eprintln!("{}", ttc);
     }
@@ -920,32 +930,33 @@ fn search_sync_parallel(
 
 /// Project TTC (time-to-cover) from measured per-level branching + rate.
 ///
-/// Method: take the measured per-level `nodes_by_level[L]` counts from
-/// the (partial or full) run. Divide by the number of DFS entries per
-/// level (each parent spawns up to b_eff children, each child is a
-/// dfs call at level L+1). That gives a measured effective branching
-/// factor `b_eff(L) = nodes_by_level[L+1] / nodes_by_level[L]` for
-/// levels where `nodes_by_level[L] > 0`.
+/// With meet-in-the-middle at `mitm_level = depth * 2 / 3`:
+///   - Walker DFS explores levels 0..mitm_level. b_eff is meaningful.
+///   - At mitm_level a SAT call handles levels mitm_level..depth.
+///     Each call = 1 "outer state" fully processed.
+///   - Total cover time = outer tree traversal + (outer states) × (avg SAT-call time).
 ///
-/// Full-cover tree size (for the canonical-post-pruning space):
-///   N_total = Σ_{L=0..depth} Π_{ℓ=0..L} b_eff(ℓ)
-///           = Π_{ℓ=0..depth-1} b_eff(ℓ)   (with geometric sum ≈ leading term when b>1)
+/// Outer tree size: Σ_{L=0..mitm_level} Π_{ℓ=0..L} b_eff(ℓ), where
+/// b_eff(L) = nodes_by_level[L+1] / nodes_by_level[L] (measured from
+/// the run, partial or full).  Geometric-mean fallback for unreached
+/// levels.
 ///
-/// TTC_serial  = N_total / rate,   TTC_parallel = TTC_serial / n_workers
-/// where rate = nodes_visited / elapsed (aggregate across workers in
-/// parallel mode, so this is already a parallel rate).
+/// Time split:
+///   walker_time  = (outer_nodes / walker_rate)
+///   mitm_time    = (outer_states_at_mitm) × (measured avg SAT call)
+///   TTC_parallel = (walker_time + mitm_time) / n_workers   (assuming no
+///                                                           worker overlap)
+///   TTC_serial   = TTC_parallel × n_workers (single-thread equivalent)
 fn project_ttc(stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize) -> String {
-    let depth = n;  // bouncing-order depth = n for even n
+    let depth = n;  // bouncing-order depth
+    let mitm_level = depth * 2 / 3;
     let levels = stats.nodes_by_level.len();
     if levels < 2 || elapsed_secs <= 0.0 || stats.nodes_visited == 0 {
         return format!("TTC projection: insufficient data");
     }
-    // Measured effective branching per level. Only levels that have
-    // been EXITED (finished exploration) give a stable estimate —
-    // in DFS early levels stabilise first. For partial runs, use the
-    // deepest level where both L and L+1 have at least one visit.
-    let mut b_eff: Vec<f64> = Vec::with_capacity(depth);
-    for l in 0..depth.min(levels - 1) {
+    // Per-level branching measured from nodes_by_level.
+    let mut b_eff: Vec<f64> = Vec::with_capacity(mitm_level);
+    for l in 0..mitm_level.min(levels - 1) {
         let parent = stats.nodes_by_level[l];
         let child = stats.nodes_by_level[l + 1];
         if parent == 0 {
@@ -954,32 +965,62 @@ fn project_ttc(stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize)
             b_eff.push(child as f64 / parent as f64);
         }
     }
-    // Projected total tree size assuming measured b_eff(L) holds at
-    // every level. For levels where we have no data (L >= max depth
-    // reached), use the geometric mean of measured levels as a best
-    // guess; clamp below 1.0 to avoid divergence on sparse leaves.
+    // Geometric-mean fallback for levels where we saw no transitions
+    // (e.g. the run didn't reach them).
     let measured_avg: f64 = if b_eff.is_empty() { 1.0 } else {
         let log_prod: f64 = b_eff.iter().filter(|&&b| b > 0.0).map(|b| b.ln()).sum();
         let count = b_eff.iter().filter(|&&b| b > 0.0).count().max(1);
         (log_prod / count as f64).exp()
     };
-    let mut projected_nodes = 1.0_f64;
+
+    // Walker tree nodes to cover the outer 2/3.
+    let mut outer_nodes = 1.0_f64;
     let mut running_product = 1.0_f64;
-    for l in 0..depth {
+    for l in 0..mitm_level {
         let b = b_eff.get(l).copied().filter(|&b| b > 0.0).unwrap_or(measured_avg);
         running_product *= b;
-        projected_nodes += running_product;
+        outer_nodes += running_product;
     }
-    let rate = stats.nodes_visited as f64 / elapsed_secs;
-    let ttc_parallel = projected_nodes / rate;
-    let ttc_serial = ttc_parallel * n_workers as f64;
+    // Outer states that reach the MITM boundary = product of all b_eff.
+    let outer_states_at_mitm = running_product;
+
+    // Measured walker rate (nodes per wall-clock second, aggregate).
+    let walker_rate = stats.nodes_visited as f64 / elapsed_secs;
+    // Measured MITM-call count = nodes_by_level[mitm_level] (each MITM
+    // entry is a dfs call at mitm_level that takes the SAT branch).
+    let mitm_calls = stats.nodes_by_level.get(mitm_level).copied().unwrap_or(0);
+    // Average SAT-call wall time (aggregate over all workers).  We
+    // don't separately track SAT-call time, so use a rough proxy:
+    // time allocated to SAT ≈ elapsed − (walker_nodes / single_worker_walker_rate).
+    // Simpler: just measure mitm_calls per aggregate-second.
+    let mitm_call_rate = if elapsed_secs > 0.0 {
+        mitm_calls as f64 / elapsed_secs
+    } else { 0.0 };
+
+    // Full cover projection:
+    //   walker_time = outer_nodes / walker_rate
+    //   mitm_time   = outer_states_at_mitm / mitm_call_rate
+    let walker_time = outer_nodes / walker_rate.max(1.0);
+    let mitm_time = if mitm_call_rate > 0.0 {
+        outer_states_at_mitm / mitm_call_rate
+    } else { 0.0 };
+    let total_time = walker_time + mitm_time;
+    let ttc_parallel = total_time;
+    let ttc_serial = total_time * n_workers as f64;
+
     format!(
-        "TTC projection: b_eff per level = [{}]\n\
-         TTC projection: measured b_eff geo mean = {:.3}, projected nodes to cover = {:.3e}\n\
-         TTC projection: rate = {:.0} nodes/s ({} workers, aggregate),\n\
+        "TTC projection: b_eff at levels 0..{} = [{}]\n\
+         TTC projection: measured b_eff geo mean = {:.3}\n\
+         TTC projection: outer nodes to cover = {:.3e}, outer states reaching MITM = {:.3e}\n\
+         TTC projection: walker rate = {:.0} nodes/s, MITM rate = {:.1} calls/s (aggregate, {} workers)\n\
+         TTC projection: walker time = {:.1}s, MITM SAT time = {:.1}s\n\
          TTC projection: TTC_parallel ≈ {:.1}s, TTC_serial ≈ {:.1}s",
+        mitm_level,
         b_eff.iter().map(|b| format!("{:.2}", b)).collect::<Vec<_>>().join(", "),
-        measured_avg, projected_nodes, rate, n_workers, ttc_parallel, ttc_serial,
+        measured_avg, outer_nodes, outer_states_at_mitm,
+        walker_rate, mitm_call_rate, n_workers,
+        walker_time, mitm_time,
+        ttc_parallel, ttc_serial,
     )
 }
 
@@ -1008,6 +1049,7 @@ fn search_sync_serial(
             time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
         peer_clauses_read: 0, peer_clauses_imported: 0,
+        mitm_sat: 0, mitm_unsat: 0, mitm_timeout: 0,
         }, start.elapsed());
     }
 
@@ -1024,6 +1066,7 @@ fn search_sync_serial(
         time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
         peer_clauses_read: 0, peer_clauses_imported: 0,
+        mitm_sat: 0, mitm_unsat: 0, mitm_timeout: 0,
     };
 
     let deadline = if cfg.sat_secs > 0 {
@@ -1123,12 +1166,17 @@ fn dfs(
     let mitm_level = ctx.depth * 2 / 3;
     if state.level == mitm_level {
         stats.leaves_reached += 1;
-        let budget = 10_000u64;
-        solver.set_conflict_limit(solver.num_conflicts() + budget);
-        let sat = solver.solve_with_assumptions(&state.assumptions);
+        // Unlimited budget at MITM: once an outer prefix survives all
+        // walker pruning (capacity + tuple + rules + BDKR), the inner
+        // half is a finite, well-posed SAT instance and we want a
+        // definite SAT/UNSAT answer rather than a timeout. For n=22+
+        // the per-call cost is worth it: we re-cover far fewer states
+        // than walker DFS would for the same inner depth.
         solver.set_conflict_limit(0);
+        let sat = solver.solve_with_assumptions(&state.assumptions);
         match sat {
             Some(true) => {
+                stats.mitm_sat += 1;
                 if stats.time_to_first_leaf.is_none() {
                     stats.time_to_first_leaf = Some(ctx.start.elapsed().as_secs_f64());
                 }
@@ -1137,11 +1185,12 @@ fn dfs(
                 return true;
             }
             Some(false) => {
-                // Proved UNSAT — entire inner half is dead for this prefix.
+                stats.mitm_unsat += 1;
                 stats.sat_unsat += 1;
                 return false;
             }
             None => {
+                stats.mitm_timeout += 1;
                 // Conflict-limit hit — indeterminate. Fall through to
                 // walker DFS for the remaining levels. The solver's
                 // partial progress (clause learning) persists.
