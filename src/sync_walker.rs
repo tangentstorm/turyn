@@ -66,6 +66,9 @@ struct Ctx {
     /// Shared cancel flag for parallel multi-start: any worker that
     /// finds a solution sets it so the others bail out promptly.
     cancel: Option<Arc<AtomicBool>>,
+    /// Wall-clock start of this worker's search; used to stamp
+    /// `time_to_first_leaf`.
+    start: Instant,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -147,10 +150,11 @@ fn kind_xy_len(kind: u8, n: usize, m: usize) -> usize {
     }
 }
 
-fn build_ctx_seeded(problem: Problem, seed: u64, cancel: Option<Arc<AtomicBool>>) -> Ctx {
+fn build_ctx_seeded(problem: Problem, seed: u64, cancel: Option<Arc<AtomicBool>>, start: Instant) -> Ctx {
     let mut ctx = build_ctx(problem);
     ctx.seed = seed;
     ctx.cancel = cancel;
+    ctx.start = start;
     ctx
 }
 
@@ -224,7 +228,7 @@ fn build_ctx(problem: Problem) -> Ctx {
         n, m, depth,
         pos_order, pos_to_level,
         closure_events, max_remaining,
-        seed: 0, cancel: None,
+        seed: 0, cancel: None, start: Instant::now(),
     }
 }
 
@@ -627,6 +631,9 @@ pub(crate) struct SyncStats {
     pub children_total: u64,
     /// Count of internal (non-leaf) dfs() calls — parents of children.
     pub internal_nodes: u64,
+    /// Elapsed seconds until the walker first hit state.level == depth
+    /// (any leaf, solution or not). `None` if no leaf was reached.
+    pub time_to_first_leaf: Option<f64>,
 }
 
 pub(crate) fn search_sync(
@@ -667,6 +674,7 @@ fn search_sync_parallel(
         rule_rejects: 0, sat_unsat: 0, leaves_reached: 0,
         learned_clauses_final: 0, max_level_reached: 0,
         nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
+        time_to_first_leaf: None,
     }));
 
     thread::scope(|s| {
@@ -693,6 +701,12 @@ fn search_sync_parallel(
                 agg.sat_unsat += stats.sat_unsat;
                 agg.leaves_reached += stats.leaves_reached;
                 agg.max_level_reached = agg.max_level_reached.max(stats.max_level_reached);
+                if let Some(t) = stats.time_to_first_leaf {
+                    agg.time_to_first_leaf = Some(match agg.time_to_first_leaf {
+                        Some(cur) => cur.min(t),
+                        None => t,
+                    });
+                }
                 agg.children_total += stats.children_total;
                 agg.internal_nodes += stats.internal_nodes;
                 if agg.nodes_by_level.len() < stats.nodes_by_level.len() {
@@ -718,8 +732,9 @@ fn search_sync_parallel(
     let found = result.lock().unwrap().clone();
     if verbose {
         eprintln!(
-            "sync_walker(parallel x{}): nodes={} cap_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?}",
+            "sync_walker(parallel x{}): nodes={} cap_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?} time_to_first_leaf={}",
             n_workers, stats.nodes_visited, stats.capacity_rejects, stats.rule_rejects, stats.sat_unsat, stats.leaves_reached, stats.max_level_reached, elapsed,
+            stats.time_to_first_leaf.map(|t| format!("{:.3}s", t)).unwrap_or_else(|| "(never)".into()),
         );
         let ttc = project_ttc(&stats, problem.n, elapsed.as_secs_f64(), n_workers);
         eprintln!("{}", ttc);
@@ -799,7 +814,7 @@ fn search_sync_serial(
     start: Instant,
 ) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SyncStats, std::time::Duration) {
     let seed = cfg.random_seed.unwrap_or(0);
-    let ctx = build_ctx_seeded(problem, seed, cfg.cancel.clone());
+    let ctx = build_ctx_seeded(problem, seed, cfg.cancel.clone(), start);
     let mut solver = build_solver(problem, &cfg.sat_config);
     if cfg.conflict_limit > 0 {
         solver.set_conflict_limit(cfg.conflict_limit);
@@ -814,6 +829,7 @@ fn search_sync_serial(
             nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
             rule_rejects: 0, sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
             nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
+            time_to_first_leaf: None,
         }, start.elapsed());
     }
 
@@ -827,6 +843,7 @@ fn search_sync_serial(
         learned_clauses_final: 0, max_level_reached: 0,
         nodes_by_level: vec![0; ctx.depth + 1],
         children_total: 0, internal_nodes: 0,
+        time_to_first_leaf: None,
     };
 
     let deadline = if cfg.sat_secs > 0 {
@@ -873,6 +890,9 @@ fn dfs(
 
     if state.level >= ctx.depth {
         stats.leaves_reached += 1;
+        if stats.time_to_first_leaf.is_none() {
+            stats.time_to_first_leaf = Some(ctx.start.elapsed().as_secs_f64());
+        }
         // All boundary positions visited. Every bit should be pinned;
         // running sums must all equal 0 (target of Turyn identity).
         let sums_all_zero = (1..ctx.n).all(|s| state.sums[s] == 0);
