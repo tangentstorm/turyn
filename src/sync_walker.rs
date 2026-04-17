@@ -21,6 +21,8 @@
 
 #![allow(unused_imports)]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use rustc_hash::FxHashMap;
@@ -34,6 +36,11 @@ pub(crate) struct SyncConfig {
     pub sat_secs: u64,
     pub sat_config: radical::SolverConfig,
     pub conflict_limit: u64,
+    /// Per-worker random-ordering seed for parallel multi-start. `None`
+    /// falls back to the `SYNC_SORT` env var (sort/none/random).
+    pub random_seed: Option<u64>,
+    /// Shared cancel flag for parallel multi-start workers.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 /// Immutable context computed once per search.
@@ -51,6 +58,14 @@ struct Ctx {
     /// Capacity bound per (level, lag): max `|S(s)|` achievable from
     /// pairs not yet closed after reaching `level`.
     max_remaining: Vec<Vec<i32>>,
+    /// Sibling ordering mode: "sort" (score asc), "none", "random".
+    sort_mode: String,
+    /// Seed for "random" mode. Mixed into the LCG so parallel workers
+    /// explore independent orderings.
+    seed: u64,
+    /// Shared cancel flag for parallel multi-start: any worker that
+    /// finds a solution sets it so the others bail out promptly.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -132,6 +147,18 @@ fn kind_xy_len(kind: u8, n: usize, m: usize) -> usize {
     }
 }
 
+fn build_ctx_seeded(problem: Problem, seed: u64, cancel: Option<Arc<AtomicBool>>) -> Ctx {
+    let mut ctx = build_ctx(problem);
+    ctx.seed = seed;
+    ctx.cancel = cancel;
+    if seed != 0 {
+        // Parallel workers use random ordering by default so each
+        // explores a different region of the tree.
+        ctx.sort_mode = "random".into();
+    }
+    ctx
+}
+
 fn build_ctx(problem: Problem) -> Ctx {
     let n = problem.n;
     let m = problem.m();
@@ -198,10 +225,12 @@ fn build_ctx(problem: Problem) -> Ctx {
         }
     }
 
+    let sort_mode = std::env::var("SYNC_SORT").ok().unwrap_or_else(|| "sort".into());
     Ctx {
         n, m, depth,
         pos_order, pos_to_level,
         closure_events, max_remaining,
+        sort_mode, seed: 0, cancel: None,
     }
 }
 
@@ -535,15 +564,47 @@ fn capacity_violated(state: &State, ctx: &Ctx) -> bool {
 }
 
 /// Heuristic score for sibling ordering. Lower = more promising.
-/// Pressure = sum over lags of (|S(s)| / (cap+1))^2, scaled.
+///
+/// Measures "tightness" of the running sums relative to the budget of
+/// pending pairs at the current post-placement level. A sibling whose
+/// sums are close to 0 with ample remaining capacity scores low; one
+/// whose sums already saturate the budget scores high.
+///
+/// SYNC_SCORE=ratio    (default) sum_s (S(s)^2 / cap[s]^2)
+/// SYNC_SCORE=abs      sum_s |S(s)| * weight(s)
+/// SYNC_SCORE=tight    favor states where cap[s] - |S(s)| is small per lag
+///                     (i.e. states where we must commit specific values soon)
 fn score_state(state: &State, ctx: &Ctx) -> i64 {
-    let lvl = (state.level + 1).min(ctx.depth);
+    let lvl = state.level.min(ctx.depth);
     let caps = &ctx.max_remaining[lvl];
+    let mode = std::env::var("SYNC_SCORE").ok().unwrap_or_else(|| "ratio".into());
     let mut total: i64 = 0;
-    for s in 1..ctx.n {
-        let v = state.sums[s] as i64;
-        let c = (caps[s] as i64).max(1);
-        total += (v * v * 1024) / (c * c);
+    match mode.as_str() {
+        "abs" => {
+            for s in 1..ctx.n {
+                let v = (state.sums[s] as i64).abs();
+                // Weight short lags higher (they have more pairs pending).
+                let w = (ctx.n - s) as i64;
+                total += v * w;
+            }
+        }
+        "tight" => {
+            for s in 1..ctx.n {
+                let v = (state.sums[s] as i64).abs();
+                let c = caps[s] as i64;
+                // Prefer states where |S(s)| is close to cap (forces
+                // near-term commits) but not over.
+                let slack = (c - v).max(0);
+                total += slack * slack;
+            }
+        }
+        _ => {
+            for s in 1..ctx.n {
+                let v = state.sums[s] as i64;
+                let c = (caps[s] as i64).max(1);
+                total += (v * v * 1024) / (c * c);
+            }
+        }
     }
     total
 }
@@ -579,6 +640,7 @@ fn compute_signature(state: &State, ctx: &Ctx) -> u64 {
     h.finish()
 }
 
+#[derive(Clone)]
 pub(crate) struct SyncStats {
     pub nodes_visited: u64,
     pub memo_hits: u64,
@@ -596,7 +658,104 @@ pub(crate) fn search_sync(
     verbose: bool,
 ) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SyncStats, std::time::Duration) {
     let start = Instant::now();
-    let ctx = build_ctx(problem);
+
+    // Parallel multi-start: SYNC_PARALLEL=N spawns N worker threads,
+    // each running an independent full search with a different random
+    // ordering seed. First to find a solution wins; all workers share
+    // a cancel flag.
+    //
+    // Each worker has its own solver + clause DB, so learnt clauses
+    // do NOT transfer between workers (would require shared-state
+    // Send+Sync Solver, not currently available). The parallelism
+    // benefit comes purely from independent exploration of different
+    // regions of the search tree.
+    if let Some(n_workers) = std::env::var("SYNC_PARALLEL").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 2)
+    {
+        return search_sync_parallel(problem, cfg, verbose, n_workers, start);
+    }
+
+    search_sync_serial(problem, cfg, verbose, start)
+}
+
+fn search_sync_parallel(
+    problem: Problem,
+    cfg: &SyncConfig,
+    verbose: bool,
+    n_workers: usize,
+    start: Instant,
+) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SyncStats, std::time::Duration) {
+    use std::sync::Mutex;
+    use std::thread;
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let result: Arc<Mutex<Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>>> =
+        Arc::new(Mutex::new(None));
+    let stats_agg: Arc<Mutex<SyncStats>> = Arc::new(Mutex::new(SyncStats {
+        nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
+        rule_rejects: 0, sat_unsat: 0, leaves_reached: 0,
+        learned_clauses_final: 0, max_level_reached: 0,
+    }));
+
+    thread::scope(|s| {
+        for worker_id in 0..n_workers {
+            let cfg = cfg.clone();
+            let cancel = Arc::clone(&cancel);
+            let result = Arc::clone(&result);
+            let stats_agg = Arc::clone(&stats_agg);
+            s.spawn(move || {
+                // Each worker seeds its random ordering differently.
+                // SAFETY: env vars are process-wide; worker 0 keeps the
+                // user-set SYNC_SORT unchanged, others override via a
+                // per-thread local variable path. We use a worker-scoped
+                // override by passing a seed through cfg.
+                let worker_cfg = SyncConfig {
+                    random_seed: Some(worker_id as u64),
+                    cancel: Some(Arc::clone(&cancel)),
+                    ..cfg
+                };
+                let (sol, stats, _) = search_sync_serial(problem, &worker_cfg, false, start);
+                let mut agg = stats_agg.lock().unwrap();
+                agg.nodes_visited += stats.nodes_visited;
+                agg.memo_hits += stats.memo_hits;
+                agg.capacity_rejects += stats.capacity_rejects;
+                agg.rule_rejects += stats.rule_rejects;
+                agg.sat_unsat += stats.sat_unsat;
+                agg.leaves_reached += stats.leaves_reached;
+                agg.max_level_reached = agg.max_level_reached.max(stats.max_level_reached);
+                drop(agg);
+                if let Some(s) = sol {
+                    let mut r = result.lock().unwrap();
+                    if r.is_none() {
+                        *r = Some(s);
+                        cancel.store(true, AtomicOrdering::Release);
+                    }
+                }
+            });
+        }
+    });
+
+    let elapsed = start.elapsed();
+    let stats = stats_agg.lock().unwrap().clone();
+    let found = result.lock().unwrap().clone();
+    if verbose {
+        eprintln!(
+            "sync_walker(parallel x{}): nodes={} cap_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?}",
+            n_workers, stats.nodes_visited, stats.capacity_rejects, stats.rule_rejects, stats.sat_unsat, stats.leaves_reached, stats.max_level_reached, elapsed,
+        );
+    }
+    (found, stats, elapsed)
+}
+
+fn search_sync_serial(
+    problem: Problem,
+    cfg: &SyncConfig,
+    verbose: bool,
+    start: Instant,
+) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SyncStats, std::time::Duration) {
+    let seed = cfg.random_seed.unwrap_or(0);
+    let ctx = build_ctx_seeded(problem, seed, cfg.cancel.clone());
     let mut solver = build_solver(problem, &cfg.sat_config);
     if cfg.conflict_limit > 0 {
         solver.set_conflict_limit(cfg.conflict_limit);
@@ -653,6 +812,9 @@ fn dfs(
     if found.is_some() { return true; }
     if let Some(d) = deadline {
         if Instant::now() >= d { return false; }
+    }
+    if let Some(c) = &ctx.cancel {
+        if c.load(AtomicOrdering::Acquire) { return false; }
     }
     stats.nodes_visited += 1;
     if state.level as u64 > stats.max_level_reached {
@@ -781,18 +943,18 @@ fn dfs(
     }
 
     // Score-ordered siblings: ascending score (low pressure first).
-    // Sibling ordering. Set `SYNC_SORT=none` to try placements in
-    // natural bit order (for A/B comparison), `=random` for pseudo-random
-    // ordering, default is ascending score (low pressure first).
-    match std::env::var("SYNC_SORT").ok().as_deref() {
-        Some("none") => {}
-        Some("random") => {
+    // Sibling ordering. `ctx.sort_mode` = "sort" (ascending score,
+    // default), "none" (natural bit order), or "random" (LCG shuffle
+    // keyed on the walker prefix + ctx.seed).
+    match ctx.sort_mode.as_str() {
+        "none" => {}
+        "random" => {
             use std::hash::Hasher;
             let mut h = rustc_hash::FxHasher::default();
+            h.write_u64(ctx.seed);
             for &lit in &state.assumptions { h.write_i32(lit); }
-            let seed = h.finish();
-            // Deterministic shuffle via LCG keyed on prefix.
-            let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let s = h.finish();
+            let mut rng = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             for i in (1..candidates.len()).rev() {
                 rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let j = (rng >> 32) as usize % (i + 1);

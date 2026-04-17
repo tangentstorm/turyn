@@ -348,6 +348,8 @@ pub(crate) fn run_mdd_sat_search(
             sat_secs: cfg.sat_secs,
             sat_config: cfg.sat_config.clone(),
             conflict_limit: cfg.conflict_limit,
+            random_seed: None,
+            cancel: None,
         };
         let _ = tuples;  // unused by sync
         let (found, stats, elapsed) = crate::sync_walker::search_sync(problem, &sync_cfg, verbose);
