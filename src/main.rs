@@ -2505,33 +2505,62 @@ fn run_mdd_sat_search(
         let run_start = Instant::now();
         let conflict_limit: u64 = std::env::var("FULL_MDD_CONFLICTS")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        // Tuple control:
+        //   FULL_MDD_TUPLES=all     (default) — single solve, no sum PB;
+        //     energy identity is implied by the Turyn quad PB. Any tuple
+        //     found is accepted.
+        //   FULL_MDD_TUPLES=each    — legacy loop, per-tuple sum PB.
+        //     Useful for debugging or comparison.
+        let tuple_mode = std::env::var("FULL_MDD_TUPLES").unwrap_or_else(|_| "all".into());
         if verbose {
-            eprintln!("FULL_MDD=1: single-solve-per-tuple over {} tuples, k={} (depth={}) conflict_limit={}",
-                tuples.len(), k, mdd.depth, conflict_limit);
+            eprintln!("FULL_MDD=1: mode={} {} tuples, k={} (depth={}) conflict_limit={}",
+                tuple_mode, tuples.len(), k, mdd.depth, conflict_limit);
         }
-        let mut found: Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq, SumTuple)> = None;
+        let mut found: Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)> = None;
         let mut total_decisions = 0u64;
         let mut total_propagations = 0u64;
         let sat_secs = cfg.sat_secs;
-        for (i, &tuple) in tuples.iter().enumerate() {
-            if sat_secs > 0 && run_start.elapsed().as_secs() >= sat_secs { break; }
-            let (xyzw, stats) = try_full_turyn_via_mdd(
-                problem, tuple, k, &mdd.nodes, mdd.root, mdd.depth,
-                &full_pos_order, &cfg.sat_config, conflict_limit,
+        if tuple_mode == "each" {
+            for (i, &tuple) in tuples.iter().enumerate() {
+                if sat_secs > 0 && run_start.elapsed().as_secs() >= sat_secs { break; }
+                let (xyzw, stats) = solve_xyzw(
+                    problem, Some(tuple), k, &mdd.nodes, mdd.root, mdd.depth,
+                    &full_pos_order, &cfg.sat_config, &[], conflict_limit,
+                );
+                total_decisions += stats.decisions;
+                total_propagations += stats.propagations;
+                if verbose {
+                    eprintln!("  tuple {}/{} {:?}: {} dec, {} prop, {}",
+                        i + 1, tuples.len(), tuple, stats.decisions, stats.propagations,
+                        if xyzw.is_some() { "SAT" } else { "UNSAT/timeout" });
+                }
+                if let Some((x, y, z, w)) = xyzw {
+                    if verify_tt(problem, &x, &y, &z, &w) {
+                        found = Some((x, y, z, w));
+                        break;
+                    } else if verbose {
+                        eprintln!("    SAT but verify_tt failed for tuple {:?}", tuple);
+                    }
+                }
+            }
+        } else {
+            // tuple_mode == "all": one solve covers all tuples.
+            let (xyzw, stats) = solve_xyzw(
+                problem, None, k, &mdd.nodes, mdd.root, mdd.depth,
+                &full_pos_order, &cfg.sat_config, &[], conflict_limit,
             );
             total_decisions += stats.decisions;
             total_propagations += stats.propagations;
             if verbose {
-                eprintln!("  tuple {}/{} {:?}: {} dec, {} prop, {}",
-                    i + 1, tuples.len(), tuple, stats.decisions, stats.propagations,
+                eprintln!("  all-tuples solve: {} dec, {} prop, {}",
+                    stats.decisions, stats.propagations,
                     if xyzw.is_some() { "SAT" } else { "UNSAT/timeout" });
             }
             if let Some((x, y, z, w)) = xyzw {
                 if verify_tt(problem, &x, &y, &z, &w) {
-                    found = Some((x, y, z, w, tuple));
-                    break;
+                    found = Some((x, y, z, w));
                 } else if verbose {
-                    eprintln!("    SAT but verify_tt failed for tuple {:?}", tuple);
+                    eprintln!("    SAT but verify_tt failed — likely a solver bug");
                 }
             }
         }
@@ -2541,7 +2570,7 @@ fn run_mdd_sat_search(
                 total_decisions, total_propagations, elapsed);
         }
         let found_solution = found.is_some();
-        if let Some((x, y, z, w, _tuple)) = found {
+        if let Some((x, y, z, w)) = found {
             if verbose {
                 println!("\nFOUND! x={} y={} z={} w={}",
                     colored_pm(&x), colored_pm(&y), colored_pm(&z), colored_pm(&w));
@@ -4664,9 +4693,15 @@ fn try_candidate_via_mdd(
     (xy, stats)
 }
 
-/// **Prototype (FULL_MDD=1)**: solve all four Turyn sequences (X, Y, Z, W)
-/// in ONE SAT call per tuple, with the full ZW+XY MDD as a native
-/// constraint. Replaces the entire boundary→W→Z→XY pipeline for one tuple.
+/// **`solve_xyzw`** — solve all four Turyn sequences (X, Y, Z, W) in a
+/// single SAT call, with the full ZW+XY MDD as a native constraint and
+/// the full Turyn identity as per-lag quad PB.
+///
+/// Designed for cube-and-conquer: the caller may supply a
+/// `partial_boundary` cube (list of signed SAT literals) that pins some
+/// boundary bits. An outer MDD walker can shard the boundary space into
+/// independent cubes and dispatch each to a different worker/machine;
+/// each cube becomes an independent SAT call.
 ///
 /// SAT variable layout (1-based):
 ///   X[0..n]   -> 1..=n
@@ -4675,13 +4710,17 @@ fn try_candidate_via_mdd(
 ///   W[0..m]   -> 3n+1..=3n+m   (m = n-1)
 ///
 /// Constraints added:
-///   - Symmetry: x[0]=y[0]=z[0]=w[0]=+1 (TT(n) closed under per-sequence
-///     negation; this is a valid 16x reduction).
+///   - BDKR Canonical1: 6 endpoint fixings (see inline comment).
+///   - BDKR Canonical6: A/B tie-break clauses.
 ///   - 4 sum PB constraints encoding tuple sums.
 ///   - n-1 quad PB constraints encoding the full Turyn identity at each
 ///     lag s: agree_X(s) + agree_Y(s) + 2*agree_Z(s) + 2*agree_W(s) =
 ///     3n - 3s - 1  (for s < m); for s = m..n-1 the W term drops and
-///     target becomes 2(n-s).
+///     target becomes 2(n-s). The quad PB propagator's slack tracking
+///     already provides the "remaining pairs can't bring it back to
+///     target" early-conflict watchdog.
+///   - BDKR Canonical2..5 are NOT enforced here — they're best expressed
+///     as MDD path pruning at `gen_mdd` build time (separate change).
 ///   - Native MDD constraint over all 4k boundary positions (Z, W, X, Y
 ///     interleaved per the MDD's level structure: 0..2k = ZW, 2k..4k = XY).
 ///
@@ -4689,15 +4728,16 @@ fn try_candidate_via_mdd(
 /// it but slower than it could be. Adding spectral requires multi-
 /// sequence support in `radical::SpectralConstraint`.
 #[allow(clippy::too_many_arguments)]
-fn try_full_turyn_via_mdd(
+fn solve_xyzw(
     problem: Problem,
-    tuple: SumTuple,
+    tuple: Option<SumTuple>,    // None = any valid tuple (clauses transfer across tuples)
     k: usize,
     mdd_nodes: &[[u32; 4]],
     mdd_root: u32,
     mdd_depth: usize,           // = 4*k
     pos_order: &[usize],        // length = 2*k, used twice (once for ZW, once for XY)
     sat_config: &radical::SolverConfig,
+    partial_boundary: &[i32],   // cube assumptions; empty = no external pinning
     conflict_limit: u64,
 ) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, XyStats) {
     let n = problem.n;
@@ -4713,32 +4753,231 @@ fn try_full_turyn_via_mdd(
         s
     };
 
-    // Symmetry breaking — first position of each sequence forced to +1.
+    // BDKR Canonical1 (Best, Djoković, Kharaghani, Ramp 2013):
+    //   A[0] = A[n-1] = B[0] = B[n-1] = C[0] = D[0] = +1
+    // Note: C[n-1] and D[n-2] are deliberately NOT fixed.
+    // Canonical2..5 (first asymmetric/symmetric/exceptional index
+    // conditions on A, B, C, D) are cleanest to bake into the MDD at
+    // gen_mdd time as path pruning — they only constrain boundary
+    // positions — and are NOT enforced here.
     solver.add_clause([x_var(0)]);
+    solver.add_clause([x_var(n - 1)]);
     solver.add_clause([y_var(0)]);
+    solver.add_clause([y_var(n - 1)]);
     solver.add_clause([z_var(0)]);
     solver.add_clause([w_var(0)]);
 
-    // Sum PB constraints: sum of x_var(i) (true=+1) must equal (tuple.* + len) / 2.
-    let parity_ok = (tuple.x + n as i32) % 2 == 0
-                 && (tuple.y + n as i32) % 2 == 0
-                 && (tuple.z + n as i32) % 2 == 0
-                 && (tuple.w + m as i32) % 2 == 0;
-    if !parity_ok { return (None, XyStats::default()); }
-    let x_pos = ((tuple.x + n as i32) / 2) as usize;
-    let y_pos = ((tuple.y + n as i32) / 2) as usize;
-    let z_pos = ((tuple.z + n as i32) / 2) as usize;
-    let w_pos = ((tuple.w + m as i32) / 2) as usize;
-    let ones_n: Vec<u32> = vec![1; n];
-    let ones_m: Vec<u32> = vec![1; m];
-    let x_lits: Vec<i32> = (0..n).map(x_var).collect();
-    let y_lits: Vec<i32> = (0..n).map(y_var).collect();
-    let z_lits: Vec<i32> = (0..n).map(z_var).collect();
-    let w_lits: Vec<i32> = (0..m).map(w_var).collect();
-    solver.add_pb_eq(&x_lits, &ones_n, x_pos as u32);
-    solver.add_pb_eq(&y_lits, &ones_n, y_pos as u32);
-    solver.add_pb_eq(&z_lits, &ones_n, z_pos as u32);
-    solver.add_pb_eq(&w_lits, &ones_m, w_pos as u32);
+    // BDKR Canonical6 (A vs B tie-break at positions 1 and n-2):
+    //   n <= 2  OR  (A[1] != B[1]  AND  A[1] = +1)
+    //           OR  (A[1]  = B[1]  AND  A[n-2] = +1  AND  B[n-2] = -1)
+    // Implication form gives a small clause set:
+    //   (A[1] != B[1]) → A[1] = +1    ≡  (a1 ∨ ¬b1)
+    //   (A[1]  = B[1]) → A[n-2] = +1  ≡  2 binary-guarded clauses on aam
+    //   (A[1]  = B[1]) → B[n-2] = -1  ≡  2 binary-guarded clauses on ¬bbm
+    if n >= 4 {
+        let a1  = x_var(1);
+        let b1  = y_var(1);
+        let aam = x_var(n - 2);
+        let bbm = y_var(n - 2);
+        solver.add_clause([a1, -b1]);              // (A[1]≠B[1]) → A[1]=+1
+        solver.add_clause([-a1,  b1, aam]);        // (A[1]=B[1]=F) → A[n-2]=+1
+        solver.add_clause([ a1, -b1, aam]);        // (A[1]=B[1]=T) → A[n-2]=+1
+        solver.add_clause([-a1,  b1, -bbm]);       // (A[1]=B[1]=F) → B[n-2]=-1
+        solver.add_clause([ a1, -b1, -bbm]);       // (A[1]=B[1]=T) → B[n-2]=-1
+    }
+
+    // BDKR Canonical2 (A is lex-min under reversal):
+    //   ∀ i' ∈ [1, n-1]: (∀ j' < i': A[j']=A[n-1-j']) ∧ (A[i']≠A[n-1-i']) → A[i']=+1
+    // Tseitin-encode eq_A[j'] = (A[j']=A[n-1-j']) as aux vars; each main
+    // clause becomes one disjunction of length O(i').
+    //
+    // Aux var numbering: we start at 3n+m+1 (first free after X,Y,Z,W)
+    // and allocate sequentially. eq_a[j'] only exists for j' ∈ [1, (n-1)/2]
+    // (positions in [n/2, n-1] alias to eq_a[n-1-j']).
+    //
+    // Only generate clauses for i' ∈ [1, (n-1)/2]: for larger i', the
+    // premise ∀j'<i' (A[j']=A[n-1-j']) together with j' = n-1-i' forces
+    // A[i'] = A[n-1-i'], contradicting A[i']≠A[n-1-i']. So those clauses
+    // are vacuously true given Canonical1.
+    let mut next_aux: i32 = (3 * n + m + 1) as i32;
+    let mut eq_a: Vec<Option<i32>> = vec![None; n];
+    for j_prime in 1..n {
+        let mirror = n - 1 - j_prime;
+        if mirror <= j_prime { break; } // past center, or at center
+        let a = x_var(j_prime);
+        let b = x_var(mirror);
+        let y = next_aux; next_aux += 1;
+        // y ↔ (a=b): 4 clauses
+        solver.add_clause([-y, -a,  b]);
+        solver.add_clause([-y,  a, -b]);
+        solver.add_clause([ y,  a,  b]);
+        solver.add_clause([ y, -a, -b]);
+        eq_a[j_prime] = Some(y);
+        eq_a[mirror] = Some(y); // alias
+    }
+    for i_prime in 1..n {
+        let mirror = n - 1 - i_prime;
+        if mirror <= i_prime { break; }
+        // clause: ¬eq_a[1] ∨ ... ∨ ¬eq_a[i'-1] ∨ eq_a[i'] ∨ A[i']
+        let mut clause: Vec<i32> = Vec::with_capacity(i_prime + 1);
+        for j_prime in 1..i_prime {
+            if let Some(y) = eq_a[j_prime] { clause.push(-y); }
+        }
+        if let Some(y) = eq_a[i_prime] { clause.push(y); }
+        clause.push(x_var(i_prime));
+        solver.add_clause(clause);
+    }
+
+    // BDKR Canonical3 (B): same structure as Canonical2, over Y.
+    let mut eq_b: Vec<Option<i32>> = vec![None; n];
+    for j_prime in 1..n {
+        let mirror = n - 1 - j_prime;
+        if mirror <= j_prime { break; }
+        let a = y_var(j_prime);
+        let b = y_var(mirror);
+        let y = next_aux; next_aux += 1;
+        solver.add_clause([-y, -a,  b]);
+        solver.add_clause([-y,  a, -b]);
+        solver.add_clause([ y,  a,  b]);
+        solver.add_clause([ y, -a, -b]);
+        eq_b[j_prime] = Some(y);
+        eq_b[mirror] = Some(y);
+    }
+    for i_prime in 1..n {
+        let mirror = n - 1 - i_prime;
+        if mirror <= i_prime { break; }
+        let mut clause: Vec<i32> = Vec::with_capacity(i_prime + 1);
+        for j_prime in 1..i_prime {
+            if let Some(y) = eq_b[j_prime] { clause.push(-y); }
+        }
+        if let Some(y) = eq_b[i_prime] { clause.push(y); }
+        clause.push(y_var(i_prime));
+        solver.add_clause(clause);
+    }
+
+    // BDKR Canonical4 (C is lex-min under "alt-reversal", i.e. anti-symmetric
+    // premise rather than symmetric):
+    //   ∀ i' ∈ [1, n-1]: (∀ j' < i': C[j']≠C[n-1-j']) ∧ (C[i']=C[n-1-i']) → C[i']=+1
+    // Same eq-aux as Canonical2, but the main clause flips eq polarity:
+    //   eq_c[1] ∨ ... ∨ eq_c[i'-1] ∨ ¬eq_c[i'] ∨ C[i']
+    let mut eq_c: Vec<Option<i32>> = vec![None; n];
+    for j_prime in 1..n {
+        let mirror = n - 1 - j_prime;
+        if mirror <= j_prime { break; }
+        let a = z_var(j_prime);
+        let b = z_var(mirror);
+        let y = next_aux; next_aux += 1;
+        solver.add_clause([-y, -a,  b]);
+        solver.add_clause([-y,  a, -b]);
+        solver.add_clause([ y,  a,  b]);
+        solver.add_clause([ y, -a, -b]);
+        eq_c[j_prime] = Some(y);
+        eq_c[mirror] = Some(y);
+    }
+    for i_prime in 1..n {
+        let mirror = n - 1 - i_prime;
+        if mirror <= i_prime { break; }
+        let mut clause: Vec<i32> = Vec::with_capacity(i_prime + 1);
+        for j_prime in 1..i_prime {
+            if let Some(y) = eq_c[j_prime] { clause.push(y); }
+        }
+        if let Some(y) = eq_c[i_prime] { clause.push(-y); }
+        clause.push(z_var(i_prime));
+        solver.add_clause(clause);
+    }
+
+    // BDKR Canonical5 (D, triple-product condition):
+    //   ∀ i' ∈ [1, m-1]:
+    //     (∀ j' < i': D[j'] * D[m-1-j'] = D[m-1]) ∧
+    //     (D[i'] * D[m-1-i'] ≠ D[m-1])
+    //   → D[i'] = +1
+    // where m = n-1 (the length of D).
+    //
+    // Define prod_D[j'] = aux var for (D[j'] * D[m-1-j'] * D[m-1] = +1), i.e.
+    // XNOR3(D[j'], D[m-1-j'], D[m-1]). Main clause for i':
+    //   ¬prod_D[1] ∨ ... ∨ ¬prod_D[i'-1] ∨ prod_D[i'] ∨ D[i']
+    // prod_D[j'] aliases to prod_D[m-1-j'] by symmetry in j' ↔ m-1-j'.
+    let mlen = m;  // length of D; n-1
+    let d_last = w_var(mlen - 1);
+    let mut prod_d: Vec<Option<i32>> = vec![None; mlen];
+    for j_prime in 1..mlen {
+        let mirror = mlen - 1 - j_prime;
+        if mirror <= j_prime { break; }
+        let a = w_var(j_prime);
+        let b = w_var(mirror);
+        let c = d_last;
+        let y = next_aux; next_aux += 1;
+        // y ↔ XNOR3(a,b,c):  y ↔ "even number of (a,b,c) are true" (0 or 2)
+        //   y → XNOR3: forbid (y=T, 1-or-3 trues)
+        //     (y=T,a=F,b=F,c=T): clause (¬y ∨ a ∨ b ∨ ¬c)
+        //     (y=T,a=F,b=T,c=F): (¬y ∨ a ∨ ¬b ∨ c)
+        //     (y=T,a=T,b=F,c=F): (¬y ∨ ¬a ∨ b ∨ c)
+        //     (y=T,a=T,b=T,c=T): (¬y ∨ ¬a ∨ ¬b ∨ ¬c)
+        solver.add_clause([-y,  a,  b, -c]);
+        solver.add_clause([-y,  a, -b,  c]);
+        solver.add_clause([-y, -a,  b,  c]);
+        solver.add_clause([-y, -a, -b, -c]);
+        //   ¬y → XOR3: forbid (y=F, 0-or-2 trues)
+        //     (y=F,a=F,b=F,c=F): (y ∨ a ∨ b ∨ c)
+        //     (y=F,a=F,b=T,c=T): (y ∨ a ∨ ¬b ∨ ¬c)
+        //     (y=F,a=T,b=F,c=T): (y ∨ ¬a ∨ b ∨ ¬c)
+        //     (y=F,a=T,b=T,c=F): (y ∨ ¬a ∨ ¬b ∨ c)
+        solver.add_clause([ y,  a,  b,  c]);
+        solver.add_clause([ y,  a, -b, -c]);
+        solver.add_clause([ y, -a,  b, -c]);
+        solver.add_clause([ y, -a, -b,  c]);
+        prod_d[j_prime] = Some(y);
+        prod_d[mirror] = Some(y);
+    }
+    for i_prime in 1..mlen {
+        let mirror = mlen - 1 - i_prime;
+        if mirror <= i_prime { break; }
+        // clause: ¬prod_d[1] ∨ ... ∨ ¬prod_d[i'-1] ∨ prod_d[i'] ∨ D[i']
+        let mut clause: Vec<i32> = Vec::with_capacity(i_prime + 1);
+        for j_prime in 1..i_prime {
+            if let Some(y) = prod_d[j_prime] { clause.push(-y); }
+        }
+        if let Some(y) = prod_d[i_prime] { clause.push(y); }
+        clause.push(w_var(i_prime));
+        solver.add_clause(clause);
+    }
+    // Silence unused-var warning when n < 4 (no aux vars allocated).
+    let _ = next_aux;
+
+    // Sum constraints.
+    //
+    // When `tuple = Some(t)`, pin each sequence sum to t.x / t.y / t.z / t.w
+    // via PB equalities — the classic "one solve per tuple" behaviour.
+    //
+    // When `tuple = None`, omit the sum PBs entirely. The energy identity
+    //   (sum X)^2 + (sum Y)^2 + 2(sum Z)^2 + 2(sum W)^2 = 6n - 2
+    // follows from summing the per-lag Turyn quad PBs over s ∈ [1, n-1]
+    // (proof: sum_{s>=1} N_X(s) = ((sum X)^2 - n)/2 by
+    // (sum X)^2 = N_X(0) + 2*sum_{s>=1} N_X(s); substitute into the
+    // Turyn identity summed over s), so the solver automatically restricts
+    // to valid tuples. One solve then covers the entire phase-A tuple
+    // space; learnt clauses transfer across tuples.
+    if let Some(t) = tuple {
+        let parity_ok = (t.x + n as i32) % 2 == 0
+                     && (t.y + n as i32) % 2 == 0
+                     && (t.z + n as i32) % 2 == 0
+                     && (t.w + m as i32) % 2 == 0;
+        if !parity_ok { return (None, XyStats::default()); }
+        let x_pos = ((t.x + n as i32) / 2) as usize;
+        let y_pos = ((t.y + n as i32) / 2) as usize;
+        let z_pos = ((t.z + n as i32) / 2) as usize;
+        let w_pos = ((t.w + m as i32) / 2) as usize;
+        let ones_n: Vec<u32> = vec![1; n];
+        let ones_m: Vec<u32> = vec![1; m];
+        let x_lits: Vec<i32> = (0..n).map(x_var).collect();
+        let y_lits: Vec<i32> = (0..n).map(y_var).collect();
+        let z_lits: Vec<i32> = (0..n).map(z_var).collect();
+        let w_lits: Vec<i32> = (0..m).map(w_var).collect();
+        solver.add_pb_eq(&x_lits, &ones_n, x_pos as u32);
+        solver.add_pb_eq(&y_lits, &ones_n, y_pos as u32);
+        solver.add_pb_eq(&z_lits, &ones_n, z_pos as u32);
+        solver.add_pb_eq(&w_lits, &ones_m, w_pos as u32);
+    }
 
     // Quad PB: full Turyn identity per lag.
     for s in 1..n {
@@ -4804,7 +5043,11 @@ fn try_full_turyn_via_mdd(
     let free_vars = (solver.num_vars() as u64).saturating_sub(vars_pre_forced);
 
     if conflict_limit > 0 { solver.set_conflict_limit(conflict_limit); }
-    let result = solver.solve_with_assumptions(&[]);
+    // Pass the partial-boundary cube as assumptions. Empty slice → no cube.
+    // This is the cube-and-conquer entrypoint: an outer procedure can
+    // shard the boundary space and hand each cube to a worker running
+    // `solve_xyzw` independently.
+    let result = solver.solve_with_assumptions(partial_boundary);
 
     let decisions    = solver.num_decisions().saturating_sub(d0);
     let propagations = solver.num_propagations().saturating_sub(p0);
