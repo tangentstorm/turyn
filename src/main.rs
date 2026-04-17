@@ -38,8 +38,9 @@ use crate::types::*;
 use crate::xy_sat::*;
 
 /// Number of spectral frequencies for the SAT solver's built-in spectral constraint.
-/// Prime number, dense enough to make the post-hoc FFT check redundant.
-pub(crate) const SPECTRAL_FREQS: usize = 563;
+/// 64 chosen via n=26 --wz=apart TTC sweep (see OPTIMIZATION_LOG §S5, April 2026);
+/// covers a dense-enough grid that post-hoc FFT still finds near-zero false-negatives.
+pub(crate) const SPECTRAL_FREQS: usize = 64;
 
 fn print_help() {
     eprintln!("turyn - Find Turyn-type sequences TT(n) for constructing Hadamard matrices");
