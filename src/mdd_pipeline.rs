@@ -351,6 +351,8 @@ pub(crate) fn run_mdd_sat_search(
             random_seed: None,
             cancel: None,
             exchange: None,
+            worker_id: None,
+            n_workers: 1,
         };
         let _ = tuples;  // unused by sync
         let (found, stats, elapsed) = crate::sync_walker::search_sync(problem, &sync_cfg, verbose);

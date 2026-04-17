@@ -54,6 +54,11 @@ pub(crate) struct SyncConfig {
     pub cancel: Option<Arc<AtomicBool>>,
     /// Shared learnt-clause exchange. `None` for single-worker mode.
     pub exchange: Option<Arc<ClauseExchange>>,
+    /// Worker index in `0..n_workers` for sub-tree partitioning.
+    /// `None` = no partitioning (single-worker / sequential mode).
+    pub worker_id: Option<usize>,
+    /// Total worker count; used as the partition modulus.
+    pub n_workers: usize,
 }
 
 /// Immutable context computed once per search.
@@ -91,6 +96,10 @@ struct Ctx {
     /// workers).  Each worker publishes newly-learnt nogoods on
     /// propagate_only UNSAT and pulls peer clauses periodically.
     exchange: Option<Arc<ClauseExchange>>,
+    /// Worker index (0..n_workers) for sub-tree partitioning.
+    worker_id: usize,
+    /// Total worker count; partition modulus.
+    n_workers: usize,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -177,12 +186,16 @@ fn build_ctx_seeded(
     seed: u64,
     cancel: Option<Arc<AtomicBool>>,
     exchange: Option<Arc<ClauseExchange>>,
+    worker_id: usize,
+    n_workers: usize,
     start: Instant,
 ) -> Ctx {
     let mut ctx = build_ctx(problem);
     ctx.seed = seed;
     ctx.cancel = cancel;
     ctx.exchange = exchange;
+    ctx.worker_id = worker_id;
+    ctx.n_workers = n_workers;
     ctx.start = start;
     ctx
 }
@@ -267,6 +280,7 @@ fn build_ctx(problem: Problem) -> Ctx {
         seed: 0, cancel: None, start: Instant::now(),
         valid_tuples,
         exchange: None,
+        worker_id: 0, n_workers: 1,
     }
 }
 
@@ -863,6 +877,8 @@ fn search_sync_parallel(
                     random_seed: Some(worker_id as u64),
                     cancel: Some(Arc::clone(&cancel)),
                     exchange: Some(Arc::clone(&exchange)),
+                    worker_id: Some(worker_id),
+                    n_workers,
                     ..cfg
                 };
                 let (sol, stats, _) = search_sync_serial(problem, &worker_cfg, false, start);
@@ -1031,7 +1047,9 @@ fn search_sync_serial(
     start: Instant,
 ) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SyncStats, std::time::Duration) {
     let seed = cfg.random_seed.unwrap_or(0);
-    let ctx = build_ctx_seeded(problem, seed, cfg.cancel.clone(), cfg.exchange.clone(), start);
+    let worker_id = cfg.worker_id.unwrap_or(0);
+    let n_workers = cfg.n_workers.max(1);
+    let ctx = build_ctx_seeded(problem, seed, cfg.cancel.clone(), cfg.exchange.clone(), worker_id, n_workers, start);
     let mut solver = build_solver(problem, &cfg.sat_config);
     if cfg.conflict_limit > 0 {
         solver.set_conflict_limit(cfg.conflict_limit);
@@ -1074,7 +1092,12 @@ fn search_sync_serial(
     } else { None };
 
     let mut found: Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)> = None;
-    dfs(&mut solver, &mut state, &ctx, &mut memo, &mut stats, deadline, &mut found);
+    // Start partitioning with divisor=1. At each branching level,
+    // (worker_id / divisor) % b identifies the candidate this worker
+    // takes; divisor *= b. Filter stops when divisor ≥ n_workers (every
+    // worker has a unique path). Single-worker serial runs have
+    // n_workers = 1, so no filtering happens.
+    dfs(&mut solver, &mut state, &ctx, &mut memo, &mut stats, deadline, &mut found, 1);
 
     let elapsed = start.elapsed();
     if verbose {
@@ -1087,6 +1110,14 @@ fn search_sync_serial(
 }
 
 /// DFS descent. Returns true if a solution was found (short-circuits up the stack).
+/// DFS descent.
+///
+/// `partition_divisor`: accumulated branching product from the root.
+/// At each branching level with b candidates, one candidate is selected
+/// via `(worker_id / partition_divisor) % b`; the divisor is then
+/// multiplied by b for the recursive call.  Once `partition_divisor >=
+/// n_workers`, every worker has a unique path through the partition
+/// portion of the tree and no further filtering is applied.
 fn dfs(
     solver: &mut radical::Solver,
     state: &mut State,
@@ -1095,6 +1126,7 @@ fn dfs(
     stats: &mut SyncStats,
     deadline: Option<Instant>,
     found: &mut Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+    partition_divisor: usize,
 ) -> bool {
     if found.is_some() { return true; }
     if let Some(d) = deadline {
@@ -1340,6 +1372,25 @@ fn dfs(
     let use_scoped_learning = state.level >= ctx.depth / 3;
     let solver_cp = if use_scoped_learning { Some(solver.save_checkpoint()) } else { None };
 
+    // Sub-tree partitioning: distribute worker_ids across candidates
+    // at each branching level until every worker is uniquely
+    // identified by its cumulative path. `partition_divisor` grows
+    // multiplicatively with b at each filter step; once it exceeds
+    // n_workers, no two workers share a path so filtering stops.
+    //
+    // For n_workers=16 with branchings [2, 8, ...]: divisor grows
+    // 1 → 2 → 16 → done. Each worker takes 1-of-2 then 1-of-8,
+    // defining a unique 4-bit path identifier.
+    let mut child_divisor = partition_divisor;
+    if candidates.len() > 1 && partition_divisor < ctx.n_workers {
+        let b = candidates.len();
+        let chosen = (ctx.worker_id / partition_divisor) % b;
+        let picked = candidates.swap_remove(chosen);
+        candidates.clear();
+        candidates.push(picked);
+        child_divisor = partition_divisor.saturating_mul(b);
+    }
+
     // Snapshot the ENTIRE state.bits vector before trying candidates.
     // harvest_forced during a candidate's SAT call may write bits far
     // beyond the walker's placed position (rule propagation reaches into
@@ -1392,7 +1443,7 @@ fn dfs(
                 // which accounts for pairs already fully determined.
                 if !capacity_violated(state, ctx) && !dynamic_capacity_violated(state, ctx) {
                     memo.insert(sig, ());
-                    if dfs(solver, state, ctx, memo, stats, deadline, found) {
+                    if dfs(solver, state, ctx, memo, stats, deadline, found, child_divisor) {
                         return true;
                     }
                 }
