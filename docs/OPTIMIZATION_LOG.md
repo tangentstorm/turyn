@@ -158,6 +158,136 @@ From git log; not all already captured above. All verified in code.
 All confirmed live except the last row (`add_mdd_constraint` is
 implemented in radical but not called from `src/main.rs`).
 
+## April 2026 — MDD-as-propagator architecture experiments
+
+Goal: test the theoretical pitch that putting the MDD inside the SAT
+solver as a native constraint (instead of driving the outer enumeration
+loop) would give a big TTC win by letting CDCL clause-learning prune
+across boundaries.
+
+### XY_MDD=1 — MDD constraint replaces walk_xy_sub_mdd enumeration
+
+`SolveXyPerCandidate::try_candidate` loops over every (x_bits, y_bits)
+leaf of the XY sub-MDD and calls the solver on each. `XY_MDD=1`
+replaces that with ONE `solve_with_assumptions` per (Z, W) boundary,
+handing the XY sub-MDD to `radical::MddConstraint`.
+
+Implemented (src/main.rs: `try_candidate_via_mdd` + ctx.xy_mdd_mode
+switch). Two bugs fixed along the way:
+
+- `radical/src/lib.rs:3084` panicked with "index out of bounds" the
+  first time the `Reason::Decision` fallback path in conflict analysis
+  ran against a real Turyn workload. Fixed.
+- The post-add_mdd_constraint `[MDD] root=... reachable_nodes=...`
+  diagnostic spammed stderr per (Z, W) pair. Gated behind `MDD_DEBUG=1`.
+
+Propagator optimizations (commit 2f92c5a):
+- Scratch bitset dedup: replaces O(n) `next.contains(&c)` with O(1).
+- Buffer swap instead of `Vec::clone` per level.
+- Incremental `dirty_level` on backtrack: old `stale` flag caused
+  full frontier recompute from root; now only levels at or above the
+  lowest unassigning MDD variable get recomputed.
+- Keep `level_frontier[0] = [root]` across backtracks.
+
+Measured results, four workers, `--wz=apart`, 60s budget:
+
+| n  | k | XY_MDD=0 TTC | XY_MDD=1 TTC | XY_MDD=0 solves | XY_MDD=1 solves |
+|----|---|--------------|--------------|-----------------|-----------------|
+| 18 | 5 | 24 s         | 23 s         | 3,609           | 94 (**-97%**)   |
+| 26 | 5 | 1.5 h        | 1.5 h        | 17,382          | 164 (**-99%**)  |
+| 26 | 6 | 3.9 h        | 4.8 h (+23%) | 74,471          | 178             |
+| 26 | 7 | 12.4 h       | 11.4 h (-8%) | 210,636         | 326 (**-99.8%**)|
+
+**Conclusion**: denominator lever is real (~99% fewer XY solves), but
+total SAT work (solves × decisions/solve) is roughly conserved
+because `solve_with_assumptions` already transfers learnt clauses
+across leaves within the same (Z, W). The MDD-constraint packaging
+gives up some learning granularity to get fewer setup overheads; the
+two roughly cancel at n=26.
+
+The earlier prediction of "10–100× fewer solves → 10–100× TTC win"
+was wrong. The fewer-solves number was right; the TTC translation
+wasn't, because the enumerate-with-assumptions path was already
+extracting most of the learning benefit.
+
+**Still a win** at n=18 (wall-clock 456 → 94 ms before → after
+propagator optimizations, ~4.8×) because at small n the dispatch
+overhead dominates and MDD-as-propagator amortises it.
+
+Both paths remain in the tree; `XY_MDD=0` is the default. The native
+propagator is a useful debug/benchmark tool but not a TTC win at n=26+.
+
+### FULL_MDD=1 — solve_xyzw: all four sequences in one SAT call
+
+The next-step escalation: instead of wiring the MDD only for the XY
+sub-tree while still enumerating (Z, W) externally, make the FULL
+MDD a native constraint and treat Z, W, X, Y all as SAT variables
+in a single solve. No outer boundary walk, no SolveW / SolveZ stages.
+
+Implemented (src/main.rs: `solve_xyzw` + early-return in
+`run_mdd_sat_search` gated by `FULL_MDD=1`). The function accepts a
+`partial_boundary: &[Lit]` cube for cube-and-conquer distribution,
+plus an optional `tuple`:
+
+- `tuple = Some(t)`: pin the four sequence sums via PB equalities
+  (classic "one solve per tuple" behaviour).
+- `tuple = None`: drop the sum PBs entirely. The energy identity
+  `(sum X)² + (sum Y)² + 2(sum Z)² + 2(sum W)² = 6n-2` is *implied*
+  by summing the per-lag Turyn quad PBs, so one solve covers all
+  phase-A tuples and learnt clauses transfer across them.
+
+Full BDKR canonical form from Best, Djokovic, Kharaghani, Ramp (2013)
+encoded as SAT clauses (Canonical2–5 use Tseitin eq/prod aux vars):
+
+| Canonical condition | Clauses added |
+|---|---|
+| 1 (6 endpoints) | 6 unit clauses |
+| 2 (A lex-min under reversal) | O(n) aux vars, O(n²) main clauses |
+| 3 (B lex-min under reversal) | O(n) aux, O(n²) main |
+| 4 (C lex-min under alt-reversal) | O(n) aux, O(n²) main |
+| 5 (D triple-product condition) | O(n) XNOR3 aux, O(n²) main |
+| 6 (A/B tie-break) | 5 clauses |
+
+**Measured progression on n=14 k=4 (per-tuple mode)**:
+
+| Configuration | TTS | Decisions |
+|---|---|---|
+| Canonical1 + 6 only | 3.3 s | 395 K |
+| + Canonical2 | **85 ms** | 11.5 K (**40× speedup**) |
+| + Canonical3 | 380 ms | 51 K |
+| + Canonical4 | 581 ms | 74 K |
+| + Canonical5 | 257 ms | 33 K |
+
+Canonical2 alone is by far the biggest individual win — it kills
+most of the left-right symmetry that would otherwise double the
+search space per bit.
+
+**All-tuples mode (tuple=None, no per-tuple sum PB)**:
+
+| n  | mode | TTS | Decisions |
+|----|------|-----|-----------|
+| 14 | each | 257 ms | 33 K  |
+| 14 | all  | 5.86 s | 600 K |
+| 16 | each | 1.72 s | 158 K |
+| 16 | all  | 1.91 s | 218 K |
+| 18 | either | >60 s (timeout) | — |
+
+All-tuples mode has a larger search space (no sum constraints) and
+pays for that at small n. At larger n it would plausibly dominate
+once clause-learning across tuples pays off, but we can't verify
+that here: at n ≥ 18 both modes hit the real wall — **no spectral
+constraint**. The baseline pipeline prunes hard via
+|Z(ω)|²+|W(ω)|² ≤ 3n-1 at every frequency, which solve_xyzw cannot
+express because radical's `SpectralConstraint` only supports one
+sequence.
+
+**TTC position**: FULL_MDD is a proof-of-architecture for cube-and-
+conquer, BDKR canonical form as SAT clauses, and the Turyn energy
+identity as a quad-PB emergent property. It finds TT(14) and TT(16)
+correctly. It does **not** yet beat the baseline pipeline at n ≥ 18.
+To make it competitive the remaining gap is a multi-sequence spectral
+constraint in `radical`.
+
 ## Current baseline (latest)
 
 - TTC (n=26, `--wz=cross`): ~10 min reported (extrapolated); actual
