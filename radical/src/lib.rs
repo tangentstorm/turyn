@@ -1631,24 +1631,25 @@ impl Solver {
 
     /// Unit-propagate under temporary assumptions — NO decisions made.
     ///
-    /// Returns `Some(true)` if propagation saturated without conflict.
-    /// Caller may read `value(var)` to inspect literals forced by
-    /// propagation (either level 0 facts or consequences of the
-    /// assumptions at level 1). Returns `Some(false)` if propagation
-    /// proves the assumptions UNSAT at current-solver state. Returns
-    /// `None` never (kept for API parity with `solve_with_assumptions`).
+    /// Returns `Some(true)` if propagation saturated without conflict;
+    /// caller may read `value(var)` to inspect literals forced by the
+    /// assumptions. Returns `Some(false)` if propagation hits a conflict.
+    /// Returns `None` never (kept for API parity with
+    /// `solve_with_assumptions`).
     ///
-    /// Unlike `solve_with_assumptions`, this never calls `solve_inner`,
+    /// Unlike `solve_with_assumptions`, this never calls `solve_inner`
     /// so it never makes a CDCL decision. Cost is proportional to new
-    /// propagation work, not to the size of the remaining search space.
+    /// propagation work.
     ///
-    /// Does NOT learn a clause on conflict (deferred to M2). A future
-    /// variant will run 1-UIP analysis so the learnt clause subsumes
-    /// future calls with overlapping prefixes.
+    /// Does NOT learn clauses on conflict. A 1-UIP variant was tried and
+    /// reverted: enqueuing an asserting literal with the learnt clause
+    /// as its reason polluted the solver's internal invariants in a way
+    /// that incorrectly rejected known-SAT prefixes on subsequent calls.
+    /// See commit history. Caller should rely on the walker-side memo for
+    /// dedup of UNSAT sub-trees instead.
     ///
     /// State after the call:
-    /// - `Some(true)` + non-empty assumptions → solver at decision
-    ///   level 1, propagation saturated. The next call backtracks to 0.
+    /// - `Some(true)` + non-empty assumptions → solver at decision level 1.
     /// - `Some(true)` + empty assumptions → solver at decision level 0.
     /// - `Some(false)` → solver at decision level 0.
     pub fn propagate_only(&mut self, assumptions: &[Lit]) -> Option<bool> {
@@ -1687,6 +1688,10 @@ impl Solver {
             match self.lit_value(lit) {
                 LBool::True => {}
                 LBool::False => {
+                    // The assumption itself contradicts a level-0 fact
+                    // (or an earlier assumption in this batch). A clause
+                    // that rules out this assumption already exists in
+                    // the DB; no new learning needed.
                     self.backtrack(0);
                     return Some(false);
                 }
