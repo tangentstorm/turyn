@@ -288,6 +288,43 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
         solver.add_clause([-b1, -bbm]);     // B[1]=+1 → B[n-2]=-1
     }
 
+    // Phase-A sum constraints: each sequence's sum must land in the
+    // set of valid σ values from enumerate_sum_tuples.  PbSetEq is
+    // exact: Σ x_var[i] ∈ V where V = {(σ + len) / 2 : σ is a valid
+    // sum for this sequence}.  Makes the solver aware of the global
+    // σ-budget, fills in where walker-side tuple_reachable can't
+    // reach (deep inside propagate_only when partial sums tighten
+    // after harvest_forced).
+    let tuples = enumerate_sum_tuples(problem);
+    let sum_set = |seq_len: usize, pick: fn(&SumTuple) -> i32| -> Vec<u32> {
+        let mut vs: Vec<u32> = tuples.iter()
+            .filter_map(|t| {
+                let s = pick(t);
+                let count_plus = s + seq_len as i32;
+                if count_plus < 0 || count_plus > 2 * seq_len as i32 || count_plus & 1 != 0 {
+                    None
+                } else {
+                    Some((count_plus / 2) as u32)
+                }
+            })
+            .collect();
+        vs.sort_unstable();
+        vs.dedup();
+        vs
+    };
+    let x_lits: Vec<i32> = (0..n).map(x_var).collect();
+    let y_lits: Vec<i32> = (0..n).map(y_var).collect();
+    let z_lits: Vec<i32> = (0..n).map(z_var).collect();
+    let w_lits: Vec<i32> = (0..m).map(w_var).collect();
+    let x_vals = sum_set(n, |t| t.x);
+    let y_vals = sum_set(n, |t| t.y);
+    let z_vals = sum_set(n, |t| t.z);
+    let w_vals = sum_set(m, |t| t.w);
+    if !x_vals.is_empty() { solver.add_pb_set_eq(&x_lits, &x_vals); }
+    if !y_vals.is_empty() { solver.add_pb_set_eq(&y_lits, &y_vals); }
+    if !z_vals.is_empty() { solver.add_pb_set_eq(&z_lits, &z_vals); }
+    if !w_vals.is_empty() { solver.add_pb_set_eq(&w_lits, &w_vals); }
+
     // BDKR Canonical2..5 via Tseitin eq / prod chains.
     let mut next_aux: i32 = (3 * n + m + 1) as i32;
 
