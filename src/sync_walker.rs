@@ -27,7 +27,8 @@ use std::time::Instant;
 
 use rustc_hash::FxHashMap;
 
-use crate::types::{PackedSeq, Problem};
+use crate::types::{PackedSeq, Problem, SumTuple};
+use crate::enumerate::enumerate_sum_tuples;
 use crate::legacy_search::{SearchReport, SearchStats};
 
 /// Config slice the walker needs. Pulled from `SearchConfig` at dispatch.
@@ -69,6 +70,12 @@ struct Ctx {
     /// Wall-clock start of this worker's search; used to stamp
     /// `time_to_first_leaf`.
     start: Instant,
+    /// All signed (σ_X, σ_Y, σ_Z, σ_W) tuples satisfying the Turyn
+    /// energy identity σ²_X + σ²_Y + 2σ²_Z + 2σ²_W = 6n-2 with parity
+    /// constraints.  Used by the walker's `tuple_reachable` check to
+    /// prune branches where no valid final sum tuple is reachable from
+    /// the current partial sums + remaining free-bit budgets.
+    valid_tuples: Vec<SumTuple>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -224,11 +231,19 @@ fn build_ctx(problem: Problem) -> Ctx {
         }
     }
 
+    // Precompute all signed sum tuples. Phase-A-style:
+    //   σ²_X + σ²_Y + 2σ²_Z + 2σ²_W = 6n - 2, with the parity required
+    // for length-n ±1 sequences (σ ≡ n mod 2).  The walker's
+    // `tuple_reachable` check uses this at every level for early
+    // hopelessness detection.
+    let valid_tuples = enumerate_sum_tuples(problem);
+
     Ctx {
         n, m, depth,
         pos_order, pos_to_level,
         closure_events, max_remaining,
         seed: 0, cancel: None, start: Instant::now(),
+        valid_tuples,
     }
 }
 
@@ -547,6 +562,52 @@ fn check_rules(state: &State, ctx: &Ctx, level: usize) -> Result<u8, ()> {
     Ok(rs)
 }
 
+/// Compute `(σ_X, σ_Y, σ_Z, σ_W, free_X, free_Y, free_Z, free_W)` from
+/// current `state.bits`.  σ = Σ of placed ±1 values per sequence;
+/// free = count of still-unplaced positions per sequence.
+fn compute_sigma(state: &State, ctx: &Ctx) -> (i32, i32, i32, i32, usize, usize, usize, usize) {
+    let mut sigma = [0i32; 4];
+    let mut free = [ctx.n, ctx.n, ctx.n, ctx.m];
+    for kind in 0u8..4 {
+        let xy_len = kind_xy_len(kind, ctx.n, ctx.m);
+        for pos in 0..xy_len {
+            match state.bit(kind, pos) {
+                1 => { sigma[kind as usize] += 1; free[kind as usize] -= 1; }
+                2 => { sigma[kind as usize] -= 1; free[kind as usize] -= 1; }
+                _ => {}
+            }
+        }
+    }
+    (sigma[0], sigma[1], sigma[2], sigma[3], free[0], free[1], free[2], free[3])
+}
+
+/// Can any valid Phase-A tuple be reached from the current partial sums?
+/// Returns `true` if at least one tuple is reachable; `false` means
+/// the prefix is hopeless and can be pruned without any further search.
+///
+/// Reachability per sequence: `|target - σ| ≤ free` (budget) and
+/// `(target - σ) ≡ free (mod 2)` (each remaining ±1 flips σ by 2).
+fn tuple_reachable(state: &State, ctx: &Ctx) -> bool {
+    let (sx, sy, sz, sw, fx, fy, fz, fw) = compute_sigma(state, ctx);
+    let dx_max = fx as i32; let px = fx & 1;
+    let dy_max = fy as i32; let py = fy & 1;
+    let dz_max = fz as i32; let pz = fz & 1;
+    let dw_max = fw as i32; let pw = fw & 1;
+    for t in &ctx.valid_tuples {
+        let dx = (t.x - sx).abs();
+        let dy = (t.y - sy).abs();
+        let dz = (t.z - sz).abs();
+        let dw = (t.w - sw).abs();
+        if dx > dx_max || dy > dy_max || dz > dz_max || dw > dw_max { continue; }
+        if (dx as usize & 1) != px { continue; }
+        if (dy as usize & 1) != py { continue; }
+        if (dz as usize & 1) != pz { continue; }
+        if (dw as usize & 1) != pw { continue; }
+        return true;
+    }
+    false
+}
+
 /// Return true if any lag's running sum blows past its remaining capacity.
 /// At level `state.level`, max_remaining applies to pairs not yet closed.
 fn capacity_violated(state: &State, ctx: &Ctx) -> bool {
@@ -617,6 +678,7 @@ pub(crate) struct SyncStats {
     pub memo_hits: u64,
     pub capacity_rejects: u64,
     pub rule_rejects: u64,
+    pub tuple_rejects: u64,
     pub sat_unsat: u64,
     pub leaves_reached: u64,
     pub learned_clauses_final: u64,
@@ -671,7 +733,7 @@ fn search_sync_parallel(
         Arc::new(Mutex::new(None));
     let stats_agg: Arc<Mutex<SyncStats>> = Arc::new(Mutex::new(SyncStats {
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-        rule_rejects: 0, sat_unsat: 0, leaves_reached: 0,
+        rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
         learned_clauses_final: 0, max_level_reached: 0,
         nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
         time_to_first_leaf: None,
@@ -699,6 +761,7 @@ fn search_sync_parallel(
                 agg.memo_hits += stats.memo_hits;
                 agg.capacity_rejects += stats.capacity_rejects;
                 agg.rule_rejects += stats.rule_rejects;
+                agg.tuple_rejects += stats.tuple_rejects;
                 agg.sat_unsat += stats.sat_unsat;
                 agg.leaves_reached += stats.leaves_reached;
                 agg.max_level_reached = agg.max_level_reached.max(stats.max_level_reached);
@@ -735,8 +798,8 @@ fn search_sync_parallel(
     let found = result.lock().unwrap().clone();
     if verbose {
         eprintln!(
-            "sync_walker(parallel x{}): nodes={} cap_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?} time_to_first_leaf={} avg_nogood={:.1}/{:.1} ({:.2}x shrink)",
-            n_workers, stats.nodes_visited, stats.capacity_rejects, stats.rule_rejects, stats.sat_unsat, stats.leaves_reached, stats.max_level_reached, elapsed,
+            "sync_walker(parallel x{}): nodes={} cap_rejects={} tuple_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?} time_to_first_leaf={} avg_nogood={:.1}/{:.1} ({:.2}x shrink)",
+            n_workers, stats.nodes_visited, stats.capacity_rejects, stats.tuple_rejects, stats.rule_rejects, stats.sat_unsat, stats.leaves_reached, stats.max_level_reached, elapsed,
             stats.time_to_first_leaf.map(|t| format!("{:.3}s", t)).unwrap_or_else(|| "(never)".into()),
             if stats.sat_unsat > 0 { stats.nogood_len_sum as f64 / stats.sat_unsat as f64 } else { 0.0 },
             if stats.sat_unsat > 0 { stats.full_nogood_len_sum as f64 / stats.sat_unsat as f64 } else { 0.0 },
@@ -833,7 +896,7 @@ fn search_sync_serial(
         eprintln!("sync_walker: base solver UNSAT — canonical constraints inconsistent");
         return (None, SyncStats {
             nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-            rule_rejects: 0, sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
+            rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
             nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
             time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
@@ -846,7 +909,7 @@ fn search_sync_serial(
     let mut memo: FxHashMap<u64, ()> = FxHashMap::default();
     let mut stats = SyncStats {
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-        rule_rejects: 0, sat_unsat: 0, leaves_reached: 0,
+        rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
         learned_clauses_final: 0, max_level_reached: 0,
         nodes_by_level: vec![0; ctx.depth + 1],
         children_total: 0, internal_nodes: 0,
@@ -973,16 +1036,21 @@ fn dfs(
         state.level += 1;
         rebuild_sums(state, ctx);
         let violated = capacity_violated(state, ctx);
+        // Early hopelessness: no valid Phase-A tuple is reachable from
+        // the partial sums + remaining free-bit budget. Independent of
+        // the per-lag capacity check — it constrains σ_final ranges
+        // rather than N(s).
+        let sigma_unreachable = !violated && !tuple_reachable(state, ctx);
         // Walker-side BDKR rule check: prune rule-violating placements
         // before calling the SAT solver. Saves a propagate_only per
         // rejected candidate and keeps CDCL from learning clauses about
         // non-canonical-but-otherwise-feasible branches.
-        let rule_check = if !violated {
+        let rule_check = if !violated && !sigma_unreachable {
             check_rules(state, ctx, state.level - 1)
         } else {
             Err(())
         };
-        let score = if !violated && rule_check.is_ok() {
+        let score = if !violated && !sigma_unreachable && rule_check.is_ok() {
             score_state(state, ctx)
         } else {
             i64::MAX
@@ -998,6 +1066,10 @@ fn dfs(
 
         if violated {
             stats.capacity_rejects += 1;
+            continue;
+        }
+        if sigma_unreachable {
+            stats.tuple_rejects += 1;
             continue;
         }
         let new_rule_state = match rule_check {
