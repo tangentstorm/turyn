@@ -10,6 +10,7 @@ mod legacy_search;
 mod mdd_pipeline;
 mod spectrum;
 mod stochastic;
+mod sync_walker;
 mod types;
 mod xy_sat;
 
@@ -67,6 +68,10 @@ fn print_help() {
     eprintln!("                           form enforced as SAT clauses. See solve_xyzw.");
     eprintln!("  --wz-xyzw-tuples=<all|each>  (with --wz=xyzw) 'all' = one solve (default);");
     eprintln!("                           'each' = legacy per-tuple loop.");
+    eprintln!("  --wz=sync                Synchronized 4-seq heuristic walker. Bouncing-order MDD");
+    eprintln!("                           built on the fly (no mdd-k.bin needed). Scores 16-way");
+    eprintln!("                           levels by running autocorrelation pressure. Persistent");
+    eprintln!("                           SAT solver enforces full BDKR (i)–(vi). See sync_walker.");
     eprintln!("  --stochastic             Stochastic local search over all four sequences");
     eprintln!("  --stochastic-secs=<S>    Stochastic search, stop after S seconds (default: 10)");
     eprintln!();
@@ -216,8 +221,9 @@ fn parse_args() -> SearchConfig {
                 "together" => WzMode::Together,
                 "apart" => WzMode::Apart,
                 "xyzw" => WzMode::Xyzw,
+                "sync" => WzMode::Sync,
                 _ => {
-                    eprintln!("error: --wz must be one of cross|together|apart|xyzw (got '{}')\n", v);
+                    eprintln!("error: --wz must be one of cross|together|apart|xyzw|sync (got '{}')\n", v);
                     print_help();
                     std::process::exit(1);
                 }
@@ -620,6 +626,7 @@ fn main() {
             WzMode::Together => "together",
             WzMode::Apart => "apart",
             WzMode::Xyzw => "xyzw",
+            WzMode::Sync => "sync",
         };
         println!("Unified search (--wz={}): found_solution={}, elapsed={:.3?}\n  {}",
             label, report.found_solution, report.elapsed, run_info());

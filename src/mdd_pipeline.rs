@@ -341,6 +341,36 @@ pub(crate) fn run_mdd_sat_search(
     let n = problem.n;
     let m = problem.m();
 
+    // --wz=sync: no pre-built MDD, no tuple enumeration. Walker runs the
+    // full bouncing boundary DFS against a persistent SAT solver.
+    if cfg.effective_wz_mode() == WzMode::Sync {
+        let sync_cfg = crate::sync_walker::SyncConfig {
+            sat_secs: cfg.sat_secs,
+            sat_config: cfg.sat_config.clone(),
+            conflict_limit: cfg.conflict_limit,
+        };
+        let _ = tuples;  // unused by sync
+        let (found, stats, elapsed) = crate::sync_walker::search_sync(problem, &sync_cfg, verbose);
+        if verbose {
+            eprintln!(
+                "\n--wz=sync: nodes={} memo_hits={} cap_rejects={} sat_unsat={} elapsed={:?}",
+                stats.nodes_visited, stats.memo_hits,
+                stats.capacity_rejects, stats.sat_unsat, elapsed,
+            );
+        }
+        if let Some((x, y, z, w)) = found.as_ref() {
+            if verbose {
+                println!("\nFOUND! x={} y={} z={} w={}",
+                    colored_pm(x), colored_pm(y), colored_pm(z), colored_pm(w));
+            }
+        }
+        return SearchReport {
+            stats: SearchStats::default(),
+            elapsed,
+            found_solution: found.is_some(),
+        };
+    }
+
     let try_k = k.min((n - 1) / 2);
     let mdd = match load_best_mdd(try_k, verbose) {
         Some(m) => {
