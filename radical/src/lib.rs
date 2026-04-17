@@ -125,13 +125,21 @@ pub struct MddConstraint {
     pub var_to_level: Vec<usize>,
     /// Whether this var is the X (true) or Y (false) variable at its level
     pub var_is_x: Vec<bool>,
-    /// Stale flag: set on backtrack, triggers recompute before next propagation
-    pub stale: bool,
     /// Cached frontier per level (level_frontier[l] = reachable nodes entering level l)
-    /// level_frontier[0] = [root], updated incrementally
+    /// level_frontier[0] = [root], updated incrementally.
     pub level_frontier: Vec<Vec<u32>>,
-    /// Lowest dirty level (levels below this are clean)
+    /// Lowest dirty level (levels below this are clean). On backtrack we only
+    /// raise dirty_level to the level of the lowest unassigning MDD variable,
+    /// so levels above it retain their valid frontiers.
     pub dirty_level: usize,
+    /// Scratch dedup bitset: 1 slot per node. Replaces the old O(n) `contains`
+    /// scan when building the next-level frontier. Reset between levels by
+    /// iterating `scratch_seen_list` (O(frontier_size), not O(nodes)).
+    scratch_seen: Vec<bool>,
+    scratch_seen_list: Vec<u32>,
+    /// Scratch buffer for the next-level frontier being built. Swapped into
+    /// level_frontier[level+1] once populated, avoiding a per-level clone.
+    scratch_next: Vec<u32>,
 }
 
 /// A quadratic pseudo-boolean constraint with exact target:
@@ -1318,6 +1326,7 @@ impl Solver {
             var_is_x[v] = false;
         }
 
+        let num_nodes = nodes.len();
         self.mdd = Some(MddConstraint {
             nodes: nodes.to_vec(),
             root, depth,
@@ -1325,57 +1334,65 @@ impl Solver {
             level_y_var: ly,
             var_to_level,
             var_is_x,
-            stale: true,
             level_frontier: {
-                let mut f = vec![Vec::new(); depth + 1];
-                f[0] = vec![root];
+                let mut f: Vec<Vec<u32>> = (0..=depth).map(|_| Vec::with_capacity(64)).collect();
+                f[0].push(root);
                 f
             },
+            // Start dirty from level 0 so the first propagate_mdd populates
+            // level_frontier[1..=depth] from root.
             dirty_level: 0,
+            scratch_seen: vec![false; num_nodes],
+            scratch_seen_list: Vec::with_capacity(64),
+            scratch_next: Vec::with_capacity(64),
         });
-        // Count reachable nodes for diagnostic
-        let mdd = self.mdd.as_ref().unwrap();
-        let mut count = 0;
-        let mut stack = vec![mdd.root];
-        let mut seen = std::collections::HashSet::new();
-        while let Some(nid) = stack.pop() {
-            if nid == 0 || nid == u32::MAX { continue; }
-            if !seen.insert(nid) { continue; }
-            count += 1;
-            for &c in &mdd.nodes[nid as usize] { stack.push(c); }
+        // Diagnostic (enable with MDD_DEBUG=1)
+        if std::env::var("MDD_DEBUG").ok().as_deref() == Some("1") {
+            let mdd = self.mdd.as_ref().unwrap();
+            let mut count = 0;
+            let mut stack = vec![mdd.root];
+            let mut seen = std::collections::HashSet::new();
+            while let Some(nid) = stack.pop() {
+                if nid == 0 || nid == u32::MAX { continue; }
+                if !seen.insert(nid) { continue; }
+                count += 1;
+                for &c in &mdd.nodes[nid as usize] { stack.push(c); }
+            }
+            eprintln!("[MDD] root={} depth={} reachable_nodes={} x_vars={:?} y_vars={:?}",
+                mdd.root, mdd.depth, count, &mdd.level_x_var[..mdd.depth.min(4)], &mdd.level_y_var[..mdd.depth.min(4)]);
         }
-        eprintln!("[MDD] root={} depth={} reachable_nodes={} x_vars={:?} y_vars={:?}",
-            root, depth, count, &mdd.level_x_var[..depth.min(4)], &mdd.level_y_var[..depth.min(4)]);
     }
 
     /// Propagate MDD constraint. Returns conflict reason if dead-end, None otherwise.
-    /// Uses top-down frontier BFS: walk MDD levels, filtering nodes by assigned vars.
-    /// When only one branch is viable at a level, force the implied variable.
+    /// Uses top-down frontier BFS: walk MDD levels from `dirty_level` forward,
+    /// filtering nodes by assigned vars. When only one branch is viable at a
+    /// level, force the implied variable.
+    ///
+    /// Perf-critical: called on every assignment of an MDD variable. Uses
+    /// `scratch_seen` bitset for O(1) next-frontier dedup (vs. O(n) contains),
+    /// swap-based buffer reuse to avoid per-level Vec::clone, and incremental
+    /// `dirty_level` maintenance on backtrack so we don't rewalk levels whose
+    /// frontiers are still valid.
     fn propagate_mdd(&mut self) -> Option<Reason> {
         const MDD_DEAD: u32 = 0;
         const MDD_LEAF: u32 = u32::MAX;
 
-        let mdd = match self.mdd.as_ref() { Some(m) => m, None => return None };
-        if mdd.root == MDD_DEAD { return Some(Reason::Mdd); }
+        let mdd_ref = match self.mdd.as_ref() { Some(m) => m, None => return None };
+        if mdd_ref.root == MDD_DEAD { return Some(Reason::Mdd); }
 
-        // If stale (backtrack occurred), find the lowest level with changed assignments
-        if mdd.stale {
-            let mdd = self.mdd.as_mut().unwrap();
-            mdd.stale = false;
-            mdd.dirty_level = 0; // conservative: full recompute on backtrack
-            mdd.level_frontier[0] = vec![mdd.root];
-        }
-
-        let mut forced: Vec<Lit> = Vec::new();
-        let mut conflict = false;
-
-        // Read MDD fields via raw pointer to avoid borrow issues
-        let mdd = self.mdd.as_ref().unwrap();
+        // Read MDD fields via raw pointer to avoid borrow issues with self.assigns.
+        let mdd_ptr = self.mdd.as_mut().unwrap() as *mut MddConstraint;
+        let mdd: &mut MddConstraint = unsafe { &mut *mdd_ptr };
         let start = mdd.dirty_level;
         let depth = mdd.depth;
         let nodes = &mdd.nodes as *const Vec<[u32; 4]>;
         let level_x = &mdd.level_x_var as *const Vec<usize>;
         let level_y = &mdd.level_y_var as *const Vec<usize>;
+
+        let mut forced: [Lit; 4] = [0; 4];
+        let mut num_forced: usize = 0;
+        let mut conflict = false;
+        let mut last_computed_level: Option<usize> = None;
 
         for level in start..depth {
             let xv = unsafe { &*level_x }[level];
@@ -1383,63 +1400,98 @@ impl Solver {
             let x_asgn = self.assigns[xv];
             let y_asgn = self.assigns[yv];
 
-            // Read current frontier for this level
-            let frontier: Vec<u32> = self.mdd.as_ref().unwrap().level_frontier[level].clone();
-            let mut next: Vec<u32> = Vec::new();
             let nodes_ref = unsafe { &*nodes };
+
+            // Take scratch_next out for push access without borrow conflicts.
+            let mut next = std::mem::take(&mut mdd.scratch_next);
+            next.clear();
+            // scratch_seen_list contains previously-set indices; clear them.
+            for &idx in &mdd.scratch_seen_list { mdd.scratch_seen[idx as usize] = false; }
+            mdd.scratch_seen_list.clear();
+
+            // Dedup helper implemented inline (closures fight the borrow checker
+            // here because `next` is a local but seen/seen_list live on mdd).
+            // `mark_and_push(c)` pushes c iff not already seen at this level.
+            macro_rules! push_dedup {
+                ($c:expr) => {{
+                    let c = $c;
+                    if c == MDD_LEAF {
+                        // LEAF sentinel collapses to "at most one per frontier"
+                        // via a separate check — use a reserved high index in
+                        // scratch_seen's last slot if needed. Simple path:
+                        // scan only the small tail in rare LEAF runs.
+                        if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); }
+                    } else {
+                        let ci = c as usize;
+                        if !mdd.scratch_seen[ci] {
+                            mdd.scratch_seen[ci] = true;
+                            mdd.scratch_seen_list.push(c);
+                            next.push(c);
+                        }
+                    }
+                }};
+            }
+
+            let frontier: &Vec<u32> = &mdd.level_frontier[level];
 
             if x_asgn != LBool::Undef && y_asgn != LBool::Undef {
                 let branch = (x_asgn == LBool::True) as usize | (((y_asgn == LBool::True) as usize) << 1);
-                for &nid in &frontier {
-                    if nid == MDD_LEAF { next.push(MDD_LEAF); }
+                for &nid in frontier {
+                    if nid == MDD_LEAF { push_dedup!(MDD_LEAF); }
                     else {
                         let c = nodes_ref[nid as usize][branch];
-                        if c != MDD_DEAD && !next.contains(&c) { next.push(c); }
+                        if c != MDD_DEAD { push_dedup!(c); }
                     }
                 }
             } else if x_asgn != LBool::Undef {
                 let b0 = (x_asgn == LBool::True) as usize;
                 let b1 = b0 | 2;
                 let (mut y0_ok, mut y1_ok) = (false, false);
-                for &nid in &frontier {
-                    if nid == MDD_LEAF { y0_ok = true; y1_ok = true; if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); } }
+                for &nid in frontier {
+                    if nid == MDD_LEAF { y0_ok = true; y1_ok = true; push_dedup!(MDD_LEAF); }
                     else {
                         let (c0, c1) = (nodes_ref[nid as usize][b0], nodes_ref[nid as usize][b1]);
-                        if c0 != MDD_DEAD { y0_ok = true; if !next.contains(&c0) { next.push(c0); } }
-                        if c1 != MDD_DEAD { y1_ok = true; if !next.contains(&c1) { next.push(c1); } }
+                        if c0 != MDD_DEAD { y0_ok = true; push_dedup!(c0); }
+                        if c1 != MDD_DEAD { y1_ok = true; push_dedup!(c1); }
                     }
                 }
                 if !y0_ok && !y1_ok { conflict = true; }
-                else if !y0_ok && self.assigns[yv] == LBool::Undef { forced.push((yv + 1) as Lit); }
-                else if !y1_ok && self.assigns[yv] == LBool::Undef { forced.push(-((yv + 1) as Lit)); }
+                else if !y0_ok && self.assigns[yv] == LBool::Undef {
+                    forced[num_forced] = (yv + 1) as Lit; num_forced += 1;
+                } else if !y1_ok && self.assigns[yv] == LBool::Undef {
+                    forced[num_forced] = -((yv + 1) as Lit); num_forced += 1;
+                }
             } else if y_asgn != LBool::Undef {
                 let b0 = ((y_asgn == LBool::True) as usize) << 1;
                 let b1 = b0 | 1;
                 let (mut x0_ok, mut x1_ok) = (false, false);
-                for &nid in &frontier {
-                    if nid == MDD_LEAF { x0_ok = true; x1_ok = true; if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); } }
+                for &nid in frontier {
+                    if nid == MDD_LEAF { x0_ok = true; x1_ok = true; push_dedup!(MDD_LEAF); }
                     else {
                         let (c0, c1) = (nodes_ref[nid as usize][b0], nodes_ref[nid as usize][b1]);
-                        if c0 != MDD_DEAD { x0_ok = true; if !next.contains(&c0) { next.push(c0); } }
-                        if c1 != MDD_DEAD { x1_ok = true; if !next.contains(&c1) { next.push(c1); } }
+                        if c0 != MDD_DEAD { x0_ok = true; push_dedup!(c0); }
+                        if c1 != MDD_DEAD { x1_ok = true; push_dedup!(c1); }
                     }
                 }
                 if !x0_ok && !x1_ok { conflict = true; }
-                else if !x0_ok && self.assigns[xv] == LBool::Undef { forced.push((xv + 1) as Lit); }
-                else if !x1_ok && self.assigns[xv] == LBool::Undef { forced.push(-((xv + 1) as Lit)); }
+                else if !x0_ok && self.assigns[xv] == LBool::Undef {
+                    forced[num_forced] = (xv + 1) as Lit; num_forced += 1;
+                } else if !x1_ok && self.assigns[xv] == LBool::Undef {
+                    forced[num_forced] = -((xv + 1) as Lit); num_forced += 1;
+                }
             } else {
                 let (mut x0_ok, mut x1_ok, mut y0_ok, mut y1_ok) = (false, false, false, false);
-                for &nid in &frontier {
+                for &nid in frontier {
                     if nid == MDD_LEAF {
                         x0_ok = true; x1_ok = true; y0_ok = true; y1_ok = true;
-                        if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); }
+                        push_dedup!(MDD_LEAF);
                     } else {
                         for b in 0..4usize {
                             let c = nodes_ref[nid as usize][b];
                             if c != MDD_DEAD {
                                 if b & 1 == 0 { x0_ok = true; } else { x1_ok = true; }
                                 if b & 2 == 0 { y0_ok = true; } else { y1_ok = true; }
-                                if !next.contains(&c) { next.push(c); }
+                                push_dedup!(c);
                             }
                         }
                     }
@@ -1447,27 +1499,39 @@ impl Solver {
                 if !x0_ok && !x1_ok { conflict = true; }
                 else if !y0_ok && !y1_ok { conflict = true; }
                 else {
-                    if !x0_ok && self.assigns[xv] == LBool::Undef { forced.push((xv + 1) as Lit); }
-                    if !x1_ok && self.assigns[xv] == LBool::Undef { forced.push(-((xv + 1) as Lit)); }
-                    if !y0_ok && self.assigns[yv] == LBool::Undef { forced.push((yv + 1) as Lit); }
-                    if !y1_ok && self.assigns[yv] == LBool::Undef { forced.push(-((yv + 1) as Lit)); }
+                    if !x0_ok && self.assigns[xv] == LBool::Undef {
+                        forced[num_forced] = (xv + 1) as Lit; num_forced += 1;
+                    }
+                    if !x1_ok && self.assigns[xv] == LBool::Undef {
+                        forced[num_forced] = -((xv + 1) as Lit); num_forced += 1;
+                    }
+                    if !y0_ok && self.assigns[yv] == LBool::Undef {
+                        forced[num_forced] = (yv + 1) as Lit; num_forced += 1;
+                    }
+                    if !y1_ok && self.assigns[yv] == LBool::Undef {
+                        forced[num_forced] = -((yv + 1) as Lit); num_forced += 1;
+                    }
                 }
             }
 
-            // Store frontier for next level
+            // Swap the populated next-buffer into level_frontier[level+1] and
+            // take the old vec out as the scratch for the next iteration.
             if !conflict && level + 1 <= depth {
-                let mdd = self.mdd.as_mut().unwrap();
-                mdd.level_frontier[level + 1] = next;
-                mdd.dirty_level = level + 1;
+                std::mem::swap(&mut mdd.level_frontier[level + 1], &mut next);
+                last_computed_level = Some(level + 1);
             }
+            // Return the (now-old) vec to scratch_next for reuse.
+            mdd.scratch_next = next;
 
             if conflict { break; }
-            if !forced.is_empty() { break; } // let forced vars trigger re-propagation
+            if num_forced > 0 { break; } // let forced vars trigger re-propagation
         }
+        if let Some(l) = last_computed_level { mdd.dirty_level = l; }
 
         if conflict { return Some(Reason::Mdd); }
 
-        for flit in forced {
+        for i in 0..num_forced {
+            let flit = forced[i];
             if self.lit_value(flit) == LBool::False { return Some(Reason::Mdd); }
             if self.lit_value(flit) == LBool::Undef {
                 self.enqueue(flit, Reason::Mdd);
@@ -3318,7 +3382,14 @@ impl Solver {
                 }
                 Reason::Decision => {
                     // Reached a decision variable — MDD explanation over-approximate.
-                    learnt[0] = negate(p);
+                    // Unit learnt clause: just negate(p). Handles the empty-learnt
+                    // case that showed up the first time this path was actually
+                    // exercised against the XY MDD (commit TODO).
+                    if learnt.is_empty() {
+                        learnt.push(negate(p));
+                    } else {
+                        learnt[0] = negate(p);
+                    }
                     return (learnt, bt_level);
                 }
             }
@@ -3515,10 +3586,13 @@ impl Solver {
                     spec.unassign(v);
                 }
             }
-            // Mark MDD constraint as stale if this is a boundary variable
+            // Raise MDD dirty_level to this variable's level: the frontier at
+            // that level and above becomes stale (the assignment that produced
+            // it is being undone), but frontiers below it are still valid.
             if let Some(ref mut mdd) = self.mdd {
                 if v < mdd.var_to_level.len() && mdd.var_to_level[v] != usize::MAX {
-                    mdd.stale = true;
+                    let l = mdd.var_to_level[v];
+                    if l < mdd.dirty_level { mdd.dirty_level = l; }
                 }
             }
             // Mark quad PB constraints involving this variable as stale.
