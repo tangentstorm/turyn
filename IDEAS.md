@@ -1590,3 +1590,202 @@ throughput went from 6 bnd/s (main/eloquent tied) to 1800 bnd/s (300×).
   when they're empty. Move into a one-shot vec of (var, lit) prebuilt
   at MddCtx creation.
   Single commit: precompute outfix_pins as Vec<i32>.
+
+## April 2026 — Claude session: Z post-hoc pair check optimisation (credit: Claude)
+
+**Baseline (2026-04-17, n=26 wz=apart k=7 30s)**: 520 eff bnd/s, TTC
+46.5m. Pipeline funnel: 26K boundaries → 6M Z SAT solutions → 99.997%
+fail post-hoc spectral pair check at theta=128 (129 freqs) → 184 reach
+XY → 18011 XY SAT solves (100% UNSAT). Per-stage: Z 0 dec/solve (fully
+decided at level 0 by SAT spectral 563 freqs); FFT + pair check is the
+hot path for the 6M Z solutions.
+
+### S1. Pre-DFT at W's tightest frequencies before Z FFT — *single commit*
+
+99.997% of Z post-hoc rejections happen at frequency `arg max_ω
+|W(ω)|² + |Z(ω)|²` where the joint power exceeds `pair_bound`. The
+rustfft post-hoc computes Z power at all 129 freqs, then
+`spectral_pair_ok` scans them; the FFT itself is non-cancellable.
+Replace this with: compute Z(ω) directly via DFT at the K (~3) freqs
+where W has highest power; if the pair sum exceeds bound at any of
+them, reject without running the full FFT. Direct DFT at K freqs is
+~K·n muladds (78 for n=26 K=3) vs ~M log M (~896 for M=128) for FFT.
+- **TTC mechanism**: rate (cuts FFT cost on 99.997% of Z solutions)
+  and shortfall-neutral (no change to which Z's pass).
+- **Detection plan**: `flow_z_pair_fail` rate same; eff bnd/s up.
+  Add a counter for "rejected by partial DFT" vs "rejected by full
+  FFT" (= 0 when partial DFT is monotone with full FFT).
+- **Where to wire**: `src/mdd_pipeline.rs:1977` (the
+  `compute_spectrum_into` call after Z SAT returns), and
+  `src/spectrum.rs` (add a `spectral_pair_partial_check` function).
+
+### S2. Precompute Z boundary DFT contribution per z_bits — *single commit*
+
+The Z boundary occupies positions `[0..k] ∪ [n-k..n]` and is shared
+across all middles for a given `z_bits`. Currently `fill_real_input`
+copies the boundary into the FFT input on every Z solution. Cache the
+boundary contribution to the DFT at the K constraining freqs (or all
+129) per (z_bits) and per worker, lookup instead of recomputing the
+boundary part. Saves `2k * num_freqs` muladds per Z FFT. For n=26
+k=7: saves 14 * 129 = 1806 muladds, ~10% of the post-FFT work.
+- **TTC mechanism**: rate.
+- **Detection plan**: eff bnd/s up; new counter
+  `z_bnd_dft_cache_hit` (will dominate, 232 hits/boundary average).
+- Combine with S1 for largest effect (partial DFT becomes:
+  bnd_contrib + middle_DFT, only the middle part computed per Z).
+
+### S3. Drop Z post-hoc when SPECTRAL_FREQS is dense enough — *single commit*
+
+If we increase the SAT's `SPECTRAL_FREQS` (currently 563) to include
+the FFT's 129 frequencies (or just go denser), the SAT spectral
+constraint already proves `|Z(ω)|² + |W(ω)|² ≤ pair_bound` at those
+freqs. Then any SAT-passing Z is guaranteed to pass post-hoc, and the
+post-hoc check (FFT + pair_ok) can be skipped entirely.
+- **TTC mechanism**: rate (skip 6M FFTs at n=26) but possibly
+  offset by denominator (denser SAT grid = more vars forced or
+  fewer Z's pass = fewer Z solutions reach post-hoc anyway).
+- **Detection plan**: `flow_z_solutions` and `flow_z_pair_fail` both
+  drop, eff bnd/s should rise. Risk: the SAT spectral check uses
+  f32 cos/sin tables and integer arithmetic — slight numerical drift
+  vs FFT's f64 may permit edge-case false-pass at boundary
+  frequencies. Verify no regression in the n=18 known-solution test.
+
+### S4. Move Z post-hoc check to use SAT's exact frequency grid — *single commit*
+
+Alternative to S3: instead of FFT post-hoc, do a direct DFT at the
+SAT's 563 frequencies. Eliminates the SAT/post-hoc grid mismatch.
+`SpectralTables` already has `pos_cos`/`pos_sin` cached at those
+freqs (radical/src/lib.rs:343). Use those to compute `|Z(ω)|²` at
+the SAT grid — guaranteed redundant with SAT spectral, so post-hoc
+becomes a no-op. **Same idea as S3 in different implementation.**
+
+### S1. Pre-DFT at W-tightest bin before Z FFT — *tested, rejected (null)*
+
+Hypothesis: 99.996% of Z solutions fail the post-hoc spectral-pair
+check; an O(n) DFT at W's single tightest frequency bin (where W's
+budget is smallest, so most likely to fail) would reject most Z's
+without ever computing the full O(M log M) rfft.
+
+Implementation: added `dft_magnitude_sq_at_bin` + `argmax_spectrum`
+to spectrum.rs; plumbed `w_tight_bin` through `SolveZWork`; in the Z
+post-hoc block (mdd_pipeline.rs:1980-2036), compute
+`|Z(ω_tight)|² + w_spectrum[tight]` first, `continue` on reject;
+only fall back to the full FFT + all-bins pair check on pass.
+
+**Detection counters**: added `flow_z_pair_fail_tight`, reported
+alongside `z_pair_fail` in the pipeline-flow block as
+`[tight-bin caught N = X%]`.
+
+**Measurement** (n=26 --wz=apart --mdd-k=7 --sat-secs=30):
+- Tight-bin rejection rate: 74-75% of all Z pair fails (good!).
+- TTC: head-to-head on a warm machine, S5+S1 ran 31.3-35.3m, S5 alone
+  ran 30.4-31.9m — S1 is neutral-to-slightly-worse.
+
+**Root cause of the null**: Z SAT runs at 0.0 decisions/solve at
+n=26 — every Z is forced at level 0.  Per-item Z SolveZ cost
+(5.4M items in 30s ≈ 8.9 µs/item/worker across 16 workers) is
+dominated by SAT *setup* (spectral-table attach, `fill_z_solver`,
+checkpoint/restore, blocking-clause handling) — NOT the FFT.
+Skipping FFTs on 74% of Z's saves real work but doesn't move the
+stage's critical path.
+
+**Lever targeting lesson**: "rate" improvements need to hit the
+dominant cost, not the most intuitive one.  max_z is already
+capped at 16 and only 1.2 Z solutions are returned per item on
+average, so S7 (increasing max_z) won't help either — most items
+run out of Z candidates before hitting the cap.  The next
+productive levers for the Z stage are direct setup-cost reductions:
+reusing `SpectralConstraint`'s `re/im/re_boundary/im_boundary`
+Vec<f64> allocations across items, or batching items by `z_bits`
+so `z_prep` + boundary-DFT are amortized over many `w_vals`.
+Reverted; kept in the idea pool below as a building block for a
+future "full pair-check via single-bin DFT + on-demand extra bins"
+design that skips the full FFT entirely.
+
+**Additional diagnostic findings**:
+- `SKIP_Z_SPECTRAL=1` env (bypass `SpectralConstraint` build/attach
+  in SolveZ): TTC 30.0/31.2/32.5m vs S5 baseline 30.4/30.5/30.5/31.0/
+  31.9m — indistinguishable.  Spectral-constraint setup is NOT the
+  dominant cost either.
+- Thread scaling (n=26 wz=apart mdd-k=7 20s): 63/261/491/811 eff
+  bnd/s at 1/4/8/16 threads → ~80% scaling efficiency at 16 threads
+  (13× speedup on 16 cores).  Some contention but not catastrophic.
+- TTC variance on this 16-core shared machine is ±5m across 30-s
+  samples (baseline 30-35m, noise dominates micro-optimizations
+  below ~10% absolute change).
+
+### S5. Reduce SPECTRAL_FREQS for wz=apart — *accepted, TTC −20%*
+
+F1 (wz=together) reduced SPECTRAL_FREQS from 563 to 17 for a 6.2×
+speedup. Never measured for `wz=apart`. The trade-off: smaller grid
+= cheaper SAT spectral propagation = more rejections leak to
+post-hoc = more FFT work. With Z SAT at 0 dec/solve already (fully
+forced at level 0), the SAT cost may be dominated by spectral table
+allocation rather than per-decision propagation; smaller grid could
+still help. **Detection**: sweep SPECTRAL_FREQS ∈ {17, 64, 128, 256,
+563, 1024} on n=26 wz=apart 30s and pick the TTC peak.
+
+**Result**: swept 17..1024 then fine-swept 40..128 at n=26 wz=apart
+mdd-k=7 30s. Peak at 64 with TTC 37.0m median (5 runs) vs 46.4m
+baseline = **−20.3% TTC**. Values 40/100 land in a broad ~38–41m
+plateau (all within 4m of the peak); 64 selected for best-validated
+central value. Lever: rate (eff bnd/s 520 → ~650–740). Correctness
+preserved: n=18 TT finds in <1s; n=20 finds with same variance as
+the 563 baseline. See OPTIMIZATION_LOG.md §S5 for the full table.
+
+### S6. Sort pair_ok freq order by W's power (descending) — *single commit*
+
+`spectral_pair_ok` walks freqs 0..129 in order. Most pair fails
+happen at freqs where W has high power. Sort the freq indices once
+per W (after W FFT), then iterate Z+W in that order — early-exit
+triggers on the first iteration in 99% of cases instead of on
+average half-way through.
+- **TTC mechanism**: rate (smaller, but composable with S1).
+- **Detection plan**: micro-bench: count avg `i` at which
+  `spectral_pair_ok` returns false.
+
+### S7. Increase max_z above 1 to amortise per-boundary fixed cost — *single commit*
+
+Currently `max_z = 1` (forced cap, `src/mdd_pipeline.rs:` analogous
+to old `src/main.rs:2545`). At n=26 the Z SAT call is essentially
+free (0 dec/solve), but the SolveZ stage's *fixed* setup cost
+(z_prep rebuild, spectral table attach, fill_z_solver_quad_pb) runs
+per item regardless. With max_z>1 we'd amortise that setup over
+multiple Z's. Risk: post-hoc rejects 99.997%, so extra Z's are
+likely waste. Only worthwhile if z_prep/setup is a meaningful
+fraction of per-Z time. **Detection**: sweep max_z ∈ {1, 2, 4, 8}
+on n=26 wz=apart 30s; watch eff bnd/s and Z solves/s.
+
+### S8. Skip W spectral when boundary contribution alone exceeds bound — *single commit*
+
+Some W boundaries have `|DFT_W_bnd(ω)|² > individual_bound` at some
+ω. No middle can reduce that (the middle adds ≤ middle_m² to the
+DFT magnitude). Pre-compute W boundary DFT, find the per-freq
+boundary power, reject the entire SolveW if the boundary is hopeless
+at any ω. Saves the 1477 W middle FFTs for that boundary.
+- **TTC mechanism**: rate (eliminates futile SolveW work) and
+  denominator (fewer W solutions emitted to SolveZ).
+- **Detection plan**: `flow_w_unsat` count; eff bnd/s.
+
+### S9. Direct DFT at top-K boundary-peak freqs in SolveW — *single commit*
+
+Same as S1 but for W: pre-compute W boundary's top-K freqs (those
+where boundary alone has high power, hence W middle most likely to
+fail). For each W middle, compute power at those freqs via direct
+DFT (with cached boundary contribution); reject if exceeds
+individual_bound. Saves FFT cost on the 82% rejected W middles.
+- **TTC mechanism**: rate; W reject rate already high (82%) so
+  direct savings.
+- **Caveat**: brute-force W path uses `spectrum_into_if_ok` which
+  already early-exits at first violating freq. Improvement comes
+  from skipping the FFT entirely for early-rejectable W's.
+
+### S10. Skip extension cache lookup for already-walked (Z,W,X,Y) sets — *single commit*
+
+The `ext_cache: HashMap<u128, bool>` (src/mdd_pipeline.rs:2116)
+records per-worker extension results. With workers sharing the same
+boundaries indirectly, the same cache key may be computed in multiple
+workers. Switch to a process-wide `DashMap<u128, bool>` so the work
+is done once globally. Risk: contention may exceed savings; the
+per-worker cache hit rate is already high (the 4312 prunes /22323
+candidates ≈ 19%). Measure.

@@ -541,6 +541,42 @@ Benchmark n=26 wz=together mdd-k=7 (4 threads, 20s, 23 runs):
 
 All 35 tests pass.
 
+## SPECTRAL_FREQS sweep for --wz=apart (April 2026)
+
+### S5. SPECTRAL_FREQS 563 → 64 for `--wz=apart` — accepted (**TTC −20%**)
+
+F1 (above) reduced `SPECTRAL_FREQS` from 563 → 17 for `--wz=together` at
+`mdd-k=5`, but the constant stayed at 563 for all other modes. `--wz=apart`
+is now the default at larger n: its pipeline runs the SAT-driven
+`SpectralConstraint` on both the Z and W solves, so the same per-frequency
+`cos/sin/amplitude` tables and inner assign/unassign loops are on the
+critical path. At n=26 the Z SAT fires ~5.8M times in a 30 s run, so even
+a small per-call overhead dominates.
+
+Swept at `--n=26 --wz=apart --mdd-k=7 --sat-secs=30`:
+
+| SPECTRAL_FREQS | TTC (median of 5, or 3) | vs 563 baseline |
+|----------------|--------------------------|------------------|
+| 563 (baseline) | 46.4m                    | —                |
+| 40             | 38.3m                    | −17.5%           |
+| 50             | 40.6m                    | −12.5%           |
+| **64**         | **37.0m**                | **−20.3%**       |
+| 80             | 40.8m                    | −12.1%           |
+| 100            | 38.4m                    | −17.2%           |
+| 128            | 40.0m                    | −13.8%           |
+
+Values below 40 were not probed because F1's n=20 correctness trace showed
+SPECTRAL_FREQS=11 leaking non-canonical pairs past the SAT. 64 is well
+above that floor and was the most-validated value (final 5 runs:
+38.1/38.0/37.0/32.5/32.3m). Correctness: the n=18 smoke test still finds
+TT(18) in <1s; n=20 still finds (variance consistent with the
+pre-existing baseline — 4/10 misses at 563 in a 30 s budget).
+
+**Lever**: rate. The eff bnd/s went from ~520 at 563 → ~650–740 at 64.
+Denominator unchanged (1,465,976 live ZW paths).
+
+All 35 tests pass.
+
 ## Current baseline (latest)
 
 - TTC (n=26, `--wz=cross`): ~10 min reported (extrapolated); actual
