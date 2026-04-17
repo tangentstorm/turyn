@@ -314,6 +314,12 @@ pub(crate) enum WzMode {
     /// constraint and the Turyn identity as per-lag quad PB, then solve
     /// it. See `solve_xyzw` for the per-call internals.
     Xyzw,
+    /// Synchronized 4-sequence heuristic walker. Builds the bouncing
+    /// boundary MDD on the fly (no `mdd-k.bin` required), scoring each
+    /// 16-way level by running autocorrelation pressure. Persistent SAT
+    /// solver absorbs full BDKR (i)–(vi) + Turyn identity as per-lag
+    /// quad PB; learned clauses persist across the walk. See `sync_walker`.
+    Sync,
 }
 
 
@@ -395,6 +401,7 @@ impl SearchConfig {
                 WzMode::Together => "together",
                 WzMode::Apart => "apart",
                 WzMode::Xyzw => "xyzw",
+                WzMode::Sync => "sync",
             };
             parts.push(format!("--wz={label}"));
         }

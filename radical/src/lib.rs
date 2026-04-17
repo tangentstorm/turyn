@@ -708,6 +708,13 @@ pub struct Solver {
     decisions: u64,
     propagations: u64,
 
+    // propagate_only stats
+    last_nogood_len: usize,
+    last_full_nogood_len: usize,
+    /// Most recently learnt nogood (from `propagate_only`), cloned so
+    /// callers can publish it to a cross-worker clause exchange.
+    last_learnt_clause: Option<Vec<Lit>>,
+
     // Restart (EMA) — glucose-style adaptive restarts
     ema_lbd_fast: f64,   // fast EMA of recent LBD (α ≈ 1/32)
     ema_lbd_slow: f64,   // slow EMA of global LBD (α ≈ 1/4096)
@@ -800,6 +807,9 @@ impl Solver {
             luby_index: 0,
             decisions: 0,
             propagations: 0,
+            last_nogood_len: 0,
+            last_full_nogood_len: 0,
+            last_learnt_clause: None,
             ema_lbd_fast: 0.0,
             ema_lbd_slow: 0.0,
             ema_restart_block: 0,
@@ -1627,6 +1637,144 @@ impl Solver {
     /// Reset the solver to level 0 (undo all decisions, keep learnt clauses).
     pub fn reset(&mut self) {
         self.backtrack(0);
+    }
+
+    /// Unit-propagate under temporary assumptions — NO decisions made.
+    ///
+    /// Returns `Some(true)` if propagation saturated without conflict;
+    /// caller may read `value(var)` to inspect literals forced by the
+    /// assumptions. Returns `Some(false)` if propagation hits a conflict;
+    /// in the conflict case a simple nogood (the disjunction of negated
+    /// assumption literals) is added to the clause database so future
+    /// calls with the same prefix short-circuit to UNSAT via a single
+    /// propagation step. Returns `None` never.
+    ///
+    /// Unlike `solve_with_assumptions`, this never calls `solve_inner`
+    /// so it never makes a CDCL decision. Cost is proportional to new
+    /// propagation work.
+    ///
+    /// Does NOT learn clauses on conflict. A 1-UIP variant was tried and
+    /// reverted: enqueuing an asserting literal with the learnt clause
+    /// as its reason polluted the solver's internal invariants in a way
+    /// that incorrectly rejected known-SAT prefixes on subsequent calls.
+    /// See commit history. Caller should rely on the walker-side memo for
+    /// dedup of UNSAT sub-trees instead.
+    ///
+    /// State after the call:
+    /// - `Some(true)` + non-empty assumptions → solver at decision level 1.
+    /// - `Some(true)` + empty assumptions → solver at decision level 0.
+    /// - `Some(false)` → solver at decision level 0.
+    pub fn propagate_only(&mut self, assumptions: &[Lit]) -> Option<bool> {
+        if !self.ok { return Some(false); }
+
+        if self.decision_level() > 0 {
+            self.backtrack(0);
+        }
+
+        // Pre-size reusable buffers (mirrors solve_with_assumptions) so
+        // propagators that touch them don't thrash on first call.
+        if self.quad_pb_seen_buf.len() < self.num_vars {
+            self.quad_pb_seen_buf.resize(self.num_vars, false);
+        }
+        if self.analyze_seen.len() < self.num_vars {
+            self.analyze_seen.resize(self.num_vars, false);
+        }
+        if self.minimize_visited.len() < self.num_vars {
+            self.minimize_visited.resize(self.num_vars, false);
+        }
+
+        // Drain any pending level-0 work (unit clauses added since the
+        // last solve, etc.).
+        if self.propagate().is_some() {
+            self.ok = false;
+            return Some(false);
+        }
+
+        if assumptions.is_empty() {
+            return Some(true);
+        }
+
+        self.new_decision_level();
+        for &lit in assumptions {
+            self.ensure_var(lit.unsigned_abs() as usize);
+            match self.lit_value(lit) {
+                LBool::True => {}
+                LBool::False => {
+                    // The assumption itself contradicts a level-0 fact
+                    // (or an earlier assumption in this batch). A clause
+                    // that rules out this assumption already exists in
+                    // the DB; no new learning needed.
+                    self.backtrack(0);
+                    return Some(false);
+                }
+                LBool::Undef => {
+                    self.enqueue(lit, Reason::Decision);
+                }
+            }
+        }
+
+        if let Some(conflict_reason) = self.propagate() {
+            // Walk the implication graph back to the Decision-level
+            // literals that actually caused the conflict.  Produces a
+            // sound minimal nogood — typically a strict subset of the
+            // full assumption list.
+            let nogood = self.analyze_assumptions(conflict_reason);
+            self.backtrack(0);
+
+            // Filter to lits that are still meaningful at level 0.
+            let mut filtered: Vec<Lit> = Vec::with_capacity(nogood.len());
+            for &lit in &nogood {
+                match self.lit_value(lit) {
+                    LBool::False | LBool::Undef => filtered.push(lit),
+                    LBool::True => {}
+                }
+            }
+
+            if filtered.is_empty() {
+                // Fall back to the full-assumption nogood when analyze
+                // didn't reach any decision literals (can happen for
+                // opaque-reason-only conflicts).
+                for &lit in assumptions {
+                    if self.lit_value(lit) != LBool::False {
+                        filtered.push(-lit);
+                    }
+                }
+            }
+
+            self.last_nogood_len = filtered.len();
+            self.last_full_nogood_len = assumptions.len();
+            self.last_learnt_clause = if filtered.is_empty() {
+                None
+            } else {
+                Some(filtered.clone())
+            };
+
+            if filtered.is_empty() {
+                self.ok = false;
+            } else {
+                self.add_clause(filtered);
+            }
+            return Some(false);
+        }
+
+        Some(true)
+    }
+
+    /// Length of the last nogood learnt from `propagate_only` (for
+    /// observability). `last_full_nogood_len` is the count of
+    /// assumptions passed in — the ratio measures how effective
+    /// 1-UIP analysis is at shrinking the clause vs. the trivial
+    /// full-assumption nogood.
+    pub fn last_nogood_stats(&self) -> (usize, usize) {
+        (self.last_nogood_len, self.last_full_nogood_len)
+    }
+
+    /// Take the last learnt clause from `propagate_only`, clearing the
+    /// slot.  Callers can forward this clause to peer solvers for
+    /// cross-worker clause sharing.  Returns `None` if no clause was
+    /// learnt since the last take.
+    pub fn take_last_learnt_clause(&mut self) -> Option<Vec<Lit>> {
+        self.last_learnt_clause.take()
     }
 
     /// Number of variables.
@@ -3170,6 +3318,137 @@ impl Solver {
         // Clear seen flags
         for i in 0..out.len() {
             seen[var_of(out[i])] = false;
+        }
+    }
+
+    /// Assumption-aware conflict analysis: walk the implication graph
+    /// backward from `conflict_reason` all the way to the Decision
+    /// literals at level > 0 that contributed.  Returns the disjunction
+    /// of currently-false decision literals — a clause of the form
+    /// `(¬a_{i1} ∨ ¬a_{i2} ∨ … ∨ ¬a_{im})` in the pure-assumption case.
+    ///
+    /// Unlike `analyze` (1-UIP with an early Reason::Decision shortcut
+    /// that yields an UNSOUND unit for pure-assumption conflicts),
+    /// this function keeps resolving through every non-decision
+    /// antecedent and accumulates ALL decision-level lits it reaches.
+    /// The result is a sound, globally-valid clause.
+    ///
+    /// Only walks through Reason::Clause / Reason::Pb / Reason::QuadPb.
+    /// Opaque reasons (Xor, PbSetEq, Spectral, Mdd) are treated as
+    /// leaves: the current literal is added directly to the clause.
+    /// That's a sound over-approximation — produces a larger clause
+    /// but never an incorrect one.
+    fn analyze_assumptions(&mut self, conflict_reason: Reason) -> Vec<Lit> {
+        self.analyze_seen.resize(self.num_vars, false);
+        self.analyze_seen.fill(false);
+        self.quad_pb_seen_buf.resize(self.num_vars, false);
+
+        let mut worklist: Vec<Lit> = Vec::new();
+        let mut learnt: Vec<Lit> = Vec::new();
+
+        self.collect_reason_lits_into(conflict_reason, 0, &mut worklist);
+
+        while let Some(lit) = worklist.pop() {
+            let v = var_of(lit);
+            if self.analyze_seen[v] { continue; }
+            self.analyze_seen[v] = true;
+            if self.assigns[v] == LBool::Undef { continue; }
+            if self.level[v] == 0 {
+                // Root-level fact; not part of any nogood.
+                continue;
+            }
+            match self.reason[v] {
+                Reason::Decision => {
+                    // Decision (assumption) literal — conflict leaf.
+                    learnt.push(lit);
+                }
+                r @ (Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_)) => {
+                    self.collect_reason_lits_into(r, lit, &mut worklist);
+                }
+                _ => {
+                    // Opaque reason: over-approximate by treating `lit`
+                    // as a leaf.  Sound but coarser.
+                    learnt.push(lit);
+                }
+            }
+        }
+
+        learnt
+    }
+
+    /// Push the currently-false antecedent literals of `reason` into
+    /// `out`.  `propagated_false_lit` is the literal we're resolving
+    /// through (currently false; its negation is the propagated-true
+    /// lit we need to exclude from the antecedent set).  Pass 0 for
+    /// the initial conflict reason (no propagated lit to skip).
+    fn collect_reason_lits_into(&mut self, reason: Reason, propagated_false_lit: Lit, out: &mut Vec<Lit>) {
+        let skip_true_lit = if propagated_false_lit == 0 { 0 } else { -propagated_false_lit };
+        match reason {
+            Reason::Clause(ci) => {
+                let m = self.clause_meta[ci as usize];
+                let cstart = m.start as usize;
+                let clen = m.len as usize;
+                for i in 0..clen {
+                    let l = self.clause_lits[cstart + i];
+                    if l == skip_true_lit { continue; }
+                    if self.lit_value(l) == LBool::False {
+                        out.push(l);
+                    }
+                }
+            }
+            Reason::Pb(pbi) => {
+                let pb = &self.pb_constraints[pbi as usize];
+                let n_lits = pb.lits.len();
+                for i in 0..n_lits {
+                    let l = self.pb_constraints[pbi as usize].lits[i];
+                    if l == skip_true_lit { continue; }
+                    if self.lit_value(l) == LBool::False {
+                        out.push(l);
+                    }
+                }
+            }
+            Reason::QuadPb(qi_encoded) => {
+                let qi = (qi_encoded & 0x7FFFFFFF) as usize;
+                let mut buf = std::mem::take(&mut self.analyze_reason_buf);
+                buf.clear();
+                if propagated_false_lit == 0 {
+                    // Conflict from QuadPb itself — collect all
+                    // assigned, non-root-level term lits in their
+                    // currently-false polarity.
+                    let nt = self.quad_pb_constraints[qi].num_terms as usize;
+                    for ti in 0..nt {
+                        let t = &self.quad_pb_constraints[qi].terms[ti];
+                        for &(lit, v) in &[(t.lit_a, t.var_a()), (t.lit_b, t.var_b())] {
+                            if !self.quad_pb_seen_buf[v]
+                                && self.assigns[v] != LBool::Undef
+                                && self.level[v] > 0
+                            {
+                                self.quad_pb_seen_buf[v] = true;
+                                let false_form = if self.lit_value(lit) == LBool::False {
+                                    lit
+                                } else {
+                                    negate(lit)
+                                };
+                                buf.push(false_form);
+                            }
+                        }
+                    }
+                    for i in 0..buf.len() {
+                        self.quad_pb_seen_buf[var_of(buf[i])] = false;
+                    }
+                } else {
+                    let pv = var_of(propagated_false_lit);
+                    self.compute_quad_pb_explanation_into(qi_encoded, pv, &mut buf);
+                }
+                for i in 0..buf.len() {
+                    let l = buf[i];
+                    if l != skip_true_lit {
+                        out.push(l);
+                    }
+                }
+                self.analyze_reason_buf = buf;
+            }
+            _ => {}
         }
     }
 

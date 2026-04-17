@@ -217,22 +217,25 @@ pub(crate) fn solve_xyzw(
     solver.add_clause([w_var(0)]);
 
     // BDKR Canonical6 (A vs B tie-break at positions 1 and n-2):
-    //   n <= 2  OR  (A[1] != B[1]  AND  A[1] = +1)
+    //   n <= 2  OR  (A[1] ≠ B[1]  AND  A[1] = +1)
     //           OR  (A[1]  = B[1]  AND  A[n-2] = +1  AND  B[n-2] = -1)
-    // Implication form gives a small clause set:
-    //   (A[1] != B[1]) → A[1] = +1    ≡  (a1 ∨ ¬b1)
-    //   (A[1]  = B[1]) → A[n-2] = +1  ≡  2 binary-guarded clauses on aam
-    //   (A[1]  = B[1]) → B[n-2] = -1  ≡  2 binary-guarded clauses on ¬bbm
+    //
+    // Five 2-literal clauses (see CANONICAL.md §rule (vi)).  This form
+    // both forbids (A[1]=-1, B[1]=+1) AND derives A[n-2]=+1 ∧ B[n-2]=-1
+    // in the A[1]=B[1] case via CNF distribution.  The previous 3-lit
+    // encoding accidentally forced A[n-2]=+1 ∧ B[n-2]=-1 in the A[1]≠B[1]
+    // case too — over-constraining and rejecting valid canonical orbits
+    // such as known TT(6) with A[1]=+1, B[1]=-1, A[n-2]=-1.
     if n >= 4 {
         let a1  = x_var(1);
         let b1  = y_var(1);
         let aam = x_var(n - 2);
         let bbm = y_var(n - 2);
-        solver.add_clause([a1, -b1]);              // (A[1]≠B[1]) → A[1]=+1
-        solver.add_clause([-a1,  b1, aam]);        // (A[1]=B[1]=F) → A[n-2]=+1
-        solver.add_clause([ a1, -b1, aam]);        // (A[1]=B[1]=T) → A[n-2]=+1
-        solver.add_clause([-a1,  b1, -bbm]);       // (A[1]=B[1]=F) → B[n-2]=-1
-        solver.add_clause([ a1, -b1, -bbm]);       // (A[1]=B[1]=T) → B[n-2]=-1
+        solver.add_clause([a1, -b1]);       // forbid A[1]=-1 ∧ B[1]=+1
+        solver.add_clause([a1, aam]);       // A[1]=-1 → A[n-2]=+1
+        solver.add_clause([-b1, aam]);      // B[1]=+1 → A[n-2]=+1
+        solver.add_clause([a1, -bbm]);      // A[1]=-1 → B[n-2]=-1
+        solver.add_clause([-b1, -bbm]);     // B[1]=+1 → B[n-2]=-1
     }
 
     // BDKR Canonical2 (A is lex-min under reversal):
@@ -378,15 +381,19 @@ pub(crate) fn solve_xyzw(
         prod_d[j_prime] = Some(y);
         prod_d[mirror] = Some(y);
     }
+    // Rule (v) main clause at i':
+    //   (∃ j<i', premise(j)) ∨ ¬premise(i') ∨ D[i']=+1
+    // with premise(j) ≡ prod_d[j] = (D[j]·D[m-1-j]·D[m-1] = -1) via
+    // XNOR3 aux.  Previous version had polarities flipped, silently
+    // accepting non-canonical W's that rule (v) should reject.
     for i_prime in 1..mlen {
         let mirror = mlen - 1 - i_prime;
         if mirror <= i_prime { break; }
-        // clause: ¬prod_d[1] ∨ ... ∨ ¬prod_d[i'-1] ∨ prod_d[i'] ∨ D[i']
         let mut clause: Vec<i32> = Vec::with_capacity(i_prime + 1);
         for j_prime in 1..i_prime {
-            if let Some(y) = prod_d[j_prime] { clause.push(-y); }
+            if let Some(y) = prod_d[j_prime] { clause.push(y); }
         }
-        if let Some(y) = prod_d[i_prime] { clause.push(y); }
+        if let Some(y) = prod_d[i_prime] { clause.push(-y); }
         clause.push(w_var(i_prime));
         solver.add_clause(clause);
     }
