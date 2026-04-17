@@ -215,16 +215,22 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     solver.add_clause([w_var(0)]);
 
     // BDKR Canonical6 (XY swap tie-break).
+    //   (A[1] ≠ B[1]) → A[1] = +1
+    //   (A[1]  = B[1]) → A[n-2] = +1 AND B[n-2] = -1
+    // Encoded as five 2-literal clauses (CANONICAL.md §rule (vi)): the
+    // two-variable form both forbids the (A[1]=-1, B[1]=+1) combo AND
+    // derives the A[n-2]/B[n-2] constraint in the A[1]=B[1] case via
+    // CNF distribution `(a ∨ z) ∧ (b ∨ z) ≡ (a ∧ b) ∨ z`.
     if n >= 4 {
         let a1 = x_var(1);
         let b1 = y_var(1);
         let aam = x_var(n - 2);
         let bbm = y_var(n - 2);
-        solver.add_clause([a1, -b1]);
-        solver.add_clause([-a1, b1, aam]);
-        solver.add_clause([a1, -b1, aam]);
-        solver.add_clause([-a1, b1, -bbm]);
-        solver.add_clause([a1, -b1, -bbm]);
+        solver.add_clause([a1, -b1]);       // forbid A[1]=-1 AND B[1]=+1
+        solver.add_clause([a1, aam]);       // A[1]=-1 → A[n-2]=+1
+        solver.add_clause([-b1, aam]);      // B[1]=+1 → A[n-2]=+1
+        solver.add_clause([a1, -bbm]);      // A[1]=-1 → B[n-2]=-1
+        solver.add_clause([-b1, -bbm]);     // B[1]=+1 → B[n-2]=-1
     }
 
     // BDKR Canonical2..5 via Tseitin eq / prod chains.
@@ -465,6 +471,7 @@ pub(crate) struct SyncStats {
     pub memo_hits: u64,
     pub capacity_rejects: u64,
     pub sat_unsat: u64,
+    pub leaves_reached: u64,
     pub learned_clauses_final: u64,
 }
 
@@ -480,12 +487,14 @@ pub(crate) fn search_sync(
         solver.set_conflict_limit(cfg.conflict_limit);
     }
 
-    // Initial solve to propagate C1 units + quad-PB base constraints.
-    if solver.solve_with_assumptions(&[]) != Some(true) {
+    // Initial propagate to fire C1 units + Tseitin chains + quad PBs at level 0.
+    // `propagate_only` drains the propagation queue without making decisions,
+    // so this is O(n) instead of a full SAT solve.
+    if solver.propagate_only(&[]) != Some(true) {
         eprintln!("sync_walker: base solver UNSAT — canonical constraints inconsistent");
         return (None, SyncStats {
             nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-            sat_unsat: 0, learned_clauses_final: 0,
+            sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0,
         }, start.elapsed());
     }
 
@@ -495,7 +504,7 @@ pub(crate) fn search_sync(
     let mut memo: FxHashMap<u64, ()> = FxHashMap::default();
     let mut stats = SyncStats {
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-        sat_unsat: 0, learned_clauses_final: 0,
+        sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0,
     };
 
     let deadline = if cfg.sat_secs > 0 {
@@ -508,8 +517,8 @@ pub(crate) fn search_sync(
     let elapsed = start.elapsed();
     if verbose {
         eprintln!(
-            "sync_walker: nodes={} memo_hits={} cap_rejects={} sat_unsat={} elapsed={:?}",
-            stats.nodes_visited, stats.memo_hits, stats.capacity_rejects, stats.sat_unsat, elapsed,
+            "sync_walker: nodes={} memo_hits={} cap_rejects={} sat_unsat={} leaves={} elapsed={:?}",
+            stats.nodes_visited, stats.memo_hits, stats.capacity_rejects, stats.sat_unsat, stats.leaves_reached, elapsed,
         );
     }
     (found, stats, elapsed)
@@ -532,9 +541,14 @@ fn dfs(
     stats.nodes_visited += 1;
 
     if state.level >= ctx.depth {
-        // All boundary positions visited. Run a final solve to fill any
-        // positions SAT hasn't pinned yet (there shouldn't be any for
-        // n even with k_max = n/2, since the walker pinned every position).
+        stats.leaves_reached += 1;
+        // All boundary positions visited. Every bit should be pinned;
+        // running sums must all equal 0 (target of Turyn identity).
+        let sums_all_zero = (1..ctx.n).all(|s| state.sums[s] == 0);
+        if !sums_all_zero {
+            return false;
+        }
+        // Validate with SAT: also enforces BDKR canonical rule Tseitin chains.
         let sat = solver.solve_with_assumptions(&state.assumptions);
         if sat == Some(true) {
             let sol = extract_solution(solver, ctx);
@@ -631,24 +645,31 @@ fn dfs(
     // Score-ordered siblings: ascending score (low pressure first).
     candidates.sort_by_key(|c| c.score);
 
+    // Snapshot the ENTIRE state.bits vector before trying candidates.
+    // harvest_forced during a candidate's SAT call may write bits far
+    // beyond the walker's placed position (rule propagation reaches into
+    // the middle). Those writes MUST be rolled back before the next
+    // sibling tries its SAT call, otherwise siblings see stale forced
+    // bits from the previous candidate's SAT state.
+    let saved_all_bits = state.bits.clone();
+    let saved_sums = state.sums.clone();
+    let saved_assum_len = state.assumptions.len();
+
     for cand in candidates {
         if found.is_some() { return true; }
         if let Some(d) = deadline {
             if Instant::now() >= d { return false; }
         }
 
-        // Apply this child's placements to state.
-        let saved_bits: Vec<(u8, usize, u8)> = (0..cand.num_placed as usize)
-            .map(|k| {
-                let (ki, pi, _) = cand.placed_signs[k];
-                (ki, pi, state.bit(ki, pi))
-            })
-            .collect();
+        // Restore state.bits to the parent snapshot before each sibling.
+        state.bits.copy_from_slice(&saved_all_bits);
+        state.sums.copy_from_slice(&saved_sums);
+        state.assumptions.truncate(saved_assum_len);
+
         for k in 0..cand.num_placed as usize {
             let (ki, pi, si) = cand.placed_signs[k];
             state.set_bit(ki, pi, si);
         }
-        let saved_assum_len = state.assumptions.len();
         state.assumptions = cand.assum.clone();
         state.level += 1;
         rebuild_sums(state, ctx);
@@ -659,34 +680,38 @@ fn dfs(
         if memo_hit {
             stats.memo_hits += 1;
         } else {
-            // Call the SAT solver to check feasibility + harvest forced bits.
-            let sat = solver.solve_with_assumptions(&state.assumptions);
+            // Walker-only mode: skip per-level SAT call (no canonicalization
+            // rules from (ii)-(vi) are enforced, and non-canonical solutions
+            // may be found). Useful for A/B comparison.
+            let skip_sat = std::env::var("SYNC_SKIP_SAT").ok().as_deref() == Some("1");
+            let sat = if skip_sat { Some(true) } else {
+                solver.propagate_only(&state.assumptions)
+            };
             if sat == Some(true) {
-                harvest_forced(solver, state, ctx);
+                if !skip_sat { harvest_forced(solver, state, ctx); }
                 rebuild_sums(state, ctx);
                 if !capacity_violated(state, ctx) {
                     memo.insert(sig, ());
                     if dfs(solver, state, ctx, memo, stats, deadline, found) {
-                        // Propagate solution up; no rollback needed since
-                        // we're done.
                         return true;
                     }
                 }
             } else {
                 stats.sat_unsat += 1;
             }
-            // Mark this sig as explored (dead) — simple memo.
             memo.entry(sig).or_insert(());
         }
 
-        // Rollback.
+        // Rollback level only; state.bits, sums, assumptions get
+        // fully restored at the top of the next iteration (or the
+        // caller's rollback if no next iteration).
         state.level -= 1;
-        state.assumptions.truncate(saved_assum_len);
-        for (ki, pi, old) in saved_bits {
-            state.bits[(ki as usize) * ctx.n + pi] = old;
-        }
-        rebuild_sums(state, ctx);
     }
+
+    // Final rollback to leave state as caller expected.
+    state.bits.copy_from_slice(&saved_all_bits);
+    state.sums.copy_from_slice(&saved_sums);
+    state.assumptions.truncate(saved_assum_len);
 
     false
 }
@@ -715,4 +740,92 @@ fn extract_solution(
         PackedSeq::from_values(&z_vals),
         PackedSeq::from_values(&w_vals),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn propagate_only_accepts_canonical_tt6() {
+        let problem = Problem::new(6);
+        let sat_cfg = radical::SolverConfig::default();
+        let mut solver = build_solver(problem, &sat_cfg);
+        // Initial propagate (drain level-0 unit clauses).
+        assert_eq!(solver.propagate_only(&[]), Some(true), "base UNSAT");
+        // Canonical TT(6): X=+++--+, Y=+-++-+, Z=+-+++-, W=++++-.
+        let x = [1, 1, 1, -1, -1, 1i8];
+        let y = [1, -1, 1, 1, -1, 1];
+        let z = [1, -1, 1, 1, 1, -1];
+        let w = [1, 1, 1, 1, -1];
+        let n = 6;
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        let z_var = |i: usize| -> i32 { (2 * n + i + 1) as i32 };
+        let w_var = |i: usize| -> i32 { (3 * n + i + 1) as i32 };
+        let mut assums: Vec<i32> = Vec::new();
+        for (i, &v) in x.iter().enumerate() { assums.push(if v > 0 { x_var(i) } else { -x_var(i) }); }
+        for (i, &v) in y.iter().enumerate() { assums.push(if v > 0 { y_var(i) } else { -y_var(i) }); }
+        for (i, &v) in z.iter().enumerate() { assums.push(if v > 0 { z_var(i) } else { -z_var(i) }); }
+        for (i, &v) in w.iter().enumerate() { assums.push(if v > 0 { w_var(i) } else { -w_var(i) }); }
+        let result = solver.propagate_only(&assums);
+        assert_eq!(result, Some(true), "canonical TT(6) rejected by propagate_only");
+    }
+
+    #[test]
+    fn propagate_only_rejects_boundary_prefix() {
+        let problem = Problem::new(6);
+        let sat_cfg = radical::SolverConfig::default();
+        let mut solver = build_solver(problem, &sat_cfg);
+        assert_eq!(solver.propagate_only(&[]), Some(true));
+        // Just the first two position placements of the canonical solution.
+        // Should still be satisfiable (many completions exist).
+        let x0 = 1; let y0 = 7; let z0 = 13; let w0 = 19; // vars for position 0
+        let x5 = 6; let y5 = 12; let z5 = 18; // vars for position 5 (no W[5])
+        let assums = vec![x0, y0, z0, w0, x5, y5, -z5]; // Z[5]=-1, others +1
+        let result = solver.propagate_only(&assums);
+        assert_eq!(result, Some(true), "partial boundary rejected");
+    }
+
+    #[test]
+    fn propagate_only_matches_solve_with_assumptions_on_tt8_prefix() {
+        // Walker-like prefix of canonical TT(8): X=++-++-++, Y=+------+,
+        // Z=+--++++-, W=+++-++- (from known_solutions.txt).
+        let problem = Problem::new(8);
+        let n = 8;
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        let z_var = |i: usize| -> i32 { (2 * n + i + 1) as i32 };
+        let w_var = |i: usize| -> i32 { (3 * n + i + 1) as i32 };
+
+        // known_solutions.txt: 8 ++-++-++ ++-+-+-+ ++++-+-- +++--++
+        let x: [i8; 8] = [1, 1, -1, 1, 1, -1, 1, 1];
+        let y: [i8; 8] = [1, 1, -1, 1, -1, 1, -1, 1];
+        let z: [i8; 8] = [1, 1, 1, 1, -1, 1, -1, -1];
+        let w: [i8; 7] = [1, 1, 1, -1, -1, 1, 1];
+
+        // Pin each bouncing-order prefix length and check consistency.
+        for prefix_len in 0..=n {
+            let mut assums: Vec<i32> = Vec::new();
+            for level in 0..prefix_len {
+                let pos = if level % 2 == 0 { level / 2 } else { n - 1 - level / 2 };
+                assums.push(if x[pos] > 0 { x_var(pos) } else { -x_var(pos) });
+                assums.push(if y[pos] > 0 { y_var(pos) } else { -y_var(pos) });
+                assums.push(if z[pos] > 0 { z_var(pos) } else { -z_var(pos) });
+                if pos < 7 {
+                    assums.push(if w[pos] > 0 { w_var(pos) } else { -w_var(pos) });
+                }
+            }
+            let sat_cfg = radical::SolverConfig::default();
+            let mut prop_solver = build_solver(problem, &sat_cfg);
+            assert_eq!(prop_solver.propagate_only(&[]), Some(true));
+            let prop_result = prop_solver.propagate_only(&assums);
+            let mut full_solver = build_solver(problem, &sat_cfg);
+            let full_result = full_solver.solve_with_assumptions(&assums);
+            if prop_result != Some(true) && full_result == Some(true) {
+                panic!("prefix_len={}: propagate_only={:?} but full SAT says {:?} — propagate_only rejected a valid partial!",
+                    prefix_len, prop_result, full_result);
+            }
+        }
+    }
 }

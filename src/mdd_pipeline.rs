@@ -353,9 +353,9 @@ pub(crate) fn run_mdd_sat_search(
         let (found, stats, elapsed) = crate::sync_walker::search_sync(problem, &sync_cfg, verbose);
         if verbose {
             eprintln!(
-                "\n--wz=sync: nodes={} memo_hits={} cap_rejects={} sat_unsat={} elapsed={:?}",
+                "\n--wz=sync: nodes={} memo_hits={} cap_rejects={} sat_unsat={} leaves={} elapsed={:?}",
                 stats.nodes_visited, stats.memo_hits,
-                stats.capacity_rejects, stats.sat_unsat, elapsed,
+                stats.capacity_rejects, stats.sat_unsat, stats.leaves_reached, elapsed,
             );
         }
         if let Some((x, y, z, w)) = found.as_ref() {

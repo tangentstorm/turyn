@@ -1629,6 +1629,81 @@ impl Solver {
         self.backtrack(0);
     }
 
+    /// Unit-propagate under temporary assumptions — NO decisions made.
+    ///
+    /// Returns `Some(true)` if propagation saturated without conflict.
+    /// Caller may read `value(var)` to inspect literals forced by
+    /// propagation (either level 0 facts or consequences of the
+    /// assumptions at level 1). Returns `Some(false)` if propagation
+    /// proves the assumptions UNSAT at current-solver state. Returns
+    /// `None` never (kept for API parity with `solve_with_assumptions`).
+    ///
+    /// Unlike `solve_with_assumptions`, this never calls `solve_inner`,
+    /// so it never makes a CDCL decision. Cost is proportional to new
+    /// propagation work, not to the size of the remaining search space.
+    ///
+    /// Does NOT learn a clause on conflict (deferred to M2). A future
+    /// variant will run 1-UIP analysis so the learnt clause subsumes
+    /// future calls with overlapping prefixes.
+    ///
+    /// State after the call:
+    /// - `Some(true)` + non-empty assumptions → solver at decision
+    ///   level 1, propagation saturated. The next call backtracks to 0.
+    /// - `Some(true)` + empty assumptions → solver at decision level 0.
+    /// - `Some(false)` → solver at decision level 0.
+    pub fn propagate_only(&mut self, assumptions: &[Lit]) -> Option<bool> {
+        if !self.ok { return Some(false); }
+
+        if self.decision_level() > 0 {
+            self.backtrack(0);
+        }
+
+        // Pre-size reusable buffers (mirrors solve_with_assumptions) so
+        // propagators that touch them don't thrash on first call.
+        if self.quad_pb_seen_buf.len() < self.num_vars {
+            self.quad_pb_seen_buf.resize(self.num_vars, false);
+        }
+        if self.analyze_seen.len() < self.num_vars {
+            self.analyze_seen.resize(self.num_vars, false);
+        }
+        if self.minimize_visited.len() < self.num_vars {
+            self.minimize_visited.resize(self.num_vars, false);
+        }
+
+        // Drain any pending level-0 work (unit clauses added since the
+        // last solve, etc.).
+        if self.propagate().is_some() {
+            self.ok = false;
+            return Some(false);
+        }
+
+        if assumptions.is_empty() {
+            return Some(true);
+        }
+
+        self.new_decision_level();
+        for &lit in assumptions {
+            self.ensure_var(lit.unsigned_abs() as usize);
+            match self.lit_value(lit) {
+                LBool::True => {}
+                LBool::False => {
+                    self.backtrack(0);
+                    return Some(false);
+                }
+                LBool::Undef => {
+                    self.enqueue(lit, Reason::Decision);
+                }
+            }
+        }
+
+        if self.propagate().is_some() {
+            self.backtrack(0);
+            return Some(false);
+        }
+
+        Some(true)
+    }
+
     /// Number of variables.
     pub fn num_vars(&self) -> usize { self.num_vars }
     /// Number of active (non-deleted) clauses.
