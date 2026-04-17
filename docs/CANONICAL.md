@@ -160,19 +160,21 @@ the same.  Regression coverage:
 ### Follow-up work
 
 All six rules are wired into the XY SAT / full SAT / Z-middle SAT /
-W-middle SAT / MDD-gen / MDD-walker layers.  Remaining items, by
-diminishing returns:
+W-middle SAT / MDD-gen / MDD-walker layers.  Rules (ii)–(vi) are now
+also baked structurally into the `build_zw_dfs` / `build_xy_dfs` DFS
+builders via a per-rule "has this rule already fired?" bit carried in
+the memo key (`BuildMemoKey = (sums, active_bits, rule_state)`).  The
+bouncing position order guarantees palindromic pair `j` closes at
+level `2j+1` in ascending `j`, which lets the DFS apply "least-index"
+rules incrementally.  `build_extension` seeds the initial rule_state
+from the walked base bits (`compute_extension_initial_rule_state`)
+so extension MDDs don't re-check rules that already fired in the
+base.  Structural pruning cuts MDD node counts by ~40–60% (measured:
+k=5 1086→618, k=7 34406→14007).  Toggle off with
+`MDD_DISABLE_CANON=1` for A/B comparisons.
 
-- **Stateful MDD-build pruning for rules (ii)/(iii) on the XY sub-MDD.**
-  Would require adding a 1-bit "rule already fired" flag to each
-  `build_xy_dfs` state key (4× memo entries).  The current
-  boundary-only post-walk filter in `walk_xy_sub_mdd` captures most
-  of the benefit without touching memoization; the structural
-  version would additionally shrink the on-disk XY sub-MDD.
-- **Stateful MDD-build pruning for rules (iv)/(v) on the ZW top half.**
-  Same idea, but on `build_zw_dfs`.  Currently the Z/W middle SAT
-  handles these via boundary pre-filter + middle clauses; structural
-  pruning would make the ZW MDD smaller still.
+Remaining items, by diminishing returns:
+
 - **MDD walker boundary-pair pre-filters for rules (iv)/(v).**
   `check_z_boundary_rule_iv` / `check_w_boundary_rule_v` run inside
   `SolveZ`/`SolveW`/`SolveWZ`; you could move them one step
