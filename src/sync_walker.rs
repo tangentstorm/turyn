@@ -1246,6 +1246,14 @@ fn dfs(
         }
     }
 
+    // Save a solver checkpoint at deep levels where branching is wide
+    // (b_eff > 1). At shallow levels (forced choices, b≈1), checkpoint
+    // overhead exceeds the sibling-pruning benefit. Threshold chosen
+    // from measured b_eff shape: first 6–8 levels are b≈1 (forced by
+    // C1 + rule propagation), then middle levels ramp to b=5–10.
+    let use_scoped_learning = state.level >= ctx.depth / 3;
+    let solver_cp = if use_scoped_learning { Some(solver.save_checkpoint()) } else { None };
+
     // Snapshot the ENTIRE state.bits vector before trying candidates.
     // harvest_forced during a candidate's SAT call may write bits far
     // beyond the walker's placed position (rule propagation reaches into
@@ -1336,6 +1344,10 @@ fn dfs(
     state.sums.copy_from_slice(&saved_sums);
     state.assumptions.truncate(saved_assum_len);
     state.rule_state = saved_rule_state;
+
+    if let Some(cp) = solver_cp {
+        solver.restore_checkpoint(cp);
+    }
 
     false
 }

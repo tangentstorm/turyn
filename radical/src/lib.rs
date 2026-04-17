@@ -1718,29 +1718,29 @@ impl Solver {
             // literals that actually caused the conflict.  Produces a
             // sound minimal nogood — typically a strict subset of the
             // full assumption list.
+            // Derive a minimal nogood from the conflict and add it as
+            // a scoped clause. Only done when scoped_learning is
+            // enabled via the checkpoint mechanism in the walker's DFS
+            // — permanent nogoods at level 0 bloat the clause DB
+            // without firing on different branches (Turyn nogoods are
+            // ~50 lits / near-unique). Scoped nogoods help prune
+            // SIBLINGS of the current branch before they're tried.
             let nogood = self.analyze_assumptions(conflict_reason);
             self.backtrack(0);
 
-            // Filter to lits that are still meaningful at level 0.
             let mut filtered: Vec<Lit> = Vec::with_capacity(nogood.len());
             for &lit in &nogood {
-                match self.lit_value(lit) {
-                    LBool::False | LBool::Undef => filtered.push(lit),
-                    LBool::True => {}
+                if self.lit_value(lit) != LBool::True {
+                    filtered.push(lit);
                 }
             }
-
             if filtered.is_empty() {
-                // Fall back to the full-assumption nogood when analyze
-                // didn't reach any decision literals (can happen for
-                // opaque-reason-only conflicts).
                 for &lit in assumptions {
                     if self.lit_value(lit) != LBool::False {
                         filtered.push(-lit);
                     }
                 }
             }
-
             self.last_nogood_len = filtered.len();
             self.last_full_nogood_len = assumptions.len();
             self.last_learnt_clause = if filtered.is_empty() {
@@ -1748,7 +1748,6 @@ impl Solver {
             } else {
                 Some(filtered.clone())
             };
-
             if filtered.is_empty() {
                 self.ok = false;
             } else {
