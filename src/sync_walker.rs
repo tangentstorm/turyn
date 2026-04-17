@@ -621,19 +621,19 @@ pub(crate) struct SyncStats {
     pub leaves_reached: u64,
     pub learned_clauses_final: u64,
     pub max_level_reached: u64,
-    /// Count of dfs() calls per level. With DFS the tree's shape at
-    /// early levels stabilises once fully explored; later levels are
-    /// partial. Used for TTC projection.
     pub nodes_by_level: Vec<u64>,
-    /// Count of surviving candidates (post capacity + rule) summed
-    /// across all internal nodes. `children_total / internal_nodes`
-    /// is the measured effective branching factor b_eff.
     pub children_total: u64,
-    /// Count of internal (non-leaf) dfs() calls — parents of children.
     pub internal_nodes: u64,
-    /// Elapsed seconds until the walker first hit state.level == depth
-    /// (any leaf, solution or not). `None` if no leaf was reached.
     pub time_to_first_leaf: Option<f64>,
+    /// Sum of nogood clause lengths learnt from conflict analysis.
+    /// `nogood_len_sum / sat_unsat` = avg learnt clause size.
+    pub nogood_len_sum: u64,
+    /// Sum of "full assumption length at conflict time" — the size
+    /// the nogood WOULD be if we just negated every assumption.
+    /// `full_nogood_len_sum / sat_unsat` = avg full-nogood size;
+    /// the ratio `nogood_len_sum / full_nogood_len_sum` shows how
+    /// effective 1-UIP analysis is at shrinking.
+    pub full_nogood_len_sum: u64,
 }
 
 pub(crate) fn search_sync(
@@ -675,6 +675,7 @@ fn search_sync_parallel(
         learned_clauses_final: 0, max_level_reached: 0,
         nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
         time_to_first_leaf: None,
+        nogood_len_sum: 0, full_nogood_len_sum: 0,
     }));
 
     thread::scope(|s| {
@@ -708,6 +709,8 @@ fn search_sync_parallel(
                     });
                 }
                 agg.children_total += stats.children_total;
+                agg.nogood_len_sum += stats.nogood_len_sum;
+                agg.full_nogood_len_sum += stats.full_nogood_len_sum;
                 agg.internal_nodes += stats.internal_nodes;
                 if agg.nodes_by_level.len() < stats.nodes_by_level.len() {
                     agg.nodes_by_level.resize(stats.nodes_by_level.len(), 0);
@@ -732,9 +735,12 @@ fn search_sync_parallel(
     let found = result.lock().unwrap().clone();
     if verbose {
         eprintln!(
-            "sync_walker(parallel x{}): nodes={} cap_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?} time_to_first_leaf={}",
+            "sync_walker(parallel x{}): nodes={} cap_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?} time_to_first_leaf={} avg_nogood={:.1}/{:.1} ({:.2}x shrink)",
             n_workers, stats.nodes_visited, stats.capacity_rejects, stats.rule_rejects, stats.sat_unsat, stats.leaves_reached, stats.max_level_reached, elapsed,
             stats.time_to_first_leaf.map(|t| format!("{:.3}s", t)).unwrap_or_else(|| "(never)".into()),
+            if stats.sat_unsat > 0 { stats.nogood_len_sum as f64 / stats.sat_unsat as f64 } else { 0.0 },
+            if stats.sat_unsat > 0 { stats.full_nogood_len_sum as f64 / stats.sat_unsat as f64 } else { 0.0 },
+            if stats.nogood_len_sum > 0 { stats.full_nogood_len_sum as f64 / stats.nogood_len_sum as f64 } else { 1.0 },
         );
         let ttc = project_ttc(&stats, problem.n, elapsed.as_secs_f64(), n_workers);
         eprintln!("{}", ttc);
@@ -830,6 +836,7 @@ fn search_sync_serial(
             rule_rejects: 0, sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
             nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
             time_to_first_leaf: None,
+        nogood_len_sum: 0, full_nogood_len_sum: 0,
         }, start.elapsed());
     }
 
@@ -844,6 +851,7 @@ fn search_sync_serial(
         nodes_by_level: vec![0; ctx.depth + 1],
         children_total: 0, internal_nodes: 0,
         time_to_first_leaf: None,
+        nogood_len_sum: 0, full_nogood_len_sum: 0,
     };
 
     let deadline = if cfg.sat_secs > 0 {
@@ -1088,6 +1096,9 @@ fn dfs(
                 }
             } else {
                 stats.sat_unsat += 1;
+                let (ng, full) = solver.last_nogood_stats();
+                stats.nogood_len_sum += ng as u64;
+                stats.full_nogood_len_sum += full as u64;
             }
             memo.entry(sig).or_insert(());
         }
