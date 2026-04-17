@@ -668,6 +668,40 @@ fn tuple_reachable(state: &State, ctx: &Ctx) -> bool {
     false
 }
 
+/// Tighter capacity check using dynamic (actually-pending) pair
+/// contributions rather than the static max_remaining[level] bound.
+///
+/// Rationale: harvest_forced may pin bits at positions the walker
+/// hasn't reached yet.  A pair with BOTH endpoints pinned — whether
+/// walker-placed or SAT-harvested — is fully determined and its
+/// contribution is already in `sums[s]`.  The static max_remaining
+/// counts it as "still pending," overestimating remaining capacity.
+///
+/// Dynamic capacity per lag = Σ over pairs where at least one
+/// endpoint is still unset.  Per-lag cost is O(n); per-level cost
+/// is O(n²); per DFS call is O(n²) — cheap compared to propagate_only.
+fn dynamic_capacity_violated(state: &State, ctx: &Ctx) -> bool {
+    for s in 1..ctx.n {
+        let mut dyn_cap: i32 = 0;
+        for i in 0..ctx.n.saturating_sub(s) {
+            for kind in 0u8..3 {
+                if state.bit(kind, i) == 0 || state.bit(kind, i + s) == 0 {
+                    dyn_cap += kind_coeff(kind) as i32;
+                }
+            }
+        }
+        for i in 0..ctx.m.saturating_sub(s) {
+            if state.bit(3, i) == 0 || state.bit(3, i + s) == 0 {
+                dyn_cap += 2;
+            }
+        }
+        if (state.sums[s] as i32).unsigned_abs() as i32 > dyn_cap {
+            return true;
+        }
+    }
+    false
+}
+
 /// Return true if any lag's running sum blows past its remaining capacity.
 /// At level `state.level`, max_remaining applies to pairs not yet closed.
 fn capacity_violated(state: &State, ctx: &Ctx) -> bool {
@@ -1258,7 +1292,11 @@ fn dfs(
             if sat == Some(true) {
                 harvest_forced(solver, state, ctx);
                 rebuild_sums(state, ctx);
-                if !capacity_violated(state, ctx) {
+                // After harvest: many bits beyond the walker frontier
+                // may now be set (via rule propagation into the
+                // middle). Use the tighter dynamic capacity check
+                // which accounts for pairs already fully determined.
+                if !capacity_violated(state, ctx) && !dynamic_capacity_violated(state, ctx) {
                     memo.insert(sig, ());
                     if dfs(solver, state, ctx, memo, stats, deadline, found) {
                         return true;
