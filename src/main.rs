@@ -282,6 +282,10 @@ struct SearchConfig {
     /// flag and the `--mdd-k=` / `--mdd-extend=` shortcuts also set this
     /// when it's still `None`.
     wz_mode: Option<WzMode>,
+    /// For `--wz=xyzw`: tuple iteration strategy. "all" = one solve,
+    /// tuple=None, learnt clauses transfer across tuples. "each" =
+    /// legacy per-tuple loop with sum PB constraints. Default "all".
+    xyzw_tuple_mode: String,
 }
 
 /// Which (Z, W) candidate producer feeds the shared XY SAT stage.
@@ -303,6 +307,11 @@ enum WzMode {
     /// MDD boundary walker feeding the SolveW → SolveZ two-stage SAT
     /// pipeline. `run_mdd_sat_search` with `wz_together = false`.
     Apart,
+    /// No outer boundary walker at all: build one SAT problem over all
+    /// four sequences (X, Y, Z, W) with the full ZW+XY MDD as a native
+    /// constraint and the Turyn identity as per-lag quad PB, then solve
+    /// it. See `solve_xyzw` for the per-call internals.
+    Xyzw,
 }
 
 impl Default for SearchConfig {
@@ -329,6 +338,7 @@ impl Default for SearchConfig {
             mdd_extend: 0,
             wz_together: false,
             wz_mode: None,
+            xyzw_tuple_mode: String::from("all"),
         }
     }
 }
@@ -2498,22 +2508,23 @@ fn run_mdd_sat_search(
         v
     };
 
-    // FULL_MDD=1 prototype: skip the boundary→W→Z→XY pipeline entirely.
-    // For each tuple, build a single SAT problem covering all 4 sequences
-    // with the full ZW+XY MDD as a native constraint, and solve once.
-    if std::env::var("FULL_MDD").ok().as_deref() == Some("1") {
+    // --wz=xyzw: skip the boundary→W→Z→XY pipeline entirely. Build a
+    // single SAT problem covering all 4 sequences with the full ZW+XY
+    // MDD as a native constraint, and solve once (or once per tuple if
+    // --wz-xyzw-tuples=each).
+    let early_wz_mode = cfg.effective_wz_mode();
+    if early_wz_mode == WzMode::Xyzw {
         let run_start = Instant::now();
-        let conflict_limit: u64 = std::env::var("FULL_MDD_CONFLICTS")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let conflict_limit: u64 = cfg.conflict_limit;
         // Tuple control:
-        //   FULL_MDD_TUPLES=all     (default) — single solve, no sum PB;
+        //   --wz-xyzw-tuples=all     (default) — single solve, no sum PB;
         //     energy identity is implied by the Turyn quad PB. Any tuple
-        //     found is accepted.
-        //   FULL_MDD_TUPLES=each    — legacy loop, per-tuple sum PB.
+        //     found is accepted, with learnt clauses transferring across tuples.
+        //   --wz-xyzw-tuples=each    — legacy loop, per-tuple sum PB.
         //     Useful for debugging or comparison.
-        let tuple_mode = std::env::var("FULL_MDD_TUPLES").unwrap_or_else(|_| "all".into());
+        let tuple_mode = cfg.xyzw_tuple_mode.clone();
         if verbose {
-            eprintln!("FULL_MDD=1: mode={} {} tuples, k={} (depth={}) conflict_limit={}",
+            eprintln!("--wz=xyzw: mode={} {} tuples, k={} (depth={}) conflict_limit={}",
                 tuple_mode, tuples.len(), k, mdd.depth, conflict_limit);
         }
         let mut found: Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)> = None;
@@ -2566,7 +2577,7 @@ fn run_mdd_sat_search(
         }
         let elapsed = run_start.elapsed();
         if verbose {
-            println!("\nFULL_MDD=1 summary: {} total decisions, {} propagations, elapsed={:?}",
+            println!("\n--wz=xyzw summary: {} total decisions, {} propagations, elapsed={:?}",
                 total_decisions, total_propagations, elapsed);
         }
         let found_solution = found.is_some();
@@ -5112,6 +5123,12 @@ fn print_help() {
     eprintln!("                           pipeline. Implied by --mdd-k=N and --mdd-extend=N.");
     eprintln!("  --wz=together            MDD boundary walker + combined W+Z SAT call (one");
     eprintln!("                           solve produces both middles). Alias: --wz-together.");
+    eprintln!("  --wz=xyzw                No outer walker — one SAT call over all 4 sequences");
+    eprintln!("                           with the full ZW+XY MDD as a native constraint and");
+    eprintln!("                           the Turyn identity as per-lag quad PB. BDKR canonical");
+    eprintln!("                           form enforced as SAT clauses. See solve_xyzw.");
+    eprintln!("  --wz-xyzw-tuples=<all|each>  (with --wz=xyzw) 'all' = one solve (default);");
+    eprintln!("                           'each' = legacy per-tuple loop.");
     eprintln!("  --stochastic             Stochastic local search over all four sequences");
     eprintln!("  --stochastic-secs=<S>    Stochastic search, stop after S seconds (default: 10)");
     eprintln!();
@@ -5237,14 +5254,23 @@ fn parse_args() -> SearchConfig {
                 "cross" => WzMode::Cross,
                 "together" => WzMode::Together,
                 "apart" => WzMode::Apart,
+                "xyzw" => WzMode::Xyzw,
                 _ => {
-                    eprintln!("error: --wz must be one of cross|together|apart (got '{}')\n", v);
+                    eprintln!("error: --wz must be one of cross|together|apart|xyzw (got '{}')\n", v);
                     print_help();
                     std::process::exit(1);
                 }
             };
             cfg.wz_mode = Some(mode);
             cfg.wz_together = matches!(mode, WzMode::Together);
+        } else if let Some(v) = arg.strip_prefix("--wz-xyzw-tuples=") {
+            match v {
+                "all" | "each" => cfg.xyzw_tuple_mode = v.into(),
+                _ => {
+                    eprintln!("error: --wz-xyzw-tuples must be 'all' or 'each' (got '{}')\n", v);
+                    std::process::exit(1);
+                }
+            }
         } else if let Some(v) = arg.strip_prefix("--mdd-k=") {
             cfg.mdd_k = v.parse().unwrap_or(8);
             // Shorthand: --mdd-k=N alone implies --wz=apart.
@@ -5607,6 +5633,7 @@ fn main() {
             WzMode::Cross => "cross",
             WzMode::Together => "together",
             WzMode::Apart => "apart",
+            WzMode::Xyzw => "xyzw",
         };
         println!("Unified search (--wz={}): found_solution={}, elapsed={:.3?}\n  {}",
             label, report.found_solution, report.elapsed, run_info());
@@ -5684,6 +5711,7 @@ mod tests {
             mdd_extend: 0,
             wz_together: false,
             wz_mode: None,
+            xyzw_tuple_mode: String::from("all"),
         };
         let report = run_hybrid_search(&cfg, false);
         assert!(report.found_solution, "n=4 hybrid should find solution");
