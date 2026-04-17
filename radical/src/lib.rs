@@ -1704,44 +1704,36 @@ impl Solver {
         }
 
         if self.propagate().is_some() {
-            // Simple nogood: the conjunction of assumptions is infeasible
-            // against the level-0 clause database + learnt clauses, so
-            // add `¬a_1 ∨ ¬a_2 ∨ … ∨ ¬a_k` as a permanent clause. This
-            // gives the caller's next call with the same prefix a
-            // single-step UNSAT via unit propagation on the nogood.
+            // Nogood: the disjunction of negated assumption literals.
+            // Sound because the conjunction of assumptions just hit a
+            // solver-level conflict, so `¬a_1 ∨ … ∨ ¬a_k` is a valid
+            // consequence of the root clause DB. Future calls with the
+            // same (or overlapping) prefix short-circuit via unit
+            // propagation on the nogood.
             //
-            // Larger than a 1-UIP clause would be (it includes every
-            // assumption, not just the UIP dependencies) but correct
-            // and cheap to add. Redundant assumptions + clause DB
-            // deletion will garbage-collect the loose ones.
+            // We deliberately do NOT use analyze() here: its 1-UIP
+            // logic takes a "Reason::Decision" shortcut at the first
+            // decision it walks to, producing a UNIT clause that's
+            // only valid under the OTHER assumptions still in scope.
+            // That's unsound as a permanent (level-0) clause and in
+            // earlier attempts caused known-SAT prefixes of TT(8)+
+            // to be incorrectly rejected.
             self.backtrack(0);
-            // Filter to genuinely-undef-at-root-level assumptions. At
-            // level 0, literals already forced by unit clauses don't
-            // need to be in the nogood (they're universally true).
             let mut nogood: Vec<Lit> = Vec::with_capacity(assumptions.len());
             for &lit in assumptions {
                 match self.lit_value(lit) {
                     LBool::True | LBool::Undef => nogood.push(-lit),
                     LBool::False => {
-                        // An assumption is already false at root; the
-                        // prefix is trivially UNSAT and no new clause
-                        // needs to be added (existing clauses already
-                        // refute it).
+                        // Assumption is already root-level false; the
+                        // prefix is trivially UNSAT via an existing
+                        // clause. No new learning needed.
                         return Some(false);
                     }
                 }
             }
             if nogood.is_empty() {
-                // No assumptions left to refute (all were root-level
-                // true). This means the problem itself is now UNSAT.
                 self.ok = false;
-            } else if nogood.len() == 1 {
-                // Unit: install via add_clause (level-0 unit clause).
-                // add_clause will propagate it through the watch
-                // mechanism on the next solve.
-                self.add_clause(nogood);
             } else {
-                // Multi-literal nogood clause.
                 self.add_clause(nogood);
             }
             return Some(false);
