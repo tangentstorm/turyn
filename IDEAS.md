@@ -1659,6 +1659,61 @@ freqs (radical/src/lib.rs:343). Use those to compute `|Z(ω)|²` at
 the SAT grid — guaranteed redundant with SAT spectral, so post-hoc
 becomes a no-op. **Same idea as S3 in different implementation.**
 
+### S1. Pre-DFT at W-tightest bin before Z FFT — *tested, rejected (null)*
+
+Hypothesis: 99.996% of Z solutions fail the post-hoc spectral-pair
+check; an O(n) DFT at W's single tightest frequency bin (where W's
+budget is smallest, so most likely to fail) would reject most Z's
+without ever computing the full O(M log M) rfft.
+
+Implementation: added `dft_magnitude_sq_at_bin` + `argmax_spectrum`
+to spectrum.rs; plumbed `w_tight_bin` through `SolveZWork`; in the Z
+post-hoc block (mdd_pipeline.rs:1980-2036), compute
+`|Z(ω_tight)|² + w_spectrum[tight]` first, `continue` on reject;
+only fall back to the full FFT + all-bins pair check on pass.
+
+**Detection counters**: added `flow_z_pair_fail_tight`, reported
+alongside `z_pair_fail` in the pipeline-flow block as
+`[tight-bin caught N = X%]`.
+
+**Measurement** (n=26 --wz=apart --mdd-k=7 --sat-secs=30):
+- Tight-bin rejection rate: 74-75% of all Z pair fails (good!).
+- TTC: head-to-head on a warm machine, S5+S1 ran 31.3-35.3m, S5 alone
+  ran 30.4-31.9m — S1 is neutral-to-slightly-worse.
+
+**Root cause of the null**: Z SAT runs at 0.0 decisions/solve at
+n=26 — every Z is forced at level 0.  Per-item Z SolveZ cost
+(5.4M items in 30s ≈ 8.9 µs/item/worker across 16 workers) is
+dominated by SAT *setup* (spectral-table attach, `fill_z_solver`,
+checkpoint/restore, blocking-clause handling) — NOT the FFT.
+Skipping FFTs on 74% of Z's saves real work but doesn't move the
+stage's critical path.
+
+**Lever targeting lesson**: "rate" improvements need to hit the
+dominant cost, not the most intuitive one.  max_z is already
+capped at 16 and only 1.2 Z solutions are returned per item on
+average, so S7 (increasing max_z) won't help either — most items
+run out of Z candidates before hitting the cap.  The next
+productive levers for the Z stage are direct setup-cost reductions:
+reusing `SpectralConstraint`'s `re/im/re_boundary/im_boundary`
+Vec<f64> allocations across items, or batching items by `z_bits`
+so `z_prep` + boundary-DFT are amortized over many `w_vals`.
+Reverted; kept in the idea pool below as a building block for a
+future "full pair-check via single-bin DFT + on-demand extra bins"
+design that skips the full FFT entirely.
+
+**Additional diagnostic findings**:
+- `SKIP_Z_SPECTRAL=1` env (bypass `SpectralConstraint` build/attach
+  in SolveZ): TTC 30.0/31.2/32.5m vs S5 baseline 30.4/30.5/30.5/31.0/
+  31.9m — indistinguishable.  Spectral-constraint setup is NOT the
+  dominant cost either.
+- Thread scaling (n=26 wz=apart mdd-k=7 20s): 63/261/491/811 eff
+  bnd/s at 1/4/8/16 threads → ~80% scaling efficiency at 16 threads
+  (13× speedup on 16 cores).  Some contention but not catastrophic.
+- TTC variance on this 16-core shared machine is ±5m across 30-s
+  samples (baseline 30-35m, noise dominates micro-optimizations
+  below ~10% absolute change).
+
 ### S5. Reduce SPECTRAL_FREQS for wz=apart — *accepted, TTC −20%*
 
 F1 (wz=together) reduced SPECTRAL_FREQS from 563 to 17 for a 6.2×
