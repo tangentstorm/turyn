@@ -31,6 +31,15 @@ use crate::types::{PackedSeq, Problem, SumTuple};
 use crate::enumerate::enumerate_sum_tuples;
 use crate::legacy_search::{SearchReport, SearchStats};
 
+/// Shared clause exchange between parallel workers.  Each worker
+/// appends its newly-learnt nogood and periodically pulls unread
+/// peers' clauses into its own solver.  `seq` is monotonically
+/// increasing; a worker's local `read_idx` tracks the next
+/// unread index.
+pub(crate) struct ClauseExchange {
+    pub clauses: std::sync::Mutex<Vec<Vec<i32>>>,
+}
+
 /// Config slice the walker needs. Pulled from `SearchConfig` at dispatch.
 #[derive(Clone)]
 pub(crate) struct SyncConfig {
@@ -43,6 +52,8 @@ pub(crate) struct SyncConfig {
     pub random_seed: Option<u64>,
     /// Shared cancel flag for parallel multi-start workers.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Shared learnt-clause exchange. `None` for single-worker mode.
+    pub exchange: Option<Arc<ClauseExchange>>,
 }
 
 /// Immutable context computed once per search.
@@ -76,6 +87,10 @@ struct Ctx {
     /// prune branches where no valid final sum tuple is reachable from
     /// the current partial sums + remaining free-bit budgets.
     valid_tuples: Vec<SumTuple>,
+    /// Cross-worker clause exchange (shared across all parallel
+    /// workers).  Each worker publishes newly-learnt nogoods on
+    /// propagate_only UNSAT and pulls peer clauses periodically.
+    exchange: Option<Arc<ClauseExchange>>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -157,10 +172,17 @@ fn kind_xy_len(kind: u8, n: usize, m: usize) -> usize {
     }
 }
 
-fn build_ctx_seeded(problem: Problem, seed: u64, cancel: Option<Arc<AtomicBool>>, start: Instant) -> Ctx {
+fn build_ctx_seeded(
+    problem: Problem,
+    seed: u64,
+    cancel: Option<Arc<AtomicBool>>,
+    exchange: Option<Arc<ClauseExchange>>,
+    start: Instant,
+) -> Ctx {
     let mut ctx = build_ctx(problem);
     ctx.seed = seed;
     ctx.cancel = cancel;
+    ctx.exchange = exchange;
     ctx.start = start;
     ctx
 }
@@ -244,6 +266,7 @@ fn build_ctx(problem: Problem) -> Ctx {
         closure_events, max_remaining,
         seed: 0, cancel: None, start: Instant::now(),
         valid_tuples,
+        exchange: None,
     }
 }
 
@@ -733,6 +756,11 @@ pub(crate) struct SyncStats {
     /// the ratio `nogood_len_sum / full_nogood_len_sum` shows how
     /// effective 1-UIP analysis is at shrinking.
     pub full_nogood_len_sum: u64,
+    /// Worker's local index into the shared clause exchange; count of
+    /// peer clauses it has already imported.
+    pub peer_clauses_read: u64,
+    /// Count of peer clauses this worker has added to its own solver.
+    pub peer_clauses_imported: u64,
 }
 
 pub(crate) fn search_sync(
@@ -775,7 +803,11 @@ fn search_sync_parallel(
         nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
         time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
+        peer_clauses_read: 0, peer_clauses_imported: 0,
     }));
+    let exchange = Arc::new(ClauseExchange {
+        clauses: std::sync::Mutex::new(Vec::new()),
+    });
 
     thread::scope(|s| {
         for worker_id in 0..n_workers {
@@ -783,6 +815,7 @@ fn search_sync_parallel(
             let cancel = Arc::clone(&cancel);
             let result = Arc::clone(&result);
             let stats_agg = Arc::clone(&stats_agg);
+            let exchange = Arc::clone(&exchange);
             s.spawn(move || {
                 // Worker 0: seed=0 → score-sorted best-first siblings.
                 // Worker k>0: seed=k → randomised ordering distinct
@@ -790,6 +823,7 @@ fn search_sync_parallel(
                 let worker_cfg = SyncConfig {
                     random_seed: Some(worker_id as u64),
                     cancel: Some(Arc::clone(&cancel)),
+                    exchange: Some(Arc::clone(&exchange)),
                     ..cfg
                 };
                 let (sol, stats, _) = search_sync_serial(problem, &worker_cfg, false, start);
@@ -811,6 +845,7 @@ fn search_sync_parallel(
                 agg.children_total += stats.children_total;
                 agg.nogood_len_sum += stats.nogood_len_sum;
                 agg.full_nogood_len_sum += stats.full_nogood_len_sum;
+                agg.peer_clauses_imported += stats.peer_clauses_imported;
                 agg.internal_nodes += stats.internal_nodes;
                 if agg.nodes_by_level.len() < stats.nodes_by_level.len() {
                     agg.nodes_by_level.resize(stats.nodes_by_level.len(), 0);
@@ -835,12 +870,13 @@ fn search_sync_parallel(
     let found = result.lock().unwrap().clone();
     if verbose {
         eprintln!(
-            "sync_walker(parallel x{}): nodes={} cap_rejects={} tuple_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?} time_to_first_leaf={} avg_nogood={:.1}/{:.1} ({:.2}x shrink)",
+            "sync_walker(parallel x{}): nodes={} cap_rejects={} tuple_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?} time_to_first_leaf={} avg_nogood={:.1}/{:.1} ({:.2}x shrink) peer_imports={}",
             n_workers, stats.nodes_visited, stats.capacity_rejects, stats.tuple_rejects, stats.rule_rejects, stats.sat_unsat, stats.leaves_reached, stats.max_level_reached, elapsed,
             stats.time_to_first_leaf.map(|t| format!("{:.3}s", t)).unwrap_or_else(|| "(never)".into()),
             if stats.sat_unsat > 0 { stats.nogood_len_sum as f64 / stats.sat_unsat as f64 } else { 0.0 },
             if stats.sat_unsat > 0 { stats.full_nogood_len_sum as f64 / stats.sat_unsat as f64 } else { 0.0 },
             if stats.nogood_len_sum > 0 { stats.full_nogood_len_sum as f64 / stats.nogood_len_sum as f64 } else { 1.0 },
+            stats.peer_clauses_imported,
         );
         let ttc = project_ttc(&stats, problem.n, elapsed.as_secs_f64(), n_workers);
         eprintln!("{}", ttc);
@@ -920,7 +956,7 @@ fn search_sync_serial(
     start: Instant,
 ) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SyncStats, std::time::Duration) {
     let seed = cfg.random_seed.unwrap_or(0);
-    let ctx = build_ctx_seeded(problem, seed, cfg.cancel.clone(), start);
+    let ctx = build_ctx_seeded(problem, seed, cfg.cancel.clone(), cfg.exchange.clone(), start);
     let mut solver = build_solver(problem, &cfg.sat_config);
     if cfg.conflict_limit > 0 {
         solver.set_conflict_limit(cfg.conflict_limit);
@@ -937,6 +973,7 @@ fn search_sync_serial(
             nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
             time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
+        peer_clauses_read: 0, peer_clauses_imported: 0,
         }, start.elapsed());
     }
 
@@ -952,6 +989,7 @@ fn search_sync_serial(
         children_total: 0, internal_nodes: 0,
         time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
+        peer_clauses_read: 0, peer_clauses_imported: 0,
     };
 
     let deadline = if cfg.sat_secs > 0 {
@@ -994,6 +1032,29 @@ fn dfs(
     }
     if state.level as u64 > stats.max_level_reached {
         stats.max_level_reached = state.level as u64;
+    }
+
+    // Pull peer clauses from the shared exchange every 256 nodes.
+    // Cheap: one Mutex lock + index compare + a handful of add_clause
+    // calls. add_clause is safe mid-search because the walker operates
+    // at decision level 0 between dfs() frames (propagate_only
+    // backtracks on every entry/exit).
+    if stats.nodes_visited & 0xFF == 0 {
+        if let Some(ex) = &ctx.exchange {
+            let local_next = stats.peer_clauses_read as usize;
+            if let Ok(v) = ex.clauses.lock() {
+                if v.len() > local_next {
+                    // Clone the new clauses out so we can drop the lock.
+                    let pending: Vec<Vec<i32>> = v[local_next..].to_vec();
+                    stats.peer_clauses_read = v.len() as u64;
+                    drop(v);
+                    for clause in pending {
+                        solver.add_clause(clause);
+                        stats.peer_clauses_imported += 1;
+                    }
+                }
+            }
+        }
     }
 
     if state.level >= ctx.depth {
@@ -1208,6 +1269,20 @@ fn dfs(
                 let (ng, full) = solver.last_nogood_stats();
                 stats.nogood_len_sum += ng as u64;
                 stats.full_nogood_len_sum += full as u64;
+                // Publish the just-learnt nogood to peer workers, but
+                // only if it's small enough to be useful. Long clauses
+                // (Turyn nogoods are typically ~n lits) rarely fire
+                // via watches and bloat the clause DB, so filter.
+                const MAX_SHARED_LEN: usize = 16;
+                if let Some(ex) = &ctx.exchange {
+                    if let Some(clause) = solver.take_last_learnt_clause() {
+                        if clause.len() <= MAX_SHARED_LEN {
+                            if let Ok(mut v) = ex.clauses.lock() {
+                                v.push(clause);
+                            }
+                        }
+                    }
+                }
             }
             memo.entry(sig).or_insert(());
         }

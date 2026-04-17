@@ -711,6 +711,9 @@ pub struct Solver {
     // propagate_only stats
     last_nogood_len: usize,
     last_full_nogood_len: usize,
+    /// Most recently learnt nogood (from `propagate_only`), cloned so
+    /// callers can publish it to a cross-worker clause exchange.
+    last_learnt_clause: Option<Vec<Lit>>,
 
     // Restart (EMA) — glucose-style adaptive restarts
     ema_lbd_fast: f64,   // fast EMA of recent LBD (α ≈ 1/32)
@@ -806,6 +809,7 @@ impl Solver {
             propagations: 0,
             last_nogood_len: 0,
             last_full_nogood_len: 0,
+            last_learnt_clause: None,
             ema_lbd_fast: 0.0,
             ema_lbd_slow: 0.0,
             ema_restart_block: 0,
@@ -1739,6 +1743,11 @@ impl Solver {
 
             self.last_nogood_len = filtered.len();
             self.last_full_nogood_len = assumptions.len();
+            self.last_learnt_clause = if filtered.is_empty() {
+                None
+            } else {
+                Some(filtered.clone())
+            };
 
             if filtered.is_empty() {
                 self.ok = false;
@@ -1758,6 +1767,14 @@ impl Solver {
     /// full-assumption nogood.
     pub fn last_nogood_stats(&self) -> (usize, usize) {
         (self.last_nogood_len, self.last_full_nogood_len)
+    }
+
+    /// Take the last learnt clause from `propagate_only`, clearing the
+    /// slot.  Callers can forward this clause to peer solvers for
+    /// cross-worker clause sharing.  Returns `None` if no clause was
+    /// learnt since the last take.
+    pub fn take_last_learnt_clause(&mut self) -> Option<Vec<Lit>> {
+        self.last_learnt_clause.take()
     }
 
     /// Number of variables.
