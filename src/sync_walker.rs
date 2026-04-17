@@ -478,6 +478,7 @@ pub(crate) struct SyncStats {
     pub sat_unsat: u64,
     pub leaves_reached: u64,
     pub learned_clauses_final: u64,
+    pub max_level_reached: u64,
 }
 
 pub(crate) fn search_sync(
@@ -499,7 +500,7 @@ pub(crate) fn search_sync(
         eprintln!("sync_walker: base solver UNSAT — canonical constraints inconsistent");
         return (None, SyncStats {
             nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-            sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0,
+            sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
         }, start.elapsed());
     }
 
@@ -509,7 +510,7 @@ pub(crate) fn search_sync(
     let mut memo: FxHashMap<u64, ()> = FxHashMap::default();
     let mut stats = SyncStats {
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-        sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0,
+        sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
     };
 
     let deadline = if cfg.sat_secs > 0 {
@@ -522,8 +523,8 @@ pub(crate) fn search_sync(
     let elapsed = start.elapsed();
     if verbose {
         eprintln!(
-            "sync_walker: nodes={} memo_hits={} cap_rejects={} sat_unsat={} leaves={} elapsed={:?}",
-            stats.nodes_visited, stats.memo_hits, stats.capacity_rejects, stats.sat_unsat, stats.leaves_reached, elapsed,
+            "sync_walker: nodes={} memo_hits={} cap_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?}",
+            stats.nodes_visited, stats.memo_hits, stats.capacity_rejects, stats.sat_unsat, stats.leaves_reached, stats.max_level_reached, elapsed,
         );
     }
     (found, stats, elapsed)
@@ -544,6 +545,9 @@ fn dfs(
         if Instant::now() >= d { return false; }
     }
     stats.nodes_visited += 1;
+    if state.level as u64 > stats.max_level_reached {
+        stats.max_level_reached = state.level as u64;
+    }
 
     if state.level >= ctx.depth {
         stats.leaves_reached += 1;
@@ -648,7 +652,28 @@ fn dfs(
     }
 
     // Score-ordered siblings: ascending score (low pressure first).
-    candidates.sort_by_key(|c| c.score);
+    // Sibling ordering. Set `SYNC_SORT=none` to try placements in
+    // natural bit order (for A/B comparison), `=random` for pseudo-random
+    // ordering, default is ascending score (low pressure first).
+    match std::env::var("SYNC_SORT").ok().as_deref() {
+        Some("none") => {}
+        Some("random") => {
+            use std::hash::Hasher;
+            let mut h = rustc_hash::FxHasher::default();
+            for &lit in &state.assumptions { h.write_i32(lit); }
+            let seed = h.finish();
+            // Deterministic shuffle via LCG keyed on prefix.
+            let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            for i in (1..candidates.len()).rev() {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let j = (rng >> 32) as usize % (i + 1);
+                candidates.swap(i, j);
+            }
+        }
+        _ => {
+            candidates.sort_by_key(|c| c.score);
+        }
+    }
 
     // Snapshot the ENTIRE state.bits vector before trying candidates.
     // harvest_forced during a candidate's SAT call may write bits far
