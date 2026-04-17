@@ -36,8 +36,9 @@ pub(crate) struct SyncConfig {
     pub sat_secs: u64,
     pub sat_config: radical::SolverConfig,
     pub conflict_limit: u64,
-    /// Per-worker random-ordering seed for parallel multi-start. `None`
-    /// falls back to the `SYNC_SORT` env var (sort/none/random).
+    /// Per-worker random-ordering seed. Worker 0 uses best-first
+    /// (score-ordered) siblings; workers 1.. use random ordering with
+    /// this seed so each explores a different region of the tree.
     pub random_seed: Option<u64>,
     /// Shared cancel flag for parallel multi-start workers.
     pub cancel: Option<Arc<AtomicBool>>,
@@ -58,10 +59,9 @@ struct Ctx {
     /// Capacity bound per (level, lag): max `|S(s)|` achievable from
     /// pairs not yet closed after reaching `level`.
     max_remaining: Vec<Vec<i32>>,
-    /// Sibling ordering mode: "sort" (score asc), "none", "random".
-    sort_mode: String,
-    /// Seed for "random" mode. Mixed into the LCG so parallel workers
-    /// explore independent orderings.
+    /// Seed mixed into the sibling-shuffle LCG. Worker 0 uses seed 0
+    /// and falls back to score-ordered siblings; workers 1.. use
+    /// random ordering seeded by their worker id.
     seed: u64,
     /// Shared cancel flag for parallel multi-start: any worker that
     /// finds a solution sets it so the others bail out promptly.
@@ -151,11 +151,6 @@ fn build_ctx_seeded(problem: Problem, seed: u64, cancel: Option<Arc<AtomicBool>>
     let mut ctx = build_ctx(problem);
     ctx.seed = seed;
     ctx.cancel = cancel;
-    if seed != 0 {
-        // Parallel workers use random ordering by default so each
-        // explores a different region of the tree.
-        ctx.sort_mode = "random".into();
-    }
     ctx
 }
 
@@ -225,12 +220,11 @@ fn build_ctx(problem: Problem) -> Ctx {
         }
     }
 
-    let sort_mode = std::env::var("SYNC_SORT").ok().unwrap_or_else(|| "sort".into());
     Ctx {
         n, m, depth,
         pos_order, pos_to_level,
         closure_events, max_remaining,
-        sort_mode, seed: 0, cancel: None,
+        seed: 0, cancel: None,
     }
 }
 
@@ -565,46 +559,19 @@ fn capacity_violated(state: &State, ctx: &Ctx) -> bool {
 
 /// Heuristic score for sibling ordering. Lower = more promising.
 ///
-/// Measures "tightness" of the running sums relative to the budget of
-/// pending pairs at the current post-placement level. A sibling whose
-/// sums are close to 0 with ample remaining capacity scores low; one
-/// whose sums already saturate the budget scores high.
-///
-/// SYNC_SCORE=ratio    (default) sum_s (S(s)^2 / cap[s]^2)
-/// SYNC_SCORE=abs      sum_s |S(s)| * weight(s)
-/// SYNC_SCORE=tight    favor states where cap[s] - |S(s)| is small per lag
-///                     (i.e. states where we must commit specific values soon)
+/// Sum over lags of (S(s)^2 / cap[s]^2) scaled, where cap is the
+/// remaining capacity at the current post-placement level. Measures
+/// "tightness" of the sums relative to how much the future can push
+/// them: low = close to target 0 with slack to spare, high = already
+/// saturating.
 fn score_state(state: &State, ctx: &Ctx) -> i64 {
     let lvl = state.level.min(ctx.depth);
     let caps = &ctx.max_remaining[lvl];
-    let mode = std::env::var("SYNC_SCORE").ok().unwrap_or_else(|| "ratio".into());
     let mut total: i64 = 0;
-    match mode.as_str() {
-        "abs" => {
-            for s in 1..ctx.n {
-                let v = (state.sums[s] as i64).abs();
-                // Weight short lags higher (they have more pairs pending).
-                let w = (ctx.n - s) as i64;
-                total += v * w;
-            }
-        }
-        "tight" => {
-            for s in 1..ctx.n {
-                let v = (state.sums[s] as i64).abs();
-                let c = caps[s] as i64;
-                // Prefer states where |S(s)| is close to cap (forces
-                // near-term commits) but not over.
-                let slack = (c - v).max(0);
-                total += slack * slack;
-            }
-        }
-        _ => {
-            for s in 1..ctx.n {
-                let v = state.sums[s] as i64;
-                let c = (caps[s] as i64).max(1);
-                total += (v * v * 1024) / (c * c);
-            }
-        }
+    for s in 1..ctx.n {
+        let v = state.sums[s] as i64;
+        let c = (caps[s] as i64).max(1);
+        total += (v * v * 1024) / (c * c);
     }
     total
 }
@@ -658,25 +625,18 @@ pub(crate) fn search_sync(
     verbose: bool,
 ) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SyncStats, std::time::Duration) {
     let start = Instant::now();
-
-    // Parallel multi-start: SYNC_PARALLEL=N spawns N worker threads,
-    // each running an independent full search with a different random
-    // ordering seed. First to find a solution wins; all workers share
-    // a cancel flag.
-    //
-    // Each worker has its own solver + clause DB, so learnt clauses
-    // do NOT transfer between workers (would require shared-state
-    // Send+Sync Solver, not currently available). The parallelism
-    // benefit comes purely from independent exploration of different
-    // regions of the search tree.
-    if let Some(n_workers) = std::env::var("SYNC_PARALLEL").ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n >= 2)
-    {
-        return search_sync_parallel(problem, cfg, verbose, n_workers, start);
-    }
-
-    search_sync_serial(problem, cfg, verbose, start)
+    // Always parallel: one worker per available CPU. Worker 0 runs
+    // best-first (score-sorted) siblings; workers 1.. each get a
+    // different LCG seed for randomised sibling ordering so they
+    // explore independent regions of the tree. Workers do NOT share
+    // learnt clauses (Solver isn't Clone/Send for its bulk state);
+    // the parallelism benefit is exploration diversity. First worker
+    // to find a solution cancels the others via a shared AtomicBool.
+    let n_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1);
+    search_sync_parallel(problem, cfg, verbose, n_workers, start)
 }
 
 fn search_sync_parallel(
@@ -705,11 +665,9 @@ fn search_sync_parallel(
             let result = Arc::clone(&result);
             let stats_agg = Arc::clone(&stats_agg);
             s.spawn(move || {
-                // Each worker seeds its random ordering differently.
-                // SAFETY: env vars are process-wide; worker 0 keeps the
-                // user-set SYNC_SORT unchanged, others override via a
-                // per-thread local variable path. We use a worker-scoped
-                // override by passing a seed through cfg.
+                // Worker 0: seed=0 → score-sorted best-first siblings.
+                // Worker k>0: seed=k → randomised ordering distinct
+                // from every other worker.
                 let worker_cfg = SyncConfig {
                     random_seed: Some(worker_id as u64),
                     cancel: Some(Arc::clone(&cancel)),
@@ -943,26 +901,22 @@ fn dfs(
     }
 
     // Score-ordered siblings: ascending score (low pressure first).
-    // Sibling ordering. `ctx.sort_mode` = "sort" (ascending score,
-    // default), "none" (natural bit order), or "random" (LCG shuffle
-    // keyed on the walker prefix + ctx.seed).
-    match ctx.sort_mode.as_str() {
-        "none" => {}
-        "random" => {
-            use std::hash::Hasher;
-            let mut h = rustc_hash::FxHasher::default();
-            h.write_u64(ctx.seed);
-            for &lit in &state.assumptions { h.write_i32(lit); }
-            let s = h.finish();
-            let mut rng = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            for i in (1..candidates.len()).rev() {
-                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                let j = (rng >> 32) as usize % (i + 1);
-                candidates.swap(i, j);
-            }
-        }
-        _ => {
-            candidates.sort_by_key(|c| c.score);
+    // Sibling ordering: worker 0 (seed=0) walks best-first by ascending
+    // score; workers 1.. shuffle by an LCG keyed on (worker seed, walker
+    // prefix) so each explores an independent region of the tree.
+    if ctx.seed == 0 {
+        candidates.sort_by_key(|c| c.score);
+    } else {
+        use std::hash::Hasher;
+        let mut h = rustc_hash::FxHasher::default();
+        h.write_u64(ctx.seed);
+        for &lit in &state.assumptions { h.write_i32(lit); }
+        let s = h.finish();
+        let mut rng = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        for i in (1..candidates.len()).rev() {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = (rng >> 32) as usize % (i + 1);
+            candidates.swap(i, j);
         }
     }
 
@@ -1004,53 +958,13 @@ fn dfs(
         if memo_hit {
             stats.memo_hits += 1;
         } else {
-            // SAT call mode:
-            //   SYNC_SKIP_SAT=1: pure walker, no SAT (rules (ii)-(vi) not enforced).
-            //   SYNC_SAT=full:   solve_with_assumptions (unlimited) — if SAT,
-            //                    extract solution and terminate immediately.
-            //   SYNC_SAT=limit:  solve_with_assumptions with conflict_limit=ctx.sat_budget.
-            //                    On Some(true) extract; Some(false) prune;
-            //                    None (limit reached) treat as indeterminate
-            //                    and keep walking. CDCL learns clauses that
-            //                    persist across the DFS.
-            //   default:         propagate_only (no decisions, fastest,
-            //                    no CDCL learning on UNSAT).
-            let skip_sat = std::env::var("SYNC_SKIP_SAT").ok().as_deref() == Some("1");
-            let sat_mode = std::env::var("SYNC_SAT").ok();
-            let sat = if skip_sat {
-                Some(true)
-            } else {
-                match sat_mode.as_deref() {
-                    Some("full") => {
-                        let r = solver.solve_with_assumptions(&state.assumptions);
-                        if r == Some(true) {
-                            // Solver has a full assignment; extract + return.
-                            let sol = extract_solution(solver, ctx);
-                            *found = Some(sol);
-                            return true;
-                        }
-                        r
-                    }
-                    Some("limit") => {
-                        let budget = std::env::var("SYNC_CL")
-                            .ok().and_then(|v| v.parse::<u64>().ok())
-                            .unwrap_or(100);
-                        solver.set_conflict_limit(solver.num_conflicts() + budget);
-                        let r = solver.solve_with_assumptions(&state.assumptions);
-                        solver.set_conflict_limit(0);
-                        if r == Some(true) {
-                            let sol = extract_solution(solver, ctx);
-                            *found = Some(sol);
-                            return true;
-                        }
-                        // None (conflict-limit hit) → indeterminate, keep walking.
-                        r.or(Some(true))
-                    }
-                    _ => solver.propagate_only(&state.assumptions),
-                }
-            };
+            // Per-level SAT call: propagate_only (no CDCL decisions,
+            // so cost is proportional to new propagation work). On
+            // UNSAT the solver installs a full-assumption nogood that
+            // short-circuits future calls with the same prefix.
+            let sat = solver.propagate_only(&state.assumptions);
             if sat == Some(true) {
-                if !skip_sat { harvest_forced(solver, state, ctx); }
+                harvest_forced(solver, state, ctx);
                 rebuild_sums(state, ctx);
                 if !capacity_violated(state, ctx) {
                     memo.insert(sig, ());
