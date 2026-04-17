@@ -1417,3 +1417,176 @@ several tuning decisions (`max_z=1`, conflict_limit=5K,
 mdd_extend=1) were made on xy/s or bnd/s and have never been
 retested against TTC; at minimum one sweep of each is cheap and
 either confirms the decision or flips it.
+
+**Update (2026-04-17)**: the native MDD propagator has since been
+wired (commits 9160e15 / 2f92c5a / 6cee2ce / c3d70ca / d516c64).
+Accessible via `--wz=xyzw` as a single-SAT-call architecture
+covering all four sequences; see the "April 2026 — MDD-as-
+propagator architecture experiments" section of
+`docs/OPTIMIZATION_LOG.md` for measurements. Short version: 99%+
+fewer XY solves confirmed, but per-solve cost grew to match —
+net TTC roughly flat at n=26 because `solve_with_assumptions`
+already transfers learnt clauses across leaves. `--wz=xyzw` is a
+correct proof-of-architecture; to beat the pipeline at n≥18 it
+needs a multi-sequence spectral constraint in `radical`.
+
+## SolveWZ enumeration ideas (not yet tried)
+
+- **Hand off timed-out SAT state to `--stochastic` worker**: When SolveWZ's
+  `solver.solve()` returns `None` (conflict limit hit), the solver has a
+  partial assignment representing its last exploration frontier. We could
+  extract the learnt clauses + current trail as a seed for a stochastic
+  local-search worker (e.g. one of the `TURYN_THREADS` workers running a
+  completely different algorithm on the same boundary).  The stochastic
+  worker operates on full ±1 sequences, so it'd need a bridge: read the
+  partial assignment → fill unassigned middle positions with random ±1 →
+  run WalkSAT-style local search.
+- **Seed blind SAT with `--stochastic` output**: Before `--wz=together`
+  starts, run `--stochastic` for a short budget (say 10s) to collect a
+  handful of candidate (W, Z) pairs at the canonical boundary.  Feed
+  those as blocking-clause seeds or initial-phase hints to each SolveWZ
+  SAT — the solver's first few decisions would then align with the
+  stochastic's best guess, dramatically improving hit rate on the
+  canonical pair.  Downside: `--stochastic` has no concept of the MDD
+  boundary, so we'd need to filter its output by boundary bits.
+- **Branch heuristic bias**: instead of random phases on every retry,
+  initialise the phase vector to match the "all +1" canonical prefix
+  (BDKR rule i pins x[0]=y[0]=z[0]=w[0]=+1, and similar tail pins).
+  The SAT would then explore canonical-biased region first, possibly
+  finding canonical TT in the first solve.
+
+## Fix performance regression of c8a0db5 (April 2026)
+
+**Context:** Commit `c8a0db5` ("turyn: add coupled WZ per-lag constraints to
+--wz=together (1460x speedup)") added a per-lag autocorrelation constraint
+encoded as quadratic PB on the union of W and Z agree literals. While the
+commit's claim of 1460x decision reduction at n=26 k=7 is real (decisions
+went from 216k to 148 per solve), the wall-clock impact across the broader
+benchmark spectrum was mixed:
+
+Baseline measurements (4 threads, mdd-5.bin, repeat=3-5):
+
+| Benchmark                          | main         | eloquent-bell-merged | Δ        |
+|------------------------------------|--------------|----------------------|----------|
+| n=18 wz=together mdd-k=5           | 0.07-1.6s    | 1.3-3.8s             | 5x worse |
+| n=20 wz=together mdd-k=5           | 0.8-3.3s     | 25-30s               | 8x worse |
+| n=26 wz=together mdd-k=5 (bnd/s)   | 0.3 bnd/s    | 1.85-3.22 bnd/s      | 6-9x better |
+| n=26 wz=together mdd-k=7 (bnd/s)   | 6.0 bnd/s    | 5.7 bnd/s            | neutral  |
+| n=18 wz=apart mdd-k=5              | 0.25-1.7s    | 4-10s (1 miss)       | 5x worse |
+| n=20 wz=apart mdd-k=5              | 0.14s ✓      | 30s ✗ (no solution)  | 200x worse|
+
+**Primary benchmark for this work**: `n=26 wz=together mdd-k=5` median
+eff bnd/s (4 threads, sat-secs=20).
+
+**Final state after fix-performance-regression branch**: ~1500 bnd/s
+at n=26 wz=together mdd-k=5 (**~560× the eloquent-bell-merged baseline**).
+All 35 tests pass. n=18-20 find solutions reliably. n=26 mdd-k=7
+throughput went from 6 bnd/s (main/eloquent tied) to 1800 bnd/s (300×).
+
+**Performance hypotheses (each ≈ one commit):**
+
+- **F1: SPECTRAL_FREQS reduction** — ACCEPTED. 6.2× speedup. Moved to
+  `docs/OPTIMIZATION_LOG.md`. Changed constant from 563 to 17.
+
+- **F2: Cache spectral cos/sin tables across SolveWZ calls** — TRIED,
+  rejected. Implemented `WzCombinedSpectral` struct in `PhaseBContext` with
+  Arc'd cos/sin/amplitudes + boundary-DFT fallback to `{w,z}_spectral_tables.pos_cos`.
+  Result at n=26 wz=together mdd-k=5 (4 threads, 7 runs): 16.43 median
+  eff bnd/s vs F1-only baseline 16.47 median — **neutral** (within noise).
+  After F1 reduced SPECTRAL_FREQS to 17, the per-boundary table allocation
+  is only ~2KB × 3 = 6KB per boundary, and the trig calls are only
+  17 × 31 = ~520. The SAT solve time dominates, so avoiding this setup
+  cost buys nothing. Reverted.
+
+- **F3: Cache trig values for spectral DFT** — TRIED (as F3a buffer reuse
+  in per-lag loop), within-noise improvement (~2.4%). Not decisive
+  enough to commit. The per-boundary DFT loop is fast after F1
+  (SPECTRAL_FREQS=17).
+
+- **F4: Skip per-lag constraint entirely** — TRIED, rejected.
+  Removing the per-lag quadratic PB constraint at n=26 k=7 gives
+  +35% bnd/s (1700 → 2300), but regresses n=22 finding rate from
+  3/10 to 1/10. The per-lag constraint provides real pruning — it
+  just has high setup cost. F9/F12 might be better approaches.
+
+- **F5: Reuse PbSetEq counts via dedup HashSet**: The current
+  `if !w_counts.contains(&c) { w_counts.push(c); }` inside a loop is
+  O(N²). Use a `HashSet<u32>` or a Vec built then sorted+deduped in
+  one shot.
+  Single commit: replace the contains-loop with sorted+dedup.
+
+- **F6: Lower per-attempt conflict budget for re-queue** — ACCEPTED.
+  93× speedup. Moved to `docs/OPTIMIZATION_LOG.md`. Budget lowered
+  from 5k/50k to 20/200.
+
+- **F7: Drop attempt re-queue entirely** — TRIED, rejected. With
+  MAX_WZ_ATTEMPTS = 1 (no re-queue), n=26 bnd/s jumps to 3320 but n=20
+  finding rate drops from 5/5 to 1/5. The re-queue provides diversity
+  (different random phases on each attempt) that's essential when the
+  conflict budget (after F6) is only 20. Reverted.
+
+- **F8: Coalesce small per-lag constraints into one**: For very-small
+  lags (s near n) the constraint has 0 or 1 terms — trivial. For very
+  large lags it can also be tight. The constraint addition overhead
+  (HashSet-style dedup of var watchers) is amortised over many calls,
+  but several lags have only 2-4 terms. Combine all lags' terms into
+  one bigger combined constraint (different `target_lo/hi` per lag is
+  a problem — would need to express as N × max_pairs ≤ ... using a
+  different encoding).
+  Single commit: investigate; may not be feasible without changing
+  constraint semantics.
+
+- **F9: Replace the per-lag quadratic PB-range with a leaner "agree
+  count" derived constraint**: The current encoding adds two quad terms
+  per mid-mid pair `(a,b)` and `(-a,-b)`. The watcher overhead per
+  variable scales with the number of constraints touching that variable.
+  Instead: for each lag s, allocate one fresh aux var per mid-mid pair
+  encoding the XNOR (4 binary clauses), then a single PB constraint on
+  the union. This is what `c8a0db5` originally did before being
+  rewritten in `b9d92ac`. The commit b9d92ac claimed "20× fewer
+  propagations per decision" but also same dec/solve — meaning weaker
+  pruning, more work for VSIDS. Reverting to XNOR aux + PB might
+  recover the lost pruning.
+  Single commit: revert b9d92ac's encoding (or A/B test).
+
+- **F10: Skip the per-lag constraint at lag s where it's trivially
+  satisfied**: Compute `combined_lo` and `combined_hi`. If
+  `combined_lo == 0 AND combined_hi >= max_possible`, skip. Check the
+  current logic — it does have an early-out but maybe too late
+  (after building the term lists).
+  Single commit: move the trivial-satisfaction check earlier.
+
+- **F11: Remove rules (iv)/(v) middle clauses for small n** — TRIED,
+  rejected. Skipping rule iv/v middle clauses at n=26 k=7 gives 1778 bnd/s
+  (vs 1791 baseline, within noise) and helps n=20 finding time (1-11s vs
+  9-20s) but n=22 finding rate unchanged at 2/10. Canonical clauses add
+  little cost so no measurable bnd/s gain. Not worth the canonical-form
+  semantic change. Reverted.
+
+- **F12: Re-use combined SolveWZ solver via checkpoint/restore**: The
+  per-lag constraints, rules, and spectral tables don't depend on
+  per-boundary information for their structure — only the boundary
+  contributes constants (agree_const) and signed bnd-mid lit signs.
+  Precompute the constraint structure once per (n, m, k), then for
+  each boundary push/restore deltas instead of building from scratch.
+  Single commit: add SolveWZ template with checkpoint/restore.
+
+- **F13: Reduce SpectralConstraint per-assign cost via SIMD or by skipping
+  freqs already at zero**: After `assign`, the `re/im` arrays are scanned
+  for conflict. With 563 freqs that's 6 × 563 = 3378 multiplies per
+  assign call. Could vectorise; or, if `mr1[fi] == 0`, the freq is
+  saturated and could be skipped.
+  Single commit: SIMD-vectorise the inner spectral assign loop.
+
+- **F14: SpectralConstraint: store cos/sin as SoA, not interleaved**:
+  Currently `cos_table[var * nf + fi]` — accessing all freqs for one var
+  is sequential, but accessing one freq for all vars strides by nf bytes.
+  The per-assign code does the former (sequential), good. Confirm SoA
+  layout and check cache miss rate.
+  Investigation only.
+
+- **F15: Move outfix pin handling out of hot path**: Currently every
+  SolveWZ iterates `outfix_z_mid_pins` and `outfix_w_mid_pins` even
+  when they're empty. Move into a one-shot vec of (var, lit) prebuilt
+  at MddCtx creation.
+  Single commit: precompute outfix_pins as Vec<i32>.

@@ -19,3 +19,10 @@ rustc-hash = "2"
 redb = "4.0.0"
 rayon = "1.11.0"
 dashmap = "6"
+
+[dev-dependencies]
+divan = "0.1"
+
+[[bench]]
+name = "turyn_bench"
+harness = false
