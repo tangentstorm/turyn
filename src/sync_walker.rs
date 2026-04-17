@@ -77,7 +77,19 @@ struct State {
     /// Assumption literals passed to `solve_with_assumptions`, accumulated
     /// as we descend.
     assumptions: Vec<i32>,
+    /// BDKR canonical-rule firing bitmask.
+    ///   bit 0 = rule (ii) fired on X
+    ///   bit 1 = rule (iii) fired on Y
+    ///   bit 2 = rule (iv) fired on Z
+    ///   bit 3 = rule (v) fired on W
+    rule_state: u8,
 }
+
+// Rule-fired bits.
+const RULE_II: u8  = 1 << 0;
+const RULE_III: u8 = 1 << 1;
+const RULE_IV: u8  = 1 << 2;
+const RULE_V: u8   = 1 << 3;
 
 impl State {
     fn new(n: usize) -> Self {
@@ -86,6 +98,7 @@ impl State {
             sums: vec![0; n + 1],
             bits: vec![0; 4 * n],
             assumptions: Vec::with_capacity(4 * n),
+            rule_state: 0,
         }
     }
 
@@ -429,6 +442,84 @@ fn rebuild_sums(state: &mut State, ctx: &Ctx) {
     }
 }
 
+/// Walker-side BDKR rule check for pairs that just closed at this level.
+/// Returns Err(()) on rule violation; Ok(new_rule_state) otherwise.
+///
+/// Checks palindromic pair events only:
+///   - X/Y/Z pair (j, n-1-j): rules (ii)/(iii)/(iv).
+///   - W pair (j, m-1-j): rule (v), requires W[m-1] already known.
+///
+/// Rule (ii)/(iii): least i with A[i]≠A[n-1-i] forces A[i]=+1.
+///   At pair j, if rule not yet fired and A[j]≠A[n-1-j]:
+///     require A[j]=+1, set rule_fired bit.
+/// Rule (iv): least i with C[i]=C[n-1-i] forces C[i]=+1.
+///   At pair j, if rule not yet fired and Z[j]=Z[n-1-j]:
+///     require Z[j]=+1, set rule_fired bit.
+/// Rule (v): least i with W[i]·W[m-1-i]·W[m-1] = -1 forces W[i]=+1.
+///   At pair j, if rule not yet fired, W[m-1] known, and product=-1:
+///     require W[j]=+1, set rule_fired bit.
+///
+/// A candidate that violates any rule is pruned *before* the SAT call.
+fn check_rules(state: &State, ctx: &Ctx, level: usize) -> Result<u8, ()> {
+    let n = ctx.n;
+    let m = ctx.m;
+    let mut rs = state.rule_state;
+
+    for ev in &ctx.closure_events[level] {
+        // Rule events only involve palindromic pairs: pos_a + pos_b == n-1
+        // for X/Y/Z (length n), or == m-1 for W (length m=n-1).
+        let is_palindromic = match ev.kind {
+            0 | 1 | 2 => ev.pos_a + ev.pos_b == n - 1,
+            3 => ev.pos_a + ev.pos_b == m - 1,
+            _ => false,
+        };
+        if !is_palindromic { continue; }
+
+        let sa = state.bit(ev.kind, ev.pos_a);
+        let sb = state.bit(ev.kind, ev.pos_b);
+        if sa == 0 || sb == 0 { continue; }
+        let sa_sign: i8 = if sa == 1 { 1 } else { -1 };
+        let sb_sign: i8 = if sb == 1 { 1 } else { -1 };
+        // By symmetry pos_a < pos_b (bouncing order pins low first).
+        // Rule forces the "i" position, which is the lower index = pos_a.
+        let early_bit = sa_sign;
+
+        match ev.kind {
+            0 => {  // X: rule (ii)
+                if rs & RULE_II == 0 && sa_sign != sb_sign {
+                    if early_bit != 1 { return Err(()); }
+                    rs |= RULE_II;
+                }
+            }
+            1 => {  // Y: rule (iii)
+                if rs & RULE_III == 0 && sa_sign != sb_sign {
+                    if early_bit != 1 { return Err(()); }
+                    rs |= RULE_III;
+                }
+            }
+            2 => {  // Z: rule (iv) — note equality polarity
+                if rs & RULE_IV == 0 && sa_sign == sb_sign {
+                    if early_bit != 1 { return Err(()); }
+                    rs |= RULE_IV;
+                }
+            }
+            3 => {  // W: rule (v), needs W[m-1]
+                let w_last = state.bit(3, m - 1);
+                if w_last == 0 { continue; }
+                let w_last_sign: i8 = if w_last == 1 { 1 } else { -1 };
+                // premise: W[j] * W[m-1-j] * W[m-1] == -1
+                let product = sa_sign * sb_sign * w_last_sign;
+                if rs & RULE_V == 0 && product == -1 {
+                    if early_bit != 1 { return Err(()); }
+                    rs |= RULE_V;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(rs)
+}
+
 /// Return true if any lag's running sum blows past its remaining capacity.
 /// At level `state.level`, max_remaining applies to pairs not yet closed.
 fn capacity_violated(state: &State, ctx: &Ctx) -> bool {
@@ -458,16 +549,33 @@ fn score_state(state: &State, ctx: &Ctx) -> i64 {
 }
 
 fn compute_signature(state: &State, ctx: &Ctx) -> u64 {
-    // FxHash-equivalent: fold sums + bits + level into a 64-bit key.
-    // Good enough to detect DAG revisits; collisions are safe (memo is
-    // purely a performance optimization).
+    // The walker's "state" at a given level is determined by:
+    //   - current level
+    //   - running per-lag sums S(s)
+    //   - walker-placed bits at positions already visited (pos_order[..level])
+    //   - rule-fired bitmask
+    //
+    // NOTE: we deliberately exclude bits beyond the walker frontier
+    // (positions pinned purely via harvest_forced from SAT propagation).
+    // Those are deterministic functions of the walker prefix + the
+    // solver's clause database, so including them makes the signature
+    // vary by clause-DB state and prevents memo hits across branches
+    // that converge to the same walker state through different routes.
     use std::hash::Hasher;
     let mut h = rustc_hash::FxHasher::default();
     h.write_usize(state.level);
     for s in 1..ctx.n {
         h.write_i16(state.sums[s]);
     }
-    h.write(&state.bits);
+    // Only include bits at walker-visited positions (pos_order[..level]).
+    for (lvl, &pos) in ctx.pos_order.iter().enumerate() {
+        if lvl >= state.level { break; }
+        for kind in 0u8..4 {
+            if pos >= kind_xy_len(kind, ctx.n, ctx.m) { continue; }
+            h.write_u8(state.bit(kind, pos));
+        }
+    }
+    h.write_u8(state.rule_state);
     h.finish()
 }
 
@@ -475,6 +583,7 @@ pub(crate) struct SyncStats {
     pub nodes_visited: u64,
     pub memo_hits: u64,
     pub capacity_rejects: u64,
+    pub rule_rejects: u64,
     pub sat_unsat: u64,
     pub leaves_reached: u64,
     pub learned_clauses_final: u64,
@@ -500,7 +609,7 @@ pub(crate) fn search_sync(
         eprintln!("sync_walker: base solver UNSAT — canonical constraints inconsistent");
         return (None, SyncStats {
             nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-            sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
+            rule_rejects: 0, sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
         }, start.elapsed());
     }
 
@@ -510,7 +619,8 @@ pub(crate) fn search_sync(
     let mut memo: FxHashMap<u64, ()> = FxHashMap::default();
     let mut stats = SyncStats {
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-        sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
+        rule_rejects: 0, sat_unsat: 0, leaves_reached: 0,
+        learned_clauses_final: 0, max_level_reached: 0,
     };
 
     let deadline = if cfg.sat_secs > 0 {
@@ -523,8 +633,8 @@ pub(crate) fn search_sync(
     let elapsed = start.elapsed();
     if verbose {
         eprintln!(
-            "sync_walker: nodes={} memo_hits={} cap_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?}",
-            stats.nodes_visited, stats.memo_hits, stats.capacity_rejects, stats.sat_unsat, stats.leaves_reached, stats.max_level_reached, elapsed,
+            "sync_walker: nodes={} memo_hits={} cap_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?}",
+            stats.nodes_visited, stats.memo_hits, stats.capacity_rejects, stats.rule_rejects, stats.sat_unsat, stats.leaves_reached, stats.max_level_reached, elapsed,
         );
     }
     (found, stats, elapsed)
@@ -574,7 +684,7 @@ fn dfs(
     let has_w = pos < ctx.m;
 
     // Build child candidates with their scores.
-    struct Cand { assum: Vec<i32>, placed_signs: [(u8, usize, i8); 4], num_placed: u8, score: i64 }
+    struct Cand { assum: Vec<i32>, placed_signs: [(u8, usize, i8); 4], num_placed: u8, score: i64, rule_state: u8 }
     let mut candidates: Vec<Cand> = Vec::with_capacity(16);
 
     for choice in 0u8..16 {
@@ -623,7 +733,20 @@ fn dfs(
         state.level += 1;
         rebuild_sums(state, ctx);
         let violated = capacity_violated(state, ctx);
-        let score = if !violated { score_state(state, ctx) } else { i64::MAX };
+        // Walker-side BDKR rule check: prune rule-violating placements
+        // before calling the SAT solver. Saves a propagate_only per
+        // rejected candidate and keeps CDCL from learning clauses about
+        // non-canonical-but-otherwise-feasible branches.
+        let rule_check = if !violated {
+            check_rules(state, ctx, state.level - 1)
+        } else {
+            Err(())
+        };
+        let score = if !violated && rule_check.is_ok() {
+            score_state(state, ctx)
+        } else {
+            i64::MAX
+        };
 
         // Rollback speculative state.
         state.level = saved_level;
@@ -631,14 +754,19 @@ fn dfs(
             state.bits[(*ki as usize) * ctx.n + pi] = *old_sign;
         }
         // Rebuild sums to the parent state after rollback.
-        // (We'll rebuild again right before recursing into an accepted
-        // child; this rollback is just to clean up the speculative view.)
         rebuild_sums(state, ctx);
 
         if violated {
             stats.capacity_rejects += 1;
             continue;
         }
+        let new_rule_state = match rule_check {
+            Ok(rs) => rs,
+            Err(()) => {
+                stats.rule_rejects += 1;
+                continue;
+            }
+        };
 
         // Build full assumption list for this child.
         let mut full_assum = state.assumptions.clone();
@@ -648,6 +776,7 @@ fn dfs(
             placed_signs: placed,
             num_placed: np,
             score,
+            rule_state: new_rule_state,
         });
     }
 
@@ -684,6 +813,7 @@ fn dfs(
     let saved_all_bits = state.bits.clone();
     let saved_sums = state.sums.clone();
     let saved_assum_len = state.assumptions.len();
+    let saved_rule_state = state.rule_state;
 
     for cand in candidates {
         if found.is_some() { return true; }
@@ -695,6 +825,7 @@ fn dfs(
         state.bits.copy_from_slice(&saved_all_bits);
         state.sums.copy_from_slice(&saved_sums);
         state.assumptions.truncate(saved_assum_len);
+        state.rule_state = saved_rule_state;
 
         for k in 0..cand.num_placed as usize {
             let (ki, pi, si) = cand.placed_signs[k];
@@ -702,6 +833,7 @@ fn dfs(
         }
         state.assumptions = cand.assum.clone();
         state.level += 1;
+        state.rule_state = cand.rule_state;
         rebuild_sums(state, ctx);
 
         // Memo check on the post-placement (pre-SAT) state.
@@ -710,12 +842,50 @@ fn dfs(
         if memo_hit {
             stats.memo_hits += 1;
         } else {
-            // Walker-only mode: skip per-level SAT call (no canonicalization
-            // rules from (ii)-(vi) are enforced, and non-canonical solutions
-            // may be found). Useful for A/B comparison.
+            // SAT call mode:
+            //   SYNC_SKIP_SAT=1: pure walker, no SAT (rules (ii)-(vi) not enforced).
+            //   SYNC_SAT=full:   solve_with_assumptions (unlimited) — if SAT,
+            //                    extract solution and terminate immediately.
+            //   SYNC_SAT=limit:  solve_with_assumptions with conflict_limit=ctx.sat_budget.
+            //                    On Some(true) extract; Some(false) prune;
+            //                    None (limit reached) treat as indeterminate
+            //                    and keep walking. CDCL learns clauses that
+            //                    persist across the DFS.
+            //   default:         propagate_only (no decisions, fastest,
+            //                    no CDCL learning on UNSAT).
             let skip_sat = std::env::var("SYNC_SKIP_SAT").ok().as_deref() == Some("1");
-            let sat = if skip_sat { Some(true) } else {
-                solver.propagate_only(&state.assumptions)
+            let sat_mode = std::env::var("SYNC_SAT").ok();
+            let sat = if skip_sat {
+                Some(true)
+            } else {
+                match sat_mode.as_deref() {
+                    Some("full") => {
+                        let r = solver.solve_with_assumptions(&state.assumptions);
+                        if r == Some(true) {
+                            // Solver has a full assignment; extract + return.
+                            let sol = extract_solution(solver, ctx);
+                            *found = Some(sol);
+                            return true;
+                        }
+                        r
+                    }
+                    Some("limit") => {
+                        let budget = std::env::var("SYNC_CL")
+                            .ok().and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(100);
+                        solver.set_conflict_limit(solver.num_conflicts() + budget);
+                        let r = solver.solve_with_assumptions(&state.assumptions);
+                        solver.set_conflict_limit(0);
+                        if r == Some(true) {
+                            let sol = extract_solution(solver, ctx);
+                            *found = Some(sol);
+                            return true;
+                        }
+                        // None (conflict-limit hit) → indeterminate, keep walking.
+                        r.or(Some(true))
+                    }
+                    _ => solver.propagate_only(&state.assumptions),
+                }
             };
             if sat == Some(true) {
                 if !skip_sat { harvest_forced(solver, state, ctx); }
@@ -742,6 +912,7 @@ fn dfs(
     state.bits.copy_from_slice(&saved_all_bits);
     state.sums.copy_from_slice(&saved_sums);
     state.assumptions.truncate(saved_assum_len);
+    state.rule_state = saved_rule_state;
 
     false
 }
@@ -856,6 +1027,46 @@ mod tests {
                 panic!("prefix_len={}: propagate_only={:?} but full SAT says {:?} — propagate_only rejected a valid partial!",
                     prefix_len, prop_result, full_result);
             }
+        }
+    }
+
+    #[test]
+    fn canonical_tt18_bouncing_prefixes_all_accepted() {
+        // For every bouncing-order prefix length of canonical TT(18),
+        // check that propagate_only accepts the prefix. If any level
+        // rejects, the walker can never reach the canonical leaf.
+        let n: usize = 18;
+        let m = n - 1;
+        let problem = Problem::new(n);
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        let z_var = |i: usize| -> i32 { (2 * n + i + 1) as i32 };
+        let w_var = |i: usize| -> i32 { (3 * n + i + 1) as i32 };
+        let parse = |s: &str| -> Vec<i8> { s.chars().map(|c| if c == '+' { 1i8 } else { -1 }).collect() };
+        let x = parse("++-+++++++++-+--++");
+        let y = parse("++----++-+---+-+-+");
+        let z = parse("++-+++----+-+-++--");
+        let w = parse("++----+--+--+++-+");
+
+        // Bouncing order
+        let mut pos_order = Vec::with_capacity(n);
+        for j in 0..n/2 { pos_order.push(j); pos_order.push(n - 1 - j); }
+
+        for prefix_len in 0..=pos_order.len() {
+            let sat_cfg = radical::SolverConfig::default();
+            let mut solver = build_solver(problem, &sat_cfg);
+            assert_eq!(solver.propagate_only(&[]), Some(true));
+
+            let mut assums: Vec<i32> = Vec::new();
+            for &pos in &pos_order[..prefix_len] {
+                assums.push(if x[pos] > 0 { x_var(pos) } else { -x_var(pos) });
+                assums.push(if y[pos] > 0 { y_var(pos) } else { -y_var(pos) });
+                assums.push(if z[pos] > 0 { z_var(pos) } else { -z_var(pos) });
+                if pos < m { assums.push(if w[pos] > 0 { w_var(pos) } else { -w_var(pos) }); }
+            }
+            let result = solver.propagate_only(&assums);
+            assert_eq!(result, Some(true),
+                "canonical TT(18) rejected at walker prefix_len={}", prefix_len);
         }
     }
 
