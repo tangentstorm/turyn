@@ -19,6 +19,30 @@ pub const LEAF: u32 = u32::MAX;
 
 pub type StateKey = (u128, u64);
 
+/// Memo key used by `build_zw_dfs` and `build_xy_dfs`.  Extends `StateKey`
+/// with a `u8` of per-rule "has this BDKR canonical rule already fired?"
+/// bits so that two subtrees with identical `(sums, active_bits)` but
+/// different firing histories aren't incorrectly memoized to the same node.
+///
+/// Bit layout depends on which half we're in (see BDKR_RULE_* constants):
+///   ZW build: bit 0 = rule (iv) fired on Z, bit 1 = rule (v) fired on W
+///   XY build: bit 0 = rule (ii) fired on X, bit 1 = rule (iii) fired on Y
+pub type BuildMemoKey = (u128, u64, u8);
+
+/// BDKR rule-fired state bit positions (XY half).
+pub const BDKR_RULE_II_FIRED: u8 = 1 << 0;
+pub const BDKR_RULE_III_FIRED: u8 = 1 << 1;
+/// BDKR rule-fired state bit positions (ZW half).
+pub const BDKR_RULE_IV_FIRED: u8 = 1 << 0;
+pub const BDKR_RULE_V_FIRED: u8 = 1 << 1;
+/// Captures the `W[m-1]` tail bit (bit 2) and a "tail known" flag (bit 3).
+/// Rule (v)'s alternation predicate `W[j]*W[m-1-j] != W[m-1]` needs `W[m-1]`,
+/// which sits at MDD position `2k-1` — placed at level 1 in bouncing order
+/// but drops out of `active_bits` at the final level.  We snapshot its bit
+/// into `zw_rule_state` the moment it's placed so later levels can read it.
+pub const BDKR_W_TAIL_BIT: u8 = 1 << 2;
+pub const BDKR_W_TAIL_KNOWN: u8 = 1 << 3;
+
 pub fn pack_sums(sums: &[i8]) -> u128 {
     let mut packed = 0u128;
     for (i, &s) in sums.iter().enumerate() {
@@ -642,6 +666,14 @@ impl ZwFirstMdd {
             all_restrict.push((1, target));
         }
 
+        // Enable BDKR canonical rule enforcement only when pos_order is the
+        // bouncing layout (required for ascending-j incremental scanning).
+        // Users can force-disable via MDD_DISABLE_CANON=1 for A/B comparisons.
+        let canonical_rules = is_bouncing_order(&pos_order, k)
+            && std::env::var("MDD_DISABLE_CANON").is_err();
+        let close_pair_at_level = compute_close_pair_at_level(&pos_order, k);
+        let w_tail_pos = 2 * k - 1;
+
         let zw_ctx = ZwBuildCtx {
             pos_order: pos_order.clone(),
             events: zw_resolved_events,
@@ -655,6 +687,10 @@ impl ZwFirstMdd {
             symmetry_break: true,
             restrict_branches: all_restrict,
             zw_only,
+            canonical_rules,
+            close_pair_at_level: close_pair_at_level.clone(),
+            w_tail_pos,
+            target_pair_offset: 0,
         };
         let xy_ctx = XyBuildCtx {
             pos_order: pos_order.clone(),
@@ -666,6 +702,10 @@ impl ZwFirstMdd {
             k,
             depth: zw_depth,
             symmetry_break: true,
+            canonical_rules,
+            close_pair_at_level,
+            target_pair_offset: 0,
+            initial_xy_rule_state: 0,
         };
 
         let mut nodes: Vec<[u32; 4]> = Vec::new();
@@ -673,8 +713,8 @@ impl ZwFirstMdd {
 
         let mut unique: HashMap<u64, u32> = HashMap::default();
 
-        let mut zw_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
-        let mut xy_memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
+        let mut zw_memo: Vec<HashMap<BuildMemoKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
+        let mut xy_memo: Vec<HashMap<BuildMemoKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
 
         // (build_zw is now the module-level build_zw_dfs)
 
@@ -713,7 +753,7 @@ impl ZwFirstMdd {
 
         let mut sums = vec![0i8; k];
         let root = build_zw_dfs(
-            0, &mut sums, &[],
+            0, &mut sums, &[], 0,
             &zw_ctx, &xy_ctx,
             &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo, &mut xy_cache,
             max_memo_entries, &mut zw_memo_count,
@@ -869,20 +909,49 @@ pub struct ZwBuildCtx {
     pub symmetry_break: bool,
     pub restrict_branches: Vec<(usize, u32)>,
     pub zw_only: bool,
+    /// Enforce BDKR canonical rules (iv) and (v) during DFS.  Only safe when
+    /// `pos_order` is the "bouncing" layout (pair `j` closes at level `2j+1`)
+    /// so that palindromic pairs close in ascending `j` order.  Toggle off to
+    /// get the old (non-canonical) MDD — e.g., in `build_extension` where the
+    /// initial rule-fired state comes from the base boundary bits.
+    pub canonical_rules: bool,
+    /// For each level `l`, `Some(j)` if palindromic pair `(j, 2k-1-j)` closes
+    /// at level `l`; `None` otherwise.  Precomputed from `pos_order`.
+    pub close_pair_at_level: Vec<Option<usize>>,
+    /// MDD position holding the tail `W[m-1]` used by rule (v).  Placed at
+    /// level 1 in bouncing order (MDD position `2k-1`); tracked here so the
+    /// DFS can read its bit from `active_bits` at any later level.  Set to
+    /// `usize::MAX` if the tail lies outside this MDD (e.g., in `build_extension`
+    /// the tail is in the old base bits and seeded into the initial rule_state).
+    pub w_tail_pos: usize,
+    /// Offset added to the MDD palindromic pair index `j` to get the target
+    /// palindromic pair index (`j_target = target_pair_offset + j`).  Zero for
+    /// the main build; equal to `base_k` in `build_extension` where the
+    /// extension MDD starts at target pair `base_k`.
+    pub target_pair_offset: usize,
 }
 
 /// DFS builder for ZW half. At the boundary, delegates to build_xy_dfs.
 /// Returns the root node ID.
+///
+/// `zw_rule_state` carries the BDKR rule (iv)/(v) "has fired at an earlier
+/// palindromic pair?" bits (`BDKR_RULE_IV_FIRED`, `BDKR_RULE_V_FIRED`).
+/// When `ctx.canonical_rules` is true, each odd level that closes a
+/// palindromic pair evaluates the rule on the closing pair's bits and
+/// either prunes the branch (rule violated) or marks the rule as fired.
+/// The initial call should pass `0` (no rules fired yet) — except when
+/// continuing from a walked base boundary (see `build_extension`).
 pub fn build_zw_dfs(
     level: usize,
     sums: &mut [i8],
     active_bits: &[u8],
+    zw_rule_state: u8,
     ctx: &ZwBuildCtx,
     xy_ctx: &XyBuildCtx,
     nodes: &mut Vec<[u32; 4]>,
     unique: &mut HashMap<u64, u32>,
-    zw_memo: &mut Vec<HashMap<StateKey, u32>>,
-    xy_memo: &mut Vec<HashMap<StateKey, u32>>,
+    zw_memo: &mut Vec<HashMap<BuildMemoKey, u32>>,
+    xy_memo: &mut Vec<HashMap<BuildMemoKey, u32>>,
     xy_cache: &mut HashMap<u128, u32>,
     max_memo_entries: usize,
     zw_memo_count: &mut usize,
@@ -896,7 +965,8 @@ pub fn build_zw_dfs(
         }
         if ctx.zw_only { return LEAF; }
 
-        // Check XY cache: same zw_sums → same XY sub-MDD root
+        // Check XY cache: same zw_sums → same XY sub-MDD root.  The XY
+        // sub-MDD is independent of ZW rule state, so we only key by sums.
         let sums_key = pack_sums(sums);
         if let Some(&cached) = xy_cache.get(&sums_key) { return cached; }
 
@@ -904,7 +974,7 @@ pub fn build_zw_dfs(
         let target: Vec<i8> = sums.iter().map(|&s| -s).collect();
         let mut xy_sums = vec![0i8; ctx.k];
         let result = build_xy_dfs(
-            0, &mut xy_sums, &[], &target,
+            0, &mut xy_sums, &[], &target, xy_ctx.initial_xy_rule_state,
             xy_ctx, nodes, unique, xy_memo,
         );
         xy_cache.insert(sums_key, result);
@@ -929,10 +999,20 @@ pub fn build_zw_dfs(
     let new_pos = ctx.pos_order[level];
     let new_idx = ctx.active_indices[level][new_pos];
 
-    let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
+    let state_key: BuildMemoKey = (
+        pack_sums(sums),
+        pack_active(&current_vals[..n_active]),
+        zw_rule_state,
+    );
     if let Some(&cached) = zw_memo[level].get(&state_key) {
         return cached;
     }
+
+    // Does a palindromic pair close at this level?  If so, the closing
+    // pair index is `close_j` and its mirror position is `2k-1-close_j`.
+    let close_j: Option<usize> = if ctx.canonical_rules {
+        ctx.close_pair_at_level[level]
+    } else { None };
 
     let mut children = [DEAD; 4];
     for branch in 0u32..4 {
@@ -946,6 +1026,65 @@ pub fn build_zw_dfs(
         }
 
         current_vals[new_idx] = branch as u8;
+
+        // Evaluate BDKR rules (iv)/(v) if a palindromic pair closes here.
+        // Z-bit is bit 0, W-bit is bit 1 of each 2-bit branch slot.
+        let mut new_rule_state = zw_rule_state;
+
+        // Snapshot the W[m-1] tail bit once its MDD position is placed.
+        // `close_pair_at_level` guarantees `new_pos == ctx.w_tail_pos` exactly
+        // once in the build (the level where pos `2k-1` enters active_bits).
+        if ctx.canonical_rules
+            && new_rule_state & BDKR_W_TAIL_KNOWN == 0
+            && new_pos == ctx.w_tail_pos
+        {
+            let w_bit = ((branch >> 1) & 1) as u8;
+            new_rule_state |= BDKR_W_TAIL_KNOWN;
+            if w_bit == 1 { new_rule_state |= BDKR_W_TAIL_BIT; }
+        }
+
+        if let Some(j) = close_j {
+            let mirror = ctx.depth - 1 - j;
+            let target_j = ctx.target_pair_offset + j;
+            let idx_j = ctx.active_indices[level][j];
+            let idx_m = ctx.active_indices[level][mirror];
+            // Both must be active at this level (they are, since the
+            // closing event is owned by this level in bouncing order).
+            if idx_j != usize::MAX && idx_m != usize::MAX {
+                let zj = (current_vals[idx_j]      ) & 1;
+                let zm = (current_vals[idx_m]      ) & 1;
+                let wj = (current_vals[idx_j] >> 1) & 1;
+                let wm = (current_vals[idx_m] >> 1) & 1;
+
+                // Rule (iv) on Z: least j with Z[j] == Z[n-1-j] ⇒ Z[j]=+1.
+                if zw_rule_state & BDKR_RULE_IV_FIRED == 0 && zj == zm {
+                    // Pair is palindromic (both equal).  Rule fires here.
+                    if zj != 1 {
+                        // Z[j] = -1 violates: skip this branch entirely.
+                        continue;
+                    }
+                    new_rule_state |= BDKR_RULE_IV_FIRED;
+                }
+
+                // Rule (v) on W: least j (>=1) with W[j]*W[n-1-j] != W[n-1]
+                //   ⇒ W[j]=+1.  target_j=0 can't fire (W[0]=+1 via rule (i)).
+                // The tail W[n-1] bit is carried in new_rule_state's
+                // BDKR_W_TAIL_BIT once known.
+                if target_j >= 1
+                    && zw_rule_state & BDKR_RULE_V_FIRED == 0
+                    && new_rule_state & BDKR_W_TAIL_KNOWN != 0
+                {
+                    let w_tail = if new_rule_state & BDKR_W_TAIL_BIT != 0 { 1u8 } else { 0 };
+                    // (wj XNOR wm) = 1 iff wj == wm iff product = +1.
+                    //   prod != tail ⇒ rule fires; require wj = +1 else prune.
+                    let prod_bit = (wj == wm) as u8;
+                    if prod_bit != w_tail {
+                        if wj != 1 { continue; }
+                        new_rule_state |= BDKR_RULE_V_FIRED;
+                    }
+                }
+            }
+        }
 
         for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.events[level] {
             let bits_a = current_vals[idx_a] as usize;
@@ -969,7 +1108,7 @@ pub fn build_zw_dfs(
 
         if ok {
             children[branch as usize] = build_zw_dfs(
-                level + 1, sums, &current_vals[..n_active],
+                level + 1, sums, &current_vals[..n_active], new_rule_state,
                 ctx, xy_ctx,
                 nodes, unique, zw_memo, xy_memo, xy_cache,
                 max_memo_entries, zw_memo_count,
@@ -1010,19 +1149,70 @@ pub struct XyBuildCtx {
     pub k: usize,
     pub depth: usize,
     pub symmetry_break: bool,
+    /// Enforce BDKR canonical rules (ii), (iii), (vi) during DFS.  See
+    /// `ZwBuildCtx::canonical_rules` for constraints (bouncing order only).
+    pub canonical_rules: bool,
+    /// See `ZwBuildCtx::close_pair_at_level`.
+    pub close_pair_at_level: Vec<Option<usize>>,
+    /// See `ZwBuildCtx::target_pair_offset`.
+    pub target_pair_offset: usize,
+    /// Initial `xy_rule_state` passed to `build_xy_dfs` when ZW reaches the
+    /// boundary.  Zero for the main build (no rules fired yet); in
+    /// `build_extension` seeded from the base bits so rules already fired in
+    /// the base aren't re-checked.
+    pub initial_xy_rule_state: u8,
+}
+
+/// Returns true iff `pos_order` is the default bouncing layout — pair `j`
+/// occupies levels `(2j, 2j+1)` so palindromic pairs close in ascending `j`.
+/// The DFS's incremental "first-violation" rule application relies on this.
+pub fn is_bouncing_order(pos_order: &[usize], k: usize) -> bool {
+    if pos_order.len() != 2 * k { return false; }
+    for j in 0..k {
+        if pos_order[2 * j] != j || pos_order[2 * j + 1] != 2 * k - 1 - j {
+            return false;
+        }
+    }
+    true
+}
+
+/// Precompute `close_pair_at_level[l]` = `Some(j)` if palindromic pair
+/// `(j, 2k-1-j)` closes (both positions placed) at level `l`.
+pub fn compute_close_pair_at_level(pos_order: &[usize], k: usize) -> Vec<Option<usize>> {
+    let depth = pos_order.len();
+    let mut pos_to_level: Vec<usize> = vec![0; 2 * k];
+    for (level, &pos) in pos_order.iter().enumerate() {
+        pos_to_level[pos] = level;
+    }
+    let mut close: Vec<Option<usize>> = vec![None; depth];
+    for j in 0..k {
+        let l1 = pos_to_level[j];
+        let l2 = pos_to_level[2 * k - 1 - j];
+        let close_level = l1.max(l2);
+        if close_level < depth {
+            close[close_level] = Some(j);
+        }
+    }
+    close
 }
 
 /// DFS builder for XY sub-MDD. Builds the 4-way MDD for (x,y) assignments
 /// that make sums reach target_sums at each lag.
+///
+/// `xy_rule_state` carries the BDKR rule (ii)/(iii) "has fired?" bits
+/// (`BDKR_RULE_II_FIRED`, `BDKR_RULE_III_FIRED`).  Rule (vi) is a one-shot
+/// tie-break evaluated at the level that closes pair `(1, 2k-2)` — no state
+/// bit needed.  The initial call should pass `0`.
 pub fn build_xy_dfs(
     level: usize,
     sums: &mut [i8],
     active_bits: &[u8],
     target_sums: &[i8],
+    xy_rule_state: u8,
     ctx: &XyBuildCtx,
     nodes: &mut Vec<[u32; 4]>,
     unique: &mut HashMap<u64, u32>,
-    memo: &mut Vec<HashMap<StateKey, u32>>,
+    memo: &mut Vec<HashMap<BuildMemoKey, u32>>,
 ) -> u32 {
     if level == ctx.depth {
         for li in 0..ctx.k {
@@ -1049,10 +1239,18 @@ pub fn build_xy_dfs(
     let new_pos = ctx.pos_order[level];
     let new_idx = ctx.active_indices[level][new_pos];
 
-    let state_key = (pack_sums(sums), pack_active(&current_vals[..n_active]));
+    let state_key: BuildMemoKey = (
+        pack_sums(sums),
+        pack_active(&current_vals[..n_active]),
+        xy_rule_state,
+    );
     if let Some(&cached) = memo[level].get(&state_key) {
         return cached;
     }
+
+    let close_j: Option<usize> = if ctx.canonical_rules {
+        ctx.close_pair_at_level[level]
+    } else { None };
 
     let mut children = [DEAD; 4];
     for branch in 0u32..4 {
@@ -1063,6 +1261,50 @@ pub fn build_xy_dfs(
         if ctx.symmetry_break && new_pos == 0 && branch != 0b11 { continue; }
         if ctx.symmetry_break && new_pos == 2 * ctx.k - 1 && branch != 0b11 { continue; }
         current_vals[new_idx] = branch as u8;
+
+        let mut new_rule_state = xy_rule_state;
+        if let Some(j) = close_j {
+            let mirror = ctx.depth - 1 - j;
+            let target_j = ctx.target_pair_offset + j;
+            let idx_j = ctx.active_indices[level][j];
+            let idx_m = ctx.active_indices[level][mirror];
+            if idx_j != usize::MAX && idx_m != usize::MAX {
+                let xj = (current_vals[idx_j]      ) & 1;
+                let xm = (current_vals[idx_m]      ) & 1;
+                let yj = (current_vals[idx_j] >> 1) & 1;
+                let ym = (current_vals[idx_m] >> 1) & 1;
+
+                // Rule (ii) on X: least j with X[j] != X[n-1-j] ⇒ X[j]=+1.
+                if xy_rule_state & BDKR_RULE_II_FIRED == 0 && xj != xm {
+                    if xj != 1 { continue; }
+                    new_rule_state |= BDKR_RULE_II_FIRED;
+                }
+                // Rule (iii) on Y.
+                if xy_rule_state & BDKR_RULE_III_FIRED == 0 && yj != ym {
+                    if yj != 1 { continue; }
+                    new_rule_state |= BDKR_RULE_III_FIRED;
+                }
+
+                // Rule (vi) — conditional A vs B tie-break at (X[1], Y[1])
+                // and (X[n-2], Y[n-2]).  Fully determined at the level
+                // closing target pair j=1 since both positions are placed by
+                // then.  In the main build target_j == j; in build_extension
+                // rule (vi) is evaluated from the base bits up-front, so it
+                // only triggers here when base_k <= 1 (target_j == 1 can
+                // correspond to ext pair j=0 when base_k==1).
+                if target_j == 1 {
+                    let x_head = xj;  // X[1]
+                    let y_head = yj;  // Y[1]
+                    let x_tail = xm;  // X[n-2]
+                    let y_tail = ym;  // Y[n-2]
+                    if x_head != y_head {
+                        if x_head != 1 { continue; }
+                    } else {
+                        if x_tail != 1 || y_tail != 0 { continue; }
+                    }
+                }
+            }
+        }
 
         for &(lag_idx, idx_a, idx_b, ref delta) in &ctx.events[level] {
             let bits_a = current_vals[idx_a] as usize;
@@ -1084,7 +1326,7 @@ pub fn build_xy_dfs(
 
         if ok {
             children[branch as usize] = build_xy_dfs(
-                level + 1, sums, &current_vals[..n_active], target_sums,
+                level + 1, sums, &current_vals[..n_active], target_sums, new_rule_state,
                 ctx, nodes, unique, memo,
             );
         }
@@ -1187,7 +1429,11 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
     let mut nodes: Vec<[u32; 4]> = Vec::new();
     nodes.push([DEAD; 4]); // sentinel
     let mut unique: HashMap<u64, u32> = HashMap::default();
-    let mut memo: Vec<HashMap<StateKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
+    let mut memo: Vec<HashMap<BuildMemoKey, u32>> = (0..=zw_depth).map(|_| HashMap::default()).collect();
+
+    let canonical_rules = is_bouncing_order(&pos_order, k)
+        && std::env::var("MDD_DISABLE_CANON").is_err();
+    let close_pair_at_level = compute_close_pair_at_level(&pos_order, k);
 
     let ctx = XyBuildCtx {
         pos_order,
@@ -1199,16 +1445,100 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
         k,
         depth: zw_depth,
         symmetry_break: true,
+        canonical_rules,
+        close_pair_at_level,
+        target_pair_offset: 0,
+        initial_xy_rule_state: 0,
     };
 
     let target: Vec<i8> = zw_sums.iter().map(|&s| -s).collect();
     let mut sums = vec![0i8; k];
     let root = build_xy_dfs(
-        0, &mut sums, &[], &target,
+        0, &mut sums, &[], &target, 0,
         &ctx, &mut nodes, &mut unique, &mut memo,
     );
 
     (nodes, root)
+}
+
+/// Compute the BDKR canonical-rule-fired state implied by a concrete base
+/// boundary.  Scans palindromic pairs `j = 0..base_k` in ascending `j`:
+///
+/// * Rules (ii)/(iii)/(iv)/(v) record their "first violation" (fired) bit if
+///   the scan finds a firing pair whose value satisfies the rule; if the scan
+///   finds a violation (e.g., rule (ii) fires with X[j]=-1), we return `None`
+///   because the base boundary itself is already non-canonical.
+/// * Rule (vi) is a one-shot tie-break at target pair `j=1`; when `base_k >= 2`
+///   both positions are in the base and we validate here, returning `None` on
+///   violation.
+/// * The tail `W[n-1]` bit is seeded into `BDKR_W_TAIL_BIT`/`BDKR_W_TAIL_KNOWN`.
+///
+/// Returns `Some((zw_rule_state, xy_rule_state))` or `None` if the base is
+/// already non-canonical.
+pub fn compute_extension_initial_rule_state(
+    base_k: usize,
+    z_bits: u32,
+    w_bits: u32,
+    x_bits: u32,
+    y_bits: u32,
+) -> Option<(u8, u8)> {
+    let bit = |bits: u32, i: usize| -> u8 { ((bits >> i) & 1) as u8 };
+    let mut zw = 0u8;
+    let mut xy = 0u8;
+
+    // Seed W tail = W[n-1] from base long bit 2*base_k-1.
+    if base_k >= 1 {
+        zw |= BDKR_W_TAIL_KNOWN;
+        if bit(w_bits, 2 * base_k - 1) == 1 { zw |= BDKR_W_TAIL_BIT; }
+    }
+    let w_tail = (zw & BDKR_W_TAIL_BIT) != 0;
+
+    for j in 0..base_k {
+        let mirror = 2 * base_k - 1 - j;
+        let xh = bit(x_bits, j);
+        let xt = bit(x_bits, mirror);
+        let yh = bit(y_bits, j);
+        let yt = bit(y_bits, mirror);
+        let zh = bit(z_bits, j);
+        let zt = bit(z_bits, mirror);
+        let wh = bit(w_bits, j);
+        let wt = bit(w_bits, mirror);
+
+        // Rule (ii) on X: least j with X[j] != X[n-1-j] ⇒ X[j]=+1.
+        if xy & BDKR_RULE_II_FIRED == 0 && xh != xt {
+            if xh != 1 { return None; }
+            xy |= BDKR_RULE_II_FIRED;
+        }
+        // Rule (iii) on Y.
+        if xy & BDKR_RULE_III_FIRED == 0 && yh != yt {
+            if yh != 1 { return None; }
+            xy |= BDKR_RULE_III_FIRED;
+        }
+        // Rule (iv) on Z: least j with Z[j] == Z[n-1-j] ⇒ Z[j]=+1.
+        if zw & BDKR_RULE_IV_FIRED == 0 && zh == zt {
+            if zh != 1 { return None; }
+            zw |= BDKR_RULE_IV_FIRED;
+        }
+        // Rule (v) on W (target_j >= 1).  j=0 trivially satisfied.
+        if j >= 1 && zw & BDKR_RULE_V_FIRED == 0 {
+            let prod = (wh == wt) as u8;
+            let tail = if w_tail { 1u8 } else { 0 };
+            if prod != tail {
+                if wh != 1 { return None; }
+                zw |= BDKR_RULE_V_FIRED;
+            }
+        }
+        // Rule (vi) at target j == 1 (one-shot).
+        if j == 1 {
+            if xh != yh {
+                if xh != 1 { return None; }
+            } else {
+                if xt != 1 || yt != 0 { return None; }
+            }
+        }
+    }
+
+    Some((zw, xy))
 }
 
 /// Build an MDD that extends a k=base_k boundary to k=target_k.
@@ -1581,10 +1911,25 @@ pub fn build_extension(
     let mut nodes: Vec<[u32; 4]> = Vec::new();
     nodes.push([DEAD; 4]);
     let mut unique: HashMap<u64, u32> = HashMap::default();
-    let mut zw_memo: Vec<HashMap<StateKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
-    let mut xy_memo: Vec<HashMap<StateKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
+    let mut zw_memo: Vec<HashMap<BuildMemoKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
+    let mut xy_memo: Vec<HashMap<BuildMemoKey, u32>> = (0..=ext_depth).map(|_| HashMap::default()).collect();
 
-    // XY half DFS
+    // Seed initial BDKR rule-fired state from the base boundary bits.  If the
+    // base itself violates any rule (e.g., X[j]!=X[n-1-j] with X[j]=-1 at the
+    // first such j) then no canonical extension is possible → return DEAD.
+    let (init_zw_state, init_xy_state) = match compute_extension_initial_rule_state(
+        base_k, z_bits, w_bits, x_bits, y_bits,
+    ) {
+        Some(s) => s,
+        None => {
+            return (nodes, DEAD);
+        }
+    };
+
+    let canonical_rules = is_bouncing_order(&pos_order, extra)
+        && std::env::var("MDD_DISABLE_CANON").is_err();
+    let close_pair_at_level = compute_close_pair_at_level(&pos_order, extra);
+
     let ext_zw_ctx = ZwBuildCtx {
         pos_order: pos_order.clone(),
         events: zw_resolved,
@@ -1598,6 +1943,13 @@ pub fn build_extension(
         symmetry_break: false,
         restrict_branches: Vec::new(),
         zw_only: false,
+        canonical_rules,
+        close_pair_at_level: close_pair_at_level.clone(),
+        // The W tail W[n-1] lies in the base (old long bit 2*base_k-1),
+        // pre-seeded into `init_zw_state`.  Use usize::MAX so no extension
+        // position ever matches and the DFS never re-snapshots.
+        w_tail_pos: usize::MAX,
+        target_pair_offset: base_k,
     };
     let ext_xy_ctx = XyBuildCtx {
         pos_order,
@@ -1609,12 +1961,16 @@ pub fn build_extension(
         k: target_k,
         depth: ext_depth,
         symmetry_break: false,
+        canonical_rules,
+        close_pair_at_level,
+        target_pair_offset: base_k,
+        initial_xy_rule_state: init_xy_state,
     };
     let mut sums = initial_sums;
     let mut zw_memo_count = 0usize;
     let mut xy_cache: HashMap<u128, u32> = HashMap::default();
     let root = build_zw_dfs(
-        0, &mut sums, &[],
+        0, &mut sums, &[], init_zw_state,
         &ext_zw_ctx, &ext_xy_ctx,
         &mut nodes, &mut unique, &mut zw_memo, &mut xy_memo, &mut xy_cache,
         0, &mut zw_memo_count,
