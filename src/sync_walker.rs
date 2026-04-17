@@ -617,6 +617,16 @@ pub(crate) struct SyncStats {
     pub leaves_reached: u64,
     pub learned_clauses_final: u64,
     pub max_level_reached: u64,
+    /// Count of dfs() calls per level. With DFS the tree's shape at
+    /// early levels stabilises once fully explored; later levels are
+    /// partial. Used for TTC projection.
+    pub nodes_by_level: Vec<u64>,
+    /// Count of surviving candidates (post capacity + rule) summed
+    /// across all internal nodes. `children_total / internal_nodes`
+    /// is the measured effective branching factor b_eff.
+    pub children_total: u64,
+    /// Count of internal (non-leaf) dfs() calls — parents of children.
+    pub internal_nodes: u64,
 }
 
 pub(crate) fn search_sync(
@@ -656,6 +666,7 @@ fn search_sync_parallel(
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
         rule_rejects: 0, sat_unsat: 0, leaves_reached: 0,
         learned_clauses_final: 0, max_level_reached: 0,
+        nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
     }));
 
     thread::scope(|s| {
@@ -682,6 +693,14 @@ fn search_sync_parallel(
                 agg.sat_unsat += stats.sat_unsat;
                 agg.leaves_reached += stats.leaves_reached;
                 agg.max_level_reached = agg.max_level_reached.max(stats.max_level_reached);
+                agg.children_total += stats.children_total;
+                agg.internal_nodes += stats.internal_nodes;
+                if agg.nodes_by_level.len() < stats.nodes_by_level.len() {
+                    agg.nodes_by_level.resize(stats.nodes_by_level.len(), 0);
+                }
+                for (i, &c) in stats.nodes_by_level.iter().enumerate() {
+                    agg.nodes_by_level[i] += c;
+                }
                 drop(agg);
                 if let Some(s) = sol {
                     let mut r = result.lock().unwrap();
@@ -702,8 +721,75 @@ fn search_sync_parallel(
             "sync_walker(parallel x{}): nodes={} cap_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?}",
             n_workers, stats.nodes_visited, stats.capacity_rejects, stats.rule_rejects, stats.sat_unsat, stats.leaves_reached, stats.max_level_reached, elapsed,
         );
+        let ttc = project_ttc(&stats, problem.n, elapsed.as_secs_f64(), n_workers);
+        eprintln!("{}", ttc);
     }
     (found, stats, elapsed)
+}
+
+/// Project TTC (time-to-cover) from measured per-level branching + rate.
+///
+/// Method: take the measured per-level `nodes_by_level[L]` counts from
+/// the (partial or full) run. Divide by the number of DFS entries per
+/// level (each parent spawns up to b_eff children, each child is a
+/// dfs call at level L+1). That gives a measured effective branching
+/// factor `b_eff(L) = nodes_by_level[L+1] / nodes_by_level[L]` for
+/// levels where `nodes_by_level[L] > 0`.
+///
+/// Full-cover tree size (for the canonical-post-pruning space):
+///   N_total = Σ_{L=0..depth} Π_{ℓ=0..L} b_eff(ℓ)
+///           = Π_{ℓ=0..depth-1} b_eff(ℓ)   (with geometric sum ≈ leading term when b>1)
+///
+/// TTC_serial  = N_total / rate,   TTC_parallel = TTC_serial / n_workers
+/// where rate = nodes_visited / elapsed (aggregate across workers in
+/// parallel mode, so this is already a parallel rate).
+fn project_ttc(stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize) -> String {
+    let depth = n;  // bouncing-order depth = n for even n
+    let levels = stats.nodes_by_level.len();
+    if levels < 2 || elapsed_secs <= 0.0 || stats.nodes_visited == 0 {
+        return format!("TTC projection: insufficient data");
+    }
+    // Measured effective branching per level. Only levels that have
+    // been EXITED (finished exploration) give a stable estimate —
+    // in DFS early levels stabilise first. For partial runs, use the
+    // deepest level where both L and L+1 have at least one visit.
+    let mut b_eff: Vec<f64> = Vec::with_capacity(depth);
+    for l in 0..depth.min(levels - 1) {
+        let parent = stats.nodes_by_level[l];
+        let child = stats.nodes_by_level[l + 1];
+        if parent == 0 {
+            b_eff.push(0.0);
+        } else {
+            b_eff.push(child as f64 / parent as f64);
+        }
+    }
+    // Projected total tree size assuming measured b_eff(L) holds at
+    // every level. For levels where we have no data (L >= max depth
+    // reached), use the geometric mean of measured levels as a best
+    // guess; clamp below 1.0 to avoid divergence on sparse leaves.
+    let measured_avg: f64 = if b_eff.is_empty() { 1.0 } else {
+        let log_prod: f64 = b_eff.iter().filter(|&&b| b > 0.0).map(|b| b.ln()).sum();
+        let count = b_eff.iter().filter(|&&b| b > 0.0).count().max(1);
+        (log_prod / count as f64).exp()
+    };
+    let mut projected_nodes = 1.0_f64;
+    let mut running_product = 1.0_f64;
+    for l in 0..depth {
+        let b = b_eff.get(l).copied().filter(|&b| b > 0.0).unwrap_or(measured_avg);
+        running_product *= b;
+        projected_nodes += running_product;
+    }
+    let rate = stats.nodes_visited as f64 / elapsed_secs;
+    let ttc_parallel = projected_nodes / rate;
+    let ttc_serial = ttc_parallel * n_workers as f64;
+    format!(
+        "TTC projection: b_eff per level = [{}]\n\
+         TTC projection: measured b_eff geo mean = {:.3}, projected nodes to cover = {:.3e}\n\
+         TTC projection: rate = {:.0} nodes/s ({} workers, aggregate),\n\
+         TTC projection: TTC_parallel ≈ {:.1}s, TTC_serial ≈ {:.1}s",
+        b_eff.iter().map(|b| format!("{:.2}", b)).collect::<Vec<_>>().join(", "),
+        measured_avg, projected_nodes, rate, n_workers, ttc_parallel, ttc_serial,
+    )
 }
 
 fn search_sync_serial(
@@ -727,6 +813,7 @@ fn search_sync_serial(
         return (None, SyncStats {
             nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
             rule_rejects: 0, sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
+            nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
         }, start.elapsed());
     }
 
@@ -738,6 +825,8 @@ fn search_sync_serial(
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
         rule_rejects: 0, sat_unsat: 0, leaves_reached: 0,
         learned_clauses_final: 0, max_level_reached: 0,
+        nodes_by_level: vec![0; ctx.depth + 1],
+        children_total: 0, internal_nodes: 0,
     };
 
     let deadline = if cfg.sat_secs > 0 {
@@ -775,6 +864,9 @@ fn dfs(
         if c.load(AtomicOrdering::Acquire) { return false; }
     }
     stats.nodes_visited += 1;
+    if state.level < stats.nodes_by_level.len() {
+        stats.nodes_by_level[state.level] += 1;
+    }
     if state.level as u64 > stats.max_level_reached {
         stats.max_level_reached = state.level as u64;
     }
@@ -899,6 +991,8 @@ fn dfs(
             rule_state: new_rule_state,
         });
     }
+    stats.internal_nodes += 1;
+    stats.children_total += candidates.len() as u64;
 
     // Score-ordered siblings: ascending score (low pressure first).
     // Sibling ordering: worker 0 (seed=0) walks best-first by ascending
