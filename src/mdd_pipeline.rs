@@ -1085,11 +1085,32 @@ pub(crate) fn run_mdd_sat_search(
                             // Collect passing W candidates into a batch to reduce
                             // queue lock contention, same as the brute-force path above.
                             let mut batch: Vec<PipelineWork> = Vec::new();
+                            // N1: cap W enumeration per boundary.  At large
+                            // middle_m the SAT path can loop for thousands
+                            // of solutions per boundary (each with a long
+                            // UNSAT proof between finds), monopolising a
+                            // worker for seconds.  A small cap lets workers
+                            // move on to fresh boundaries — each capped
+                            // boundary still feeds the Z stage dozens of
+                            // (Z, W) pairs, which is plenty.  Matches the
+                            // spirit of `max_z.min(16)` at line 518.
+                            let max_w_per_boundary: usize = std::env::var("TURYN_MAX_W_PER_BND")
+                                .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+                            // N2: per-call conflict budget so one pathological
+                            // solve() can't freeze a worker past sat_secs and
+                            // can't monopolise the attention past what's
+                            // useful.  5k matches the XY pattern for n > 30.
+                            let w_conflict_budget: u64 = std::env::var("TURYN_W_CONFL")
+                                .ok().and_then(|s| s.parse().ok()).unwrap_or(5000);
+                            let mut w_iter_count: usize = 0;
                             loop {
                                 if ctx.found.load(AtomicOrdering::Relaxed) { break; }
+                                if w_iter_count >= max_w_per_boundary { break; }
+                                w_iter_count += 1;
                                 let phases: Vec<bool> = (0..ctx.middle_m)
                                     .map(|_| next_rng!() & 1 == 1).collect();
                                 w_solver.set_phase(&phases);
+                                if w_conflict_budget > 0 { w_solver.set_conflict_budget(w_conflict_budget); }
                                 if w_solver.solve() != Some(true) { break; }
                                 flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
 
@@ -1930,12 +1951,18 @@ pub(crate) fn run_mdd_sat_search(
                         let z_nv = z_solver.num_vars();
 
                         let mut z_count = 0usize;
+                        // N2: per-call Z SAT conflict budget, same rationale
+                        // as W SAT above.  Without this a single pathological
+                        // solve() can run past sat_secs and block shutdown.
+                        let z_conflict_budget: u64 = std::env::var("TURYN_Z_CONFL")
+                            .ok().and_then(|s| s.parse().ok()).unwrap_or(5000);
                         loop {
                             if ctx.found.load(AtomicOrdering::Relaxed) { break; }
                             if z_count >= ctx.max_z { break; }
                             let z_phases: Vec<bool> = (0..ctx.middle_n)
                                 .map(|_| next_rng!() & 1 == 1).collect();
                             z_solver.set_phase(&z_phases);
+                            if z_conflict_budget > 0 { z_solver.set_conflict_budget(z_conflict_budget); }
                             let z_result = z_solver.solve();
                             if z_result != Some(true) {
                                 if z_count == 0 { flow_z_unsat.fetch_add(1, AtomicOrdering::Relaxed); }

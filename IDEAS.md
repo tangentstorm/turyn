@@ -1789,3 +1789,230 @@ workers. Switch to a process-wide `DashMap<u128, bool>` so the work
 is done once globally. Risk: contention may exceed savings; the
 per-worker cache hit rate is already high (the 4312 prunes /22323
 candidates ≈ 19%). Measure.
+
+## N-series: boundary throughput and pipeline balance (April 17 2026, Claude)
+
+Observation from fresh baseline measurements (`--wz=apart` on current
+container, 16 threads):
+
+- n=26 mdd-k=7 sat-secs=60: TTC = **45.4 m**, 526 eff bnd/s, XY
+  timeout 0.0%, `flow_w_spec_fail` = 82.7% of W solutions, `flow_z_pair_fail`
+  = 99.996% of Z solutions, W dec/solve ~0 (brute-force path: middle_m = 10).
+- n=56 mdd-k=10 sat-secs=60: TTC = **114883 d**, 0.27 eff bnd/s,
+  only **16 boundaries** walked in 60s because every W solve is a SAT
+  path doing ~12M decisions per solve (W middle_m = 34, SAT loop runs
+  until UNSAT → blocking clauses force it through huge UNSAT proofs).
+  `flow_w_solutions` = 127k across 16 boundaries = 8000 Ws per boundary.
+
+Big picture: at n=56 the pipeline has an unbalanced W stage that
+monopolises every worker. None ever reach SolveZ/XY. Some of these
+ideas pull the W stage back into budget so the rest of the pipeline
+can run.
+
+### N1. Cap W enumeration per boundary in SAT path — **LANDED**
+
+At middle_m > 20 the W SAT loop (`src/mdd_pipeline.rs:1055`) calls
+`w_solver.solve()` in an unbounded loop, adding a blocking clause after
+each solution. At n=56 each boundary produces ~8000 Ws over ~4s
+wall-clock, and ~82% fail the post-hoc spectral filter anyway. Analogue
+to `max_z: cfg.max_z.min(16)` at line 518.
+
+- **TTC mechanism**: rate — frees the worker to process new boundaries.
+  Each capped boundary still produces 16–32 (Z, W) pairs to XY-check,
+  which is plenty of coverage at n=56.
+- **Detection plan**: `stage_exit[0]`/s (boundaries walked) should
+  rise significantly; `stage_exit[1]`/s should fall (fewer W solutions
+  per boundary) but `stage_exit[0]` dominates TTC. Watch `eff bnd/s`.
+- **Risk**: capping W may leave the pair spectral filter unable to
+  find good (Z, W) pairs → higher XY UNSAT rate. Not a soundness risk;
+  just need to verify the W cap doesn't starve downstream XY SAT of
+  work.
+
+**Result (on top of main @ 1316047 which includes F1
+`SPECTRAL_FREQS 563→64`)**: at n=56 `--wz=apart --mdd-k=10` 60s,
+boundaries walked 34→730 (21×), `eff bnd/s` 0.57→12.16 (21×),
+TTC 53923d→2509d (**21.5×**). Env override:
+`TURYN_MAX_W_PER_BND=<N>`. See OPTIMIZATION_LOG.md "N1+N2".
+
+### N2. W and Z SAT conflict budget per solve — **LANDED**
+
+Set a conflict limit on each W and Z `solver.solve()` call, same as XY
+already does for n>30. At n=56 the per-solve average was into the
+millions of decisions — most of those are wasted UNSAT proofs, and
+without a limit a single pathological solve could block shutdown past
+`sat_secs`.
+
+- **TTC mechanism**: rate (+ makes runs cleanly measurable).
+- **Detection plan**: `flow_w_decisions/flow_w_solves` drops;
+  `stage_exit[1]`/s rises; `eff bnd/s` goes up; `sat_secs` expiry
+  now leads to clean exit.
+- **Risk**: a too-tight budget kills SAT diversity. Default 5000
+  matches the XY n>30 pattern; override via `TURYN_W_CONFL` /
+  `TURYN_Z_CONFL`.
+
+**Result**: default 5000 combined with N1 gives the 21× TTC win
+recorded under N1 (mostly attributable to N1; N2 is the
+testability / shutdown-soundness piece).
+
+### N3. Share SolveZ "pair check" with W spectral filter
+
+Today: W passes post-hoc spectral (individual bound) → goes to Z SAT →
+every Z solution is then FFT-ed and passed through `spectral_pair_ok`.
+99.996% fail at this step. If we computed the W's spectrum once and
+used `pair_bound - |W(ω)|²` as a tighter per-freq bound inside the Z
+SAT solver (already implemented as `per_freq_bound` in
+`src/sat_z_middle.rs`), the Z SAT would reject most of these without
+producing a solution.
+
+- **TTC mechanism**: rate (Z stage gets cheaper) + denominator (fewer
+  Z solutions reach the pair filter).
+- **Detection plan**: `flow_z_solves` drops sharply; `flow_z_pair_fail`
+  drops; `stage_exit[2]`/s rises.
+- **Verification needed**: is this *already* active? Read
+  `src/sat_z_middle.rs` and confirm. If it is, then this idea is
+  already done; if not, wire it.
+
+### N4. BDKR rules (ii)–(vi) enforced at MDD build time
+
+Today rules (ii)–(vi) are enforced only via SAT unit propagation in
+XY/W solvers. At MDD build the MDD still contains live ZW paths whose
+W would be rejected by rule (v) at SAT time. Enforcing the rules
+directly in the MDD (as boundary-rule-v / iv pre-filters during the
+ZW-first MDD build) shrinks `live_zw_paths` directly.
+
+- **TTC mechanism**: denominator — smaller live ZW path count.
+- **Detection plan**: `mdd.count_live_paths()` delta before/after;
+  TTC should drop by the ratio.
+- **Risk**: soundness — if we mis-encode a rule, we lose the
+  canonical TT. Required check: `known_tt26_verifies` regression
+  test.
+
+### N5. Adaptive gold/work queue ratio
+
+Current dual queue hard-codes a coinflip between XY (gold) and
+upstream (work). At n=56 the work queue is backlogged with SolveZ
+items but the XY queue drains fast; at n=26 the opposite may be true.
+Monitor thread adjusts the ratio based on queue sizes.
+
+- **TTC mechanism**: rate — better worker utilization.
+- **Detection plan**: `stage_exit[3]/elapsed` rises uniformly
+  through the run; workers spend less time on cheap stages.
+
+### N6. Per-freq W rejection using full tuple sum_w
+
+Currently W spectral filter uses `individual_bound = 3n-1` (optimal
+under the pair identity). But for a *specific tuple* with fixed
+`σ_Z, σ_W`, the sum tuple also fixes `σ_X, σ_Y` — and therefore
+`|X(0)|² + |Y(0)|² = σ_X² + σ_Y²`. This tightens `|Z(0)|² + |W(0)|²`
+below the generic pair bound at ω=0. At other frequencies the bound
+doesn't tighten, but every frequency counted reduces false-positive
+W solutions.
+
+- **TTC mechanism**: denominator + rate — fewer W solutions reach
+  the Z stage.
+- **Detection plan**: `flow_w_spec_pass` drops with no regression
+  in `flow_xy_sat`.
+- **Risk**: tuple-specific filtering may reject some boundaries
+  that have a legitimate other-tuple match. Need to preserve
+  canonical coverage.
+
+### N7. Eager XY item emission from SolveZ batch
+
+Today SolveZ → emits one XY item per Z solution. If we batch
+multiple Z solutions against the same W and emit a single XY item
+that iterates them internally, we avoid per-Z queue lock overhead.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: no direct counter; measure via `eff bnd/s`.
+- **Risk**: changes the work-stealing dynamics, may actually slow
+  down overall (monitor needs even units of work for load-balancing).
+
+### N8. Conflict limit retest at n=56 (tier-3 #9 retry)
+
+`set_conflict_limit(5000)` for n>30 was tuned on xy/s, not TTC.
+Sweep `{2k, 5k, 10k, 20k, 50k}` at n=56 mdd-k=10 sat-secs=60 and
+record TTC, `flow_xy_timeout/flow_xy_solves`, and `eff bnd/s`. Watch
+for a TTC win that higher budgets provide via reduced shortfall.
+
+- **TTC mechanism**: shortfall.
+- **Detection plan**: TTC vs budget curve.
+
+### N9. mdd_extend retest at n=26 and n=56 (tier-3 #11 retry)
+
+`mdd_extend=1` was accepted on +28% bnd/s. Sweep
+`{0, 1, 2, 3}` on TTC (not bnd/s) to confirm.
+
+- **TTC mechanism**: denominator (higher extend = more pruning) vs
+  rate (higher extend = more per-candidate work).
+
+### N10. max_z cap retest at n=56 (tier-3 #8 retry)
+
+`max_z` currently capped at 16 (src/mdd_pipeline.rs:518). Re-sweep
+`{1, 4, 8, 16, 32, 64}` at n=56 mdd-k=10. Note comment says measured
+sweep was at n=26 k=3, which is a very different profile — at n=56
+k=10, cheap Z per boundary prep may amortise better with a higher
+cap.
+
+### N11. Incremental spectral filter in XY SAT
+
+The Z SAT solver already has `SpectralConstraint` to enforce
+`|Z(ω)|²  ≤ pair_bound - |W(ω)|²` per-frequency. The XY SAT solver
+does NOT — it relies on the post-facto spectral pair check at the
+XY output to reject bad assignments. Adding `SpectralConstraint` on
+XY (with `pair_bound - |Z(ω)|² - |W(ω)|²` as the per-freq bound) would
+prune XY assignments that blow the Parseval budget during search.
+
+- **TTC mechanism**: shortfall + rate.
+- **Detection plan**: `flow_xy_decisions/flow_xy_solves` drops;
+  `flow_xy_timeout` drops at large n.
+- **Risk**: the spectral constraint is pair-dependent, so must be
+  rebuilt per (Z, W) candidate — cheap if the `SpectralTables` can
+  be shared via Arc.
+
+### N12. Skip SolveZ when XY sub-MDD is empty
+
+Today the MDD-guided tuple fail-fast (G8, `any_valid_xy`) happens at
+SolveW / Boundary time. But `xy_root` is available at SolveZ too. If
+after fixing Z the XY sub-MDD is empty, we know the pair can't
+produce an XY. Pre-check before entering SAT.
+
+- **TTC mechanism**: rate — skip Z SAT for dead tuples.
+- **Detection plan**: `flow_z_solves` drops; `flow_z_pair_fail`
+  unchanged; `eff bnd/s` rises.
+
+### N13. Monitor thread bumped at n=56
+
+Today the monitor sleeps between dispatches. At n=56 where
+boundaries are the limiting resource (workers stuck in W SAT
+because monitor hasn't dispatched enough), a faster monitor thread
+may help.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: `stage_exit[0]` rises as monitor dispatches
+  more boundaries per second. Tricky — can't improve if workers
+  can't process what they have.
+
+### N14. Precompute and cache W boundary DFT contribution
+
+W SAT builds `SpectralConstraint::from_tables(wtab, &w_boundary,
+individual_bound)` once per boundary, which recomputes
+`boundary_dft` every time. If two boundaries share prefix/suffix
+bits, the per-prefix contribution can be cached.
+
+- **TTC mechanism**: rate — per-boundary setup cheaper.
+- **Detection plan**: indirect; measure via `stage_exit[1]/elapsed`
+  (SolveW throughput) net of the setup cost.
+
+### N15. Deprioritise boundaries where sub-MDD is tiny
+
+The MDD walker produces boundaries in LCG order. Some boundaries
+have very few live (x, y) extensions; these produce little XY
+coverage per W/Z work done. Monitor could use `any_valid_xy` count
+as a priority signal.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: `eff/elapsed` curve should be steeper early
+  when we prioritise "bigger payoff" boundaries.
+- **Risk**: we still need to walk every boundary eventually for
+  completeness — this is purely a *rate* win (same denominator,
+  better rate shape).
