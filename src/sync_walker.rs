@@ -25,8 +25,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Instant;
 
-use rustc_hash::FxHashMap;
-
 use crate::types::{PackedSeq, Problem, SumTuple};
 use crate::enumerate::enumerate_sum_tuples;
 use crate::legacy_search::{SearchReport, SearchStats};
@@ -735,37 +733,6 @@ fn score_state(state: &State, ctx: &Ctx) -> i64 {
     total
 }
 
-fn compute_signature(state: &State, ctx: &Ctx) -> u64 {
-    // The walker's "state" at a given level is determined by:
-    //   - current level
-    //   - running per-lag sums S(s)
-    //   - walker-placed bits at positions already visited (pos_order[..level])
-    //   - rule-fired bitmask
-    //
-    // NOTE: we deliberately exclude bits beyond the walker frontier
-    // (positions pinned purely via harvest_forced from SAT propagation).
-    // Those are deterministic functions of the walker prefix + the
-    // solver's clause database, so including them makes the signature
-    // vary by clause-DB state and prevents memo hits across branches
-    // that converge to the same walker state through different routes.
-    use std::hash::Hasher;
-    let mut h = rustc_hash::FxHasher::default();
-    h.write_usize(state.level);
-    for s in 1..ctx.n {
-        h.write_i16(state.sums[s]);
-    }
-    // Only include bits at walker-visited positions (pos_order[..level]).
-    for (lvl, &pos) in ctx.pos_order.iter().enumerate() {
-        if lvl >= state.level { break; }
-        for kind in 0u8..4 {
-            if pos >= kind_xy_len(kind, ctx.n, ctx.m) { continue; }
-            h.write_u8(state.bit(kind, pos));
-        }
-    }
-    h.write_u8(state.rule_state);
-    h.finish()
-}
-
 #[derive(Clone)]
 pub(crate) struct SyncStats {
     pub nodes_visited: u64,
@@ -778,6 +745,13 @@ pub(crate) struct SyncStats {
     pub learned_clauses_final: u64,
     pub max_level_reached: u64,
     pub nodes_by_level: Vec<u64>,
+    /// Per-level sum of `candidates.len()` — i.e. the children that
+    /// survived cap/tuple/rule pruning at that level and became
+    /// candidates for SAT / descent. `children_by_level[L] /
+    /// nodes_by_level[L]` is the true per-level branching factor
+    /// (independent of DFS partial-run bias that contaminates the
+    /// ratio `nodes_by_level[L+1] / nodes_by_level[L]`).
+    pub children_by_level: Vec<u64>,
     pub children_total: u64,
     pub internal_nodes: u64,
     pub time_to_first_leaf: Option<f64>,
@@ -834,7 +808,8 @@ fn search_sync_parallel(
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
         rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
         learned_clauses_final: 0, max_level_reached: 0,
-        nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
+        nodes_by_level: Vec::new(), children_by_level: Vec::new(),
+        children_total: 0, internal_nodes: 0,
         time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
         peer_clauses_read: 0, peer_clauses_imported: 0,
@@ -887,6 +862,12 @@ fn search_sync_parallel(
                 for (i, &c) in stats.nodes_by_level.iter().enumerate() {
                     agg.nodes_by_level[i] += c;
                 }
+                if agg.children_by_level.len() < stats.children_by_level.len() {
+                    agg.children_by_level.resize(stats.children_by_level.len(), 0);
+                }
+                for (i, &c) in stats.children_by_level.iter().enumerate() {
+                    agg.children_by_level[i] += c;
+                }
                 drop(agg);
                 if let Some(s) = sol {
                     let mut r = result.lock().unwrap();
@@ -920,66 +901,98 @@ fn search_sync_parallel(
 
 /// Project TTC (time-to-cover) from measured per-level branching + rate.
 ///
-/// Method: take the measured per-level `nodes_by_level[L]` counts from
-/// the (partial or full) run. Divide by the number of DFS entries per
-/// level (each parent spawns up to b_eff children, each child is a
-/// dfs call at level L+1). That gives a measured effective branching
-/// factor `b_eff(L) = nodes_by_level[L+1] / nodes_by_level[L]` for
-/// levels where `nodes_by_level[L] > 0`.
+/// Method: for each level L, compute the true per-parent branching
+/// factor `b_eff(L) = children_by_level[L] / nodes_by_level[L]` —
+/// i.e. "out of every parent visited at depth L, how many children
+/// survived cap/tuple/rule pruning and became candidates for SAT /
+/// descent". This ratio is INDEPENDENT of DFS completion: even if the
+/// run ends after visiting only 3 parents at level L=20, each of those
+/// 3 parents still gives an unbiased estimate of the true per-parent
+/// branching.
 ///
-/// Full-cover tree size (for the canonical-post-pruning space):
-///   N_total = Σ_{L=0..depth} Π_{ℓ=0..L} b_eff(ℓ)
-///           = Π_{ℓ=0..depth-1} b_eff(ℓ)   (with geometric sum ≈ leading term when b>1)
+/// Contrast with the old (buggy) estimator
+///   b_eff(L) = nodes_by_level[L+1] / nodes_by_level[L]
+/// which is massively downward-biased on a partial run: the DFS
+/// leaves many parents at level L with their children unexplored, so
+/// nodes_by_level[L+1] counts far fewer than b*nodes_by_level[L].
+///
+/// Full-cover tree size:
+///   N_total = 1 + Σ_{L=0..depth-1} Π_{ℓ=0..L} b_eff(ℓ)
+///
+/// For levels with too few samples (MIN_SAMPLES) we fall back to the
+/// median of the reliably-sampled levels — a conservative estimate
+/// that avoids both the "exactly zero" cliff and the "one weird
+/// sample" cliff.
 ///
 /// TTC_serial  = N_total / rate,   TTC_parallel = TTC_serial / n_workers
 /// where rate = nodes_visited / elapsed (aggregate across workers in
 /// parallel mode, so this is already a parallel rate).
 fn project_ttc(stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize) -> String {
+    const MIN_SAMPLES: u64 = 32;
     let depth = n;  // bouncing-order depth = n for even n
-    let levels = stats.nodes_by_level.len();
-    if levels < 2 || elapsed_secs <= 0.0 || stats.nodes_visited == 0 {
-        return format!("TTC projection: insufficient data");
+    if elapsed_secs <= 0.0 || stats.nodes_visited == 0 {
+        return "TTC projection: insufficient data".to_string();
     }
-    // Measured effective branching per level. Only levels that have
-    // been EXITED (finished exploration) give a stable estimate —
-    // in DFS early levels stabilise first. For partial runs, use the
-    // deepest level where both L and L+1 have at least one visit.
-    let mut b_eff: Vec<f64> = Vec::with_capacity(depth);
-    for l in 0..depth.min(levels - 1) {
-        let parent = stats.nodes_by_level[l];
-        let child = stats.nodes_by_level[l + 1];
+    // Per-level true branching factor, flagged as reliable if the
+    // parent count is large enough to trust the ratio.
+    struct Bee { b: f64, reliable: bool }
+    let mut b_eff: Vec<Bee> = Vec::with_capacity(depth);
+    for l in 0..depth {
+        let parent = stats.nodes_by_level.get(l).copied().unwrap_or(0);
+        let child = stats.children_by_level.get(l).copied().unwrap_or(0);
         if parent == 0 {
-            b_eff.push(0.0);
+            b_eff.push(Bee { b: 0.0, reliable: false });
         } else {
-            b_eff.push(child as f64 / parent as f64);
+            b_eff.push(Bee {
+                b: child as f64 / parent as f64,
+                reliable: parent >= MIN_SAMPLES,
+            });
         }
     }
-    // Projected total tree size assuming measured b_eff(L) holds at
-    // every level. For levels where we have no data (L >= max depth
-    // reached), use the geometric mean of measured levels as a best
-    // guess; clamp below 1.0 to avoid divergence on sparse leaves.
-    let measured_avg: f64 = if b_eff.is_empty() { 1.0 } else {
-        let log_prod: f64 = b_eff.iter().filter(|&&b| b > 0.0).map(|b| b.ln()).sum();
-        let count = b_eff.iter().filter(|&&b| b > 0.0).count().max(1);
-        (log_prod / count as f64).exp()
+    // Fallback for unreliable levels: use the median of reliable
+    // levels' b_eff. Median (not mean) resists one weird outlier.
+    let mut reliable_bs: Vec<f64> =
+        b_eff.iter().filter(|x| x.reliable).map(|x| x.b).collect();
+    reliable_bs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let fallback = if reliable_bs.is_empty() {
+        1.0
+    } else {
+        reliable_bs[reliable_bs.len() / 2]
     };
+    let geo_mean = if reliable_bs.is_empty() {
+        fallback
+    } else {
+        let log_sum: f64 = reliable_bs.iter().map(|b| b.max(1e-9).ln()).sum();
+        (log_sum / reliable_bs.len() as f64).exp()
+    };
+    // Build the full-cover projection. Use each reliable level as-is;
+    // for unreliable levels use the median fallback.
     let mut projected_nodes = 1.0_f64;
     let mut running_product = 1.0_f64;
     for l in 0..depth {
-        let b = b_eff.get(l).copied().filter(|&b| b > 0.0).unwrap_or(measured_avg);
+        let b = match b_eff.get(l) {
+            Some(Bee { b, reliable: true }) => *b,
+            _ => fallback,
+        };
         running_product *= b;
         projected_nodes += running_product;
+        // Numerical guard: huge projections blow up f64 quickly.
+        if !running_product.is_finite() { break; }
     }
     let rate = stats.nodes_visited as f64 / elapsed_secs;
     let ttc_parallel = projected_nodes / rate;
     let ttc_serial = ttc_parallel * n_workers as f64;
+    let tail_unreliable = b_eff.iter().filter(|x| !x.reliable).count();
     format!(
-        "TTC projection: b_eff per level = [{}]\n\
-         TTC projection: measured b_eff geo mean = {:.3}, projected nodes to cover = {:.3e}\n\
+        "TTC projection: b_eff per level = [{}] ({} reliable, {} filled w/ median={:.3})\n\
+         TTC projection: reliable geo mean = {:.3}, projected nodes to cover = {:.3e}\n\
          TTC projection: rate = {:.0} nodes/s ({} workers, aggregate),\n\
          TTC projection: TTC_parallel ≈ {:.1}s, TTC_serial ≈ {:.1}s",
-        b_eff.iter().map(|b| format!("{:.2}", b)).collect::<Vec<_>>().join(", "),
-        measured_avg, projected_nodes, rate, n_workers, ttc_parallel, ttc_serial,
+        b_eff.iter()
+            .map(|x| if x.reliable { format!("{:.2}", x.b) } else { format!("{:.2}?", x.b) })
+            .collect::<Vec<_>>().join(", "),
+        reliable_bs.len(), tail_unreliable, fallback,
+        geo_mean, projected_nodes, rate, n_workers, ttc_parallel, ttc_serial,
     )
 }
 
@@ -1004,7 +1017,8 @@ fn search_sync_serial(
         return (None, SyncStats {
             nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
             rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
-            nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
+            nodes_by_level: Vec::new(), children_by_level: Vec::new(),
+            children_total: 0, internal_nodes: 0,
             time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
         peer_clauses_read: 0, peer_clauses_imported: 0,
@@ -1014,12 +1028,12 @@ fn search_sync_serial(
     let mut state = State::new(ctx.n);
     harvest_forced(&solver, &mut state, &ctx);
 
-    let mut memo: FxHashMap<u64, ()> = FxHashMap::default();
     let mut stats = SyncStats {
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
         rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
         learned_clauses_final: 0, max_level_reached: 0,
         nodes_by_level: vec![0; ctx.depth + 1],
+        children_by_level: vec![0; ctx.depth + 1],
         children_total: 0, internal_nodes: 0,
         time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
@@ -1031,7 +1045,7 @@ fn search_sync_serial(
     } else { None };
 
     let mut found: Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)> = None;
-    dfs(&mut solver, &mut state, &ctx, &mut memo, &mut stats, deadline, &mut found);
+    dfs(&mut solver, &mut state, &ctx, &mut stats, deadline, &mut found);
 
     let elapsed = start.elapsed();
     if verbose {
@@ -1048,7 +1062,6 @@ fn dfs(
     solver: &mut radical::Solver,
     state: &mut State,
     ctx: &Ctx,
-    memo: &mut FxHashMap<u64, ()>,
     stats: &mut SyncStats,
     deadline: Option<Instant>,
     found: &mut Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
@@ -1119,7 +1132,20 @@ fn dfs(
     let has_w = pos < ctx.m;
 
     // Build child candidates with their scores.
-    struct Cand { assum: Vec<i32>, placed_signs: [(u8, usize, i8); 4], num_placed: u8, score: i64, rule_state: u8 }
+    //
+    // `new_assums` / `num_new_assums` store only the NEW literals added at
+    // this level (≤4). The full assumption list is reconstructed at child
+    // entry via `state.assumptions.truncate(parent_len) +
+    // extend_from_slice(&cand.new_assums)`, avoiding a per-candidate Vec
+    // clone of the ancestor list (typically 4*level lits).
+    struct Cand {
+        new_assums: [i32; 4],
+        num_new_assums: u8,
+        placed_signs: [(u8, usize, i8); 4],
+        num_placed: u8,
+        score: i64,
+        rule_state: u8,
+    }
     let mut candidates: Vec<Cand> = Vec::with_capacity(16);
 
     for choice in 0u8..16 {
@@ -1132,7 +1158,8 @@ fn dfs(
         let mut placed = [(0u8, 0usize, 0i8); 4];
         let mut np: u8 = 0;
         let mut consistent = true;
-        let mut new_assums: Vec<i32> = Vec::with_capacity(4);
+        let mut new_assums: [i32; 4] = [0; 4];
+        let mut num_new: u8 = 0;
 
         for (kind, sign) in [(0u8, bx), (1, by), (2, bz), (3, bw)] {
             let xy_len = kind_xy_len(kind, ctx.n, ctx.m);
@@ -1147,7 +1174,8 @@ fn dfs(
             placed[np as usize] = (kind, pos, sign);
             np += 1;
             let var = var_for(kind, pos, ctx.n);
-            new_assums.push(if sign > 0 { var } else { -var });
+            new_assums[num_new as usize] = if sign > 0 { var } else { -var };
+            num_new += 1;
         }
         if !consistent { continue; }
 
@@ -1212,11 +1240,9 @@ fn dfs(
             }
         };
 
-        // Build full assumption list for this child.
-        let mut full_assum = state.assumptions.clone();
-        full_assum.extend_from_slice(&new_assums);
         candidates.push(Cand {
-            assum: full_assum,
+            new_assums,
+            num_new_assums: num_new,
             placed_signs: placed,
             num_placed: np,
             score,
@@ -1225,6 +1251,10 @@ fn dfs(
     }
     stats.internal_nodes += 1;
     stats.children_total += candidates.len() as u64;
+    if state.level >= stats.children_by_level.len() {
+        stats.children_by_level.resize(state.level + 1, 0);
+    }
+    stats.children_by_level[state.level] += candidates.len() as u64;
 
     // Score-ordered siblings: ascending score (low pressure first).
     // Sibling ordering: worker 0 (seed=0) walks best-first by ascending
@@ -1273,56 +1303,53 @@ fn dfs(
             let (ki, pi, si) = cand.placed_signs[k];
             state.set_bit(ki, pi, si);
         }
-        state.assumptions = cand.assum.clone();
+        state.assumptions.extend_from_slice(&cand.new_assums[..cand.num_new_assums as usize]);
         state.level += 1;
         state.rule_state = cand.rule_state;
         rebuild_sums(state, ctx);
 
-        // Memo check on the post-placement (pre-SAT) state.
-        let sig = compute_signature(state, ctx);
-        let memo_hit = memo.contains_key(&sig);
-        if memo_hit {
-            stats.memo_hits += 1;
-        } else {
-            // Per-level SAT call: propagate_only (no CDCL decisions,
-            // so cost is proportional to new propagation work). On
-            // UNSAT the solver installs a full-assumption nogood that
-            // short-circuits future calls with the same prefix.
-            let sat = solver.propagate_only(&state.assumptions);
-            if sat == Some(true) {
-                harvest_forced(solver, state, ctx);
-                rebuild_sums(state, ctx);
-                // After harvest: many bits beyond the walker frontier
-                // may now be set (via rule propagation into the
-                // middle). Use the tighter dynamic capacity check
-                // which accounts for pairs already fully determined.
-                if !capacity_violated(state, ctx) && !dynamic_capacity_violated(state, ctx) {
-                    memo.insert(sig, ());
-                    if dfs(solver, state, ctx, memo, stats, deadline, found) {
-                        return true;
-                    }
+        // Per-level SAT call: propagate_only (no CDCL decisions,
+        // so cost is proportional to new propagation work). On
+        // UNSAT the solver installs a full-assumption nogood that
+        // short-circuits future calls with the same prefix.
+        //
+        // Note: a per-worker signature-keyed memo was tried here and
+        // measured memo_hits=0 on every benchmark (n=18, 22, 26) —
+        // each DFS path has a unique (level, sums, walker_bits)
+        // signature, so the memo never fires. Removed to save the
+        // compute_signature + hash cost per accepted candidate.
+        let sat = solver.propagate_only(&state.assumptions);
+        if sat == Some(true) {
+            harvest_forced(solver, state, ctx);
+            rebuild_sums(state, ctx);
+            // After harvest: many bits beyond the walker frontier
+            // may now be set (via rule propagation into the
+            // middle). Use the tighter dynamic capacity check
+            // which accounts for pairs already fully determined.
+            if !capacity_violated(state, ctx) {
+                if dfs(solver, state, ctx, stats, deadline, found) {
+                    return true;
                 }
-            } else {
-                stats.sat_unsat += 1;
-                let (ng, full) = solver.last_nogood_stats();
-                stats.nogood_len_sum += ng as u64;
-                stats.full_nogood_len_sum += full as u64;
-                // Publish the just-learnt nogood to peer workers, but
-                // only if it's small enough to be useful. Long clauses
-                // (Turyn nogoods are typically ~n lits) rarely fire
-                // via watches and bloat the clause DB, so filter.
-                const MAX_SHARED_LEN: usize = 16;
-                if let Some(ex) = &ctx.exchange {
-                    if let Some(clause) = solver.take_last_learnt_clause() {
-                        if clause.len() <= MAX_SHARED_LEN {
-                            if let Ok(mut v) = ex.clauses.lock() {
-                                v.push(clause);
-                            }
+            }
+        } else {
+            stats.sat_unsat += 1;
+            let (ng, full) = solver.last_nogood_stats();
+            stats.nogood_len_sum += ng as u64;
+            stats.full_nogood_len_sum += full as u64;
+            // Publish the just-learnt nogood to peer workers, but
+            // only if it's small enough to be useful. Long clauses
+            // (Turyn nogoods are typically ~n lits) rarely fire
+            // via watches and bloat the clause DB, so filter.
+            const MAX_SHARED_LEN: usize = 16;
+            if let Some(ex) = &ctx.exchange {
+                if let Some(clause) = solver.take_last_learnt_clause() {
+                    if clause.len() <= MAX_SHARED_LEN {
+                        if let Ok(mut v) = ex.clauses.lock() {
+                            v.push(clause);
                         }
                     }
                 }
             }
-            memo.entry(sig).or_insert(());
         }
 
         // Rollback level only; state.bits, sums, assumptions get

@@ -2016,3 +2016,237 @@ as a priority signal.
 - **Risk**: we still need to walk every boundary eventually for
   completeness — this is purely a *rate* win (same denominator,
   better rate shape).
+
+## S-series: `--wz=sync` walker optimisation (April 18 2026, Claude)
+
+Baseline (n=26 `--wz=sync` sat-secs=60, 16 workers):
+- nodes=3.6M, rate 60k nodes/s, max_lvl=25/26, 0 leaves
+- memo_hits=**0** (memoization is dead code on every benchmark we've run)
+- rule_rejects=**0** (walker-side rule check catches nothing; SAT handles it)
+- avg_nogood 70.9/70.6 (**1.00× shrink** — 1-UIP produces nothing)
+- cap_rejects=48M (dominant pruner), tuple_rejects=1.4M, sat_unsat=1.6M
+- b_eff levels 0..5 all = 1.0 (deterministic — every worker re-walks them)
+- peer_imports=416 (tiny cross-worker clause exchange)
+- projected TTC 3.8s parallel, but 60s real time never finished. Projection
+  overestimates because early b_eff=1 dominates the geometric mean.
+
+The hot inner loop per DFS node runs 16 times (once per choice of
+(X, Y, Z, W) sign tuple at `pos_order[level]`): build Cand with cloned
+assumptions, speculatively set bits, rebuild_sums (O(n²)), check capacity /
+tuple-reachable / rules, rollback, rebuild_sums again. Then for the
+accepted siblings: `propagate_only(&state.assumptions)` (re-asserts every
+ancestor assumption), optionally harvest forced bits, insert into memo
+(never queried), recurse.
+
+### S1. Remove the dead memoization
+
+`memo_hits=0` on every run we've measured (n=18, 22, 26). Removing memo
+drops: (a) `compute_signature`'s hash of `state.level` × 4 bits per
+call (O(level) per DFS call), (b) FxHashMap insert, (c) the entire
+`memo` HashMap allocation. Net win: per-node cost drops with no
+pruning lost.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: `nodes_visited / elapsed` rises; `memo_hits`
+  remains 0 (confirmed dead); TTC (projected_parallel) should drop
+  by the same ratio.
+- **Risk**: none — `memo_hits=0` is proof the map is write-only.
+  Should still keep the hash signature mechanism in the tree for
+  potential future coarser memoization (S8 below).
+
+### S2. Avoid cloning state.assumptions per candidate
+
+`dfs()` builds `Cand { assum: state.assumptions.clone() + new_assums,
+... }` for every sibling. At depth L the assumption list is ~4L lits;
+with 16 siblings per node, that's 64L i32 allocations per node. At
+n=26, ~50 MB/s of churn once the walker is deep. Replace by storing
+only the `new_assums` (≤4 lits, fits in inline array) and
+reconstructing full assumptions from `state.assumptions` at child
+entry via `truncate + extend_from_slice`.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: `nodes_visited / elapsed` rises; check with
+  `perf` that `Vec::allocate` in candidates ranking falls.
+
+### S3. Skip speculative rebuild_sums — compute score from delta
+
+Current code: for each candidate, set bits, `rebuild_sums` (O(n²)),
+compute capacity+score, unset bits, `rebuild_sums` again to parent
+state. Two full O(n²) sweeps per candidate × 16 candidates × every
+node. Replace with: keep parent-level sums unchanged; for each
+candidate, compute a `sums_delta` from `closure_events[level]` using
+the candidate's placed bits (O(|events at this level|)); add/subtract
+for checks; no global rebuild. Same savings on the post-SAT harvest
+path by incrementally updating.
+
+- **TTC mechanism**: rate (large — rebuild_sums is in the innermost
+  loop and does O(n²) work).
+- **Detection plan**: nodes/s should rise; per-node elapsed (via
+  `perf stat -e cycles,instructions`) should drop meaningfully.
+
+### S4. Partition first deterministic levels across workers
+
+b_eff=1 for levels 0..5 means all 16 workers re-walk the same prefix.
+Pre-compute the single forced path through levels 0..L* (where L* is
+the first branching level) once, then dispatch workers from there
+with distinct first-branching assignments. Equivalent to doing a
+single serial walk until the first branch, then parallelising.
+
+- **TTC mechanism**: rate (stop wasting 15/16 × prefix work).
+- **Detection plan**: `nodes_visited / elapsed` aggregate should
+  rise by ~15/16 when prefix is forced; the `nodes_by_level[0..L*]`
+  should be 1 per worker rather than ~1 per worker × 16.
+- **Risk**: workers need distinct starting assumptions; need to
+  emit N work-items (one per first-branching sibling) to a shared
+  queue and let workers pull.
+
+### S5. Raise cross-worker nogood-share threshold
+
+`MAX_SHARED_LEN: usize = 16` in `dfs()`. Measured avg nogood len is
+~70; basically nothing gets shared. Try raising to 256 (or: share
+unconditionally and let the solver DB evict). Peer clauses prune
+repeat deadends across different workers — this is literally the
+mechanism that makes parallel CDCL scale.
+
+- **TTC mechanism**: rate (bigger peer clause flow → fewer
+  redundant SAT-UNSAT calls across workers).
+- **Detection plan**: `peer_imports` should rise 10–100×; `sat_unsat`
+  should drop; need to verify no regression in nodes/s from added
+  clause-DB overhead.
+- **Risk**: long clauses rarely fire via two-watch and bloat the DB.
+  If regression, add a heuristic: share clauses with short LBD
+  regardless of length.
+
+### S6. Remove `compute_sigma` O(4n) sweep from tuple_reachable
+
+`tuple_reachable` is called in the speculative-candidate loop and
+calls `compute_sigma` which scans all 4 sequences × n positions
+looking at every bit. We can maintain sigma/free incrementally per
+sequence and update on bit set/unset.
+
+- **TTC mechanism**: rate (cuts per-candidate cost).
+- **Detection plan**: nodes/s rises.
+
+### S7. Skip `propagate_only` when new bits are only deterministic
+
+When the just-placed bits are all forced by already-present SAT
+constraints (e.g., the placement matches what the parent's
+`harvest_forced` predicted), we know `propagate_only` would be a
+no-op and just re-assert ancestor assumptions. Detect this via a
+"would-be-forced" check before calling propagate_only.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: `sat_unsat` unchanged; nodes/s rises.
+- **Risk**: has to be sound — if we skip propagate_only we're
+  trusting walker pruning to be equivalent. Gated on
+  harvest_forced's prediction matching the placement.
+
+### S8. Coarser memo key — (level, sums, rule_state) only
+
+Current signature also hashes walker-placed bits, which means every
+DFS path is unique and memo never fires. If we drop the bit hash,
+different sibling orderings that reach the same (sums, rule_state)
+at the same level would short-circuit. But: two placements with the
+same (sums, rule_state) may still differ in feasibility because
+harvest_forced's set of forced bits differs. Need either (a) a
+soundness proof that (level, sums) determines feasibility, or (b)
+a weaker guarantee — memo only the "UNSAT" outcomes (they're always
+safe to cache by sums).
+
+- **TTC mechanism**: rate (denominator on revisit paths).
+- **Detection plan**: `memo_hits` rises; `sat_unsat` drops.
+- **Risk**: soundness — must not prune feasible states. Start with
+  UNSAT-only memo for safety.
+
+### S9. Incrementally maintain sums instead of rebuild_sums
+
+Store sum deltas per level in a stack so descent = add delta,
+backtrack = subtract delta. Replaces all three `rebuild_sums` calls
+in the dfs (top-of-sibling-loop, speculative, post-harvest) with
+O(events at this level) updates.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: nodes/s up; function-level profile shows
+  `rebuild_sums` disappearing.
+- **Status**: subsumed by S3 if implemented carefully.
+
+### S10. Swap `solve_with_assumptions` at leaf for `propagate_only`-plus-model-extraction
+
+At the leaf (level==depth), code calls `solver.solve_with_assumptions`
+to validate. At depth≥18 we've already filtered with capacity/tuple
+and propagate_only; the full solve is redundant work (harvesting the
+model only). Replace with `propagate_only` + `solver.value()` calls.
+
+- **TTC mechanism**: rate — leaves are rare but each full solve costs
+  ms+. However leaves reached ≤1 at n=26 baseline, so impact is small
+  unless we also fix TTC.
+- **Detection plan**: `leaves_reached` unchanged; elapsed lower when
+  leaves are actually reached.
+- **Risk**: model extraction requires the solver to have the full
+  assignment. If propagate_only didn't force all lits, we need a
+  separate model-completion step.
+
+### S11. Delete unused `dynamic_capacity_violated` hot path
+
+`dynamic_capacity_violated` runs after every accepted child's SAT
+propagate. It's O(n²) and checks a tighter bound than
+`capacity_violated`. But with the static max_remaining bound already
+catching 48M/node ratio, the dynamic check may never fire. Measure
+its contribution: run with dynamic check removed; compare
+`cap_rejects` delta. If delta ≈ 0, remove it entirely.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: `cap_rejects` unchanged; nodes/s rises.
+
+### S12. Test `--no-xor` on sync walker
+
+Sync's SAT config uses the default (XOR + QuadPB + spectral where
+applicable). propagate_only is called per DFS node, and on every call
+all three propagators re-fire across all re-asserted assumptions.
+XOR propagation is heavy. Unclear if it's necessary for the Turyn
+identity once QuadPB is active. Try toggling.
+
+- **TTC mechanism**: rate if XOR is unnecessary; regression if it's
+  catching what QuadPB can't.
+- **Detection plan**: `sat_unsat` stays similar (or drops slightly
+  from slower propagation); nodes/s rises.
+- **Risk**: none (gated by config).
+
+### S13. Pre-compute and cache the level-0 propagated solver
+
+All workers build the same base solver via `build_solver`. Building
+the solver with quad PB and Tseitin chains takes ~10-50ms per worker.
+Build once in `search_sync_parallel`, then `Clone` the solver into
+each worker. Currently `Solver` is not `Clone`, but the walker's
+base clause set is constant across workers — can clone the core DB.
+
+- **TTC mechanism**: rate (faster startup; matters for short runs).
+- **Detection plan**: only visible on short runs; TTC-relevant at
+  small sat-secs.
+- **Status**: low-priority unless we also lean on restart churn.
+
+### S14. Early exit the sibling loop when a rule just fired
+
+If check_rules on the first few accepted candidates resolves the
+same rule (RULE_II / RULE_IV / RULE_V), later candidates likely fail
+the same rule check. Currently we enumerate all 16 candidates
+regardless. Cache "rule fired at this level by early-bit=X" and
+skip any candidate that'd re-fire with an inconsistent early bit.
+
+- **TTC mechanism**: denominator (fewer candidates per node).
+- **Detection plan**: `candidates.len()` avg drops; nodes/s stays flat
+  but per-node effective work drops.
+
+### S15. Adaptive per-worker sibling-sort randomness
+
+Worker 0 is best-first (seed=0 → score-sorted), workers 1..15 fully
+random. Middle ground: workers 1..15 do epsilon-greedy (best-first
+with probability `1-ε`, random otherwise). At ε=0.1 they follow the
+gradient most of the time but diverge onto different paths
+occasionally — more likely to find leaves than pure random.
+
+- **TTC mechanism**: rate (faster leaf discovery → earlier first
+  solution).
+- **Detection plan**: `time_to_first_leaf` should drop.
+- **Risk**: on UNSAT-complete search this is neutral (still need
+  to cover tree); purely a find-solution-faster optimisation.
