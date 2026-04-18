@@ -63,12 +63,6 @@ fn print_help() {
     eprintln!("                           pipeline. Implied by --mdd-k=N and --mdd-extend=N.");
     eprintln!("  --wz=together            MDD boundary walker + combined W+Z SAT call (one");
     eprintln!("                           solve produces both middles). Alias: --wz-together.");
-    eprintln!("  --wz=xyzw                No outer walker — one SAT call over all 4 sequences");
-    eprintln!("                           with the full ZW+XY MDD as a native constraint and");
-    eprintln!("                           the Turyn identity as per-lag quad PB. BDKR canonical");
-    eprintln!("                           form enforced as SAT clauses. See solve_xyzw.");
-    eprintln!("  --wz-xyzw-tuples=<all|each>  (with --wz=xyzw) 'all' = one solve (default);");
-    eprintln!("                           'each' = legacy per-tuple loop.");
     eprintln!("  --wz=sync                Synchronized 4-seq heuristic walker. Bouncing-order MDD");
     eprintln!("                           built on the fly (no mdd-k.bin needed). Scores 16-way");
     eprintln!("                           levels by running autocorrelation pressure. Persistent");
@@ -221,24 +215,15 @@ fn parse_args() -> SearchConfig {
                 "cross" => WzMode::Cross,
                 "together" => WzMode::Together,
                 "apart" => WzMode::Apart,
-                "xyzw" => WzMode::Xyzw,
                 "sync" => WzMode::Sync,
                 _ => {
-                    eprintln!("error: --wz must be one of cross|together|apart|xyzw|sync (got '{}')\n", v);
+                    eprintln!("error: --wz must be one of cross|together|apart|sync (got '{}')\n", v);
                     print_help();
                     std::process::exit(1);
                 }
             };
             cfg.wz_mode = Some(mode);
             cfg.wz_together = matches!(mode, WzMode::Together);
-        } else if let Some(v) = arg.strip_prefix("--wz-xyzw-tuples=") {
-            match v {
-                "all" | "each" => cfg.xyzw_tuple_mode = v.into(),
-                _ => {
-                    eprintln!("error: --wz-xyzw-tuples must be 'all' or 'each' (got '{}')\n", v);
-                    std::process::exit(1);
-                }
-            }
         } else if let Some(v) = arg.strip_prefix("--mdd-k=") {
             cfg.mdd_k = v.parse().unwrap_or(8);
             // Shorthand: --mdd-k=N alone implies --wz=apart.
@@ -626,7 +611,6 @@ fn main() {
             WzMode::Cross => "cross",
             WzMode::Together => "together",
             WzMode::Apart => "apart",
-            WzMode::Xyzw => "xyzw",
             WzMode::Sync => "sync",
         };
         println!("Unified search (--wz={}): found_solution={}, elapsed={:.3?}\n  {}",
@@ -714,7 +698,6 @@ mod tests {
             mdd_extend: 0,
             wz_together: false,
             wz_mode: Some(WzMode::Apart),
-            xyzw_tuple_mode: String::from("all"),
         };
         let tuples = phase_a_tuples(cfg.problem, None);
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, false, cfg.mdd_k);

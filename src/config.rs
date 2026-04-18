@@ -283,10 +283,6 @@ pub(crate) struct SearchConfig {
     /// flag and the `--mdd-k=` / `--mdd-extend=` shortcuts also set this
     /// when it's still `None`.
     pub(crate) wz_mode: Option<WzMode>,
-    /// For `--wz=xyzw`: tuple iteration strategy. "all" = one solve,
-    /// tuple=None, learnt clauses transfer across tuples. "each" =
-    /// legacy per-tuple loop with sum PB constraints. Default "all".
-    pub(crate) xyzw_tuple_mode: String,
 }
 
 
@@ -309,11 +305,6 @@ pub(crate) enum WzMode {
     /// MDD boundary walker feeding the SolveW → SolveZ two-stage SAT
     /// pipeline. `run_mdd_sat_search` with `wz_together = false`.
     Apart,
-    /// No outer boundary walker at all: build one SAT problem over all
-    /// four sequences (X, Y, Z, W) with the full ZW+XY MDD as a native
-    /// constraint and the Turyn identity as per-lag quad PB, then solve
-    /// it. See `solve_xyzw` for the per-call internals.
-    Xyzw,
     /// Synchronized 4-sequence heuristic walker. Builds the bouncing
     /// boundary MDD on the fly (no `mdd-k.bin` required), scoring each
     /// 16-way level by running autocorrelation pressure. Persistent SAT
@@ -348,7 +339,6 @@ impl Default for SearchConfig {
             mdd_extend: 0,
             wz_together: false,
             wz_mode: None,
-            xyzw_tuple_mode: String::from("all"),
         }
     }
 }
@@ -400,7 +390,6 @@ impl SearchConfig {
                 WzMode::Cross => "cross",
                 WzMode::Together => "together",
                 WzMode::Apart => "apart",
-                WzMode::Xyzw => "xyzw",
                 WzMode::Sync => "sync",
             };
             parts.push(format!("--wz={label}"));
