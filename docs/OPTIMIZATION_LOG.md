@@ -323,6 +323,66 @@ From git log; not all already captured above. All verified in code.
 All confirmed live except the last row (`add_mdd_constraint` is
 implemented in radical but not called from `src/main.rs`).
 
+## N1+N2: per-boundary W cap + per-call SAT conflict budgets (April 2026)
+
+At n=56 (`--wz=apart --mdd-k=10`), two compounding pathologies were
+throttling the MDD pipeline:
+
+1. W SAT at middle_m ≈ 36 could enumerate thousands of solutions per
+   boundary. Decisions/solve ran into the millions, monopolising a
+   worker for tens of seconds before any other boundary ran.
+2. Both W and Z SAT `solve()` calls had no conflict limit at n=56.
+   One pathological solve could run past `sat_secs`, blocking
+   shutdown (the monitor sets `found=true`, but workers can only
+   observe it between solve calls).
+
+**N1** (`mdd_pipeline.rs:~1064`) caps W iterations per boundary at 128
+(override via `TURYN_MAX_W_PER_BND`). 128 still feeds the Z stage
+dozens of (Z, W) pairs, while letting workers move on.
+
+**N2** (`mdd_pipeline.rs:~1074,~1932`) adds a per-call
+`set_conflict_budget(5000)` to both the W and Z SAT loops
+(override via `TURYN_W_CONFL` / `TURYN_Z_CONFL`). Mirrors the
+existing XY pattern (`set_conflict_limit(5000)` for n > 30).
+
+### TTC measurement (n=56, --wz=apart --mdd-k=10, 60s, 16 threads)
+
+Measured on top of main @ `1316047` (which already landed F1
+`SPECTRAL_FREQS 563→64` for `--wz=apart`):
+
+| Configuration | Boundaries | bnd/s | TTC |
+|---|---|---|---|
+| N2 only (conflict budgets, no W cap) | 34 | 0.57 | 53923 d |
+| **N1 + N2 (128 W cap + 5k/5k conflict budgets)** | **730** | **12.16** | **2509 d** |
+
+Speedup: **21.5× TTC improvement** (53923d → 2509d) from the W cap.
+The conflict budgets (N2) are required for sat_secs to exit cleanly;
+they don't themselves change TTC much at defaults.
+
+Lever: **rate** (raises boundaries/sec by unblocking stuck workers).
+
+### Regression check
+
+TT(18/22/24) (`--wz=together` default): wall-clocks 136 ms / 1.4 s /
+11 s — all unchanged (changes live only in the `--wz=apart` SAT W/Z
+inner loops).
+
+TT(18) `--wz=apart --mdd-k=5` still solves in 563 ms.
+
+### Caveats / follow-ups
+
+- 0 Z solutions at n=56 under 5k/5k budgets. Z SAT is either genuinely
+  UNSAT for these W candidates, or 5000 conflicts is too tight to
+  prove SAT. Bumping to `TURYN_Z_CONFL=50000` didn't change that but
+  did worsen TTC to 97456d (slower walks, still no Z). A real fix
+  needs either a smarter Z pair filter (denominator) or a more
+  targeted Z search (different levers).
+- TTC "cover" counts walked boundaries, not full ZW-path coverage
+  via successful Z solves. We're accelerating coverage of the
+  enumeration space but not (yet) solving Z, so XY never runs.
+  The win is real — it unblocks the pipeline — but the next
+  bottleneck (Z SAT success rate) is now the ceiling.
+
 ## April 2026 — MDD-as-propagator architecture experiments
 
 Goal: test the theoretical pitch that putting the MDD inside the SAT
