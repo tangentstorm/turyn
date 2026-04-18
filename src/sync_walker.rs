@@ -806,6 +806,12 @@ pub(crate) struct SyncStats {
     /// the total root sub-cube covered so far, which gives a direct
     /// TTC formula: `TTC = elapsed / root_coverage_product`.
     pub children_processed_by_level: Vec<u64>,
+    /// Per-propagator forced-variable totals (sum of deltas over every
+    /// `propagate_only` call). Indexed by `radical::PropKind as usize`.
+    /// Tells you which feature of the SAT solver did the most work:
+    /// `clause` (CNF BCP) / `pb` / `quadpb` (Turyn identity) / `xor`
+    /// (Tseitin chains) / `spect` (spectral DFT) / `mdd` / `pbseteq`.
+    pub prop_by_kind_total: [u64; radical::PropKind::COUNT],
 }
 
 pub(crate) fn search_sync(
@@ -853,6 +859,7 @@ fn search_sync_parallel(
         forced_by_level: Vec::new(),
         sub_cube_time_by_level: Vec::new(),
         children_processed_by_level: Vec::new(),
+        prop_by_kind_total: [0; radical::PropKind::COUNT],
     }));
     let exchange = Arc::new(ClauseExchange {
         clauses: std::sync::Mutex::new(Vec::new()),
@@ -926,6 +933,9 @@ fn search_sync_parallel(
                 for (i, &c) in stats.children_processed_by_level.iter().enumerate() {
                     agg.children_processed_by_level[i] += c;
                 }
+                for (i, &c) in stats.prop_by_kind_total.iter().enumerate() {
+                    agg.prop_by_kind_total[i] += c;
+                }
                 drop(agg);
                 if let Some(s) = sol {
                     let mut r = result.lock().unwrap();
@@ -987,16 +997,35 @@ fn format_per_level_telemetry_with_ttc(stats: &SyncStats, elapsed_secs: f64, n_w
             coverage_product *= processed as f64 / children as f64;
         }
     }
+    let kind_summary = format_prop_by_kind_summary(stats);
     if coverage_product > 0.0 && elapsed_secs > 0.0 {
         let ttc_parallel = elapsed_secs / coverage_product;
         let ttc_serial = ttc_parallel * n_workers as f64;
         format!(
-            "{}Per-level: direct TTC (from coverage product) ≈ {:.3e}s parallel, {:.3e}s serial\n",
-            base, ttc_parallel, ttc_serial,
+            "{}{}Per-level: direct TTC (from coverage product) ≈ {:.3e}s parallel, {:.3e}s serial\n",
+            base, kind_summary, ttc_parallel, ttc_serial,
         )
     } else {
-        base
+        format!("{}{}", base, kind_summary)
     }
+}
+
+/// One-line summary of where the SAT solver spent its propagation work,
+/// broken out by propagator family. Sums to `num_propagations` (modulo
+/// rounding from the per-call delta tracking). Use to identify the
+/// dominant feature: e.g. "quadpb=72.3%" means the Turyn quad PB is
+/// doing most of the propagation; "spect=45%" means spectral is hot.
+fn format_prop_by_kind_summary(stats: &SyncStats) -> String {
+    let total: u64 = stats.prop_by_kind_total.iter().sum();
+    if total == 0 { return String::new(); }
+    let mut parts: Vec<String> = Vec::with_capacity(radical::PropKind::COUNT);
+    for kind in radical::PropKind::ALL {
+        let c = stats.prop_by_kind_total[kind as usize];
+        if c == 0 { continue; }
+        let pct = c as f64 / total as f64 * 100.0;
+        parts.push(format!("{}={} ({:.1}%)", kind.label(), c, pct));
+    }
+    format!("Per-feature forcings (total {}): {}\n", total, parts.join("  "))
 }
 
 fn format_per_level_telemetry(stats: &SyncStats) -> String {
@@ -1188,6 +1217,7 @@ fn search_sync_serial(
         forced_by_level: Vec::new(),
         sub_cube_time_by_level: Vec::new(),
         children_processed_by_level: Vec::new(),
+        prop_by_kind_total: [0; radical::PropKind::COUNT],
         }, start.elapsed());
     }
 
@@ -1213,6 +1243,7 @@ fn search_sync_serial(
         forced_by_level: vec![0; ctx.depth + 1],
         sub_cube_time_by_level: vec![0.0; ctx.depth + 1],
         children_processed_by_level: vec![0; ctx.depth + 1],
+        prop_by_kind_total: [0; radical::PropKind::COUNT],
     };
 
     let deadline = if cfg.sat_secs > 0 {
@@ -1549,7 +1580,20 @@ fn dfs_body(
         // each DFS path has a unique (level, sums, walker_bits)
         // signature, so the memo never fires. Removed to save the
         // compute_signature + hash cost per accepted candidate.
+        // Capture per-propagator forcings before the call so we can
+        // attribute the delta to the right SAT feature in stats.
+        // prop_by_kind_total[kind] tells us, across the full search,
+        // whether quad PB / XOR / spectral / clause BCP / MDD was the
+        // dominant work source.
+        let mut pre_kind = [0u64; radical::PropKind::COUNT];
+        for kind in radical::PropKind::ALL {
+            pre_kind[kind as usize] = solver.propagations_by_kind(kind);
+        }
         let sat = solver.propagate_only(&state.assumptions);
+        for kind in radical::PropKind::ALL {
+            let post = solver.propagations_by_kind(kind);
+            stats.prop_by_kind_total[kind as usize] += post - pre_kind[kind as usize];
+        }
         if sat == Some(true) {
             // Count walker-var forcings that THIS level's new assumptions
             // caused. `child_walker_forced` is cumulative across levels
