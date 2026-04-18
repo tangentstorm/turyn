@@ -793,6 +793,19 @@ pub(crate) struct SyncStats {
     /// which — combined with `forced_by_level[L]` — tells us the
     /// marginal cost/benefit of each decision at that depth.
     pub sub_cube_time_by_level: Vec<f64>,
+    /// Per-level sum of `candidates_processed`: how many of each frame's
+    /// generated candidates (up to `candidates.len()`) actually went
+    /// through the propagate_only call before the frame returned.
+    /// Equals `children_by_level[L]` if every frame at L fully iterated
+    /// its sibling list; less if some frames bailed early (deadline hit,
+    /// solution found, or cancel signal). The ratio
+    /// `children_processed_by_level[L] / children_by_level[L]` is the
+    /// work-weighted "coverage fraction" at level L — a direct measure
+    /// of how much of each sub-cube we actually did. The PRODUCT of
+    /// coverages down the tree (starting from level 0) = fraction of
+    /// the total root sub-cube covered so far, which gives a direct
+    /// TTC formula: `TTC = elapsed / root_coverage_product`.
+    pub children_processed_by_level: Vec<u64>,
 }
 
 pub(crate) fn search_sync(
@@ -839,6 +852,7 @@ fn search_sync_parallel(
         peer_clauses_read: 0, peer_clauses_imported: 0,
         forced_by_level: Vec::new(),
         sub_cube_time_by_level: Vec::new(),
+        children_processed_by_level: Vec::new(),
     }));
     let exchange = Arc::new(ClauseExchange {
         clauses: std::sync::Mutex::new(Vec::new()),
@@ -906,6 +920,12 @@ fn search_sync_parallel(
                 for (i, &t) in stats.sub_cube_time_by_level.iter().enumerate() {
                     agg.sub_cube_time_by_level[i] += t;
                 }
+                if agg.children_processed_by_level.len() < stats.children_processed_by_level.len() {
+                    agg.children_processed_by_level.resize(stats.children_processed_by_level.len(), 0);
+                }
+                for (i, &c) in stats.children_processed_by_level.iter().enumerate() {
+                    agg.children_processed_by_level[i] += c;
+                }
                 drop(agg);
                 if let Some(s) = sol {
                     let mut r = result.lock().unwrap();
@@ -933,7 +953,11 @@ fn search_sync_parallel(
         );
         let ttc = project_ttc(&stats, problem.n, elapsed.as_secs_f64(), n_workers);
         eprintln!("{}", ttc);
-        let per_level = format_per_level_telemetry(&stats);
+        let per_level = format_per_level_telemetry_with_ttc(
+            &stats,
+            elapsed.as_secs_f64(),
+            n_workers,
+        );
         eprintln!("{}", per_level);
     }
     (found, stats, elapsed)
@@ -951,17 +975,46 @@ fn search_sync_parallel(
 ///   (includes descendants). Divided by nodes gives avg sub-cube time.
 /// - `implied_pruned_2^…`: log2 estimate of how many walker sub-cubes
 ///   at the DEEPEST level were eliminated by SAT work at level L.
+fn format_per_level_telemetry_with_ttc(stats: &SyncStats, elapsed_secs: f64, n_workers: usize) -> String {
+    let base = format_per_level_telemetry(stats);
+    // Compute coverage product over levels with generated candidates.
+    let mut coverage_product: f64 = 1.0;
+    let levels = stats.nodes_by_level.len().max(stats.children_by_level.len());
+    for l in 0..levels {
+        let children = stats.children_by_level.get(l).copied().unwrap_or(0);
+        let processed = stats.children_processed_by_level.get(l).copied().unwrap_or(0);
+        if children > 0 {
+            coverage_product *= processed as f64 / children as f64;
+        }
+    }
+    if coverage_product > 0.0 && elapsed_secs > 0.0 {
+        let ttc_parallel = elapsed_secs / coverage_product;
+        let ttc_serial = ttc_parallel * n_workers as f64;
+        format!(
+            "{}Per-level: direct TTC (from coverage product) ≈ {:.3e}s parallel, {:.3e}s serial\n",
+            base, ttc_parallel, ttc_serial,
+        )
+    } else {
+        base
+    }
+}
+
 fn format_per_level_telemetry(stats: &SyncStats) -> String {
-    let mut out = String::from("Per-level: lvl |   nodes |  children |   forced | forced/node |   time(s) |  t/node\n");
+    let mut out = String::from("Per-level: lvl |   nodes |  children | proc'd | cov% |   forced | f/node |   time(s) |  t/node\n");
     let levels = stats
         .nodes_by_level.len()
         .max(stats.forced_by_level.len())
         .max(stats.sub_cube_time_by_level.len());
     let mut total_forced: u64 = 0;
     let mut total_time: f64 = 0.0;
+    // Cumulative "fraction of root sub-cube that has been fully
+    // covered" — product of per-level coverages. For deepest levels
+    // the product dominates because most work is there.
+    let mut coverage_product: f64 = 1.0;
     for l in 0..levels {
         let nodes = stats.nodes_by_level.get(l).copied().unwrap_or(0);
         let children = stats.children_by_level.get(l).copied().unwrap_or(0);
+        let processed = stats.children_processed_by_level.get(l).copied().unwrap_or(0);
         let forced = stats.forced_by_level.get(l).copied().unwrap_or(0);
         let tsec = stats.sub_cube_time_by_level.get(l).copied().unwrap_or(0.0);
         total_forced += forced;
@@ -969,11 +1022,17 @@ fn format_per_level_telemetry(stats: &SyncStats) -> String {
         if nodes == 0 && forced == 0 && tsec == 0.0 { continue; }
         let fpn = if nodes > 0 { forced as f64 / nodes as f64 } else { 0.0 };
         let tpn = if nodes > 0 { tsec / nodes as f64 } else { 0.0 };
+        let cov = if children > 0 { processed as f64 / children as f64 } else { 1.0 };
+        if children > 0 { coverage_product *= cov; }
         out.push_str(&format!(
-            "Per-level: {:>3} | {:>7} | {:>9} | {:>8} | {:>11.2} | {:>9.3} | {:>7.6}\n",
-            l, nodes, children, forced, fpn, tsec, tpn,
+            "Per-level: {:>3} | {:>7} | {:>9} | {:>6} | {:>4.1} | {:>8} | {:>6.2} | {:>9.3} | {:>7.6}\n",
+            l, nodes, children, processed, cov * 100.0, forced, fpn, tsec, tpn,
         ));
     }
+    out.push_str(&format!(
+        "Per-level: cumulative root-coverage (∏ cov) = {:.3e}  →  direct TTC = elapsed / coverage\n",
+        coverage_product,
+    ));
     // Cumulative (over the whole run) log2-prune budget and weighted
     // mean pruning factor. `total_forced` is Σ_calls(forced_at_call),
     // which equals Σ_calls log2(sub-cube shrink factor). Dividing by
@@ -1128,6 +1187,7 @@ fn search_sync_serial(
         peer_clauses_read: 0, peer_clauses_imported: 0,
         forced_by_level: Vec::new(),
         sub_cube_time_by_level: Vec::new(),
+        children_processed_by_level: Vec::new(),
         }, start.elapsed());
     }
 
@@ -1152,6 +1212,7 @@ fn search_sync_serial(
         peer_clauses_read: 0, peer_clauses_imported: 0,
         forced_by_level: vec![0; ctx.depth + 1],
         sub_cube_time_by_level: vec![0.0; ctx.depth + 1],
+        children_processed_by_level: vec![0; ctx.depth + 1],
     };
 
     let deadline = if cfg.sat_secs > 0 {
@@ -1436,10 +1497,30 @@ fn dfs_body(
     let saved_assum_len = state.assumptions.len();
     let saved_rule_state = state.rule_state;
 
+    // Capture the entry level for the "candidates processed" counter:
+    // the sibling loop may break before we decrement state.level, so
+    // we must stash the level we started at.
+    let entry_level = state.level;
+    // Count of candidates that actually reached propagate_only (as
+    // opposed to being skipped by an early break for `found`,
+    // `deadline`, or `cancel`). Divided by `candidates.len()` this
+    // gives the frame's coverage fraction; averaged across frames at a
+    // given depth, it yields the level's coverage fraction and hence
+    // the direct TTC formula `TTC = elapsed / root_coverage_product`.
+    let total_candidates = candidates.len() as u64;
+    let mut processed_count: u64 = 0;
+    // Stored break-out result so we can hit the coverage accumulator
+    // before returning (otherwise the loop's multiple exits would
+    // bypass it).
+    let mut result_override: Option<bool> = None;
+
     for cand in candidates {
-        if found.is_some() { return true; }
+        if found.is_some() { result_override = Some(true); break; }
         if let Some(d) = deadline {
-            if Instant::now() >= d { return false; }
+            if Instant::now() >= d { result_override = Some(false); break; }
+        }
+        if let Some(c) = &ctx.cancel {
+            if c.load(AtomicOrdering::Acquire) { result_override = Some(false); break; }
         }
 
         // Restore state.bits to the parent snapshot before each sibling.
@@ -1456,6 +1537,7 @@ fn dfs_body(
         state.level += 1;
         state.rule_state = cand.rule_state;
         rebuild_sums(state, ctx);
+        processed_count += 1;
 
         // Per-level SAT call: propagate_only (no CDCL decisions,
         // so cost is proportional to new propagation work). On
@@ -1492,7 +1574,8 @@ fn dfs_body(
             // which accounts for pairs already fully determined.
             if !capacity_violated(state, ctx) {
                 if dfs(solver, state, ctx, stats, deadline, found) {
-                    return true;
+                    result_override = Some(true);
+                    break;
                 }
             }
         } else {
@@ -1522,12 +1605,24 @@ fn dfs_body(
         state.level -= 1;
     }
 
+    // Record coverage at this frame's level. `total_candidates` was
+    // already added to `children_by_level` before the loop; this is
+    // the matching "actually processed" numerator.
+    if entry_level >= stats.children_processed_by_level.len() {
+        stats.children_processed_by_level.resize(entry_level + 1, 0);
+    }
+    stats.children_processed_by_level[entry_level] += processed_count;
+    let _ = total_candidates;  // silence unused if only for debugging
+
     // Final rollback to leave state as caller expected.
     state.bits.copy_from_slice(&saved_all_bits);
     state.sums.copy_from_slice(&saved_sums);
     state.assumptions.truncate(saved_assum_len);
     state.rule_state = saved_rule_state;
+    // Restore state.level if the loop broke with state.level bumped.
+    state.level = entry_level;
 
+    if let Some(v) = result_override { return v; }
     false
 }
 
