@@ -121,6 +121,11 @@ struct State {
     ///   bit 2 = rule (iv) fired on Z
     ///   bit 3 = rule (v) fired on W
     rule_state: u8,
+    /// Solver trail size at decision level 0 (after the initial
+    /// `propagate_only(&[])` has drained unit clauses + Tseitin chains).
+    /// Used to compute "forced by propagation above what we assumed":
+    /// `forced = solver.num_assigned() - trail0_size - assumptions.len()`.
+    trail0_size: usize,
 }
 
 // Rule-fired bits.
@@ -137,6 +142,7 @@ impl State {
             bits: vec![0; 4 * n],
             assumptions: Vec::with_capacity(4 * n),
             rule_state: 0,
+            trail0_size: 0,
         }
     }
 
@@ -769,6 +775,24 @@ pub(crate) struct SyncStats {
     pub peer_clauses_read: u64,
     /// Count of peer clauses this worker has added to its own solver.
     pub peer_clauses_imported: u64,
+    /// Per-level sum of "vars the SAT solver forced via propagation
+    /// beyond the walker's own assumption at this level". Each forced
+    /// var trims 2^1 from the subtree that the walker would otherwise
+    /// have had to explore; k forced vars at this level mean the
+    /// walker got a "free" 2^k prune of the sub-cube below.
+    /// `forced_by_level[L]` accumulates over every propagate_only call
+    /// made while the walker was at level L (across every sub-cube
+    /// traversed). `sum(forced_by_level) / sat_unsat` ≈ avg forced per
+    /// call; `2^forced_by_level[L]` estimates total subtree nodes
+    /// pruned at that level.
+    pub forced_by_level: Vec<u64>,
+    /// Per-level wall-clock time (seconds) accumulated across all dfs()
+    /// calls at that level — i.e. "how long did the walker spend
+    /// traversing sub-cubes rooted at depth L, including descendants".
+    /// Divided by `nodes_by_level[L]` gives avg sub-cube time at depth L,
+    /// which — combined with `forced_by_level[L]` — tells us the
+    /// marginal cost/benefit of each decision at that depth.
+    pub sub_cube_time_by_level: Vec<f64>,
 }
 
 pub(crate) fn search_sync(
@@ -813,6 +837,8 @@ fn search_sync_parallel(
         time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
         peer_clauses_read: 0, peer_clauses_imported: 0,
+        forced_by_level: Vec::new(),
+        sub_cube_time_by_level: Vec::new(),
     }));
     let exchange = Arc::new(ClauseExchange {
         clauses: std::sync::Mutex::new(Vec::new()),
@@ -868,6 +894,18 @@ fn search_sync_parallel(
                 for (i, &c) in stats.children_by_level.iter().enumerate() {
                     agg.children_by_level[i] += c;
                 }
+                if agg.forced_by_level.len() < stats.forced_by_level.len() {
+                    agg.forced_by_level.resize(stats.forced_by_level.len(), 0);
+                }
+                for (i, &c) in stats.forced_by_level.iter().enumerate() {
+                    agg.forced_by_level[i] += c;
+                }
+                if agg.sub_cube_time_by_level.len() < stats.sub_cube_time_by_level.len() {
+                    agg.sub_cube_time_by_level.resize(stats.sub_cube_time_by_level.len(), 0.0);
+                }
+                for (i, &t) in stats.sub_cube_time_by_level.iter().enumerate() {
+                    agg.sub_cube_time_by_level[i] += t;
+                }
                 drop(agg);
                 if let Some(s) = sol {
                     let mut r = result.lock().unwrap();
@@ -895,8 +933,66 @@ fn search_sync_parallel(
         );
         let ttc = project_ttc(&stats, problem.n, elapsed.as_secs_f64(), n_workers);
         eprintln!("{}", ttc);
+        let per_level = format_per_level_telemetry(&stats);
+        eprintln!("{}", per_level);
     }
     (found, stats, elapsed)
+}
+
+/// Per-level forced-prune and timer telemetry.
+///
+/// For each walker level L, reports:
+/// - `nodes`: dfs visits at level L (cumulative across all workers).
+/// - `forced`: walker-var forcings by SAT propagation AT THIS LEVEL
+///   (incremental: new assumptions at L minus everything above L).
+///   Divide by nodes to get "avg free prunes per sub-cube at level L";
+///   `2^(forced/nodes)` is the multiplicative sub-cube shrink factor.
+/// - `time`: cumulative wall-seconds spent in dfs frames rooted at L
+///   (includes descendants). Divided by nodes gives avg sub-cube time.
+/// - `implied_pruned_2^…`: log2 estimate of how many walker sub-cubes
+///   at the DEEPEST level were eliminated by SAT work at level L.
+fn format_per_level_telemetry(stats: &SyncStats) -> String {
+    let mut out = String::from("Per-level: lvl |   nodes |  children |   forced | forced/node |   time(s) |  t/node\n");
+    let levels = stats
+        .nodes_by_level.len()
+        .max(stats.forced_by_level.len())
+        .max(stats.sub_cube_time_by_level.len());
+    let mut total_forced: u64 = 0;
+    let mut total_time: f64 = 0.0;
+    for l in 0..levels {
+        let nodes = stats.nodes_by_level.get(l).copied().unwrap_or(0);
+        let children = stats.children_by_level.get(l).copied().unwrap_or(0);
+        let forced = stats.forced_by_level.get(l).copied().unwrap_or(0);
+        let tsec = stats.sub_cube_time_by_level.get(l).copied().unwrap_or(0.0);
+        total_forced += forced;
+        total_time += tsec;
+        if nodes == 0 && forced == 0 && tsec == 0.0 { continue; }
+        let fpn = if nodes > 0 { forced as f64 / nodes as f64 } else { 0.0 };
+        let tpn = if nodes > 0 { tsec / nodes as f64 } else { 0.0 };
+        out.push_str(&format!(
+            "Per-level: {:>3} | {:>7} | {:>9} | {:>8} | {:>11.2} | {:>9.3} | {:>7.6}\n",
+            l, nodes, children, forced, fpn, tsec, tpn,
+        ));
+    }
+    // Cumulative (over the whole run) log2-prune budget and weighted
+    // mean pruning factor. `total_forced` is Σ_calls(forced_at_call),
+    // which equals Σ_calls log2(sub-cube shrink factor). Dividing by
+    // sat-call count gives the geometric-mean shrink: the "typical"
+    // propagate_only trims 2^avg_forced walker sub-cubes.
+    let sat_calls = stats.sat_unsat + stats.nodes_visited.saturating_sub(stats.leaves_reached);
+    let avg_forced_per_call = if sat_calls > 0 {
+        total_forced as f64 / sat_calls as f64
+    } else { 0.0 };
+    // Per-level time columns are INCLUSIVE of descendants, so summing
+    // across levels double-counts. We suppress the "total" to avoid
+    // that confusion; the level-0 column already shows total aggregate
+    // (sum of wall-time across workers).
+    let _ = total_time;
+    out.push_str(&format!(
+        "Per-level: total walker-var forcings = {} (avg 2^{:.2} shrink per propagate call)",
+        total_forced, avg_forced_per_call,
+    ));
+    out
 }
 
 /// Project TTC (time-to-cover) from measured per-level branching + rate.
@@ -928,70 +1024,78 @@ fn search_sync_parallel(
 /// where rate = nodes_visited / elapsed (aggregate across workers in
 /// parallel mode, so this is already a parallel rate).
 fn project_ttc(stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize) -> String {
-    const MIN_SAMPLES: u64 = 32;
+    const NOISY_THRESHOLD: u64 = 32;
     let depth = n;  // bouncing-order depth = n for even n
     if elapsed_secs <= 0.0 || stats.nodes_visited == 0 {
         return "TTC projection: insufficient data".to_string();
     }
-    // Per-level true branching factor, flagged as reliable if the
-    // parent count is large enough to trust the ratio.
-    struct Bee { b: f64, reliable: bool }
+    // Per-level true branching factor. `sampled` = we have at least
+    // one parent at this level, so the ratio has meaning.
+    // `noisy` = sample count below NOISY_THRESHOLD, printed with `?`
+    // but still USED in the projection (early levels have near-zero
+    // variance because every worker sees the same root-level
+    // branching — 1 sample is effectively exact there).
+    struct Bee { b: f64, sampled: bool, noisy: bool }
     let mut b_eff: Vec<Bee> = Vec::with_capacity(depth);
     for l in 0..depth {
         let parent = stats.nodes_by_level.get(l).copied().unwrap_or(0);
         let child = stats.children_by_level.get(l).copied().unwrap_or(0);
         if parent == 0 {
-            b_eff.push(Bee { b: 0.0, reliable: false });
+            b_eff.push(Bee { b: 0.0, sampled: false, noisy: false });
         } else {
             b_eff.push(Bee {
                 b: child as f64 / parent as f64,
-                reliable: parent >= MIN_SAMPLES,
+                sampled: true,
+                noisy: parent < NOISY_THRESHOLD,
             });
         }
     }
-    // Fallback for unreliable levels: use the median of reliable
-    // levels' b_eff. Median (not mean) resists one weird outlier.
-    let mut reliable_bs: Vec<f64> =
-        b_eff.iter().filter(|x| x.reliable).map(|x| x.b).collect();
-    reliable_bs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let fallback = if reliable_bs.is_empty() {
+    // Fallback for un-SAMPLED levels (no data at all): median of
+    // well-sampled levels (noisy excluded). Median resists outliers.
+    let mut clean_bs: Vec<f64> =
+        b_eff.iter().filter(|x| x.sampled && !x.noisy).map(|x| x.b).collect();
+    clean_bs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let fallback = if clean_bs.is_empty() {
         1.0
     } else {
-        reliable_bs[reliable_bs.len() / 2]
+        clean_bs[clean_bs.len() / 2]
     };
-    let geo_mean = if reliable_bs.is_empty() {
+    let geo_mean = if clean_bs.is_empty() {
         fallback
     } else {
-        let log_sum: f64 = reliable_bs.iter().map(|b| b.max(1e-9).ln()).sum();
-        (log_sum / reliable_bs.len() as f64).exp()
+        let log_sum: f64 = clean_bs.iter().map(|b| b.max(1e-9).ln()).sum();
+        (log_sum / clean_bs.len() as f64).exp()
     };
-    // Build the full-cover projection. Use each reliable level as-is;
-    // for unreliable levels use the median fallback.
+    // Build the full-cover projection. Use each SAMPLED level's
+    // measurement as-is (noisy or not). Only fall back to median for
+    // truly unsampled levels (zero parents ever visited).
     let mut projected_nodes = 1.0_f64;
     let mut running_product = 1.0_f64;
     for l in 0..depth {
         let b = match b_eff.get(l) {
-            Some(Bee { b, reliable: true }) => *b,
+            Some(Bee { b, sampled: true, .. }) => *b,
             _ => fallback,
         };
         running_product *= b;
         projected_nodes += running_product;
-        // Numerical guard: huge projections blow up f64 quickly.
         if !running_product.is_finite() { break; }
     }
     let rate = stats.nodes_visited as f64 / elapsed_secs;
     let ttc_parallel = projected_nodes / rate;
     let ttc_serial = ttc_parallel * n_workers as f64;
-    let tail_unreliable = b_eff.iter().filter(|x| !x.reliable).count();
+    let unsampled = b_eff.iter().filter(|x| !x.sampled).count();
+    let noisy_count = b_eff.iter().filter(|x| x.sampled && x.noisy).count();
     format!(
-        "TTC projection: b_eff per level = [{}] ({} reliable, {} filled w/ median={:.3})\n\
-         TTC projection: reliable geo mean = {:.3}, projected nodes to cover = {:.3e}\n\
+        "TTC projection: b_eff per level = [{}] ({} clean, {} noisy?, {} unsampled→median={:.3})\n\
+         TTC projection: clean geo mean = {:.3}, projected nodes to cover = {:.3e}\n\
          TTC projection: rate = {:.0} nodes/s ({} workers, aggregate),\n\
          TTC projection: TTC_parallel ≈ {:.1}s, TTC_serial ≈ {:.1}s",
         b_eff.iter()
-            .map(|x| if x.reliable { format!("{:.2}", x.b) } else { format!("{:.2}?", x.b) })
+            .map(|x| if !x.sampled { "-".into() }
+                     else if x.noisy { format!("{:.2}?", x.b) }
+                     else { format!("{:.2}", x.b) })
             .collect::<Vec<_>>().join(", "),
-        reliable_bs.len(), tail_unreliable, fallback,
+        clean_bs.len(), noisy_count, unsampled, fallback,
         geo_mean, projected_nodes, rate, n_workers, ttc_parallel, ttc_serial,
     )
 }
@@ -1022,10 +1126,18 @@ fn search_sync_serial(
             time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
         peer_clauses_read: 0, peer_clauses_imported: 0,
+        forced_by_level: Vec::new(),
+        sub_cube_time_by_level: Vec::new(),
         }, start.elapsed());
     }
 
     let mut state = State::new(ctx.n);
+    // Record walker-var count at decision-level-0 (before any
+    // assumptions). "Walker vars" = the 4n sign-choice vars at IDs
+    // 1..=4n; higher IDs are Tseitin/XOR auxiliary vars. Forcing an
+    // aux var doesn't prune walker-tree space, only walker-var forcings
+    // halve the remaining sub-cube.
+    state.trail0_size = solver.num_assigned_in_range(4 * ctx.n);
     harvest_forced(&solver, &mut state, &ctx);
 
     let mut stats = SyncStats {
@@ -1038,6 +1150,8 @@ fn search_sync_serial(
         time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
         peer_clauses_read: 0, peer_clauses_imported: 0,
+        forced_by_level: vec![0; ctx.depth + 1],
+        sub_cube_time_by_level: vec![0.0; ctx.depth + 1],
     };
 
     let deadline = if cfg.sat_secs > 0 {
@@ -1057,8 +1171,30 @@ fn search_sync_serial(
     (found, stats, elapsed)
 }
 
-/// DFS descent. Returns true if a solution was found (short-circuits up the stack).
+/// DFS descent. Thin wrapper around `dfs_body` that records wall-time
+/// spent traversing the sub-cube rooted at the current level, so we
+/// can report per-level "sub-cube traversal time" telemetry.
 fn dfs(
+    solver: &mut radical::Solver,
+    state: &mut State,
+    ctx: &Ctx,
+    stats: &mut SyncStats,
+    deadline: Option<Instant>,
+    found: &mut Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+) -> bool {
+    let entry_level = state.level;
+    let t_enter = Instant::now();
+    let result = dfs_body(solver, state, ctx, stats, deadline, found);
+    if entry_level >= stats.sub_cube_time_by_level.len() {
+        stats.sub_cube_time_by_level.resize(entry_level + 1, 0.0);
+    }
+    stats.sub_cube_time_by_level[entry_level] += t_enter.elapsed().as_secs_f64();
+    result
+}
+
+/// Actual DFS body — see `dfs` for the timing wrapper.
+/// Returns true if a solution was found (short-circuits up the stack).
+fn dfs_body(
     solver: &mut radical::Solver,
     state: &mut State,
     ctx: &Ctx,
@@ -1080,6 +1216,19 @@ fn dfs(
     if state.level as u64 > stats.max_level_reached {
         stats.max_level_reached = state.level as u64;
     }
+
+    // Cumulative count of walker-var propagations at this frame's
+    // entry: the solver has just finished propagate_only(&parent_assums)
+    // and the trail contains (trail0 walker-vars) + (parent assumption
+    // lits) + (propagated walker-vars) + (propagated aux vars). We
+    // subtract trail0 + assumption count to get only "walker vars
+    // forced by propagation since level 0". Each subsequent child's
+    // propagate_only can only make this number grow monotonically
+    // (more assumptions → more forcings), and the per-level delta is
+    // what we credit to `forced_by_level[child_level]`.
+    let parent_walker_forced: usize = solver
+        .num_assigned_in_range(4 * ctx.n)
+        .saturating_sub(state.trail0_size + state.assumptions.len());
 
     // Pull peer clauses from the shared exchange every 256 nodes.
     // Cheap: one Mutex lock + index compare + a handful of add_clause
@@ -1320,6 +1469,21 @@ fn dfs(
         // compute_signature + hash cost per accepted candidate.
         let sat = solver.propagate_only(&state.assumptions);
         if sat == Some(true) {
+            // Count walker-var forcings that THIS level's new assumptions
+            // caused. `child_walker_forced` is cumulative across levels
+            // 0..=state.level; `parent_walker_forced` (captured at dfs
+            // entry) is cumulative across 0..=state.level-1. The delta
+            // is the "2^delta sub-cubes pruned" that we get for free at
+            // this walker level.
+            let child_walker_forced: usize = solver
+                .num_assigned_in_range(4 * ctx.n)
+                .saturating_sub(state.trail0_size + state.assumptions.len());
+            let delta = child_walker_forced.saturating_sub(parent_walker_forced);
+            if state.level >= stats.forced_by_level.len() {
+                stats.forced_by_level.resize(state.level + 1, 0);
+            }
+            stats.forced_by_level[state.level] += delta as u64;
+
             harvest_forced(solver, state, ctx);
             rebuild_sums(state, ctx);
             // After harvest: many bits beyond the walker frontier

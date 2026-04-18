@@ -1779,6 +1779,29 @@ impl Solver {
 
     /// Number of variables.
     pub fn num_vars(&self) -> usize { self.num_vars }
+
+    /// Number of currently-assigned variables (trail length). Includes
+    /// level-0 forced units, decision-level-1 assumption lits, and all
+    /// propagated lits. After `propagate_only(assums)` returns `Some(true)`,
+    /// `num_assigned() - trail0_size - assums.len()` = vars the solver
+    /// forced via propagation, i.e. the "free" pruning power of the
+    /// current assumption prefix.
+    pub fn num_assigned(&self) -> usize { self.trail.len() }
+
+    /// Number of assigned vars with var-id in `1..=max_var` (inclusive).
+    /// Useful for "how many walker-space variables have been resolved"
+    /// when Tseitin/XOR auxiliary vars live at higher IDs — forcing
+    /// an auxiliary var doesn't prune the walker's search space, but
+    /// forcing a walker-space var does (each one halves the remaining
+    /// sub-cube).
+    pub fn num_assigned_in_range(&self, max_var: usize) -> usize {
+        let upper = max_var.min(self.num_vars);
+        let mut n = 0usize;
+        for v in 1..=upper {
+            if self.assigns[v] != LBool::Undef { n += 1; }
+        }
+        n
+    }
     /// Number of active (non-deleted) clauses.
     /// Verify all quad PB constraint states match actual variable assignments.
     /// Returns the number of mismatched constraints found.
