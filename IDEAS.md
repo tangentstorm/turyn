@@ -2372,3 +2372,266 @@ TT(18) solve time: 13.2s → 6.0s.
 - **Risk verified**: reject ratios (cap_rejects/node, sat_unsat/node)
   match baseline exactly, confirming delta sums are bit-identical to
   the full-rebuild semantics.
+
+## T-series: `--wz=sync` walker optimisation round 2 (April 19 2026, Claude)
+
+Baseline for this session (n=22 `--wz=sync --sat-secs=30`, 16 workers,
+3 runs, apr 2026 main):
+- nodes: 3.05–3.10M over 30s, rate ≈ 102k nodes/s (aggregate)
+- direct TTC parallel: 1.42–1.43e6s (noise floor ≈ 0.5%)
+- coverage product: 2.10e-5
+- sat_unsat: ~1.04M (one propagate_only UNSAT per ~3 nodes)
+- cap_rejects: ~40M (13.0 per node), tuple_rejects: 1.0M (0.3/node)
+
+Observed allocation hot spots in `dfs_body`:
+1. `candidates: Vec<Cand> = Vec::with_capacity(16)` — per frame
+2. `saved_bits: Vec<(u8,usize,u8)>` — per candidate (≤4 entries)
+3. `sums_snapshot: Vec<i16> = state.sums.clone()` — per candidate
+4. `saved_all_bits = state.bits.clone()` — per frame (4n bytes)
+5. `saved_sums = state.sums.clone()` — per frame (2·(n+1) bytes)
+6. `pre_kind = [0u64; COUNT]` + `for kind in ALL { ... }` — per candidate
+
+At ~200k nodes/s aggregate × 16 candidates that's 3M+ small Vec allocs
+per second from (2)/(3) alone. Vecs (1)/(4)/(5) are ~200k/s.
+
+### T1. Invert delta instead of cloning `sums_snapshot` per candidate — *tested, rejected*
+
+Replace `let sums_snapshot = state.sums.clone(); apply_level_delta(...);
+... state.sums.copy_from_slice(&sums_snapshot);` with a symmetric
+apply/reverse_delta pair. Since `apply_level_delta` only adds integer
+deltas per lag, `reverse_level_delta` subtracts them. No clone.
+
+- **TTC mechanism attempted**: rate (eliminate 3M+ 44-byte allocs/s at n=22).
+- **Result**: ~1.5% TTC regression at n=22 sync 30s. `copy_from_slice` on
+  the 44-byte `sums: Vec<i16>` beats iterating `closure_events[level]`
+  with signed delta; the Vec is small enough that the allocator fast-
+  caches it and memcpy wins over the event-walk. Reverted.
+
+### T2. Stack-array `saved_bits` instead of Vec — *tested, null*
+
+`saved_bits: Vec<(u8, usize, u8)>` has at most 4 entries. Use `[(u8,
+usize, u8); 4]` plus a length byte. Saves 3M+ allocations/s.
+
+- **TTC mechanism attempted**: rate.
+- **Result**: no measurable change at n=22 sync 30s. `Vec::with_capacity(4)`
+  allocations for (u8, usize, u8) × ≤4 are cheap — the allocator fast-
+  caches the small slab. Skipped; left the Vec in place for clarity.
+
+### T3+T4. Reuse frame-level Vec clones via per-level State scratch pool — *tested, rejected*
+
+Move `candidates: Vec<Cand>`, `saved_all_bits`, `saved_sums` into a
+per-level `FrameScratch` pool in `State`, borrowed via `std::mem::take`
+on entry and returned on exit. Index by `state.level` so a recursive
+call at L+1 gets its own slot.
+
+- **TTC mechanism attempted**: rate (eliminate ~3 heap allocs per DFS
+  frame × 200k frames/s = 600k allocs/s at n=22).
+- **Result**: ~1-2% TTC regression at n=22 sync 30s. The per-level
+  index indirection and `std::mem::take` / restore code adds more cost
+  per frame than the saved allocations. The allocator is very good at
+  small `Vec::clone()` patterns (it reuses the same slab). Reverted.
+
+### T5. Skip per-candidate `propagations_by_kind` capture when zero delta
+
+Currently every sibling call captures `pre_kind[8]` before and subtracts
+after. When propagate_only returns SAT and forces no walker vars, the
+delta is only aux var forcings — feature attribution is cheap to do in
+bulk rather than per-call. Alternative: track totals, attribute at
+level granularity not per-candidate.
+
+- **TTC mechanism**: rate (telemetry overhead).
+- **Risk**: lower-fidelity per-level feature attribution.
+- **Detection plan**: TTC drop; per-level-feature totals should still
+  sum correctly across all candidates at a level.
+
+### T6. Skip `harvest_forced` + `rebuild_sums` + `capacity_violated` post-harvest when delta=0 — *tested, rejected*
+
+Hypothesis: when `delta = child_walker_forced - parent_walker_forced
+== 0`, `propagate_only` forced no walker vars beyond the new assumption
+literals themselves, so `harvest_forced` would write nothing new. The
+accompanying `rebuild_sums` + post-harvest `capacity_violated` are
+then also redundant.
+
+**Implementation** (revert of `harvest/rebuild/capacity` trio, conditional
+on `delta == 0`). Build passed; n=18 smoke test found TT(18) in 8.09s
+(baseline 8.28s, ~2% faster).
+
+**Measurement at n=22 sync 30s** (3 trials):
+
+| metric              | baseline | T6 |
+|---------------------|----------|----|
+| direct TTC parallel | 1.42-1.43e6s | **3.38-3.40e5s** (4.2× lower) |
+| nodes               | 3.05-3.08M | 3.00-3.03M |
+| sat_unsat           | 1.04M    | 1.07M (+3%) |
+| cap_rejects         | 40.2M    | 38.7M (-4%) |
+| coverage product    | 2.10e-5  | 8.85e-5 (4.2× higher) |
+
+**Soundness issue discovered**: the direct-TTC improvement is a metric
+artifact, not a real speedup. Here's why:
+
+- `apply_level_delta(level, placed_kind_mask)` only adds contributions
+  for kinds in the mask (= kinds newly placed by this candidate). For
+  kinds pre-pinned at `pos_order[level]` by parent's `harvest_forced`
+  (not in the mask), the pair's contribution at `level` is not added
+  by `apply_level_delta` nor by the parent's `rebuild_sums` (which
+  scanned levels `0..=parent_level < level`).
+- In baseline, post-harvest `rebuild_sums` fixes this by scanning
+  through `state.level` including the current level.
+- When T6 skips `rebuild_sums` for `delta=0`, these pre-pinned-kind
+  contributions are **missing** from `state.sums`. `capacity_violated`
+  then under-estimates |S(s)|, becoming too permissive.
+- Result: the walker recurses into subtrees baseline correctly prunes
+  via the post-harvest capacity check. They eventually UNSAT via the
+  solver's next propagate_only (installed nogood fires), so the search
+  is still *sound* (no valid solutions missed), but it does ~4× more
+  "dead-subtree" work. Coverage product inflates (more subtrees
+  "processed" per frame) while wall-clock throughput is flat: n=18
+  wall time improved only 2% (8.28s → 8.09s), nowhere near the 4.2×
+  TTC metric drop.
+
+**Lesson**: `direct TTC = elapsed / coverage_product` trusts the
+coverage counter to reflect *productive* exploration. When the pruning
+semantics change, `coverage_product` can inflate without real
+progress. Always cross-check with wall-time to solution on a size
+where one exists (n=18 in sync mode). Reverted.
+
+- **TTC mechanism attempted**: rate (skip redundant O(4n+events)
+  per SAT-accepted sibling).
+- **Result**: +2% at n=18, apparent 4.2× at n=22 but illusory.
+  Reverted.
+
+#### T6-safe. Skip only `harvest_forced` when delta=0, keep `rebuild_sums`
+
+The soundness argument *only* covers `harvest_forced` — when delta=0,
+harvest is a no-op scan (nothing new written). `rebuild_sums` still
+has work to do because of the pre-pinned-kind pair issue above.
+Keeping rebuild keeps sums correct; skipping harvest saves O(4n)
+per SAT-accepted call. Untried so far — possibly a ≤1% win, worth
+measuring but likely below noise.
+
+### T7. Batch `propagations_by_kind` via new array-returning API — *tested, null*
+
+Added `pub fn prop_by_kind_array(&self) -> [u64; PropKind::COUNT]` to
+`radical::Solver` that returns the internal counter array in one copy.
+Replaced the two `for kind in PropKind::ALL` loops in `dfs_body` with
+a single array copy + one `0..COUNT` delta loop.
+
+- **TTC mechanism attempted**: rate (telemetry overhead).
+- **Result**: n=22 sync 30s 3-trial: TTC 1.434-1.443e6s vs baseline
+  1.422-1.433e6s — no change (within 1% noise). rustc/LLVM already
+  compile `propagations_by_kind(k)` to an inline array read, and the
+  7-iter loop fully unrolls. Reverted both `sync_walker.rs` and the
+  new API in `radical/src/lib.rs`. Confirmed the per-kind telemetry
+  capture is **not** a hotspot; stop targeting it.
+
+### T8. Precompute `closure_events_by_kind[level][kind]`
+
+`apply_level_delta` loops over `closure_events[level]`, branching on
+`placed_kind_mask` per event. For frames where only 1-3 kinds were
+newly placed (most frames at odd levels where W is absent), most events
+are filtered out anyway. Store events partitioned by kind, iterate
+only the relevant partitions.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: TTC drop; per-level apply_level_delta work
+  reduces proportionally to the kind-filter ratio.
+
+### T9. Hoist `kind_xy_len` and `has_kind` out of the per-candidate loop
+
+`for (kind, sign) in [(0,...), (1,...), ...] { let xy_len =
+kind_xy_len(kind, n, m); if pos >= xy_len ... }` — `xy_len` depends
+only on `(kind, n, m)`, which is constant across siblings at a frame.
+Precompute `active_kinds_at_level[level]` in Ctx.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: TTC drop; `kind_xy_len` function disappears from
+  profile.
+
+### T10. Early-break on the first SAT sibling at rule-forcing levels
+
+When `state.rule_state` has just set e.g. RULE_II, only one sign
+choice for X[pos_order[level]] is canonical. The 16-sibling loop
+generates all candidates, then rule_check prunes. If we check the
+rule state *before* the 16-choice loop, we can skip half the iteration
+cost.
+
+- **TTC mechanism**: denominator (fewer candidates generated).
+- **Detection plan**: `candidates.len()` drops; `rule_rejects` drops
+  proportionally; TTC rate may rise from reduced overhead.
+
+### T-series Round 2: summary and next directions
+
+Five ideas measured (T1, T2, T3+T4, T6, T7); none produced a real TTC
+win. Three key takeaways:
+
+1. **The allocator is already excellent at small-Vec reuse.**
+   T1/T2/T3+T4 all targeted per-frame / per-candidate `Vec` clones of
+   ≤64 bytes. Rust's default allocator fast-caches these slabs; the
+   indirection / bookkeeping required to avoid the alloc costs more
+   than the alloc itself. Do not re-attempt micro-level allocator
+   optimisations in `dfs_body` without first confirming the target
+   Vec sizes exceed ~256 bytes.
+
+2. **Short loops are compiler-unrolled.**
+   T7 tried to batch a `for kind in PropKind::ALL { pre[k] =
+   self.propagations_by_kind(k) }` into a single array-returning
+   method. No measurable gain: LLVM already unrolls a 7-iter
+   fixed-bound loop where each body is an inline array read. Per-kind
+   telemetry capture is **not** the hotspot; stop targeting it.
+
+3. **Direct-TTC can be fooled by pruning-semantics changes.**
+   T6's apparent 4.2× TTC improvement was a *metric artifact*:
+   skipping `rebuild_sums` when `delta=0` left `state.sums` incomplete
+   w.r.t. pre-pinned-kind pair contributions at the current level,
+   making `capacity_violated` too permissive. The walker then
+   "covered" more of the tree per frame (inflating
+   `coverage_product`) but the extra coverage was into dead subtrees
+   that the solver's installed nogoods eventually UNSAT'd. Search
+   stayed sound, but wall-clock on a solvable size (n=18 TT
+   discovery) showed only ~2% improvement vs 4.2× direct TTC. Always
+   cross-check direct TTC with a solvable-size wall-clock when the
+   change touches pruning.
+
+**Post-round baseline (unchanged)**: n=22 sync 30s, direct TTC parallel
+1.42–1.43e6s, rate ≈ 102k nodes/s.
+
+**Prioritised next directions** (structural, not micro-opt):
+
+- **[high] Incremental assumption API in radical.** The biggest
+  identified lever: currently every sibling's `propagate_only`
+  backtracks to level 0 and re-propagates the whole parent prefix.
+  For a 4n-length frame at level L, that's O(L) wasted propagation
+  work × 16 siblings. A `propagate_push(lit) / propagate_pop()` API
+  that keeps level-0 state and only pushes/pops the delta would save
+  `L × 15 / (L+1) ≈ 14×` propagator work per frame. Non-trivial
+  refactor; needs ~3 days. Potential 2-5× rate lift on sync mode.
+
+- **[med] T6-safe variant.** Skip *only* `harvest_forced` when
+  delta=0 (keep `rebuild_sums` for sum correctness). Upper-bound win
+  is small (harvest is O(4n) ≈ 80ns per accepted sibling), but it's
+  mechanical and the soundness argument is tight. Measure before
+  committing.
+
+- **[med] T8: partition `closure_events` by kind.** `apply_level_delta`
+  currently filters each event by `placed_kind_mask`. At odd levels
+  (W absent), most events have `kind != current mask bits`, wasting
+  branches. Store `closure_events_by_kind[level][kind]: Vec<Event>`,
+  iterate only the active-kind partitions. Win scales with kinds-
+  per-level × events-per-kind; needs measurement.
+
+- **[low] S14: cache "rule fired at early-bit=X" per level.** The
+  BDKR rule_check recomputes per candidate; its input is
+  deterministic in the frame's rule_state + early bit. Cache a 2-bit
+  outcome per (level, early_bit). `rule_rejects=0` in practice so
+  this only matters for the arithmetic, not pruning — likely ≤0.5%.
+
+- **[low] S8: UNSAT-only memo keyed on (level, sums, rule_state).**
+  sat_unsat is ~1/3 of nodes; if a memo hits, we skip the
+  propagate_only call (the expensive step). Memory/hash overhead
+  must stay below the SAT-call cost. Uncertain; need a dry-run.
+
+**Not worth pursuing without new evidence**: T9 (hoist `kind_xy_len`
+— already a 5ns inline fn in the profile), T10 (early-break on
+rule-forcing — `rule_rejects=0` so nothing to break on), T5
+(per-candidate telemetry skip — proven null by T7).
+
