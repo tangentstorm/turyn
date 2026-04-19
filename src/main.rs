@@ -88,6 +88,12 @@ fn print_help() {
     eprintln!("  --probing                Run failed literal probing before each SAT solve");
     eprintln!("  --rephasing              Periodically reset phase saving heuristic");
     eprintln!();
+    eprintln!("SEARCH CONJECTURES (hypothetical, off by default):");
+    eprintln!("  --conj-xy-product        XY product-law conjecture: U_i = x_i*y_i satisfies");
+    eprintln!("                           U_1 = U_n = +1 and U_i = -U_{{n+1-i}} (2<=i<=n-1).");
+    eprintln!("                           Empirically holds on the known corpus; implies X·Y=2.");
+    eprintln!("                           See conjectures/xy-product.md.");
+    eprintln!();
     eprintln!("DEBUGGING / TESTING:");
     eprintln!("  --verify=<X,Y,Z,W>      Check if four +/- sequences form a valid TT(n)");
     eprintln!("                           Example: --verify=++--+-,+-+-++,+++-,+-+-");
@@ -233,6 +239,10 @@ fn parse_args() -> SearchConfig {
             if cfg.wz_mode.is_none() { cfg.wz_mode = Some(WzMode::Apart); }
         } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
             cfg.dump_dimacs = Some(v.to_string());
+        } else if arg == "--conj-xy-product" {
+            cfg.conj_xy_product = true;
+        } else if arg == "--no-conj-xy-product" {
+            cfg.conj_xy_product = false;
         } else {
             eprintln!("error: unknown option '{}'\n", arg);
             print_help();
@@ -698,6 +708,7 @@ mod tests {
             mdd_extend: 0,
             wz_together: false,
             wz_mode: Some(WzMode::Apart),
+            conj_xy_product: false,
         };
         let tuples = phase_a_tuples(cfg.problem, None);
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, false, cfg.mdd_k);

@@ -302,6 +302,11 @@ pub(crate) struct PhaseBContext {
     /// Use the combined SolveWZ stage instead of the default SolveW →
     /// SolveZ two-stage pipeline. Plumbed from cfg.wz_together.
     pub(crate) wz_together: bool,
+    /// Optional XY product-law conjecture (`U_i = -U_{n+1-i}` for
+    /// 2 <= i <= n-1, with U_i = x_i*y_i). Plumbed from
+    /// cfg.conj_xy_product; only consulted by stages that build an
+    /// XY SAT template. See conjectures/xy-product.md.
+    pub(crate) conj_xy_product: bool,
     /// Prototype: replace the per-leaf walk_xy_sub_mdd fan-out with a
     /// single `try_candidate_via_mdd` call that uses radical's native
     /// `MddConstraint` propagator. Gated by env `XY_MDD=1`. Only the
@@ -468,6 +473,7 @@ pub(crate) fn run_mdd_sat_search(
         theta: cfg.theta_samples,
         mdd_extend: cfg.mdd_extend,
         wz_together: cfg.wz_together,
+        conj_xy_product: cfg.conj_xy_product,
         xy_mdd_mode: std::env::var("XY_MDD").ok().as_deref() == Some("1"),
         w_mid_vars: (0..middle_m).map(|i| (i + 1) as i32).collect(),
         z_mid_vars: (0..middle_n).map(|i| (i + 1) as i32).collect(),
@@ -495,6 +501,9 @@ pub(crate) fn run_mdd_sat_search(
     if verbose {
         eprintln!("TT({}): MDD pipeline k={}, {} workers, 4^{}={:.0e} paths",
             n, k, workers, zw_depth, total_paths as f64);
+        if cfg.conj_xy_product {
+            eprintln!("  --conj-xy-product: enforcing U_i = -U_{{n+1-i}} on XY canonical reps (XY product-law conjecture)");
+        }
     }
 
     // Shared priority queue: workers push and pop. Higher stage = higher priority.
@@ -1548,7 +1557,7 @@ pub(crate) fn run_mdd_sat_search(
                                 .map(|t| (t.x, t.y, t.z, t.w)).collect();
                             tuple_key.sort_unstable();
                             let template = template_cache.entry(tuple_key).or_insert_with(||
-                                SatXYTemplate::build_multi(problem, &swz.candidate_tuples, &sat_config).unwrap()
+                                SatXYTemplate::build_multi_opts(problem, &swz.candidate_tuples, &sat_config, ctx.conj_xy_product).unwrap()
                             );
                             let candidate = CandidateZW { zw_autocorr };
                             if let Some(mut xy_solver) = template.prepare_candidate_solver(&candidate) {
@@ -2009,7 +2018,7 @@ pub(crate) fn run_mdd_sat_search(
                                 .map(|t| (t.x, t.y, t.z, t.w)).collect();
                             tuple_key.sort_unstable();
                             let template = template_cache.entry(tuple_key).or_insert_with(||
-                                SatXYTemplate::build_multi(problem, &sz.candidate_tuples, &sat_config).unwrap()
+                                SatXYTemplate::build_multi_opts(problem, &sz.candidate_tuples, &sat_config, ctx.conj_xy_product).unwrap()
                             );
                             let candidate = CandidateZW { zw_autocorr };
                             // Shared XY SAT fast path: clone the per-tuple
@@ -2199,7 +2208,7 @@ pub(crate) fn run_mdd_sat_search(
                         let tuple_key: Vec<(i32, i32, i32, i32)> = vec![(
                             item.tuple.x, item.tuple.y, item.tuple.z, item.tuple.w)];
                         let template = template_cache.entry(tuple_key).or_insert_with(||
-                            SatXYTemplate::build(ctx.problem, item.tuple, &sat_config).unwrap()
+                            SatXYTemplate::build_opts(ctx.problem, item.tuple, &sat_config, ctx.conj_xy_product).unwrap()
                         );
 
                         if let Some(mut state) = SolveXyPerCandidate::new(

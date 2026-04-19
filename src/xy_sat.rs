@@ -423,6 +423,56 @@ pub(crate) fn add_swap_break<F, G, S>(
 }
 
 
+/// XY product-law conjecture (`--conj-xy-product`): enforce
+/// `U_i = -U_{n+1-i}` for every 2 <= i <= n-1, where
+/// `U_i := x_i * y_i ∈ {±1}` (1-indexed).  Empirically holds on the
+/// known Turyn corpus; unproven. See `conjectures/xy-product.md`.
+///
+/// The BDKR rule (i) symmetry-break already pins `U_1 = U_n = +1` via
+/// `x_0 = y_0 = x_{n-1} = y_{n-1} = +1`, so only the pairwise middle
+/// equalities need to be emitted here.
+///
+/// Encoding: `x_j * y_j * x_k * y_k = -1` (where `k = n-1-j`, 0-indexed)
+/// is equivalent to odd parity of `{x_j, y_j, x_k, y_k}`, so each
+/// distinct middle pair contributes 8 CNF clauses (one per even-parity
+/// assignment ruled out).
+///
+/// Self-paired indices (`j == n-1-j`, only possible for odd `n`) force
+/// `U_i * U_i = -1` which is infeasible; in that case we emit a trivial
+/// empty clause and the solver returns UNSAT.
+pub(crate) fn add_xy_product_law<F, G, S>(
+    solver: &mut S,
+    x_var: F,
+    y_var: G,
+    n: usize,
+) where F: Fn(usize) -> i32, G: Fn(usize) -> i32, S: SatSolver {
+    if n < 2 { return; }
+    for j in 1..=((n - 1) / 2) {
+        let k = n - 1 - j;
+        if j > k { break; }
+        if j == k {
+            // Infeasible: (x_j*y_j)^2 = +1 ≠ -1. Make it obviously UNSAT.
+            solver.add_clause([]);
+            return;
+        }
+        let a = x_var(j);
+        let b = y_var(j);
+        let c = x_var(k);
+        let d = y_var(k);
+        // Forbid every even-parity assignment of (a,b,c,d):
+        //   0 true, all four 2-true combos, 4 true.
+        solver.add_clause([ a,  b,  c,  d]);  // rule out (F,F,F,F)
+        solver.add_clause([-a, -b, -c, -d]);  // rule out (T,T,T,T)
+        solver.add_clause([-a, -b,  c,  d]);  // rule out (T,T,F,F)
+        solver.add_clause([-a,  b, -c,  d]);  // rule out (T,F,T,F)
+        solver.add_clause([-a,  b,  c, -d]);  // rule out (T,F,F,T)
+        solver.add_clause([ a, -b, -c,  d]);  // rule out (F,T,T,F)
+        solver.add_clause([ a, -b,  c, -d]);  // rule out (F,T,F,T)
+        solver.add_clause([ a,  b, -c, -d]);  // rule out (F,F,T,T)
+    }
+}
+
+
 /// Build SAT XY template with PB constraints for sum constraints
 /// and quadratic PB agree pairs per lag. No XNOR auxiliary variables.
 /// Multi-tuple variant of `build_sat_xy_clauses`.  Builds V_x and V_y
@@ -435,6 +485,19 @@ pub(crate) fn build_sat_xy_clauses_multi(
     problem: Problem,
     tuples: &[SumTuple],
     solver: &mut impl SatSolver,
+) -> Option<(Vec<LagPairs>, usize)> {
+    build_sat_xy_clauses_multi_opts(problem, tuples, solver, false)
+}
+
+
+/// Like `build_sat_xy_clauses_multi`, but optionally appends the
+/// XY product-law conjecture (`U_i = -U_{n+1-i}` pairwise) on top of
+/// the canonical rules. See `add_xy_product_law`.
+pub(crate) fn build_sat_xy_clauses_multi_opts(
+    problem: Problem,
+    tuples: &[SumTuple],
+    solver: &mut impl SatSolver,
+    conj_xy_product: bool,
 ) -> Option<(Vec<LagPairs>, usize)> {
     let n = problem.n;
 
@@ -452,6 +515,13 @@ pub(crate) fn build_sat_xy_clauses_multi(
     add_palindromic_break(solver, n, x_var, false, 1, &mut next_var);
     add_palindromic_break(solver, n, y_var, false, 1, &mut next_var);
     add_swap_break(solver, x_var, y_var, n);
+
+    // Optional XY product-law conjecture (toggle: off by default,
+    // enabled by `--conj-xy-product`). See conjectures/xy-product.md
+    // and `add_xy_product_law` for the encoding.
+    if conj_xy_product {
+        add_xy_product_law(solver, x_var, y_var, n);
+    }
 
     // Sum constraints via PbSetEq over the union across `tuples`.
     let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
@@ -606,17 +676,39 @@ impl SatXYTemplate {
         Self::build_multi(problem, std::slice::from_ref(&tuple), sat_config)
     }
 
+    /// Like `build`, but with the XY product-law conjecture toggled
+    /// by `conj_xy_product` (see `add_xy_product_law`).
+    pub(crate) fn build_opts(
+        problem: Problem,
+        tuple: SumTuple,
+        sat_config: &radical::SolverConfig,
+        conj_xy_product: bool,
+    ) -> Option<Self> {
+        Self::build_multi_opts(problem, std::slice::from_ref(&tuple), sat_config, conj_xy_product)
+    }
+
     /// Multi-tuple template: `PbSetEq` on X and Y unions the ±|σ| counts
     /// across every tuple in `tuples`.  A single solver covers every
     /// unsigned (σ_X, σ_Y) pair in the list — the SAT picks a
     /// rule-(i)..(vi)-consistent sign combination at solve time.
     pub(crate) fn build_multi(problem: Problem, tuples: &[SumTuple], sat_config: &radical::SolverConfig) -> Option<Self> {
+        Self::build_multi_opts(problem, tuples, sat_config, false)
+    }
+
+    /// Like `build_multi`, but appends the XY product-law conjecture
+    /// when `conj_xy_product = true` (see `add_xy_product_law`).
+    pub(crate) fn build_multi_opts(
+        problem: Problem,
+        tuples: &[SumTuple],
+        sat_config: &radical::SolverConfig,
+        conj_xy_product: bool,
+    ) -> Option<Self> {
         #[cfg(not(feature = "cadical"))]
         let mut solver: radical::Solver = { let mut s = radical::Solver::new(); s.config = sat_config.clone(); s };
         #[cfg(feature = "cadical")]
         let mut solver: cadical::Solver = Default::default();
 
-        let (lag_pairs, n) = build_sat_xy_clauses_multi(problem, tuples, &mut solver)?;
+        let (lag_pairs, n) = build_sat_xy_clauses_multi_opts(problem, tuples, &mut solver, conj_xy_product)?;
         #[cfg(not(feature = "cadical"))]
         solver.reserve_for_search(200);
         Some(Self { solver, lag_pairs, n })
