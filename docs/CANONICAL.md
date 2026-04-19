@@ -75,40 +75,44 @@ aux blocks.
 
 ### Tuple-level correctness
 
-Empirical investigation (Python exhaustive enumeration at n=6):
+`SumTuple::norm_key` returns `(|σ_X|, |σ_Y|, |σ_Z|, |σ_W|)` — the
+*absolute-value* tuple.  Phase A yields one representative per
+abs-key (not per signed tuple), and downstream the search tries
+*both signs* of `σ_Z` and `σ_W` at each boundary via
+`sigma_full_to_cnt` against `±|σ|`, and via `PbSetEq`'s set-valued
+sum constraint on the middle counts.  See `src/mdd_pipeline.rs`
+around line 810 (`z_feas = [tuple.z.abs(), -tuple.z.abs()] …`) and
+`src/mdd_pipeline.rs` around line 750 ("templates differ only in
+their `V_x`/`V_y` `PbSetEq` values").  σ_X and σ_Y sign choices
+are folded into the XY template's `V_x`/`V_y` sets the same way.
 
-|                                      | orbits  | reachable by signed-tuple search | reachable by `|·|`-tuple search |
-|--------------------------------------|--------:|---------------------------------:|--------------------------------:|
-| Total BDKR orbits                    | 4       | 4                                | 2                               |
-| Orbits with all `σ ≥ 0`              | 2       | 2                                | 2                               |
-| Orbits with at least one `σ < 0`     | 2       | 2                                | **0**  ← missed                  |
+This is verified against Kharaghani's complete catalogue
+(`data/turyn-type-N`, `n ∈ {2..32}`):
 
-Concretely the n=6 orbits and their canonical sums are:
+| n  | canonical solutions | distinct signed σ-tuples | distinct `|·|`-keys | phase-a `|·|`-keys |
+|----|--------------------:|-------------------------:|--------------------:|-------------------:|
+|  6 |                   4 |                        4 |                   3 |                  5 |
+| 18 |                 675 |                        — |                   — |                 10 |
+| 28 |                4 161 |                      163 |                  18 |                 18 |
 
-| `(σ_X, σ_Y, σ_Z, σ_W)`   | `|·|` bucket    | reachable pre-fix? |
-|--------------------------|-----------------|--------------------|
-| `(+4, +4,  0, -1)`       | `(4, 4, 0, 1)`  | no                 |
-| `(+4,  0,  0, +3)`       | `(4, 0, 0, 3)`  | yes                |
-| `(+2, +2, +2, +3)`       | `(2, 2, 2, 3)`  | yes                |
-| `(+2, -2, +2, +3)`       | `(2, 2, 2, 3)`  | no  (collides)     |
+Every signed σ-tuple in the data collapses to exactly one
+phase-a abs-key, and phase-a's abs-keys are a superset of the
+data's abs-keys (it enumerates some that turn out infeasible
+downstream, which is expected).  So the abs-key enumeration plus
+two-sided sign expansion is *complete* — it reaches every BDKR
+orbit — while keeping the per-boundary tuple count small.
 
-The pre-fix `norm_key` collapsed each component by `abs()`.  That
-would have been valid only if T1 (negate any one sequence) were a
-free symmetry of the canonical-form search, but rule (i)
-**unconditionally pins** `x[0]=x[n-1]=y[0]=y[n-1]=z[0]=w[0]=+1` —
-every single-sequence T1 image flips one of those pinned bits, so
-T1 is **fully broken** by the rule set.  Other operators don't help
-either: T2 doesn't move tuples (sums invariant), T4 is broken by
-rule (vi), and T3 changes sums non-simply (no cheap tuple key).
-The only sound key is therefore the signed tuple itself.
-
-The cost is real: at n=18 throughput drops from ~8000 to ~900
-paths/s in the `--wz=apart --mdd-k=5` smoke test.  The tuple
-enumerator now has to try every signed combination satisfying the
-energy equation rather than collapsing to `|·|` representatives, so
-the per-boundary tuple count grows roughly 5–9× depending on how
-many `σ` components are non-zero (each non-zero σ contributes a
-factor 2).  This is the price of completeness.
+Historical note: an earlier revision of this document (and of the
+code) expanded phase-a to enumerate all signed tuples up front,
+which was correct but cost ~5–9× more tuples per boundary and
+dropped n=18 throughput from ~8000 to ~900 paths/s in the
+`--wz=apart --mdd-k=5` smoke test.  The PbSetEq-based V_x/V_y
+encoding lets us push the sign expansion from phase-a into the
+SAT template instead, recovering the lost throughput without
+losing completeness.  The n=6 table of "missed orbits" in that
+earlier revision was accurate *before* the two-sided-sign
+expansion was wired in, and no longer describes the current
+code.
 
 ### Test-suite status
 
