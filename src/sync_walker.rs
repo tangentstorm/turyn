@@ -61,8 +61,6 @@ struct Ctx {
     depth: usize,
     /// Bouncing position order: [0, n-1, 1, n-2, ...].
     pos_order: Vec<usize>,
-    /// `pos_to_level[p]` = level at which position `p` is pinned.
-    pos_to_level: Vec<usize>,
     /// Events that fire when a lag pair closes at this level.
     /// `closure_events[level] = [(lag, kind, pos_a, pos_b, abs_coeff), ...]`.
     closure_events: Vec<Vec<PairEvent>>,
@@ -266,7 +264,7 @@ fn build_ctx(problem: Problem) -> Ctx {
 
     Ctx {
         n, m, depth,
-        pos_order, pos_to_level,
+        pos_order,
         closure_events, max_remaining,
         seed: 0, cancel: None, start: Instant::now(),
         valid_tuples,
@@ -693,40 +691,6 @@ fn tuple_reachable(state: &State, ctx: &Ctx) -> bool {
     false
 }
 
-/// Tighter capacity check using dynamic (actually-pending) pair
-/// contributions rather than the static max_remaining[level] bound.
-///
-/// Rationale: harvest_forced may pin bits at positions the walker
-/// hasn't reached yet.  A pair with BOTH endpoints pinned — whether
-/// walker-placed or SAT-harvested — is fully determined and its
-/// contribution is already in `sums[s]`.  The static max_remaining
-/// counts it as "still pending," overestimating remaining capacity.
-///
-/// Dynamic capacity per lag = Σ over pairs where at least one
-/// endpoint is still unset.  Per-lag cost is O(n); per-level cost
-/// is O(n²); per DFS call is O(n²) — cheap compared to propagate_only.
-fn dynamic_capacity_violated(state: &State, ctx: &Ctx) -> bool {
-    for s in 1..ctx.n {
-        let mut dyn_cap: i32 = 0;
-        for i in 0..ctx.n.saturating_sub(s) {
-            for kind in 0u8..3 {
-                if state.bit(kind, i) == 0 || state.bit(kind, i + s) == 0 {
-                    dyn_cap += kind_coeff(kind) as i32;
-                }
-            }
-        }
-        for i in 0..ctx.m.saturating_sub(s) {
-            if state.bit(3, i) == 0 || state.bit(3, i + s) == 0 {
-                dyn_cap += 2;
-            }
-        }
-        if (state.sums[s] as i32).unsigned_abs() as i32 > dyn_cap {
-            return true;
-        }
-    }
-    false
-}
-
 /// Return true if any lag's running sum blows past its remaining capacity.
 /// At level `state.level`, max_remaining applies to pairs not yet closed.
 fn capacity_violated(state: &State, ctx: &Ctx) -> bool {
@@ -769,7 +733,6 @@ pub(crate) struct SyncStats {
     pub tuple_rejects: u64,
     pub sat_unsat: u64,
     pub leaves_reached: u64,
-    pub learned_clauses_final: u64,
     pub max_level_reached: u64,
     pub nodes_by_level: Vec<u64>,
     /// Per-level sum of `candidates.len()` — i.e. the children that
@@ -885,7 +848,7 @@ fn search_sync_parallel(
     let stats_agg: Arc<Mutex<SyncStats>> = Arc::new(Mutex::new(SyncStats {
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
         rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
-        learned_clauses_final: 0, max_level_reached: 0,
+        max_level_reached: 0,
         nodes_by_level: Vec::new(), children_by_level: Vec::new(),
         children_total: 0, internal_nodes: 0,
         time_to_first_leaf: None,
@@ -1284,7 +1247,7 @@ fn search_sync_serial(
         eprintln!("sync_walker: base solver UNSAT — canonical constraints inconsistent");
         return (None, SyncStats {
             nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-            rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
+            rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0, max_level_reached: 0,
             nodes_by_level: Vec::new(), children_by_level: Vec::new(),
             children_total: 0, internal_nodes: 0,
             time_to_first_leaf: None,
@@ -1310,7 +1273,7 @@ fn search_sync_serial(
     let mut stats = SyncStats {
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
         rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
-        learned_clauses_final: 0, max_level_reached: 0,
+        max_level_reached: 0,
         nodes_by_level: vec![0; ctx.depth + 1],
         children_by_level: vec![0; ctx.depth + 1],
         children_total: 0, internal_nodes: 0,
