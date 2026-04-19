@@ -4723,6 +4723,65 @@ impl Solver {
             }
         }
     }
+
+    /// Backbone detection (kissat-style): for every currently-unassigned
+    /// variable in range `[1, max_var]`, try each polarity under
+    /// assumption. If one polarity conflicts, the opposite is a level-0
+    /// fact (a backbone literal) and is enqueued + propagated. Halts
+    /// early if the solver becomes UNSAT.
+    ///
+    /// Returns the number of literals installed at level 0 as backbone
+    /// facts.
+    ///
+    /// Cost: O(max_var × propagate) = O(V·E) worst case. Intended as a
+    /// one-shot preprocessing step, not a per-conflict trigger.
+    /// `max_var` = 0 means all variables.
+    pub fn backbone_scan(&mut self, max_var: usize) -> usize {
+        if self.num_vars == 0 || !self.ok { return 0; }
+        self.backtrack(0);
+        let limit = if max_var == 0 { self.num_vars } else { max_var.min(self.num_vars) };
+        // Pre-size reusable buffers.
+        if self.quad_pb_seen_buf.len() < self.num_vars {
+            self.quad_pb_seen_buf.resize(self.num_vars, false);
+        }
+        if self.analyze_seen.len() < self.num_vars {
+            self.analyze_seen.resize(self.num_vars, false);
+        }
+        let mut installed = 0usize;
+        let mut progress = true;
+        while progress {
+            progress = false;
+            for v in 0..limit {
+                if !self.ok { return installed; }
+                if self.assigns[v] != LBool::Undef { continue; }
+                let lit = (v + 1) as Lit;
+                // Try +lit first, then -lit.
+                let mut forced: Option<Lit> = None;
+                for sign in [lit, -lit] {
+                    self.new_decision_level();
+                    self.enqueue(sign, Reason::Decision);
+                    let conflict = self.propagate().is_some();
+                    self.backtrack(0);
+                    if conflict {
+                        forced = Some(-sign);
+                        break;
+                    }
+                }
+                if let Some(f) = forced {
+                    if self.lit_value(f) == LBool::Undef {
+                        self.enqueue(f, Reason::Decision);
+                        if self.propagate().is_some() {
+                            self.ok = false;
+                            return installed;
+                        }
+                        installed += 1;
+                        progress = true;
+                    }
+                }
+            }
+        }
+        installed
+    }
 }
 
 /// Luby sequence: 1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8, ...
