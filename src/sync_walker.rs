@@ -1492,12 +1492,15 @@ fn dfs_body(
         // Speculatively update sums for pairs closing at this level
         // using the placed bits. We don't call the solver yet — capacity
         // check first (cheap).
-        let saved_bits: Vec<(u8, usize, u8)> = (0..np as usize)
-            .map(|k| {
-                let (ki, pi, _) = placed[k];
-                (ki, pi, state.bit(ki, pi))
-            })
-            .collect();
+        // Stack-allocated saved bits (≤4 placements per choice — fits
+        // in the same pattern as `placed` itself). Avoids the
+        // per-choice Vec allocation that the choice loop's high
+        // iteration count would otherwise pay 16× per node.
+        let mut saved_bits: [(u8, usize, u8); 4] = [(0, 0, 0); 4];
+        for k in 0..np as usize {
+            let (ki, pi, _) = placed[k];
+            saved_bits[k] = (ki, pi, state.bit(ki, pi));
+        }
         // R8: kinds whose bit at pos_order[level] was 0 before this
         // choice — i.e. newly placed NOW. The parent's rebuild_sums
         // already counted closure_events[saved_level] events for kinds
@@ -1540,8 +1543,9 @@ fn dfs_body(
 
         // Rollback speculative state.
         state.level = saved_level;
-        for (ki, pi, old_sign) in &saved_bits {
-            state.bits[(*ki as usize) * ctx.n + pi] = *old_sign;
+        for k in 0..np as usize {
+            let (ki, pi, old_sign) = saved_bits[k];
+            state.bits[(ki as usize) * ctx.n + pi] = old_sign;
         }
         // R8: restore parent sums from the pre-loop snapshot
         // (O(n)) instead of a full rebuild (O(total events)).
