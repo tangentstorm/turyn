@@ -2084,21 +2084,42 @@ path by incrementally updating.
 - **Detection plan**: nodes/s should rise; per-node elapsed (via
   `perf stat -e cycles,instructions`) should drop meaningfully.
 
-### S4. Partition first deterministic levels across workers
+### S4. Partition first deterministic levels across workers — *tested, rejected*
 
-b_eff=1 for levels 0..5 means all 16 workers re-walk the same prefix.
-Pre-compute the single forced path through levels 0..L* (where L* is
-the first branching level) once, then dispatch workers from there
-with distinct first-branching assignments. Equivalent to doing a
-single serial walk until the first branch, then parallelising.
+Hypothesis: at levels 0..5 the search is essentially forced (b_eff≈1
+for levels 0/1, then branches). Without partitioning, each of 16
+workers explores level 2's 16 siblings in its own shuffled order,
+with some overlap. Partitioning by stride (worker i takes siblings
+i, i+16, i+32, …) eliminates overlap.
 
-- **TTC mechanism**: rate (stop wasting 15/16 × prefix work).
-- **Detection plan**: `nodes_visited / elapsed` aggregate should
-  rise by ~15/16 when prefix is forced; the `nodes_by_level[0..L*]`
-  should be 1 per worker rather than ~1 per worker × 16.
-- **Risk**: workers need distinct starting assumptions; need to
-  emit N work-items (one per first-branching sibling) to a shared
-  queue and let workers pull.
+Implementation: added `worker_id`/`n_workers` to `SyncConfig`/`Ctx`;
+at `state.level == PARTITION_LEVEL` the candidate list is stride-
+filtered by `i % n_workers == worker_id`. Tested at level 2 and
+level 6 on n=22, 30s, 16 workers.
+
+| Partition at | TTC parallel | nodes    | notes |
+|--------------|--------------|----------|-------|
+| (baseline)   | 1.37e6 s     | 4.14 M   | no partition |
+| level 2      | 2.36e6 s     | 1.56 M   | −72% regression |
+| level 6      | 2.67–3.34e6 s | 3.5–4.2 M | −95% to −140% regression |
+
+**Root cause**: the `children_processed_by_level / children_by_level`
+coverage metric assumes each worker can traverse any sibling at a
+level. Partitioning restricts a worker to its stride, so its per-
+frame "processed fraction" is at most `1/n_workers`. The metric
+collapses coverage even when real unique-sibling coverage could be
+higher. Additionally, workers that drew a "hard" stride get stuck
+for the whole run with no ability to help with easier strides.
+
+Needs a work-stealing queue to preserve both (a) metric soundness
+and (b) load balance — too complex for this session. Reverted.
+
+- **TTC mechanism attempted**: rate (eliminate cross-worker overlap).
+- **Result**: both fixed-level attempts regressed, +72% to +140% TTC.
+- **Next direction**: a shared AtomicUsize counter at level 2 that
+  workers atomically pop the next sibling index from — dynamic
+  partition with implicit load balancing, but solves harder problems
+  of locking + wakeup. Defer.
 
 ### S5. Raise cross-worker nogood-share threshold — *tested, rejected*
 
