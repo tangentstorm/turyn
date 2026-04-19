@@ -2,6 +2,52 @@
 
 This file tracks performance-oriented changes and their measured impact.
 
+## April 19 2026 — `--wz=sync` deep optimization session (-91 % TTC cumulative)
+
+A single multi-hour session pushed `--wz=sync` from baseline TTC
+6.581e8 s parallel down to ~5.87e7 s parallel — an **11× cumulative
+speedup** at n=26.  All wins came from the walker / solver
+interaction; no algorithmic changes to the search space.
+
+| Stage           | TTC (mean of 5 sequential runs) | Δ vs baseline |
+|-----------------|---------------------------------|---------------|
+| Baseline        | 6.581e8 s ± 0.089e8             | —             |
+| + R1            | 5.224e8 s ± 0.067e8             | −20.6 %       |
+| + R8            | 2.62e8 s (range 2.04–3.05e8)    | −60 %         |
+| + R8b           | 2.30e8 s (range 1.83–3.00e8)    | −65 %         |
+| + R8c           | **5.97e7 s ± 0.001e7**          | **−91 %**     |
+| + R8c stack-bits + assert + per-kind ranges + SCC + BVE | 5.87e7 s | **−91.1 %** |
+
+Methodology lessons (logged for future sessions):
+
+- **Sequential, not parallel runs**: Earlier in the session the noise
+  floor was ~11 % (parallel benchmarks contended on CPU). Switching
+  to strict sequential 5-run measurements brought it to ~1.3 %.
+- **CPU thermal throttling**: After ~30 min of continuous runs,
+  R8/R8b results showed bimodal clustering that vanished once R8c
+  removed the dominant inner-loop work. The "thermal bimodal" pattern
+  is a tell that the hot path is sustained-high-CPU rather than
+  noisy.
+- **Decisive wins only**: Six experiments (R5, R6, R9, capacity SIMD,
+  S6, per-kind cfg gate) regressed or measured in noise. None were
+  committed. Several (R8d, R9, R10 with high MAX_SHARED_LEN) were
+  rejected after benchmarking despite plausible theoretical merit.
+
+The remaining residual cost on n=26 sync is essentially the SAT
+propagator (push_assume_frame's propagate loop, dominated by
+clause-BCP and quad-PB). Further wins likely require:
+
+- Solver-internal: chronological backtracking, dedicated binary
+  watch list (radical has very few binaries to start, so payoff
+  uncertain), LBD-tier clause retention with a sync-driven
+  reduce_db schedule.
+- Walker-side: combined-level walking (place 2 levels per push
+  for amortized propagation), spectral constraint as a walker
+  filter.
+
+Detailed before/after for each landed commit is documented inline
+below as `R*` entries.
+
 ## TTC: the universal metric
 
 Every entry in this log is framed against **Time to Cover (TTC)** —
