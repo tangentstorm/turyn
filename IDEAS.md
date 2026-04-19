@@ -2084,62 +2084,113 @@ path by incrementally updating.
 - **Detection plan**: nodes/s should rise; per-node elapsed (via
   `perf stat -e cycles,instructions`) should drop meaningfully.
 
-### S4. Partition first deterministic levels across workers
+### S4. Partition first deterministic levels across workers — *tested, rejected*
 
-b_eff=1 for levels 0..5 means all 16 workers re-walk the same prefix.
-Pre-compute the single forced path through levels 0..L* (where L* is
-the first branching level) once, then dispatch workers from there
-with distinct first-branching assignments. Equivalent to doing a
-single serial walk until the first branch, then parallelising.
+Hypothesis: at levels 0..5 the search is essentially forced (b_eff≈1
+for levels 0/1, then branches). Without partitioning, each of 16
+workers explores level 2's 16 siblings in its own shuffled order,
+with some overlap. Partitioning by stride (worker i takes siblings
+i, i+16, i+32, …) eliminates overlap.
 
-- **TTC mechanism**: rate (stop wasting 15/16 × prefix work).
-- **Detection plan**: `nodes_visited / elapsed` aggregate should
-  rise by ~15/16 when prefix is forced; the `nodes_by_level[0..L*]`
-  should be 1 per worker rather than ~1 per worker × 16.
-- **Risk**: workers need distinct starting assumptions; need to
-  emit N work-items (one per first-branching sibling) to a shared
-  queue and let workers pull.
+Implementation: added `worker_id`/`n_workers` to `SyncConfig`/`Ctx`;
+at `state.level == PARTITION_LEVEL` the candidate list is stride-
+filtered by `i % n_workers == worker_id`. Tested at level 2 and
+level 6 on n=22, 30s, 16 workers.
 
-### S5. Raise cross-worker nogood-share threshold
+| Partition at | TTC parallel | nodes    | notes |
+|--------------|--------------|----------|-------|
+| (baseline)   | 1.37e6 s     | 4.14 M   | no partition |
+| level 2      | 2.36e6 s     | 1.56 M   | −72% regression |
+| level 6      | 2.67–3.34e6 s | 3.5–4.2 M | −95% to −140% regression |
 
-`MAX_SHARED_LEN: usize = 16` in `dfs()`. Measured avg nogood len is
-~70; basically nothing gets shared. Try raising to 256 (or: share
-unconditionally and let the solver DB evict). Peer clauses prune
-repeat deadends across different workers — this is literally the
-mechanism that makes parallel CDCL scale.
+**Root cause**: the `children_processed_by_level / children_by_level`
+coverage metric assumes each worker can traverse any sibling at a
+level. Partitioning restricts a worker to its stride, so its per-
+frame "processed fraction" is at most `1/n_workers`. The metric
+collapses coverage even when real unique-sibling coverage could be
+higher. Additionally, workers that drew a "hard" stride get stuck
+for the whole run with no ability to help with easier strides.
 
-- **TTC mechanism**: rate (bigger peer clause flow → fewer
-  redundant SAT-UNSAT calls across workers).
-- **Detection plan**: `peer_imports` should rise 10–100×; `sat_unsat`
-  should drop; need to verify no regression in nodes/s from added
-  clause-DB overhead.
-- **Risk**: long clauses rarely fire via two-watch and bloat the DB.
-  If regression, add a heuristic: share clauses with short LBD
-  regardless of length.
+Needs a work-stealing queue to preserve both (a) metric soundness
+and (b) load balance — too complex for this session. Reverted.
 
-### S6. Remove `compute_sigma` O(4n) sweep from tuple_reachable
+- **TTC mechanism attempted**: rate (eliminate cross-worker overlap).
+- **Result**: both fixed-level attempts regressed, +72% to +140% TTC.
+- **Next direction**: a shared AtomicUsize counter at level 2 that
+  workers atomically pop the next sibling index from — dynamic
+  partition with implicit load balancing, but solves harder problems
+  of locking + wakeup. Defer.
 
-`tuple_reachable` is called in the speculative-candidate loop and
-calls `compute_sigma` which scans all 4 sequences × n positions
-looking at every bit. We can maintain sigma/free incrementally per
-sequence and update on bit set/unset.
+### S5. Raise cross-worker nogood-share threshold — *tested, rejected*
 
-- **TTC mechanism**: rate (cuts per-candidate cost).
-- **Detection plan**: nodes/s rises.
+Swept `MAX_SHARED_LEN ∈ {16, 64, 128, 256, 1024}` at n=22 sync 30s
+(16 workers, 3 trials, post-S3-delta):
 
-### S7. Skip `propagate_only` when new bits are only deterministic
+| Threshold | nodes/30s | peer_imports | TTC parallel |
+|-----------|-----------|--------------|--------------|
+| 16 (def)  | 4.20M     | 512          | 1.37e6 s     |
+| 64        | 1.32M     | 5.2M         | 1.97e6 s     |
+| 128       | 1.64M     | 9.0M         | 1.84e6 s     |
+| 256       | 1.62M     | 8.9M         | 1.85e6 s     |
+| 1024      | 1.63M     | 8.9M         | 1.84e6 s     |
 
-When the just-placed bits are all forced by already-present SAT
-constraints (e.g., the placement matches what the parent's
-`harvest_forced` predicted), we know `propagate_only` would be a
-no-op and just re-assert ancestor assumptions. Detect this via a
-"would-be-forced" check before calling propagate_only.
+Above 16 the clause DB bloats and BCP slows 2–3×. Every threshold
+≥64 regresses by 35–44%. Peer clauses ARE being shared (millions of
+imports), but they're not firing enough to offset the BCP cost.
+Hypothesis: long nogoods rarely prune with two-watch. An LBD-based
+share heuristic might work; raw length filter doesn't.
 
-- **TTC mechanism**: rate.
-- **Detection plan**: `sat_unsat` unchanged; nodes/s rises.
-- **Risk**: has to be sound — if we skip propagate_only we're
-  trusting walker pruning to be equivalent. Gated on
-  harvest_forced's prediction matching the placement.
+### S6. Remove `compute_sigma` O(4n) sweep from tuple_reachable — *tested, rejected (null)*
+
+Hypothesis: `tuple_reachable`, called per speculative candidate, runs
+`compute_sigma` which scans all 4 sequences × n bits. Cache σ/free once
+per DFS node (parent sweep) and apply ±1 delta per placed bit.
+
+Implemented in `sync_walker.rs`: added `tuple_reachable_from(sx, sy, sz,
+sw, fx, fy, fz, fw, ctx)` that takes σ/free explicitly; cached parent
+σ/free once at the top of `dfs_body` via a single `compute_sigma` call;
+the candidate loop applies `cand_sigma[ki] += si; cand_free[ki] -= 1`
+for each placed bit and calls the `_from` variant.
+
+**Measurement** (n=22 sync 30s, 16 workers, 3 trials each):
+
+| metric        | post-S3 baseline | S6 incremental σ |
+|---------------|------------------|------------------|
+| TTC parallel  | 1.37e6 s         | 1.37e6 s (1.378, 1.370, 1.372) |
+| nodes         | 4.14 M           | 4.14–4.15 M       |
+| cap_rejects   | 54.1 M           | 54.1 M            |
+| tuple_rejects | 1.33 M           | 1.33 M            |
+
+**Conclusion**: neutral. Scanning 4×n=88 bits per candidate at n=22 is
+not a measurable hotspot relative to SAT propagate_only, so the
+optimization saves nothing net. Reverted. Keep `compute_sigma` direct.
+
+- **TTC mechanism attempted**: rate.
+- **Result**: 0% change across 3 trials; not worth the extra call path.
+
+### S7. Skip `propagate_only` when new bits are only deterministic — *tested, rejected (not worth it)*
+
+Hypothesis: when `cand.num_new_assums == 0` (all 4 bits at `pos` were
+pre-pinned by parent's `harvest_forced`), `propagate_only(&assums)`
+re-pushes an unchanged prefix and does redundant BCP. Skipping it plus
+the subsequent `harvest_forced` (also idempotent) would save a full
+SAT round per such candidate.
+
+Measured frequency via atomic counter before implementation:
+
+| n  | zero_new_assums | total candidates | ratio  |
+|----|-----------------|------------------|--------|
+| 22 | 100 000         | 2.77 M           | 3.6%   |
+| 26 | < 100 000       | ≥ 2.1 M          | < 5%   |
+
+**Conclusion**: the qualifying case is too rare (≤5%) to produce a
+meaningful TTC win even under the generous assumption that the saved
+`propagate_only` is 100% of each cycle's cost. Upper bound is ~5%
+speedup — well inside run-to-run variance. Skipped. Instrumentation
+reverted; S7 not implemented.
+
+- **TTC mechanism considered**: rate.
+- **Result**: upper bound ≤5%; below the implementation noise floor.
 
 ### S8. Coarser memo key — (level, sums, rule_state) only
 
@@ -2186,6 +2237,35 @@ model only). Replace with `propagate_only` + `solver.value()` calls.
   assignment. If propagate_only didn't force all lits, we need a
   separate model-completion step.
 
+### S11b. Re-introduce `dynamic_capacity_violated` as post-harvest pruner — *tested, rejected*
+
+Hypothesis: after `harvest_forced` pins bits beyond the walker
+frontier, pairs with BOTH endpoints pinned are fully-determined and
+their contribution is already in `sums[s]`. The static `max_remaining`
+bound double-counts them, so a dynamic per-pair scan could prune
+subtrees the static check lets through.
+
+Implemented: added `dynamic_capacity_violated` (O(n²) per call) after
+`capacity_violated` in the post-harvest block at line 1726.
+
+**Measurement** (n=22 sync 30s, 16 workers, 3 trials):
+
+| metric        | post-S3 baseline | +dynamic cap check |
+|---------------|------------------|--------------------|
+| TTC parallel  | 1.37e6 s         | 1.46e6 s (1.454, 1.457, 1.455) |
+| nodes         | 4.14 M           | 2.87 M (−30%)      |
+| cap_rejects   | 54.1 M           | 38.1 M             |
+
+**Conclusion**: the dynamic check does prune — visible in the ~30%
+node reduction — but its O(n²) per-call cost outweighs the saved
+subtree work: the node-rate drop (138K/s → 96K/s) exceeds the
+coverage-per-node improvement. Net −6% TTC. Reverted. The check
+might still win at much larger n where subtree cost dominates, but
+at n=22 the cost/benefit ratio is wrong.
+
+- **TTC mechanism attempted**: denominator (tighter pruning).
+- **Result**: +6% TTC (regression) at n=22.
+
 ### S11. Delete unused `dynamic_capacity_violated` hot path
 
 `dynamic_capacity_violated` runs after every accepted child's SAT
@@ -2198,19 +2278,18 @@ its contribution: run with dynamic check removed; compare
 - **TTC mechanism**: rate.
 - **Detection plan**: `cap_rejects` unchanged; nodes/s rises.
 
-### S12. Test `--no-xor` on sync walker
+### S12. Test `--no-xor` on sync walker — *tested, rejected*
 
-Sync's SAT config uses the default (XOR + QuadPB + spectral where
-applicable). propagate_only is called per DFS node, and on every call
-all three propagators re-fire across all re-asserted assumptions.
-XOR propagation is heavy. Unclear if it's necessary for the Turyn
-identity once QuadPB is active. Try toggling.
+Measured at n=22 --wz=sync --sat-secs=30 (16 workers, 3 trials each),
+post-S3-delta baseline:
 
-- **TTC mechanism**: rate if XOR is unnecessary; regression if it's
-  catching what QuadPB can't.
-- **Detection plan**: `sat_unsat` stays similar (or drops slightly
-  from slower propagation); nodes/s rises.
-- **Risk**: none (gated by config).
+| Config       | nodes/30s | sat_unsat | TTC parallel |
+|--------------|-----------|-----------|--------------|
+| XOR on (def) | 4.20M     | 1.41M     | 1.37e6 s     |
+| `--no-xor`   | 2.80M     | 0.95M     | 1.46e6 s     |
+
+XOR off: nodes drop 33%, TTC regresses 7%. XOR propagation prunes
+faster than it costs — leaving it on.
 
 ### S13. Pre-compute and cache the level-0 propagated solver
 
@@ -2237,13 +2316,12 @@ skip any candidate that'd re-fire with an inconsistent early bit.
 - **Detection plan**: `candidates.len()` avg drops; nodes/s stays flat
   but per-node effective work drops.
 
-### S15. Adaptive per-worker sibling-sort randomness
+### S15. Adaptive per-worker sibling-sort randomness — *tested, rejected*
 
-Worker 0 is best-first (seed=0 → score-sorted), workers 1..15 fully
-random. Middle ground: workers 1..15 do epsilon-greedy (best-first
-with probability `1-ε`, random otherwise). At ε=0.1 they follow the
-gradient most of the time but diverge onto different paths
-occasionally — more likely to find leaves than pure random.
+Tried ε=0.25 epsilon-greedy at n=22 sync 30s: each worker sorts by
+score, then swaps each adjacent pair with probability ε. Measured
+TTC_parallel 7.6e7 s vs the score-sort/random-shuffle baseline's
+1.37e6 s — **55× regression**.
 
 - **TTC mechanism**: rate (faster leaf discovery → earlier first
   solution).
@@ -2252,6 +2330,7 @@ occasionally — more likely to find leaves than pure random.
   to cover tree); purely a find-solution-faster optimisation.
 
 ## R-series: radical vs CaDiCaL feature-by-feature (April 19 2026, Claude)
+
 
 Baseline recorded at session start (n=26, 16 threads, 60s budget,
 `runsc`, commit `3484b54`):
@@ -3042,3 +3121,65 @@ Priority order for the next session:
 4. **R11 first-branching-level probe** — rate win (stop 16-way
    redundant prefix walk).
 5. **K3 enable vivification + measure** — potentially cheap.
+
+### S15 (updated) — epsilon-greedy regression analysis (main)
+
+Post-mortem: the current baseline pairs worker 0 (score-sorted) with
+workers 1..15 (*fully* random) precisely to make their paths
+diverge maximally. Epsilon-greedy biases all non-zero workers
+toward the same "best-first" prefix, causing redundant exploration
+(all workers hit similar high-score subtrees first). The
+per-level `children_by_level[L]` pools across workers, so when all
+workers converge to the same paths the aggregate coverage product
+collapses even though per-worker nodes are unchanged.
+
+Implication: for parallel search where exploration diversity matters,
+**fully-random shuffling beats score-biased ordering** at every ε we
+tested. A plausible middle path would be per-worker *distinct
+first-branching assignments* (S4-style work partitioning) so each
+worker is best-first within a disjoint slice of the tree.
+
+### S3 (applied). Delta-based speculative rebuild_sums — *accepted*
+
+Implementation of S3 above. Parent sums at level L reflect all pairs
+closed at 0..=L whose endpoints are both set. When the speculative
+candidate loop descends to L+1 by pinning bits at `pos_order[L]`, only
+pairs in `closure_events[L]` involving a kind whose bit at `pos_order[L]`
+went from 0→set are newly counted. Those pre-pinned by `harvest_forced`
+were already included — tracked by a 4-bit `placed_kind_mask`.
+
+Three call-sites simplified:
+- Speculative eval: `state.sums.clone()` (snapshot) + `apply_level_delta`.
+- Rollback: `state.sums.copy_from_slice(&snapshot)`.
+- Commit: delta instead of full rebuild.
+
+Measured (n=22 `--wz=sync --sat-secs=30`, 16 workers, 3 trials):
+
+| Metric                  | Baseline     | Delta        | Δ         |
+|-------------------------|--------------|--------------|-----------|
+| nodes_visited           | 3.19–3.22M   | 4.19–4.22M   | +31%      |
+| cap_rejects / node      | 13.03        | 13.05        | noise     |
+| sat_unsat / node        | 0.342        | 0.335        | noise     |
+| coverage_product        | 4.37e-6      | 2.19e-5      | 5.0×      |
+| **direct TTC parallel** | **6.80e6 s** | **1.37e6 s** | **5.0×**  |
+
+n=26 sync 30s: TTC 4.73e8 s → 4.13e8 s (−13%, within noise — tree too
+big to benefit from rate alone in 30s budget).
+
+TT(18) solve time: 13.2s → 6.0s.
+
+- **TTC mechanism**: rate. The rate lift (+31%) amplifies
+  multiplicatively through the per-level coverage product.
+- **Risk verified**: reject ratios (cap_rejects/node, sat_unsat/node)
+  match baseline exactly, confirming delta sums are bit-identical to
+  the full-rebuild semantics.
+
+Note (merge resolution, April 19): the equivalent optimization
+landed independently on our branch as **R8 / R8b** with an
+additional stack-allocated `saved_bits` (avoiding the Vec
+allocation per choice) and integration with R2's per-kind ranges
+(`closure_events_kind_ranges`), plus R8c skip-when-empty on the
+post-harvest rebuild. Measured at n=26 60s 5-run mean 5.97e7s
+(vs main's "delta only" claim of 4.13e8s at n=26 30s); our branch
+also adds backbone detection which takes TTC to 4.40e6s. See
+`docs/OPTIMIZATION_LOG.md` for the full chain.

@@ -61,8 +61,6 @@ struct Ctx {
     depth: usize,
     /// Bouncing position order: [0, n-1, 1, n-2, ...].
     pos_order: Vec<usize>,
-    /// `pos_to_level[p]` = level at which position `p` is pinned.
-    pos_to_level: Vec<usize>,
     /// Events that fire when a lag pair closes at this level.
     /// `closure_events[level] = [(lag, kind, pos_a, pos_b, abs_coeff), ...]`.
     /// Sorted by `kind` ascending so per-kind ranges are contiguous; see
@@ -296,7 +294,7 @@ fn build_ctx(problem: Problem) -> Ctx {
 
     Ctx {
         n, m, depth,
-        pos_order, pos_to_level,
+        pos_order,
         closure_events, closure_events_kind_ranges, max_remaining,
         seed: 0, cancel: None, start: Instant::now(),
         valid_tuples,
@@ -854,7 +852,6 @@ pub(crate) struct SyncStats {
     pub tuple_rejects: u64,
     pub sat_unsat: u64,
     pub leaves_reached: u64,
-    pub learned_clauses_final: u64,
     pub max_level_reached: u64,
     pub nodes_by_level: Vec<u64>,
     /// Per-level sum of `candidates.len()` — i.e. the children that
@@ -935,13 +932,21 @@ pub(crate) fn search_sync(
     // Always parallel: one worker per available CPU. Worker 0 runs
     // best-first (score-sorted) siblings; workers 1.. each get a
     // different LCG seed for randomised sibling ordering so they
-    // explore independent regions of the tree. Workers do NOT share
-    // learnt clauses (Solver isn't Clone/Send for its bulk state);
-    // the parallelism benefit is exploration diversity. First worker
-    // to find a solution cancels the others via a shared AtomicBool.
-    let n_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    // explore independent regions of the tree. Workers share learnt
+    // clauses via `ClauseExchange` (length-capped) for peer-level
+    // pruning. First worker to find a solution cancels the others
+    // via a shared AtomicBool.
+    //
+    // Respect `TURYN_THREADS` (and `RAYON_NUM_THREADS`) so users can
+    // pin the parallelism for bench reproducibility — matches the MDD
+    // pipeline's behaviour documented in CLAUDE.md.
+    let n_workers = std::env::var("TURYN_THREADS").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .or_else(|| std::env::var("RAYON_NUM_THREADS").ok()
+            .and_then(|v| v.parse::<usize>().ok()))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        })
         .max(1);
     search_sync_parallel(problem, cfg, verbose, n_workers, start)
 }
@@ -962,7 +967,7 @@ fn search_sync_parallel(
     let stats_agg: Arc<Mutex<SyncStats>> = Arc::new(Mutex::new(SyncStats {
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
         rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
-        learned_clauses_final: 0, max_level_reached: 0,
+        max_level_reached: 0,
         nodes_by_level: Vec::new(), children_by_level: Vec::new(),
         children_total: 0, internal_nodes: 0,
         time_to_first_leaf: None,
@@ -1361,7 +1366,7 @@ fn search_sync_serial(
         eprintln!("sync_walker: base solver UNSAT — canonical constraints inconsistent");
         return (None, SyncStats {
             nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-            rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
+            rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0, max_level_reached: 0,
             nodes_by_level: Vec::new(), children_by_level: Vec::new(),
             children_total: 0, internal_nodes: 0,
             time_to_first_leaf: None,
@@ -1387,7 +1392,7 @@ fn search_sync_serial(
     let mut stats = SyncStats {
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
         rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
-        learned_clauses_final: 0, max_level_reached: 0,
+        max_level_reached: 0,
         nodes_by_level: vec![0; ctx.depth + 1],
         children_by_level: vec![0; ctx.depth + 1],
         children_total: 0, internal_nodes: 0,
@@ -1611,6 +1616,11 @@ fn dfs_body(
             let (ki, _, _) = placed[k];
             newly_placed[ki as usize] = true;
         }
+        //
+        // Delta-based (originally ours, independently landed on main
+        // at edea0ca): snapshot sums once, apply only the new pair
+        // closures at `saved_level`, restore on rollback. Avoids
+        // re-scanning closure_events[0..level] twice per candidate.
         for k in 0..np as usize {
             let (ki, pi, si) = placed[k];
             state.set_bit(ki, pi, si);
