@@ -538,6 +538,12 @@ fn harvest_forced(solver: &radical::Solver, state: &mut State, ctx: &Ctx) -> usi
 /// already counted in the parent rebuild, e.g. if harvest_forced set
 /// the bit before this level). O(|closure_events[level]|) —
 /// avoids the full O(total events) rebuild per candidate.
+///
+/// Soundness invariant (debug_assert'd): when `newly_placed[kind]` is
+/// true, every event in `closure_events[level]` of that kind has both
+/// endpoints set in `state.bits`. The "max-level" endpoint is
+/// `pos_order[level]` (just placed by us), and the "earlier" endpoint
+/// is at some level < `level` (placed by an ancestor or harvested).
 fn apply_sum_delta_at(
     state: &mut State,
     ctx: &Ctx,
@@ -549,9 +555,11 @@ fn apply_sum_delta_at(
         if !newly_placed[ev.kind as usize] { continue; }
         let a_sign = state.bit(ev.kind, ev.pos_a);
         let b_sign = state.bit(ev.kind, ev.pos_b);
-        if a_sign == 0 || b_sign == 0 {
-            continue;
-        }
+        debug_assert!(
+            a_sign != 0 && b_sign != 0,
+            "apply_sum_delta_at: unset endpoint at level={} kind={} pos_a={} pos_b={}",
+            level, ev.kind, ev.pos_a, ev.pos_b,
+        );
         let a = if a_sign == 1 { 1i16 } else { -1 };
         let b = if b_sign == 1 { 1i16 } else { -1 };
         state.sums[ev.lag] += (a * b) * ev.abs_coeff;
