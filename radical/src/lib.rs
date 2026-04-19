@@ -4537,6 +4537,104 @@ impl Solver {
         }
     }
 
+    /// Physically remove clauses marked `deleted` from the clause DB,
+    /// freeing space in `clause_lits` and shrinking `clause_meta`.
+    /// Remaps surviving clause indices in `watches`, `bin_watches`,
+    /// and trail reasons (`Reason::Clause(ci)`).
+    ///
+    /// Returns the number of clauses physically freed.
+    ///
+    /// Safety: only call when `decision_level() == 0`. Level>0 trail
+    /// entries may reference clause indices that we'd remap, but the
+    /// analysis path uses those references by position/iteration and
+    /// would need their old indices for reason-chain walks.
+    pub fn compact_arena(&mut self) -> usize {
+        if self.decision_level() != 0 { return 0; }
+        let old_n = self.clause_meta.len();
+        // Protect any clause still referenced by a trail entry.
+        // Preprocessing (BVE / SCC) can mark a clause deleted even
+        // if a trail entry still uses it as its Reason::Clause(ci)
+        // (different invariant from reduce_db's is_reason gate).
+        // Compaction must honour this: keep the clause alive and
+        // remap the trail pointer normally.
+        let mut trail_referenced: Vec<bool> = vec![false; old_n];
+        for entry in &self.trail {
+            if let Reason::Clause(ci) = entry.reason {
+                if (ci as usize) < old_n {
+                    trail_referenced[ci as usize] = true;
+                }
+            }
+        }
+
+        // Build an old_ci -> Option<new_ci> remap, and assemble the
+        // new (compacted) arenas in a single pass. Keep any clause
+        // that is either not-deleted OR is still referenced by the
+        // trail.
+        let mut remap: Vec<i32> = vec![-1i32; old_n];
+        let mut new_meta: Vec<ClauseMeta> = Vec::with_capacity(old_n);
+        let mut new_lits: Vec<Lit> = Vec::with_capacity(self.clause_lits.len());
+        for (old_ci, m) in self.clause_meta.iter().enumerate() {
+            if m.deleted && !trail_referenced[old_ci] { continue; }
+            let new_ci = new_meta.len() as u32;
+            remap[old_ci] = new_ci as i32;
+            let start = new_lits.len() as u32;
+            let end = m.start as usize + m.len as usize;
+            new_lits.extend_from_slice(&self.clause_lits[m.start as usize..end]);
+            let mut nm = *m;
+            nm.start = start;
+            new_meta.push(nm);
+        }
+        let freed = old_n - new_meta.len();
+        if freed == 0 { return 0; }
+        self.clause_meta = new_meta;
+        self.clause_lits = new_lits;
+
+        // Remap references in all watch lists.
+        for wl in &mut self.watches {
+            let mut write = 0usize;
+            for read in 0..wl.len() {
+                let (ci, blocker) = wl[read];
+                let new = remap[ci as usize];
+                if new >= 0 {
+                    wl[write] = (new as u32, blocker);
+                    write += 1;
+                }
+            }
+            wl.truncate(write);
+        }
+        for bw in &mut self.bin_watches {
+            let mut write = 0usize;
+            for read in 0..bw.len() {
+                let (other, ci) = bw[read];
+                let new = remap[ci as usize];
+                if new >= 0 {
+                    bw[write] = (other, new as u32);
+                    write += 1;
+                }
+            }
+            bw.truncate(write);
+        }
+
+        // Remap Reason::Clause references on the level-0 trail. The
+        // reduce_db policy already protects on-trail clauses from
+        // deletion via `is_reason`, so remap[ci] >= 0 should always
+        // hold; assert defensively.
+        for entry in &mut self.trail {
+            if let Reason::Clause(ref mut ci) = entry.reason {
+                let new = remap[*ci as usize];
+                debug_assert!(new >= 0, "compact_arena: level-0 trail entry references deleted clause {}", ci);
+                if new >= 0 {
+                    *ci = new as u32;
+                }
+            }
+        }
+
+        // `last_learnt_clause` / `last_nogood_len` are transient —
+        // they don't store clause indices directly.
+
+        freed
+    }
+
     /// Rephasing: alternate between resetting to best-known phase and random phases.
     fn rephase(&mut self) {
         if self.best_phase_set {
