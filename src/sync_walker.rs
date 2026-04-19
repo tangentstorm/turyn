@@ -687,6 +687,19 @@ fn compute_sigma(state: &State, ctx: &Ctx) -> (i32, i32, i32, i32, usize, usize,
 /// `(target - σ) ≡ free (mod 2)` (each remaining ±1 flips σ by 2).
 fn tuple_reachable(state: &State, ctx: &Ctx) -> bool {
     let (sx, sy, sz, sw, fx, fy, fz, fw) = compute_sigma(state, ctx);
+    tuple_reachable_args(ctx, sx, sy, sz, sw, fx, fy, fz, fw)
+}
+
+/// Same as `tuple_reachable` but takes pre-computed sigma/free directly.
+/// Used by the candidate-building speculative loop to avoid the
+/// O(4n) `compute_sigma` scan per choice (S6 — caller maintains
+/// parent sigma + applies a 4-element delta).
+#[inline]
+fn tuple_reachable_args(
+    ctx: &Ctx,
+    sx: i32, sy: i32, sz: i32, sw: i32,
+    fx: usize, fy: usize, fz: usize, fw: usize,
+) -> bool {
     let dx_max = fx as i32; let px = fx & 1;
     let dy_max = fy as i32; let py = fy & 1;
     let dz_max = fz as i32; let pz = fz & 1;
@@ -702,40 +715,6 @@ fn tuple_reachable(state: &State, ctx: &Ctx) -> bool {
         if (dz as usize & 1) != pz { continue; }
         if (dw as usize & 1) != pw { continue; }
         return true;
-    }
-    false
-}
-
-/// Tighter capacity check using dynamic (actually-pending) pair
-/// contributions rather than the static max_remaining[level] bound.
-///
-/// Rationale: harvest_forced may pin bits at positions the walker
-/// hasn't reached yet.  A pair with BOTH endpoints pinned — whether
-/// walker-placed or SAT-harvested — is fully determined and its
-/// contribution is already in `sums[s]`.  The static max_remaining
-/// counts it as "still pending," overestimating remaining capacity.
-///
-/// Dynamic capacity per lag = Σ over pairs where at least one
-/// endpoint is still unset.  Per-lag cost is O(n); per-level cost
-/// is O(n²); per DFS call is O(n²) — cheap compared to propagate_only.
-fn dynamic_capacity_violated(state: &State, ctx: &Ctx) -> bool {
-    for s in 1..ctx.n {
-        let mut dyn_cap: i32 = 0;
-        for i in 0..ctx.n.saturating_sub(s) {
-            for kind in 0u8..3 {
-                if state.bit(kind, i) == 0 || state.bit(kind, i + s) == 0 {
-                    dyn_cap += kind_coeff(kind) as i32;
-                }
-            }
-        }
-        for i in 0..ctx.m.saturating_sub(s) {
-            if state.bit(3, i) == 0 || state.bit(3, i + s) == 0 {
-                dyn_cap += 2;
-            }
-        }
-        if (state.sums[s] as i32).unsigned_abs() as i32 > dyn_cap {
-            return true;
-        }
     }
     false
 }
@@ -1748,6 +1727,13 @@ fn dfs_body(
             // consistent with state.bits in that case). At shallow
             // levels harvest typically finds 0-1 new bits; this skip
             // saves an O(L * events) scan per accepted candidate.
+            //
+            // R8d (rejected): also gating harvest itself on `delta > 0`
+            // regressed TTC by ~4% — harvest's pre-set state.bits is
+            // used by the next dfs_body's candidate-building loop to
+            // reject choices that would conflict with SAT-forced bits;
+            // skipping harvest pushes that work into more expensive
+            // push_assume_frame conflicts.
             let n_harvested = harvest_forced(solver, state, ctx);
             if n_harvested > 0 {
                 rebuild_sums(state, ctx);
