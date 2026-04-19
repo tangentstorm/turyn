@@ -61,8 +61,6 @@ struct Ctx {
     depth: usize,
     /// Bouncing position order: [0, n-1, 1, n-2, ...].
     pos_order: Vec<usize>,
-    /// `pos_to_level[p]` = level at which position `p` is pinned.
-    pos_to_level: Vec<usize>,
     /// Events that fire when a lag pair closes at this level.
     /// `closure_events[level] = [(lag, kind, pos_a, pos_b, abs_coeff), ...]`.
     closure_events: Vec<Vec<PairEvent>>,
@@ -266,7 +264,7 @@ fn build_ctx(problem: Problem) -> Ctx {
 
     Ctx {
         n, m, depth,
-        pos_order, pos_to_level,
+        pos_order,
         closure_events, max_remaining,
         seed: 0, cancel: None, start: Instant::now(),
         valid_tuples,
@@ -548,6 +546,27 @@ fn rebuild_sums(state: &mut State, ctx: &Ctx) {
     }
 }
 
+/// Delta-apply closure events at a single level, restricted to kinds
+/// that were just newly placed at pos_order[level]. Parent sums at
+/// level L already scanned closure_events[L]; for a kind whose bit at
+/// pos_order[L] was harvest-pinned *before* this candidate loop, the
+/// pair was already counted. We must only add contributions for kinds
+/// that went from 0 → set in this speculative step. `placed_kind_mask`
+/// is the 4-bit mask of such kinds.
+/// Cost: O(|closure_events[level]|).
+fn apply_level_delta(state: &mut State, ctx: &Ctx, level: usize, placed_kind_mask: u8) {
+    if level >= ctx.depth || placed_kind_mask == 0 { return; }
+    for ev in &ctx.closure_events[level] {
+        if (placed_kind_mask >> ev.kind) & 1 == 0 { continue; }
+        let a_sign = state.bit(ev.kind, ev.pos_a);
+        let b_sign = state.bit(ev.kind, ev.pos_b);
+        if a_sign == 0 || b_sign == 0 { continue; }
+        let a = if a_sign == 1 { 1i16 } else { -1 };
+        let b = if b_sign == 1 { 1i16 } else { -1 };
+        state.sums[ev.lag] += (a * b) * ev.abs_coeff;
+    }
+}
+
 /// Walker-side BDKR rule check for pairs that just closed at this level.
 /// Returns Err(()) on rule violation; Ok(new_rule_state) otherwise.
 ///
@@ -672,40 +691,6 @@ fn tuple_reachable(state: &State, ctx: &Ctx) -> bool {
     false
 }
 
-/// Tighter capacity check using dynamic (actually-pending) pair
-/// contributions rather than the static max_remaining[level] bound.
-///
-/// Rationale: harvest_forced may pin bits at positions the walker
-/// hasn't reached yet.  A pair with BOTH endpoints pinned — whether
-/// walker-placed or SAT-harvested — is fully determined and its
-/// contribution is already in `sums[s]`.  The static max_remaining
-/// counts it as "still pending," overestimating remaining capacity.
-///
-/// Dynamic capacity per lag = Σ over pairs where at least one
-/// endpoint is still unset.  Per-lag cost is O(n); per-level cost
-/// is O(n²); per DFS call is O(n²) — cheap compared to propagate_only.
-fn dynamic_capacity_violated(state: &State, ctx: &Ctx) -> bool {
-    for s in 1..ctx.n {
-        let mut dyn_cap: i32 = 0;
-        for i in 0..ctx.n.saturating_sub(s) {
-            for kind in 0u8..3 {
-                if state.bit(kind, i) == 0 || state.bit(kind, i + s) == 0 {
-                    dyn_cap += kind_coeff(kind) as i32;
-                }
-            }
-        }
-        for i in 0..ctx.m.saturating_sub(s) {
-            if state.bit(3, i) == 0 || state.bit(3, i + s) == 0 {
-                dyn_cap += 2;
-            }
-        }
-        if (state.sums[s] as i32).unsigned_abs() as i32 > dyn_cap {
-            return true;
-        }
-    }
-    false
-}
-
 /// Return true if any lag's running sum blows past its remaining capacity.
 /// At level `state.level`, max_remaining applies to pairs not yet closed.
 fn capacity_violated(state: &State, ctx: &Ctx) -> bool {
@@ -748,7 +733,6 @@ pub(crate) struct SyncStats {
     pub tuple_rejects: u64,
     pub sat_unsat: u64,
     pub leaves_reached: u64,
-    pub learned_clauses_final: u64,
     pub max_level_reached: u64,
     pub nodes_by_level: Vec<u64>,
     /// Per-level sum of `candidates.len()` — i.e. the children that
@@ -829,13 +813,21 @@ pub(crate) fn search_sync(
     // Always parallel: one worker per available CPU. Worker 0 runs
     // best-first (score-sorted) siblings; workers 1.. each get a
     // different LCG seed for randomised sibling ordering so they
-    // explore independent regions of the tree. Workers do NOT share
-    // learnt clauses (Solver isn't Clone/Send for its bulk state);
-    // the parallelism benefit is exploration diversity. First worker
-    // to find a solution cancels the others via a shared AtomicBool.
-    let n_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    // explore independent regions of the tree. Workers share learnt
+    // clauses via `ClauseExchange` (length-capped) for peer-level
+    // pruning. First worker to find a solution cancels the others
+    // via a shared AtomicBool.
+    //
+    // Respect `TURYN_THREADS` (and `RAYON_NUM_THREADS`) so users can
+    // pin the parallelism for bench reproducibility — matches the MDD
+    // pipeline's behaviour documented in CLAUDE.md.
+    let n_workers = std::env::var("TURYN_THREADS").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .or_else(|| std::env::var("RAYON_NUM_THREADS").ok()
+            .and_then(|v| v.parse::<usize>().ok()))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        })
         .max(1);
     search_sync_parallel(problem, cfg, verbose, n_workers, start)
 }
@@ -856,7 +848,7 @@ fn search_sync_parallel(
     let stats_agg: Arc<Mutex<SyncStats>> = Arc::new(Mutex::new(SyncStats {
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
         rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
-        learned_clauses_final: 0, max_level_reached: 0,
+        max_level_reached: 0,
         nodes_by_level: Vec::new(), children_by_level: Vec::new(),
         children_total: 0, internal_nodes: 0,
         time_to_first_leaf: None,
@@ -1255,7 +1247,7 @@ fn search_sync_serial(
         eprintln!("sync_walker: base solver UNSAT — canonical constraints inconsistent");
         return (None, SyncStats {
             nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-            rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
+            rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0, max_level_reached: 0,
             nodes_by_level: Vec::new(), children_by_level: Vec::new(),
             children_total: 0, internal_nodes: 0,
             time_to_first_leaf: None,
@@ -1281,7 +1273,7 @@ fn search_sync_serial(
     let mut stats = SyncStats {
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
         rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
-        learned_clauses_final: 0, max_level_reached: 0,
+        max_level_reached: 0,
         nodes_by_level: vec![0; ctx.depth + 1],
         children_by_level: vec![0; ctx.depth + 1],
         children_total: 0, internal_nodes: 0,
@@ -1472,6 +1464,10 @@ fn dfs_body(
         // Speculatively update sums for pairs closing at this level
         // using the placed bits. We don't call the solver yet — capacity
         // check first (cheap).
+        //
+        // Delta-based: snapshot sums once, apply only the new pair
+        // closures at `saved_level`, restore on rollback. Avoids
+        // re-scanning closure_events[0..level] twice per candidate.
         let saved_bits: Vec<(u8, usize, u8)> = (0..np as usize)
             .map(|k| {
                 let (ki, pi, _) = placed[k];
@@ -1484,7 +1480,15 @@ fn dfs_body(
         }
         let saved_level = state.level;
         state.level += 1;
-        rebuild_sums(state, ctx);
+        let sums_snapshot: Vec<i16> = state.sums.clone();
+        // Build mask of newly-placed kinds; only these contribute to
+        // the delta (bits pre-pinned by harvest_forced were already
+        // counted in the parent's sums).
+        let mut placed_kind_mask: u8 = 0;
+        for k in 0..np as usize {
+            placed_kind_mask |= 1 << placed[k].0;
+        }
+        apply_level_delta(state, ctx, saved_level, placed_kind_mask);
         let violated = capacity_violated(state, ctx);
         // Early hopelessness: no valid Phase-A tuple is reachable from
         // the partial sums + remaining free-bit budget. Independent of
@@ -1511,8 +1515,9 @@ fn dfs_body(
         for (ki, pi, old_sign) in &saved_bits {
             state.bits[(*ki as usize) * ctx.n + pi] = *old_sign;
         }
-        // Rebuild sums to the parent state after rollback.
-        rebuild_sums(state, ctx);
+        // Restore sums from the pre-delta snapshot (O(n)) instead of
+        // re-scanning the full closure history (O(level × n)).
+        state.sums.copy_from_slice(&sums_snapshot);
 
         if violated {
             stats.capacity_rejects += 1;
@@ -1614,9 +1619,16 @@ fn dfs_body(
             state.set_bit(ki, pi, si);
         }
         state.assumptions.extend_from_slice(&cand.new_assums[..cand.num_new_assums as usize]);
+        let commit_parent_level = state.level;
         state.level += 1;
         state.rule_state = cand.rule_state;
-        rebuild_sums(state, ctx);
+        // sums was just copied from parent snapshot; delta applies only
+        // to pairs whose pos_order[L] endpoint was newly placed.
+        let mut commit_kind_mask: u8 = 0;
+        for k in 0..cand.num_placed as usize {
+            commit_kind_mask |= 1 << cand.placed_signs[k].0;
+        }
+        apply_level_delta(state, ctx, commit_parent_level, commit_kind_mask);
         processed_count += 1;
 
         // Per-level SAT call: propagate_only (no CDCL decisions,
