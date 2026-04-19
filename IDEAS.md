@@ -2100,22 +2100,24 @@ single serial walk until the first branch, then parallelising.
   emit N work-items (one per first-branching sibling) to a shared
   queue and let workers pull.
 
-### S5. Raise cross-worker nogood-share threshold
+### S5. Raise cross-worker nogood-share threshold — *tested, rejected*
 
-`MAX_SHARED_LEN: usize = 16` in `dfs()`. Measured avg nogood len is
-~70; basically nothing gets shared. Try raising to 256 (or: share
-unconditionally and let the solver DB evict). Peer clauses prune
-repeat deadends across different workers — this is literally the
-mechanism that makes parallel CDCL scale.
+Swept `MAX_SHARED_LEN ∈ {16, 64, 128, 256, 1024}` at n=22 sync 30s
+(16 workers, 3 trials, post-S3-delta):
 
-- **TTC mechanism**: rate (bigger peer clause flow → fewer
-  redundant SAT-UNSAT calls across workers).
-- **Detection plan**: `peer_imports` should rise 10–100×; `sat_unsat`
-  should drop; need to verify no regression in nodes/s from added
-  clause-DB overhead.
-- **Risk**: long clauses rarely fire via two-watch and bloat the DB.
-  If regression, add a heuristic: share clauses with short LBD
-  regardless of length.
+| Threshold | nodes/30s | peer_imports | TTC parallel |
+|-----------|-----------|--------------|--------------|
+| 16 (def)  | 4.20M     | 512          | 1.37e6 s     |
+| 64        | 1.32M     | 5.2M         | 1.97e6 s     |
+| 128       | 1.64M     | 9.0M         | 1.84e6 s     |
+| 256       | 1.62M     | 8.9M         | 1.85e6 s     |
+| 1024      | 1.63M     | 8.9M         | 1.84e6 s     |
+
+Above 16 the clause DB bloats and BCP slows 2–3×. Every threshold
+≥64 regresses by 35–44%. Peer clauses ARE being shared (millions of
+imports), but they're not firing enough to offset the BCP cost.
+Hypothesis: long nogoods rarely prune with two-watch. An LBD-based
+share heuristic might work; raw length filter doesn't.
 
 ### S6. Remove `compute_sigma` O(4n) sweep from tuple_reachable
 
@@ -2198,19 +2200,18 @@ its contribution: run with dynamic check removed; compare
 - **TTC mechanism**: rate.
 - **Detection plan**: `cap_rejects` unchanged; nodes/s rises.
 
-### S12. Test `--no-xor` on sync walker
+### S12. Test `--no-xor` on sync walker — *tested, rejected*
 
-Sync's SAT config uses the default (XOR + QuadPB + spectral where
-applicable). propagate_only is called per DFS node, and on every call
-all three propagators re-fire across all re-asserted assumptions.
-XOR propagation is heavy. Unclear if it's necessary for the Turyn
-identity once QuadPB is active. Try toggling.
+Measured at n=22 --wz=sync --sat-secs=30 (16 workers, 3 trials each),
+post-S3-delta baseline:
 
-- **TTC mechanism**: rate if XOR is unnecessary; regression if it's
-  catching what QuadPB can't.
-- **Detection plan**: `sat_unsat` stays similar (or drops slightly
-  from slower propagation); nodes/s rises.
-- **Risk**: none (gated by config).
+| Config       | nodes/30s | sat_unsat | TTC parallel |
+|--------------|-----------|-----------|--------------|
+| XOR on (def) | 4.20M     | 1.41M     | 1.37e6 s     |
+| `--no-xor`   | 2.80M     | 0.95M     | 1.46e6 s     |
+
+XOR off: nodes drop 33%, TTC regresses 7%. XOR propagation prunes
+faster than it costs — leaving it on.
 
 ### S13. Pre-compute and cache the level-0 propagated solver
 
