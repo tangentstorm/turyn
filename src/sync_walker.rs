@@ -1662,14 +1662,29 @@ fn dfs_body(
         state.assumptions.truncate(saved_assum_len);
         state.rule_state = saved_rule_state;
 
+        // R8b: collect newly-placed kinds (same logic as candidate
+        // building) so the post-set_bit delta-apply doesn't double
+        // count events whose kind was set by harvest_forced before
+        // this dfs_body entry (those contributions are already in
+        // saved_sums).
+        let mut sib_newly_placed = [false; 4];
+        for k in 0..cand.num_placed as usize {
+            let (ki, _, _) = cand.placed_signs[k];
+            sib_newly_placed[ki as usize] = true;
+        }
         for k in 0..cand.num_placed as usize {
             let (ki, pi, si) = cand.placed_signs[k];
             state.set_bit(ki, pi, si);
         }
         state.assumptions.extend_from_slice(&cand.new_assums[..cand.num_new_assums as usize]);
+        let sib_saved_level = state.level;
         state.level += 1;
         state.rule_state = cand.rule_state;
-        rebuild_sums(state, ctx);
+        // R8b: delta replaces full rebuild_sums(state, ctx) here.
+        // state.sums starts at saved_sums (post-harvest at entry
+        // level); the only events that newly fire at level
+        // sib_saved_level are those involving kinds we just placed.
+        apply_sum_delta_at(state, ctx, sib_saved_level, &sib_newly_placed);
         processed_count += 1;
 
         // R1: Incremental assumption propagation.

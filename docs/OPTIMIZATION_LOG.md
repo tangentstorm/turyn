@@ -603,6 +603,41 @@ All 35 tests pass.
 
 ## SPECTRAL_FREQS sweep for --wz=apart (April 2026)
 
+### R8b. Extend delta sums to the sync walker's sibling loop — accepted (**TTC −12 % vs R8**, **−65 % cumulative**)
+
+The sibling loop's `rebuild_sums` at `src/sync_walker.rs:1677` (the
+one between `state.set_bit` of the cand's placed bits and the
+`push_assume_frame` call) is the second-most-frequent rebuild after
+the candidate-building speculative loop fixed by R8.  Same logic
+applies: `state.sums` enters as `saved_sums` (post-harvest at
+parent level), the bits being placed are `cand.placed_signs`, and
+the only events that newly fire at level `entry_level` are those
+involving kinds in `cand.placed_signs[..]`.
+
+Replaced with `apply_sum_delta_at(state, ctx, sib_saved_level,
+&sib_newly_placed)`.
+
+Benchmark: n=26 `--wz=sync --sat-secs=60`, 16 threads, 5 sequential
+runs (still showing thermal-throttle bimodal pattern).
+
+| Metric                  | R1 + R8         | R1 + R8 + R8b   |
+|-------------------------|-----------------|------------------|
+| direct TTC parallel (s) | 2.62e8 mean     | 2.30e8 mean      |
+|                         | (range 2.04–3.05) | (range 1.83–3.00) |
+| Δ vs R8                 | —               | **−12 %** mean   |
+| Δ vs R8 (fast cluster)  | —               | **−10 %**        |
+| Δ vs baseline (cumul.)  | −60 %           | **−65 %** mean   |
+| nodes / 60 s            | 37 – 58 M       | 41 – 68 M        |
+
+The post-harvest `rebuild_sums` at `src/sync_walker.rs:1730`
+remains in place because `harvest_forced` can set walker bits at
+*any* position (not just `pos_order[level]`), so a kind-filtered
+delta isn't sufficient to capture the change.  An incremental
+post-harvest rebuild would need a more careful invariant; deferred.
+
+Soundness: n=18 finds TT(18) in 1.46 s (`leaves=1`), `cargo test
+--release --bins` 40/40 pass.
+
 ### R8. Delta-based sums in the sync walker's speculative choice loop — accepted (**TTC −50 % vs R1**, **−60 % cumulative**)
 
 The candidate-building loop in `sync_walker::dfs_body` called
