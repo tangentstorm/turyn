@@ -1510,11 +1510,6 @@ pub(crate) fn run_mdd_sat_search(
                             solver.add_clause(block.iter().copied());
                             new_blocks.push(block);
 
-                            // Combined spectral in solver guarantees pair bound.
-                            // Compute spectra only for downstream use.
-                            let w_spectrum = compute_spectrum(&w_vals, &spectral_w, &mut fft_buf_w);
-                            let _ = &w_spectrum; // used by pair_power below
-
                             // Got a valid (W,Z) pair — proceed to XY
                             flow_z_solutions.fetch_add(1, AtomicOrdering::Relaxed);
                             let z_seq = PackedSeq::from_values(&z_vals);
