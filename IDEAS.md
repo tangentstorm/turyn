@@ -3183,3 +3183,30 @@ post-harvest rebuild. Measured at n=26 60s 5-run mean 5.97e7s
 (vs main's "delta only" claim of 4.13e8s at n=26 30s); our branch
 also adds backbone detection which takes TTC to 4.40e6s. See
 `docs/OPTIMIZATION_LOG.md` for the full chain.
+
+### T25. Drop dead post-SolveWZ `compute_spectrum(w_vals)` — **ACCEPTED**
+
+`src/mdd_pipeline.rs` (pre-cleanup) executed a full 256-point real
+FFT of `w_vals` per WZ solution in the `--wz=together` inner loop
+then never consumed the result. The trailing comment said `// used
+by pair_power below`, but the combined WZ `SpectralConstraint` in
+the SAT solver already enforces the pair bound, and the downstream
+XY stage uses `zw_autocorr` / `z_seq` / `w_seq` directly — not the
+post-hoc spectrum. Removed the FFT call and the now-unused
+`compute_spectrum` helper in `src/spectrum.rs`.
+
+- **TTC mechanism**: rate — saves one FFT per WZ solution (24k/15s
+  at n=24 k=8 single tuple = 1.6k FFTs/s-worker).
+- **Measurement**: n=24 `--wz=together --mdd-k=8 --sat-secs=30
+  --tuple=10,4,2,3` (16 threads): median TTC 48.6m → 48.25m
+  (**-0.7%**). 20-run baseline vs 20-run after-change; tight
+  distributions (baseline 48.0–49.4 clean sample, after
+  47.7–49.2) — within typical noise envelope individually but
+  directionally consistent across all 20 pairings.
+- **Detection**: no new counter; `stage_exit[3]/elapsed` (XY
+  throughput) rises slightly.
+- **Status**: landed. All 40 `cargo test --release --bin turyn`
+  tests pass; n=24 `--wz=together` still finds TT(24) in <3s on
+  the default (no-tuple) benchmark. Commit removes a stale
+  `let _ = &w_spectrum; // used by pair_power below` comment that
+  outlived the pair_power check it documented.

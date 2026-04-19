@@ -169,18 +169,6 @@ pub(crate) fn fill_real_input(values: &[i8], input: &mut Vec<f64>, fft_size: usi
 }
 
 
-pub(crate) fn compute_spectrum(
-    values: &[i8],
-    filter: &SpectralFilter,
-    scratch: &mut FftScratch,
-) -> Vec<f64> {
-    let m = filter.fft_size;
-    fill_real_input(values, &mut scratch.input, m);
-    filter.rfft.process(&mut scratch.input, &mut scratch.output).unwrap();
-    scratch.output.iter().map(|c| c.norm_sqr()).collect()
-}
-
-
 /// Write the spectrum into `out` (reusable buffer) instead of allocating.
 pub(crate) fn compute_spectrum_into(
     values: &[i8],
