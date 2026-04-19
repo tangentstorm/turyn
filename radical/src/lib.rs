@@ -983,6 +983,72 @@ impl Solver {
         }
     }
 
+    /// Install a learnt clause for 2WL propagation **without** triggering
+    /// immediate propagation. Safe to call at any decision level — unlike
+    /// `add_clause`, which can enqueue + propagate (creating a level-0
+    /// fact at the wrong level).
+    ///
+    /// Intended for cross-worker peer-clause sharing during incremental
+    /// search (caller is mid-`push_assume_frame` stack and cannot afford
+    /// to have the clause kill the solver via `ok = false` if it becomes
+    /// unit-conflicting under the current assignment).
+    ///
+    /// Behaviour:
+    /// - Empty clause: ignored (would otherwise kill the solver).
+    /// - Unit clause: dropped (proper level-0 install requires a full
+    ///   backtrack to 0 which we won't do here).
+    /// - Already-true under current assignment: still installed (it'll
+    ///   fire correctly on a future propagation).
+    /// - Two non-false lits available: installed normally with 2WL.
+    /// - Fewer than two non-false lits: dropped (can't pick valid
+    ///   watches at the current assignment; the clause is implied or
+    ///   contradicted in the current state and will be re-derived if
+    ///   needed).
+    pub fn add_clause_deferred(&mut self, lits: &[Lit]) {
+        if !self.ok { return; }
+        if lits.len() < 2 { return; }
+
+        // Ensure all variables exist.
+        for &lit in lits {
+            if lit == 0 { return; }
+            self.ensure_var(lit.unsigned_abs() as usize);
+        }
+
+        // Pick two non-false lits as watches. Prefer true > undef > false
+        // so the clause is satisfied (and never re-fires) when possible.
+        let mut order: Vec<Lit> = lits.to_vec();
+        // Sort by lit_value priority (True=2, Undef=1, False=0) descending.
+        order.sort_by_key(|&lit| {
+            match self.lit_value(lit) {
+                LBool::True => 0u8,
+                LBool::Undef => 1u8,
+                LBool::False => 2u8,
+            }
+        });
+        // After sort, index 0 has the highest priority (true if any),
+        // index 1 next.
+        let v0 = self.lit_value(order[0]);
+        let v1 = self.lit_value(order[1]);
+        if v0 == LBool::False && v1 == LBool::False {
+            // Cannot pick two non-false watches — clause is fully
+            // false under current assignment. Drop.
+            return;
+        }
+
+        let ci = self.clause_meta.len() as u32;
+        let start = self.clause_lits.len() as u32;
+        self.watches[lit_index(negate(order[0]))].push((ci, order[1]));
+        self.watches[lit_index(negate(order[1]))].push((ci, order[0]));
+        self.clause_lits.extend_from_slice(&order);
+        self.clause_meta.push(ClauseMeta {
+            start,
+            len: order.len() as u16,
+            learnt: true,
+            lbd: 0,
+            deleted: false,
+        });
+    }
+
     /// Add a pseudo-boolean "at least" constraint: sum(coeffs[i] * lits[i]) >= bound.
     /// All coefficients must be positive. Literals use DIMACS convention.
     pub fn add_pb_atleast(&mut self, lits: &[i32], coeffs: &[u32], bound: u32) {

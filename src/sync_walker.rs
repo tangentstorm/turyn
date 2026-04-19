@@ -1385,17 +1385,11 @@ fn dfs_body(
         .saturating_sub(state.trail0_size + state.assumptions.len());
 
     // Pull peer clauses from the shared exchange every 256 nodes.
-    // Cheap: one Mutex lock + index compare + a handful of add_clause
-    // calls. add_clause can trigger immediate propagation (units under
-    // the current assignment) which only preserves level-0 invariants
-    // — so gate on `solver.current_decision_level() == 0`. Under R1
-    // (incremental assumption frames) the solver stays at level ==
-    // state.level during descent, so this check typically only fires
-    // at the worker's very first dfs entry (before any frame has been
-    // pushed). That loses most of the peer-sharing benefit at depth,
-    // but keeping correctness first; a proper "install-without-
-    // propagate" helper could relax this later.
-    if stats.nodes_visited & 0xFF == 0 && solver.current_decision_level() == 0 {
+    // R10: peer-clause import via add_clause_deferred — safe at any
+    // decision level (no immediate propagation, dropped on
+    // unit-conflict). Restores per-depth peer-sharing that R1's
+    // current_decision_level() == 0 gate had to suppress.
+    if stats.nodes_visited & 0xFF == 0 {
         if let Some(ex) = &ctx.exchange {
             let local_next = stats.peer_clauses_read as usize;
             if let Ok(v) = ex.clauses.lock() {
@@ -1405,7 +1399,7 @@ fn dfs_body(
                     stats.peer_clauses_read = v.len() as u64;
                     drop(v);
                     for clause in pending {
-                        solver.add_clause(clause);
+                        solver.add_clause_deferred(&clause);
                         stats.peer_clauses_imported += 1;
                     }
                 }
@@ -1757,10 +1751,12 @@ fn dfs_body(
             stats.nogood_len_sum += ng as u64;
             stats.full_nogood_len_sum += full as u64;
             // Publish the just-learnt nogood to peer workers, but
-            // only if it's small enough to be useful. Long clauses
-            // (Turyn nogoods are typically ~n lits) rarely fire
-            // via watches and bloat the clause DB, so filter.
-            const MAX_SHARED_LEN: usize = 16;
+            // only if it's small enough to be useful. R10: with
+            // mid-search peer import enabled (add_clause_deferred),
+            // import volume scales with how aggressively we share.
+            // Restrict to very short clauses (Glucose tier-1 proxy)
+            // so watch lists stay lean.
+            const MAX_SHARED_LEN: usize = 2;
             if let Some(ex) = &ctx.exchange {
                 if let Some(clause) = solver.take_last_learnt_clause() {
                     if clause.len() <= MAX_SHARED_LEN {
