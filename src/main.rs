@@ -1914,6 +1914,391 @@ mod tests {
         );
     }
 
+    /// Oracle tests driven by Kharaghani's complete catalogue in `data/`.
+    ///
+    /// `data/turyn-type-{02..32}` is a mirror of Hadi Kharaghani's Turyn-type
+    /// sequence catalogue, in BDKR hex format (each hex digit packs
+    /// `(X, Y, Z, W)` at one position with `+1 → 0, -1 → 1` as
+    /// `8·X + 4·Y + 2·Z + W`; last position `n-1` is 3-bit since W has
+    /// length `n-1`; `Z[n-1] = -1` always by BDKR consequence, and
+    /// `X[n-1] = Y[n-1] = +1` by rule (i)).
+    ///
+    /// These tests decode a sample of rows and run them through
+    /// `sanity_check_canonical_tt`, which exercises the Turyn identity
+    /// check, BDKR rule checks, rule-(iv)/(v) boundary pre-filters, W- and
+    /// Z-middle SAT encoders, the external and in-SAT spectral filters,
+    /// and the XY SAT template's acceptance of the canonical (x_bits,
+    /// y_bits) boundary.  Any regression in canonical-form encoding,
+    /// spectral bounds, or rule pre-filters will surface here as a
+    /// concrete failing input from a published catalogue.
+    ///
+    /// Catalogue source: <https://www.cs.uleth.ca/~hadi/research/TurynType/>,
+    /// mirrored under `data/` (see `data/README.md`).
+    fn decode_kharaghani_hex(hex: &str, n: usize) -> (String, String, String, String) {
+        assert_eq!(hex.len(), n - 1, "hex must have n-1 digits for TT({n})");
+        let mut x = String::with_capacity(n);
+        let mut y = String::with_capacity(n);
+        let mut z = String::with_capacity(n);
+        let mut w = String::with_capacity(n - 1);
+        for c in hex.chars() {
+            let d = c.to_digit(16).expect("hex digit");
+            x.push(if (d >> 3) & 1 == 0 { '+' } else { '-' });
+            y.push(if (d >> 2) & 1 == 0 { '+' } else { '-' });
+            z.push(if (d >> 1) & 1 == 0 { '+' } else { '-' });
+            w.push(if d & 1 == 0 { '+' } else { '-' });
+        }
+        // Append X[n-1]=+1, Y[n-1]=+1, Z[n-1]=-1 (BDKR consequences).
+        x.push('+');
+        y.push('+');
+        z.push('-');
+        (x, y, z, w)
+    }
+
+    /// Pick a deterministic sample of rows from a data file (first, 25%,
+    /// 50%, 75%, last — or fewer if the file is shorter).
+    fn sample_kharaghani_rows(n: usize) -> Vec<String> {
+        let path = format!("data/turyn-type-{:02}", n);
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => panic!("failed to read {path}: {e}.  \
+                The Kharaghani oracle needs `data/turyn-type-{n:02}` checked into \
+                the repo; re-run after rebasing on main."),
+        };
+        let rows: Vec<String> = contents
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        assert!(!rows.is_empty(), "{path} has no rows");
+        let picks: Vec<usize> = {
+            let len = rows.len();
+            if len <= 5 {
+                (0..len).collect()
+            } else {
+                vec![0, len / 4, len / 2, 3 * len / 4, len - 1]
+            }
+        };
+        picks.into_iter().map(|i| rows[i].clone()).collect()
+    }
+
+    /// Full oracle run at one `n`, with a given `k`.  Decodes a small
+    /// sample of canonical solutions from `data/turyn-type-{n}` and
+    /// checks that the pipeline accepts each one at the key stages:
+    ///
+    /// 1. `verify_tt` — Turyn identity holds.
+    /// 2. BDKR rules (i)–(vi) satisfied.
+    /// 3. Rule-(iv)/(v) boundary pre-filters accept the Z/W boundary at k.
+    /// 4. W-middle SAT accepts the canonical W middle.
+    /// 5. Z-middle SAT accepts the canonical Z middle (given canonical W).
+    /// 6. External and in-SAT spectral pair filters accept canonical (Z, W).
+    /// 7. XY SAT `try_candidate(x_bits, y_bits)` returns **Sat(_, _)**
+    ///    for the canonical boundary, and whatever (X, Y) it finds is
+    ///    itself a valid TT with the canonical (Z, W).
+    ///
+    /// Step 7 does *not* assert that SAT returns the exact canonical
+    /// (X, Y), because the same `(Z, W, x_bits, y_bits)` sometimes
+    /// admits more than one middle completion and SAT may pick any.
+    fn run_kharaghani_sample(n: usize, k: usize) {
+        let rows = sample_kharaghani_rows(n);
+        for (i, row) in rows.iter().enumerate() {
+            let (x, y, z, w) = decode_kharaghani_hex(row, n);
+            eprintln!("kharaghani oracle n={n} k={k} sample {i}/{}: row={row}", rows.len());
+            kharaghani_oracle_check(&x, &y, &z, &w, k);
+        }
+    }
+
+    /// Like `sanity_check_canonical_tt` but only asserts *existence*
+    /// of an (X, Y) middle for the canonical boundary — the pipeline
+    /// is allowed to return any valid completion, not necessarily the
+    /// exact canonical one from the data row.  Panics identify the
+    /// first stage that rejects.  Shares steps (a)–(g2) with
+    /// `sanity_check_canonical_tt`; only the final XY step is relaxed.
+    fn kharaghani_oracle_check(x_str: &str, y_str: &str, z_str: &str, w_str: &str, k: usize) {
+        let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
+        let x = parse(x_str);
+        let y = parse(y_str);
+        let z = parse(z_str);
+        let w = parse(w_str);
+        let n = x.len();
+        let m = n - 1;
+
+        let problem = Problem::new(n);
+        let px = PackedSeq::from_values(&x);
+        let py = PackedSeq::from_values(&y);
+        let pz = PackedSeq::from_values(&z);
+        let pw = PackedSeq::from_values(&w);
+        assert!(verify_tt(problem, &px, &py, &pz, &pw), "n={n}: fails verify_tt");
+
+        // BDKR rules (i)–(vi).  These repeat the ones in
+        // sanity_check_canonical_tt so failures on oracle data are easy
+        // to attribute.
+        assert_eq!((x[0], x[n-1], y[0], y[n-1], z[0], w[0]), (1, 1, 1, 1, 1, 1),
+            "n={n}: rule (i) violated");
+        for i in 1..n/2 { if x[i] != x[n-1-i] { assert_eq!(x[i], 1, "n={n}: rule (ii)"); break; } }
+        for i in 1..n/2 { if y[i] != y[n-1-i] { assert_eq!(y[i], 1, "n={n}: rule (iii)"); break; } }
+        for i in 1..n/2 { if z[i] == z[n-1-i] { assert_eq!(z[i], 1, "n={n}: rule (iv)"); break; } }
+        let tail = w[m-1];
+        for i in 1..(m-1)/2 + 1 { if w[i] * w[m-1-i] != tail { assert_eq!(w[i], 1, "n={n}: rule (v)"); break; } }
+        if x[1] != y[1] { assert_eq!(x[1], 1, "n={n}: rule (vi)"); }
+        else { assert_eq!(x[n-2], 1, "n={n}: rule (vi)"); assert_eq!(y[n-2], -1, "n={n}: rule (vi)"); }
+
+        let sigma_z: i32 = z.iter().map(|&b| b as i32).sum();
+        let sigma_w: i32 = w.iter().map(|&b| b as i32).sum();
+
+        // Middle boundaries at k.
+        let mut z_boundary = vec![0i8; n];
+        z_boundary[..k].copy_from_slice(&z[..k]);
+        z_boundary[n-k..].copy_from_slice(&z[n-k..]);
+        let mut w_boundary = vec![0i8; m];
+        w_boundary[..k].copy_from_slice(&w[..k]);
+        w_boundary[m-k..].copy_from_slice(&w[m-k..]);
+        let middle_n = n - 2 * k;
+        let middle_m = m - 2 * k;
+        let z_bnd_sum: i32 = z_boundary.iter().map(|&v| v as i32).sum();
+        let w_bnd_sum: i32 = w_boundary.iter().map(|&v| v as i32).sum();
+
+        let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
+        assert_ne!(rule_iv_state, sat_z_middle::BoundaryRuleState::ViolatedAtBoundary,
+            "n={n}: rule (iv) pre-filter rejects canonical Z boundary");
+        let rule_v_state = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
+        assert_ne!(rule_v_state, sat_z_middle::BoundaryRuleState::ViolatedAtBoundary,
+            "n={n}: rule (v) pre-filter rejects canonical W boundary");
+
+        // W-middle SAT must accept the canonical middle.
+        let abs_w = sigma_w.abs();
+        let w_counts: Vec<u32> = if abs_w == 0 {
+            sigma_full_to_cnt(0, w_bnd_sum, middle_m).into_iter().collect()
+        } else {
+            [abs_w, -abs_w].iter().filter_map(|&s| sigma_full_to_cnt(s, w_bnd_sum, middle_m)).collect()
+        };
+        assert!(!w_counts.is_empty(), "n={n}: empty V_w");
+        let w_tmpl = sat_z_middle::LagTemplate::new(m, k);
+        let mut w_solver = w_tmpl.build_base_solver_pb_set(middle_m, &w_counts);
+        sat_z_middle::fill_w_solver(&mut w_solver, &w_tmpl, m, &w_boundary);
+        if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
+            let mut nv = (w_solver.num_vars() + 1) as i32;
+            sat_z_middle::add_rule_v_middle_clauses(&mut w_solver, m, k, &w_boundary, |pf| (pf - k + 1) as i32, &mut nv);
+        }
+        let w_mid_lits: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
+        for (i, &v) in w[k..k+middle_m].iter().enumerate() {
+            w_solver.add_clause([if v == 1 { w_mid_lits[i] } else { -w_mid_lits[i] }]);
+        }
+        assert_eq!(w_solver.solve(), Some(true), "n={n}: W-middle SAT rejects canonical W middle");
+
+        // Z-middle SAT must accept the canonical middle.
+        let abs_z = sigma_z.abs();
+        let z_counts: Vec<u32> = if abs_z == 0 {
+            sigma_full_to_cnt(0, z_bnd_sum, middle_n).into_iter().collect()
+        } else {
+            [abs_z, -abs_z].iter().filter_map(|&s| sigma_full_to_cnt(s, z_bnd_sum, middle_n)).collect()
+        };
+        assert!(!z_counts.is_empty(), "n={n}: empty V_z");
+        let z_tmpl = sat_z_middle::LagTemplate::new(n, k);
+        let mut z_solver = z_tmpl.build_base_solver_quad_pb_pb_set(middle_n, &z_counts);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver, &z_tmpl, n, m, middle_n, &z_boundary, &w);
+        let z_mid_lits: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
+        for (i, &v) in z[k..k+middle_n].iter().enumerate() {
+            z_solver.add_clause([if v == 1 { z_mid_lits[i] } else { -z_mid_lits[i] }]);
+        }
+        assert_eq!(z_solver.solve(), Some(true), "n={n}: Z-middle SAT rejects canonical Z middle");
+
+        // External spectral pair filter.
+        let spectral_z = SpectralFilter::new(n, 128);
+        let spectral_w = SpectralFilter::new(m, 128);
+        let mut fft_z = FftScratch::new(&spectral_z);
+        let mut fft_w = FftScratch::new(&spectral_w);
+        let pair_bound = problem.spectral_bound();
+        let w_spec = spectrum_if_ok(&w, &spectral_w, pair_bound, &mut fft_w)
+            .unwrap_or_else(|| panic!("n={n}: canonical W fails individual spectral filter"));
+        let mut z_spec = vec![0.0; w_spec.len()];
+        compute_spectrum_into(&z, &spectral_z, &mut fft_z, &mut z_spec);
+        assert!(spectral_pair_ok(&z_spec, &w_spec, pair_bound),
+            "n={n}: canonical (Z, W) fails external spectral_pair_ok");
+
+        // XY SAT: try_candidate must accept the canonical boundary.
+        // Whatever (X, Y) it returns must be a valid TT with the
+        // canonical (Z, W); it is not required to equal (x, y).
+        let sigma_x: i32 = x.iter().map(|&b| b as i32).sum();
+        let sigma_y: i32 = y.iter().map(|&b| b as i32).sum();
+        let mut zw = vec![0i32; n];
+        for s in 1..n {
+            let nz = pz.autocorrelation(s);
+            let nw = if s < m { pw.autocorrelation(s) } else { 0 };
+            zw[s] = 2 * nz + 2 * nw;
+        }
+        let candidate = CandidateZW { zw_autocorr: zw };
+        let tuple = SumTuple { x: sigma_x, y: sigma_y, z: sigma_z, w: sigma_w };
+        let template = SatXYTemplate::build(problem, tuple, &radical::SolverConfig::default())
+            .expect("template should build");
+        let mut state = SolveXyPerCandidate::new(problem, &candidate, &template, k)
+            .expect("SolveXyPerCandidate::new should succeed");
+        let mut x_bits = 0u32;
+        let mut y_bits = 0u32;
+        for i in 0..k {
+            if x[i] == 1 { x_bits |= 1 << i; }
+            if x[n - k + i] == 1 { x_bits |= 1 << (k + i); }
+            if y[i] == 1 { y_bits |= 1 << i; }
+            if y[n - k + i] == 1 { y_bits |= 1 << (k + i); }
+        }
+        let (result, _stats) = state.try_candidate(x_bits, y_bits);
+        match result {
+            XyTryResult::Sat(found_x, found_y) => {
+                let fx: Vec<i8> = (0..n).map(|i| found_x.get(i)).collect();
+                let fy: Vec<i8> = (0..n).map(|i| found_y.get(i)).collect();
+                let pfx = PackedSeq::from_values(&fx);
+                let pfy = PackedSeq::from_values(&fy);
+                assert!(verify_tt(problem, &pfx, &pfy, &pz, &pw),
+                    "n={n}: SAT returned non-TT completion for canonical (Z, W) + x_bits=0b{x_bits:b}, y_bits=0b{y_bits:b}");
+            }
+            XyTryResult::Unsat => panic!(
+                "n={n}: try_candidate returned UNSAT for canonical TT — rule/template/PbSetEq bug. \
+                 tuple=({}, {}, {}, {}), x_bits=0b{x_bits:b}, y_bits=0b{y_bits:b}",
+                tuple.x, tuple.y, tuple.z, tuple.w),
+            XyTryResult::Pruned => panic!("n={n}: try_candidate pruned canonical at GJ/lag pre-filter"),
+            XyTryResult::Timeout => panic!("n={n}: try_candidate timed out"),
+        }
+    }
+
+    #[test]
+    fn kharaghani_oracle_n6() { run_kharaghani_sample(6, 2); }
+
+    #[test]
+    fn kharaghani_oracle_n8() { run_kharaghani_sample(8, 2); }
+
+    #[test]
+    fn kharaghani_oracle_n10() { run_kharaghani_sample(10, 3); }
+
+    #[test]
+    fn kharaghani_oracle_n12() { run_kharaghani_sample(12, 3); }
+
+    #[test]
+    fn kharaghani_oracle_n14() { run_kharaghani_sample(14, 4); }
+
+    #[test]
+    fn kharaghani_oracle_n16() { run_kharaghani_sample(16, 4); }
+
+    #[test]
+    fn kharaghani_oracle_n18() { run_kharaghani_sample(18, 5); }
+
+    #[test]
+    fn kharaghani_oracle_n20() { run_kharaghani_sample(20, 5); }
+
+    // Larger n are slower (bigger SAT instances).  Gate n≥22 behind
+    // `--ignored` so the default `cargo test` run stays quick.  Run the
+    // full oracle with `cargo test -- --ignored kharaghani`.
+    #[test]
+    #[ignore = "slow; run via `cargo test -- --ignored kharaghani`"]
+    fn kharaghani_oracle_n22() { run_kharaghani_sample(22, 6); }
+
+    #[test]
+    #[ignore = "slow"]
+    fn kharaghani_oracle_n24() { run_kharaghani_sample(24, 6); }
+
+    #[test]
+    #[ignore = "slow"]
+    fn kharaghani_oracle_n26() { run_kharaghani_sample(26, 7); }
+
+    #[test]
+    #[ignore = "slow"]
+    fn kharaghani_oracle_n28() { run_kharaghani_sample(28, 7); }
+
+    #[test]
+    #[ignore = "slow"]
+    fn kharaghani_oracle_n30() { run_kharaghani_sample(30, 7); }
+
+    #[test]
+    #[ignore = "slow"]
+    fn kharaghani_oracle_n32() { run_kharaghani_sample(32, 8); }
+
+    /// Regression test for the `--outfix` middle-pin wiring.  Pre-fix,
+    /// `outfix_z_mid_pins` and `outfix_w_mid_pins` were only honoured
+    /// inside the combined `SolveWZ` path at `src/mdd_pipeline.rs:1380`;
+    /// the separate `--wz=apart` `SolveW` and `SolveZ` stages ignored
+    /// them, so an outfix with middle pins (`pref_len > k` or
+    /// `suf_len > k+1`) would walk over the user-specified middle and
+    /// enumerate arbitrary completions, nearly all of which fail the
+    /// downstream pair check → UNSAT even on a canonical TT.
+    ///
+    /// This test drives the regression at the CLI level: give the
+    /// pipeline a *fully pinning* outfix derived from a known TT(28),
+    /// and require it to find a solution in a few seconds.  Also
+    /// covers n=16 as a smaller reproducer.
+    ///
+    /// Note: a *minimal* outfix (`pref_len=k`, `suf_len=k+1` — boundary
+    /// only, no middle pins) on n=28 still returns UNSAT, but that is
+    /// a separate issue: the Z SAT's 16-frequency pair filter rejects
+    /// the canonical middle when combined with certain boundaries.
+    /// Tracked by `outfix_minimal_boundary_bug_tt28` below.
+    #[test]
+    fn outfix_extended_finds_canonical_tt28() {
+        use std::process::Command;
+        // Unit tests can't use CARGO_BIN_EXE_*; resolve the release
+        // binary from the workspace manifest dir.  `cargo test --release`
+        // builds it automatically before running tests.
+        let exe = format!("{}/target/release/turyn", env!("CARGO_MANIFEST_DIR"));
+        let out = Command::new(exe)
+            .args([
+                "--n=28", "--wz=apart", "--mdd-k=9", "--sat-secs=5",
+                "--outfix=0000067cde3e50...0639ab46135aa51",
+            ])
+            .output()
+            .expect("turyn binary should run");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let all = format!("{stdout}{stderr}");
+        assert!(all.contains("found_solution=true"),
+            "--outfix with fully-pinning prefix+suffix should find a TT(28)\nfull output:\n{all}");
+    }
+
+    /// Smaller variant at n=16 (row 1 of `data/turyn-type-16`, all-positive σ).
+    #[test]
+    fn outfix_extended_finds_canonical_tt16() {
+        use std::process::Command;
+        // Unit tests can't use CARGO_BIN_EXE_*; resolve the release
+        // binary from the workspace manifest dir.  `cargo test --release`
+        // builds it automatically before running tests.
+        let exe = format!("{}/target/release/turyn", env!("CARGO_MANIFEST_DIR"));
+        let out = Command::new(exe)
+            .args([
+                "--n=16", "--wz=apart", "--mdd-k=4", "--sat-secs=5",
+                "--outfix=00007e4b0e53...19561",
+            ])
+            .output()
+            .expect("turyn binary should run");
+        let all = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(all.contains("found_solution=true"),
+            "--outfix with fully-pinning prefix+suffix should find a TT(16)\nfull output:\n{all}");
+    }
+
+    /// Known-broken repro for the minimal-outfix (boundary-only) case on
+    /// n=28.  Passes a k=9 boundary with no middle pins and expects the
+    /// pipeline to find some (Z, W) middle + (X, Y) completion.  Fails
+    /// today because the 16-frequency Z pair filter rejects every
+    /// Z-middle candidate at this boundary.  Moving the filter to a
+    /// higher-resolution grid, or making it a hint rather than a
+    /// hard cut, would plausibly fix this.  Left as `#[ignore]` so
+    /// `cargo test -- --ignored` surfaces it as a known limitation.
+    #[test]
+    #[ignore = "minimal outfix + 16-freq Z pair filter rejects canonical (Z,W)"]
+    fn outfix_minimal_boundary_bug_tt28() {
+        use std::process::Command;
+        // Unit tests can't use CARGO_BIN_EXE_*; resolve the release
+        // binary from the workspace manifest dir.  `cargo test --release`
+        // builds it automatically before running tests.
+        let exe = format!("{}/target/release/turyn", env!("CARGO_MANIFEST_DIR"));
+        let out = Command::new(exe)
+            .args([
+                "--n=28", "--wz=apart", "--mdd-k=9", "--sat-secs=10",
+                "--outfix=0000067cd...146135aa51",
+            ])
+            .output()
+            .expect("turyn binary should run");
+        let all = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(all.contains("found_solution=true"),
+            "minimal --outfix (boundary-only) should find a TT(28)\noutput:\n{all}");
+    }
+
     /// Same for canonical TT(36).
     #[test]
     fn sanity_canonical_tt36() {

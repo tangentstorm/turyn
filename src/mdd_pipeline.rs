@@ -920,6 +920,17 @@ pub(crate) fn run_mdd_sat_search(
                               let mid_sum_iter = 2 * cnt as i32 - ctx.middle_m as i32;
                               generate_sequences_permuted(ctx.middle_m, mid_sum_iter, false, false, 200_000, |w_mid| {
                                 if ctx.found.load(AtomicOrdering::Relaxed) { return false; }
+                                // --outfix middle pins: skip W middles that
+                                // disagree with the user-specified pin.
+                                // Without this filter the outfix boundary is
+                                // honoured but the middle is free, so the
+                                // pipeline enumerates many W completions that
+                                // differ from the one the user wanted to test.
+                                if !ctx.outfix_w_mid_pins.is_empty() {
+                                    let pin_ok = ctx.outfix_w_mid_pins.iter()
+                                        .all(|&(mid, val)| mid >= ctx.middle_m || w_mid[mid] == val);
+                                    if !pin_ok { return true; }
+                                }
                                 let mut w_vals = w_boundary.clone();
                                 w_vals[k..k+ctx.middle_m].copy_from_slice(w_mid);
                                 flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
@@ -985,6 +996,16 @@ pub(crate) fn run_mdd_sat_search(
                                 w_solver.spectral = Some(radical::SpectralConstraint::from_tables(
                                     wtab, &w_boundary, ctx.individual_bound,
                                 ));
+                            }
+
+                            // --outfix middle pins for W: force middle
+                            // positions to user-specified values.  Matches
+                            // the brute-force path above.
+                            for &(mid, val) in &ctx.outfix_w_mid_pins {
+                                if mid < ctx.middle_m {
+                                    let lit = (mid + 1) as i32;
+                                    w_solver.add_clause([if val > 0 { lit } else { -lit }]);
+                                }
                             }
 
                             // Snapshot solver search stats before the enumeration
@@ -1819,6 +1840,17 @@ pub(crate) fn run_mdd_sat_search(
                                 |jf| (jf - k + 1) as i32,
                                 &mut nv,
                             );
+                        }
+                        // --outfix middle pins for Z: force middle positions
+                        // to user-specified values.  Without this the outfix
+                        // honours only the Z boundary and SolveZ enumerates
+                        // many different middles, most of which fail the
+                        // downstream pair check.
+                        for &(mid, val) in &ctx.outfix_z_mid_pins {
+                            if mid < ctx.middle_n {
+                                let lit = ctx.z_mid_vars[mid];
+                                z_solver.add_clause([if val > 0 { lit } else { -lit }]);
+                            }
                         }
                         // Retroactively feed middle vars that fill_z_solver
                         // forced at level 0 into the spectral constraint.
