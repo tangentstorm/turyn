@@ -850,13 +850,21 @@ pub(crate) fn search_sync(
     // Always parallel: one worker per available CPU. Worker 0 runs
     // best-first (score-sorted) siblings; workers 1.. each get a
     // different LCG seed for randomised sibling ordering so they
-    // explore independent regions of the tree. Workers do NOT share
-    // learnt clauses (Solver isn't Clone/Send for its bulk state);
-    // the parallelism benefit is exploration diversity. First worker
-    // to find a solution cancels the others via a shared AtomicBool.
-    let n_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    // explore independent regions of the tree. Workers share learnt
+    // clauses via `ClauseExchange` (length-capped) for peer-level
+    // pruning. First worker to find a solution cancels the others
+    // via a shared AtomicBool.
+    //
+    // Respect `TURYN_THREADS` (and `RAYON_NUM_THREADS`) so users can
+    // pin the parallelism for bench reproducibility — matches the MDD
+    // pipeline's behaviour documented in CLAUDE.md.
+    let n_workers = std::env::var("TURYN_THREADS").ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .or_else(|| std::env::var("RAYON_NUM_THREADS").ok()
+            .and_then(|v| v.parse::<usize>().ok()))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        })
         .max(1);
     search_sync_parallel(problem, cfg, verbose, n_workers, start)
 }
