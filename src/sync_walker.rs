@@ -548,6 +548,27 @@ fn rebuild_sums(state: &mut State, ctx: &Ctx) {
     }
 }
 
+/// Delta-apply closure events at a single level, restricted to kinds
+/// that were just newly placed at pos_order[level]. Parent sums at
+/// level L already scanned closure_events[L]; for a kind whose bit at
+/// pos_order[L] was harvest-pinned *before* this candidate loop, the
+/// pair was already counted. We must only add contributions for kinds
+/// that went from 0 → set in this speculative step. `placed_kind_mask`
+/// is the 4-bit mask of such kinds.
+/// Cost: O(|closure_events[level]|).
+fn apply_level_delta(state: &mut State, ctx: &Ctx, level: usize, placed_kind_mask: u8) {
+    if level >= ctx.depth || placed_kind_mask == 0 { return; }
+    for ev in &ctx.closure_events[level] {
+        if (placed_kind_mask >> ev.kind) & 1 == 0 { continue; }
+        let a_sign = state.bit(ev.kind, ev.pos_a);
+        let b_sign = state.bit(ev.kind, ev.pos_b);
+        if a_sign == 0 || b_sign == 0 { continue; }
+        let a = if a_sign == 1 { 1i16 } else { -1 };
+        let b = if b_sign == 1 { 1i16 } else { -1 };
+        state.sums[ev.lag] += (a * b) * ev.abs_coeff;
+    }
+}
+
 /// Walker-side BDKR rule check for pairs that just closed at this level.
 /// Returns Err(()) on rule violation; Ok(new_rule_state) otherwise.
 ///
@@ -1472,6 +1493,10 @@ fn dfs_body(
         // Speculatively update sums for pairs closing at this level
         // using the placed bits. We don't call the solver yet — capacity
         // check first (cheap).
+        //
+        // Delta-based: snapshot sums once, apply only the new pair
+        // closures at `saved_level`, restore on rollback. Avoids
+        // re-scanning closure_events[0..level] twice per candidate.
         let saved_bits: Vec<(u8, usize, u8)> = (0..np as usize)
             .map(|k| {
                 let (ki, pi, _) = placed[k];
@@ -1484,7 +1509,15 @@ fn dfs_body(
         }
         let saved_level = state.level;
         state.level += 1;
-        rebuild_sums(state, ctx);
+        let sums_snapshot: Vec<i16> = state.sums.clone();
+        // Build mask of newly-placed kinds; only these contribute to
+        // the delta (bits pre-pinned by harvest_forced were already
+        // counted in the parent's sums).
+        let mut placed_kind_mask: u8 = 0;
+        for k in 0..np as usize {
+            placed_kind_mask |= 1 << placed[k].0;
+        }
+        apply_level_delta(state, ctx, saved_level, placed_kind_mask);
         let violated = capacity_violated(state, ctx);
         // Early hopelessness: no valid Phase-A tuple is reachable from
         // the partial sums + remaining free-bit budget. Independent of
@@ -1511,8 +1544,9 @@ fn dfs_body(
         for (ki, pi, old_sign) in &saved_bits {
             state.bits[(*ki as usize) * ctx.n + pi] = *old_sign;
         }
-        // Rebuild sums to the parent state after rollback.
-        rebuild_sums(state, ctx);
+        // Restore sums from the pre-delta snapshot (O(n)) instead of
+        // re-scanning the full closure history (O(level × n)).
+        state.sums.copy_from_slice(&sums_snapshot);
 
         if violated {
             stats.capacity_rejects += 1;
@@ -1614,9 +1648,16 @@ fn dfs_body(
             state.set_bit(ki, pi, si);
         }
         state.assumptions.extend_from_slice(&cand.new_assums[..cand.num_new_assums as usize]);
+        let commit_parent_level = state.level;
         state.level += 1;
         state.rule_state = cand.rule_state;
-        rebuild_sums(state, ctx);
+        // sums was just copied from parent snapshot; delta applies only
+        // to pairs whose pos_order[L] endpoint was newly placed.
+        let mut commit_kind_mask: u8 = 0;
+        for k in 0..cand.num_placed as usize {
+            commit_kind_mask |= 1 << cand.placed_signs[k].0;
+        }
+        apply_level_delta(state, ctx, commit_parent_level, commit_kind_mask);
         processed_count += 1;
 
         // Per-level SAT call: propagate_only (no CDCL decisions,

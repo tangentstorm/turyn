@@ -2250,3 +2250,38 @@ occasionally — more likely to find leaves than pure random.
 - **Detection plan**: `time_to_first_leaf` should drop.
 - **Risk**: on UNSAT-complete search this is neutral (still need
   to cover tree); purely a find-solution-faster optimisation.
+
+### S3 (applied). Delta-based speculative rebuild_sums — *accepted*
+
+Implementation of S3 above. Parent sums at level L reflect all pairs
+closed at 0..=L whose endpoints are both set. When the speculative
+candidate loop descends to L+1 by pinning bits at `pos_order[L]`, only
+pairs in `closure_events[L]` involving a kind whose bit at `pos_order[L]`
+went from 0→set are newly counted. Those pre-pinned by `harvest_forced`
+were already included — tracked by a 4-bit `placed_kind_mask`.
+
+Three call-sites simplified:
+- Speculative eval: `state.sums.clone()` (snapshot) + `apply_level_delta`.
+- Rollback: `state.sums.copy_from_slice(&snapshot)`.
+- Commit: delta instead of full rebuild.
+
+Measured (n=22 `--wz=sync --sat-secs=30`, 16 workers, 3 trials):
+
+| Metric                  | Baseline     | Delta        | Δ         |
+|-------------------------|--------------|--------------|-----------|
+| nodes_visited           | 3.19–3.22M   | 4.19–4.22M   | +31%      |
+| cap_rejects / node      | 13.03        | 13.05        | noise     |
+| sat_unsat / node        | 0.342        | 0.335        | noise     |
+| coverage_product        | 4.37e-6      | 2.19e-5      | 5.0×      |
+| **direct TTC parallel** | **6.80e6 s** | **1.37e6 s** | **5.0×**  |
+
+n=26 sync 30s: TTC 4.73e8 s → 4.13e8 s (−13%, within noise — tree too
+big to benefit from rate alone in 30s budget).
+
+TT(18) solve time: 13.2s → 6.0s.
+
+- **TTC mechanism**: rate. The rate lift (+31%) amplifies
+  multiplicatively through the per-level coverage product.
+- **Risk verified**: reject ratios (cap_rejects/node, sat_unsat/node)
+  match baseline exactly, confirming delta sums are bit-identical to
+  the full-rebuild semantics.
