@@ -2,6 +2,56 @@
 
 This file tracks performance-oriented changes and their measured impact.
 
+## April 19 2026 — `--wz=sync` deep optimization session (-99.3 % TTC cumulative, 150×)
+
+A single multi-hour session pushed `--wz=sync` from baseline TTC
+6.581e8 s parallel down to ~4.40e6 s parallel — a **150× cumulative
+speedup** at n=26. The final order-of-magnitude came from
+**backbone detection** (kissat-style preprocessing) alone.  All wins came from the walker / solver
+interaction; no algorithmic changes to the search space.
+
+| Stage           | TTC (mean of 5 sequential runs) | Δ vs baseline |
+|-----------------|---------------------------------|---------------|
+| Baseline        | 6.581e8 s ± 0.089e8             | —             |
+| + R1            | 5.224e8 s ± 0.067e8             | −20.6 %       |
+| + R8            | 2.62e8 s (range 2.04–3.05e8)    | −60 %         |
+| + R8b           | 2.30e8 s (range 1.83–3.00e8)    | −65 %         |
+| + R8c           | **5.97e7 s ± 0.001e7**          | **−91 %**     |
+| + R8c stack-bits + assert + per-kind ranges + SCC + BVE | 5.87e7 s | −91.1 %     |
+| + R2 (gated)    | 5.47e7 s ± 0.15e7               | −91.7 %       |
+| + arena compact + used counter | 5.71-5.87e7 (within noise)      | −91.3 %       |
+| + **backbone**  | **4.40e6 s ± 0.02e6**           | **−99.3 %**   |
+
+Methodology lessons (logged for future sessions):
+
+- **Sequential, not parallel runs**: Earlier in the session the noise
+  floor was ~11 % (parallel benchmarks contended on CPU). Switching
+  to strict sequential 5-run measurements brought it to ~1.3 %.
+- **CPU thermal throttling**: After ~30 min of continuous runs,
+  R8/R8b results showed bimodal clustering that vanished once R8c
+  removed the dominant inner-loop work. The "thermal bimodal" pattern
+  is a tell that the hot path is sustained-high-CPU rather than
+  noisy.
+- **Decisive wins only**: Six experiments (R5, R6, R9, capacity SIMD,
+  S6, per-kind cfg gate) regressed or measured in noise. None were
+  committed. Several (R8d, R9, R10 with high MAX_SHARED_LEN) were
+  rejected after benchmarking despite plausible theoretical merit.
+
+The remaining residual cost on n=26 sync is essentially the SAT
+propagator (push_assume_frame's propagate loop, dominated by
+clause-BCP and quad-PB). Further wins likely require:
+
+- Solver-internal: chronological backtracking, dedicated binary
+  watch list (radical has very few binaries to start, so payoff
+  uncertain), LBD-tier clause retention with a sync-driven
+  reduce_db schedule.
+- Walker-side: combined-level walking (place 2 levels per push
+  for amortized propagation), spectral constraint as a walker
+  filter.
+
+Detailed before/after for each landed commit is documented inline
+below as `R*` entries.
+
 ## TTC: the universal metric
 
 Every entry in this log is framed against **Time to Cover (TTC)** —
@@ -602,6 +652,245 @@ Benchmark n=26 wz=together mdd-k=7 (4 threads, 20s, 23 runs):
 All 35 tests pass.
 
 ## SPECTRAL_FREQS sweep for --wz=apart (April 2026)
+
+### Backbone detection preprocessing — accepted (**TTC −92.5 % vs R8c+R2, −99.3 % cumulative**)
+
+Added `pub Solver::backbone_scan(max_var: usize) -> usize` (kissat
+`backbone.c` equivalent) to radical, wired into sync's `build_solver`
+after SCC + BVE.  For every unassigned walker var in `1..=4n`, probe
+both polarities under assumption; if one conflicts at level 0, the
+opposite is a backbone fact (true in every satisfying assignment)
+and is enqueued + propagated at level 0.  Iterates to fixpoint in
+case new facts unlock further failed literals.
+
+Typical behaviour at n=26:
+
+- Installs just 2 walker-var facts (e.g. X[1]=+1).
+- Each installed fact's propagation pins a cascade of Tseitin aux
+  variables as level-0 facts too.  Those aux pins don't count
+  towards the "installed" count but dramatically tighten every
+  subsequent `push_assume_frame` call.
+
+Benchmark (n=26 `--wz=sync --sat-secs=60`, 16 threads, 5 sequential):
+
+| Metric                  | Pre                | Post (backbone)            |
+|-------------------------|--------------------|----------------------------|
+| direct TTC parallel (s) | 5.47–5.87e7        | **4.390e6 – 4.426e6**      |
+| Δ vs prior              | —                  | **−92.5 %** decisive        |
+| Δ vs session baseline   | −91–92 %           | **−99.3 %** (150× total)    |
+
+Soundness:
+- `cargo test --release --bins` 40/40 pass.
+- n=18 `--wz=sync` still finds TT(18) in 1.35 s (`leaves=1`,
+  `max_lvl=18`) — the anchor smoke test for sync correctness.
+- `backbone_scan` is a sound inference: "assuming lit ⇒ conflict"
+  is exactly the standard failed-literal-probing premise.
+
+**Lever**: denominator.  The 2 installed facts halve walker-branching
+at those two levels, and the cascading aux-var pins propagate down
+into later levels' propagate_only calls, reducing per-descent work.
+
+Apart / together unaffected — `backbone_scan` is only called from
+sync's `build_solver`.
+
+Deferred work (general-SAT improvements that didn't land):
+- Full CaDiCaL-style tier1/tier2 retention: regressed sync 25 % on
+  60 s budgets (larger retained clause DB hurt the hot loop more
+  than tier quality helped). Kept the `ClauseMeta.used` counter for
+  future work + as a tie-break in `reduce_db`.
+- Native XOR gate collapse of Tseitin equivalence chains:
+  regressed sync 10 % (radical's XOR propagator is slower than 2WL
+  on 3- and 4-variable gates).
+- On-the-fly subsumption during analysis (CaDiCaL OTFS): not
+  attempted — implementation complexity outweighs expected sync
+  payoff given how short radical's learnt clauses already are.
+
+### R8c. Skip post-harvest `rebuild_sums` when no walker bits forced — accepted (**TTC −74 % vs R8b**, **−91 % cumulative**)
+
+The post-harvest `rebuild_sums` at `sync_walker.rs:1747` ran on
+EVERY accepted candidate, regardless of whether
+`harvest_forced` actually picked up any new walker bits.  Per-level
+telemetry shows that at shallow-to-mid levels (where most siblings
+are processed) `forced_by_level / nodes_at_level` is around
+0.4 – 1.5 — i.e., on most pushes the solver propagation forces
+zero or one walker bit, and the rebuild was pure waste.
+
+**Fix (single commit)**: `harvest_forced` now returns the count of
+newly-set walker bits (`src/sync_walker.rs:514-532`), and the
+caller skips `rebuild_sums` when the count is zero
+(`src/sync_walker.rs:1746-1750`).  This is sound because if
+`harvest_forced` set no bits, `state.bits` is unchanged from
+before the call, so `state.sums` (consistent before harvest) is
+still consistent.
+
+Benchmark: n=26 `--wz=sync --sat-secs=60`, 16 threads, 5
+sequential runs.
+
+| Metric                  | R1+R8+R8b              | R1+R8+R8b+R8c       |
+|-------------------------|------------------------|---------------------|
+| direct TTC parallel (s) | 2.30e8 mean (1.83-3.0) | **5.97e7 ± 0.001e7** |
+| Δ vs R8b                | —                      | **−74 %**           |
+| Δ vs baseline (cumul.)  | −65 %                  | **−91 %**           |
+| nodes / 60 s            | 41 – 68 M              | 79 M (very stable)  |
+| run-to-run spread       | ~50 % (thermal bimodal) | **~0.3 %**         |
+
+The thermal bimodal pattern that affected R8/R8b is gone — R8c
+runs are within 0.3 % of each other.  This indicates the previous
+runs were CPU-bound on a redundant rebuild that didn't run as
+often after R8c, removing the sustained thermal load.
+
+Soundness verified by n=18 smoke test (TT(18) found in 1.55 s,
+`leaves=1`, `max_lvl=18`) and `cargo test --release --bins` 40/40
+pass.
+
+**Lever**: rate.  Eliminates a per-accepted-sibling O(L · events_
+per_level) sum-rebuild on the common case (no new walker bit
+forced).
+
+### R8b. Extend delta sums to the sync walker's sibling loop — accepted (**TTC −12 % vs R8**, **−65 % cumulative**)
+
+The sibling loop's `rebuild_sums` at `src/sync_walker.rs:1677` (the
+one between `state.set_bit` of the cand's placed bits and the
+`push_assume_frame` call) is the second-most-frequent rebuild after
+the candidate-building speculative loop fixed by R8.  Same logic
+applies: `state.sums` enters as `saved_sums` (post-harvest at
+parent level), the bits being placed are `cand.placed_signs`, and
+the only events that newly fire at level `entry_level` are those
+involving kinds in `cand.placed_signs[..]`.
+
+Replaced with `apply_sum_delta_at(state, ctx, sib_saved_level,
+&sib_newly_placed)`.
+
+Benchmark: n=26 `--wz=sync --sat-secs=60`, 16 threads, 5 sequential
+runs (still showing thermal-throttle bimodal pattern).
+
+| Metric                  | R1 + R8         | R1 + R8 + R8b   |
+|-------------------------|-----------------|------------------|
+| direct TTC parallel (s) | 2.62e8 mean     | 2.30e8 mean      |
+|                         | (range 2.04–3.05) | (range 1.83–3.00) |
+| Δ vs R8                 | —               | **−12 %** mean   |
+| Δ vs R8 (fast cluster)  | —               | **−10 %**        |
+| Δ vs baseline (cumul.)  | −60 %           | **−65 %** mean   |
+| nodes / 60 s            | 37 – 58 M       | 41 – 68 M        |
+
+The post-harvest `rebuild_sums` at `src/sync_walker.rs:1730`
+remains in place because `harvest_forced` can set walker bits at
+*any* position (not just `pos_order[level]`), so a kind-filtered
+delta isn't sufficient to capture the change.  An incremental
+post-harvest rebuild would need a more careful invariant; deferred.
+
+Soundness: n=18 finds TT(18) in 1.46 s (`leaves=1`), `cargo test
+--release --bins` 40/40 pass.
+
+### R8. Delta-based sums in the sync walker's speculative choice loop — accepted (**TTC −50 % vs R1**, **−60 % cumulative**)
+
+The candidate-building loop in `sync_walker::dfs_body` called
+`rebuild_sums` twice per choice (once after the speculative bit
+placement, once after rollback), O(total closure events) each.  For
+16 choices per DFS node at ~11 M nodes / 60 s (post-R1), that's
+2 × 16 × 11 M = 350 M rebuilds/s, each scanning ≈ 50 events at n=26
+— one of the two dominant hot paths in sync.
+
+**Fix (single commit)**: added
+`apply_sum_delta_at(state, ctx, level, &newly_placed)`
+(`src/sync_walker.rs:532-557`) which only adds contributions for
+pairs closing at `level` whose kind was **newly** placed this
+iteration — not kinds whose bit was already set by
+`harvest_forced` at the caller (those were already counted in the
+parent's rebuild and would double-count otherwise).  The
+speculative `rebuild_sums` after advance is replaced with
+`apply_sum_delta_at`; the rebuild after rollback is replaced with
+`state.sums.copy_from_slice(&spec_parent_sums)`, where
+`spec_parent_sums` is a one-time clone of `state.sums` taken
+before the choice loop.
+
+Subtle soundness invariant caught by debugging: `newly_placed`
+must be the set of kinds whose `state.bit(kind, pos_order[level])`
+was 0 at iteration entry.  Kinds skipped by
+`if existing != 0 { continue; }` (line 1498) in the caller already
+contributed to the parent rebuild via their pre-set bit, and
+double-counting them here drove `n=18 --wz=sync` from "finds TT(18)
+in ~2 s" to "max_lvl=17, no solution in 15 s".  The `newly_placed`
+filter is the correctness fix.
+
+Benchmark: n=26 `--wz=sync --sat-secs=60`, 16 threads, 5
+sequential runs.  High run-to-run variance visible (thermal
+throttling under the R8-enabled higher load), so we report
+mean + range.
+
+| Metric                  | Pre-R1              | R1 alone            | R1 + R8 (this)       |
+|-------------------------|---------------------|---------------------|-----------------------|
+| direct TTC parallel (s) | 6.581e8 ± 0.089e8   | 5.224e8 ± 0.067e8   | 2.62e8 (range 2.04e8 – 3.05e8) |
+| Δ vs baseline           | —                   | −20.6 %             | **−60 %** (mean)     |
+| Δ vs R1                 | —                   | —                   | **−50 %** (mean)     |
+| nodes / 60 s            | 3.9 M               | 11.2 M              | 37 – 58 M            |
+
+Even the worst individual R1+R8 run (3.05e8 s) is −54 % versus
+baseline — the lower bound of the R8 effect is decisively above
+the noise envelope.  Soundness verified by n=18 smoke test (finds
+TT(18) in 1.82 s, `leaves=1`) and full `cargo test --release`
+(40/40 pass).
+
+**Lever**: rate.  Candidate-building pair iteration drops from
+O(cumulative events across all levels) to O(events at the just-
+advanced level) and a fixed-size `copy_from_slice` on rollback.
+
+### R1. Incremental assumption propagation for `--wz=sync` — accepted (**TTC −20.6 %**)
+
+`radical::Solver::propagate_only(assumptions)` unconditionally
+backtracks to decision level 0 and re-enqueues every assumption
+literal as a fresh decision (`radical/src/lib.rs:1726-1770`).  The
+sync walker's DFS sibling loop calls it once per candidate, passing
+`state.assumptions` — an ancestor prefix of 4·L literals that is
+identical across all 16 siblings at level L.  The previous frame's
+propagation work was thrown away on every call.
+
+**Fix (single commit)**: added `push_assume_frame(&[Lit])` /
+`pop_assume_frame()` to `radical::Solver`
+(`radical/src/lib.rs:1819-1972`).  `push_assume_frame` creates a
+new decision level above the current one, enqueues only the new
+lits, propagates, and on conflict backtracks to the parent level
+and installs a learnt nogood (via `add_learnt_clause_no_enqueue`
+so no asserting literal is fired at the wrong level).
+`pop_assume_frame` is a single-level backtrack.  In
+`sync_walker::dfs_body` the per-sibling
+`solver.propagate_only(&state.assumptions)` is now
+`solver.push_assume_frame(&cand.new_assums[..])`, with
+`pop_assume_frame` paired on the `Some(true)` branch
+(`src/sync_walker.rs:1641-1700`).
+
+Peer-clause import is gated on
+`solver.current_decision_level() == 0` so that
+`solver.add_clause()` — which can immediately propagate a unit at
+the install site — never fires at a non-zero level and corrupts
+the frame stack.  This loses most of the per-worker peer flow at
+depth but preserves soundness; a proper "install-without-
+propagate" helper is follow-up work.
+
+Benchmark: n=26 `--wz=sync --sat-secs=60`, 16 threads, 5
+sequential runs each (noise floor ~1.3 %).
+
+| Metric                  | Baseline (mean±σ)   | R1 (mean±σ)         | Δ            |
+|-------------------------|---------------------|---------------------|--------------|
+| direct TTC parallel (s) | 6.581e8 ± 0.089e8   | 5.224e8 ± 0.067e8   | **−20.6 %**  |
+| nodes (60 s)            | 3.90 M              | 11.20 M             | **+187 %**   |
+| sat_unsat               | 1.736 M             | 37 k                | −98 %        |
+| cap_rejects             | 51 M                | 165 M               | +223 %       |
+
+The nodes/s triple and the `sat_unsat` collapse both confirm the
+mechanism: baseline kept re-deriving the same UNSAT verdict once
+per descent into each unique ancestor prefix; R1 derives it once
+per actual new conflict.
+
+**Lever**: rate (propagation cost per sibling ≈ O(|new_lits|)
+instead of O(|full assumption prefix|)).  Denominator unchanged.
+No change in leaf correctness: n=18 `--wz=sync` still finds
+TT(18) (smoke test, 2.4 s wall-clock to first leaf).
+
+All tests pass.  Single commit targeting `--wz=sync`;
+`--wz=apart|together|cross` paths are unchanged because they use
+the per-candidate `SolveXyPerCandidate` / `solve_inner` flow with
+a cloned template solver and do not touch `propagate_only`.
 
 ### S5. SPECTRAL_FREQS 563 → 64 for `--wz=apart` — accepted (**TTC −20%**)
 

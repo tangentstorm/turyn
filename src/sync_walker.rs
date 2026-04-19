@@ -63,7 +63,13 @@ struct Ctx {
     pos_order: Vec<usize>,
     /// Events that fire when a lag pair closes at this level.
     /// `closure_events[level] = [(lag, kind, pos_a, pos_b, abs_coeff), ...]`.
+    /// Sorted by `kind` ascending so per-kind ranges are contiguous; see
+    /// `closure_events_kind_ranges`.
     closure_events: Vec<Vec<PairEvent>>,
+    /// Per-(level, kind) [start, end) range into `closure_events[level]`.
+    /// Used by `apply_sum_delta_at` to skip kinds not in `newly_placed`
+    /// without per-event branching.
+    closure_events_kind_ranges: Vec<[(u32, u32); 4]>,
     /// Capacity bound per (level, lag): max `|S(s)|` achievable from
     /// pairs not yet closed after reaching `level`.
     max_remaining: Vec<Vec<i32>>,
@@ -262,10 +268,34 @@ fn build_ctx(problem: Problem) -> Ctx {
     // hopelessness detection.
     let valid_tuples = enumerate_sum_tuples(problem);
 
+    // Sort each level's events by kind ascending and record per-kind
+    // ranges so `apply_sum_delta_at` can skip whole kind blocks when
+    // `newly_placed[k]` is false.
+    for events in closure_events.iter_mut() {
+        events.sort_by_key(|e| e.kind);
+    }
+    let mut closure_events_kind_ranges: Vec<[(u32, u32); 4]> =
+        Vec::with_capacity(depth);
+    for events in &closure_events {
+        let mut ranges = [(0u32, 0u32); 4];
+        let mut start = 0usize;
+        let len = events.len();
+        for k in 0u8..4 {
+            // Find end of contiguous run of events with this kind.
+            let mut end = start;
+            while end < len && events[end].kind == k {
+                end += 1;
+            }
+            ranges[k as usize] = (start as u32, end as u32);
+            start = end;
+        }
+        closure_events_kind_ranges.push(ranges);
+    }
+
     Ctx {
         n, m, depth,
         pos_order,
-        closure_events, max_remaining,
+        closure_events, closure_events_kind_ranges, max_remaining,
         seed: 0, cancel: None, start: Instant::now(),
         valid_tuples,
         exchange: None,
@@ -285,6 +315,13 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
 
     let mut solver = radical::Solver::new();
     solver.config = sat_config.clone();
+    // R2: sync's propagate_only-dominated workload benefits from the
+    // dedicated binary-watch fast path (−6.8 % TTC measured on n=26).
+    // Apart/together regress ~8 % because they clone the template
+    // solver per candidate and GJ-equality binaries cross the
+    // bin/general watch split, so we opt in from sync specifically
+    // rather than flipping the default.
+    solver.config.bin_watch_fastpath = true;
 
     // BDKR Canonical1: X[0]=X[n-1]=Y[0]=Y[n-1]=Z[0]=W[0]=+1.
     solver.add_clause([x_var(0)]);
@@ -354,6 +391,14 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     let mut next_aux: i32 = (3 * n + m + 1) as i32;
 
     // (ii) A lex-min under reversal: eq_a[j] = (X[j]=X[n-1-j]); chain.
+    //
+    // Attempted K4 gate collapse (Tseitin clauses → native XOR
+    // `y ⊕ a ⊕ b = 1`) regressed sync TTC ~+10% because radical's XOR
+    // propagator has a per-propagate-lit loop that's heavier than
+    // the 2WL blocker-check short-circuit for these simple 3-var
+    // equivalences. The Tseitin clause encoding is kept as-is;
+    // gate-aware propagation is deferred until either XOR propagation
+    // is faster or we have a wider gate to collapse.
     let mut eq_a: Vec<Option<i32>> = vec![None; n];
     for j in 1..n {
         let mirror = n - 1 - j;
@@ -493,6 +538,40 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
         solver.add_quad_pb_eq(&lits_a, &lits_b, &coeffs, target);
     }
 
+    // SCC equivalence preprocessing on the binary implication graph.
+    // Strongly-connected components in the implication graph are
+    // logically-equivalent literals; substituting them out shrinks
+    // the formula. radical exposes this but neither sync nor any
+    // other entry point currently calls it.
+    let _scc_eliminated = solver.preprocess_scc_equivalences();
+
+    // BVE preprocessing — eliminate Tseitin aux vars where possible,
+    // but protect walker vars (1..=4n) since they're used as
+    // assumption literals in push_assume_frame.
+    let protected: Vec<usize> = (0..4 * n).collect();  // 0-based var idx
+    let _bve_eliminated = solver.preprocess_bve_with_protection(&protected);
+
+    // Compact the clause arena after preprocessing. BVE / SCC leave
+    // holes in `clause_lits` + `clause_meta` as clauses get marked
+    // deleted; compaction physically removes them and shrinks the
+    // per-literal watch lists. One-time cost; frees memory in the
+    // template solver that would otherwise be re-cloned per worker.
+    // Typical reduction on n=26: ~53 clauses freed of ~290 (18 %).
+    let _compacted = solver.compact_arena();
+
+    // Backbone scan: for each unassigned walker variable (1..=4n),
+    // try both polarities; if one conflicts at level 0 the other is
+    // installed as a level-0 fact. Kissat-style preprocessing;
+    // extension of radical's existing probe() to run systematically
+    // over all walker vars, not just the activity-top-200.
+    // Backbone scan: for each unassigned walker variable (1..=4n),
+    // try both polarities; if one conflicts at level 0 the other is
+    // installed as a level-0 fact. Kissat-style preprocessing.
+    // Scanning all vars (including aux Tseitin) gave the same TTC
+    // (~4.40e6s) since aux vars have no additional backbone facts
+    // beyond what propagating walker-forced lits already installs.
+    let _backbone = solver.backbone_scan(4 * n);
+
     solver
 }
 
@@ -509,7 +588,12 @@ fn var_for(kind: u8, pos: usize, n: usize) -> i32 {
 /// Harvest all boundary bit values currently forced by the solver.
 /// Writes into `state.bits`; returns `true` if any new bit became forced
 /// since this state was constructed.
-fn harvest_forced(solver: &radical::Solver, state: &mut State, ctx: &Ctx) {
+/// Pull SAT-forced walker-var values from the solver into `state.bits`.
+/// Returns the number of bits newly set (caller can use this to skip
+/// `rebuild_sums` when zero — state.sums remains consistent in that
+/// case).
+fn harvest_forced(solver: &radical::Solver, state: &mut State, ctx: &Ctx) -> usize {
+    let mut newly_set = 0usize;
     for kind in 0u8..4 {
         let xy_len = kind_xy_len(kind, ctx.n, ctx.m);
         for pos in 0..xy_len {
@@ -517,7 +601,50 @@ fn harvest_forced(solver: &radical::Solver, state: &mut State, ctx: &Ctx) {
             let var = var_for(kind, pos, ctx.n);
             if let Some(b) = solver.value(var) {
                 state.set_bit(kind, pos, if b { 1 } else { -1 });
+                newly_set += 1;
             }
+        }
+    }
+    newly_set
+}
+
+/// Apply ONLY the per-lag sum delta contributed by pairs closing at
+/// `level` whose kind is in `newly_placed`. Assumes `state.sums`
+/// already reflects contributions for closure_events[`level`] events
+/// whose kind was NOT newly placed at this iteration (those were
+/// already counted in the parent rebuild, e.g. if harvest_forced set
+/// the bit before this level). O(|closure_events[level]|) —
+/// avoids the full O(total events) rebuild per candidate.
+///
+/// Soundness invariant (debug_assert'd): when `newly_placed[kind]` is
+/// true, every event in `closure_events[level]` of that kind has both
+/// endpoints set in `state.bits`. The "max-level" endpoint is
+/// `pos_order[level]` (just placed by us), and the "earlier" endpoint
+/// is at some level < `level` (placed by an ancestor or harvested).
+fn apply_sum_delta_at(
+    state: &mut State,
+    ctx: &Ctx,
+    level: usize,
+    newly_placed: &[bool; 4],
+) {
+    if level >= ctx.depth { return; }
+    let events = &ctx.closure_events[level];
+    let ranges = &ctx.closure_events_kind_ranges[level];
+    for k in 0u8..4 {
+        if !newly_placed[k as usize] { continue; }
+        let (start, end) = ranges[k as usize];
+        // Slice over the contiguous run for this kind.
+        for ev in &events[start as usize .. end as usize] {
+            let a_sign = state.bit(ev.kind, ev.pos_a);
+            let b_sign = state.bit(ev.kind, ev.pos_b);
+            debug_assert!(
+                a_sign != 0 && b_sign != 0,
+                "apply_sum_delta_at: unset endpoint at level={} kind={} pos_a={} pos_b={}",
+                level, ev.kind, ev.pos_a, ev.pos_b,
+            );
+            let a = if a_sign == 1 { 1i16 } else { -1 };
+            let b = if b_sign == 1 { 1i16 } else { -1 };
+            state.sums[ev.lag] += (a * b) * ev.abs_coeff;
         }
     }
 }
@@ -543,27 +670,6 @@ fn rebuild_sums(state: &mut State, ctx: &Ctx) {
             let b = if b_sign == 1 { 1i16 } else { -1 };
             state.sums[ev.lag] += (a * b) * ev.abs_coeff;
         }
-    }
-}
-
-/// Delta-apply closure events at a single level, restricted to kinds
-/// that were just newly placed at pos_order[level]. Parent sums at
-/// level L already scanned closure_events[L]; for a kind whose bit at
-/// pos_order[L] was harvest-pinned *before* this candidate loop, the
-/// pair was already counted. We must only add contributions for kinds
-/// that went from 0 → set in this speculative step. `placed_kind_mask`
-/// is the 4-bit mask of such kinds.
-/// Cost: O(|closure_events[level]|).
-fn apply_level_delta(state: &mut State, ctx: &Ctx, level: usize, placed_kind_mask: u8) {
-    if level >= ctx.depth || placed_kind_mask == 0 { return; }
-    for ev in &ctx.closure_events[level] {
-        if (placed_kind_mask >> ev.kind) & 1 == 0 { continue; }
-        let a_sign = state.bit(ev.kind, ev.pos_a);
-        let b_sign = state.bit(ev.kind, ev.pos_b);
-        if a_sign == 0 || b_sign == 0 { continue; }
-        let a = if a_sign == 1 { 1i16 } else { -1 };
-        let b = if b_sign == 1 { 1i16 } else { -1 };
-        state.sums[ev.lag] += (a * b) * ev.abs_coeff;
     }
 }
 
@@ -672,6 +778,19 @@ fn compute_sigma(state: &State, ctx: &Ctx) -> (i32, i32, i32, i32, usize, usize,
 /// `(target - σ) ≡ free (mod 2)` (each remaining ±1 flips σ by 2).
 fn tuple_reachable(state: &State, ctx: &Ctx) -> bool {
     let (sx, sy, sz, sw, fx, fy, fz, fw) = compute_sigma(state, ctx);
+    tuple_reachable_args(ctx, sx, sy, sz, sw, fx, fy, fz, fw)
+}
+
+/// Same as `tuple_reachable` but takes pre-computed sigma/free directly.
+/// Used by the candidate-building speculative loop to avoid the
+/// O(4n) `compute_sigma` scan per choice (S6 — caller maintains
+/// parent sigma + applies a 4-element delta).
+#[inline]
+fn tuple_reachable_args(
+    ctx: &Ctx,
+    sx: i32, sy: i32, sz: i32, sw: i32,
+    fx: usize, fy: usize, fz: usize, fw: usize,
+) -> bool {
     let dx_max = fx as i32; let px = fx & 1;
     let dy_max = fy as i32; let py = fy & 1;
     let dz_max = fz as i32; let pz = fz & 1;
@@ -1364,10 +1483,10 @@ fn dfs_body(
         .saturating_sub(state.trail0_size + state.assumptions.len());
 
     // Pull peer clauses from the shared exchange every 256 nodes.
-    // Cheap: one Mutex lock + index compare + a handful of add_clause
-    // calls. add_clause is safe mid-search because the walker operates
-    // at decision level 0 between dfs() frames (propagate_only
-    // backtracks on every entry/exit).
+    // R10: peer-clause import via add_clause_deferred — safe at any
+    // decision level (no immediate propagation, dropped on
+    // unit-conflict). Restores per-depth peer-sharing that R1's
+    // current_decision_level() == 0 gate had to suppress.
     if stats.nodes_visited & 0xFF == 0 {
         if let Some(ex) = &ctx.exchange {
             let local_next = stats.peer_clauses_read as usize;
@@ -1378,12 +1497,19 @@ fn dfs_body(
                     stats.peer_clauses_read = v.len() as u64;
                     drop(v);
                     for clause in pending {
-                        solver.add_clause(clause);
+                        solver.add_clause_deferred(&clause);
                         stats.peer_clauses_imported += 1;
                     }
                 }
             }
         }
+    }
+    // Periodically reduce the learnt clause DB so it doesn't grow
+    // unbounded under sync's many push_assume_frame UNSATs (which
+    // each install a learnt nogood when filtered.len() ≥ 2).
+    // Trigger every 4096 nodes — well above the per-node cost.
+    if stats.nodes_visited & 0xFFF == 0 {
+        solver.reduce_db();
     }
 
     if state.level >= ctx.depth {
@@ -1430,6 +1556,13 @@ fn dfs_body(
     }
     let mut candidates: Vec<Cand> = Vec::with_capacity(16);
 
+    // R8: capture the parent sums once before the speculative choice
+    // loop. Each choice's "advance to level+1" is represented as
+    // `apply_sum_delta_at(level)` on top of the parent sums, and the
+    // rollback is a cheap `copy_from_slice(&parent_sums)` instead of a
+    // full `rebuild_sums` over all prior levels' closure events.
+    let spec_parent_sums = state.sums.clone();
+
     for choice in 0u8..16 {
         if !has_w && (choice & 1) != 0 { continue; }  // W bit must be 0 (ignored)
         let bx = if (choice >> 3) & 1 == 0 { 1i8 } else { -1 };
@@ -1464,31 +1597,39 @@ fn dfs_body(
         // Speculatively update sums for pairs closing at this level
         // using the placed bits. We don't call the solver yet — capacity
         // check first (cheap).
+        // Stack-allocated saved bits (≤4 placements per choice — fits
+        // in the same pattern as `placed` itself). Avoids the
+        // per-choice Vec allocation that the choice loop's high
+        // iteration count would otherwise pay 16× per node.
+        let mut saved_bits: [(u8, usize, u8); 4] = [(0, 0, 0); 4];
+        for k in 0..np as usize {
+            let (ki, pi, _) = placed[k];
+            saved_bits[k] = (ki, pi, state.bit(ki, pi));
+        }
+        // R8: kinds whose bit at pos_order[level] was 0 before this
+        // choice — i.e. newly placed NOW. The parent's rebuild_sums
+        // already counted closure_events[saved_level] events for kinds
+        // whose bit was set by harvest (not in placed[]); this set
+        // filters out those so we don't double-count.
+        let mut newly_placed = [false; 4];
+        for k in 0..np as usize {
+            let (ki, _, _) = placed[k];
+            newly_placed[ki as usize] = true;
+        }
         //
-        // Delta-based: snapshot sums once, apply only the new pair
+        // Delta-based (originally ours, independently landed on main
+        // at edea0ca): snapshot sums once, apply only the new pair
         // closures at `saved_level`, restore on rollback. Avoids
         // re-scanning closure_events[0..level] twice per candidate.
-        let saved_bits: Vec<(u8, usize, u8)> = (0..np as usize)
-            .map(|k| {
-                let (ki, pi, _) = placed[k];
-                (ki, pi, state.bit(ki, pi))
-            })
-            .collect();
         for k in 0..np as usize {
             let (ki, pi, si) = placed[k];
             state.set_bit(ki, pi, si);
         }
         let saved_level = state.level;
         state.level += 1;
-        let sums_snapshot: Vec<i16> = state.sums.clone();
-        // Build mask of newly-placed kinds; only these contribute to
-        // the delta (bits pre-pinned by harvest_forced were already
-        // counted in the parent's sums).
-        let mut placed_kind_mask: u8 = 0;
-        for k in 0..np as usize {
-            placed_kind_mask |= 1 << placed[k].0;
-        }
-        apply_level_delta(state, ctx, saved_level, placed_kind_mask);
+        // R8: delta on advance (only for newly-placed kinds), restore
+        // parent sums from snapshot on rollback.
+        apply_sum_delta_at(state, ctx, saved_level, &newly_placed);
         let violated = capacity_violated(state, ctx);
         // Early hopelessness: no valid Phase-A tuple is reachable from
         // the partial sums + remaining free-bit budget. Independent of
@@ -1512,12 +1653,13 @@ fn dfs_body(
 
         // Rollback speculative state.
         state.level = saved_level;
-        for (ki, pi, old_sign) in &saved_bits {
-            state.bits[(*ki as usize) * ctx.n + pi] = *old_sign;
+        for k in 0..np as usize {
+            let (ki, pi, old_sign) = saved_bits[k];
+            state.bits[(ki as usize) * ctx.n + pi] = old_sign;
         }
-        // Restore sums from the pre-delta snapshot (O(n)) instead of
-        // re-scanning the full closure history (O(level × n)).
-        state.sums.copy_from_slice(&sums_snapshot);
+        // R8: restore parent sums from the pre-loop snapshot
+        // (O(n)) instead of a full rebuild (O(total events)).
+        state.sums.copy_from_slice(&spec_parent_sums);
 
         if violated {
             stats.capacity_rejects += 1;
@@ -1614,43 +1756,52 @@ fn dfs_body(
         state.assumptions.truncate(saved_assum_len);
         state.rule_state = saved_rule_state;
 
+        // R8b: collect newly-placed kinds (same logic as candidate
+        // building) so the post-set_bit delta-apply doesn't double
+        // count events whose kind was set by harvest_forced before
+        // this dfs_body entry (those contributions are already in
+        // saved_sums).
+        let mut sib_newly_placed = [false; 4];
+        for k in 0..cand.num_placed as usize {
+            let (ki, _, _) = cand.placed_signs[k];
+            sib_newly_placed[ki as usize] = true;
+        }
         for k in 0..cand.num_placed as usize {
             let (ki, pi, si) = cand.placed_signs[k];
             state.set_bit(ki, pi, si);
         }
         state.assumptions.extend_from_slice(&cand.new_assums[..cand.num_new_assums as usize]);
-        let commit_parent_level = state.level;
+        let sib_saved_level = state.level;
         state.level += 1;
         state.rule_state = cand.rule_state;
-        // sums was just copied from parent snapshot; delta applies only
-        // to pairs whose pos_order[L] endpoint was newly placed.
-        let mut commit_kind_mask: u8 = 0;
-        for k in 0..cand.num_placed as usize {
-            commit_kind_mask |= 1 << cand.placed_signs[k].0;
-        }
-        apply_level_delta(state, ctx, commit_parent_level, commit_kind_mask);
+        // R8b: delta replaces full rebuild_sums(state, ctx) here.
+        // state.sums starts at saved_sums (post-harvest at entry
+        // level); the only events that newly fire at level
+        // sib_saved_level are those involving kinds we just placed.
+        apply_sum_delta_at(state, ctx, sib_saved_level, &sib_newly_placed);
         processed_count += 1;
 
-        // Per-level SAT call: propagate_only (no CDCL decisions,
-        // so cost is proportional to new propagation work). On
-        // UNSAT the solver installs a full-assumption nogood that
-        // short-circuits future calls with the same prefix.
+        // R1: Incremental assumption propagation.
         //
-        // Note: a per-worker signature-keyed memo was tried here and
-        // measured memo_hits=0 on every benchmark (n=18, 22, 26) —
-        // each DFS path has a unique (level, sums, walker_bits)
-        // signature, so the memo never fires. Removed to save the
-        // compute_signature + hash cost per accepted candidate.
-        // Capture per-propagator forcings before the call so we can
-        // attribute the delta to the right SAT feature in stats.
-        // prop_by_kind_total[kind] tells us, across the full search,
-        // whether quad PB / XOR / spectral / clause BCP / MDD was the
-        // dominant work source.
+        // Instead of calling `propagate_only(&state.assumptions)` —
+        // which backtracks the solver to level 0 and re-enqueues every
+        // ancestor lit per sibling — we push only this sibling's new
+        // lits as a fresh decision level on top of the existing frame
+        // stack. Ancestor frames' propagation work carries over
+        // unchanged. On UNSAT, `push_assume_frame` has already
+        // backtracked to the parent level and installed the learnt
+        // nogood; on SAT, we must pair with `pop_assume_frame` after
+        // recursion.
+        //
+        // Invariant: at every dfs_body entry, `solver.current_decision_
+        // level() == state.level` (and state.assumptions length
+        // agrees).
         let mut pre_kind = [0u64; radical::PropKind::COUNT];
         for kind in radical::PropKind::ALL {
             pre_kind[kind as usize] = solver.propagations_by_kind(kind);
         }
-        let sat = solver.propagate_only(&state.assumptions);
+        let new_lits = &cand.new_assums[..cand.num_new_assums as usize];
+        let sat = solver.push_assume_frame(new_lits);
         if state.level >= stats.forced_by_level_kind.len() {
             stats.forced_by_level_kind.resize(
                 state.level + 1,
@@ -1679,17 +1830,34 @@ fn dfs_body(
             }
             stats.forced_by_level[state.level] += delta as u64;
 
-            harvest_forced(solver, state, ctx);
-            rebuild_sums(state, ctx);
+            // R8c: skip the full rebuild_sums when harvest_forced
+            // didn't set any new walker bits (state.sums is already
+            // consistent with state.bits in that case). At shallow
+            // levels harvest typically finds 0-1 new bits; this skip
+            // saves an O(L * events) scan per accepted candidate.
+            //
+            // R8d (rejected): also gating harvest itself on `delta > 0`
+            // regressed TTC by ~4% — harvest's pre-set state.bits is
+            // used by the next dfs_body's candidate-building loop to
+            // reject choices that would conflict with SAT-forced bits;
+            // skipping harvest pushes that work into more expensive
+            // push_assume_frame conflicts.
+            let n_harvested = harvest_forced(solver, state, ctx);
+            if n_harvested > 0 {
+                rebuild_sums(state, ctx);
+            }
             // After harvest: many bits beyond the walker frontier
             // may now be set (via rule propagation into the
             // middle). Use the tighter dynamic capacity check
             // which accounts for pairs already fully determined.
-            if !capacity_violated(state, ctx) {
-                if dfs(solver, state, ctx, stats, deadline, found) {
-                    result_override = Some(true);
-                    break;
-                }
+            let found_solution = !capacity_violated(state, ctx)
+                && dfs(solver, state, ctx, stats, deadline, found);
+            // Pop this sibling's frame before moving to the next
+            // sibling. Must be paired with the Some(true) push above.
+            solver.pop_assume_frame();
+            if found_solution {
+                result_override = Some(true);
+                break;
             }
         } else {
             stats.sat_unsat += 1;
@@ -1697,10 +1865,12 @@ fn dfs_body(
             stats.nogood_len_sum += ng as u64;
             stats.full_nogood_len_sum += full as u64;
             // Publish the just-learnt nogood to peer workers, but
-            // only if it's small enough to be useful. Long clauses
-            // (Turyn nogoods are typically ~n lits) rarely fire
-            // via watches and bloat the clause DB, so filter.
-            const MAX_SHARED_LEN: usize = 16;
+            // only if it's small enough to be useful. R10: with
+            // mid-search peer import enabled (add_clause_deferred),
+            // import volume scales with how aggressively we share.
+            // Restrict to very short clauses (Glucose tier-1 proxy)
+            // so watch lists stay lean.
+            const MAX_SHARED_LEN: usize = 2;
             if let Some(ex) = &ctx.exchange {
                 if let Some(clause) = solver.take_last_learnt_clause() {
                     if clause.len() <= MAX_SHARED_LEN {

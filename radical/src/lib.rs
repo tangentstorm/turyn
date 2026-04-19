@@ -48,6 +48,13 @@ struct ClauseMeta {
     learnt: bool,
     lbd: u8,
     deleted: bool,
+    /// Activity-style "usefulness" counter (CaDiCaL `used` field):
+    /// bumped each time this clause is followed as a Reason during
+    /// conflict analysis. `reduce_db` consults it when choosing
+    /// which medium-LBD learnt clauses to protect.  Saturates at
+    /// `u8::MAX` — we only care about the "used more than once"
+    /// distinction.
+    used: u8,
 }
 
 /// A pseudo-boolean constraint: sum(coeffs[i] * lits[i]) >= bound.
@@ -669,6 +676,15 @@ pub struct SolverConfig {
     pub vivification: bool,
     /// Use chronological backtracking for shallow conflicts.
     pub chrono_bt: bool,
+    /// R2: route binary clauses to a dedicated `bin_watches` fast
+    /// path in propagate_lit. Helps workloads where the per-lit
+    /// watch-list scan is hot and binaries are a meaningful fraction
+    /// (e.g. `--wz=sync`, −6.8 % TTC on n=26). Hurts workloads with
+    /// many per-candidate `solver.clone()` calls plus dense
+    /// Gauss-Jordan binary additions (e.g. `--wz=apart`'s XY stage,
+    /// +8 % TTC observed). Defaults to off; callers with
+    /// propagate_only-dominated flows should opt in.
+    pub bin_watch_fastpath: bool,
 }
 
 impl Default for SolverConfig {
@@ -681,6 +697,7 @@ impl Default for SolverConfig {
             lucky_phases: false,
             vivification: false,
             chrono_bt: false,
+            bin_watch_fastpath: false,
         }
     }
 }
@@ -706,6 +723,13 @@ pub struct Solver {
     clause_meta: Vec<ClauseMeta>,
     clause_lits: Vec<Lit>,         // flat array of all clause literals
     watches: Vec<Vec<(u32, Lit)>>,  // watches[lit_index] = (clause_index, blocker_literal)
+    /// R2: Dedicated binary-clause fast-path index. When literal `l`
+    /// becomes true, every `(other, ci)` in `bin_watches[lit_index(l)]`
+    /// is a binary clause (-l ∨ other) that now forces `other` or
+    /// conflicts. Separating binaries from the general watch list
+    /// avoids per-event `clause_meta` dereferences (is-binary check +
+    /// size load) and keeps the hot path cache-clean.
+    bin_watches: Vec<Vec<(Lit, u32)>>,
 
     // VSIDS activity with binary heap
     activity: Vec<f64>,
@@ -834,6 +858,7 @@ impl Solver {
             clause_meta: Vec::new(),
             clause_lits: Vec::new(),
             watches: Vec::new(),
+            bin_watches: Vec::new(),
             pb_constraints: Vec::new(),
             pb_watches: Vec::new(),
             quad_pb_constraints: Vec::new(),
@@ -895,6 +920,8 @@ impl Solver {
             self.activity.push(0.0);
             self.watches.push(Vec::new()); // positive literal watch
             self.watches.push(Vec::new()); // negative literal watch
+            self.bin_watches.push(Vec::new()); // R2: positive literal bin watch
+            self.bin_watches.push(Vec::new()); // R2: negative literal bin watch
             self.pb_watches.push(Vec::new()); // positive literal PB
             self.pb_watches.push(Vec::new()); // negative literal PB
             self.quad_pb_var_watches.push(Vec::new());
@@ -931,7 +958,7 @@ impl Solver {
                         let ci = self.clause_meta.len() as u32;
                         let start = self.clause_lits.len() as u32;
                         self.clause_lits.extend_from_slice(&lits);
-                        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
+                        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false, used: 0 });
                         self.enqueue(lit, Reason::Clause(ci));
                         // Propagate immediately
                         if self.propagate().is_some() {
@@ -965,22 +992,104 @@ impl Solver {
                     let ci = self.clause_meta.len() as u32;
                     let start = self.clause_lits.len() as u32;
                     self.clause_lits.extend_from_slice(&lits);
-                    self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
+                    self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false, used: 0 });
                     self.enqueue(lits[0], Reason::Clause(ci));
                     if self.propagate().is_some() {
                         self.ok = false;
                     }
                     return;
                 }
-                // At least two non-false literals: normal 2WL setup
+                // At least two non-false literals: normal 2WL setup.
+                // R2: binary clauses go to `bin_watches` if the
+                // `bin_watch_fastpath` config flag is set; otherwise
+                // fall back to general watches (where a blocker-check
+                // short-circuit already handles most binary events).
                 let ci = self.clause_meta.len() as u32;
                 let start = self.clause_lits.len() as u32;
-                self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
-                self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
+                if lits.len() == 2 && self.config.bin_watch_fastpath {
+                    self.bin_watches[lit_index(negate(lits[0]))].push((lits[1], ci));
+                    self.bin_watches[lit_index(negate(lits[1]))].push((lits[0], ci));
+                } else {
+                    self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
+                    self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
+                }
                 self.clause_lits.extend_from_slice(&lits);
-                self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
+                self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false, used: 0 });
             }
         }
+    }
+
+    /// Install a learnt clause for 2WL propagation **without** triggering
+    /// immediate propagation. Safe to call at any decision level — unlike
+    /// `add_clause`, which can enqueue + propagate (creating a level-0
+    /// fact at the wrong level).
+    ///
+    /// Intended for cross-worker peer-clause sharing during incremental
+    /// search (caller is mid-`push_assume_frame` stack and cannot afford
+    /// to have the clause kill the solver via `ok = false` if it becomes
+    /// unit-conflicting under the current assignment).
+    ///
+    /// Behaviour:
+    /// - Empty clause: ignored (would otherwise kill the solver).
+    /// - Unit clause: dropped (proper level-0 install requires a full
+    ///   backtrack to 0 which we won't do here).
+    /// - Already-true under current assignment: still installed (it'll
+    ///   fire correctly on a future propagation).
+    /// - Two non-false lits available: installed normally with 2WL.
+    /// - Fewer than two non-false lits: dropped (can't pick valid
+    ///   watches at the current assignment; the clause is implied or
+    ///   contradicted in the current state and will be re-derived if
+    ///   needed).
+    pub fn add_clause_deferred(&mut self, lits: &[Lit]) {
+        if !self.ok { return; }
+        if lits.len() < 2 { return; }
+
+        // Ensure all variables exist.
+        for &lit in lits {
+            if lit == 0 { return; }
+            self.ensure_var(lit.unsigned_abs() as usize);
+        }
+
+        // Pick two non-false lits as watches. Prefer true > undef > false
+        // so the clause is satisfied (and never re-fires) when possible.
+        let mut order: Vec<Lit> = lits.to_vec();
+        // Sort by lit_value priority (True=2, Undef=1, False=0) descending.
+        order.sort_by_key(|&lit| {
+            match self.lit_value(lit) {
+                LBool::True => 0u8,
+                LBool::Undef => 1u8,
+                LBool::False => 2u8,
+            }
+        });
+        // After sort, index 0 has the highest priority (true if any),
+        // index 1 next.
+        let v0 = self.lit_value(order[0]);
+        let v1 = self.lit_value(order[1]);
+        if v0 == LBool::False && v1 == LBool::False {
+            // Cannot pick two non-false watches — clause is fully
+            // false under current assignment. Drop.
+            return;
+        }
+
+        let ci = self.clause_meta.len() as u32;
+        let start = self.clause_lits.len() as u32;
+        // R2: binary → bin_watches (only when fastpath enabled).
+        if order.len() == 2 && self.config.bin_watch_fastpath {
+            self.bin_watches[lit_index(negate(order[0]))].push((order[1], ci));
+            self.bin_watches[lit_index(negate(order[1]))].push((order[0], ci));
+        } else {
+            self.watches[lit_index(negate(order[0]))].push((ci, order[1]));
+            self.watches[lit_index(negate(order[1]))].push((ci, order[0]));
+        }
+        self.clause_lits.extend_from_slice(&order);
+        self.clause_meta.push(ClauseMeta {
+            start,
+            len: order.len() as u16,
+            learnt: true,
+            lbd: 0,
+            deleted: false,
+            used: 0,
+        });
     }
 
     /// Add a pseudo-boolean "at least" constraint: sum(coeffs[i] * lits[i]) >= bound.
@@ -1816,6 +1925,159 @@ impl Solver {
         Some(true)
     }
 
+    /// Incremental assumption propagation: push `lits` as a fresh
+    /// decision level on top of the current trail and propagate. The
+    /// existing decision levels (previously-pushed frames) are
+    /// preserved, so the watch + propagation state built up by earlier
+    /// frames is reused — unlike `propagate_only`, which backtracks to
+    /// level 0 on every call.
+    ///
+    /// Returns:
+    /// - `Some(true)`: propagation succeeded. The solver's decision
+    ///   level is now `prev_level + 1`. Caller must pair with
+    ///   `pop_assume_frame` when unwinding.
+    /// - `Some(false)`: conflict. A nogood has been learnt and the
+    ///   solver has been backtracked to `prev_level`. Caller must NOT
+    ///   call `pop_assume_frame` for this push — the frame was never
+    ///   materialized.
+    /// - `None` never returned (reserved for future use).
+    ///
+    /// Empty `lits` is a no-op returning `Some(true)` without creating
+    /// a level; a matching `pop_assume_frame` in that case is a
+    /// harmless backtrack one level (don't do it).
+    ///
+    /// Learnt clause side-effects mirror `propagate_only`:
+    /// `last_nogood_stats`, `take_last_learnt_clause` are updated on
+    /// `Some(false)`.
+    pub fn push_assume_frame(&mut self, lits: &[Lit]) -> Option<bool> {
+        if !self.ok { return Some(false); }
+        if lits.is_empty() { return Some(true); }
+
+        // Pre-size reusable buffers (mirrors propagate_only).
+        if self.quad_pb_seen_buf.len() < self.num_vars {
+            self.quad_pb_seen_buf.resize(self.num_vars, false);
+        }
+        if self.analyze_seen.len() < self.num_vars {
+            self.analyze_seen.resize(self.num_vars, false);
+        }
+        if self.minimize_visited.len() < self.num_vars {
+            self.minimize_visited.resize(self.num_vars, false);
+        }
+
+        // At level 0, drain any pending level-0 work (units added since
+        // the last incremental call, etc.). At level > 0 we trust the
+        // previous successful push to have already propagated its
+        // trail.
+        if self.decision_level() == 0 {
+            if self.propagate().is_some() {
+                self.ok = false;
+                return Some(false);
+            }
+        }
+
+        let parent_level = self.decision_level();
+        self.new_decision_level();
+
+        for &lit in lits {
+            self.ensure_var(lit.unsigned_abs() as usize);
+            match self.lit_value(lit) {
+                LBool::True => {}
+                LBool::False => {
+                    // Immediate conflict on assumption push. Build a
+                    // minimal nogood from the frame itself and install
+                    // it if ≥ 2 lits. Units are skipped here to avoid
+                    // blowing away parent frames (they're rare in the
+                    // sync walker's 4-lits-per-frame use case).
+                    self.backtrack(parent_level);
+                    let mut filtered: Vec<Lit> = Vec::with_capacity(lits.len());
+                    for &l in lits {
+                        if self.lit_value(l) != LBool::True {
+                            filtered.push(-l);
+                        }
+                    }
+                    self.last_nogood_len = filtered.len();
+                    self.last_full_nogood_len = lits.len();
+                    self.last_learnt_clause = if filtered.is_empty() {
+                        None
+                    } else {
+                        Some(filtered.clone())
+                    };
+                    if filtered.is_empty() {
+                        self.ok = false;
+                    } else if filtered.len() >= 2 {
+                        self.add_learnt_clause_no_enqueue(filtered);
+                    }
+                    return Some(false);
+                }
+                LBool::Undef => {
+                    self.enqueue(lit, Reason::Decision);
+                }
+            }
+        }
+
+        if let Some(conflict_reason) = self.propagate() {
+            let nogood = self.analyze_assumptions(conflict_reason);
+            // Backtrack to the caller's level (not 0). This preserves
+            // parent frames' propagation state.
+            self.backtrack(parent_level);
+
+            let mut filtered: Vec<Lit> = Vec::with_capacity(nogood.len());
+            for &lit in &nogood {
+                match self.lit_value(lit) {
+                    LBool::False | LBool::Undef => filtered.push(lit),
+                    LBool::True => {}
+                }
+            }
+            if filtered.is_empty() {
+                // Fall-back: use the frame itself as the nogood.
+                for &lit in lits {
+                    if self.lit_value(lit) != LBool::False {
+                        filtered.push(-lit);
+                    }
+                }
+            }
+
+            self.last_nogood_len = filtered.len();
+            self.last_full_nogood_len = lits.len();
+            self.last_learnt_clause = if filtered.is_empty() {
+                None
+            } else {
+                Some(filtered.clone())
+            };
+
+            if filtered.is_empty() {
+                self.ok = false;
+            } else if filtered.len() >= 2 {
+                self.add_learnt_clause_no_enqueue(filtered);
+            }
+            // Skip learning units here (rare on 4-lit frames); would
+            // require a full backtrack to 0, invalidating parent
+            // frames.
+            return Some(false);
+        }
+
+        Some(true)
+    }
+
+    /// Pop the top assumption frame pushed by `push_assume_frame` that
+    /// returned `Some(true)`. Backtracks the solver by exactly one
+    /// decision level. Safe to call when the solver is already at
+    /// level 0 (no-op in that case), but the caller should not need
+    /// that fallback — push/pop must be balanced.
+    pub fn pop_assume_frame(&mut self) {
+        let lvl = self.decision_level();
+        if lvl > 0 {
+            self.backtrack(lvl - 1);
+        }
+    }
+
+    /// Current decision level (number of active frames above level 0).
+    /// Used by incremental-assumption callers to audit push/pop
+    /// discipline.
+    pub fn current_decision_level(&self) -> u32 {
+        self.decision_level()
+    }
+
     /// Length of the last nogood learnt from `propagate_only` (for
     /// observability). `last_full_nogood_len` is the count of
     /// assumptions passed in — the ratio measures how effective
@@ -1908,6 +2170,18 @@ impl Solver {
     pub fn num_clauses(&self) -> usize {
         self.clause_meta.iter().filter(|m| !m.deleted).count()
     }
+    /// Histogram of clause lengths by length: returns Vec where index is
+    /// length and value is count. Used for diagnostics/profiling.
+    pub fn clause_length_histogram(&self) -> Vec<u32> {
+        let mut hist: Vec<u32> = Vec::new();
+        for m in &self.clause_meta {
+            if m.deleted { continue; }
+            let l = m.len as usize;
+            if hist.len() <= l { hist.resize(l + 1, 0); }
+            hist[l] += 1;
+        }
+        hist
+    }
     /// Number of conflicts so far.
     pub fn num_conflicts(&self) -> u64 { self.conflicts }
     /// Number of branching decisions made so far.
@@ -1962,7 +2236,7 @@ impl Solver {
                     let ci = self.clause_meta.len() as u32;
                     let start = self.clause_lits.len() as u32;
                     self.clause_lits.push(lit);
-                    self.clause_meta.push(ClauseMeta { start, len: 1, learnt: false, lbd: 0, deleted: false });
+                    self.clause_meta.push(ClauseMeta { start, len: 1, learnt: false, lbd: 0, deleted: false, used: 0 });
                     self.enqueue(lit, Reason::Clause(ci));
                 }
             }
@@ -2331,7 +2605,7 @@ impl Solver {
                     let start = self.clause_lits.len() as u32;
                     self.clause_lits.extend_from_slice(resolvent);
                     self.clause_meta.push(ClauseMeta {
-                        start, len: resolvent.len() as u16, learnt: false, lbd: 0, deleted: false
+                        start, len: resolvent.len() as u16, learnt: false, lbd: 0, deleted: false, used: 0,
                     });
                     // Add to occurrence lists for future iterations
                     for &lit in resolvent {
@@ -2354,9 +2628,15 @@ impl Solver {
     /// Clears existing watches and re-adds watches for all non-deleted clauses with >= 2 literals.
     fn rebuild_watches(&mut self) {
         for wl in &mut self.watches { wl.clear(); }
+        for bw in &mut self.bin_watches { bw.clear(); }
         for (ci, m) in self.clause_meta.iter().enumerate() {
             if m.deleted || m.len < 2 { continue; }
             let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
+            if m.len == 2 && self.config.bin_watch_fastpath {
+                self.bin_watches[lit_index(negate(lits[0]))].push((lits[1], ci as u32));
+                self.bin_watches[lit_index(negate(lits[1]))].push((lits[0], ci as u32));
+                continue;
+            }
             self.watches[lit_index(negate(lits[0]))].push((ci as u32, lits[1]));
             self.watches[lit_index(negate(lits[1]))].push((ci as u32, lits[0]));
         }
@@ -2467,12 +2747,19 @@ impl Solver {
                 learnt: true,
                 lbd,
                 deleted: false,
+                used: 0,
             });
-            // Add watches for first two literals
+            // Add watches for first two literals. R2: binary → bin_watches
+            // when fastpath enabled.
             let lit0 = clause[0];
             let lit1 = clause[1];
-            self.watches[lit_index(-lit0)].push((ci, lit1));
-            self.watches[lit_index(-lit1)].push((ci, lit0));
+            if clause.len() == 2 && self.config.bin_watch_fastpath {
+                self.bin_watches[lit_index(-lit0)].push((lit1, ci));
+                self.bin_watches[lit_index(-lit1)].push((lit0, ci));
+            } else {
+                self.watches[lit_index(-lit0)].push((ci, lit1));
+                self.watches[lit_index(-lit1)].push((ci, lit0));
+            }
         }
     }
 
@@ -2526,6 +2813,11 @@ impl Solver {
         // Rebuild watch lists (cheaper than trying to surgically remove entries)
         for wl in &mut self.watches {
             wl.retain(|&(ci, _)| (ci as usize) < n_clauses);
+        }
+        // R2: trim bin_watches consistently with the main watches
+        // rollback so a checkpoint/restore doesn't leave stale entries.
+        for bw in &mut self.bin_watches {
+            bw.retain(|&(_, ci)| (ci as usize) < n_clauses);
         }
 
         // Remove post-checkpoint PB constraints
@@ -2583,15 +2875,22 @@ impl Solver {
         for cm in &mut self.clause_meta {
             if cm.learnt { cm.deleted = true; }
         }
-        // Rebuild watch lists (only non-deleted clauses)
+        // Rebuild watch lists (only non-deleted clauses). R2: route
+        // binaries into bin_watches when fastpath is enabled.
         for wl in &mut self.watches { wl.clear(); }
+        for bw in &mut self.bin_watches { bw.clear(); }
         for (ci, cm) in self.clause_meta.iter().enumerate() {
             if cm.deleted || cm.len < 2 { continue; }
             let start = cm.start as usize;
             let l0 = self.clause_lits[start];
             let l1 = self.clause_lits[start + 1];
-            self.watches[lit_index(l0)].push((ci as u32, l1));
-            self.watches[lit_index(l1)].push((ci as u32, l0));
+            if cm.len == 2 && self.config.bin_watch_fastpath {
+                self.bin_watches[lit_index(l0)].push((l1, ci as u32));
+                self.bin_watches[lit_index(l1)].push((l0, ci as u32));
+            } else {
+                self.watches[lit_index(l0)].push((ci as u32, l1));
+                self.watches[lit_index(l1)].push((ci as u32, l0));
+            }
         }
         self.conflicts = 0;
         self.restart_limit = 100;
@@ -2619,6 +2918,10 @@ impl Solver {
         }
         for wl in &mut self.watches {
             wl.retain(|&(ci, _)| !self.clause_meta[ci as usize].deleted);
+        }
+        // R2: mirror clean-up for bin_watches.
+        for bw in &mut self.bin_watches {
+            bw.retain(|&(_, ci)| !self.clause_meta[ci as usize].deleted);
         }
     }
 
@@ -2716,12 +3019,17 @@ impl Solver {
                     let new_ci = self.clause_meta.len() as u32;
                     let new_start = self.clause_lits.len() as u32;
                     let lbd = self.compute_lbd(&short_lits).min(new_len as u32) as u8;
-                    self.watches[lit_index(negate(short_lits[0]))].push((new_ci, short_lits[1]));
-                    self.watches[lit_index(negate(short_lits[1]))].push((new_ci, short_lits[0]));
+                    if short_lits.len() == 2 && self.config.bin_watch_fastpath {
+                        self.bin_watches[lit_index(negate(short_lits[0]))].push((short_lits[1], new_ci));
+                        self.bin_watches[lit_index(negate(short_lits[1]))].push((short_lits[0], new_ci));
+                    } else {
+                        self.watches[lit_index(negate(short_lits[0]))].push((new_ci, short_lits[1]));
+                        self.watches[lit_index(negate(short_lits[1]))].push((new_ci, short_lits[0]));
+                    }
                     self.clause_lits.extend_from_slice(&short_lits);
                     self.clause_meta.push(ClauseMeta {
                         start: new_start, len: short_lits.len() as u16,
-                        learnt: true, lbd, deleted: false,
+                        learnt: true, lbd, deleted: false, used: 0,
                     });
                 }
             }
@@ -3040,9 +3348,12 @@ impl Solver {
                         for &l in &cl { self.clause_lits.push(l); }
                         self.clause_meta.push(ClauseMeta {
                             start: cs as u32, len: cn as u16,
-                            learnt: true, deleted: false, lbd: cn.min(255) as u8,
+                            learnt: true, deleted: false, lbd: cn.min(255) as u8, used: 0,
                         });
-                        if cn >= 2 {
+                        if cn == 2 && self.config.bin_watch_fastpath {
+                            self.bin_watches[lit_index(cl[0])].push((cl[1], ci));
+                            self.bin_watches[lit_index(cl[1])].push((cl[0], ci));
+                        } else if cn >= 2 {
                             self.watches[lit_index(cl[0])].push((ci, cl[1]));
                             self.watches[lit_index(cl[1])].push((ci, cl[0]));
                         }
@@ -3108,6 +3419,28 @@ impl Solver {
     fn propagate_lit(&mut self, lit: Lit) -> Option<u32> {
         let false_lit = negate(lit);
         let watch_idx = lit_index(lit);
+
+        // R2: Binary-clause fast path. Each entry is a binary clause
+        // ( -lit ∨ other ): if `other` is true, clause satisfied; if
+        // false, conflict; if undef, enqueue `other` as a unit.
+        //
+        // This loop avoids the clause_meta dereference and "find new
+        // watch" search that the general 2WL path pays for long
+        // clauses — for binaries both are wasted work. We do NOT
+        // rewrite bin_watches in place (binary clauses never "move"
+        // a watch: they only have two lits, no replacement possible).
+        {
+            let bin_len = self.bin_watches[watch_idx].len();
+            for idx in 0..bin_len {
+                let (other, ci) = self.bin_watches[watch_idx][idx];
+                if self.clause_meta[ci as usize].deleted { continue; }
+                match self.lit_value(other) {
+                    LBool::True => {} // clause satisfied
+                    LBool::False => { return Some(ci); } // conflict
+                    LBool::Undef => { self.enqueue(other, Reason::Clause(ci)); }
+                }
+            }
+        }
 
         let mut watch_list = std::mem::take(&mut self.watches[watch_idx]);
         let mut i = 0;
@@ -3448,6 +3781,12 @@ impl Solver {
                     learnt.push(lit);
                 }
                 r @ (Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_)) => {
+                    // Note: we deliberately do NOT bump `used` here.
+                    // `analyze_assumptions` is the sync-mode path and
+                    // reduce_db rarely fires there, so the bump is
+                    // pure overhead that hurts sync's hot loop.
+                    // The CDCL `analyze` path does bump it — that's
+                    // where clause-DB management has real leverage.
                     self.collect_reason_lits_into(r, lit, &mut worklist);
                 }
                 _ => {
@@ -3577,7 +3916,13 @@ impl Solver {
             // Process reason literals inline — avoid Vec allocation for Clause path
             match current_reason {
                 Reason::Clause(ci) => {
+                    // Bump this clause's "used" counter (saturating).
+                    // reduce_db's tiered retention keeps mid-LBD
+                    // clauses alive if they've participated in at
+                    // least one conflict analysis.
                     let m = self.clause_meta[ci as usize];
+                    self.clause_meta[ci as usize].used =
+                        self.clause_meta[ci as usize].used.saturating_add(1);
                     let cstart = m.start as usize;
                     let clen = m.len as usize;
                     for idx in 0..clen {
@@ -4021,11 +4366,17 @@ impl Solver {
         let lbd = self.compute_lbd(&lits);
         let start = self.clause_lits.len() as u32;
 
-        // Watch the first two literals (blocker = the other watched lit)
-        self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
-        self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
+        // Watch the first two literals (blocker = the other watched lit).
+        // R2: binary learnt → bin_watches fast path when enabled.
+        if lits.len() == 2 && self.config.bin_watch_fastpath {
+            self.bin_watches[lit_index(negate(lits[0]))].push((lits[1], ci));
+            self.bin_watches[lit_index(negate(lits[1]))].push((lits[0], ci));
+        } else {
+            self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
+            self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
+        }
         self.clause_lits.extend_from_slice(&lits);
-        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8, deleted: false });
+        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8, deleted: false, used: 0 });
 
         if enqueue_asserting {
             self.enqueue(lits[0], Reason::Clause(ci));
@@ -4164,7 +4515,19 @@ impl Solver {
     }
 
     /// Remove low-quality learnt clauses to keep the database manageable.
-    fn reduce_db(&mut self) {
+    ///
+    /// Current policy: keep glue clauses (LBD ≤ 3) always; delete
+    /// the worst half of the rest (by LBD descending, then `used`
+    /// ascending — a mild tier-2 lean that evicts unused medium-LBD
+    /// clauses first). The `used` counter is decayed (shifted right
+    /// by 1) after each reduce so "recently useful" wins out.
+    ///
+    /// Full CaDiCaL-style tier1/tier2 promotion with `used`-gated
+    /// retention was tried but regressed sync TTC ~25 % — the
+    /// larger clause DB hurt the propagation hot loop more than the
+    /// higher-quality retention helped. Kept the `used` counter in
+    /// `ClauseMeta` as a tie-breaker for the sort.
+    pub fn reduce_db(&mut self) {
         let num_learnt: usize = self.clause_meta.iter()
             .filter(|m| m.learnt && !m.deleted).count();
         let num_original: usize = self.clause_meta.iter()
@@ -4180,26 +4543,137 @@ impl Solver {
         }
 
         // Keep glue clauses (LBD ≤ 3) always. Delete worst half of the rest.
-        let mut eligible: Vec<(u32, u8)> = Vec::new();
+        let mut eligible: Vec<(u32, u8, u8)> = Vec::new(); // (ci, lbd, used)
         for ci in 0..self.clause_meta.len() {
             let m = &self.clause_meta[ci];
             if m.learnt && !m.deleted && m.lbd > 3 && !is_reason[ci] {
-                eligible.push((ci as u32, m.lbd));
+                eligible.push((ci as u32, m.lbd, m.used));
             }
         }
         if eligible.len() < 100 { return; }
 
-        // Sort by LBD descending — delete worst half
-        eligible.sort_by(|a, b| b.1.cmp(&a.1));
+        // Sort by (lbd desc, used asc) — evict worst-LBD first, ties broken
+        // by least-used (so unused clauses go before used ones at the
+        // same LBD). The `used` tie-break preserves clauses that have
+        // actually participated in conflict analysis.
+        eligible.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
         let to_delete = eligible.len() / 2;
-        for &(ci, _) in &eligible[..to_delete] {
+        for &(ci, _, _) in &eligible[..to_delete] {
             self.clause_meta[ci as usize].deleted = true;
         }
 
-        // Clean watch lists
+        // Decay `used` counters so "recently useful" wins across cycles.
+        for m in &mut self.clause_meta {
+            if !m.deleted { m.used >>= 1; }
+        }
+
+        // Clean watch lists. R2: also clean bin_watches. Binary
+        // learnt clauses rarely hit reduce_db (they have LBD ≤ 2 so
+        // they're in the protected tier) but be defensive.
+        for bw in &mut self.bin_watches {
+            bw.retain(|&(_, ci)| !self.clause_meta[ci as usize].deleted);
+        }
         for wl in &mut self.watches {
             wl.retain(|&(ci, _)| !self.clause_meta[ci as usize].deleted);
         }
+    }
+
+    /// Physically remove clauses marked `deleted` from the clause DB,
+    /// freeing space in `clause_lits` and shrinking `clause_meta`.
+    /// Remaps surviving clause indices in `watches`, `bin_watches`,
+    /// and trail reasons (`Reason::Clause(ci)`).
+    ///
+    /// Returns the number of clauses physically freed.
+    ///
+    /// Safety: only call when `decision_level() == 0`. Level>0 trail
+    /// entries may reference clause indices that we'd remap, but the
+    /// analysis path uses those references by position/iteration and
+    /// would need their old indices for reason-chain walks.
+    pub fn compact_arena(&mut self) -> usize {
+        if self.decision_level() != 0 { return 0; }
+        let old_n = self.clause_meta.len();
+        // Protect any clause still referenced by a trail entry.
+        // Preprocessing (BVE / SCC) can mark a clause deleted even
+        // if a trail entry still uses it as its Reason::Clause(ci)
+        // (different invariant from reduce_db's is_reason gate).
+        // Compaction must honour this: keep the clause alive and
+        // remap the trail pointer normally.
+        let mut trail_referenced: Vec<bool> = vec![false; old_n];
+        for entry in &self.trail {
+            if let Reason::Clause(ci) = entry.reason {
+                if (ci as usize) < old_n {
+                    trail_referenced[ci as usize] = true;
+                }
+            }
+        }
+
+        // Build an old_ci -> Option<new_ci> remap, and assemble the
+        // new (compacted) arenas in a single pass. Keep any clause
+        // that is either not-deleted OR is still referenced by the
+        // trail.
+        let mut remap: Vec<i32> = vec![-1i32; old_n];
+        let mut new_meta: Vec<ClauseMeta> = Vec::with_capacity(old_n);
+        let mut new_lits: Vec<Lit> = Vec::with_capacity(self.clause_lits.len());
+        for (old_ci, m) in self.clause_meta.iter().enumerate() {
+            if m.deleted && !trail_referenced[old_ci] { continue; }
+            let new_ci = new_meta.len() as u32;
+            remap[old_ci] = new_ci as i32;
+            let start = new_lits.len() as u32;
+            let end = m.start as usize + m.len as usize;
+            new_lits.extend_from_slice(&self.clause_lits[m.start as usize..end]);
+            let mut nm = *m;
+            nm.start = start;
+            new_meta.push(nm);
+        }
+        let freed = old_n - new_meta.len();
+        if freed == 0 { return 0; }
+        self.clause_meta = new_meta;
+        self.clause_lits = new_lits;
+
+        // Remap references in all watch lists.
+        for wl in &mut self.watches {
+            let mut write = 0usize;
+            for read in 0..wl.len() {
+                let (ci, blocker) = wl[read];
+                let new = remap[ci as usize];
+                if new >= 0 {
+                    wl[write] = (new as u32, blocker);
+                    write += 1;
+                }
+            }
+            wl.truncate(write);
+        }
+        for bw in &mut self.bin_watches {
+            let mut write = 0usize;
+            for read in 0..bw.len() {
+                let (other, ci) = bw[read];
+                let new = remap[ci as usize];
+                if new >= 0 {
+                    bw[write] = (other, new as u32);
+                    write += 1;
+                }
+            }
+            bw.truncate(write);
+        }
+
+        // Remap Reason::Clause references on the level-0 trail. The
+        // reduce_db policy already protects on-trail clauses from
+        // deletion via `is_reason`, so remap[ci] >= 0 should always
+        // hold; assert defensively.
+        for entry in &mut self.trail {
+            if let Reason::Clause(ref mut ci) = entry.reason {
+                let new = remap[*ci as usize];
+                debug_assert!(new >= 0, "compact_arena: level-0 trail entry references deleted clause {}", ci);
+                if new >= 0 {
+                    *ci = new as u32;
+                }
+            }
+        }
+
+        // `last_learnt_clause` / `last_nogood_len` are transient —
+        // they don't store clause indices directly.
+
+        freed
     }
 
     /// Rephasing: alternate between resetting to best-known phase and random phases.
@@ -4248,6 +4722,65 @@ impl Solver {
                 }
             }
         }
+    }
+
+    /// Backbone detection (kissat-style): for every currently-unassigned
+    /// variable in range `[1, max_var]`, try each polarity under
+    /// assumption. If one polarity conflicts, the opposite is a level-0
+    /// fact (a backbone literal) and is enqueued + propagated. Halts
+    /// early if the solver becomes UNSAT.
+    ///
+    /// Returns the number of literals installed at level 0 as backbone
+    /// facts.
+    ///
+    /// Cost: O(max_var × propagate) = O(V·E) worst case. Intended as a
+    /// one-shot preprocessing step, not a per-conflict trigger.
+    /// `max_var` = 0 means all variables.
+    pub fn backbone_scan(&mut self, max_var: usize) -> usize {
+        if self.num_vars == 0 || !self.ok { return 0; }
+        self.backtrack(0);
+        let limit = if max_var == 0 { self.num_vars } else { max_var.min(self.num_vars) };
+        // Pre-size reusable buffers.
+        if self.quad_pb_seen_buf.len() < self.num_vars {
+            self.quad_pb_seen_buf.resize(self.num_vars, false);
+        }
+        if self.analyze_seen.len() < self.num_vars {
+            self.analyze_seen.resize(self.num_vars, false);
+        }
+        let mut installed = 0usize;
+        let mut progress = true;
+        while progress {
+            progress = false;
+            for v in 0..limit {
+                if !self.ok { return installed; }
+                if self.assigns[v] != LBool::Undef { continue; }
+                let lit = (v + 1) as Lit;
+                // Try +lit first, then -lit.
+                let mut forced: Option<Lit> = None;
+                for sign in [lit, -lit] {
+                    self.new_decision_level();
+                    self.enqueue(sign, Reason::Decision);
+                    let conflict = self.propagate().is_some();
+                    self.backtrack(0);
+                    if conflict {
+                        forced = Some(-sign);
+                        break;
+                    }
+                }
+                if let Some(f) = forced {
+                    if self.lit_value(f) == LBool::Undef {
+                        self.enqueue(f, Reason::Decision);
+                        if self.propagate().is_some() {
+                            self.ok = false;
+                            return installed;
+                        }
+                        installed += 1;
+                        progress = true;
+                    }
+                }
+            }
+        }
+        installed
     }
 }
 
