@@ -1177,6 +1177,98 @@ symposium singled out one idea each:
    at least nonconstructive — prove a Turyn tuple exists at n=56,
    then we search with renewed hope."
 
+## Part VII.5 — Experimental log (the morning after)
+
+Some of the ideas actually got tried. Results in execution order.
+
+### #154 Tao fourth-moment / Parseval floor — no new pruning
+
+Checked on every known `TT(n)` for `n ≤ 44`. The Turyn identity plus
+Parseval gives trivially `avg_ω |X̂(ω)|² = n`, hence
+`max_ω |X̂(ω)|² ≥ n` as a free consequence of the identity. All known
+solutions satisfy this and their actual `max|X̂|²` values range from
+`n` to roughly `10n`. No single-sequence lower bound that's useful
+as a SAT constraint beyond what is already enforced pointwise by
+`SpectralConstraint`. **Verdict: measured but not actionable.**
+
+### #52 / #194 Moser-style constructive LLL — does not scale
+
+Python reference implementation: random `±1^{4n-1}`, pick a violated
+lag, resample all bits that touch it, repeat.
+
+| n | time to find | steps   |
+|---|--------------|---------|
+| 4 | instant      | 352     |
+| 6 | instant      | 2,877   |
+| 8 | instant      | 23,248  |
+| 10 | did not find in 10s | >218k |
+| 12 | did not find in 10s | >174k |
+
+Scaling looks exponential. The existing `--stochastic` simulated
+annealing already solves to `n = 18`, so Moser is strictly weaker.
+**Verdict: implemented, dominated.**
+
+### #140 `N_Z + N_W ∈ [-(n-s), n-s]` — already implemented
+
+Derivation: `x_i x_{i+s} + y_i y_{i+s} = 2 x_i x_{i+s}` when
+`a_i a_{i+s} = +1` (where `a_i = x_i y_i`), else `0`. So
+`N_X(s) + N_Y(s) = 2 · Σ_{i ∈ S_s} x_i x_{i+s}` with
+`|S_s| ≤ n − s`, giving `|N_Z(s) + N_W(s)| ≤ n − s`.
+
+This is *exactly* the bound at `src/mdd_pipeline.rs:1204–1230`
+(`max_nzw = (n - s) as i32`). The idea was rediscovered; the code
+already enforces it. **Verdict: already present.**
+
+### #140b Novel saturation observation — *all* known TT(n) hit `|N_Z+N_W| = |S_s|` somewhere
+
+For every known solution `TT(n)`, `n ∈ {4, 6, …, 44}`, there exists
+at least one lag `s` with
+
+    |N_Z(s) + N_W(s)| / |S_s| = 1.0
+
+where `S_s = {i : a_i a_{i+s} = +1}`. That is, *the agreement set
+must be 100% uniform-signed at that lag*. This is not currently used
+as a pruning heuristic, and it's a free pre-filter:
+
+- Given a candidate `(Z, W)` boundary, compute `c_s = |N_Z(s) + N_W(s)|`.
+- A solution requires `c_s ≤ n − s` at every lag (already enforced).
+- But additionally, for *some* lag, a solution requires `|S_s| = c_s`
+  **exactly**, which forces a hard unification among the `x_i x_{i+s}`
+  on agreement positions.
+
+Implementation suggestion: prioritise XY solves whose `(Z, W)`
+has at least one lag with `c_s` *close to* `n − s`. These boundaries
+have the tightest unification constraints and are most likely to
+either SAT quickly or UNSAT quickly. Add to the gold-queue scoring
+function. **Verdict: candidate heuristic; not yet implemented.**
+
+### Baseline n = 28 (180 s, `--wz=apart --mdd-k=9`)
+
+- 264 575 boundaries walked (0.13 % of 211 M live ZW paths)
+- 21.6 M Z solutions, **100.0 %** Z pair-spectral fail
+- 326 reach XY stage, 162 019 XY SAT solves, **100.0 %** UNSAT
+- **TTC ≈ 1.7 days** at 16 threads.
+
+Interpretation: the spectral pair filter is brutal (good). All 326
+XY-reaching boundaries failed UNSAT. That's evidence either TT(28)
+doesn't exist in the canonical form, or its boundary is not among
+these 0.13 %. A full ~41-hour overnight run would settle
+**existence** at mdd-k=9 with current pipeline.
+
+### #132 Paley/Legendre Z seeds — partial
+
+For `n ∈ {28, 30, 32, 36, 38}`, computed `Z_i = (i | p_n)` for the
+smallest prime `p_n > n`. Autocorrelation profiles are Paley-small
+but *not* matching any known TT Z structure. The known Z sequences
+at `n ≤ 44` do **not** exhibit Legendre structure (verified: their
+profiles don't match the Paley family).
+
+Full test would require `--test-zw=Z,W` for each candidate W. Enumerating
+W at `n = 28` is 2^27 = 134 M, but restricted by `σ_W ∈ sum-tuple`
+and rule (i) pinning, still ~2^22 candidates — borderline. This test
+was **not executed**; set up for a follow-up pass.
+**Verdict: preliminary only.**
+
 ## Part VIII — Closing remarks from the chairs
 
 > *Gauss:* "Every simple problem deserves a Gauss sum."
