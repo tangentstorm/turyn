@@ -48,6 +48,13 @@ struct ClauseMeta {
     learnt: bool,
     lbd: u8,
     deleted: bool,
+    /// Activity-style "usefulness" counter (CaDiCaL `used` field):
+    /// bumped each time this clause is followed as a Reason during
+    /// conflict analysis. `reduce_db` consults it when choosing
+    /// which medium-LBD learnt clauses to protect.  Saturates at
+    /// `u8::MAX` — we only care about the "used more than once"
+    /// distinction.
+    used: u8,
 }
 
 /// A pseudo-boolean constraint: sum(coeffs[i] * lits[i]) >= bound.
@@ -951,7 +958,7 @@ impl Solver {
                         let ci = self.clause_meta.len() as u32;
                         let start = self.clause_lits.len() as u32;
                         self.clause_lits.extend_from_slice(&lits);
-                        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
+                        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false, used: 0 });
                         self.enqueue(lit, Reason::Clause(ci));
                         // Propagate immediately
                         if self.propagate().is_some() {
@@ -985,7 +992,7 @@ impl Solver {
                     let ci = self.clause_meta.len() as u32;
                     let start = self.clause_lits.len() as u32;
                     self.clause_lits.extend_from_slice(&lits);
-                    self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
+                    self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false, used: 0 });
                     self.enqueue(lits[0], Reason::Clause(ci));
                     if self.propagate().is_some() {
                         self.ok = false;
@@ -1007,7 +1014,7 @@ impl Solver {
                     self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
                 }
                 self.clause_lits.extend_from_slice(&lits);
-                self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
+                self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false, used: 0 });
             }
         }
     }
@@ -1081,6 +1088,7 @@ impl Solver {
             learnt: true,
             lbd: 0,
             deleted: false,
+            used: 0,
         });
     }
 
@@ -2228,7 +2236,7 @@ impl Solver {
                     let ci = self.clause_meta.len() as u32;
                     let start = self.clause_lits.len() as u32;
                     self.clause_lits.push(lit);
-                    self.clause_meta.push(ClauseMeta { start, len: 1, learnt: false, lbd: 0, deleted: false });
+                    self.clause_meta.push(ClauseMeta { start, len: 1, learnt: false, lbd: 0, deleted: false, used: 0 });
                     self.enqueue(lit, Reason::Clause(ci));
                 }
             }
@@ -2597,7 +2605,7 @@ impl Solver {
                     let start = self.clause_lits.len() as u32;
                     self.clause_lits.extend_from_slice(resolvent);
                     self.clause_meta.push(ClauseMeta {
-                        start, len: resolvent.len() as u16, learnt: false, lbd: 0, deleted: false
+                        start, len: resolvent.len() as u16, learnt: false, lbd: 0, deleted: false, used: 0,
                     });
                     // Add to occurrence lists for future iterations
                     for &lit in resolvent {
@@ -2739,6 +2747,7 @@ impl Solver {
                 learnt: true,
                 lbd,
                 deleted: false,
+                used: 0,
             });
             // Add watches for first two literals. R2: binary → bin_watches
             // when fastpath enabled.
@@ -3020,7 +3029,7 @@ impl Solver {
                     self.clause_lits.extend_from_slice(&short_lits);
                     self.clause_meta.push(ClauseMeta {
                         start: new_start, len: short_lits.len() as u16,
-                        learnt: true, lbd, deleted: false,
+                        learnt: true, lbd, deleted: false, used: 0,
                     });
                 }
             }
@@ -3339,7 +3348,7 @@ impl Solver {
                         for &l in &cl { self.clause_lits.push(l); }
                         self.clause_meta.push(ClauseMeta {
                             start: cs as u32, len: cn as u16,
-                            learnt: true, deleted: false, lbd: cn.min(255) as u8,
+                            learnt: true, deleted: false, lbd: cn.min(255) as u8, used: 0,
                         });
                         if cn == 2 && self.config.bin_watch_fastpath {
                             self.bin_watches[lit_index(cl[0])].push((cl[1], ci));
@@ -3772,6 +3781,12 @@ impl Solver {
                     learnt.push(lit);
                 }
                 r @ (Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_)) => {
+                    // Note: we deliberately do NOT bump `used` here.
+                    // `analyze_assumptions` is the sync-mode path and
+                    // reduce_db rarely fires there, so the bump is
+                    // pure overhead that hurts sync's hot loop.
+                    // The CDCL `analyze` path does bump it — that's
+                    // where clause-DB management has real leverage.
                     self.collect_reason_lits_into(r, lit, &mut worklist);
                 }
                 _ => {
@@ -3901,7 +3916,13 @@ impl Solver {
             // Process reason literals inline — avoid Vec allocation for Clause path
             match current_reason {
                 Reason::Clause(ci) => {
+                    // Bump this clause's "used" counter (saturating).
+                    // reduce_db's tiered retention keeps mid-LBD
+                    // clauses alive if they've participated in at
+                    // least one conflict analysis.
                     let m = self.clause_meta[ci as usize];
+                    self.clause_meta[ci as usize].used =
+                        self.clause_meta[ci as usize].used.saturating_add(1);
                     let cstart = m.start as usize;
                     let clen = m.len as usize;
                     for idx in 0..clen {
@@ -4355,7 +4376,7 @@ impl Solver {
             self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
         }
         self.clause_lits.extend_from_slice(&lits);
-        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8, deleted: false });
+        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8, deleted: false, used: 0 });
 
         if enqueue_asserting {
             self.enqueue(lits[0], Reason::Clause(ci));
@@ -4494,6 +4515,18 @@ impl Solver {
     }
 
     /// Remove low-quality learnt clauses to keep the database manageable.
+    ///
+    /// Current policy: keep glue clauses (LBD ≤ 3) always; delete
+    /// the worst half of the rest (by LBD descending, then `used`
+    /// ascending — a mild tier-2 lean that evicts unused medium-LBD
+    /// clauses first). The `used` counter is decayed (shifted right
+    /// by 1) after each reduce so "recently useful" wins out.
+    ///
+    /// Full CaDiCaL-style tier1/tier2 promotion with `used`-gated
+    /// retention was tried but regressed sync TTC ~25 % — the
+    /// larger clause DB hurt the propagation hot loop more than the
+    /// higher-quality retention helped. Kept the `used` counter in
+    /// `ClauseMeta` as a tie-breaker for the sort.
     pub fn reduce_db(&mut self) {
         let num_learnt: usize = self.clause_meta.iter()
             .filter(|m| m.learnt && !m.deleted).count();
@@ -4510,20 +4543,28 @@ impl Solver {
         }
 
         // Keep glue clauses (LBD ≤ 3) always. Delete worst half of the rest.
-        let mut eligible: Vec<(u32, u8)> = Vec::new();
+        let mut eligible: Vec<(u32, u8, u8)> = Vec::new(); // (ci, lbd, used)
         for ci in 0..self.clause_meta.len() {
             let m = &self.clause_meta[ci];
             if m.learnt && !m.deleted && m.lbd > 3 && !is_reason[ci] {
-                eligible.push((ci as u32, m.lbd));
+                eligible.push((ci as u32, m.lbd, m.used));
             }
         }
         if eligible.len() < 100 { return; }
 
-        // Sort by LBD descending — delete worst half
-        eligible.sort_by(|a, b| b.1.cmp(&a.1));
+        // Sort by (lbd desc, used asc) — evict worst-LBD first, ties broken
+        // by least-used (so unused clauses go before used ones at the
+        // same LBD). The `used` tie-break preserves clauses that have
+        // actually participated in conflict analysis.
+        eligible.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
         let to_delete = eligible.len() / 2;
-        for &(ci, _) in &eligible[..to_delete] {
+        for &(ci, _, _) in &eligible[..to_delete] {
             self.clause_meta[ci as usize].deleted = true;
+        }
+
+        // Decay `used` counters so "recently useful" wins across cycles.
+        for m in &mut self.clause_meta {
+            if !m.deleted { m.used >>= 1; }
         }
 
         // Clean watch lists. R2: also clean bin_watches. Binary
