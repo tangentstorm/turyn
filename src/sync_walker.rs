@@ -65,7 +65,13 @@ struct Ctx {
     pos_to_level: Vec<usize>,
     /// Events that fire when a lag pair closes at this level.
     /// `closure_events[level] = [(lag, kind, pos_a, pos_b, abs_coeff), ...]`.
+    /// Sorted by `kind` ascending so per-kind ranges are contiguous; see
+    /// `closure_events_kind_ranges`.
     closure_events: Vec<Vec<PairEvent>>,
+    /// Per-(level, kind) [start, end) range into `closure_events[level]`.
+    /// Used by `apply_sum_delta_at` to skip kinds not in `newly_placed`
+    /// without per-event branching.
+    closure_events_kind_ranges: Vec<[(u32, u32); 4]>,
     /// Capacity bound per (level, lag): max `|S(s)|` achievable from
     /// pairs not yet closed after reaching `level`.
     max_remaining: Vec<Vec<i32>>,
@@ -264,10 +270,34 @@ fn build_ctx(problem: Problem) -> Ctx {
     // hopelessness detection.
     let valid_tuples = enumerate_sum_tuples(problem);
 
+    // Sort each level's events by kind ascending and record per-kind
+    // ranges so `apply_sum_delta_at` can skip whole kind blocks when
+    // `newly_placed[k]` is false.
+    for events in closure_events.iter_mut() {
+        events.sort_by_key(|e| e.kind);
+    }
+    let mut closure_events_kind_ranges: Vec<[(u32, u32); 4]> =
+        Vec::with_capacity(depth);
+    for events in &closure_events {
+        let mut ranges = [(0u32, 0u32); 4];
+        let mut start = 0usize;
+        let len = events.len();
+        for k in 0u8..4 {
+            // Find end of contiguous run of events with this kind.
+            let mut end = start;
+            while end < len && events[end].kind == k {
+                end += 1;
+            }
+            ranges[k as usize] = (start as u32, end as u32);
+            start = end;
+        }
+        closure_events_kind_ranges.push(ranges);
+    }
+
     Ctx {
         n, m, depth,
         pos_order, pos_to_level,
-        closure_events, max_remaining,
+        closure_events, closure_events_kind_ranges, max_remaining,
         seed: 0, cancel: None, start: Instant::now(),
         valid_tuples,
         exchange: None,
@@ -551,18 +581,24 @@ fn apply_sum_delta_at(
     newly_placed: &[bool; 4],
 ) {
     if level >= ctx.depth { return; }
-    for ev in &ctx.closure_events[level] {
-        if !newly_placed[ev.kind as usize] { continue; }
-        let a_sign = state.bit(ev.kind, ev.pos_a);
-        let b_sign = state.bit(ev.kind, ev.pos_b);
-        debug_assert!(
-            a_sign != 0 && b_sign != 0,
-            "apply_sum_delta_at: unset endpoint at level={} kind={} pos_a={} pos_b={}",
-            level, ev.kind, ev.pos_a, ev.pos_b,
-        );
-        let a = if a_sign == 1 { 1i16 } else { -1 };
-        let b = if b_sign == 1 { 1i16 } else { -1 };
-        state.sums[ev.lag] += (a * b) * ev.abs_coeff;
+    let events = &ctx.closure_events[level];
+    let ranges = &ctx.closure_events_kind_ranges[level];
+    for k in 0u8..4 {
+        if !newly_placed[k as usize] { continue; }
+        let (start, end) = ranges[k as usize];
+        // Slice over the contiguous run for this kind.
+        for ev in &events[start as usize .. end as usize] {
+            let a_sign = state.bit(ev.kind, ev.pos_a);
+            let b_sign = state.bit(ev.kind, ev.pos_b);
+            debug_assert!(
+                a_sign != 0 && b_sign != 0,
+                "apply_sum_delta_at: unset endpoint at level={} kind={} pos_a={} pos_b={}",
+                level, ev.kind, ev.pos_a, ev.pos_b,
+            );
+            let a = if a_sign == 1 { 1i16 } else { -1 };
+            let b = if b_sign == 1 { 1i16 } else { -1 };
+            state.sums[ev.lag] += (a * b) * ev.abs_coeff;
+        }
     }
 }
 
