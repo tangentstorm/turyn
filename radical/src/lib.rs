@@ -1816,6 +1816,159 @@ impl Solver {
         Some(true)
     }
 
+    /// Incremental assumption propagation: push `lits` as a fresh
+    /// decision level on top of the current trail and propagate. The
+    /// existing decision levels (previously-pushed frames) are
+    /// preserved, so the watch + propagation state built up by earlier
+    /// frames is reused — unlike `propagate_only`, which backtracks to
+    /// level 0 on every call.
+    ///
+    /// Returns:
+    /// - `Some(true)`: propagation succeeded. The solver's decision
+    ///   level is now `prev_level + 1`. Caller must pair with
+    ///   `pop_assume_frame` when unwinding.
+    /// - `Some(false)`: conflict. A nogood has been learnt and the
+    ///   solver has been backtracked to `prev_level`. Caller must NOT
+    ///   call `pop_assume_frame` for this push — the frame was never
+    ///   materialized.
+    /// - `None` never returned (reserved for future use).
+    ///
+    /// Empty `lits` is a no-op returning `Some(true)` without creating
+    /// a level; a matching `pop_assume_frame` in that case is a
+    /// harmless backtrack one level (don't do it).
+    ///
+    /// Learnt clause side-effects mirror `propagate_only`:
+    /// `last_nogood_stats`, `take_last_learnt_clause` are updated on
+    /// `Some(false)`.
+    pub fn push_assume_frame(&mut self, lits: &[Lit]) -> Option<bool> {
+        if !self.ok { return Some(false); }
+        if lits.is_empty() { return Some(true); }
+
+        // Pre-size reusable buffers (mirrors propagate_only).
+        if self.quad_pb_seen_buf.len() < self.num_vars {
+            self.quad_pb_seen_buf.resize(self.num_vars, false);
+        }
+        if self.analyze_seen.len() < self.num_vars {
+            self.analyze_seen.resize(self.num_vars, false);
+        }
+        if self.minimize_visited.len() < self.num_vars {
+            self.minimize_visited.resize(self.num_vars, false);
+        }
+
+        // At level 0, drain any pending level-0 work (units added since
+        // the last incremental call, etc.). At level > 0 we trust the
+        // previous successful push to have already propagated its
+        // trail.
+        if self.decision_level() == 0 {
+            if self.propagate().is_some() {
+                self.ok = false;
+                return Some(false);
+            }
+        }
+
+        let parent_level = self.decision_level();
+        self.new_decision_level();
+
+        for &lit in lits {
+            self.ensure_var(lit.unsigned_abs() as usize);
+            match self.lit_value(lit) {
+                LBool::True => {}
+                LBool::False => {
+                    // Immediate conflict on assumption push. Build a
+                    // minimal nogood from the frame itself and install
+                    // it if ≥ 2 lits. Units are skipped here to avoid
+                    // blowing away parent frames (they're rare in the
+                    // sync walker's 4-lits-per-frame use case).
+                    self.backtrack(parent_level);
+                    let mut filtered: Vec<Lit> = Vec::with_capacity(lits.len());
+                    for &l in lits {
+                        if self.lit_value(l) != LBool::True {
+                            filtered.push(-l);
+                        }
+                    }
+                    self.last_nogood_len = filtered.len();
+                    self.last_full_nogood_len = lits.len();
+                    self.last_learnt_clause = if filtered.is_empty() {
+                        None
+                    } else {
+                        Some(filtered.clone())
+                    };
+                    if filtered.is_empty() {
+                        self.ok = false;
+                    } else if filtered.len() >= 2 {
+                        self.add_learnt_clause_no_enqueue(filtered);
+                    }
+                    return Some(false);
+                }
+                LBool::Undef => {
+                    self.enqueue(lit, Reason::Decision);
+                }
+            }
+        }
+
+        if let Some(conflict_reason) = self.propagate() {
+            let nogood = self.analyze_assumptions(conflict_reason);
+            // Backtrack to the caller's level (not 0). This preserves
+            // parent frames' propagation state.
+            self.backtrack(parent_level);
+
+            let mut filtered: Vec<Lit> = Vec::with_capacity(nogood.len());
+            for &lit in &nogood {
+                match self.lit_value(lit) {
+                    LBool::False | LBool::Undef => filtered.push(lit),
+                    LBool::True => {}
+                }
+            }
+            if filtered.is_empty() {
+                // Fall-back: use the frame itself as the nogood.
+                for &lit in lits {
+                    if self.lit_value(lit) != LBool::False {
+                        filtered.push(-lit);
+                    }
+                }
+            }
+
+            self.last_nogood_len = filtered.len();
+            self.last_full_nogood_len = lits.len();
+            self.last_learnt_clause = if filtered.is_empty() {
+                None
+            } else {
+                Some(filtered.clone())
+            };
+
+            if filtered.is_empty() {
+                self.ok = false;
+            } else if filtered.len() >= 2 {
+                self.add_learnt_clause_no_enqueue(filtered);
+            }
+            // Skip learning units here (rare on 4-lit frames); would
+            // require a full backtrack to 0, invalidating parent
+            // frames.
+            return Some(false);
+        }
+
+        Some(true)
+    }
+
+    /// Pop the top assumption frame pushed by `push_assume_frame` that
+    /// returned `Some(true)`. Backtracks the solver by exactly one
+    /// decision level. Safe to call when the solver is already at
+    /// level 0 (no-op in that case), but the caller should not need
+    /// that fallback — push/pop must be balanced.
+    pub fn pop_assume_frame(&mut self) {
+        let lvl = self.decision_level();
+        if lvl > 0 {
+            self.backtrack(lvl - 1);
+        }
+    }
+
+    /// Current decision level (number of active frames above level 0).
+    /// Used by incremental-assumption callers to audit push/pop
+    /// discipline.
+    pub fn current_decision_level(&self) -> u32 {
+        self.decision_level()
+    }
+
     /// Length of the last nogood learnt from `propagate_only` (for
     /// observability). `last_full_nogood_len` is the count of
     /// assumptions passed in — the ratio measures how effective

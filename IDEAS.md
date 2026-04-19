@@ -2508,19 +2508,18 @@ CaDiCaL's tier retention).
   `grep` confirms it's never called; removing is pure cleanup and
   should not move TTC. Not committed this session.
 
-- **R1 (incremental assumption propagation)**: **not attempted this
-  session — flagged as highest-leverage next step.** Read of
-  `radical::Solver::propagate_only` (`radical/src/lib.rs:1723`)
-  confirms every call does `backtrack(0)` + full assumption
-  re-enqueue. Sync's DFS at depth L calls it with an assumption
-  prefix of ~4L lits that is identical across 16 siblings, so 15
-  of 16 re-propagations are wasted work. The fix is to expose
-  `push_assume_frame(&[Lit])` / `pop_assume_frame()` on the Solver
-  and have sync's dfs_body push 4 new lits instead of re-asserting
-  all 4L. Expected per-node propagate_only cost drops O(L) → O(1),
-  a 5–20× rate improvement at n=26. This is a medium-sized change
-  (solver surface, DFS plumbing, testing) that should be
-  attempted in a dedicated session.
+- **R1 (incremental assumption propagation)**: **ACCEPTED — TTC
+  −20.6 % decisive (12 σ).** Exposed
+  `push_assume_frame(&[Lit])` / `pop_assume_frame()` /
+  `current_decision_level()` on `radical::Solver`
+  (`radical/src/lib.rs:1819-1972`).  Sync's DFS sibling loop now
+  pushes only the 4 new lits per sibling instead of re-asserting
+  the ancestor prefix.  Details in
+  `docs/OPTIMIZATION_LOG.md#r1`.  Rate lever: nodes/60 s
+  3.9 M → 11.2 M (+187 %); `sat_unsat` fell 98 % because baseline
+  was re-deriving the same UNSAT per descent.  Peer-clause import
+  is gated on `current_decision_level() == 0` for soundness
+  (install path can immediately propagate at non-zero level).
 
 ### Kissat comparison (April 19 2026)
 

@@ -1373,10 +1373,16 @@ fn dfs_body(
 
     // Pull peer clauses from the shared exchange every 256 nodes.
     // Cheap: one Mutex lock + index compare + a handful of add_clause
-    // calls. add_clause is safe mid-search because the walker operates
-    // at decision level 0 between dfs() frames (propagate_only
-    // backtracks on every entry/exit).
-    if stats.nodes_visited & 0xFF == 0 {
+    // calls. add_clause can trigger immediate propagation (units under
+    // the current assignment) which only preserves level-0 invariants
+    // — so gate on `solver.current_decision_level() == 0`. Under R1
+    // (incremental assumption frames) the solver stays at level ==
+    // state.level during descent, so this check typically only fires
+    // at the worker's very first dfs entry (before any frame has been
+    // pushed). That loses most of the peer-sharing benefit at depth,
+    // but keeping correctness first; a proper "install-without-
+    // propagate" helper could relax this later.
+    if stats.nodes_visited & 0xFF == 0 && solver.current_decision_level() == 0 {
         if let Some(ex) = &ctx.exchange {
             let local_next = stats.peer_clauses_read as usize;
             if let Ok(v) = ex.clauses.lock() {
@@ -1619,26 +1625,27 @@ fn dfs_body(
         rebuild_sums(state, ctx);
         processed_count += 1;
 
-        // Per-level SAT call: propagate_only (no CDCL decisions,
-        // so cost is proportional to new propagation work). On
-        // UNSAT the solver installs a full-assumption nogood that
-        // short-circuits future calls with the same prefix.
+        // R1: Incremental assumption propagation.
         //
-        // Note: a per-worker signature-keyed memo was tried here and
-        // measured memo_hits=0 on every benchmark (n=18, 22, 26) —
-        // each DFS path has a unique (level, sums, walker_bits)
-        // signature, so the memo never fires. Removed to save the
-        // compute_signature + hash cost per accepted candidate.
-        // Capture per-propagator forcings before the call so we can
-        // attribute the delta to the right SAT feature in stats.
-        // prop_by_kind_total[kind] tells us, across the full search,
-        // whether quad PB / XOR / spectral / clause BCP / MDD was the
-        // dominant work source.
+        // Instead of calling `propagate_only(&state.assumptions)` —
+        // which backtracks the solver to level 0 and re-enqueues every
+        // ancestor lit per sibling — we push only this sibling's new
+        // lits as a fresh decision level on top of the existing frame
+        // stack. Ancestor frames' propagation work carries over
+        // unchanged. On UNSAT, `push_assume_frame` has already
+        // backtracked to the parent level and installed the learnt
+        // nogood; on SAT, we must pair with `pop_assume_frame` after
+        // recursion.
+        //
+        // Invariant: at every dfs_body entry, `solver.current_decision_
+        // level() == state.level` (and state.assumptions length
+        // agrees).
         let mut pre_kind = [0u64; radical::PropKind::COUNT];
         for kind in radical::PropKind::ALL {
             pre_kind[kind as usize] = solver.propagations_by_kind(kind);
         }
-        let sat = solver.propagate_only(&state.assumptions);
+        let new_lits = &cand.new_assums[..cand.num_new_assums as usize];
+        let sat = solver.push_assume_frame(new_lits);
         if state.level >= stats.forced_by_level_kind.len() {
             stats.forced_by_level_kind.resize(
                 state.level + 1,
@@ -1673,11 +1680,14 @@ fn dfs_body(
             // may now be set (via rule propagation into the
             // middle). Use the tighter dynamic capacity check
             // which accounts for pairs already fully determined.
-            if !capacity_violated(state, ctx) {
-                if dfs(solver, state, ctx, stats, deadline, found) {
-                    result_override = Some(true);
-                    break;
-                }
+            let found_solution = !capacity_violated(state, ctx)
+                && dfs(solver, state, ctx, stats, deadline, found);
+            // Pop this sibling's frame before moving to the next
+            // sibling. Must be paired with the Some(true) push above.
+            solver.pop_assume_frame();
+            if found_solution {
+                result_override = Some(true);
+                break;
             }
         } else {
             stats.sat_unsat += 1;

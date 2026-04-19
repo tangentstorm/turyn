@@ -603,6 +603,63 @@ All 35 tests pass.
 
 ## SPECTRAL_FREQS sweep for --wz=apart (April 2026)
 
+### R1. Incremental assumption propagation for `--wz=sync` — accepted (**TTC −20.6 %**)
+
+`radical::Solver::propagate_only(assumptions)` unconditionally
+backtracks to decision level 0 and re-enqueues every assumption
+literal as a fresh decision (`radical/src/lib.rs:1726-1770`).  The
+sync walker's DFS sibling loop calls it once per candidate, passing
+`state.assumptions` — an ancestor prefix of 4·L literals that is
+identical across all 16 siblings at level L.  The previous frame's
+propagation work was thrown away on every call.
+
+**Fix (single commit)**: added `push_assume_frame(&[Lit])` /
+`pop_assume_frame()` to `radical::Solver`
+(`radical/src/lib.rs:1819-1972`).  `push_assume_frame` creates a
+new decision level above the current one, enqueues only the new
+lits, propagates, and on conflict backtracks to the parent level
+and installs a learnt nogood (via `add_learnt_clause_no_enqueue`
+so no asserting literal is fired at the wrong level).
+`pop_assume_frame` is a single-level backtrack.  In
+`sync_walker::dfs_body` the per-sibling
+`solver.propagate_only(&state.assumptions)` is now
+`solver.push_assume_frame(&cand.new_assums[..])`, with
+`pop_assume_frame` paired on the `Some(true)` branch
+(`src/sync_walker.rs:1641-1700`).
+
+Peer-clause import is gated on
+`solver.current_decision_level() == 0` so that
+`solver.add_clause()` — which can immediately propagate a unit at
+the install site — never fires at a non-zero level and corrupts
+the frame stack.  This loses most of the per-worker peer flow at
+depth but preserves soundness; a proper "install-without-
+propagate" helper is follow-up work.
+
+Benchmark: n=26 `--wz=sync --sat-secs=60`, 16 threads, 5
+sequential runs each (noise floor ~1.3 %).
+
+| Metric                  | Baseline (mean±σ)   | R1 (mean±σ)         | Δ            |
+|-------------------------|---------------------|---------------------|--------------|
+| direct TTC parallel (s) | 6.581e8 ± 0.089e8   | 5.224e8 ± 0.067e8   | **−20.6 %**  |
+| nodes (60 s)            | 3.90 M              | 11.20 M             | **+187 %**   |
+| sat_unsat               | 1.736 M             | 37 k                | −98 %        |
+| cap_rejects             | 51 M                | 165 M               | +223 %       |
+
+The nodes/s triple and the `sat_unsat` collapse both confirm the
+mechanism: baseline kept re-deriving the same UNSAT verdict once
+per descent into each unique ancestor prefix; R1 derives it once
+per actual new conflict.
+
+**Lever**: rate (propagation cost per sibling ≈ O(|new_lits|)
+instead of O(|full assumption prefix|)).  Denominator unchanged.
+No change in leaf correctness: n=18 `--wz=sync` still finds
+TT(18) (smoke test, 2.4 s wall-clock to first leaf).
+
+All tests pass.  Single commit targeting `--wz=sync`;
+`--wz=apart|together|cross` paths are unchanged because they use
+the per-candidate `SolveXyPerCandidate` / `solve_inner` flow with
+a cloned template solver and do not touch `propagate_only`.
+
 ### S5. SPECTRAL_FREQS 563 → 64 for `--wz=apart` — accepted (**TTC −20%**)
 
 F1 (above) reduced `SPECTRAL_FREQS` from 563 → 17 for `--wz=together` at
