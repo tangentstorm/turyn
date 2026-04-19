@@ -2238,19 +2238,27 @@ skip any candidate that'd re-fire with an inconsistent early bit.
 - **Detection plan**: `candidates.len()` avg drops; nodes/s stays flat
   but per-node effective work drops.
 
-### S15. Adaptive per-worker sibling-sort randomness
+### S15. Adaptive per-worker sibling-sort randomness — *tested, rejected*
 
-Worker 0 is best-first (seed=0 → score-sorted), workers 1..15 fully
-random. Middle ground: workers 1..15 do epsilon-greedy (best-first
-with probability `1-ε`, random otherwise). At ε=0.1 they follow the
-gradient most of the time but diverge onto different paths
-occasionally — more likely to find leaves than pure random.
+Tried ε=0.25 epsilon-greedy at n=22 sync 30s: each worker sorts by
+score, then swaps each adjacent pair with probability ε. Measured
+TTC_parallel 7.6e7 s vs the score-sort/random-shuffle baseline's
+1.37e6 s — **55× regression**.
 
-- **TTC mechanism**: rate (faster leaf discovery → earlier first
-  solution).
-- **Detection plan**: `time_to_first_leaf` should drop.
-- **Risk**: on UNSAT-complete search this is neutral (still need
-  to cover tree); purely a find-solution-faster optimisation.
+Post-mortem: the current baseline pairs worker 0 (score-sorted) with
+workers 1..15 (*fully* random) precisely to make their paths
+diverge maximally. Epsilon-greedy biases all non-zero workers
+toward the same "best-first" prefix, causing redundant exploration
+(all workers hit similar high-score subtrees first). The
+per-level `children_by_level[L]` pools across workers, so when all
+workers converge to the same paths the aggregate coverage product
+collapses even though per-worker nodes are unchanged.
+
+Implication: for parallel search where exploration diversity matters,
+**fully-random shuffling beats score-biased ordering** at every ε we
+tested. A plausible middle path would be per-worker *distinct
+first-branching assignments* (S4-style work partitioning) so each
+worker is best-first within a disjoint slice of the tree.
 
 ### S3 (applied). Delta-based speculative rebuild_sums — *accepted*
 
