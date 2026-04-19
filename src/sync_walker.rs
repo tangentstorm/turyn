@@ -1463,6 +1463,13 @@ fn dfs_body(
             }
         }
     }
+    // Periodically reduce the learnt clause DB so it doesn't grow
+    // unbounded under sync's many push_assume_frame UNSATs (which
+    // each install a learnt nogood when filtered.len() ≥ 2).
+    // Trigger every 4096 nodes — well above the per-node cost.
+    if stats.nodes_visited & 0xFFF == 0 {
+        solver.reduce_db();
+    }
 
     if state.level >= ctx.depth {
         stats.leaves_reached += 1;

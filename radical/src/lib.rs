@@ -4395,7 +4395,7 @@ impl Solver {
     }
 
     /// Remove low-quality learnt clauses to keep the database manageable.
-    fn reduce_db(&mut self) {
+    pub fn reduce_db(&mut self) {
         let num_learnt: usize = self.clause_meta.iter()
             .filter(|m| m.learnt && !m.deleted).count();
         let num_original: usize = self.clause_meta.iter()
