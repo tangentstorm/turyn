@@ -2061,6 +2061,18 @@ impl Solver {
     pub fn num_clauses(&self) -> usize {
         self.clause_meta.iter().filter(|m| !m.deleted).count()
     }
+    /// Histogram of clause lengths by length: returns Vec where index is
+    /// length and value is count. Used for diagnostics/profiling.
+    pub fn clause_length_histogram(&self) -> Vec<u32> {
+        let mut hist: Vec<u32> = Vec::new();
+        for m in &self.clause_meta {
+            if m.deleted { continue; }
+            let l = m.len as usize;
+            if hist.len() <= l { hist.resize(l + 1, 0); }
+            hist[l] += 1;
+        }
+        hist
+    }
     /// Number of conflicts so far.
     pub fn num_conflicts(&self) -> u64 { self.conflicts }
     /// Number of branching decisions made so far.
