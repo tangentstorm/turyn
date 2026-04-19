@@ -812,6 +812,12 @@ pub(crate) struct SyncStats {
     /// `clause` (CNF BCP) / `pb` / `quadpb` (Turyn identity) / `xor`
     /// (Tseitin chains) / `spect` (spectral DFT) / `mdd` / `pbseteq`.
     pub prop_by_kind_total: [u64; radical::PropKind::COUNT],
+    /// Per-(walker level, propagator) forcing counts. `[L][k]` = total
+    /// variables forced by propagator `k` across every `propagate_only`
+    /// call made while the walker was at level L. Reveals *where* in the
+    /// walker's DFS each SAT feature is doing work (e.g. is quadpb hot
+    /// near the root while clause BCP dominates near the leaves?).
+    pub forced_by_level_kind: Vec<[u64; radical::PropKind::COUNT]>,
 }
 
 pub(crate) fn search_sync(
@@ -860,6 +866,7 @@ fn search_sync_parallel(
         sub_cube_time_by_level: Vec::new(),
         children_processed_by_level: Vec::new(),
         prop_by_kind_total: [0; radical::PropKind::COUNT],
+        forced_by_level_kind: Vec::new(),
     }));
     let exchange = Arc::new(ClauseExchange {
         clauses: std::sync::Mutex::new(Vec::new()),
@@ -936,6 +943,17 @@ fn search_sync_parallel(
                 for (i, &c) in stats.prop_by_kind_total.iter().enumerate() {
                     agg.prop_by_kind_total[i] += c;
                 }
+                if agg.forced_by_level_kind.len() < stats.forced_by_level_kind.len() {
+                    agg.forced_by_level_kind.resize(
+                        stats.forced_by_level_kind.len(),
+                        [0; radical::PropKind::COUNT],
+                    );
+                }
+                for (l, row) in stats.forced_by_level_kind.iter().enumerate() {
+                    for (k, &c) in row.iter().enumerate() {
+                        agg.forced_by_level_kind[l][k] += c;
+                    }
+                }
                 drop(agg);
                 if let Some(s) = sol {
                     let mut r = result.lock().unwrap();
@@ -998,16 +1016,45 @@ fn format_per_level_telemetry_with_ttc(stats: &SyncStats, elapsed_secs: f64, n_w
         }
     }
     let kind_summary = format_prop_by_kind_summary(stats);
+    let kind_per_level = format_per_level_kind_table(stats);
     if coverage_product > 0.0 && elapsed_secs > 0.0 {
         let ttc_parallel = elapsed_secs / coverage_product;
         let ttc_serial = ttc_parallel * n_workers as f64;
         format!(
-            "{}{}Per-level: direct TTC (from coverage product) ≈ {:.3e}s parallel, {:.3e}s serial\n",
-            base, kind_summary, ttc_parallel, ttc_serial,
+            "{}{}{}Per-level: direct TTC (from coverage product) ≈ {:.3e}s parallel, {:.3e}s serial\n",
+            base, kind_summary, kind_per_level, ttc_parallel, ttc_serial,
         )
     } else {
-        format!("{}{}", base, kind_summary)
+        format!("{}{}{}", base, kind_summary, kind_per_level)
     }
+}
+
+/// Per-(walker level, propagator) table. Only shows propagator columns
+/// that have at least one non-zero count across all levels (keeps the
+/// table compact — in sync mode XOR/spectral/MDD are all zero).
+/// Answer to "which level is quadpb hottest at, and where does clause
+/// BCP take over?"
+fn format_per_level_kind_table(stats: &SyncStats) -> String {
+    if stats.forced_by_level_kind.is_empty() { return String::new(); }
+    let active_kinds: Vec<radical::PropKind> = radical::PropKind::ALL
+        .iter()
+        .copied()
+        .filter(|k| stats.forced_by_level_kind.iter().any(|row| row[*k as usize] > 0))
+        .collect();
+    if active_kinds.is_empty() { return String::new(); }
+    let mut out = String::from("Per-level forcings by feature: lvl");
+    for k in &active_kinds { out.push_str(&format!(" | {:>10}", k.label())); }
+    out.push('\n');
+    for (l, row) in stats.forced_by_level_kind.iter().enumerate() {
+        let row_total: u64 = active_kinds.iter().map(|k| row[*k as usize]).sum();
+        if row_total == 0 { continue; }
+        out.push_str(&format!("Per-level forcings by feature: {:3}", l));
+        for k in &active_kinds {
+            out.push_str(&format!(" | {:>10}", row[*k as usize]));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// One-line summary of where the SAT solver spent its propagation work,
@@ -1218,6 +1265,7 @@ fn search_sync_serial(
         sub_cube_time_by_level: Vec::new(),
         children_processed_by_level: Vec::new(),
         prop_by_kind_total: [0; radical::PropKind::COUNT],
+        forced_by_level_kind: Vec::new(),
         }, start.elapsed());
     }
 
@@ -1244,6 +1292,7 @@ fn search_sync_serial(
         sub_cube_time_by_level: vec![0.0; ctx.depth + 1],
         children_processed_by_level: vec![0; ctx.depth + 1],
         prop_by_kind_total: [0; radical::PropKind::COUNT],
+        forced_by_level_kind: vec![[0; radical::PropKind::COUNT]; ctx.depth + 1],
     };
 
     let deadline = if cfg.sat_secs > 0 {
@@ -1590,9 +1639,17 @@ fn dfs_body(
             pre_kind[kind as usize] = solver.propagations_by_kind(kind);
         }
         let sat = solver.propagate_only(&state.assumptions);
+        if state.level >= stats.forced_by_level_kind.len() {
+            stats.forced_by_level_kind.resize(
+                state.level + 1,
+                [0; radical::PropKind::COUNT],
+            );
+        }
         for kind in radical::PropKind::ALL {
             let post = solver.propagations_by_kind(kind);
-            stats.prop_by_kind_total[kind as usize] += post - pre_kind[kind as usize];
+            let delta = post - pre_kind[kind as usize];
+            stats.prop_by_kind_total[kind as usize] += delta;
+            stats.forced_by_level_kind[state.level][kind as usize] += delta;
         }
         if sat == Some(true) {
             // Count walker-var forcings that THIS level's new assumptions
