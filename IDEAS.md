@@ -2521,6 +2521,16 @@ CaDiCaL's tier retention).
   is gated on `current_decision_level() == 0` for soundness
   (install path can immediately propagate at non-zero level).
 
+- **R8 (delta sums in sync walker's speculative choice loop)**:
+  **ACCEPTED — TTC −50 % vs R1 (−60 % vs pre-R1 baseline).**
+  `apply_sum_delta_at` replaces two full `rebuild_sums` per choice
+  with an O(|closure_events[level]|) delta filtered by
+  `newly_placed` kinds (so we don't double-count events whose kind
+  was pre-set by `harvest_forced`) and an O(n) `copy_from_slice`
+  on rollback.  Nodes/60 s: 11.2 M → 37-58 M (3-5×).  Subtle
+  correctness invariant on `newly_placed` caught by debug
+  assertion; n=18 TT(18) verified in 1.8 s.
+
 ### Kissat comparison (April 19 2026)
 
 Kissat (`/home/user/kissat`, 206 source files, ~32k LOC C) is a

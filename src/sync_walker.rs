@@ -524,6 +524,33 @@ fn harvest_forced(solver: &radical::Solver, state: &mut State, ctx: &Ctx) {
     }
 }
 
+/// Apply ONLY the per-lag sum delta contributed by pairs closing at
+/// `level` whose kind is in `newly_placed`. Assumes `state.sums`
+/// already reflects contributions for closure_events[`level`] events
+/// whose kind was NOT newly placed at this iteration (those were
+/// already counted in the parent rebuild, e.g. if harvest_forced set
+/// the bit before this level). O(|closure_events[level]|) —
+/// avoids the full O(total events) rebuild per candidate.
+fn apply_sum_delta_at(
+    state: &mut State,
+    ctx: &Ctx,
+    level: usize,
+    newly_placed: &[bool; 4],
+) {
+    if level >= ctx.depth { return; }
+    for ev in &ctx.closure_events[level] {
+        if !newly_placed[ev.kind as usize] { continue; }
+        let a_sign = state.bit(ev.kind, ev.pos_a);
+        let b_sign = state.bit(ev.kind, ev.pos_b);
+        if a_sign == 0 || b_sign == 0 {
+            continue;
+        }
+        let a = if a_sign == 1 { 1i16 } else { -1 };
+        let b = if b_sign == 1 { 1i16 } else { -1 };
+        state.sums[ev.lag] += (a * b) * ev.abs_coeff;
+    }
+}
+
 /// Apply per-lag sum updates for every pair whose SECOND endpoint became
 /// known at the current descent step. Runs over all closure events at
 /// levels 0..=state.level so freshly-forced bits (from SAT propagation or
@@ -1444,6 +1471,13 @@ fn dfs_body(
     }
     let mut candidates: Vec<Cand> = Vec::with_capacity(16);
 
+    // R8: capture the parent sums once before the speculative choice
+    // loop. Each choice's "advance to level+1" is represented as
+    // `apply_sum_delta_at(level)` on top of the parent sums, and the
+    // rollback is a cheap `copy_from_slice(&parent_sums)` instead of a
+    // full `rebuild_sums` over all prior levels' closure events.
+    let spec_parent_sums = state.sums.clone();
+
     for choice in 0u8..16 {
         if !has_w && (choice & 1) != 0 { continue; }  // W bit must be 0 (ignored)
         let bx = if (choice >> 3) & 1 == 0 { 1i8 } else { -1 };
@@ -1484,13 +1518,25 @@ fn dfs_body(
                 (ki, pi, state.bit(ki, pi))
             })
             .collect();
+        // R8: kinds whose bit at pos_order[level] was 0 before this
+        // choice — i.e. newly placed NOW. The parent's rebuild_sums
+        // already counted closure_events[saved_level] events for kinds
+        // whose bit was set by harvest (not in placed[]); this set
+        // filters out those so we don't double-count.
+        let mut newly_placed = [false; 4];
+        for k in 0..np as usize {
+            let (ki, _, _) = placed[k];
+            newly_placed[ki as usize] = true;
+        }
         for k in 0..np as usize {
             let (ki, pi, si) = placed[k];
             state.set_bit(ki, pi, si);
         }
         let saved_level = state.level;
         state.level += 1;
-        rebuild_sums(state, ctx);
+        // R8: delta on advance (only for newly-placed kinds), restore
+        // parent sums from snapshot on rollback.
+        apply_sum_delta_at(state, ctx, saved_level, &newly_placed);
         let violated = capacity_violated(state, ctx);
         // Early hopelessness: no valid Phase-A tuple is reachable from
         // the partial sums + remaining free-bit budget. Independent of
@@ -1517,8 +1563,9 @@ fn dfs_body(
         for (ki, pi, old_sign) in &saved_bits {
             state.bits[(*ki as usize) * ctx.n + pi] = *old_sign;
         }
-        // Rebuild sums to the parent state after rollback.
-        rebuild_sums(state, ctx);
+        // R8: restore parent sums from the pre-loop snapshot
+        // (O(n)) instead of a full rebuild (O(total events)).
+        state.sums.copy_from_slice(&spec_parent_sums);
 
         if violated {
             stats.capacity_rejects += 1;

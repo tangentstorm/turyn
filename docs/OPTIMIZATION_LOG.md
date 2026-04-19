@@ -603,6 +603,59 @@ All 35 tests pass.
 
 ## SPECTRAL_FREQS sweep for --wz=apart (April 2026)
 
+### R8. Delta-based sums in the sync walker's speculative choice loop — accepted (**TTC −50 % vs R1**, **−60 % cumulative**)
+
+The candidate-building loop in `sync_walker::dfs_body` called
+`rebuild_sums` twice per choice (once after the speculative bit
+placement, once after rollback), O(total closure events) each.  For
+16 choices per DFS node at ~11 M nodes / 60 s (post-R1), that's
+2 × 16 × 11 M = 350 M rebuilds/s, each scanning ≈ 50 events at n=26
+— one of the two dominant hot paths in sync.
+
+**Fix (single commit)**: added
+`apply_sum_delta_at(state, ctx, level, &newly_placed)`
+(`src/sync_walker.rs:532-557`) which only adds contributions for
+pairs closing at `level` whose kind was **newly** placed this
+iteration — not kinds whose bit was already set by
+`harvest_forced` at the caller (those were already counted in the
+parent's rebuild and would double-count otherwise).  The
+speculative `rebuild_sums` after advance is replaced with
+`apply_sum_delta_at`; the rebuild after rollback is replaced with
+`state.sums.copy_from_slice(&spec_parent_sums)`, where
+`spec_parent_sums` is a one-time clone of `state.sums` taken
+before the choice loop.
+
+Subtle soundness invariant caught by debugging: `newly_placed`
+must be the set of kinds whose `state.bit(kind, pos_order[level])`
+was 0 at iteration entry.  Kinds skipped by
+`if existing != 0 { continue; }` (line 1498) in the caller already
+contributed to the parent rebuild via their pre-set bit, and
+double-counting them here drove `n=18 --wz=sync` from "finds TT(18)
+in ~2 s" to "max_lvl=17, no solution in 15 s".  The `newly_placed`
+filter is the correctness fix.
+
+Benchmark: n=26 `--wz=sync --sat-secs=60`, 16 threads, 5
+sequential runs.  High run-to-run variance visible (thermal
+throttling under the R8-enabled higher load), so we report
+mean + range.
+
+| Metric                  | Pre-R1              | R1 alone            | R1 + R8 (this)       |
+|-------------------------|---------------------|---------------------|-----------------------|
+| direct TTC parallel (s) | 6.581e8 ± 0.089e8   | 5.224e8 ± 0.067e8   | 2.62e8 (range 2.04e8 – 3.05e8) |
+| Δ vs baseline           | —                   | −20.6 %             | **−60 %** (mean)     |
+| Δ vs R1                 | —                   | —                   | **−50 %** (mean)     |
+| nodes / 60 s            | 3.9 M               | 11.2 M              | 37 – 58 M            |
+
+Even the worst individual R1+R8 run (3.05e8 s) is −54 % versus
+baseline — the lower bound of the R8 effect is decisively above
+the noise envelope.  Soundness verified by n=18 smoke test (finds
+TT(18) in 1.82 s, `leaves=1`) and full `cargo test --release`
+(40/40 pass).
+
+**Lever**: rate.  Candidate-building pair iteration drops from
+O(cumulative events across all levels) to O(events at the just-
+advanced level) and a fixed-size `copy_from_slice` on rollback.
+
 ### R1. Incremental assumption propagation for `--wz=sync` — accepted (**TTC −20.6 %**)
 
 `radical::Solver::propagate_only(assumptions)` unconditionally
