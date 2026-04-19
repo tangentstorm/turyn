@@ -2618,7 +2618,104 @@ cutoff.
 - **Complexity**: moderate. Pre-requisite: track LBD per learnt
   clause (R3 above).
 
-### Session wrap-up (April 19 2026)
+### Continuation session (April 19 2026, autonomous extended) — **−91 % TTC cumulative**
+
+After the initial inventory & methodology fix above, the session
+continued autonomously. The cumulative TTC delta on n=26 sync went
+from 0 → −91 % across many commits.
+
+**Landed wins** (in OPTIMIZATION_LOG.md with full before/after):
+
+- **R1** (incremental assumption frames in radical, push/pop frame
+  API): −20.6 % TTC. Sync's per-sibling propagate dropped from
+  re-asserting 4L lits to pushing 4 fresh lits.
+- **R8** (delta sums in candidate-building loop): −50 % vs R1.
+  Replaced two full `rebuild_sums` per choice with O(events at this
+  level) delta + O(n) restore. Subtle correctness bug (double-count
+  when `harvest_forced` pre-set a kind) caught by debug assertion
+  before commit.
+- **R8b** (delta sums in sibling loop): −12 % vs R8. Same idea as
+  R8 applied to the post-set-bit rebuild in the sibling loop.
+- **R8c** (skip post-harvest rebuild_sums when no walker bit forced):
+  **−74 % vs R8b** — the single biggest win. Most pushes at
+  shallow-to-mid levels force 0 walker bits, making the rebuild pure
+  waste.
+- **R7** (delete dead `dynamic_capacity_violated`): trivial cleanup.
+- **R10** (`Solver::add_clause_deferred` infrastructure + ungated
+  peer-clause import): TTC parity at n=26 (very few binary
+  nogoods to share), but enables future LBD-tier sharing.
+- **stack-saved_bits, debug-assert dead guard, per-kind ranges in
+  closure_events, SCC + BVE preprocessing**: each ~1–2 % nodes/s
+  rate gain, TTC in noise but rate measurably above noise.
+
+**Rejected this session**:
+
+- **R5** (`--no-xor` flag at sync): in noise (~−1.4 %).
+- **R6** (`MAX_SHARED_LEN` ∈ {32, 64, 8}): all regressed
+  measurably; long shared clauses bloat watch lists faster than
+  they prune.
+- **R8d** (skip `harvest_forced` when no walker var inferred):
+  +4 % regression. Harvest's side-effect of populating
+  `state.bits` for the next dfs_body's candidate-building is
+  necessary; skipping harvest pushes that work into more
+  expensive `push_assume_frame` conflicts.
+- **R9** (forbidden-lit cache from unit nogoods):
+  **UNSOUND** — unit nogoods from `analyze_assumptions` aren't
+  level-0 facts; they depend on the current assumption stack.
+  Caching them lost solutions (n=18 max_lvl dropped from 18 to
+  17, no leaves found).
+- **S6** (incremental sigma in `tuple_reachable`): in noise
+  (~+0.4 %). The compiler had already optimized
+  `compute_sigma`'s O(4n) scan well.
+- **`capacity_violated` unsafe + tight loop**: in noise. Compiler
+  auto-vectorized the original. The function IS critical (1.16B
+  rejects/min; stubbed → 5000× TTC regression) but already
+  near-optimal.
+- **Per-kind propagation telemetry skip via `cfg!(feature)` gate**:
+  no measurable speedup (compiler folded the constant true/false
+  branch).
+
+**Methodology lessons** (logged to OPTIMIZATION_LOG.md):
+
+- **Sequential single-machine measurements** brought the noise
+  floor from 11 % (parallel benchmarks contending) to ~1.3 %.
+- **Thermal bimodal patterns** are a tell that the hot path is
+  sustained-CPU. Once we removed the dominant work (R8c), runs
+  became tightly clustered (~0.3 % spread).
+- **Decisive only**: no in-noise commits. Six experiments with
+  plausible theoretical merit failed to clear the noise envelope
+  and were not committed.
+
+**Cumulative TTC trajectory at n=26 sync**:
+
+| Stage           | TTC (mean)   | Δ vs baseline |
+|-----------------|---------------|----------------|
+| Baseline        | 6.581e8 s     | —              |
+| + R1            | 5.224e8 s     | −20.6 %        |
+| + R8            | 2.62e8 s      | −60 %          |
+| + R8b           | 2.30e8 s      | −65 %          |
+| + R8c           | 5.97e7 s      | **−91 %**      |
+| + R7+R10+marginals | 5.87e7 s   | **−91.1 %**    |
+
+**Next levers** (post-session priorities, hardest first):
+
+1. **Chronological backtracking in radical**: the SAT '18-style
+   shallow backtrack would help propagate_only-dominated workloads
+   like sync. Medium-large solver-internal change.
+2. **Combined-level walking**: place 2 levels' worth of bits per
+   `push_assume_frame` (8 lits instead of 4). Halves push call
+   count, doubles propagation per call. Net benefit dependent on
+   propagation linearity.
+3. **Sync-driven `reduce_db` schedule**: clauses accumulate
+   unbounded under sync (no internal trigger). For long n=56 runs
+   this matters. Wire reduce_db + vivify into sync's worker loop
+   on a conflict-count schedule.
+4. **Architectural denominator**: MDD-equivalent boundary
+   pre-pruning for sync mode. Currently sync walks raw bouncing-
+   order DFS while apart pre-prunes via MDD. The 5700× gap at n=56
+   between sync and apart is denominator-driven.
+
+### Earlier session wrap-up (April 19 2026 — initial measurement only)
 
 Productive inventory, limited measurement:
 
