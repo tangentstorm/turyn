@@ -1269,6 +1269,94 @@ and rule (i) pinning, still ~2^22 candidates — borderline. This test
 was **not executed**; set up for a follow-up pass.
 **Verdict: preliminary only.**
 
+## Part VII.6 — Insights unlocked by the Kharaghani dataset
+
+After the branch rebase, `data/turyn-type-{02..32}` became available
+— a complete enumeration of canonical-form `TT(n)` mirrored from
+Hadi Kharaghani's website. 28 029 solutions in total. Some of them
+were used as an *oracle*.
+
+### Solution-count and structural statistics
+
+| n | sols  | distinct k=9 boundaries | distinct abs-keys | pair peak-ratio range |
+|---|-------|-------------------------|--------------------|------------------------|
+| 28 | 4 161 | 4 157 (99.9 % unique)   | 18                 | [0.876, 0.996]         |
+| 30 | 4 500 | —                       | —                  | —                      |
+| 32 | 6 292 | —                       | —                  | —                      |
+
+**Boundary uniqueness**: at `k = 9`, 4 157 of 4 161 TT(28) solutions
+have *distinct* ZW boundaries. Compression is trivial — each
+solution effectively lives at its own boundary. Implication: widening
+`k` won't dedup much; the search space really is ≥4157 for n=28.
+
+**Spectral pair flatness** (peak of `|Ẑ(ω)|² + |Ŵ(ω)|²` normalised by
+`(6n-2)/2`):
+
+- Random `(Z, W)` (500 samples): peak ratio in `[1.09, 3.92]`,
+  **0.00 %** are Turyn-compatible (peak ≤ 1.0).
+- Known TT(28) (500-sample): peak ratio in `[0.876, 0.996]`, all below
+  1.0, clustered near 0.95.
+
+So the Turyn pair-bound `|Ẑ|² + |Ŵ|² ≤ (6n−2)/2` is already extremely
+selective on its own (rejects 100 % of random pairs), and Kharaghani's
+solutions cluster tightly just below saturation. **No new constraint
+falls out** — the existing spectral-pair filter already captures it.
+
+### The `--outfix` path is buggy — `--test-zw` is the reliable oracle
+
+Decoding the BDKR hex format from `data/`, we tested whether the
+pipeline re-discovers known solutions:
+
+| Tool | Input | Result |
+|------|-------|--------|
+| `--verify` | full `(X, Y, Z, W)` | ✅ accepts |
+| `--test-zw` | full `(Z, W)` | ✅ finds `(X, Y)` in ~100 ms |
+| `--outfix` | k=9 boundary of same `(Z, W)` | ❌ **UNSAT** (5/5 tested) |
+
+For n=6 (tiny sanity check) `--outfix` works. For n=28 it systematically
+fails on known canonical solutions. Likely cause: rule (ii)/(iii)/(iv)/(v)
+middle-clause interaction with outfix-pinned boundary bits. This is
+a real bug to fix before using `--outfix` for any directed search.
+**Verdict: bug found, tracked for follow-up.**
+
+### Phase-a tuple enumeration is correct after all
+
+The Kharaghani data has 163 distinct *signed* sum-tuples at n=28
+but only 18 distinct *absolute-value* keys
+`(|σX|, |σY|, |σZ|, |σW|)`. Our phase-a enumerator lists 18 tuples —
+*exactly the abs-keys*. The CANONICAL.md claim that phase-a was
+"missing orbits" appears to refer to an older version; the current
+`norm_key` using `abs()` is consistent with Kharaghani's full
+enumeration.
+
+### Moser does not scale (revisited)
+
+Reconfirmed at n=10, 12 — Python Moser-LLL does not converge.
+`--stochastic` simulated annealing dominates for n ≤ 18 and remains
+the better small-n heuristic.
+
+### Bottom-line recommendations
+
+1. **Fix the `--outfix` UNSAT bug**. The kernel of the recipe
+   — `--outfix=<prefix>...<suffix>` on a known TT(n) boundary
+   — should succeed; today it doesn't for n ≥ 18ish. Triage by
+   diffing `--outfix` vs. `--test-zw` + middle-position pinning
+   in the DIMACS dump; suspect rule-(iv)/(v) middle clauses
+   being emitted for a boundary that already satisfied them.
+2. **Use `data/turyn-type-N` as a continuous-integration oracle.**
+   Pick a random sample of known `(Z, W)` boundaries per n and run
+   `--test-zw` on them. Flags regressions in SAT-XY encoding
+   *and* in canonical-form rules.
+3. **Run n=28 overnight (~42 h, 16 cores)** at `--wz=apart --mdd-k=10`.
+   At 1500 bnd/s this covers 211 M live paths. Given 4 157
+   solution boundaries and no known exclusion, it should find at
+   least one and close the existence question definitively.
+4. **Spectral-peak-lower-bound priority**. Known TT(28) cluster
+   at peak ratio ≥ 0.876. Boundaries with peak ratio below (say)
+   0.7 may be either (a) very flat but actually infeasible, or
+   (b) outliers worth checking. Add as a secondary score
+   for the gold queue.
+
 ## Part VIII — Closing remarks from the chairs
 
 > *Gauss:* "Every simple problem deserves a Gauss sum."
