@@ -525,6 +525,19 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
         solver.add_quad_pb_eq(&lits_a, &lits_b, &coeffs, target);
     }
 
+    // SCC equivalence preprocessing on the binary implication graph.
+    // Strongly-connected components in the implication graph are
+    // logically-equivalent literals; substituting them out shrinks
+    // the formula. radical exposes this but neither sync nor any
+    // other entry point currently calls it.
+    let _scc_eliminated = solver.preprocess_scc_equivalences();
+
+    // BVE preprocessing — eliminate Tseitin aux vars where possible,
+    // but protect walker vars (1..=4n) since they're used as
+    // assumption literals in push_assume_frame.
+    let protected: Vec<usize> = (0..4 * n).collect();  // 0-based var idx
+    let _bve_eliminated = solver.preprocess_bve_with_protection(&protected);
+
     solver
 }
 
