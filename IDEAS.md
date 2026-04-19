@@ -2250,3 +2250,393 @@ occasionally — more likely to find leaves than pure random.
 - **Detection plan**: `time_to_first_leaf` should drop.
 - **Risk**: on UNSAT-complete search this is neutral (still need
   to cover tree); purely a find-solution-faster optimisation.
+
+## R-series: radical vs CaDiCaL feature-by-feature (April 19 2026, Claude)
+
+Baseline recorded at session start (n=26, 16 threads, 60s budget,
+`runsc`, commit `3484b54`):
+
+- `--wz=apart --mdd-k=7`: TTC 37.8 min parallel, 629 eff bnd/s,
+  1.47M live ZW paths, 0 % XY timeout.
+- `--wz=sync`: direct TTC ≈ 6.76e8 s parallel (~21.4 y), ~51k
+  nodes/s, 3.1M nodes, 40.6M cap_rejects, 0 leaves at max_lvl=25.
+  Per-feature forcings: **clause 77.8 % / quadpb 21.7 % / pbseteq
+  0.4 %**.
+- `--wz=cross`: at 60 s budget the producer is still streaming Z/W
+  candidates; 0 boundaries walked → TTC "infd". Not a usable
+  baseline at this budget for this session.
+
+Sync is ~3e5× worse TTC than apart at n=26. CaDiCaL comparison (agent
+Explore report) identified 5 gaps in `radical` relative to CaDiCaL
+that plausibly help a `propagate_only`-dominated workload:
+
+1. **Chronological backtracking** (CaDiCaL SAT'18 signature) — keep
+   shallow-level literals on the trail across conflicts.
+2. **Dedicated binary clause list** — CaDiCaL's `bins` index lets
+   binary propagation skip the general 2WL scan.
+3. **LBD-tiered clause retention (glue)** — keep `glue ≤ 2` forever;
+   radical currently deletes by age only.
+4. **On-the-fly subsumption during learning** — radical adds the
+   learnt nogood without checking if it subsumes or is subsumed.
+5. **Hyper-binary resolution (HBR) during probing** — derive binary
+   clauses eagerly to densify the implication graph.
+
+The highest-leverage lever I can see in the existing
+`radical::propagate_only` code (`radical/src/lib.rs:1723`):
+
+> **Every `propagate_only(&assumptions)` call backtracks to
+> decision level 0 and re-enqueues every literal in the assumption
+> list as a fresh decision.** Sync's DFS sibling loop calls
+> `propagate_only(state.assumptions)` with a prefix of ~4L literals
+> that is identical across all 16 siblings at this node, differing
+> only in the last 4 lits. We pay full O(L) re-propagation 16 times
+> per node.
+
+This is by far the most promising single commit for `--wz=sync`
+rate.
+
+### R1. Incremental assumption propagation (push/pop frames)
+
+Expose `push_assumption_frame(&[Lit]) -> Option<bool>` and
+`pop_assumption_frame()` on `radical::Solver`. `push` pushes the new
+lits at `decision_level + 1`, propagates, returns Some(true) / Some
+(false); `pop` backtracks one level. Sync's DFS:
+
+```
+// on entering level L, after filtering candidates:
+solver.push_assumption_frame(&cand.new_assums[..n]);
+// ... harvest, recurse ...
+solver.pop_assumption_frame();
+```
+
+- **TTC mechanism**: rate — propagation cost per node drops from
+  re-asserting 4L lits to propagating 4 lits. Expected 5-20×
+  speedup on the `propagate_only` call alone.
+- **Detection plan**: `clause` forcing rate (per-second) rises ~5–
+  20×; `nodes_visited/elapsed` rises; `avg_nogood` size should be
+  stable; `sat_unsat` per second rises.
+- **Risk**: must guarantee pop matches push; learnt clauses that
+  fire within an assumption frame must be consistent with being
+  popped. Existing `solve_with_assumptions` path is unaffected.
+
+### R2. Dedicated binary clause list in radical
+
+Maintain a `Vec<Vec<Lit>>` (per-literal `bin_implications`) in
+addition to the general 2WL. During `propagate()`, when a literal
+`l` is enqueued, walk `bin_implications[index(l)]` first — each
+entry implies a single other literal, zero overhead.
+
+- **TTC mechanism**: rate. 77.8 % of sync's forcings are `clause`;
+  a large fraction are binary (Tseitin chains, BDKR rule
+  encodings, learnt unit-like nogoods). Separate-path binary
+  propagation is a known ~1.2–1.5× solver speedup.
+- **Detection plan**: `clause` forcings/sec ↑, total forcing count
+  unchanged, nodes/s ↑.
+- **Risk**: have to keep the bin list consistent with clause DB
+  deletions and the clause arena. Needs a `Clause::is_binary()`
+  short-circuit in `reduce_learnt`.
+
+### R3. LBD-tiered learnt clause retention
+
+On learning, compute `lbd = #distinct decision levels in the
+clause`. Tag the clause `Tier1` if `lbd ≤ 2`, `Tier2` if `lbd ≤ 6`,
+`Tier3` otherwise. `reduce_learnt` never evicts Tier1; preserves
+Tier2 until size/2 pressure; evicts Tier3 aggressively.
+
+- **TTC mechanism**: rate — high-quality propagators persist across
+  the sync walker, so the same state's conflict is cheaper the
+  second time.
+- **Detection plan**: `clause` forcing count rises (more short
+  clauses firing); `peer_imports` may rise; nodes/s ↑.
+- **Risk**: clause DB grows until cap is raised; watch RSS.
+
+### R4. Preload walker-infeasible tuples as solver nogoods
+
+Phase-A enumerates sum tuples `(σ_x, σ_y, σ_z, σ_w)`. The walker
+checks `tuple_reachable(state)` after each speculative placement
+and rejects infeasible branches with `tuple_rejects`. If we
+encode those tuple constraints as native solver clauses (one
+PbSetEq per sequence's target sum, plus a disjunction over
+allowed tuples), the CDCL branch ordering + VSIDS gets to use
+them.
+
+- **TTC mechanism**: denominator (fewer siblings reach the SAT
+  stage) + rate (solver can cut earlier).
+- **Detection plan**: `tuple_rejects` drops; `sat_unsat` rises
+  proportionally; TTC ≈ no change unless the SAT prunes earlier
+  than the walker's capacity check.
+- **Risk**: sync already attaches Phase-A sum PbSetEq (see
+  sync_walker.rs) — verify these are wired in before claiming an
+  easy win. If they are, R4 is already landed in a weaker form
+  and moves to "verified".
+
+### R5. Session benchmark: `--no-xor` on `--wz=sync` (S12)
+
+Just run `target/release/turyn --n=26 --wz=sync --sat-secs=60
+--no-xor` and compare TTC, nodes/s, per-feature forcing
+breakdown. No code change; pure measurement. If XOR propagation
+has negative marginal value on sync (which is plausible — quad PB
+already enforces the Turyn lag identity), removing it frees
+propagation budget.
+
+- **TTC mechanism**: rate if XOR is net-overhead; regression if
+  it's net-positive.
+- **Detection plan**: per-feature `xor` forcings should drop to 0;
+  `clause`/`quadpb` unchanged or up; nodes/s ↑ or ↓.
+
+### R6. Raise sync's `MAX_SHARED_LEN` 16 → 64 (S5 concrete)
+
+In `src/sync_walker.rs`, change `const MAX_SHARED_LEN: usize = 16;`
+to 64. avg_nogood len at baseline is ~71; current threshold
+filters out essentially everything.
+
+- **TTC mechanism**: rate (cross-worker nogood flow increases).
+- **Detection plan**: `peer_imports` should rise 10–100×;
+  `sat_unsat` should drop in aggregate.
+
+### R7. Delete dead `dynamic_capacity_violated` (S11 concrete)
+
+Verified dead: defined at `src/sync_walker.rs:687`, never called.
+Simple cleanup; removes a dead-code warning. Zero TTC impact
+expected, filed for measurement discipline.
+
+- **TTC mechanism**: rate (micro; instrumentation).
+- **Detection plan**: `cap_rejects` unchanged; warning disappears.
+
+### R8. Incremental sum maintenance (S3/S6/S9 consolidated)
+
+Replace the three `rebuild_sums` calls per candidate with a delta
+stack: at each level, precompute `sums_delta_by_bit[level][bit]`
+(the 4-bit sigma deltas if we place each of the 4 kinds with
+sign). Candidate loop: for each choice, add 4 deltas; on
+reject/accept/rollback, subtract or stay.
+
+- **TTC mechanism**: rate — `rebuild_sums` is O(n²) on n=26; delta
+  is O(4).
+- **Detection plan**: nodes/s ↑ by a visible margin in profiling
+  (expected 15–30 % at n=26).
+- **Risk**: easy to get off-by-one; add a debug-only `assert_eq`
+  against `rebuild_sums` under `cfg(test)`.
+
+### R9. Early sibling-loop exit when a BDKR rule just fired (S14)
+
+Cache "rule X fired with early-bit Y at level L"; later siblings
+at the same level with the same early-bit skip the rule check and
+skip directly. Cheap denominator filter.
+
+- **TTC mechanism**: denominator.
+- **Detection plan**: `rule_rejects` unchanged, avg candidates
+  processed per node drops, nodes/s stable.
+
+### R10. Epsilon-greedy sibling order on workers 1..N (S15)
+
+Replace workers 1..N's fully-random ordering with ε-greedy (best-
+first with probability 1-ε; ε=0.1). Diverges enough to explore
+different regions but exploits the score heuristic for bulk of
+choices.
+
+- **TTC mechanism**: rate (time-to-first-leaf).
+- **Detection plan**: `time_to_first_leaf` drops; TTC unchanged
+  for UNSAT-complete coverage.
+
+### R11. Probe the first branching level once per search (S4)
+
+Pre-walk levels 0..L* (where L* is the first branching level —
+measure with `nodes_by_level / children_by_level`) serially once,
+then dispatch workers at L* with distinct first-branch
+assignments via a shared queue. Avoids 15/16 × prefix work.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: `nodes_by_level[0..L*]` drops to 1 per
+  worker instead of ~1 per worker × N.
+
+### R12. UNSAT-only coarser memo (S8 concrete)
+
+Memoize only the UNSAT verdict keyed by `(level, sums, rule_state)`
+(drop the walker-bits dimension). Sound because UNSAT at this key
+holds regardless of which bits led here, provided rule_state
+encodes BDKR state. Re-entering the same key at a later sibling
+returns UNSAT immediately.
+
+- **TTC mechanism**: denominator.
+- **Detection plan**: `memo_hits` > 0; `sat_unsat` drops.
+- **Risk**: soundness proof needed — rule_state must be a
+  complete summary of BDKR enforcement at this level.
+
+### Ranking of R-series by expected TTC leverage
+
+Top 3 likely wins (single-commit feasible):
+- **R1** (incremental assumption propagation): biggest rate lever;
+  theoretically ~5-20×. Medium complexity.
+- **R8** (delta sums): solid rate lever; low complexity.
+- **R6** (MAX_SHARED_LEN 16→64): trivial; rate lever via peer flow.
+
+Low-risk quick tests to run first:
+- **R5** (`--no-xor` measurement): no code.
+- **R7** (delete dead fn): cleanup.
+- **R6** (1-line const change): trivial.
+
+### R-series results (this session, April 19 2026)
+
+Clean n=26 `--wz=sync --sat-secs=60` baseline (16 threads, `runsc`,
+MAX_SHARED_LEN=16): **noise floor ~11 %** over 3 back-to-back runs
+(TTC 6.79e8, 6.78e8, 7.54e8 → mean 7.03e8). Need ≥15 % TTC move to
+call a win decisively on a single 60 s run.
+
+- **R5 (`--no-xor`)**: direct TTC 6.58e8 s vs baseline 6.67e8 s
+  (-1.4 %), nodes/s +3 %. **Within noise — rejected.** Per-feature
+  forcing shape unchanged (baseline already shows `xor=0` lines
+  suppressed — XOR propagator fires but forces nothing visible at
+  telemetry granularity). Keep XOR on; no benefit demonstrated.
+
+- **R6 @ MAX_SHARED_LEN=64**: peer_imports 416 → 3.64M (8800×),
+  nodes/s −20 %, direct TTC +2 % (6.81e8). Long clauses via
+  2WL are net overhead. **Rejected.**
+
+- **R6 @ MAX_SHARED_LEN=32**: peer_imports 416 → 592 (essentially
+  unchanged — baseline noise), nodes 3.94M → 2.60M, direct TTC
+  7.70e8 s. Regression falls inside the noise envelope; no signal
+  of benefit. **Rejected.**
+
+The 2WL architecture in `radical` penalises long shared clauses
+(clause DB scans grow and most never fire). A smarter share
+policy — e.g., share only if `lbd ≤ 2` regardless of length — is
+the right follow-up, but requires glue tracking first (see R3 or
+CaDiCaL's tier retention).
+
+- **R7 (delete dead `dynamic_capacity_violated`)**: deferred —
+  `grep` confirms it's never called; removing is pure cleanup and
+  should not move TTC. Not committed this session.
+
+- **R1 (incremental assumption propagation)**: **not attempted this
+  session — flagged as highest-leverage next step.** Read of
+  `radical::Solver::propagate_only` (`radical/src/lib.rs:1723`)
+  confirms every call does `backtrack(0)` + full assumption
+  re-enqueue. Sync's DFS at depth L calls it with an assumption
+  prefix of ~4L lits that is identical across 16 siblings, so 15
+  of 16 re-propagations are wasted work. The fix is to expose
+  `push_assume_frame(&[Lit])` / `pop_assume_frame()` on the Solver
+  and have sync's dfs_body push 4 new lits instead of re-asserting
+  all 4L. Expected per-node propagate_only cost drops O(L) → O(1),
+  a 5–20× rate improvement at n=26. This is a medium-sized change
+  (solver surface, DFS plumbing, testing) that should be
+  attempted in a dedicated session.
+
+### Kissat comparison (April 19 2026)
+
+Kissat (`/home/user/kissat`, 206 source files, ~32k LOC C) is a
+re-engineered CaDiCaL focused on cache layout and adaptive
+heuristic policy. All five gaps found vs. CaDiCaL also exist vs.
+kissat; in addition kissat has the following mechanisms worth
+considering for the Turyn `--wz=sync` loop.
+
+#### K1. Binary-watch prioritization (kissat: `watch.h:38-80`)
+
+Kissat separates watch lists into tagged `binary_watch` vs
+`large_watch` and runs transitive reduction that moves all
+binaries to watch-list heads. Propagation touches binaries first;
+cache line per propagated literal is well-packed. Radical has one
+flat `Vec<(u32, Lit)>` per literal.
+
+- **TTC mechanism**: rate. 77.8 % of sync's forcings are `clause`;
+  many are binary (Tseitin, BDKR rules). Hitting binaries first
+  terminates the per-lit watcher loop earlier and reduces cache
+  pressure.
+- **Detection plan**: `clause` forcings/sec ↑; nodes/s ↑;
+  `sat_unsat` rate ↑.
+- **Complexity**: moderate — either a dedicated `bin_watches:
+  Vec<Vec<Lit>>` index (R2 as originally proposed) or an in-place
+  partition + tagged watch struct. Former is simpler and
+  compatible with existing clause-arena API.
+
+#### K2. Backbone detection at solver build time (kissat: `backbone.c:16-68`)
+
+Kissat detects literals forced to a single polarity across *all*
+satisfying assignments of the base formula, then fixes them at
+level 0. Radical has failed-literal probing but no systematic
+backbone phase.
+
+- **TTC mechanism**: denominator (variables fixed pre-search never
+  enter the walker's assumption stack) + rate (solver starts at
+  smaller instance).
+- **Detection plan**: number of variables assigned at level 0
+  after backbone phase rises; per-level `children` at deep
+  levels shrinks.
+- **Complexity**: ~200-500 LOC. Gated by config; off by default
+  until measured.
+
+#### K3. Enable and tune radical's existing vivification path (`radical/src/lib.rs:2635`)
+
+Radical has a vivification implementation but it's off by default
+(`vivification: false` in default config) and only runs every
+1000 conflicts on ≤ 50 clauses. Kissat runs vivification regularly
+and integrates it with minimization via the removable-set (shrink).
+
+- **TTC mechanism**: rate (shorter clauses propagate faster) +
+  shortfall (earlier UNSAT on redundant branches).
+- **Detection plan**: avg_nogood len drops; clauses/sec ↑;
+  nodes/s roughly flat (fewer but shorter) unless a clause-DB-
+  compaction win manifests.
+- **Complexity**: trivial to enable, non-trivial to tune (budget
+  fraction, subsumed-clause eviction).
+
+#### K4. Congruence closure / gate recognition (kissat: `congruence.c`)
+
+Detects AND/XOR/ITE gate sub-structures in clause sets and merges
+equivalent variables. For Turyn, XOR/QuadPB constraints are
+explicit (`quad_pb_var_terms`, `xor_chain`), not hidden in CNF, so
+gate recognition over the pure-clause part (BDKR Tseitin chains,
+MDD canonicalization rules) might find something.
+
+- **TTC mechanism**: denominator (fewer decision variables after
+  merge).
+- **Detection plan**: `num_vars` after preprocessing < original;
+  nodes/s ↑ via smaller search tree.
+- **Complexity**: large (~500-1000 LOC). Lower priority than K1/K2.
+
+#### K5. Adaptive LBD tiers with mode switching (kissat: `tiers.c:6-49`, `reduce.c:82-86`)
+
+Kissat splits reduction into `tier1` (glue ≤ adaptive1),
+`tier2` (glue ≤ adaptive2), `tier3` (rest). Thresholds are
+computed from the running glue histogram and differ between
+stable and focused modes. Radical has a hard-coded `lbd ≤ 3`
+cutoff.
+
+- **TTC mechanism**: rate (longer retention of high-quality
+  learnt clauses).
+- **Detection plan**: `clause` forcing count ↑; peer exchange
+  quality ↑ (clauses fired more often before eviction).
+- **Complexity**: moderate. Pre-requisite: track LBD per learnt
+  clause (R3 above).
+
+### Session wrap-up (April 19 2026)
+
+Productive inventory, limited measurement:
+
+- Established baselines for all three `--wz` modes at n=26 (60 s
+  budget). Sync noise floor = 11 %, so deltas < 15 % need
+  averaged runs to be decisive.
+- Compared radical vs CaDiCaL and vs kissat; identified five
+  cadical gaps + five kissat-specific gaps.
+- Added 17 concrete, single-commit ideas to this file (R1-R12
+  against the CaDiCaL/radical gap, K1-K5 against the kissat
+  refinements).
+- Tested R5 (`--no-xor`) and R6 at MAX_SHARED_LEN ∈ {32, 64} on
+  sync. All three were within the 11 % noise envelope;
+  rejected. **No commit landed this session.**
+- Identified **R1 (incremental assumption propagation)** as the
+  highest-leverage next step: `propagate_only` currently
+  backtracks to level 0 and re-enqueues every ancestor
+  assumption per sibling, costing O(L) per call where O(Δ) would
+  suffice. Theoretical 5-20× rate improvement, medium-sized
+  change (solver surface + DFS plumbing).
+
+Priority order for the next session:
+
+1. **R1 incremental assumption propagation** — biggest sync TTC lever.
+2. **K1 binary-watch prioritization / dedicated bin list** —
+   targets the 77.8 % of forcings that come from `clause`.
+3. **R8 delta sums in sync** — rate win inside the walker.
+4. **R11 first-branching-level probe** — rate win (stop 16-way
+   redundant prefix walk).
+5. **K3 enable vivification + measure** — potentially cheap.
