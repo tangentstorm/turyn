@@ -2709,11 +2709,270 @@ from 0 → −91 % across many commits.
 3. **Sync-driven `reduce_db` schedule**: clauses accumulate
    unbounded under sync (no internal trigger). For long n=56 runs
    this matters. Wire reduce_db + vivify into sync's worker loop
-   on a conflict-count schedule.
+   on a conflict-count schedule. *(Landed as infrastructure,
+   commit 1431456.)*
 4. **Architectural denominator**: MDD-equivalent boundary
    pre-pruning for sync mode. Currently sync walks raw bouncing-
    order DFS while apart pre-prunes via MDD. The 5700× gap at n=56
    between sync and apart is denominator-driven.
+
+### Carry-over to `--wz=apart` / `--wz=together` (April 19 2026)
+
+**Empirical verdict**: none of the session's 13 commits measurably
+changed apart-mode TTC. Pre-session baseline `--n=26 --wz=apart
+--mdd-k=7 --sat-secs=60`: 37.8 min. Post-session (same flags, all
+commits live): 39.8–40.4 min across 3 sequential runs. That's
+within thermal noise — **the session was sync-specific**.
+
+Why apart/together weren't touched:
+
+- **sync_walker.rs hot path changes** (R8, R8b, R8c, R7, stack-
+  saved_bits, per-kind ranges, dead-guard removal, SCC+BVE in
+  sync's `build_solver`, periodic `reduce_db`, R10 `add_clause_
+  deferred` usage) are all inside `search_sync_serial` /
+  `dfs_body`. Apart/together don't execute any of this code.
+- **radical API additions** (R1's `push_assume_frame` /
+  `pop_assume_frame` / `current_decision_level`,
+  `add_clause_deferred`, `pub reduce_db`, `clause_length_histogram`)
+  are new methods with no callers in apart/together. The flows
+  there use the pre-existing `solve_with_assumptions` path on a
+  cloned template solver per `(Z, W, tuple)` candidate.
+
+**How apart/together could benefit (ranked by expected payoff)**:
+
+1. **R1 for SolveZ / SolveW stages** (*largest lever*). The
+   `SolveXyPerCandidate` / `solve_inner` flow currently clones
+   the template solver per `(Z, W)` candidate and re-propagates
+   the whole assignment from scratch. The same R1 machinery
+   (`push_assume_frame` / `pop_assume_frame`) applied here would
+   let SolveW's W enumeration, SolveZ's Z enumeration, and the
+   XY per-candidate walk run on a *persistent* solver whose
+   trail is extended by only the lits that differ between
+   consecutive candidates. Same mechanism as R1 for sync:
+   eliminates O(4L)-style re-assertion per candidate. Expected
+   effect similar in magnitude to R1's −20.6 % for sync.
+   Implementation size: similar to R1 (solver surface + stage
+   plumbing).
+2. **Cross-stage clause sharing via `add_clause_deferred`**.
+   SolveW / SolveZ learn nogoods that are valid across all
+   candidates with the same `(tuple, z_bits)` or `(tuple, w_bits)`
+   prefix. Currently each candidate starts from scratch. Using
+   `add_clause_deferred` to publish + import short nogoods into
+   a persistent template solver would compound with (1).
+3. **Periodic `reduce_db` in long apart/together runs at n=56**.
+   Apart's 19-day n=56 run would accumulate learnt clauses
+   unbounded without a reduce schedule. Same hygiene as R10 for
+   sync.
+4. **SCC / BVE preprocessing in apart's template solver**.
+   The apart pipeline uses a separate `SatXYTemplate` + `LagTemplate`
+   construction (see `src/xy_sat.rs` / `src/sat_z_middle.rs`).
+   Calling `preprocess_scc_equivalences` / `preprocess_bve_with_
+   protection` on those template solvers after construction would
+   shrink the per-candidate work. Expected: small (+1–2 % rate)
+   per sync measurements, but free once the API is wired.
+
+None of these are attempted here because the session was sync-
+targeted and the apart-mode wiring is non-trivial (each stage has
+its own template construction and candidate-feeding discipline).
+They are the natural next workstream.
+
+### General SAT-implementation lessons from the CaDiCaL / Kissat deep-dives
+
+Independent of what landed for sync in this session, the four deep-
+dive agents surfaced a coherent picture of how a production-grade
+CDCL solver differs from radical's current implementation.  These
+are gaps that apply to **every** use of radical (apart, together,
+cross, and sync), not just the sync pipeline.
+
+**Honest accounting of what was actually DONE vs DOCUMENTED this
+session** (the rest are future work, not present wins):
+
+| Technique | Status this session |
+|---|---|
+| R1 push/pop assumption frames | **DONE** (inspired by kissat's pointer-based propagate state; radical's `Solver::push_assume_frame` is the adapted form). Landed −20.6 % TTC on sync. |
+| `add_clause_deferred` | **DONE** — install-at-any-level path, peer analog of kissat's safe-deferred install. |
+| SCC equivalence preprocessing | **WIRED UP** — was already in radical (`preprocess_scc_equivalences`), never called; now called in sync's `build_solver`. |
+| BVE preprocessing | **WIRED UP** — same, via `preprocess_bve_with_protection`. |
+| `reduce_db` at non-zero level | **WIRED UP** — made `pub`, called periodically from sync. Policy unchanged (simple single-threshold `lbd ≤ 3`), *not* the adaptive cadical/kissat tiers. |
+| Watch-list 4-byte tagged union / dedicated binary list | **not implemented** |
+| Intrusive clause arena | **not implemented** |
+| Arena compaction | **not implemented** |
+| Full chronological backtracking (Möhle–Biere) | **not implemented** (radical has only the trivial 2-level form) |
+| On-the-fly subsumption during analysis | **not implemented** |
+| Adaptive LBD tiers with `used` counter | **not implemented** |
+| Stable vs focused mode switching | **not implemented** |
+| Walking / local-search integration | **not implemented** |
+| Backbone detection | **not implemented** |
+| Gate/congruence closure (AND/XOR gate patterns) | **not implemented** |
+
+So: one real radical-side win inspired by the comparison (R1),
+plus three "wire-up" commits that activate code that was already
+present but unused (SCC, BVE, reduce_db), plus a small new API
+surface (add_clause_deferred) that measurably matches parity
+because the cross-worker share filter is necessarily tight for
+correctness. **The bulk of the session's 91 % TTC gain came from
+walker-level delta-sum and skip-when-empty optimisations in
+`sync_walker.rs` (R8 / R8b / R8c), not from porting cadical/kissat
+solver techniques.**
+
+The below list is **future work**, ordered roughly by expected
+impact on a mixed CDCL + incremental-assumption workload:
+
+**1. Watch-list layout.**
+- **Kissat**: 4-byte tagged union — `{ binary-lit | large-ref }`
+  per entry, `watch.h:18-44`. Binary watches fit in one 32-bit
+  word (lit + tag); large watches are `ref | 0`. Propagation
+  iterates both with conditional pointer stepping (advance 1
+  word for binary, 2 for large).
+- **CaDiCaL**: 16-byte struct `{ Clause *clause; int blit; int
+  size; }` (`watch.hpp:31-44`). Caches `size` so the "is binary"
+  check avoids a pointer dereference.
+- **Radical** (`lib.rs:708`): 12-byte `(u32 clause_idx, i32 blocker)`
+  tuple stored in `Vec<Vec<(u32, Lit)>>`. No binary/large distinction,
+  no size cache; every propagation call dereferences `clause_meta`
+  to learn the length. This costs both cache lines (metadata is a
+  separate Vec) and branch prediction (is-binary is re-derived per
+  event).
+
+**Improvement for radical (any mode)**: either a dedicated
+`bin_watches: Vec<Vec<(Lit, u32)>>` side index (what R2 in this
+file proposes) or an in-place tagged watch rewrite à la Kissat. The
+histogram at sync startup showed binaries are only ~3 % of the base
+formula for n=26, so the win is small for sync's template.  But
+apart/together solvers often end up with many learnt binaries after
+minimisation, so the payoff rises with run length. **Generalisable
+to every solver use, not sync-specific.**
+
+**2. Clause arena with intrusive metadata.**
+- **Kissat / CaDiCaL**: clauses stored in a bump-allocator arena
+  (`arena.cpp`), with metadata (size, LBD, used flag, deleted
+  flag) packed into the first few bytes of the clause itself.
+  Watched-clause iteration = dereference single pointer, metadata
+  + literals both loaded on the same cache line.
+- **Radical**: parallel `clause_lits: Vec<Lit>` + `clause_meta:
+  Vec<ClauseMeta>` indexed by `ci`. Metadata lookup is a separate
+  load; literals are a second load. Two-cache-line access per
+  watch hit.
+
+**Improvement for radical**: intrusive arena layout. Meaningful
+engineering effort but one-time. Reduces per-propagate memory
+traffic by roughly 50 % on the clause-BCP path (which is 98.6 % of
+sync's forcings and dominant in any CDCL mode).
+
+**3. Periodic arena compaction.**
+- **Kissat / CaDiCaL**: `compact.cpp` / `compact.c` run a full
+  pass remapping clause references when enough garbage (deleted
+  clauses) has accumulated. Necessary for long runs because
+  `deleted` flags leave holes in the arena.
+- **Radical**: no compaction pass. Deleted clauses sit in
+  `clause_lits` + `clause_meta` forever, fragmenting cache and
+  slowing clause-pointer iteration over time.
+
+**Improvement for radical**: add a `compact_arena` pass triggered
+from `reduce_db` when `deleted_count / total > 0.3`. Matters
+primarily on multi-day runs — the sync 60 s benchmark doesn't
+hit it, but n=56 apart at 19 days absolutely would.
+
+**4. Chronological backtracking (Möhle & Biere, SAT '18).**
+- **CaDiCaL**: signature feature (`backtrack.cpp:129-144`). On
+  shallow conflicts, only backtrack one level instead of to the
+  asserting level; keep deeper-level propagated lits on the
+  trail. Avoids re-deriving the same implications.
+- **Kissat**: also supports it.
+- **Radical**: flag `chrono_bt` in `SolverConfig`, implementation
+  at `lib.rs:2780-2791`. Enabled path is very limited — triggers
+  only for `cur_level - bt_level ≤ 2` AND `learnt.len() > 1`.
+  Full Möhle–Biere chronological semantics (out-of-order trail
+  literals, level-reassignment on collision) is not implemented.
+
+**Improvement for radical**: full chronological BT. Benefits any
+workload that hits many shallow conflicts — not sync (which
+backtracks by one assumption frame at a time by design), but
+definitely apart's SolveXY per-candidate search.
+
+**5. On-the-fly subsumption during conflict analysis.**
+- **CaDiCaL** (`analyze.cpp:1068-1105`): during resolution, if the
+  resolvent shrinks below the antecedent size, strengthen the
+  antecedent and mark it for subsumption.
+- **Kissat**: shrink-phase equivalent (`shrink.c`).
+- **Radical**: absent. 1-UIP analysis + recursive minimisation
+  only.
+
+**Improvement for radical**: implement OTFS. Shortens the clause
+DB continuously. Expected biggest effect in apart's XY sub-MDD
+walk where a large fraction of clauses become redundant.
+
+**6. Adaptive LBD tiers (Kissat `tiers.c`).**
+- **Kissat** computes tier-1 / tier-2 LBD thresholds dynamically
+  from the running glue histogram. Clauses with glue ≤ tier1 are
+  kept ~forever if recently used; tier2 kept if used more than
+  once; rest evicted.
+- **CaDiCaL**: fixed tier1=2 / tier2=6 with a `used` counter.
+- **Radical** (`lib.rs:4398`): single threshold `lbd ≤ 3` kept,
+  worst-half of the rest deleted; no usage counter.
+
+**Improvement for radical**: add a `used: u8` per clause, bumped
+on each use as an antecedent during analysis. Reduce-time, sort
+by `(tier, used, -lbd)` descending and keep tier1 (used>0) plus
+tier2 (used≥2). **This compounds with (3) — tier-retention
+combined with compaction is how CaDiCaL keeps clause-DB quality
+high over millions of conflicts.**
+
+**7. Stable vs focused mode switching (Kissat `mode.c`).**
+- **Kissat**: alternates between stable (VMTF, high-quality
+  retention, reluctant-doubling restarts) and focused (VSIDS,
+  aggressive retention, Glucose-EMA restarts) modes. Each mode's
+  restart policy and tier thresholds are tuned independently.
+- **CaDiCaL**: similar (`stable.cpp`).
+- **Radical**: always in a single mode equivalent to focused.
+
+**Improvement for radical**: medium-large. Helps SAT Competition-
+style instances but less clearly useful for Turyn's structured
+formulas.
+
+**8. Walking / local-search integration (Kissat `walk.c`).**
+- **Kissat**: ProbSAT-style random walk invoked during rephasing.
+  Produces phase hints for subsequent CDCL search.
+- **Radical**: absent. Rephasing only toggles between best and
+  inverted saved phases.
+
+**Improvement for radical**: low priority for Turyn (walk conflicts
+with the walker's own phase control).
+
+**9. Backbone detection (Kissat `backbone.c`).**
+- **Kissat**: identifies literals forced to a single polarity in
+  every model. Installs them as level-0 units.
+- **Radical**: none. (Failed-literal probing at startup is the
+  closest analog — but one-shot and limited to 200 vars.)
+
+**Improvement for radical**: run eager backbone propagation during
+preprocessing. For Turyn formulas with heavy symmetry (BDKR
+rules, etc.), the backbone may be substantial.
+
+**10. Gate/congruence closure (CaDiCaL `congruence.cpp`,
+Kissat `congruence.c`).**
+- Detect AND / XOR / ITE gate patterns in clause sets and merge
+  logically-equivalent variables. Particularly effective against
+  Tseitin chains.
+- **Radical**: SCC equivalence only (`preprocess_scc_equivalences`,
+  now called at sync's `build_solver`). No gate detection.
+
+**Improvement for radical**: add AND-gate and XOR-gate pattern
+matching. Turyn's Tseitin chains are the target — each chain
+generates ~4 clauses per gate that congruence could collapse.
+
+---
+
+**How to use this list**: each of (1)–(10) is a generalisable
+solver improvement that would help *every* mode radical is
+called from, not just sync. They are ordered by expected
+impact on a mixed workload. The first three (watch layout,
+arena compaction, clause tiers) are the highest-leverage
+refactors; they are also the biggest engineering lifts.
+Chronological backtracking and OTFS are medium-sized wins
+appropriate for a second dedicated radical-optimization
+session. The remaining five are specialised features whose
+relevance depends on workload.
 
 ### Earlier session wrap-up (April 19 2026 — initial measurement only)
 
