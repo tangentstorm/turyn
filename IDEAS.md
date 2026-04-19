@@ -2147,19 +2147,29 @@ optimization saves nothing net. Reverted. Keep `compute_sigma` direct.
 - **TTC mechanism attempted**: rate.
 - **Result**: 0% change across 3 trials; not worth the extra call path.
 
-### S7. Skip `propagate_only` when new bits are only deterministic
+### S7. Skip `propagate_only` when new bits are only deterministic — *tested, rejected (not worth it)*
 
-When the just-placed bits are all forced by already-present SAT
-constraints (e.g., the placement matches what the parent's
-`harvest_forced` predicted), we know `propagate_only` would be a
-no-op and just re-assert ancestor assumptions. Detect this via a
-"would-be-forced" check before calling propagate_only.
+Hypothesis: when `cand.num_new_assums == 0` (all 4 bits at `pos` were
+pre-pinned by parent's `harvest_forced`), `propagate_only(&assums)`
+re-pushes an unchanged prefix and does redundant BCP. Skipping it plus
+the subsequent `harvest_forced` (also idempotent) would save a full
+SAT round per such candidate.
 
-- **TTC mechanism**: rate.
-- **Detection plan**: `sat_unsat` unchanged; nodes/s rises.
-- **Risk**: has to be sound — if we skip propagate_only we're
-  trusting walker pruning to be equivalent. Gated on
-  harvest_forced's prediction matching the placement.
+Measured frequency via atomic counter before implementation:
+
+| n  | zero_new_assums | total candidates | ratio  |
+|----|-----------------|------------------|--------|
+| 22 | 100 000         | 2.77 M           | 3.6%   |
+| 26 | < 100 000       | ≥ 2.1 M          | < 5%   |
+
+**Conclusion**: the qualifying case is too rare (≤5%) to produce a
+meaningful TTC win even under the generous assumption that the saved
+`propagate_only` is 100% of each cycle's cost. Upper bound is ~5%
+speedup — well inside run-to-run variance. Skipped. Instrumentation
+reverted; S7 not implemented.
+
+- **TTC mechanism considered**: rate.
+- **Result**: upper bound ≤5%; below the implementation noise floor.
 
 ### S8. Coarser memo key — (level, sums, rule_state) only
 
@@ -2205,6 +2215,35 @@ model only). Replace with `propagate_only` + `solver.value()` calls.
 - **Risk**: model extraction requires the solver to have the full
   assignment. If propagate_only didn't force all lits, we need a
   separate model-completion step.
+
+### S11b. Re-introduce `dynamic_capacity_violated` as post-harvest pruner — *tested, rejected*
+
+Hypothesis: after `harvest_forced` pins bits beyond the walker
+frontier, pairs with BOTH endpoints pinned are fully-determined and
+their contribution is already in `sums[s]`. The static `max_remaining`
+bound double-counts them, so a dynamic per-pair scan could prune
+subtrees the static check lets through.
+
+Implemented: added `dynamic_capacity_violated` (O(n²) per call) after
+`capacity_violated` in the post-harvest block at line 1726.
+
+**Measurement** (n=22 sync 30s, 16 workers, 3 trials):
+
+| metric        | post-S3 baseline | +dynamic cap check |
+|---------------|------------------|--------------------|
+| TTC parallel  | 1.37e6 s         | 1.46e6 s (1.454, 1.457, 1.455) |
+| nodes         | 4.14 M           | 2.87 M (−30%)      |
+| cap_rejects   | 54.1 M           | 38.1 M             |
+
+**Conclusion**: the dynamic check does prune — visible in the ~30%
+node reduction — but its O(n²) per-call cost outweighs the saved
+subtree work: the node-rate drop (138K/s → 96K/s) exceeds the
+coverage-per-node improvement. Net −6% TTC. Reverted. The check
+might still win at much larger n where subtree cost dominates, but
+at n=22 the cost/benefit ratio is wrong.
+
+- **TTC mechanism attempted**: denominator (tighter pruning).
+- **Result**: +6% TTC (regression) at n=22.
 
 ### S11. Delete unused `dynamic_capacity_violated` hot path
 
