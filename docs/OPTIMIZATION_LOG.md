@@ -648,6 +648,25 @@ All 35 tests pass.
 - The ~7-8× gap between cross and MDD producers at n=26 is the
   (Z, W)-enumeration strategy, not the XY SAT stage.
 
+### TT(56) baselines (April 2026, 16 threads)
+
+- TTC (n=56, `--wz=sync`, 30 s sample): **9.67 × 10⁹ s parallel**
+  (~307 years). Direct coverage-product TTC from sync telemetry.
+- TTC (n=56, `--wz=apart --mdd-k=8`, 30 s sample): **1.68 × 10⁶ s
+  parallel** (~19.5 days). `live_zw_paths` is ~1.6 × 10⁻¹⁰ of the
+  naive 4^(2k) bouncing-order space.
+- The ~5700× gap is pure denominator: the MDD encodes most BDKR
+  canonicalization + boundary feasibility up front. Matching sync
+  mode's TTC would require either (a) adding MDD/spectral
+  propagators to the sync solver or (b) an MDD-aware sibling-
+  ordering heuristic in the walker.
+
+### TT(18) smoke test (16 threads)
+
+- `--wz=sync`: solves in ~13.5 s wall-clock; reported TTC ~6.7 × 10⁴
+  s parallel (tree coverage dominates the projection after the leaf
+  is found). Correctness anchor for the sync pipeline.
+
 - Exhaustive search (n=16, theta=20000):
   - Command: `target/release/turyn --n=16 --theta=20000 --max-z=50000 --max-w=50000 --max-pairs=2000 --benchmark=3`
   - Result: `mean_ms=5976, median_ms=5950`
@@ -703,7 +722,9 @@ the Notes column; otherwise the legacy number is preserved as-is.
 
 | Date (UTC) | Change | Why it helps | Measured effect |
 |---|---|---|---|
-| 2026-04-05 | Quad PB encoding for cubed SAT (--quad-pb): uses 223 primary vars + quad PB constraints instead of 52K-var totalizer. Also fixes stale-state bug in add_quad_pb_eq. | Eliminates 99.6% of variables and 99.9% of clauses. Clone cost becomes negligible. Custom propagator proves UNSAT efficiently for most instances. | n=56 SAT cubed: 202 → 274 solves/s (**+37%**). |
+| 2026-04-19 | Remove `--wz=xyzw` mode entirely: delete `solve_xyzw` (legacy three-phase Tseitin XY solver), `WzMode::Xyzw` variant, `--wz-xyzw-tuples` flag, main dispatch case, mdd\_pipeline early-return branch. | xyzw was a strict subset of `--wz=sync` (same BDKR Tseitin chains, no spectral/walker/parallel). Keeping it cost tests, cli surface area, and a whole parallel code path that nobody was debugging. | -498 lines, zero behavioral change for `cross/apart/together/sync`. `--wz=sync` smoke tests still pass (TT(18) solves <1s); `--wz=apart` n=56 unchanged. **TTC lever**: instrumentation (maintenance only — reduces future work, no rate/denominator/shortfall delta). |
+| 2026-04-19 | Per-feature SAT propagator telemetry: add `PropKind` enum (7 variants: Clause, Pb, QuadPb, Xor, Spectral, Mdd, PbSetEq) and a `Solver::prop_by_kind` counter array incremented from the single `enqueue` site. Expose via `propagations_by_kind(kind)`. Wire into `sync_walker` via pre/post delta capture around each `propagate_only` call, aggregated into `SyncStats::{prop_by_kind_total, forced_by_level_kind}`. Emit three new telemetry blocks: one-line per-feature summary, per-(level, kind) matrix, and direct TTC from DFS coverage product. All blocks publish on timeout (written unconditionally at end of `thread::scope`). | Without per-feature attribution we could not tell which propagator was the bottleneck — e.g. whether quad PB or clause BCP was dominating time at each walker level. This is pure instrumentation, but it unlocks targeted rate optimizations. | n=18 `--wz=sync` breakdown: 81% clause BCP / 18% quadpb / 0.7% pbseteq; ratio uniform across levels; pbseteq activates only at depth ≥11; levels n-3..n-1 do 99% of work. No runtime delta on `cross/apart/together`. **TTC lever**: instrumentation for future rate work. |
+| 2026-04-19 | Direct TTC from DFS coverage product (`Π_L cov(L)`) added alongside projection-based TTC in `--wz=sync`. Both print unconditionally at end of run. | The projection estimator (`b_eff` per level → full tree size) is biased when early levels have tiny sample counts. The coverage product is a second independent estimator based purely on "fraction of siblings that survived to the next propagate call" — disagreement between the two flags noisy levels. | Measured: n=56 sync TTC 9.67e9 s parallel (~307 yrs, 16 threads); n=56 apart k=8 TTC 1.68e6 s (~19.5 days, 16 threads). **TTC lever**: instrumentation. |
 | 2026-04-05 | Batch solver clone per ZW group in cubed SAT path: clone once per (z_bits, w_bits, tuple) group, add Z/W boundary as permanent unit clauses, use solve_with_assumptions() for XY boundary variations. | Reduces clones from ~8K to ~500 per 60s run. Learnt clauses from earlier XY configs transfer to later ones within the same ZW group, improving the rate over time. | n=56 SAT cubed (k=7): 140 → 202 solves/s (**+44%**). Cumulative vs pre-session baseline: +191%. |
 | 2026-04-03 | Batch recompute all stale quad PB constraints together: when encountering any stale constraint during propagation, recompute ALL stale constraints at once. | Cache locality: the assigns[] array (44 bytes at n=26) stays hot in L1 for all constraints instead of being evicted between interleaved propagation work. | n=26 SAT-heavy: 15.47s → 14.69s (**-5.0%**). |
 | 2026-04-03 | Lazy backtrack: mark quad PB constraints as stale instead of per-term state updates. Recompute from scratch on next forward propagation if stale. | Backtrack was 16.24% of runtime, dominated by per-term `update_quad_pb_term_hint` calls (~200 random memory accesses per backtrack). Lazy approach reduces backtrack to O(constraints_per_var) and amortizes recomputation into the forward propagation path. | n=26 SAT-heavy: 16.41s → 15.47s (**-5.7%**). Phase B neutral. |

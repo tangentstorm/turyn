@@ -244,6 +244,57 @@ enum Reason {
     PbSetEq(u32), // index into pb_set_eq_constraints
 }
 
+/// Public tag identifying which propagator forced a variable. Used by
+/// `Solver::propagations_by_kind` so callers can attribute work to each
+/// constraint family.  Order matches the array indexing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum PropKind {
+    Clause = 0,
+    Pb = 1,
+    QuadPb = 2,
+    Xor = 3,
+    Spectral = 4,
+    Mdd = 5,
+    PbSetEq = 6,
+}
+
+impl PropKind {
+    pub const COUNT: usize = 7;
+    pub const ALL: [PropKind; Self::COUNT] = [
+        PropKind::Clause, PropKind::Pb, PropKind::QuadPb, PropKind::Xor,
+        PropKind::Spectral, PropKind::Mdd, PropKind::PbSetEq,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            PropKind::Clause => "clause",
+            PropKind::Pb => "pb",
+            PropKind::QuadPb => "quadpb",
+            PropKind::Xor => "xor",
+            PropKind::Spectral => "spect",
+            PropKind::Mdd => "mdd",
+            PropKind::PbSetEq => "pbseteq",
+        }
+    }
+}
+
+impl Reason {
+    /// Returns the `PropKind` index for this reason, or `None` if it is
+    /// `Reason::Decision` (not a propagator).
+    fn prop_kind(self) -> Option<PropKind> {
+        match self {
+            Reason::Decision => None,
+            Reason::Clause(_) => Some(PropKind::Clause),
+            Reason::Pb(_) => Some(PropKind::Pb),
+            Reason::QuadPb(_) => Some(PropKind::QuadPb),
+            Reason::Xor(_) => Some(PropKind::Xor),
+            Reason::Spectral => Some(PropKind::Spectral),
+            Reason::Mdd => Some(PropKind::Mdd),
+            Reason::PbSetEq(_) => Some(PropKind::PbSetEq),
+        }
+    }
+}
+
 /// Trail entry: records an assignment.
 #[derive(Clone, Copy, Debug)]
 struct TrailEntry {
@@ -707,6 +758,10 @@ pub struct Solver {
     // Search stats (plain u64 — Solver is per-thread; aggregation at caller)
     decisions: u64,
     propagations: u64,
+    /// Per-propagator forced-variable counters, indexed by `PropKind`.
+    /// `propagations` is the sum of these. Lets callers attribute work
+    /// to clause BCP / PB / quad PB / XOR / spectral / MDD / PB-set-eq.
+    prop_by_kind: [u64; PropKind::COUNT],
 
     // propagate_only stats
     last_nogood_len: usize,
@@ -807,6 +862,7 @@ impl Solver {
             luby_index: 0,
             decisions: 0,
             propagations: 0,
+            prop_by_kind: [0; PropKind::COUNT],
             last_nogood_len: 0,
             last_full_nogood_len: 0,
             last_learnt_clause: None,
@@ -1779,6 +1835,29 @@ impl Solver {
 
     /// Number of variables.
     pub fn num_vars(&self) -> usize { self.num_vars }
+
+    /// Number of currently-assigned variables (trail length). Includes
+    /// level-0 forced units, decision-level-1 assumption lits, and all
+    /// propagated lits. After `propagate_only(assums)` returns `Some(true)`,
+    /// `num_assigned() - trail0_size - assums.len()` = vars the solver
+    /// forced via propagation, i.e. the "free" pruning power of the
+    /// current assumption prefix.
+    pub fn num_assigned(&self) -> usize { self.trail.len() }
+
+    /// Number of assigned vars with var-id in `1..=max_var` (inclusive).
+    /// Useful for "how many walker-space variables have been resolved"
+    /// when Tseitin/XOR auxiliary vars live at higher IDs — forcing
+    /// an auxiliary var doesn't prune the walker's search space, but
+    /// forcing a walker-space var does (each one halves the remaining
+    /// sub-cube).
+    pub fn num_assigned_in_range(&self, max_var: usize) -> usize {
+        let upper = max_var.min(self.num_vars);
+        let mut n = 0usize;
+        for v in 1..=upper {
+            if self.assigns[v] != LBool::Undef { n += 1; }
+        }
+        n
+    }
     /// Number of active (non-deleted) clauses.
     /// Verify all quad PB constraint states match actual variable assignments.
     /// Returns the number of mismatched constraints found.
@@ -1836,6 +1915,11 @@ impl Solver {
     /// Number of variable assignments forced by propagation (clause BCP, PB,
     /// quad PB, XOR, MDD, spectral). Excludes branching decisions.
     pub fn num_propagations(&self) -> u64 { self.propagations }
+    /// Per-propagator forced-variable counts (sums to `num_propagations`).
+    /// Index with `kind as usize`; `PropKind::ALL` enumerates all kinds.
+    pub fn propagations_by_kind(&self, kind: PropKind) -> u64 {
+        self.prop_by_kind[kind as usize]
+    }
     /// Number of variables currently assigned at decision level 0 (the
     /// "forced prefix"). Diff before/after a solve to see how many vars
     /// became permanently forced by initial propagation of assumptions.
@@ -2803,8 +2887,9 @@ impl Solver {
         self.level[v] = self.decision_level();
         self.reason[v] = reason;
         self.trail.push(TrailEntry { lit, level: self.decision_level(), reason });
-        if !matches!(reason, Reason::Decision) {
+        if let Some(kind) = reason.prop_kind() {
             self.propagations += 1;
+            self.prop_by_kind[kind as usize] += 1;
         }
     }
 

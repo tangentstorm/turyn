@@ -21,7 +21,7 @@ some discrete sample of this continuous condition.
 
 ## Entry points
 
-`main()` dispatches into one of four modes (with a handful of
+`main()` dispatches into one of several modes (with a handful of
 early-return subcommands for verification, DIMACS dumps, etc.):
 
 ```
@@ -40,33 +40,46 @@ main():
     elif --stochastic:     stochastic_search()           # SA / local search
     else:
         match cfg.effective_wz_mode():
-            WzMode::Cross    => run_hybrid_search()      # DEFAULT
+            WzMode::Cross    => run_hybrid_search()              # DEFAULT
             WzMode::Apart    => run_mdd_sat_search(wz_together=false)
             WzMode::Together => run_mdd_sat_search(wz_together=true)
+            WzMode::Sync     => sync_walker::search_sync()       # no MDD file
 ```
 
-The producer is chosen by `--wz=cross|together|apart`. `--wz-together`
-still works as a short alias for `--wz=together`, and `--mdd-k=N` /
-`--mdd-extend=N` imply `--wz=apart` when no explicit `--wz` is given.
-Explicit `--wz` always wins.
+The producer is chosen by `--wz=cross|apart|together|sync`.
+`--wz-together` still works as a short alias for `--wz=together`, and
+`--mdd-k=N` / `--mdd-extend=N` imply `--wz=apart` when no explicit
+`--wz` is given. Explicit `--wz` always wins.
 
-**All three modes load the same MDD** (`mdd-<k>.bin`) — the name
-"MDD pipeline" for `--wz=apart|together` is a historical artefact.
-Every search layer uses the MDD as its XY boundary enumerator; the
-three `--wz` modes differ only in how they generate the `(Z, W)`
-candidate pairs before handing each pair off to the shared
-`SolveXyPerCandidate::try_candidate` XY SAT path.
+`--wz=sync` is the newest mode and differs structurally from the other
+three: it does **not** load `mdd-<k>.bin`, does **not** enumerate sum
+tuples up-front, and does **not** split the search into `(Z, W)`
+producer → XY consumer. Instead, one persistent CDCL solver holds every
+constraint and a single DFS walker over all four sequences feeds it
+assumptions. See [`--wz=sync`](#wzsync--sync_walkersearch_sync) below.
+
+**The `cross`, `apart`, and `together` modes all load the same MDD**
+(`mdd-<k>.bin`) — the name "MDD pipeline" for `--wz=apart|together`
+is a historical artefact. Every search layer in those three modes
+uses the MDD as its XY boundary enumerator; they differ only in how
+they generate the `(Z, W)` candidate pairs before handing each pair
+off to the shared `SolveXyPerCandidate::try_candidate` XY SAT path.
+
+`--wz=sync` is different: no MDD file is loaded and there is no
+separate XY stage. A single CDCL solver encodes the whole problem and
+a unified 4-sequence walker drives it to a leaf.
 
 The flat `xy-table-k*.bin` format was retired once we proved (test:
 `table_vs_mdd_same_k_agree`, now removed) that at the same `k` the
 MDD sub-tree walker returned identical `(x_bits, y_bits)` sets.
 
-## The three (Z, W) producers
+## The three (Z, W) producers (Cross / Apart / Together)
 
-All three modes ultimately feed the same XY SAT consumer
-(`SolveXyPerCandidate::try_candidate`). They differ in how they
-*generate* the candidate `(Z, W)` pairs that get handed to that
-consumer.
+The `cross`, `apart`, and `together` modes ultimately feed the same
+XY SAT consumer (`SolveXyPerCandidate::try_candidate`). They differ
+in how they *generate* the candidate `(Z, W)` pairs that get handed
+to that consumer. (`--wz=sync` is a separate architecture and is
+described in its own section below.)
 
 ### `--wz=cross` — `run_hybrid_search` (default)
 
@@ -149,6 +162,71 @@ producers share identical XY SAT behaviour once they reach that
 stage. They differ only in how they *get* to the point of having a
 `(Z, W, xy_root)` triple.
 
+### `--wz=sync` — `sync_walker::search_sync`
+
+One persistent CDCL solver, one DFS walker, all four sequences
+assigned together. No MDD file, no tuple pre-enumeration, no
+separate `(Z, W)` → XY handoff.
+
+```
+search_sync(problem, cfg):
+    solver = radical::Solver::new_with_config(cfg.sat_config)
+    encode_all_variables(solver):              # X, Y, Z boundary + middle
+        length-n {±1} vars for X, Y, Z; length-(n-1) for W
+        BDKR canonicalization rules (i..vi) as Tseitin clauses
+        per-lag Turyn identity as native quad-PB constraints
+        (spectral / MDD constraints are NOT attached in sync mode)
+
+    # Bouncing-order position schedule: pin end-points first, work inwards.
+    # depth = n for even n; at each level we pin all four sequences at one p.
+    pos_order = [0, n-1, 1, n-2, 2, n-3, ..., n/2-1, n/2]
+
+    # Parallel workers (N = available_parallelism or $TURYN_THREADS):
+    # worker 0 explores siblings in score order (best-first); workers 1..
+    # use a per-worker-seeded random permutation so each starts in a
+    # different region of the tree. A shared ClauseExchange relays
+    # learnt nogoods across workers.
+    for worker in 0..N in thread::scope:
+        state = DFS state; assumptions = [];
+        dfs(state):
+            if cancelled or timed out: return
+            if level == depth: found leaf → verify → publish
+            p = pos_order[state.level]
+            for each (x,y,z,w) sibling at position p:
+                extend assumptions with the 4 (or 3 when p == n-1) unit lits
+                capacity check: |S(s)| ≤ max_remaining[level][s]  (walker-side)
+                solver.propagate_only(&assumptions)                (SAT-side)
+                    → learn nogood on conflict (persists for the whole walk)
+                if sat: record forcings, recurse; else: backtrack
+```
+
+Key structural differences vs. the three MDD-backed producers:
+
+- **No upfront MDD**: boundary sub-cubes are implicitly enumerated by
+  the DFS. No `mdd-<k>.bin` dependency.
+- **No tuple split**: the sum identity `σ_X² + σ_Y² + 2σ_Z² + 2σ_W² =
+  6n-2` is a derived consequence of the per-lag constraints and is
+  not used to pre-filter search regions.
+- **Propagation-only**: the SAT solver is used exclusively via
+  `propagate_only(&assumptions)` — no CDCL decisions, no full solve.
+  It answers "can the current 4-sequence prefix be extended?" as
+  cheaply as possible, and learns a nogood on failure.
+- **Persistent solver**: there is no clone-per-candidate. Every
+  walker node hits the same solver instance, so CDCL nogoods learnt
+  early in the walk prune every later sub-cube they apply to.
+- **Per-worker clause exchange**: parallel workers swap learnt
+  clauses through a lock-free-ish `ClauseExchange` buffer. This is
+  the only cross-worker communication besides the cancel flag.
+- **Rich telemetry**: sync mode emits a per-level table, a
+  per-propagator-feature summary, a per-(level, feature) matrix,
+  and a direct TTC computed from the DFS coverage product. See
+  [docs/TELEMETRY.md](TELEMETRY.md) for the output format.
+
+`--wz=sync` is currently the only mode that exposes per-feature
+SAT-propagator attribution. The `cross`/`apart`/`together` pipelines
+use clones and per-candidate solves; their propagation counters are
+reset per-clone and the total is not aggregated anywhere.
+
 ### Measured TTC at `n=26` (4 threads)
 
 | Mode | TTC | Notes |
@@ -162,6 +240,24 @@ enumeration strategy difference, not the XY SAT stage — Commit A
 (`SolveXyPerCandidate`) unified the XY stage and closed a ~24 %
 per-solve gap at `n=22`, but at `n=26` the bottleneck is upstream of
 XY for both MDD producers.
+
+### Measured TTC at `n=56` (16 threads, April 2026)
+
+| Mode | TTC (parallel) | In human units | Notes |
+|---|---|---|---|
+| `--wz=sync` | 9.67 × 10⁹ s | ~307 years | direct coverage-product TTC from sync telemetry |
+| `--wz=apart --mdd-k=8` | 1.68 × 10⁶ s | ~19.5 days | MDD pre-prunes to 1.6×10⁻¹⁰ of naive space |
+
+The ~5700× gap is entirely the MDD denominator — `--wz=apart` walks
+a pre-pruned boundary DAG, `--wz=sync` walks the raw bouncing-order
+DFS with SAT-side pruning only. Both use the same `radical` solver
+and the same quad-PB identity; the difference is up-front search
+space reduction.
+
+At `n=18` `--wz=sync` solves in ~13.5 s wall-clock (16 threads) with
+a reported TTC of ~6.7 × 10⁴ s (direct coverage, 16 threads) — the
+leaf was hit early but residual tree coverage dominates the TTC
+projection. This is the smoke-test correctness anchor for sync mode.
 
 ## Known-good anchor points
 

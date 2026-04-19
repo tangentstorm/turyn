@@ -25,8 +25,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::Instant;
 
-use rustc_hash::FxHashMap;
-
 use crate::types::{PackedSeq, Problem, SumTuple};
 use crate::enumerate::enumerate_sum_tuples;
 use crate::legacy_search::{SearchReport, SearchStats};
@@ -123,6 +121,11 @@ struct State {
     ///   bit 2 = rule (iv) fired on Z
     ///   bit 3 = rule (v) fired on W
     rule_state: u8,
+    /// Solver trail size at decision level 0 (after the initial
+    /// `propagate_only(&[])` has drained unit clauses + Tseitin chains).
+    /// Used to compute "forced by propagation above what we assumed":
+    /// `forced = solver.num_assigned() - trail0_size - assumptions.len()`.
+    trail0_size: usize,
 }
 
 // Rule-fired bits.
@@ -139,6 +142,7 @@ impl State {
             bits: vec![0; 4 * n],
             assumptions: Vec::with_capacity(4 * n),
             rule_state: 0,
+            trail0_size: 0,
         }
     }
 
@@ -735,37 +739,6 @@ fn score_state(state: &State, ctx: &Ctx) -> i64 {
     total
 }
 
-fn compute_signature(state: &State, ctx: &Ctx) -> u64 {
-    // The walker's "state" at a given level is determined by:
-    //   - current level
-    //   - running per-lag sums S(s)
-    //   - walker-placed bits at positions already visited (pos_order[..level])
-    //   - rule-fired bitmask
-    //
-    // NOTE: we deliberately exclude bits beyond the walker frontier
-    // (positions pinned purely via harvest_forced from SAT propagation).
-    // Those are deterministic functions of the walker prefix + the
-    // solver's clause database, so including them makes the signature
-    // vary by clause-DB state and prevents memo hits across branches
-    // that converge to the same walker state through different routes.
-    use std::hash::Hasher;
-    let mut h = rustc_hash::FxHasher::default();
-    h.write_usize(state.level);
-    for s in 1..ctx.n {
-        h.write_i16(state.sums[s]);
-    }
-    // Only include bits at walker-visited positions (pos_order[..level]).
-    for (lvl, &pos) in ctx.pos_order.iter().enumerate() {
-        if lvl >= state.level { break; }
-        for kind in 0u8..4 {
-            if pos >= kind_xy_len(kind, ctx.n, ctx.m) { continue; }
-            h.write_u8(state.bit(kind, pos));
-        }
-    }
-    h.write_u8(state.rule_state);
-    h.finish()
-}
-
 #[derive(Clone)]
 pub(crate) struct SyncStats {
     pub nodes_visited: u64,
@@ -778,6 +751,13 @@ pub(crate) struct SyncStats {
     pub learned_clauses_final: u64,
     pub max_level_reached: u64,
     pub nodes_by_level: Vec<u64>,
+    /// Per-level sum of `candidates.len()` — i.e. the children that
+    /// survived cap/tuple/rule pruning at that level and became
+    /// candidates for SAT / descent. `children_by_level[L] /
+    /// nodes_by_level[L]` is the true per-level branching factor
+    /// (independent of DFS partial-run bias that contaminates the
+    /// ratio `nodes_by_level[L+1] / nodes_by_level[L]`).
+    pub children_by_level: Vec<u64>,
     pub children_total: u64,
     pub internal_nodes: u64,
     pub time_to_first_leaf: Option<f64>,
@@ -795,6 +775,49 @@ pub(crate) struct SyncStats {
     pub peer_clauses_read: u64,
     /// Count of peer clauses this worker has added to its own solver.
     pub peer_clauses_imported: u64,
+    /// Per-level sum of "vars the SAT solver forced via propagation
+    /// beyond the walker's own assumption at this level". Each forced
+    /// var trims 2^1 from the subtree that the walker would otherwise
+    /// have had to explore; k forced vars at this level mean the
+    /// walker got a "free" 2^k prune of the sub-cube below.
+    /// `forced_by_level[L]` accumulates over every propagate_only call
+    /// made while the walker was at level L (across every sub-cube
+    /// traversed). `sum(forced_by_level) / sat_unsat` ≈ avg forced per
+    /// call; `2^forced_by_level[L]` estimates total subtree nodes
+    /// pruned at that level.
+    pub forced_by_level: Vec<u64>,
+    /// Per-level wall-clock time (seconds) accumulated across all dfs()
+    /// calls at that level — i.e. "how long did the walker spend
+    /// traversing sub-cubes rooted at depth L, including descendants".
+    /// Divided by `nodes_by_level[L]` gives avg sub-cube time at depth L,
+    /// which — combined with `forced_by_level[L]` — tells us the
+    /// marginal cost/benefit of each decision at that depth.
+    pub sub_cube_time_by_level: Vec<f64>,
+    /// Per-level sum of `candidates_processed`: how many of each frame's
+    /// generated candidates (up to `candidates.len()`) actually went
+    /// through the propagate_only call before the frame returned.
+    /// Equals `children_by_level[L]` if every frame at L fully iterated
+    /// its sibling list; less if some frames bailed early (deadline hit,
+    /// solution found, or cancel signal). The ratio
+    /// `children_processed_by_level[L] / children_by_level[L]` is the
+    /// work-weighted "coverage fraction" at level L — a direct measure
+    /// of how much of each sub-cube we actually did. The PRODUCT of
+    /// coverages down the tree (starting from level 0) = fraction of
+    /// the total root sub-cube covered so far, which gives a direct
+    /// TTC formula: `TTC = elapsed / root_coverage_product`.
+    pub children_processed_by_level: Vec<u64>,
+    /// Per-propagator forced-variable totals (sum of deltas over every
+    /// `propagate_only` call). Indexed by `radical::PropKind as usize`.
+    /// Tells you which feature of the SAT solver did the most work:
+    /// `clause` (CNF BCP) / `pb` / `quadpb` (Turyn identity) / `xor`
+    /// (Tseitin chains) / `spect` (spectral DFT) / `mdd` / `pbseteq`.
+    pub prop_by_kind_total: [u64; radical::PropKind::COUNT],
+    /// Per-(walker level, propagator) forcing counts. `[L][k]` = total
+    /// variables forced by propagator `k` across every `propagate_only`
+    /// call made while the walker was at level L. Reveals *where* in the
+    /// walker's DFS each SAT feature is doing work (e.g. is quadpb hot
+    /// near the root while clause BCP dominates near the leaves?).
+    pub forced_by_level_kind: Vec<[u64; radical::PropKind::COUNT]>,
 }
 
 pub(crate) fn search_sync(
@@ -834,10 +857,16 @@ fn search_sync_parallel(
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
         rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
         learned_clauses_final: 0, max_level_reached: 0,
-        nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
+        nodes_by_level: Vec::new(), children_by_level: Vec::new(),
+        children_total: 0, internal_nodes: 0,
         time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
         peer_clauses_read: 0, peer_clauses_imported: 0,
+        forced_by_level: Vec::new(),
+        sub_cube_time_by_level: Vec::new(),
+        children_processed_by_level: Vec::new(),
+        prop_by_kind_total: [0; radical::PropKind::COUNT],
+        forced_by_level_kind: Vec::new(),
     }));
     let exchange = Arc::new(ClauseExchange {
         clauses: std::sync::Mutex::new(Vec::new()),
@@ -887,6 +916,44 @@ fn search_sync_parallel(
                 for (i, &c) in stats.nodes_by_level.iter().enumerate() {
                     agg.nodes_by_level[i] += c;
                 }
+                if agg.children_by_level.len() < stats.children_by_level.len() {
+                    agg.children_by_level.resize(stats.children_by_level.len(), 0);
+                }
+                for (i, &c) in stats.children_by_level.iter().enumerate() {
+                    agg.children_by_level[i] += c;
+                }
+                if agg.forced_by_level.len() < stats.forced_by_level.len() {
+                    agg.forced_by_level.resize(stats.forced_by_level.len(), 0);
+                }
+                for (i, &c) in stats.forced_by_level.iter().enumerate() {
+                    agg.forced_by_level[i] += c;
+                }
+                if agg.sub_cube_time_by_level.len() < stats.sub_cube_time_by_level.len() {
+                    agg.sub_cube_time_by_level.resize(stats.sub_cube_time_by_level.len(), 0.0);
+                }
+                for (i, &t) in stats.sub_cube_time_by_level.iter().enumerate() {
+                    agg.sub_cube_time_by_level[i] += t;
+                }
+                if agg.children_processed_by_level.len() < stats.children_processed_by_level.len() {
+                    agg.children_processed_by_level.resize(stats.children_processed_by_level.len(), 0);
+                }
+                for (i, &c) in stats.children_processed_by_level.iter().enumerate() {
+                    agg.children_processed_by_level[i] += c;
+                }
+                for (i, &c) in stats.prop_by_kind_total.iter().enumerate() {
+                    agg.prop_by_kind_total[i] += c;
+                }
+                if agg.forced_by_level_kind.len() < stats.forced_by_level_kind.len() {
+                    agg.forced_by_level_kind.resize(
+                        stats.forced_by_level_kind.len(),
+                        [0; radical::PropKind::COUNT],
+                    );
+                }
+                for (l, row) in stats.forced_by_level_kind.iter().enumerate() {
+                    for (k, &c) in row.iter().enumerate() {
+                        agg.forced_by_level_kind[l][k] += c;
+                    }
+                }
                 drop(agg);
                 if let Some(s) = sol {
                     let mut r = result.lock().unwrap();
@@ -914,72 +981,257 @@ fn search_sync_parallel(
         );
         let ttc = project_ttc(&stats, problem.n, elapsed.as_secs_f64(), n_workers);
         eprintln!("{}", ttc);
+        let per_level = format_per_level_telemetry_with_ttc(
+            &stats,
+            elapsed.as_secs_f64(),
+            n_workers,
+        );
+        eprintln!("{}", per_level);
     }
     (found, stats, elapsed)
 }
 
+/// Per-level forced-prune and timer telemetry.
+///
+/// For each walker level L, reports:
+/// - `nodes`: dfs visits at level L (cumulative across all workers).
+/// - `forced`: walker-var forcings by SAT propagation AT THIS LEVEL
+///   (incremental: new assumptions at L minus everything above L).
+///   Divide by nodes to get "avg free prunes per sub-cube at level L";
+///   `2^(forced/nodes)` is the multiplicative sub-cube shrink factor.
+/// - `time`: cumulative wall-seconds spent in dfs frames rooted at L
+///   (includes descendants). Divided by nodes gives avg sub-cube time.
+/// - `implied_pruned_2^…`: log2 estimate of how many walker sub-cubes
+///   at the DEEPEST level were eliminated by SAT work at level L.
+fn format_per_level_telemetry_with_ttc(stats: &SyncStats, elapsed_secs: f64, n_workers: usize) -> String {
+    let base = format_per_level_telemetry(stats);
+    // Compute coverage product over levels with generated candidates.
+    let mut coverage_product: f64 = 1.0;
+    let levels = stats.nodes_by_level.len().max(stats.children_by_level.len());
+    for l in 0..levels {
+        let children = stats.children_by_level.get(l).copied().unwrap_or(0);
+        let processed = stats.children_processed_by_level.get(l).copied().unwrap_or(0);
+        if children > 0 {
+            coverage_product *= processed as f64 / children as f64;
+        }
+    }
+    let kind_summary = format_prop_by_kind_summary(stats);
+    let kind_per_level = format_per_level_kind_table(stats);
+    if coverage_product > 0.0 && elapsed_secs > 0.0 {
+        let ttc_parallel = elapsed_secs / coverage_product;
+        let ttc_serial = ttc_parallel * n_workers as f64;
+        format!(
+            "{}{}{}Per-level: direct TTC (from coverage product) ≈ {:.3e}s parallel, {:.3e}s serial\n",
+            base, kind_summary, kind_per_level, ttc_parallel, ttc_serial,
+        )
+    } else {
+        format!("{}{}{}", base, kind_summary, kind_per_level)
+    }
+}
+
+/// Per-(walker level, propagator) table. Only shows propagator columns
+/// that have at least one non-zero count across all levels (keeps the
+/// table compact — in sync mode XOR/spectral/MDD are all zero).
+/// Answer to "which level is quadpb hottest at, and where does clause
+/// BCP take over?"
+fn format_per_level_kind_table(stats: &SyncStats) -> String {
+    if stats.forced_by_level_kind.is_empty() { return String::new(); }
+    let active_kinds: Vec<radical::PropKind> = radical::PropKind::ALL
+        .iter()
+        .copied()
+        .filter(|k| stats.forced_by_level_kind.iter().any(|row| row[*k as usize] > 0))
+        .collect();
+    if active_kinds.is_empty() { return String::new(); }
+    let mut out = String::from("Per-level forcings by feature: lvl");
+    for k in &active_kinds { out.push_str(&format!(" | {:>10}", k.label())); }
+    out.push('\n');
+    for (l, row) in stats.forced_by_level_kind.iter().enumerate() {
+        let row_total: u64 = active_kinds.iter().map(|k| row[*k as usize]).sum();
+        if row_total == 0 { continue; }
+        out.push_str(&format!("Per-level forcings by feature: {:3}", l));
+        for k in &active_kinds {
+            out.push_str(&format!(" | {:>10}", row[*k as usize]));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// One-line summary of where the SAT solver spent its propagation work,
+/// broken out by propagator family. Sums to `num_propagations` (modulo
+/// rounding from the per-call delta tracking). Use to identify the
+/// dominant feature: e.g. "quadpb=72.3%" means the Turyn quad PB is
+/// doing most of the propagation; "spect=45%" means spectral is hot.
+fn format_prop_by_kind_summary(stats: &SyncStats) -> String {
+    let total: u64 = stats.prop_by_kind_total.iter().sum();
+    if total == 0 { return String::new(); }
+    let mut parts: Vec<String> = Vec::with_capacity(radical::PropKind::COUNT);
+    for kind in radical::PropKind::ALL {
+        let c = stats.prop_by_kind_total[kind as usize];
+        if c == 0 { continue; }
+        let pct = c as f64 / total as f64 * 100.0;
+        parts.push(format!("{}={} ({:.1}%)", kind.label(), c, pct));
+    }
+    format!("Per-feature forcings (total {}): {}\n", total, parts.join("  "))
+}
+
+fn format_per_level_telemetry(stats: &SyncStats) -> String {
+    let mut out = String::from("Per-level: lvl |   nodes |  children | proc'd | cov% |   forced | f/node |   time(s) |  t/node\n");
+    let levels = stats
+        .nodes_by_level.len()
+        .max(stats.forced_by_level.len())
+        .max(stats.sub_cube_time_by_level.len());
+    let mut total_forced: u64 = 0;
+    let mut total_time: f64 = 0.0;
+    // Cumulative "fraction of root sub-cube that has been fully
+    // covered" — product of per-level coverages. For deepest levels
+    // the product dominates because most work is there.
+    let mut coverage_product: f64 = 1.0;
+    for l in 0..levels {
+        let nodes = stats.nodes_by_level.get(l).copied().unwrap_or(0);
+        let children = stats.children_by_level.get(l).copied().unwrap_or(0);
+        let processed = stats.children_processed_by_level.get(l).copied().unwrap_or(0);
+        let forced = stats.forced_by_level.get(l).copied().unwrap_or(0);
+        let tsec = stats.sub_cube_time_by_level.get(l).copied().unwrap_or(0.0);
+        total_forced += forced;
+        total_time += tsec;
+        if nodes == 0 && forced == 0 && tsec == 0.0 { continue; }
+        let fpn = if nodes > 0 { forced as f64 / nodes as f64 } else { 0.0 };
+        let tpn = if nodes > 0 { tsec / nodes as f64 } else { 0.0 };
+        let cov = if children > 0 { processed as f64 / children as f64 } else { 1.0 };
+        if children > 0 { coverage_product *= cov; }
+        out.push_str(&format!(
+            "Per-level: {:>3} | {:>7} | {:>9} | {:>6} | {:>4.1} | {:>8} | {:>6.2} | {:>9.3} | {:>7.6}\n",
+            l, nodes, children, processed, cov * 100.0, forced, fpn, tsec, tpn,
+        ));
+    }
+    out.push_str(&format!(
+        "Per-level: cumulative root-coverage (∏ cov) = {:.3e}  →  direct TTC = elapsed / coverage\n",
+        coverage_product,
+    ));
+    // Cumulative (over the whole run) log2-prune budget and weighted
+    // mean pruning factor. `total_forced` is Σ_calls(forced_at_call),
+    // which equals Σ_calls log2(sub-cube shrink factor). Dividing by
+    // sat-call count gives the geometric-mean shrink: the "typical"
+    // propagate_only trims 2^avg_forced walker sub-cubes.
+    let sat_calls = stats.sat_unsat + stats.nodes_visited.saturating_sub(stats.leaves_reached);
+    let avg_forced_per_call = if sat_calls > 0 {
+        total_forced as f64 / sat_calls as f64
+    } else { 0.0 };
+    // Per-level time columns are INCLUSIVE of descendants, so summing
+    // across levels double-counts. We suppress the "total" to avoid
+    // that confusion; the level-0 column already shows total aggregate
+    // (sum of wall-time across workers).
+    let _ = total_time;
+    out.push_str(&format!(
+        "Per-level: total walker-var forcings = {} (avg 2^{:.2} shrink per propagate call)",
+        total_forced, avg_forced_per_call,
+    ));
+    out
+}
+
 /// Project TTC (time-to-cover) from measured per-level branching + rate.
 ///
-/// Method: take the measured per-level `nodes_by_level[L]` counts from
-/// the (partial or full) run. Divide by the number of DFS entries per
-/// level (each parent spawns up to b_eff children, each child is a
-/// dfs call at level L+1). That gives a measured effective branching
-/// factor `b_eff(L) = nodes_by_level[L+1] / nodes_by_level[L]` for
-/// levels where `nodes_by_level[L] > 0`.
+/// Method: for each level L, compute the true per-parent branching
+/// factor `b_eff(L) = children_by_level[L] / nodes_by_level[L]` —
+/// i.e. "out of every parent visited at depth L, how many children
+/// survived cap/tuple/rule pruning and became candidates for SAT /
+/// descent". This ratio is INDEPENDENT of DFS completion: even if the
+/// run ends after visiting only 3 parents at level L=20, each of those
+/// 3 parents still gives an unbiased estimate of the true per-parent
+/// branching.
 ///
-/// Full-cover tree size (for the canonical-post-pruning space):
-///   N_total = Σ_{L=0..depth} Π_{ℓ=0..L} b_eff(ℓ)
-///           = Π_{ℓ=0..depth-1} b_eff(ℓ)   (with geometric sum ≈ leading term when b>1)
+/// Contrast with the old (buggy) estimator
+///   b_eff(L) = nodes_by_level[L+1] / nodes_by_level[L]
+/// which is massively downward-biased on a partial run: the DFS
+/// leaves many parents at level L with their children unexplored, so
+/// nodes_by_level[L+1] counts far fewer than b*nodes_by_level[L].
+///
+/// Full-cover tree size:
+///   N_total = 1 + Σ_{L=0..depth-1} Π_{ℓ=0..L} b_eff(ℓ)
+///
+/// For levels with too few samples (MIN_SAMPLES) we fall back to the
+/// median of the reliably-sampled levels — a conservative estimate
+/// that avoids both the "exactly zero" cliff and the "one weird
+/// sample" cliff.
 ///
 /// TTC_serial  = N_total / rate,   TTC_parallel = TTC_serial / n_workers
 /// where rate = nodes_visited / elapsed (aggregate across workers in
 /// parallel mode, so this is already a parallel rate).
 fn project_ttc(stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize) -> String {
+    const NOISY_THRESHOLD: u64 = 32;
     let depth = n;  // bouncing-order depth = n for even n
-    let levels = stats.nodes_by_level.len();
-    if levels < 2 || elapsed_secs <= 0.0 || stats.nodes_visited == 0 {
-        return format!("TTC projection: insufficient data");
+    if elapsed_secs <= 0.0 || stats.nodes_visited == 0 {
+        return "TTC projection: insufficient data".to_string();
     }
-    // Measured effective branching per level. Only levels that have
-    // been EXITED (finished exploration) give a stable estimate —
-    // in DFS early levels stabilise first. For partial runs, use the
-    // deepest level where both L and L+1 have at least one visit.
-    let mut b_eff: Vec<f64> = Vec::with_capacity(depth);
-    for l in 0..depth.min(levels - 1) {
-        let parent = stats.nodes_by_level[l];
-        let child = stats.nodes_by_level[l + 1];
+    // Per-level true branching factor. `sampled` = we have at least
+    // one parent at this level, so the ratio has meaning.
+    // `noisy` = sample count below NOISY_THRESHOLD, printed with `?`
+    // but still USED in the projection (early levels have near-zero
+    // variance because every worker sees the same root-level
+    // branching — 1 sample is effectively exact there).
+    struct Bee { b: f64, sampled: bool, noisy: bool }
+    let mut b_eff: Vec<Bee> = Vec::with_capacity(depth);
+    for l in 0..depth {
+        let parent = stats.nodes_by_level.get(l).copied().unwrap_or(0);
+        let child = stats.children_by_level.get(l).copied().unwrap_or(0);
         if parent == 0 {
-            b_eff.push(0.0);
+            b_eff.push(Bee { b: 0.0, sampled: false, noisy: false });
         } else {
-            b_eff.push(child as f64 / parent as f64);
+            b_eff.push(Bee {
+                b: child as f64 / parent as f64,
+                sampled: true,
+                noisy: parent < NOISY_THRESHOLD,
+            });
         }
     }
-    // Projected total tree size assuming measured b_eff(L) holds at
-    // every level. For levels where we have no data (L >= max depth
-    // reached), use the geometric mean of measured levels as a best
-    // guess; clamp below 1.0 to avoid divergence on sparse leaves.
-    let measured_avg: f64 = if b_eff.is_empty() { 1.0 } else {
-        let log_prod: f64 = b_eff.iter().filter(|&&b| b > 0.0).map(|b| b.ln()).sum();
-        let count = b_eff.iter().filter(|&&b| b > 0.0).count().max(1);
-        (log_prod / count as f64).exp()
+    // Fallback for un-SAMPLED levels (no data at all): median of
+    // well-sampled levels (noisy excluded). Median resists outliers.
+    let mut clean_bs: Vec<f64> =
+        b_eff.iter().filter(|x| x.sampled && !x.noisy).map(|x| x.b).collect();
+    clean_bs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let fallback = if clean_bs.is_empty() {
+        1.0
+    } else {
+        clean_bs[clean_bs.len() / 2]
     };
+    let geo_mean = if clean_bs.is_empty() {
+        fallback
+    } else {
+        let log_sum: f64 = clean_bs.iter().map(|b| b.max(1e-9).ln()).sum();
+        (log_sum / clean_bs.len() as f64).exp()
+    };
+    // Build the full-cover projection. Use each SAMPLED level's
+    // measurement as-is (noisy or not). Only fall back to median for
+    // truly unsampled levels (zero parents ever visited).
     let mut projected_nodes = 1.0_f64;
     let mut running_product = 1.0_f64;
     for l in 0..depth {
-        let b = b_eff.get(l).copied().filter(|&b| b > 0.0).unwrap_or(measured_avg);
+        let b = match b_eff.get(l) {
+            Some(Bee { b, sampled: true, .. }) => *b,
+            _ => fallback,
+        };
         running_product *= b;
         projected_nodes += running_product;
+        if !running_product.is_finite() { break; }
     }
     let rate = stats.nodes_visited as f64 / elapsed_secs;
     let ttc_parallel = projected_nodes / rate;
     let ttc_serial = ttc_parallel * n_workers as f64;
+    let unsampled = b_eff.iter().filter(|x| !x.sampled).count();
+    let noisy_count = b_eff.iter().filter(|x| x.sampled && x.noisy).count();
     format!(
-        "TTC projection: b_eff per level = [{}]\n\
-         TTC projection: measured b_eff geo mean = {:.3}, projected nodes to cover = {:.3e}\n\
+        "TTC projection: b_eff per level = [{}] ({} clean, {} noisy?, {} unsampled→median={:.3})\n\
+         TTC projection: clean geo mean = {:.3}, projected nodes to cover = {:.3e}\n\
          TTC projection: rate = {:.0} nodes/s ({} workers, aggregate),\n\
          TTC projection: TTC_parallel ≈ {:.1}s, TTC_serial ≈ {:.1}s",
-        b_eff.iter().map(|b| format!("{:.2}", b)).collect::<Vec<_>>().join(", "),
-        measured_avg, projected_nodes, rate, n_workers, ttc_parallel, ttc_serial,
+        b_eff.iter()
+            .map(|x| if !x.sampled { "-".into() }
+                     else if x.noisy { format!("{:.2}?", x.b) }
+                     else { format!("{:.2}", x.b) })
+            .collect::<Vec<_>>().join(", "),
+        clean_bs.len(), noisy_count, unsampled, fallback,
+        geo_mean, projected_nodes, rate, n_workers, ttc_parallel, ttc_serial,
     )
 }
 
@@ -1004,26 +1256,43 @@ fn search_sync_serial(
         return (None, SyncStats {
             nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
             rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0, learned_clauses_final: 0, max_level_reached: 0,
-            nodes_by_level: Vec::new(), children_total: 0, internal_nodes: 0,
+            nodes_by_level: Vec::new(), children_by_level: Vec::new(),
+            children_total: 0, internal_nodes: 0,
             time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
         peer_clauses_read: 0, peer_clauses_imported: 0,
+        forced_by_level: Vec::new(),
+        sub_cube_time_by_level: Vec::new(),
+        children_processed_by_level: Vec::new(),
+        prop_by_kind_total: [0; radical::PropKind::COUNT],
+        forced_by_level_kind: Vec::new(),
         }, start.elapsed());
     }
 
     let mut state = State::new(ctx.n);
+    // Record walker-var count at decision-level-0 (before any
+    // assumptions). "Walker vars" = the 4n sign-choice vars at IDs
+    // 1..=4n; higher IDs are Tseitin/XOR auxiliary vars. Forcing an
+    // aux var doesn't prune walker-tree space, only walker-var forcings
+    // halve the remaining sub-cube.
+    state.trail0_size = solver.num_assigned_in_range(4 * ctx.n);
     harvest_forced(&solver, &mut state, &ctx);
 
-    let mut memo: FxHashMap<u64, ()> = FxHashMap::default();
     let mut stats = SyncStats {
         nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
         rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
         learned_clauses_final: 0, max_level_reached: 0,
         nodes_by_level: vec![0; ctx.depth + 1],
+        children_by_level: vec![0; ctx.depth + 1],
         children_total: 0, internal_nodes: 0,
         time_to_first_leaf: None,
         nogood_len_sum: 0, full_nogood_len_sum: 0,
         peer_clauses_read: 0, peer_clauses_imported: 0,
+        forced_by_level: vec![0; ctx.depth + 1],
+        sub_cube_time_by_level: vec![0.0; ctx.depth + 1],
+        children_processed_by_level: vec![0; ctx.depth + 1],
+        prop_by_kind_total: [0; radical::PropKind::COUNT],
+        forced_by_level_kind: vec![[0; radical::PropKind::COUNT]; ctx.depth + 1],
     };
 
     let deadline = if cfg.sat_secs > 0 {
@@ -1031,7 +1300,7 @@ fn search_sync_serial(
     } else { None };
 
     let mut found: Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)> = None;
-    dfs(&mut solver, &mut state, &ctx, &mut memo, &mut stats, deadline, &mut found);
+    dfs(&mut solver, &mut state, &ctx, &mut stats, deadline, &mut found);
 
     let elapsed = start.elapsed();
     if verbose {
@@ -1043,12 +1312,33 @@ fn search_sync_serial(
     (found, stats, elapsed)
 }
 
-/// DFS descent. Returns true if a solution was found (short-circuits up the stack).
+/// DFS descent. Thin wrapper around `dfs_body` that records wall-time
+/// spent traversing the sub-cube rooted at the current level, so we
+/// can report per-level "sub-cube traversal time" telemetry.
 fn dfs(
     solver: &mut radical::Solver,
     state: &mut State,
     ctx: &Ctx,
-    memo: &mut FxHashMap<u64, ()>,
+    stats: &mut SyncStats,
+    deadline: Option<Instant>,
+    found: &mut Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+) -> bool {
+    let entry_level = state.level;
+    let t_enter = Instant::now();
+    let result = dfs_body(solver, state, ctx, stats, deadline, found);
+    if entry_level >= stats.sub_cube_time_by_level.len() {
+        stats.sub_cube_time_by_level.resize(entry_level + 1, 0.0);
+    }
+    stats.sub_cube_time_by_level[entry_level] += t_enter.elapsed().as_secs_f64();
+    result
+}
+
+/// Actual DFS body — see `dfs` for the timing wrapper.
+/// Returns true if a solution was found (short-circuits up the stack).
+fn dfs_body(
+    solver: &mut radical::Solver,
+    state: &mut State,
+    ctx: &Ctx,
     stats: &mut SyncStats,
     deadline: Option<Instant>,
     found: &mut Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
@@ -1067,6 +1357,19 @@ fn dfs(
     if state.level as u64 > stats.max_level_reached {
         stats.max_level_reached = state.level as u64;
     }
+
+    // Cumulative count of walker-var propagations at this frame's
+    // entry: the solver has just finished propagate_only(&parent_assums)
+    // and the trail contains (trail0 walker-vars) + (parent assumption
+    // lits) + (propagated walker-vars) + (propagated aux vars). We
+    // subtract trail0 + assumption count to get only "walker vars
+    // forced by propagation since level 0". Each subsequent child's
+    // propagate_only can only make this number grow monotonically
+    // (more assumptions → more forcings), and the per-level delta is
+    // what we credit to `forced_by_level[child_level]`.
+    let parent_walker_forced: usize = solver
+        .num_assigned_in_range(4 * ctx.n)
+        .saturating_sub(state.trail0_size + state.assumptions.len());
 
     // Pull peer clauses from the shared exchange every 256 nodes.
     // Cheap: one Mutex lock + index compare + a handful of add_clause
@@ -1119,7 +1422,20 @@ fn dfs(
     let has_w = pos < ctx.m;
 
     // Build child candidates with their scores.
-    struct Cand { assum: Vec<i32>, placed_signs: [(u8, usize, i8); 4], num_placed: u8, score: i64, rule_state: u8 }
+    //
+    // `new_assums` / `num_new_assums` store only the NEW literals added at
+    // this level (≤4). The full assumption list is reconstructed at child
+    // entry via `state.assumptions.truncate(parent_len) +
+    // extend_from_slice(&cand.new_assums)`, avoiding a per-candidate Vec
+    // clone of the ancestor list (typically 4*level lits).
+    struct Cand {
+        new_assums: [i32; 4],
+        num_new_assums: u8,
+        placed_signs: [(u8, usize, i8); 4],
+        num_placed: u8,
+        score: i64,
+        rule_state: u8,
+    }
     let mut candidates: Vec<Cand> = Vec::with_capacity(16);
 
     for choice in 0u8..16 {
@@ -1132,7 +1448,8 @@ fn dfs(
         let mut placed = [(0u8, 0usize, 0i8); 4];
         let mut np: u8 = 0;
         let mut consistent = true;
-        let mut new_assums: Vec<i32> = Vec::with_capacity(4);
+        let mut new_assums: [i32; 4] = [0; 4];
+        let mut num_new: u8 = 0;
 
         for (kind, sign) in [(0u8, bx), (1, by), (2, bz), (3, bw)] {
             let xy_len = kind_xy_len(kind, ctx.n, ctx.m);
@@ -1147,7 +1464,8 @@ fn dfs(
             placed[np as usize] = (kind, pos, sign);
             np += 1;
             let var = var_for(kind, pos, ctx.n);
-            new_assums.push(if sign > 0 { var } else { -var });
+            new_assums[num_new as usize] = if sign > 0 { var } else { -var };
+            num_new += 1;
         }
         if !consistent { continue; }
 
@@ -1212,11 +1530,9 @@ fn dfs(
             }
         };
 
-        // Build full assumption list for this child.
-        let mut full_assum = state.assumptions.clone();
-        full_assum.extend_from_slice(&new_assums);
         candidates.push(Cand {
-            assum: full_assum,
+            new_assums,
+            num_new_assums: num_new,
             placed_signs: placed,
             num_placed: np,
             score,
@@ -1225,6 +1541,10 @@ fn dfs(
     }
     stats.internal_nodes += 1;
     stats.children_total += candidates.len() as u64;
+    if state.level >= stats.children_by_level.len() {
+        stats.children_by_level.resize(state.level + 1, 0);
+    }
+    stats.children_by_level[state.level] += candidates.len() as u64;
 
     // Score-ordered siblings: ascending score (low pressure first).
     // Sibling ordering: worker 0 (seed=0) walks best-first by ascending
@@ -1257,10 +1577,30 @@ fn dfs(
     let saved_assum_len = state.assumptions.len();
     let saved_rule_state = state.rule_state;
 
+    // Capture the entry level for the "candidates processed" counter:
+    // the sibling loop may break before we decrement state.level, so
+    // we must stash the level we started at.
+    let entry_level = state.level;
+    // Count of candidates that actually reached propagate_only (as
+    // opposed to being skipped by an early break for `found`,
+    // `deadline`, or `cancel`). Divided by `candidates.len()` this
+    // gives the frame's coverage fraction; averaged across frames at a
+    // given depth, it yields the level's coverage fraction and hence
+    // the direct TTC formula `TTC = elapsed / root_coverage_product`.
+    let total_candidates = candidates.len() as u64;
+    let mut processed_count: u64 = 0;
+    // Stored break-out result so we can hit the coverage accumulator
+    // before returning (otherwise the loop's multiple exits would
+    // bypass it).
+    let mut result_override: Option<bool> = None;
+
     for cand in candidates {
-        if found.is_some() { return true; }
+        if found.is_some() { result_override = Some(true); break; }
         if let Some(d) = deadline {
-            if Instant::now() >= d { return false; }
+            if Instant::now() >= d { result_override = Some(false); break; }
+        }
+        if let Some(c) = &ctx.cancel {
+            if c.load(AtomicOrdering::Acquire) { result_override = Some(false); break; }
         }
 
         // Restore state.bits to the parent snapshot before each sibling.
@@ -1273,56 +1613,91 @@ fn dfs(
             let (ki, pi, si) = cand.placed_signs[k];
             state.set_bit(ki, pi, si);
         }
-        state.assumptions = cand.assum.clone();
+        state.assumptions.extend_from_slice(&cand.new_assums[..cand.num_new_assums as usize]);
         state.level += 1;
         state.rule_state = cand.rule_state;
         rebuild_sums(state, ctx);
+        processed_count += 1;
 
-        // Memo check on the post-placement (pre-SAT) state.
-        let sig = compute_signature(state, ctx);
-        let memo_hit = memo.contains_key(&sig);
-        if memo_hit {
-            stats.memo_hits += 1;
-        } else {
-            // Per-level SAT call: propagate_only (no CDCL decisions,
-            // so cost is proportional to new propagation work). On
-            // UNSAT the solver installs a full-assumption nogood that
-            // short-circuits future calls with the same prefix.
-            let sat = solver.propagate_only(&state.assumptions);
-            if sat == Some(true) {
-                harvest_forced(solver, state, ctx);
-                rebuild_sums(state, ctx);
-                // After harvest: many bits beyond the walker frontier
-                // may now be set (via rule propagation into the
-                // middle). Use the tighter dynamic capacity check
-                // which accounts for pairs already fully determined.
-                if !capacity_violated(state, ctx) && !dynamic_capacity_violated(state, ctx) {
-                    memo.insert(sig, ());
-                    if dfs(solver, state, ctx, memo, stats, deadline, found) {
-                        return true;
-                    }
+        // Per-level SAT call: propagate_only (no CDCL decisions,
+        // so cost is proportional to new propagation work). On
+        // UNSAT the solver installs a full-assumption nogood that
+        // short-circuits future calls with the same prefix.
+        //
+        // Note: a per-worker signature-keyed memo was tried here and
+        // measured memo_hits=0 on every benchmark (n=18, 22, 26) —
+        // each DFS path has a unique (level, sums, walker_bits)
+        // signature, so the memo never fires. Removed to save the
+        // compute_signature + hash cost per accepted candidate.
+        // Capture per-propagator forcings before the call so we can
+        // attribute the delta to the right SAT feature in stats.
+        // prop_by_kind_total[kind] tells us, across the full search,
+        // whether quad PB / XOR / spectral / clause BCP / MDD was the
+        // dominant work source.
+        let mut pre_kind = [0u64; radical::PropKind::COUNT];
+        for kind in radical::PropKind::ALL {
+            pre_kind[kind as usize] = solver.propagations_by_kind(kind);
+        }
+        let sat = solver.propagate_only(&state.assumptions);
+        if state.level >= stats.forced_by_level_kind.len() {
+            stats.forced_by_level_kind.resize(
+                state.level + 1,
+                [0; radical::PropKind::COUNT],
+            );
+        }
+        for kind in radical::PropKind::ALL {
+            let post = solver.propagations_by_kind(kind);
+            let delta = post - pre_kind[kind as usize];
+            stats.prop_by_kind_total[kind as usize] += delta;
+            stats.forced_by_level_kind[state.level][kind as usize] += delta;
+        }
+        if sat == Some(true) {
+            // Count walker-var forcings that THIS level's new assumptions
+            // caused. `child_walker_forced` is cumulative across levels
+            // 0..=state.level; `parent_walker_forced` (captured at dfs
+            // entry) is cumulative across 0..=state.level-1. The delta
+            // is the "2^delta sub-cubes pruned" that we get for free at
+            // this walker level.
+            let child_walker_forced: usize = solver
+                .num_assigned_in_range(4 * ctx.n)
+                .saturating_sub(state.trail0_size + state.assumptions.len());
+            let delta = child_walker_forced.saturating_sub(parent_walker_forced);
+            if state.level >= stats.forced_by_level.len() {
+                stats.forced_by_level.resize(state.level + 1, 0);
+            }
+            stats.forced_by_level[state.level] += delta as u64;
+
+            harvest_forced(solver, state, ctx);
+            rebuild_sums(state, ctx);
+            // After harvest: many bits beyond the walker frontier
+            // may now be set (via rule propagation into the
+            // middle). Use the tighter dynamic capacity check
+            // which accounts for pairs already fully determined.
+            if !capacity_violated(state, ctx) {
+                if dfs(solver, state, ctx, stats, deadline, found) {
+                    result_override = Some(true);
+                    break;
                 }
-            } else {
-                stats.sat_unsat += 1;
-                let (ng, full) = solver.last_nogood_stats();
-                stats.nogood_len_sum += ng as u64;
-                stats.full_nogood_len_sum += full as u64;
-                // Publish the just-learnt nogood to peer workers, but
-                // only if it's small enough to be useful. Long clauses
-                // (Turyn nogoods are typically ~n lits) rarely fire
-                // via watches and bloat the clause DB, so filter.
-                const MAX_SHARED_LEN: usize = 16;
-                if let Some(ex) = &ctx.exchange {
-                    if let Some(clause) = solver.take_last_learnt_clause() {
-                        if clause.len() <= MAX_SHARED_LEN {
-                            if let Ok(mut v) = ex.clauses.lock() {
-                                v.push(clause);
-                            }
+            }
+        } else {
+            stats.sat_unsat += 1;
+            let (ng, full) = solver.last_nogood_stats();
+            stats.nogood_len_sum += ng as u64;
+            stats.full_nogood_len_sum += full as u64;
+            // Publish the just-learnt nogood to peer workers, but
+            // only if it's small enough to be useful. Long clauses
+            // (Turyn nogoods are typically ~n lits) rarely fire
+            // via watches and bloat the clause DB, so filter.
+            const MAX_SHARED_LEN: usize = 16;
+            if let Some(ex) = &ctx.exchange {
+                if let Some(clause) = solver.take_last_learnt_clause() {
+                    if clause.len() <= MAX_SHARED_LEN {
+                        if let Ok(mut v) = ex.clauses.lock() {
+                            v.push(clause);
                         }
                     }
                 }
             }
-            memo.entry(sig).or_insert(());
         }
 
         // Rollback level only; state.bits, sums, assumptions get
@@ -1331,12 +1706,24 @@ fn dfs(
         state.level -= 1;
     }
 
+    // Record coverage at this frame's level. `total_candidates` was
+    // already added to `children_by_level` before the loop; this is
+    // the matching "actually processed" numerator.
+    if entry_level >= stats.children_processed_by_level.len() {
+        stats.children_processed_by_level.resize(entry_level + 1, 0);
+    }
+    stats.children_processed_by_level[entry_level] += processed_count;
+    let _ = total_candidates;  // silence unused if only for debugging
+
     // Final rollback to leave state as caller expected.
     state.bits.copy_from_slice(&saved_all_bits);
     state.sums.copy_from_slice(&saved_sums);
     state.assumptions.truncate(saved_assum_len);
     state.rule_state = saved_rule_state;
+    // Restore state.level if the loop broke with state.level bumped.
+    state.level = entry_level;
 
+    if let Some(v) = result_override { return v; }
     false
 }
 
