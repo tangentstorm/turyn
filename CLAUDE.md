@@ -14,14 +14,18 @@ target/release/turyn --n=18 --mdd-k=5     # shorthand for --wz=apart --mdd-k=5
 
 ### Producer modes (`--wz`)
 
-All three modes load the same `mdd-<k>.bin` for XY boundary enumeration
-and feed the same `SolveXyPerCandidate` XY SAT fast path. They differ
-only in how they generate the `(Z, W)` candidate pairs:
+The `cross`, `apart`, and `together` modes all load the same
+`mdd-<k>.bin` for XY boundary enumeration and feed the same
+`SolveXyPerCandidate` XY SAT fast path. They differ only in how they
+generate the `(Z, W)` candidate pairs. `sync` is a fourth mode that
+does **not** load any MDD — it runs a unified 4-sequence walker
+against a persistent CDCL solver.
 
 ```bash
 target/release/turyn --n=26 --wz=cross                 # default: brute-force Z × W, SpectralIndex match
 target/release/turyn --n=26 --wz=apart    --mdd-k=7    # MDD walker + SolveW → SolveZ
 target/release/turyn --n=26 --wz=together --mdd-k=7    # MDD walker + combined W+Z SAT
+target/release/turyn --n=18 --wz=sync     --sat-secs=30 # no MDD, persistent solver, bouncing walker
 ```
 
 The `--wz=apart|together` modes use a pull-based 4-stage priority queue:
@@ -31,6 +35,10 @@ The `--wz=apart|together` modes use a pull-based 4-stage priority queue:
 4. **SolveXY** (stage 3): XY SAT solve via `SolveXyPerCandidate::try_candidate`
 
 Workers pull from a dual queue (gold queue for ranked XY items, work queue for stages 0-2). The monitor navigates MDD paths on demand (nanosecond per path, no upfront enumeration).
+
+`--wz=sync` is documented in `docs/PIPELINE.md#wzsync--sync_walkersearch_sync`
+and its telemetry format in `docs/TELEMETRY.md`. Use it when you
+want a single-solver baseline with per-feature propagator attribution.
 
 ## Startup: generate the MDD
 
@@ -77,8 +85,10 @@ TURYN_THREADS=8 target/release/turyn --n=56 --wz=apart --mdd-k=10 --sat-secs=30
 
 ## Docs
 
-- `docs/OPTIMIZATION_LOG.md`: Measured before/after for every optimization
-- `docs/MDD-OPTIMIZATION-LOG.md`: MDD generation optimizations
+- `docs/PIPELINE.md`: Overview of all four `--wz` modes and shared building blocks.
+- `docs/TELEMETRY.md`: Reader's guide to the `--wz=sync` output (per-level table, per-feature forcings, per-(level, kind) matrix, direct/projected TTC).
+- `docs/OPTIMIZATION_LOG.md`: Measured before/after for every optimization.
+- `docs/MDD-OPTIMIZATION-LOG.md`: MDD generation optimizations.
 - `docs/CANONICAL.md`: Turyn symmetry group (T1..T4) and BDKR 2012 canonicalization rules (i..vi). Summarizes what the code currently enforces (rule i) and TODO encodings for rules (ii..vi).
-- `IDEAS.md`: Tried and untried optimization ideas with results
-- `toc-ideas.md`: Theory of Constraints analysis of the MDD pipeline
+- `IDEAS.md`: Tried and untried optimization ideas with results.
+- `toc-ideas.md`: Theory of Constraints analysis of the MDD pipeline.
