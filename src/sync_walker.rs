@@ -393,6 +393,14 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     let mut next_aux: i32 = (3 * n + m + 1) as i32;
 
     // (ii) A lex-min under reversal: eq_a[j] = (X[j]=X[n-1-j]); chain.
+    //
+    // Attempted K4 gate collapse (Tseitin clauses → native XOR
+    // `y ⊕ a ⊕ b = 1`) regressed sync TTC ~+10% because radical's XOR
+    // propagator has a per-propagate-lit loop that's heavier than
+    // the 2WL blocker-check short-circuit for these simple 3-var
+    // equivalences. The Tseitin clause encoding is kept as-is;
+    // gate-aware propagation is deferred until either XOR propagation
+    // is faster or we have a wider gate to collapse.
     let mut eq_a: Vec<Option<i32>> = vec![None; n];
     for j in 1..n {
         let mirror = n - 1 - j;
