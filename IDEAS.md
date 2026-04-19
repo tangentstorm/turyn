@@ -2119,15 +2119,33 @@ imports), but they're not firing enough to offset the BCP cost.
 Hypothesis: long nogoods rarely prune with two-watch. An LBD-based
 share heuristic might work; raw length filter doesn't.
 
-### S6. Remove `compute_sigma` O(4n) sweep from tuple_reachable
+### S6. Remove `compute_sigma` O(4n) sweep from tuple_reachable — *tested, rejected (null)*
 
-`tuple_reachable` is called in the speculative-candidate loop and
-calls `compute_sigma` which scans all 4 sequences × n positions
-looking at every bit. We can maintain sigma/free incrementally per
-sequence and update on bit set/unset.
+Hypothesis: `tuple_reachable`, called per speculative candidate, runs
+`compute_sigma` which scans all 4 sequences × n bits. Cache σ/free once
+per DFS node (parent sweep) and apply ±1 delta per placed bit.
 
-- **TTC mechanism**: rate (cuts per-candidate cost).
-- **Detection plan**: nodes/s rises.
+Implemented in `sync_walker.rs`: added `tuple_reachable_from(sx, sy, sz,
+sw, fx, fy, fz, fw, ctx)` that takes σ/free explicitly; cached parent
+σ/free once at the top of `dfs_body` via a single `compute_sigma` call;
+the candidate loop applies `cand_sigma[ki] += si; cand_free[ki] -= 1`
+for each placed bit and calls the `_from` variant.
+
+**Measurement** (n=22 sync 30s, 16 workers, 3 trials each):
+
+| metric        | post-S3 baseline | S6 incremental σ |
+|---------------|------------------|------------------|
+| TTC parallel  | 1.37e6 s         | 1.37e6 s (1.378, 1.370, 1.372) |
+| nodes         | 4.14 M           | 4.14–4.15 M       |
+| cap_rejects   | 54.1 M           | 54.1 M            |
+| tuple_rejects | 1.33 M           | 1.33 M            |
+
+**Conclusion**: neutral. Scanning 4×n=88 bits per candidate at n=22 is
+not a measurable hotspot relative to SAT propagate_only, so the
+optimization saves nothing net. Reverted. Keep `compute_sigma` direct.
+
+- **TTC mechanism attempted**: rate.
+- **Result**: 0% change across 3 trials; not worth the extra call path.
 
 ### S7. Skip `propagate_only` when new bits are only deterministic
 
