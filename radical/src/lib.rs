@@ -669,6 +669,15 @@ pub struct SolverConfig {
     pub vivification: bool,
     /// Use chronological backtracking for shallow conflicts.
     pub chrono_bt: bool,
+    /// R2: route binary clauses to a dedicated `bin_watches` fast
+    /// path in propagate_lit. Helps workloads where the per-lit
+    /// watch-list scan is hot and binaries are a meaningful fraction
+    /// (e.g. `--wz=sync`, −6.8 % TTC on n=26). Hurts workloads with
+    /// many per-candidate `solver.clone()` calls plus dense
+    /// Gauss-Jordan binary additions (e.g. `--wz=apart`'s XY stage,
+    /// +8 % TTC observed). Defaults to off; callers with
+    /// propagate_only-dominated flows should opt in.
+    pub bin_watch_fastpath: bool,
 }
 
 impl Default for SolverConfig {
@@ -681,6 +690,7 @@ impl Default for SolverConfig {
             lucky_phases: false,
             vivification: false,
             chrono_bt: false,
+            bin_watch_fastpath: false,
         }
     }
 }
@@ -706,6 +716,13 @@ pub struct Solver {
     clause_meta: Vec<ClauseMeta>,
     clause_lits: Vec<Lit>,         // flat array of all clause literals
     watches: Vec<Vec<(u32, Lit)>>,  // watches[lit_index] = (clause_index, blocker_literal)
+    /// R2: Dedicated binary-clause fast-path index. When literal `l`
+    /// becomes true, every `(other, ci)` in `bin_watches[lit_index(l)]`
+    /// is a binary clause (-l ∨ other) that now forces `other` or
+    /// conflicts. Separating binaries from the general watch list
+    /// avoids per-event `clause_meta` dereferences (is-binary check +
+    /// size load) and keeps the hot path cache-clean.
+    bin_watches: Vec<Vec<(Lit, u32)>>,
 
     // VSIDS activity with binary heap
     activity: Vec<f64>,
@@ -834,6 +851,7 @@ impl Solver {
             clause_meta: Vec::new(),
             clause_lits: Vec::new(),
             watches: Vec::new(),
+            bin_watches: Vec::new(),
             pb_constraints: Vec::new(),
             pb_watches: Vec::new(),
             quad_pb_constraints: Vec::new(),
@@ -895,6 +913,8 @@ impl Solver {
             self.activity.push(0.0);
             self.watches.push(Vec::new()); // positive literal watch
             self.watches.push(Vec::new()); // negative literal watch
+            self.bin_watches.push(Vec::new()); // R2: positive literal bin watch
+            self.bin_watches.push(Vec::new()); // R2: negative literal bin watch
             self.pb_watches.push(Vec::new()); // positive literal PB
             self.pb_watches.push(Vec::new()); // negative literal PB
             self.quad_pb_var_watches.push(Vec::new());
@@ -972,11 +992,20 @@ impl Solver {
                     }
                     return;
                 }
-                // At least two non-false literals: normal 2WL setup
+                // At least two non-false literals: normal 2WL setup.
+                // R2: binary clauses go to `bin_watches` if the
+                // `bin_watch_fastpath` config flag is set; otherwise
+                // fall back to general watches (where a blocker-check
+                // short-circuit already handles most binary events).
                 let ci = self.clause_meta.len() as u32;
                 let start = self.clause_lits.len() as u32;
-                self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
-                self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
+                if lits.len() == 2 && self.config.bin_watch_fastpath {
+                    self.bin_watches[lit_index(negate(lits[0]))].push((lits[1], ci));
+                    self.bin_watches[lit_index(negate(lits[1]))].push((lits[0], ci));
+                } else {
+                    self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
+                    self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
+                }
                 self.clause_lits.extend_from_slice(&lits);
                 self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false });
             }
@@ -1037,8 +1066,14 @@ impl Solver {
 
         let ci = self.clause_meta.len() as u32;
         let start = self.clause_lits.len() as u32;
-        self.watches[lit_index(negate(order[0]))].push((ci, order[1]));
-        self.watches[lit_index(negate(order[1]))].push((ci, order[0]));
+        // R2: binary → bin_watches (only when fastpath enabled).
+        if order.len() == 2 && self.config.bin_watch_fastpath {
+            self.bin_watches[lit_index(negate(order[0]))].push((order[1], ci));
+            self.bin_watches[lit_index(negate(order[1]))].push((order[0], ci));
+        } else {
+            self.watches[lit_index(negate(order[0]))].push((ci, order[1]));
+            self.watches[lit_index(negate(order[1]))].push((ci, order[0]));
+        }
         self.clause_lits.extend_from_slice(&order);
         self.clause_meta.push(ClauseMeta {
             start,
@@ -2585,9 +2620,15 @@ impl Solver {
     /// Clears existing watches and re-adds watches for all non-deleted clauses with >= 2 literals.
     fn rebuild_watches(&mut self) {
         for wl in &mut self.watches { wl.clear(); }
+        for bw in &mut self.bin_watches { bw.clear(); }
         for (ci, m) in self.clause_meta.iter().enumerate() {
             if m.deleted || m.len < 2 { continue; }
             let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
+            if m.len == 2 && self.config.bin_watch_fastpath {
+                self.bin_watches[lit_index(negate(lits[0]))].push((lits[1], ci as u32));
+                self.bin_watches[lit_index(negate(lits[1]))].push((lits[0], ci as u32));
+                continue;
+            }
             self.watches[lit_index(negate(lits[0]))].push((ci as u32, lits[1]));
             self.watches[lit_index(negate(lits[1]))].push((ci as u32, lits[0]));
         }
@@ -2699,11 +2740,17 @@ impl Solver {
                 lbd,
                 deleted: false,
             });
-            // Add watches for first two literals
+            // Add watches for first two literals. R2: binary → bin_watches
+            // when fastpath enabled.
             let lit0 = clause[0];
             let lit1 = clause[1];
-            self.watches[lit_index(-lit0)].push((ci, lit1));
-            self.watches[lit_index(-lit1)].push((ci, lit0));
+            if clause.len() == 2 && self.config.bin_watch_fastpath {
+                self.bin_watches[lit_index(-lit0)].push((lit1, ci));
+                self.bin_watches[lit_index(-lit1)].push((lit0, ci));
+            } else {
+                self.watches[lit_index(-lit0)].push((ci, lit1));
+                self.watches[lit_index(-lit1)].push((ci, lit0));
+            }
         }
     }
 
@@ -2757,6 +2804,11 @@ impl Solver {
         // Rebuild watch lists (cheaper than trying to surgically remove entries)
         for wl in &mut self.watches {
             wl.retain(|&(ci, _)| (ci as usize) < n_clauses);
+        }
+        // R2: trim bin_watches consistently with the main watches
+        // rollback so a checkpoint/restore doesn't leave stale entries.
+        for bw in &mut self.bin_watches {
+            bw.retain(|&(_, ci)| (ci as usize) < n_clauses);
         }
 
         // Remove post-checkpoint PB constraints
@@ -2814,15 +2866,22 @@ impl Solver {
         for cm in &mut self.clause_meta {
             if cm.learnt { cm.deleted = true; }
         }
-        // Rebuild watch lists (only non-deleted clauses)
+        // Rebuild watch lists (only non-deleted clauses). R2: route
+        // binaries into bin_watches when fastpath is enabled.
         for wl in &mut self.watches { wl.clear(); }
+        for bw in &mut self.bin_watches { bw.clear(); }
         for (ci, cm) in self.clause_meta.iter().enumerate() {
             if cm.deleted || cm.len < 2 { continue; }
             let start = cm.start as usize;
             let l0 = self.clause_lits[start];
             let l1 = self.clause_lits[start + 1];
-            self.watches[lit_index(l0)].push((ci as u32, l1));
-            self.watches[lit_index(l1)].push((ci as u32, l0));
+            if cm.len == 2 && self.config.bin_watch_fastpath {
+                self.bin_watches[lit_index(l0)].push((l1, ci as u32));
+                self.bin_watches[lit_index(l1)].push((l0, ci as u32));
+            } else {
+                self.watches[lit_index(l0)].push((ci as u32, l1));
+                self.watches[lit_index(l1)].push((ci as u32, l0));
+            }
         }
         self.conflicts = 0;
         self.restart_limit = 100;
@@ -2850,6 +2909,10 @@ impl Solver {
         }
         for wl in &mut self.watches {
             wl.retain(|&(ci, _)| !self.clause_meta[ci as usize].deleted);
+        }
+        // R2: mirror clean-up for bin_watches.
+        for bw in &mut self.bin_watches {
+            bw.retain(|&(_, ci)| !self.clause_meta[ci as usize].deleted);
         }
     }
 
@@ -2947,8 +3010,13 @@ impl Solver {
                     let new_ci = self.clause_meta.len() as u32;
                     let new_start = self.clause_lits.len() as u32;
                     let lbd = self.compute_lbd(&short_lits).min(new_len as u32) as u8;
-                    self.watches[lit_index(negate(short_lits[0]))].push((new_ci, short_lits[1]));
-                    self.watches[lit_index(negate(short_lits[1]))].push((new_ci, short_lits[0]));
+                    if short_lits.len() == 2 && self.config.bin_watch_fastpath {
+                        self.bin_watches[lit_index(negate(short_lits[0]))].push((short_lits[1], new_ci));
+                        self.bin_watches[lit_index(negate(short_lits[1]))].push((short_lits[0], new_ci));
+                    } else {
+                        self.watches[lit_index(negate(short_lits[0]))].push((new_ci, short_lits[1]));
+                        self.watches[lit_index(negate(short_lits[1]))].push((new_ci, short_lits[0]));
+                    }
                     self.clause_lits.extend_from_slice(&short_lits);
                     self.clause_meta.push(ClauseMeta {
                         start: new_start, len: short_lits.len() as u16,
@@ -3273,7 +3341,10 @@ impl Solver {
                             start: cs as u32, len: cn as u16,
                             learnt: true, deleted: false, lbd: cn.min(255) as u8,
                         });
-                        if cn >= 2 {
+                        if cn == 2 && self.config.bin_watch_fastpath {
+                            self.bin_watches[lit_index(cl[0])].push((cl[1], ci));
+                            self.bin_watches[lit_index(cl[1])].push((cl[0], ci));
+                        } else if cn >= 2 {
                             self.watches[lit_index(cl[0])].push((ci, cl[1]));
                             self.watches[lit_index(cl[1])].push((ci, cl[0]));
                         }
@@ -3339,6 +3410,28 @@ impl Solver {
     fn propagate_lit(&mut self, lit: Lit) -> Option<u32> {
         let false_lit = negate(lit);
         let watch_idx = lit_index(lit);
+
+        // R2: Binary-clause fast path. Each entry is a binary clause
+        // ( -lit ∨ other ): if `other` is true, clause satisfied; if
+        // false, conflict; if undef, enqueue `other` as a unit.
+        //
+        // This loop avoids the clause_meta dereference and "find new
+        // watch" search that the general 2WL path pays for long
+        // clauses — for binaries both are wasted work. We do NOT
+        // rewrite bin_watches in place (binary clauses never "move"
+        // a watch: they only have two lits, no replacement possible).
+        {
+            let bin_len = self.bin_watches[watch_idx].len();
+            for idx in 0..bin_len {
+                let (other, ci) = self.bin_watches[watch_idx][idx];
+                if self.clause_meta[ci as usize].deleted { continue; }
+                match self.lit_value(other) {
+                    LBool::True => {} // clause satisfied
+                    LBool::False => { return Some(ci); } // conflict
+                    LBool::Undef => { self.enqueue(other, Reason::Clause(ci)); }
+                }
+            }
+        }
 
         let mut watch_list = std::mem::take(&mut self.watches[watch_idx]);
         let mut i = 0;
@@ -4252,9 +4345,15 @@ impl Solver {
         let lbd = self.compute_lbd(&lits);
         let start = self.clause_lits.len() as u32;
 
-        // Watch the first two literals (blocker = the other watched lit)
-        self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
-        self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
+        // Watch the first two literals (blocker = the other watched lit).
+        // R2: binary learnt → bin_watches fast path when enabled.
+        if lits.len() == 2 && self.config.bin_watch_fastpath {
+            self.bin_watches[lit_index(negate(lits[0]))].push((lits[1], ci));
+            self.bin_watches[lit_index(negate(lits[1]))].push((lits[0], ci));
+        } else {
+            self.watches[lit_index(negate(lits[0]))].push((ci, lits[1]));
+            self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
+        }
         self.clause_lits.extend_from_slice(&lits);
         self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8, deleted: false });
 
@@ -4427,7 +4526,12 @@ impl Solver {
             self.clause_meta[ci as usize].deleted = true;
         }
 
-        // Clean watch lists
+        // Clean watch lists. R2: also clean bin_watches. Binary
+        // learnt clauses rarely hit reduce_db (they have LBD ≤ 2 so
+        // they're in the protected tier) but be defensive.
+        for bw in &mut self.bin_watches {
+            bw.retain(|&(_, ci)| !self.clause_meta[ci as usize].deleted);
+        }
         for wl in &mut self.watches {
             wl.retain(|&(ci, _)| !self.clause_meta[ci as usize].deleted);
         }

@@ -317,6 +317,13 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
 
     let mut solver = radical::Solver::new();
     solver.config = sat_config.clone();
+    // R2: sync's propagate_only-dominated workload benefits from the
+    // dedicated binary-watch fast path (−6.8 % TTC measured on n=26).
+    // Apart/together regress ~8 % because they clone the template
+    // solver per candidate and GJ-equality binaries cross the
+    // bin/general watch split, so we opt in from sync specifically
+    // rather than flipping the default.
+    solver.config.bin_watch_fastpath = true;
 
     // BDKR Canonical1: X[0]=X[n-1]=Y[0]=Y[n-1]=Z[0]=W[0]=+1.
     solver.add_clause([x_var(0)]);
