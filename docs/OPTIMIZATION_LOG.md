@@ -603,6 +603,48 @@ All 35 tests pass.
 
 ## SPECTRAL_FREQS sweep for --wz=apart (April 2026)
 
+### R8c. Skip post-harvest `rebuild_sums` when no walker bits forced — accepted (**TTC −74 % vs R8b**, **−91 % cumulative**)
+
+The post-harvest `rebuild_sums` at `sync_walker.rs:1747` ran on
+EVERY accepted candidate, regardless of whether
+`harvest_forced` actually picked up any new walker bits.  Per-level
+telemetry shows that at shallow-to-mid levels (where most siblings
+are processed) `forced_by_level / nodes_at_level` is around
+0.4 – 1.5 — i.e., on most pushes the solver propagation forces
+zero or one walker bit, and the rebuild was pure waste.
+
+**Fix (single commit)**: `harvest_forced` now returns the count of
+newly-set walker bits (`src/sync_walker.rs:514-532`), and the
+caller skips `rebuild_sums` when the count is zero
+(`src/sync_walker.rs:1746-1750`).  This is sound because if
+`harvest_forced` set no bits, `state.bits` is unchanged from
+before the call, so `state.sums` (consistent before harvest) is
+still consistent.
+
+Benchmark: n=26 `--wz=sync --sat-secs=60`, 16 threads, 5
+sequential runs.
+
+| Metric                  | R1+R8+R8b              | R1+R8+R8b+R8c       |
+|-------------------------|------------------------|---------------------|
+| direct TTC parallel (s) | 2.30e8 mean (1.83-3.0) | **5.97e7 ± 0.001e7** |
+| Δ vs R8b                | —                      | **−74 %**           |
+| Δ vs baseline (cumul.)  | −65 %                  | **−91 %**           |
+| nodes / 60 s            | 41 – 68 M              | 79 M (very stable)  |
+| run-to-run spread       | ~50 % (thermal bimodal) | **~0.3 %**         |
+
+The thermal bimodal pattern that affected R8/R8b is gone — R8c
+runs are within 0.3 % of each other.  This indicates the previous
+runs were CPU-bound on a redundant rebuild that didn't run as
+often after R8c, removing the sustained thermal load.
+
+Soundness verified by n=18 smoke test (TT(18) found in 1.55 s,
+`leaves=1`, `max_lvl=18`) and `cargo test --release --bins` 40/40
+pass.
+
+**Lever**: rate.  Eliminates a per-accepted-sibling O(L · events_
+per_level) sum-rebuild on the common case (no new walker bit
+forced).
+
 ### R8b. Extend delta sums to the sync walker's sibling loop — accepted (**TTC −12 % vs R8**, **−65 % cumulative**)
 
 The sibling loop's `rebuild_sums` at `src/sync_walker.rs:1677` (the

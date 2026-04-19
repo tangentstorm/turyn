@@ -511,7 +511,12 @@ fn var_for(kind: u8, pos: usize, n: usize) -> i32 {
 /// Harvest all boundary bit values currently forced by the solver.
 /// Writes into `state.bits`; returns `true` if any new bit became forced
 /// since this state was constructed.
-fn harvest_forced(solver: &radical::Solver, state: &mut State, ctx: &Ctx) {
+/// Pull SAT-forced walker-var values from the solver into `state.bits`.
+/// Returns the number of bits newly set (caller can use this to skip
+/// `rebuild_sums` when zero — state.sums remains consistent in that
+/// case).
+fn harvest_forced(solver: &radical::Solver, state: &mut State, ctx: &Ctx) -> usize {
+    let mut newly_set = 0usize;
     for kind in 0u8..4 {
         let xy_len = kind_xy_len(kind, ctx.n, ctx.m);
         for pos in 0..xy_len {
@@ -519,9 +524,11 @@ fn harvest_forced(solver: &radical::Solver, state: &mut State, ctx: &Ctx) {
             let var = var_for(kind, pos, ctx.n);
             if let Some(b) = solver.value(var) {
                 state.set_bit(kind, pos, if b { 1 } else { -1 });
+                newly_set += 1;
             }
         }
     }
+    newly_set
 }
 
 /// Apply ONLY the per-lag sum delta contributed by pairs closing at
@@ -1736,8 +1743,15 @@ fn dfs_body(
             }
             stats.forced_by_level[state.level] += delta as u64;
 
-            harvest_forced(solver, state, ctx);
-            rebuild_sums(state, ctx);
+            // R8c: skip the full rebuild_sums when harvest_forced
+            // didn't set any new walker bits (state.sums is already
+            // consistent with state.bits in that case). At shallow
+            // levels harvest typically finds 0-1 new bits; this skip
+            // saves an O(L * events) scan per accepted candidate.
+            let n_harvested = harvest_forced(solver, state, ctx);
+            if n_harvested > 0 {
+                rebuild_sums(state, ctx);
+            }
             // After harvest: many bits beyond the walker frontier
             // may now be set (via rule propagation into the
             // middle). Use the tighter dynamic capacity check
