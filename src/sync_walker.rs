@@ -568,9 +568,10 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     // over all walker vars, not just the activity-top-200.
     // Backbone scan: for each unassigned walker variable (1..=4n),
     // try both polarities; if one conflicts at level 0 the other is
-    // installed as a level-0 fact. Kissat-style preprocessing;
-    // extension of radical's existing probe() to run systematically
-    // over all walker vars, not just the activity-top-200.
+    // installed as a level-0 fact. Kissat-style preprocessing.
+    // Scanning all vars (including aux Tseitin) gave the same TTC
+    // (~4.40e6s) since aux vars have no additional backbone facts
+    // beyond what propagating walker-forced lits already installs.
     let _backbone = solver.backbone_scan(4 * n);
 
     solver
