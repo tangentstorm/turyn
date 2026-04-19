@@ -2,11 +2,12 @@
 
 This file tracks performance-oriented changes and their measured impact.
 
-## April 19 2026 — `--wz=sync` deep optimization session (-91 % TTC cumulative)
+## April 19 2026 — `--wz=sync` deep optimization session (-99.3 % TTC cumulative, 150×)
 
 A single multi-hour session pushed `--wz=sync` from baseline TTC
-6.581e8 s parallel down to ~5.87e7 s parallel — an **11× cumulative
-speedup** at n=26.  All wins came from the walker / solver
+6.581e8 s parallel down to ~4.40e6 s parallel — a **150× cumulative
+speedup** at n=26. The final order-of-magnitude came from
+**backbone detection** (kissat-style preprocessing) alone.  All wins came from the walker / solver
 interaction; no algorithmic changes to the search space.
 
 | Stage           | TTC (mean of 5 sequential runs) | Δ vs baseline |
@@ -16,7 +17,10 @@ interaction; no algorithmic changes to the search space.
 | + R8            | 2.62e8 s (range 2.04–3.05e8)    | −60 %         |
 | + R8b           | 2.30e8 s (range 1.83–3.00e8)    | −65 %         |
 | + R8c           | **5.97e7 s ± 0.001e7**          | **−91 %**     |
-| + R8c stack-bits + assert + per-kind ranges + SCC + BVE | 5.87e7 s | **−91.1 %** |
+| + R8c stack-bits + assert + per-kind ranges + SCC + BVE | 5.87e7 s | −91.1 %     |
+| + R2 (gated)    | 5.47e7 s ± 0.15e7               | −91.7 %       |
+| + arena compact + used counter | 5.71-5.87e7 (within noise)      | −91.3 %       |
+| + **backbone**  | **4.40e6 s ± 0.02e6**           | **−99.3 %**   |
 
 Methodology lessons (logged for future sessions):
 
@@ -648,6 +652,58 @@ Benchmark n=26 wz=together mdd-k=7 (4 threads, 20s, 23 runs):
 All 35 tests pass.
 
 ## SPECTRAL_FREQS sweep for --wz=apart (April 2026)
+
+### Backbone detection preprocessing — accepted (**TTC −92.5 % vs R8c+R2, −99.3 % cumulative**)
+
+Added `pub Solver::backbone_scan(max_var: usize) -> usize` (kissat
+`backbone.c` equivalent) to radical, wired into sync's `build_solver`
+after SCC + BVE.  For every unassigned walker var in `1..=4n`, probe
+both polarities under assumption; if one conflicts at level 0, the
+opposite is a backbone fact (true in every satisfying assignment)
+and is enqueued + propagated at level 0.  Iterates to fixpoint in
+case new facts unlock further failed literals.
+
+Typical behaviour at n=26:
+
+- Installs just 2 walker-var facts (e.g. X[1]=+1).
+- Each installed fact's propagation pins a cascade of Tseitin aux
+  variables as level-0 facts too.  Those aux pins don't count
+  towards the "installed" count but dramatically tighten every
+  subsequent `push_assume_frame` call.
+
+Benchmark (n=26 `--wz=sync --sat-secs=60`, 16 threads, 5 sequential):
+
+| Metric                  | Pre                | Post (backbone)            |
+|-------------------------|--------------------|----------------------------|
+| direct TTC parallel (s) | 5.47–5.87e7        | **4.390e6 – 4.426e6**      |
+| Δ vs prior              | —                  | **−92.5 %** decisive        |
+| Δ vs session baseline   | −91–92 %           | **−99.3 %** (150× total)    |
+
+Soundness:
+- `cargo test --release --bins` 40/40 pass.
+- n=18 `--wz=sync` still finds TT(18) in 1.35 s (`leaves=1`,
+  `max_lvl=18`) — the anchor smoke test for sync correctness.
+- `backbone_scan` is a sound inference: "assuming lit ⇒ conflict"
+  is exactly the standard failed-literal-probing premise.
+
+**Lever**: denominator.  The 2 installed facts halve walker-branching
+at those two levels, and the cascading aux-var pins propagate down
+into later levels' propagate_only calls, reducing per-descent work.
+
+Apart / together unaffected — `backbone_scan` is only called from
+sync's `build_solver`.
+
+Deferred work (general-SAT improvements that didn't land):
+- Full CaDiCaL-style tier1/tier2 retention: regressed sync 25 % on
+  60 s budgets (larger retained clause DB hurt the hot loop more
+  than tier quality helped). Kept the `ClauseMeta.used` counter for
+  future work + as a tie-break in `reduce_db`.
+- Native XOR gate collapse of Tseitin equivalence chains:
+  regressed sync 10 % (radical's XOR propagator is slower than 2WL
+  on 3- and 4-variable gates).
+- On-the-fly subsumption during analysis (CaDiCaL OTFS): not
+  attempted — implementation complexity outweighs expected sync
+  payoff given how short radical's learnt clauses already are.
 
 ### R8c. Skip post-harvest `rebuild_sums` when no walker bits forced — accepted (**TTC −74 % vs R8b**, **−91 % cumulative**)
 
