@@ -2795,6 +2795,10 @@ session** (the rest are future work, not present wins):
 | BVE preprocessing | **WIRED UP** — same, via `preprocess_bve_with_protection`. |
 | `reduce_db` at non-zero level | **WIRED UP** — made `pub`, called periodically from sync. Policy unchanged (simple single-threshold `lbd ≤ 3`), *not* the adaptive cadical/kissat tiers. |
 | Dedicated binary watch list (R2) | **DONE** — `Solver::bin_watches: Vec<Vec<(Lit, u32)>>` with a dedicated fast path in `propagate_lit`. Gated on `SolverConfig.bin_watch_fastpath` (default off). Sync opts in and lands −6.8 % TTC on n=26. Apart/together stay on the general watch path (opt-in gate keeps their code path identical to pre-R2 — preliminary testing showed they regress ~8 % with the gate flipped because their per-candidate `solver.clone()` + GJ-equality binary additions interact poorly with the split watch index). Commit `cc49446`. |
+| Arena compaction | **DONE** — `pub Solver::compact_arena()` physically removes marked-deleted clauses from `clause_lits` / `clause_meta` and remaps indices in `watches`, `bin_watches`, and trail reasons. Found a soundness edge case during implementation: BVE / SCC preprocessing can mark a clause deleted while a trail entry still references it; compact_arena protects trail-referenced clauses. Wired into sync's `build_solver` after SCC + BVE. Typical freed: ~53 of ~290 base clauses at n=26. TTC neutral at n=26/60s (infrastructure for longer runs). Commit `f9b1ff5`. |
+| Clause `used` counter + reduce_db tie-break | **DONE (limited)** — `ClauseMeta.used: u8` bumped on each `Reason::Clause` traversal in the CDCL `analyze` path (deliberately NOT in `analyze_assumptions` — sync path). `reduce_db` sort now tie-breaks by `used` (ascending) at equal LBD; `used` is halved per reduce_db pass (decay). Full CaDiCaL/kissat-style tier1/tier2 retention with `used`-gated keep was attempted and REGRESSED sync 25 % (larger retained DB hurt the propagation hot loop more than tier quality helped). Kept as infrastructure / tie-break only. Commit `a859900`. |
+| Backbone detection | **DONE — HUGE WIN.** `pub Solver::backbone_scan(max_var)` implements kissat-style systematic failed-literal probing over all vars in range, iterated to fixpoint. Wired into sync's `build_solver` post-preprocessing over walker vars (1..=4n). Installs just 2 walker-var facts at n=26 (e.g. X[1]=+1), but their propagation cascades to pin many Tseitin aux vars at level 0. Sync TTC: 5.7e7 → **4.4e6** parallel seconds — −92.5 % local, **−99.3 % cumulative** vs session baseline (150× total speedup). Commit `7529acf`. |
+| Gate / congruence closure (AND / XOR patterns) | **ATTEMPTED, REJECTED.** Tried replacing BDKR Tseitin equivalence clauses with native `add_xor` constraints. Replacing (4 clauses → 1 XOR per 3-var equiv, 8 clauses → 1 XOR per 4-var product) regressed sync TTC ~+10 %; adding XOR alongside regressed ~+4.5 %. Radical's XOR propagator iterates all `xor_var_watches[v]` per propagated lit and re-counts `num_unknown` from scratch — heavier than the 2WL blocker-check short-circuit on short gates. Would likely pay off with wider gates or a faster XOR propagator (incremental num_unknown). Commit `f1b8e5a` documents. |
 | Full kissat-style 4-byte tagged watch union (shared memory layout) | **not implemented** (R2 used the simpler split-index approach) |
 | Intrusive clause arena | **not implemented** |
 | Arena compaction | **not implemented** |
@@ -2806,17 +2810,39 @@ session** (the rest are future work, not present wins):
 | Backbone detection | **not implemented** |
 | Gate/congruence closure (AND/XOR gate patterns) | **not implemented** |
 
-So: **two** real radical-side wins inspired by the comparison —
-R1 (incremental push/pop assumption frames, kissat-pointer-style)
-and R2 (dedicated binary watch list / fast-path in `propagate_lit`,
-gated on config) — plus three "wire-up" commits that activate code
-already present but unused (SCC, BVE, reduce_db), plus a small new
-API surface (add_clause_deferred) that measurably matches parity
-because the cross-worker share filter is necessarily tight for
-correctness. **The bulk of the session's 91.7 % TTC gain still
-came from walker-level delta-sum and skip-when-empty optimisations
-in `sync_walker.rs` (R8 / R8b / R8c); R1 and R2 together contribute
-~−25 % of the cumulative.**
+So: **four** real radical-side wins inspired by the CaDiCaL/kissat
+comparison —
+- R1 (incremental push/pop assumption frames, kissat-pointer-style)
+- R2 (dedicated binary watch list, split-index fast path)
+- arena compaction (CaDiCaL/kissat compact.cpp / compact.c equivalent)
+- **backbone detection** (kissat backbone.c equivalent) — the biggest
+  single win of the entire session at −92.5 % on its own, taking
+  cumulative TTC from −91 % to **−99.3 %**
+
+— plus three "wire-up" commits that activate code already present
+but unused (SCC, BVE, reduce_db), plus a `ClauseMeta.used` counter
+for future tier work, plus a small new API surface
+(`add_clause_deferred`) that measurably matches parity because
+the cross-worker share filter is necessarily tight for
+correctness. Gate / congruence closure was ATTEMPTED AND REJECTED
+(regressed ~10 % on short gates due to radical's XOR propagator
+overhead).
+
+**The session's cumulative trajectory at n=26 sync is:**
+
+| Stage                           | TTC (parallel s)  | Δ vs baseline |
+|---------------------------------|--------------------|---------------|
+| Session baseline                | 6.581e8            | —             |
+| + R1 + R8 + R8b + R8c series    | 5.87e7             | −91 %         |
+| + R2 + compact_arena + used     | 5.47e7             | −92 %         |
+| + **backbone**                  | **4.40e6**         | **−99.3 %**   |
+
+The final 4.40e6 s (≈ 51 days parallel, ≈ 2.2 yrs serial) at n=26
+is dominated by the intrinsic denominator — sync walks the raw
+bouncing-order DFS with no MDD pre-pruning. Further rate wins of
+a few percent are plausible; another order-of-magnitude denominator
+reduction would require porting MDD-equivalent structural pruning
+into the sync pipeline, which is architectural-scale work.
 
 R2 also demonstrated an important meta-lesson: the two Turyn flows
 (sync's persistent-solver incremental assumptions vs
