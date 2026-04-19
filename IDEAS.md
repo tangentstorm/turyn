@@ -2794,7 +2794,8 @@ session** (the rest are future work, not present wins):
 | SCC equivalence preprocessing | **WIRED UP** — was already in radical (`preprocess_scc_equivalences`), never called; now called in sync's `build_solver`. |
 | BVE preprocessing | **WIRED UP** — same, via `preprocess_bve_with_protection`. |
 | `reduce_db` at non-zero level | **WIRED UP** — made `pub`, called periodically from sync. Policy unchanged (simple single-threshold `lbd ≤ 3`), *not* the adaptive cadical/kissat tiers. |
-| Watch-list 4-byte tagged union / dedicated binary list | **not implemented** |
+| Dedicated binary watch list (R2) | **DONE** — `Solver::bin_watches: Vec<Vec<(Lit, u32)>>` with a dedicated fast path in `propagate_lit`. Gated on `SolverConfig.bin_watch_fastpath` (default off). Sync opts in and lands −6.8 % TTC on n=26. Apart/together stay on the general watch path (opt-in gate keeps their code path identical to pre-R2 — preliminary testing showed they regress ~8 % with the gate flipped because their per-candidate `solver.clone()` + GJ-equality binary additions interact poorly with the split watch index). Commit `cc49446`. |
+| Full kissat-style 4-byte tagged watch union (shared memory layout) | **not implemented** (R2 used the simpler split-index approach) |
 | Intrusive clause arena | **not implemented** |
 | Arena compaction | **not implemented** |
 | Full chronological backtracking (Möhle–Biere) | **not implemented** (radical has only the trivial 2-level form) |
@@ -2805,15 +2806,25 @@ session** (the rest are future work, not present wins):
 | Backbone detection | **not implemented** |
 | Gate/congruence closure (AND/XOR gate patterns) | **not implemented** |
 
-So: one real radical-side win inspired by the comparison (R1),
-plus three "wire-up" commits that activate code that was already
-present but unused (SCC, BVE, reduce_db), plus a small new API
-surface (add_clause_deferred) that measurably matches parity
+So: **two** real radical-side wins inspired by the comparison —
+R1 (incremental push/pop assumption frames, kissat-pointer-style)
+and R2 (dedicated binary watch list / fast-path in `propagate_lit`,
+gated on config) — plus three "wire-up" commits that activate code
+already present but unused (SCC, BVE, reduce_db), plus a small new
+API surface (add_clause_deferred) that measurably matches parity
 because the cross-worker share filter is necessarily tight for
-correctness. **The bulk of the session's 91 % TTC gain came from
-walker-level delta-sum and skip-when-empty optimisations in
-`sync_walker.rs` (R8 / R8b / R8c), not from porting cadical/kissat
-solver techniques.**
+correctness. **The bulk of the session's 91.7 % TTC gain still
+came from walker-level delta-sum and skip-when-empty optimisations
+in `sync_walker.rs` (R8 / R8b / R8c); R1 and R2 together contribute
+~−25 % of the cumulative.**
+
+R2 also demonstrated an important meta-lesson: the two Turyn flows
+(sync's persistent-solver incremental assumptions vs
+apart/together's per-candidate clone + CDCL solve) have
+**different** optimal solver configurations. Sync wants the binary
+fast path; apart does not. The config-gated implementation is the
+right pattern — a flag in `SolverConfig` lets each caller pick its
+regime without forcing a compromise default.
 
 The below list is **future work**, ordered roughly by expected
 impact on a mixed CDCL + incremental-assumption workload:
