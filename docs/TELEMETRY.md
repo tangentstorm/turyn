@@ -12,6 +12,25 @@ Example invocation used throughout:
 target/release/turyn --n=56 --wz=sync --sat-secs=30
 ```
 
+## Minimal dashboard (recommended)
+
+If the goal is to avoid over-tracking, use this compact dashboard and
+ignore the rest unless debugging:
+
+- **Primary 1: TTC_parallel**
+  - For `--wz=sync`: Block 2 `TTC_parallel` (and Block 3 direct TTC as a
+    consistency check).
+  - For `cross/apart/together`: final `Time to cover` line.
+- **Primary 2: Progress % (effective coverage)**
+  - From the pipeline `Progress:` line (effective covered mass / total
+    mass for that mode).
+- **Primary 3: Timeout quality**
+  - `XY timeout` line (rate + coverage credit behavior).
+- **Primary 4: Conjecture pruning activity (only when enabled)**
+  - `--conj-zw-bound rejects`.
+
+Treat all other telemetry blocks as root-cause diagnostics, not KPIs.
+
 ## Block 1 — scalar summary line
 
 ```
@@ -251,3 +270,39 @@ per-feature counters. Adding them requires capturing deltas around
 calls and aggregating across clones — see `SearchStats` in
 `src/legacy_search.rs` and `src/mdd_pipeline.rs` for the
 aggregation points.
+
+
+## Conjecture flags and telemetry (April 2026 update)
+
+The conjecture flags are now live in CLI and pipeline modes:
+
+- `--conj-xy-product`
+- `--conj-zw-bound`
+- `--conj-tuple`
+
+How they interact with telemetry:
+
+1. **`--wz=sync` blocks in this document are unchanged.**
+   - These five blocks come from `search_sync` walker stats.
+   - Current sync path does not apply conjecture toggles, so Block 2/3
+     TTC values should be compared only against other sync runs with the
+     same core sync settings.
+
+2. **`cross/apart/together` print conjecture status in pipeline output.**
+   - Verbose startup prints active `--conj-*` toggles.
+   - `--conj-zw-bound` additionally prints a reject counter in the final
+     summary (`--conj-zw-bound rejects: ...`).
+
+3. **TTC comparison rule:**
+   - If any conjecture flag is enabled, label runs as
+     `conjecture-constrained` when comparing TTC to baseline.
+   - In particular, `--conj-tuple` restricts tuple shells and can make
+     progress/TTC look better while targeting a narrower search problem.
+
+Practical workflow when testing conjecture impact:
+
+- Keep mode, `n`, thread count, `--sat-secs`, and MDD settings fixed.
+- Run baseline, then one flag at a time, then combined flags.
+- Record both TTC and any conjecture-specific counters (especially
+  `--conj-zw-bound rejects`) to separate "real pruning activity" from
+  pure throughput noise.
