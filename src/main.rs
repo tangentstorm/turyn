@@ -88,6 +88,17 @@ fn print_help() {
     eprintln!("  --probing                Run failed literal probing before each SAT solve");
     eprintln!("  --rephasing              Periodically reset phase saving heuristic");
     eprintln!();
+    eprintln!("SEARCH CONJECTURES (hypothetical, off by default):");
+    eprintln!("  --conj-xy-product        XY product-law conjecture: U_i = x_i*y_i satisfies");
+    eprintln!("                           U_1 = U_n = +1 and U_i = -U_{{n+1-i}} (2<=i<=n-1).");
+    eprintln!("                           Implies X·Y=2. See conjectures/xy-product.md.");
+    eprintln!("  --conj-zw-bound          ZW high-lag U-bound tightness: enforce equality");
+    eprintln!("                           |N_Z(s)+N_W(s)| = ((n-s) + N_U(s))/2 at");
+    eprintln!("                           s in {{n-1, n-2, n-3}}. See conjectures/zw-u-bound-tight.md.");
+    eprintln!("  --conj-tuple             Auto-pick the single sum-tuple with the smallest");
+    eprintln!("                           search space (min binomial product) and restrict");
+    eprintln!("                           search to it, like --tuple= but automatic.");
+    eprintln!();
     eprintln!("DEBUGGING / TESTING:");
     eprintln!("  --verify=<X,Y,Z,W>      Check if four +/- sequences form a valid TT(n)");
     eprintln!("                           Example: --verify=++--+-,+-+-++,+++-,+-+-");
@@ -233,6 +244,18 @@ fn parse_args() -> SearchConfig {
             if cfg.wz_mode.is_none() { cfg.wz_mode = Some(WzMode::Apart); }
         } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
             cfg.dump_dimacs = Some(v.to_string());
+        } else if arg == "--conj-xy-product" {
+            cfg.conj_xy_product = true;
+        } else if arg == "--no-conj-xy-product" {
+            cfg.conj_xy_product = false;
+        } else if arg == "--conj-zw-bound" {
+            cfg.conj_zw_bound = true;
+        } else if arg == "--no-conj-zw-bound" {
+            cfg.conj_zw_bound = false;
+        } else if arg == "--conj-tuple" {
+            cfg.conj_tuple = true;
+        } else if arg == "--no-conj-tuple" {
+            cfg.conj_tuple = false;
         } else {
             eprintln!("error: unknown option '{}'\n", arg);
             print_help();
@@ -250,7 +273,85 @@ fn parse_args() -> SearchConfig {
     if matches!(cfg.effective_wz_mode(), WzMode::Apart | WzMode::Together) && cfg.mdd_extend == 0 {
         cfg.mdd_extend = 1;
     }
+    // --conj-tuple: auto-pick the tuple with the smallest search
+    // space (minimum binomial product).  We can't know solution
+    // density a priori at an open n, so the best proxy we can compute
+    // is raw space size.  Small space ⇒ fast per-orbit enumeration;
+    // accept that the orbit may have few solutions.  Skip if --tuple=
+    // was also supplied.
+    if cfg.conj_tuple && cfg.test_tuple.is_none() && cfg.problem.n > 0 {
+        if let Some(t) = pick_fewest_candidate_tuple(cfg.problem) {
+            eprintln!(
+                "  --conj-tuple: auto-selected tuple {} (log2 space ≈ {:.2})",
+                t, candidate_log2_score(cfg.problem, &t),
+            );
+            cfg.test_tuple = Some(t);
+        } else {
+            eprintln!("warning: --conj-tuple found no valid sum-tuples for n={}", cfg.problem.n);
+        }
+    }
     cfg
+}
+
+
+/// log2 of `C(n, (n+|σ_X|)/2) * C(n, (n+|σ_Y|)/2) * C(n, (n+|σ_Z|)/2)
+///        * C(n-1, (n-1+|σ_W|)/2)`.  Used as the `--conj-tuple`
+/// "candidate count" proxy: smaller = fewer raw ±1 sequences matching
+/// the tuple's per-sum cardinality across X/Y/Z/W.
+fn candidate_log2_score(p: Problem, t: &SumTuple) -> f64 {
+    fn lb(n: i32, sigma: i32) -> f64 {
+        // log2 C(n, (n+sigma)/2).  Infeasible parity ⇒ +∞ penalty.
+        if (n + sigma).rem_euclid(2) != 0 { return f64::INFINITY; }
+        let k = (n + sigma) / 2;
+        if k < 0 || k > n { return f64::INFINITY; }
+        // log2(n!) - log2(k!) - log2((n-k)!) via lgamma.
+        let num = lgamma(n as f64 + 1.0);
+        let den = lgamma(k as f64 + 1.0) + lgamma((n - k) as f64 + 1.0);
+        (num - den) / std::f64::consts::LN_2
+    }
+    lb(p.n as i32, t.x.abs())
+        + lb(p.n as i32, t.y.abs())
+        + lb(p.n as i32, t.z.abs())
+        + lb(p.m() as i32, t.w.abs())
+}
+
+
+/// Natural log of the Gamma function (Lanczos approximation, standard
+/// form).  Sufficient precision for comparing binomial-product scores.
+fn lgamma(x: f64) -> f64 {
+    // Shift x to x ≥ 0.5.
+    if x < 0.5 {
+        return (std::f64::consts::PI / (std::f64::consts::PI * x).sin()).ln() - lgamma(1.0 - x);
+    }
+    let g = 7.0;
+    let coeff: [f64; 9] = [
+        0.99999999999980993,
+        676.5203681218851,
+        -1259.1392167224028,
+        771.32342877765313,
+        -176.61502916214059,
+        12.507343278686905,
+        -0.13857109526572012,
+        9.9843695780195716e-6,
+        1.5056327351493116e-7,
+    ];
+    let x = x - 1.0;
+    let mut a = coeff[0];
+    let t = x + g + 0.5;
+    for (i, &c) in coeff.iter().enumerate().skip(1) {
+        a += c / (x + i as f64);
+    }
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
+}
+
+
+fn pick_fewest_candidate_tuple(p: Problem) -> Option<SumTuple> {
+    let tuples = phase_a_tuples(p, None);
+    tuples.into_iter().min_by(|a, b| {
+        candidate_log2_score(p, a)
+            .partial_cmp(&candidate_log2_score(p, b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
 }
 
 
@@ -698,6 +799,9 @@ mod tests {
             mdd_extend: 0,
             wz_together: false,
             wz_mode: Some(WzMode::Apart),
+            conj_xy_product: false,
+            conj_zw_bound: false,
+            conj_tuple: false,
         };
         let tuples = phase_a_tuples(cfg.problem, None);
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, false, cfg.mdd_k);

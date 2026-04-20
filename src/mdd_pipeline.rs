@@ -51,6 +51,64 @@ pub(crate) fn compute_zw_autocorr(problem: Problem, z: &PackedSeq, w: &PackedSeq
 }
 
 
+/// `--conj-zw-bound` filter: at lag `s = n - diff` for `diff in 1..=3`
+/// (only while `k >= diff`), check the tightness conjecture
+/// `|N_Z(s) + N_W(s)| = ((n - s) + N_U(s)) / 2` where
+/// `u_i = x_i y_i`.  All positions involved live at the boundary, so
+/// the check is O(1) given the fully-decoded `z_seq`, `w_seq` and the
+/// `x_bits`/`y_bits` packing used by `walk_xy_sub_mdd` (prefix bits at
+/// 0..k, suffix bits at k..2k, i.e., position `n-k+i`).  Returns true
+/// iff every applicable lag satisfies equality.
+///
+/// Empirical note (n ∈ {18, 26}): at `s = n - 1, n - 2` the equality is
+/// provably forced by Turyn at that lag combined with BDKR rules (i)
+/// and (vi) plus the top-lag identity, so the check rejects nothing
+/// in practice; the real conjectural content lives at `s = n - 3` and
+/// the aggressive `s ∈ {n-4, n-5}` regime (not yet wired).  Filter is
+/// retained for correctness and for future aggressive-lag extensions.
+pub(crate) fn check_conj_zw_bound(
+    n: usize, k: usize,
+    x_bits: u32, y_bits: u32,
+    z_seq: &PackedSeq, w_seq: &PackedSeq,
+) -> bool {
+    let m = n - 1;
+    let boundary_val = |bits: u32, pos: usize| -> i32 {
+        let bit_idx = if pos < k { pos } else { k + (pos - (n - k)) };
+        if (bits >> bit_idx) & 1 == 1 { 1 } else { -1 }
+    };
+    let u_at = |pos: usize| -> i32 {
+        boundary_val(x_bits, pos) * boundary_val(y_bits, pos)
+    };
+
+    for diff in 1..=3usize {
+        if k < diff { break; }
+        let s = n - diff;
+        let nz = z_seq.autocorrelation(s);
+        let nw = if s < m { w_seq.autocorrelation(s) } else { 0 };
+        let lhs = nz + nw;
+
+        // Sum u_i * u_{i+s} for i in 0..=(n-1-s) = 0..diff.  Both
+        // endpoints sit at the boundary: i ∈ [0, k), i+s ∈ [n-k, n).
+        let mut nu: i32 = 0;
+        for i in 0..diff {
+            nu += u_at(i) * u_at(i + s);
+        }
+
+        let rhs_twice = diff as i32 + nu;
+        // `rhs` is a count of matching-U pairs, guaranteed non-negative
+        // and same parity as `diff` (odd+odd or even+even).  A mismatch
+        // here means the candidate violates the conjecture.
+        if rhs_twice < 0 || rhs_twice % 2 != 0 {
+            return false;
+        }
+        if lhs.abs() != rhs_twice / 2 {
+            return false;
+        }
+    }
+    true
+}
+
+
 /// Generic 4-way MDD walker. Walks from `nid` at `level` down to `depth`,
 /// accumulating two bit-packed values (a_acc, b_acc) for branches (low bit, high bit).
 /// Calls `emit(a_acc, b_acc, terminal_nid)` at terminal depth.
@@ -302,6 +360,17 @@ pub(crate) struct PhaseBContext {
     /// Use the combined SolveWZ stage instead of the default SolveW →
     /// SolveZ two-stage pipeline. Plumbed from cfg.wz_together.
     pub(crate) wz_together: bool,
+    /// Optional XY product-law conjecture (`U_i = -U_{n+1-i}` for
+    /// 2 <= i <= n-1, with U_i = x_i*y_i). Plumbed from
+    /// cfg.conj_xy_product; only consulted by stages that build an
+    /// XY SAT template. See conjectures/xy-product.md.
+    pub(crate) conj_xy_product: bool,
+    /// Optional ZW u-bound tightness conjecture: enforce
+    /// `|N_Z(s)+N_W(s)| = ((n-s)+N_U(s))/2` at s in {n-1, n-2, n-3}.
+    /// Plumbed from cfg.conj_zw_bound; applied as an XY-stage
+    /// pre-filter per (x_bits, y_bits). See
+    /// conjectures/zw-u-bound-tight.md.
+    pub(crate) conj_zw_bound: bool,
     /// Prototype: replace the per-leaf walk_xy_sub_mdd fan-out with a
     /// single `try_candidate_via_mdd` call that uses radical's native
     /// `MddConstraint` propagator. Gated by env `XY_MDD=1`. Only the
@@ -468,6 +537,8 @@ pub(crate) fn run_mdd_sat_search(
         theta: cfg.theta_samples,
         mdd_extend: cfg.mdd_extend,
         wz_together: cfg.wz_together,
+        conj_xy_product: cfg.conj_xy_product,
+        conj_zw_bound: cfg.conj_zw_bound,
         xy_mdd_mode: std::env::var("XY_MDD").ok().as_deref() == Some("1"),
         w_mid_vars: (0..middle_m).map(|i| (i + 1) as i32).collect(),
         z_mid_vars: (0..middle_n).map(|i| (i + 1) as i32).collect(),
@@ -495,6 +566,15 @@ pub(crate) fn run_mdd_sat_search(
     if verbose {
         eprintln!("TT({}): MDD pipeline k={}, {} workers, 4^{}={:.0e} paths",
             n, k, workers, zw_depth, total_paths as f64);
+        if cfg.conj_xy_product {
+            eprintln!("  --conj-xy-product: enforcing U_i = -U_{{n+1-i}} on XY canonical reps (XY product-law conjecture)");
+        }
+        if cfg.conj_zw_bound {
+            eprintln!("  --conj-zw-bound: enforcing |N_Z(s)+N_W(s)| = ((n-s)+N_U(s))/2 for s in {{n-1,n-2,n-3}}");
+        }
+        if cfg.test_tuple.is_some() && cfg.conj_tuple {
+            eprintln!("  --conj-tuple: restricted search to auto-selected tuple");
+        }
     }
 
     // Shared priority queue: workers push and pop. Higher stage = higher priority.
@@ -642,6 +722,7 @@ pub(crate) fn run_mdd_sat_search(
     let flow_z_pair_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));        // Z solutions failing pair check
     let flow_z_prep_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));        // Z solutions failing prepare_candidate (infeasible/GJ)
     let flow_xy_ext_pruned = Arc::new(std::sync::atomic::AtomicU64::new(0));      // XY candidates pruned by extension
+    let flow_xy_zw_bound_rej = Arc::new(std::sync::atomic::AtomicU64::new(0));    // XY candidates pruned by --conj-zw-bound pre-filter
     let flow_xy_sat = Arc::new(std::sync::atomic::AtomicU64::new(0));             // XY SAT result = SAT
     let flow_xy_unsat = Arc::new(std::sync::atomic::AtomicU64::new(0));           // XY SAT result = UNSAT (proved)
     let flow_xy_timeout = Arc::new(std::sync::atomic::AtomicU64::new(0));         // XY SAT result = None (conflict limit)
@@ -713,6 +794,7 @@ pub(crate) fn run_mdd_sat_search(
         let flow_z_pair_fail = Arc::clone(&flow_z_pair_fail);
         let flow_z_prep_fail = Arc::clone(&flow_z_prep_fail);
         let _flow_xy_ext_pruned = Arc::clone(&flow_xy_ext_pruned);
+        let flow_xy_zw_bound_rej = Arc::clone(&flow_xy_zw_bound_rej);
         let flow_xy_sat = Arc::clone(&flow_xy_sat);
         let flow_xy_unsat = Arc::clone(&flow_xy_unsat);
         let flow_xy_timeout = Arc::clone(&flow_xy_timeout);
@@ -1548,7 +1630,7 @@ pub(crate) fn run_mdd_sat_search(
                                 .map(|t| (t.x, t.y, t.z, t.w)).collect();
                             tuple_key.sort_unstable();
                             let template = template_cache.entry(tuple_key).or_insert_with(||
-                                SatXYTemplate::build_multi(problem, &swz.candidate_tuples, &sat_config).unwrap()
+                                SatXYTemplate::build_multi_opts(problem, &swz.candidate_tuples, &sat_config, ctx.conj_xy_product).unwrap()
                             );
                             let candidate = CandidateZW { zw_autocorr };
                             if let Some(mut xy_solver) = template.prepare_candidate_solver(&candidate) {
@@ -1561,6 +1643,12 @@ pub(crate) fn run_mdd_sat_search(
                                         if ctx.found.load(AtomicOrdering::Relaxed) { return; }
                                         if let Some((fx, fy)) = ctx.outfix_xy {
                                             if x_bits != fx || y_bits != fy { return; }
+                                        }
+                                        if ctx.conj_zw_bound
+                                            && !check_conj_zw_bound(n, k, x_bits, y_bits, &z_seq, &w_seq)
+                                        {
+                                            flow_xy_zw_bound_rej.fetch_add(1, AtomicOrdering::Relaxed);
+                                            return;
                                         }
                                         stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
                                         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
@@ -2009,7 +2097,7 @@ pub(crate) fn run_mdd_sat_search(
                                 .map(|t| (t.x, t.y, t.z, t.w)).collect();
                             tuple_key.sort_unstable();
                             let template = template_cache.entry(tuple_key).or_insert_with(||
-                                SatXYTemplate::build_multi(problem, &sz.candidate_tuples, &sat_config).unwrap()
+                                SatXYTemplate::build_multi_opts(problem, &sz.candidate_tuples, &sat_config, ctx.conj_xy_product).unwrap()
                             );
                             let candidate = CandidateZW { zw_autocorr };
                             // Shared XY SAT fast path: clone the per-tuple
@@ -2076,6 +2164,12 @@ pub(crate) fn run_mdd_sat_search(
                                         // pinned (x_bits, y_bits) when the flag is set.
                                         if let Some((fx, fy)) = ctx.outfix_xy {
                                             if x_bits != fx || y_bits != fy { return; }
+                                        }
+                                        if ctx.conj_zw_bound
+                                            && !check_conj_zw_bound(n, k, x_bits, y_bits, &z_seq, &w_seq)
+                                        {
+                                            flow_xy_zw_bound_rej.fetch_add(1, AtomicOrdering::Relaxed);
+                                            return;
                                         }
                                         // E1: Extension filter with cache.
                                         if ctx.mdd_extend > 0 {
@@ -2199,7 +2293,7 @@ pub(crate) fn run_mdd_sat_search(
                         let tuple_key: Vec<(i32, i32, i32, i32)> = vec![(
                             item.tuple.x, item.tuple.y, item.tuple.z, item.tuple.w)];
                         let template = template_cache.entry(tuple_key).or_insert_with(||
-                            SatXYTemplate::build(ctx.problem, item.tuple, &sat_config).unwrap()
+                            SatXYTemplate::build_opts(ctx.problem, item.tuple, &sat_config, ctx.conj_xy_product).unwrap()
                         );
 
                         if let Some(mut state) = SolveXyPerCandidate::new(
@@ -2218,6 +2312,12 @@ pub(crate) fn run_mdd_sat_search(
                                     if ctx.found.load(AtomicOrdering::Relaxed) { return; }
                                     if let Some((fx, fy)) = ctx.outfix_xy {
                                         if x_bits != fx || y_bits != fy { return; }
+                                    }
+                                    if ctx.conj_zw_bound
+                                        && !check_conj_zw_bound(n, k, x_bits, y_bits, &z_seq, &w_seq)
+                                    {
+                                        flow_xy_zw_bound_rej.fetch_add(1, AtomicOrdering::Relaxed);
+                                        return;
                                     }
                                     stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
                                     let (result, stats) = state.try_candidate(x_bits, y_bits);
@@ -2560,6 +2660,10 @@ pub(crate) fn run_mdd_sat_search(
         let ext_pruned = extensions_pruned.load(AtomicOrdering::Relaxed);
         println!("  XY solves:                {:>10}", done);
         println!("  Extensions pruned:        {:>10}", ext_pruned);
+        if cfg.conj_zw_bound {
+            let zw_rej = flow_xy_zw_bound_rej.load(AtomicOrdering::Relaxed);
+            println!("  --conj-zw-bound rejects:  {:>10}", zw_rej);
+        }
         println!("  Boundaries walked:        {:>10} (pushed: {})", walked, pushed);
         // Coverage metrics
         let secs = elapsed.as_secs_f64();
