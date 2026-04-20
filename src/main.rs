@@ -39,7 +39,7 @@ use crate::search_framework::engine::{EngineConfig, SearchEngine, SearchModeAdap
 #[cfg(feature = "search-framework")]
 use crate::search_framework::events::SearchEvent;
 #[cfg(feature = "search-framework")]
-use crate::search_framework::mode_adapters::apart_together::{ApartTogetherAdapter, TuplePayload};
+use crate::search_framework::mode_adapters::apart_together::{MddTupleAdapter, TuplePayload};
 #[cfg(feature = "search-framework")]
 use crate::search_framework::queue::GoldThenWork;
 use crate::spectrum::*;
@@ -323,7 +323,7 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
 }
 
 #[cfg(feature = "search-framework")]
-fn run_framework_apart_together(
+fn run_framework_mdd_mode(
     problem: Problem,
     tuples: Vec<SumTuple>,
     cfg: &SearchConfig,
@@ -331,11 +331,12 @@ fn run_framework_apart_together(
     k: usize,
 ) {
     let mode_name = match cfg.effective_wz_mode() {
+        WzMode::Cross => "cross",
         WzMode::Apart => "apart",
         WzMode::Together => "together",
-        _ => "unknown",
+        WzMode::Sync => "sync",
     };
-    let adapter = ApartTogetherAdapter {
+    let adapter = MddTupleAdapter {
         problem,
         tuples: std::sync::Arc::new(tuples),
         cfg: std::sync::Arc::new(cfg.clone()),
@@ -1118,8 +1119,8 @@ fn main() {
             }
         }
         #[cfg(feature = "search-framework")]
-        if cfg.engine == EngineKind::New && matches!(mode, WzMode::Apart | WzMode::Together) {
-            run_framework_apart_together(cfg.problem, tuples, &cfg, true, mdd_k);
+        if cfg.engine == EngineKind::New && matches!(mode, WzMode::Cross | WzMode::Apart | WzMode::Together) {
+            run_framework_mdd_mode(cfg.problem, tuples, &cfg, true, mdd_k);
             return;
         }
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, true, mdd_k);

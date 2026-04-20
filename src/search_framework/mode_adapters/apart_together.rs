@@ -104,7 +104,7 @@ impl StageHandler<TuplePayload> for TupleSolveStage {
     }
 }
 
-pub struct ApartTogetherAdapter {
+pub struct MddTupleAdapter {
     pub problem: Problem,
     pub tuples: Arc<Vec<SumTuple>>,
     pub cfg: Arc<SearchConfig>,
@@ -113,7 +113,7 @@ pub struct ApartTogetherAdapter {
     pub mode_name: &'static str,
 }
 
-impl SearchModeAdapter<TuplePayload> for ApartTogetherAdapter {
+impl SearchModeAdapter<TuplePayload> for MddTupleAdapter {
     fn name(&self) -> &'static str {
         self.mode_name
     }
