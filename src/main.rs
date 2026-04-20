@@ -95,9 +95,11 @@ fn print_help() {
     eprintln!("  --conj-zw-bound          ZW high-lag U-bound tightness: enforce equality");
     eprintln!("                           |N_Z(s)+N_W(s)| = ((n-s) + N_U(s))/2 at");
     eprintln!("                           s in {{n-1, n-2, n-3}}. See conjectures/zw-u-bound-tight.md.");
-    eprintln!("  --conj-tuple             Auto-pick the single sum-tuple with the fewest raw");
-    eprintln!("                           candidate sequences and restrict search to it");
-    eprintln!("                           (like --tuple=... but automatic).");
+    eprintln!("  --conj-tuple             Auto-pick the single sum-tuple with the highest");
+    eprintln!("                           known-solution density (solutions/space) from the");
+    eprintln!("                           data/turyn-type-{{n}} corpus, falling back to smallest");
+    eprintln!("                           space when the corpus is absent.  Restricts search");
+    eprintln!("                           to the chosen tuple (like --tuple= but automatic).");
     eprintln!();
     eprintln!("DEBUGGING / TESTING:");
     eprintln!("  --verify=<X,Y,Z,W>      Check if four +/- sequences form a valid TT(n)");
@@ -273,13 +275,21 @@ fn parse_args() -> SearchConfig {
     if matches!(cfg.effective_wz_mode(), WzMode::Apart | WzMode::Together) && cfg.mdd_extend == 0 {
         cfg.mdd_extend = 1;
     }
-    // --conj-tuple: auto-pick the tuple with fewest raw candidate
-    // sequences.  Skip if --tuple= was also supplied.
+    // --conj-tuple: auto-pick the tuple with highest solution-density
+    // (known solutions / space size) from the `data/turyn-type-{n:02}`
+    // corpus when available; fall back to smallest-space when the
+    // corpus file is missing.  Skip if --tuple= was also supplied.
     if cfg.conj_tuple && cfg.test_tuple.is_none() && cfg.problem.n > 0 {
-        if let Some(t) = pick_fewest_candidate_tuple(cfg.problem) {
+        if let Some((t, log2_density, n_sol, log2_space)) = pick_best_density_tuple(cfg.problem) {
             eprintln!(
-                "  --conj-tuple: auto-selected tuple {} (log2 candidates ≈ {:.2})",
-                t, candidate_log2_score(cfg.problem, &t),
+                "  --conj-tuple: auto-selected tuple {} (corpus: {} known solutions, log2 space ≈ {:.2}, log2 density ≈ {:.2})",
+                t, n_sol, log2_space, log2_density,
+            );
+            cfg.test_tuple = Some(t);
+        } else if let Some(t) = pick_fewest_candidate_tuple(cfg.problem) {
+            eprintln!(
+                "  --conj-tuple: corpus for n={} unavailable, falling back to smallest-space pick {} (log2 space ≈ {:.2})",
+                cfg.problem.n, t, candidate_log2_score(cfg.problem, &t),
             );
             cfg.test_tuple = Some(t);
         } else {
@@ -348,6 +358,65 @@ fn pick_fewest_candidate_tuple(p: Problem) -> Option<SumTuple> {
             .partial_cmp(&candidate_log2_score(p, b))
             .unwrap_or(std::cmp::Ordering::Equal)
     })
+}
+
+
+/// Parse `data/turyn-type-{n:02}` and return a map from the
+/// `SumTuple::norm_key` (`(|σ_X|, |σ_Y|, |σ_Z|, |σ_W|)`) of each
+/// decoded solution to the count of corpus entries in that class.
+///
+/// Catalogue format (per `decode_kharaghani_hex`): each line is
+/// `n-1` hex digits, with a hidden final position contributing
+/// `X[n-1]=+1, Y[n-1]=+1, Z[n-1]=-1`; W has only `n-1` entries.
+/// Returns `None` if the file is missing or empty.
+fn corpus_solution_counts_by_norm_key(n: usize) -> Option<std::collections::HashMap<(i32, i32, i32, i32), u64>> {
+    let path = format!("data/turyn-type-{:02}", n);
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let mut counts: std::collections::HashMap<(i32, i32, i32, i32), u64> = std::collections::HashMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        if line.len() != n - 1 { continue; }
+        let (mut x, mut y, mut z, mut w) = (0i32, 0i32, 0i32, 0i32);
+        let mut ok = true;
+        for c in line.chars() {
+            let Some(d) = c.to_digit(16) else { ok = false; break; };
+            x += if (d >> 3) & 1 == 0 { 1 } else { -1 };
+            y += if (d >> 2) & 1 == 0 { 1 } else { -1 };
+            z += if (d >> 1) & 1 == 0 { 1 } else { -1 };
+            w += if d & 1 == 0 { 1 } else { -1 };
+        }
+        if !ok { continue; }
+        // Hidden final position: X[n-1]=+1, Y[n-1]=+1, Z[n-1]=-1 (W has no n-1).
+        x += 1; y += 1; z -= 1;
+        *counts.entry((x.abs(), y.abs(), z.abs(), w.abs())).or_insert(0) += 1;
+    }
+    if counts.is_empty() { None } else { Some(counts) }
+}
+
+
+/// Pick the `SumTuple` from `phase_a_tuples` whose
+/// `log2(corpus_solution_count) - log2(candidate_space)` is largest,
+/// using `data/turyn-type-{n:02}` as the solution corpus.  This is
+/// the expected-log-time-to-first-solution metric: smaller space with
+/// more known solutions dominates.  Returns `None` if no corpus is
+/// available (caller should then fall back to `pick_fewest_candidate_tuple`).
+fn pick_best_density_tuple(p: Problem) -> Option<(SumTuple, f64, u64, f64)> {
+    let counts = corpus_solution_counts_by_norm_key(p.n)?;
+    let tuples = phase_a_tuples(p, None);
+    let mut best: Option<(SumTuple, f64, u64, f64)> = None;
+    for t in tuples {
+        let n_sol = *counts.get(&t.norm_key()).unwrap_or(&0);
+        if n_sol == 0 { continue; }
+        let log2_space = candidate_log2_score(p, &t);
+        if !log2_space.is_finite() { continue; }
+        let log2_density = (n_sol as f64).log2() - log2_space;
+        match &best {
+            Some((_, d, _, _)) if *d >= log2_density => {}
+            _ => best = Some((t, log2_density, n_sol, log2_space)),
+        }
+    }
+    best
 }
 
 
