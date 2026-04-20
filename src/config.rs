@@ -15,6 +15,7 @@ use turyn::mdd_reorder;
 use turyn::mdd_zw_first;
 use turyn::sat_z_middle;
 
+use crate::SPECTRAL_FREQS;
 use crate::enumerate::*;
 use crate::legacy_search::*;
 use crate::mdd_pipeline::*;
@@ -22,9 +23,6 @@ use crate::spectrum::*;
 use crate::stochastic::*;
 use crate::types::*;
 use crate::xy_sat::*;
-use crate::SPECTRAL_FREQS;
-
-
 
 /// A specific (Z, W) boundary — optionally also (X, Y) — encoded as hex
 /// prefix/suffix pairs.  Each `*_bits` value follows the internal
@@ -53,7 +51,6 @@ pub(crate) struct OutfixSpec {
     /// Same for Y.
     pub(crate) y_middle_pins: Vec<(usize, i8)>,
 }
-
 
 /// Parse `--outfix=<prefHex>...<sufHex>`.  BDKR hex encoding: each hex
 /// digit packs all four sequences (A, B, C, D) = (X, Y, Z, W) at one
@@ -89,19 +86,31 @@ pub(crate) fn parse_outfix(s: &str, n: usize, k: usize) -> Result<OutfixSpec, St
     // (full sequence pinned).  Longer prefixes pin middle Z/W/X/Y
     // positions via unit clauses added at SAT build time.
     if pref_hex.len() < k {
-        return Err(format!("--outfix: prefix has {} hex digits, need at least k={k}", pref_hex.len()));
+        return Err(format!(
+            "--outfix: prefix has {} hex digits, need at least k={k}",
+            pref_hex.len()
+        ));
     }
     // Suffix minimum is k+1 (the MDD boundary + h_{n-1-k}); maximum is
     // n-pref_len (so pref+suf don't overlap).
     if suf_hex.len() < k + 1 {
-        return Err(format!("--outfix: suffix has {} hex digits, need at least k+1={}", suf_hex.len(), k + 1));
+        return Err(format!(
+            "--outfix: suffix has {} hex digits, need at least k+1={}",
+            suf_hex.len(),
+            k + 1
+        ));
     }
     if pref_hex.len() + suf_hex.len() > n + 1 {
-        return Err(format!("--outfix: prefix ({}) + suffix ({}) hex digits exceed n+1={}",
-            pref_hex.len(), suf_hex.len(), n + 1));
+        return Err(format!(
+            "--outfix: prefix ({}) + suffix ({}) hex digits exceed n+1={}",
+            pref_hex.len(),
+            suf_hex.len(),
+            n + 1
+        ));
     }
     fn hex_digit(c: char) -> Result<u32, String> {
-        c.to_digit(16).ok_or_else(|| format!("--outfix: '{c}' is not a hex digit"))
+        c.to_digit(16)
+            .ok_or_else(|| format!("--outfix: '{c}' is not a hex digit"))
     }
     // BDKR: bit polarity 0=+1, 1=-1.  For boundary bits we use the
     // packed u32 convention (`expand_boundary_bits`): internal bit 1 = +1.
@@ -124,7 +133,9 @@ pub(crate) fn parse_outfix(s: &str, n: usize, k: usize) -> Result<OutfixSpec, St
     // k + (i - k) = i for all four sequences.  Middle index is (i - k).
     for (i, c) in pref_hex.chars().enumerate() {
         let d = hex_digit(c)?;
-        if d > 0xf { return Err(format!("--outfix: prefix digit {i} '{c}' > f")); }
+        if d > 0xf {
+            return Err(format!("--outfix: prefix digit {i} '{c}' > f"));
+        }
         if i < k {
             set(&mut x_bits, i, (d >> 3) & 1);
             set(&mut y_bits, i, (d >> 2) & 1);
@@ -177,11 +188,17 @@ pub(crate) fn parse_outfix(s: &str, n: usize, k: usize) -> Result<OutfixSpec, St
         if i == 0 {
             // Only W at this digit.  Other 3 bits must be zero (A=B=C=0).
             if (d >> 1) != 0 {
-                return Err(format!("--outfix: suffix digit 0 '{c}' has X/Y/Z bits set — must be 0..1 (only D bit / W used)"));
+                return Err(format!(
+                    "--outfix: suffix digit 0 '{c}' has X/Y/Z bits set — must be 0..1 (only D bit / W used)"
+                ));
             }
         } else if i == suf_len - 1 {
             // Last digit: 3-bit (no W).
-            if d > 0x7 { return Err(format!("--outfix: last suffix digit '{c}' > 7 (must be 3-bit)")); }
+            if d > 0x7 {
+                return Err(format!(
+                    "--outfix: last suffix digit '{c}' > 7 (must be 3-bit)"
+                ));
+            }
         }
 
         if let Some(wp) = w_pos_abs {
@@ -193,7 +210,8 @@ pub(crate) fn parse_outfix(s: &str, n: usize, k: usize) -> Result<OutfixSpec, St
             } else if wp < m - k {
                 // W middle position wp, which is index (wp - k) within
                 // the middle range [k, m-k).
-                if i != suf_len - 1 {  // last digit has no W anyway
+                if i != suf_len - 1 {
+                    // last digit has no W anyway
                     w_middle_pins.push((wp - k, polarity_val(d & 1)));
                 }
             }
@@ -224,13 +242,15 @@ pub(crate) fn parse_outfix(s: &str, n: usize, k: usize) -> Result<OutfixSpec, St
     }
 
     Ok(OutfixSpec {
-        z_bits, w_bits,
+        z_bits,
+        w_bits,
         xy_bits: Some((x_bits, y_bits)),
-        z_middle_pins, w_middle_pins,
-        x_middle_pins, y_middle_pins,
+        z_middle_pins,
+        w_middle_pins,
+        x_middle_pins,
+        y_middle_pins,
     })
 }
-
 
 #[derive(Clone, Debug)]
 pub(crate) struct SearchConfig {
@@ -306,8 +326,11 @@ pub(crate) struct SearchConfig {
     /// is a no-op. Enabled via `--conj-tuple` (see
     /// conjectures/positive-tuple.md).
     pub(crate) conj_tuple: bool,
+    /// Hidden migration toggle for the unified search framework.
+    /// `legacy` keeps the existing direct pipeline; `new` routes selected
+    /// modes through `search_framework::engine`.
+    pub(crate) engine: EngineKind,
 }
-
 
 /// Which (Z, W) candidate producer feeds the shared XY SAT stage.
 ///
@@ -336,6 +359,11 @@ pub(crate) enum WzMode {
     Sync,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EngineKind {
+    Legacy,
+    New,
+}
 
 impl Default for SearchConfig {
     fn default() -> Self {
@@ -365,10 +393,10 @@ impl Default for SearchConfig {
             conj_xy_product: false,
             conj_zw_bound: false,
             conj_tuple: false,
+            engine: EngineKind::Legacy,
         }
     }
 }
-
 
 impl SearchConfig {
     /// Resolve the effective `WzMode`: explicit `--wz` (or a legacy
@@ -388,11 +416,17 @@ impl SearchConfig {
             let default_k = self.mdd_k == SearchConfig::default().mdd_k;
             let try_k = if default_k { 5 } else { self.mdd_k };
             let max_k = try_k.min((self.problem.n - 1) / 2);
-            let has_mdd = (1..=max_k).rev().any(|k| std::path::Path::new(&format!("mdd-{}.bin", k)).exists());
+            let has_mdd = (1..=max_k)
+                .rev()
+                .any(|k| std::path::Path::new(&format!("mdd-{}.bin", k)).exists());
             if has_mdd {
                 self.wz_mode = Some(WzMode::Together);
-                if default_k { self.mdd_k = 5; }
-                if self.mdd_extend == 0 { self.mdd_extend = 1; }
+                if default_k {
+                    self.mdd_k = 5;
+                }
+                if self.mdd_extend == 0 {
+                    self.mdd_extend = 1;
+                }
             }
         }
         let mode = self.effective_wz_mode();
@@ -420,35 +454,60 @@ impl SearchConfig {
             };
             parts.push(format!("--wz={label}"));
         }
-        if let Some(k) = mdd_k { parts.push(format!("--mdd-k={k}")); }
+        if let Some(k) = mdd_k {
+            parts.push(format!("--mdd-k={k}"));
+        }
         parts.push(format!("--mdd-extend={}", self.mdd_extend));
         parts.push(format!("--theta={}", self.theta_samples));
         parts.push(format!("--max-z={}", self.max_z));
         parts.push(format!("--max-w={}", self.max_w));
-        if let Some(s) = self.max_spectral { parts.push(format!("--max-spectral={s}")); }
+        if let Some(s) = self.max_spectral {
+            parts.push(format!("--max-spectral={s}"));
+        }
         parts.push(format!("--conflict-limit={}", self.conflict_limit));
-        if self.sat_secs > 0 { parts.push(format!("--sat-secs={}", self.sat_secs)); }
+        if self.sat_secs > 0 {
+            parts.push(format!("--sat-secs={}", self.sat_secs));
+        }
         parts.push(format!("--quad-pb={}", self.quad_pb));
-        if self.sat_config.ema_restarts { parts.push("--ema-restarts".into()); }
-        if self.sat_config.probing { parts.push("--probing".into()); }
-        if self.sat_config.rephasing { parts.push("--rephasing".into()); }
-        if self.sat_config.xor_propagation { parts.push("--xor-propagation".into()); }
+        if self.sat_config.ema_restarts {
+            parts.push("--ema-restarts".into());
+        }
+        if self.sat_config.probing {
+            parts.push("--probing".into());
+        }
+        if self.sat_config.rephasing {
+            parts.push("--rephasing".into());
+        }
+        if self.sat_config.xor_propagation {
+            parts.push("--xor-propagation".into());
+        }
         if self.stochastic {
             parts.push("--stochastic".into());
             if self.stochastic_seconds > 0 {
                 parts.push(format!("--stochastic-secs={}", self.stochastic_seconds));
             }
         }
-        if self.benchmark_repeats > 0 { parts.push(format!("--benchmark={}", self.benchmark_repeats)); }
-        if let Some(t) = self.test_tuple.as_ref() { parts.push(format!("--tuple={t}")); }
-        if let Some(p) = self.phase_only.as_ref() { parts.push(format!("--{p}")); }
-        if let Some(d) = self.dump_dimacs.as_ref() { parts.push(format!("--dump-dimacs={d}")); }
-        let threads = std::env::var("TURYN_THREADS").ok()
+        if self.benchmark_repeats > 0 {
+            parts.push(format!("--benchmark={}", self.benchmark_repeats));
+        }
+        if let Some(t) = self.test_tuple.as_ref() {
+            parts.push(format!("--tuple={t}"));
+        }
+        if let Some(p) = self.phase_only.as_ref() {
+            parts.push(format!("--{p}"));
+        }
+        if let Some(d) = self.dump_dimacs.as_ref() {
+            parts.push(format!("--dump-dimacs={d}"));
+        }
+        if self.engine == EngineKind::New {
+            parts.push("--engine=new".into());
+        }
+        let threads = std::env::var("TURYN_THREADS")
+            .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or_else(num_cpus_or_one);
         format!("turyn settings: {}  (threads={threads})", parts.join(" "))
     }
-
 }
 
 /// Best-effort parallelism count: prefer `RAYON_NUM_THREADS`, then
@@ -456,8 +515,11 @@ impl SearchConfig {
 /// count rayon spawns by default.
 pub(crate) fn num_cpus_or_one() -> usize {
     if let Ok(v) = std::env::var("RAYON_NUM_THREADS") {
-        if let Ok(n) = v.parse() { return n; }
+        if let Ok(n) = v.parse() {
+            return n;
+        }
     }
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
-

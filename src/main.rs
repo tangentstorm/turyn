@@ -34,6 +34,14 @@ use crate::config::*;
 use crate::enumerate::*;
 use crate::legacy_search::*;
 use crate::mdd_pipeline::*;
+#[cfg(feature = "search-framework")]
+use crate::search_framework::engine::{EngineConfig, SearchEngine, SearchModeAdapter};
+#[cfg(feature = "search-framework")]
+use crate::search_framework::events::SearchEvent;
+#[cfg(feature = "search-framework")]
+use crate::search_framework::mode_adapters::apart_together::{ApartTogetherAdapter, TuplePayload};
+#[cfg(feature = "search-framework")]
+use crate::search_framework::queue::GoldThenWork;
 use crate::spectrum::*;
 use crate::stochastic::*;
 use crate::types::*;
@@ -60,12 +68,18 @@ fn print_help() {
     eprintln!();
     eprintln!("Verb-first CLI:");
     eprintln!("  turyn help                          Show this help");
-    eprintln!("  turyn search [OPTIONS]              SAT/MDD/conjecture exhaustive search (tracks TTC)");
-    eprintln!("  turyn guess [OPTIONS]               Non-exhaustive guess mode (currently stochastic)");
+    eprintln!(
+        "  turyn search [OPTIONS]              SAT/MDD/conjecture exhaustive search (tracks TTC)"
+    );
+    eprintln!(
+        "  turyn guess [OPTIONS]               Non-exhaustive guess mode (currently stochastic)"
+    );
     eprintln!("  turyn verify [SEQ_OR_OPTIONS]       Verify one candidate");
     eprintln!("  turyn tuples --n=<N>                Print Phase-A tuple shells");
     eprintln!("  turyn dump --n=<N> --dump-dimacs=<PATH> [search options]");
-    eprintln!("  turyn list --n=<N>                  Print known TT(n) entries from known_solutions.txt");
+    eprintln!(
+        "  turyn list --n=<N>                  Print known TT(n) entries from known_solutions.txt"
+    );
     eprintln!();
     eprintln!("Legacy compatibility: `turyn --n=... [OPTIONS]` still maps to `turyn search ...`.");
     eprintln!();
@@ -84,7 +98,9 @@ fn print_help() {
     eprintln!("  --wz=sync                Synchronized 4-seq heuristic walker. Bouncing-order MDD");
     eprintln!("                           built on the fly (no mdd-k.bin needed). Scores 16-way");
     eprintln!("                           levels by running autocorrelation pressure. Persistent");
-    eprintln!("                           SAT solver enforces full BDKR (i)–(vi). See sync_walker.");
+    eprintln!(
+        "                           SAT solver enforces full BDKR (i)–(vi). See sync_walker."
+    );
     eprintln!("  --stochastic             Stochastic local search over all four sequences");
     eprintln!("  --stochastic-secs=<S>    Stochastic guess/search cutoff in seconds (default: 10)");
     eprintln!();
@@ -112,7 +128,9 @@ fn print_help() {
     eprintln!("                           Implies X·Y=2. See conjectures/xy-product.md.");
     eprintln!("  --conj-zw-bound          ZW high-lag U-bound tightness: enforce equality");
     eprintln!("                           |N_Z(s)+N_W(s)| = ((n-s) + N_U(s))/2 at");
-    eprintln!("                           s in {{n-1, n-2, n-3}}. See conjectures/zw-u-bound-tight.md.");
+    eprintln!(
+        "                           s in {{n-1, n-2, n-3}}. See conjectures/zw-u-bound-tight.md."
+    );
     eprintln!("  --conj-tuple             Auto-pick the single sum-tuple with the smallest");
     eprintln!("                           search space (min binomial product) and restrict");
     eprintln!("                           search to it, like --tuple= but automatic.");
@@ -141,17 +159,22 @@ fn print_help() {
     eprintln!("  -h, --help               Show this help message");
     eprintln!();
     eprintln!("EXAMPLES:");
-    eprintln!("  turyn search --n=26                           # auto-selects --wz=together if MDD exists");
+    eprintln!(
+        "  turyn search --n=26                           # auto-selects --wz=together if MDD exists"
+    );
     eprintln!("  turyn search --n=26 --wz=cross                # force brute-force Z×W mode");
-    eprintln!("  turyn search --n=26 --wz=apart --mdd-k=7      # MDD boundary walker, SolveW→SolveZ");
-    eprintln!("  turyn search --n=26 --wz=together --mdd-k=7   # MDD boundary walker, combined W+Z SAT");
+    eprintln!(
+        "  turyn search --n=26 --wz=apart --mdd-k=7      # MDD boundary walker, SolveW→SolveZ"
+    );
+    eprintln!(
+        "  turyn search --n=26 --wz=together --mdd-k=7   # MDD boundary walker, combined W+Z SAT"
+    );
     eprintln!("  turyn guess --n=26 --stochastic-secs=10       # stochastic non-exhaustive guess");
     eprintln!("  turyn tuples --n=26                           # print tuple shells");
     eprintln!("  turyn verify ++--+-,+-+-++,+++-,+-+-          # verify a candidate solution");
     eprintln!("  turyn dump --n=26 --dump-dimacs=tt26.cnf      # write CNF instead of searching");
     eprintln!("  turyn list --n=26                             # show known TT(26) entries");
 }
-
 
 fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
     for arg in args {
@@ -182,8 +205,12 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
         } else if let Some(v) = arg.strip_prefix("--verify=") {
             let parts: Vec<&str> = v.split(',').collect();
             if parts.len() == 4 {
-                cfg.verify_seqs = Some([parts[0].to_string(), parts[1].to_string(),
-                                        parts[2].to_string(), parts[3].to_string()]);
+                cfg.verify_seqs = Some([
+                    parts[0].to_string(),
+                    parts[1].to_string(),
+                    parts[2].to_string(),
+                    parts[3].to_string(),
+                ]);
             }
         } else if let Some(v) = arg.strip_prefix("--test-zw=") {
             let parts: Vec<&str> = v.split(',').collect();
@@ -204,12 +231,26 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
             cfg.sat_config.xor_propagation = true;
         } else if arg == "--no-xor" {
             cfg.sat_config.xor_propagation = false;
+        } else if let Some(v) = arg.strip_prefix("--engine=") {
+            cfg.engine = match v {
+                "legacy" => EngineKind::Legacy,
+                "new" => EngineKind::New,
+                _ => {
+                    eprintln!("error: --engine must be one of legacy|new (got '{}')", v);
+                    std::process::exit(1);
+                }
+            };
         } else if arg == "--phase-a" || arg == "--phase-b" {
             cfg.phase_only = Some(arg[2..].to_string());
         } else if let Some(v) = arg.strip_prefix("--tuple=") {
             let parts: Vec<i32> = v.split(',').filter_map(|s| s.parse().ok()).collect();
             if parts.len() == 4 {
-                cfg.test_tuple = Some(SumTuple { x: parts[0], y: parts[1], z: parts[2], w: parts[3] });
+                cfg.test_tuple = Some(SumTuple {
+                    x: parts[0],
+                    y: parts[1],
+                    z: parts[2],
+                    w: parts[3],
+                });
             }
         } else if let Some(v) = arg.strip_prefix("--outfix=") {
             if cfg.problem.n == 0 {
@@ -218,7 +259,10 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
             }
             cfg.test_outfix = match parse_outfix(v, cfg.problem.n, cfg.mdd_k) {
                 Ok(spec) => Some(spec),
-                Err(e) => { eprintln!("error: {e}"); std::process::exit(2); }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
             };
         } else if arg == "--quad-pb" {
             cfg.quad_pb = true;
@@ -226,7 +270,9 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
             cfg.quad_pb = false;
         } else if arg == "--wz-together" {
             cfg.wz_together = true;
-            if cfg.wz_mode.is_none() { cfg.wz_mode = Some(WzMode::Together); }
+            if cfg.wz_mode.is_none() {
+                cfg.wz_mode = Some(WzMode::Together);
+            }
         } else if let Some(v) = arg.strip_prefix("--wz=") {
             let mode = match v {
                 "cross" => WzMode::Cross,
@@ -234,7 +280,10 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
                 "apart" => WzMode::Apart,
                 "sync" => WzMode::Sync,
                 _ => {
-                    eprintln!("error: --wz must be one of cross|together|apart|sync (got '{}')\n", v);
+                    eprintln!(
+                        "error: --wz must be one of cross|together|apart|sync (got '{}')\n",
+                        v
+                    );
                     print_help();
                     std::process::exit(1);
                 }
@@ -243,10 +292,14 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
             cfg.wz_together = matches!(mode, WzMode::Together);
         } else if let Some(v) = arg.strip_prefix("--mdd-k=") {
             cfg.mdd_k = v.parse().unwrap_or(8);
-            if cfg.wz_mode.is_none() { cfg.wz_mode = Some(WzMode::Apart); }
+            if cfg.wz_mode.is_none() {
+                cfg.wz_mode = Some(WzMode::Apart);
+            }
         } else if let Some(v) = arg.strip_prefix("--mdd-extend=") {
             cfg.mdd_extend = v.parse().unwrap_or(0);
-            if cfg.wz_mode.is_none() { cfg.wz_mode = Some(WzMode::Apart); }
+            if cfg.wz_mode.is_none() {
+                cfg.wz_mode = Some(WzMode::Apart);
+            }
         } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
             cfg.dump_dimacs = Some(v.to_string());
         } else if arg == "--conj-xy-product" {
@@ -267,6 +320,47 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
             std::process::exit(1);
         }
     }
+}
+
+#[cfg(feature = "search-framework")]
+fn run_framework_apart_together(
+    problem: Problem,
+    tuples: Vec<SumTuple>,
+    cfg: &SearchConfig,
+    verbose: bool,
+    k: usize,
+) {
+    let mode_name = match cfg.effective_wz_mode() {
+        WzMode::Apart => "apart",
+        WzMode::Together => "together",
+        _ => "unknown",
+    };
+    let adapter = ApartTogetherAdapter {
+        problem,
+        tuples: std::sync::Arc::new(tuples),
+        cfg: std::sync::Arc::new(cfg.clone()),
+        k,
+        verbose,
+        mode_name,
+    };
+    let mut engine =
+        SearchEngine::<TuplePayload>::new(EngineConfig::default(), Box::new(GoldThenWork::new(32)));
+    engine.run(&adapter, |event| match event {
+        SearchEvent::Progress(p) => {
+            if verbose {
+                eprintln!(
+                    "[framework:{}] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}",
+                    mode_name, p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc
+                );
+            }
+        }
+        SearchEvent::Finished(p) => {
+            println!(
+                "Framework search (--wz={}): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?}",
+                mode_name, p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc
+            );
+        }
+    });
 }
 
 fn parse_args() -> (CliVerb, SearchConfig) {
@@ -305,7 +399,12 @@ fn parse_args() -> (CliVerb, SearchConfig) {
             if args.len() == 1 && !args[0].starts_with("--") {
                 let parts: Vec<&str> = args[0].split(',').collect();
                 if parts.len() == 4 {
-                    cfg.verify_seqs = Some([parts[0].to_string(), parts[1].to_string(), parts[2].to_string(), parts[3].to_string()]);
+                    cfg.verify_seqs = Some([
+                        parts[0].to_string(),
+                        parts[1].to_string(),
+                        parts[2].to_string(),
+                        parts[3].to_string(),
+                    ]);
                 } else {
                     eprintln!("error: verify expects one comma-separated X,Y,Z,W payload");
                     std::process::exit(1);
@@ -341,7 +440,11 @@ fn parse_args() -> (CliVerb, SearchConfig) {
         return (verb, cfg);
     }
     // --n is required unless verify/test-zw provide their own sequences
-    if cfg.problem.n == 0 && cfg.verify_seqs.is_none() && cfg.test_zw.is_none() && verb != CliVerb::Verify {
+    if cfg.problem.n == 0
+        && cfg.verify_seqs.is_none()
+        && cfg.test_zw.is_none()
+        && verb != CliVerb::Verify
+    {
         eprintln!("error: --n=<N> is required\n");
         print_help();
         std::process::exit(1);
@@ -361,16 +464,19 @@ fn parse_args() -> (CliVerb, SearchConfig) {
         if let Some(t) = pick_fewest_candidate_tuple(cfg.problem) {
             eprintln!(
                 "  --conj-tuple: auto-selected tuple {} (log2 space ≈ {:.2})",
-                t, candidate_log2_score(cfg.problem, &t),
+                t,
+                candidate_log2_score(cfg.problem, &t),
             );
             cfg.test_tuple = Some(t);
         } else {
-            eprintln!("warning: --conj-tuple found no valid sum-tuples for n={}", cfg.problem.n);
+            eprintln!(
+                "warning: --conj-tuple found no valid sum-tuples for n={}",
+                cfg.problem.n
+            );
         }
     }
     (verb, cfg)
 }
-
 
 /// log2 of `C(n, (n+|σ_X|)/2) * C(n, (n+|σ_Y|)/2) * C(n, (n+|σ_Z|)/2)
 ///        * C(n-1, (n-1+|σ_W|)/2)`.  Used as the `--conj-tuple`
@@ -379,9 +485,13 @@ fn parse_args() -> (CliVerb, SearchConfig) {
 fn candidate_log2_score(p: Problem, t: &SumTuple) -> f64 {
     fn lb(n: i32, sigma: i32) -> f64 {
         // log2 C(n, (n+sigma)/2).  Infeasible parity ⇒ +∞ penalty.
-        if (n + sigma).rem_euclid(2) != 0 { return f64::INFINITY; }
+        if (n + sigma).rem_euclid(2) != 0 {
+            return f64::INFINITY;
+        }
         let k = (n + sigma) / 2;
-        if k < 0 || k > n { return f64::INFINITY; }
+        if k < 0 || k > n {
+            return f64::INFINITY;
+        }
         // log2(n!) - log2(k!) - log2((n-k)!) via lgamma.
         let num = lgamma(n as f64 + 1.0);
         let den = lgamma(k as f64 + 1.0) + lgamma((n - k) as f64 + 1.0);
@@ -392,7 +502,6 @@ fn candidate_log2_score(p: Problem, t: &SumTuple) -> f64 {
         + lb(p.n as i32, t.z.abs())
         + lb(p.m() as i32, t.w.abs())
 }
-
 
 /// Natural log of the Gamma function (Lanczos approximation, standard
 /// form).  Sufficient precision for comparing binomial-product scores.
@@ -422,7 +531,6 @@ fn lgamma(x: f64) -> f64 {
     0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
 }
 
-
 fn pick_fewest_candidate_tuple(p: Problem) -> Option<SumTuple> {
     let tuples = phase_a_tuples(p, None);
     tuples.into_iter().min_by(|a, b| {
@@ -432,24 +540,28 @@ fn pick_fewest_candidate_tuple(p: Problem) -> Option<SumTuple> {
     })
 }
 
-
 /// Parse a +/- string into a PackedSeq. '+' = +1, '-' = -1.
 fn parse_seq(s: &str) -> PackedSeq {
     let vals: Vec<i8> = s.chars().map(|c| if c == '+' { 1 } else { -1 }).collect();
     PackedSeq::from_values(&vals)
 }
 
-
 fn run_info() -> String {
     let hostname = std::process::Command::new("hostname")
-        .output().ok()
+        .output()
+        .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default().trim().to_string();
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let git_hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
-        .output().ok()
+        .output()
+        .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default().trim().to_string();
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     format!("host={}, commit={}", hostname, git_hash)
 }
 
@@ -464,12 +576,20 @@ fn list_known_solutions(n_filter: Option<usize>) {
     let mut matched = 0usize;
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 { continue; }
-        let Ok(n) = parts[0].parse::<usize>() else { continue; };
+        if parts.len() < 5 {
+            continue;
+        }
+        let Ok(n) = parts[0].parse::<usize>() else {
+            continue;
+        };
         if let Some(want) = n_filter {
-            if n != want { continue; }
+            if n != want {
+                continue;
+            }
         }
         let x = parts[1];
         let y = parts[2];
@@ -491,7 +611,6 @@ fn list_known_solutions(n_filter: Option<usize>) {
         }
     }
 }
-
 
 fn main() {
     let (verb, mut cfg) = parse_args();
@@ -517,10 +636,13 @@ fn main() {
     } else {
         None
     };
-    println!("{}", cfg.settings_line(
-        resolved_mode_k.map(|(m, _)| m),
-        resolved_mode_k.map(|(_, k)| k),
-    ));
+    println!(
+        "{}",
+        cfg.settings_line(
+            resolved_mode_k.map(|(m, _)| m),
+            resolved_mode_k.map(|(_, k)| k),
+        )
+    );
     let cfg = cfg;
     if verb == CliVerb::List {
         list_known_solutions(Some(cfg.problem.n));
@@ -536,7 +658,9 @@ fn main() {
         print_solution(&format!("Verifying TT({})", n), &x, &y, &z, &w);
         let ok = verify_tt(p, &x, &y, &z, &w);
         println!("Verified: {}", ok);
-        if !ok { std::process::exit(1); }
+        if !ok {
+            std::process::exit(1);
+        }
         return;
     }
     if let Some(ref zw) = cfg.test_zw {
@@ -551,15 +675,43 @@ fn main() {
         // Try all sum tuples that match this Z/W
         let mut tuples = phase_a_tuples(p, cfg.test_tuple.as_ref());
         tuples.retain(|t| t.z == zs && t.w == ws);
-        println!("TT({}): testing Z(sum={}) W(sum={}) against {} tuples", n, zs, ws, tuples.len());
-        print_solution("  Z/W", &PackedSeq::from_values(&[0]), &PackedSeq::from_values(&[0]), &z, &w);
+        println!(
+            "TT({}): testing Z(sum={}) W(sum={}) against {} tuples",
+            n,
+            zs,
+            ws,
+            tuples.len()
+        );
+        print_solution(
+            "  Z/W",
+            &PackedSeq::from_values(&[0]),
+            &PackedSeq::from_values(&[0]),
+            &z,
+            &w,
+        );
         for tuple in &tuples {
             let start = Instant::now();
-            let Some(template) = SatXYTemplate::build(p, *tuple, &radical::SolverConfig::default()) else { continue };
+            let Some(template) = SatXYTemplate::build(p, *tuple, &radical::SolverConfig::default())
+            else {
+                continue;
+            };
             if let Some((x, y)) = template.solve_for(&candidate) {
                 let ok = verify_tt(p, &x, &y, &z, &w);
-                print_solution(&format!("FOUND for tuple {} ({:.3?}, verified={})", tuple, start.elapsed(), ok), &x, &y, &z, &w);
-                if ok { return; }
+                print_solution(
+                    &format!(
+                        "FOUND for tuple {} ({:.3?}, verified={})",
+                        tuple,
+                        start.elapsed(),
+                        ok
+                    ),
+                    &x,
+                    &y,
+                    &z,
+                    &w,
+                );
+                if ok {
+                    return;
+                }
             } else {
                 println!("  Tuple {}: UNSAT ({:.3?})", tuple, start.elapsed());
             }
@@ -571,14 +723,26 @@ fn main() {
         let problem = cfg.problem;
         let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
         // Heuristic tuple ordering: try small |z|+|w| first (cheap Phase B),
-    // break ties by small |x-y| (solutions often have x≈y).
-    tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
+        // break ties by small |x-y| (solutions often have x≈y).
+        tuples.sort_by_key(|t| {
+            (
+                t.z.abs() + t.w.abs(),
+                (t.x - t.y).abs(),
+                t.x.abs() + t.y.abs(),
+            )
+        });
 
         if phase == "phase-a" {
-            eprintln!("TT({}): {} tuples (x,y,z,w) satisfying x²+y²+2z²+2w²={}",
-                problem.n, tuples.len(), problem.target_energy());
+            eprintln!(
+                "TT({}): {} tuples (x,y,z,w) satisfying x²+y²+2z²+2w²={}",
+                problem.n,
+                tuples.len(),
+                problem.target_energy()
+            );
             print_search_space(problem, &tuples);
-        } else if phase == "phase-b" && matches!(cfg.effective_wz_mode(), WzMode::Apart | WzMode::Together) {
+        } else if phase == "phase-b"
+            && matches!(cfg.effective_wz_mode(), WzMode::Apart | WzMode::Together)
+        {
             // MDD-based Phase B:
             // 1. Generate ONE W at a time (boundary from MDD + middle enumerated, spectral filtered)
             // 2. For each valid W + each compatible z_boundary: SAT solve for z_middle
@@ -588,7 +752,10 @@ fn main() {
             let mdd_k = cfg.mdd_k.min((problem.n - 1) / 2).min(problem.m() / 2);
             let reordered = match load_best_mdd(mdd_k, true) {
                 Some(m) => m,
-                None => { eprintln!("No MDD file found. Run: target/release/gen_mdd {}", mdd_k); return; }
+                None => {
+                    eprintln!("No MDD file found. Run: target/release/gen_mdd {}", mdd_k);
+                    return;
+                }
             };
             let k = reordered.k;
             let n = problem.n;
@@ -599,7 +766,10 @@ fn main() {
             let zw_depth = 2 * k;
             let pos_order: Vec<usize> = {
                 let mut v = Vec::with_capacity(2 * k);
-                for t in 0..k { v.push(t); v.push(2 * k - 1 - t); }
+                for t in 0..k {
+                    v.push(t);
+                    v.push(2 * k - 1 - t);
+                }
                 v
             };
 
@@ -653,19 +823,29 @@ fn main() {
 
                 for (ti, tuple) in state.tuples.iter().enumerate() {
                     let z_mid_sum = tuple.z - z_bnd_sum;
-                    if z_mid_sum.abs() > middle_n as i32 || (z_mid_sum + middle_n as i32) % 2 != 0 { continue; }
+                    if z_mid_sum.abs() > middle_n as i32 || (z_mid_sum + middle_n as i32) % 2 != 0 {
+                        continue;
+                    }
                     let w_mid_sum = tuple.w - w_bnd_sum;
-                    if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 { continue; }
+                    if w_mid_sum.abs() > middle_m as i32 || (w_mid_sum + middle_m as i32) % 2 != 0 {
+                        continue;
+                    }
 
                     let (w_prefix, w_suffix) = expand_boundary_bits(w_bits, k);
                     let (z_prefix, z_suffix) = expand_boundary_bits(z_bits, k);
 
                     let mut z_boundary = vec![0i8; n];
-                    for i in 0..k { z_boundary[i] = z_prefix[i]; z_boundary[n - k + i] = z_suffix[i]; }
+                    for i in 0..k {
+                        z_boundary[i] = z_prefix[i];
+                        z_boundary[n - k + i] = z_suffix[i];
+                    }
 
                     // SAT-based W middle generation with autocorrelation constraints
                     let mut w_boundary = vec![0i8; m];
-                    for i in 0..k { w_boundary[i] = w_prefix[i]; w_boundary[m - k + i] = w_suffix[i]; }
+                    for i in 0..k {
+                        w_boundary[i] = w_prefix[i];
+                        w_boundary[m - k + i] = w_suffix[i];
+                    }
                     let w_tmpl_local = sat_z_middle::LagTemplate::new(m, k);
                     let mut w_solver = w_tmpl_local.build_base_solver(middle_m, w_mid_sum);
                     sat_z_middle::fill_w_solver(&mut w_solver, &w_tmpl_local, m, &w_boundary);
@@ -675,7 +855,8 @@ fn main() {
                     let mut w_passing = 0usize;
 
                     // Simple PRNG for phase randomization
-                    let mut rng_state: u64 = (z_bits as u64) ^ ((w_bits as u64) << 32) ^ 0x517cc1b727220a95;
+                    let mut rng_state: u64 =
+                        (z_bits as u64) ^ ((w_bits as u64) << 32) ^ 0x517cc1b727220a95;
                     let mut next_rng = || -> u64 {
                         rng_state ^= rng_state << 13;
                         rng_state ^= rng_state >> 7;
@@ -684,14 +865,20 @@ fn main() {
                     };
 
                     loop {
-                        if w_passing >= state.max_w_passing { break; }
+                        if w_passing >= state.max_w_passing {
+                            break;
+                        }
 
                         // Randomize phases for diversity
-                        let phases: Vec<bool> = (0..middle_m).map(|i| (next_rng() >> (i % 64)) & 1 == 1).collect();
+                        let phases: Vec<bool> = (0..middle_m)
+                            .map(|i| (next_rng() >> (i % 64)) & 1 == 1)
+                            .collect();
                         w_solver.set_phase(&phases);
 
                         let w_result = w_solver.solve();
-                        if w_result != Some(true) { break; }
+                        if w_result != Some(true) {
+                            break;
+                        }
                         *state.grand_w_gen += 1;
 
                         // Extract W middle
@@ -702,18 +889,37 @@ fn main() {
                         w_vals.extend_from_slice(&w_suffix);
 
                         // Block this W
-                        let w_block: Vec<i32> = w_mid_vars.iter().map(|&v| {
-                            if w_solver.value(v) == Some(true) { -v } else { v }
-                        }).collect();
+                        let w_block: Vec<i32> = w_mid_vars
+                            .iter()
+                            .map(|&v| {
+                                if w_solver.value(v) == Some(true) {
+                                    -v
+                                } else {
+                                    v
+                                }
+                            })
+                            .collect();
                         w_solver.add_clause(w_block);
 
-                        let Some(_w_spectrum) = spectrum_if_ok(&w_vals, state.spectral_w, state.individual_bound, &mut fft_buf_w) else { continue; };
+                        let Some(_w_spectrum) = spectrum_if_ok(
+                            &w_vals,
+                            state.spectral_w,
+                            state.individual_bound,
+                            &mut fft_buf_w,
+                        ) else {
+                            continue;
+                        };
                         *state.grand_w_ok += 1;
                         w_passing += 1;
 
                         // For each valid W, immediately run Z SAT solver
                         let mut solver = sat_z_middle::build_z_middle_solver(
-                            n, m, k, &z_boundary, &w_vals, z_mid_sum,
+                            n,
+                            m,
+                            k,
+                            &z_boundary,
+                            &w_vals,
+                            z_mid_sum,
                         );
 
                         loop {
@@ -727,21 +933,32 @@ fn main() {
 
                             let mut z_vals = z_boundary.clone();
                             for i in 0..middle_n {
-                                z_vals[k + i] = if solver.value(z_mid_vars[i]) == Some(true) { 1 } else { -1 };
+                                z_vals[k + i] = if solver.value(z_mid_vars[i]) == Some(true) {
+                                    1
+                                } else {
+                                    -1
+                                };
                             }
 
                             state.tuple_pairs[ti] += 1;
                             *state.grand_total_pairs += 1;
 
-                            let block: Vec<i32> = z_mid_vars.iter().map(|&v| {
-                                if solver.value(v) == Some(true) { -v } else { v }
-                            }).collect();
+                            let block: Vec<i32> = z_mid_vars
+                                .iter()
+                                .map(|&v| if solver.value(v) == Some(true) { -v } else { v })
+                                .collect();
                             solver.add_clause(block);
                         }
 
                         if w_passing % 100 == 0 && w_passing > 0 {
-                            eprint!("\r  w_ok: {}, sat: {}/{}/{}, pairs: {}",
-                                state.grand_w_ok, state.sat_solutions, state.sat_unsats, state.sat_calls, state.grand_total_pairs);
+                            eprint!(
+                                "\r  w_ok: {}, sat: {}/{}/{}, pairs: {}",
+                                state.grand_w_ok,
+                                state.sat_solutions,
+                                state.sat_unsats,
+                                state.sat_calls,
+                                state.grand_total_pairs
+                            );
                         }
                     }
                 }
@@ -762,33 +979,69 @@ fn main() {
                     spectral_w: &spectral_w,
                     individual_bound,
                     max_w_passing,
-                    n, m, k, middle_n, middle_m, max_bnd_sum,
+                    n,
+                    m,
+                    k,
+                    middle_n,
+                    middle_m,
+                    max_bnd_sum,
                 };
-                walk_mdd_4way(reordered.root, 0, zw_depth, 0, 0,
-                    &pos_order, &reordered.nodes,
+                walk_mdd_4way(
+                    reordered.root,
+                    0,
+                    zw_depth,
+                    0,
+                    0,
+                    &pos_order,
+                    &reordered.nodes,
                     &mut |z_acc, w_acc, _nid| {
                         process_boundary(z_acc, w_acc, _nid, &mut state);
-                    });
+                    },
+                );
             }
-            eprintln!("{} (z,w) boundaries walked lazily ({:.1?})", total_zw, start.elapsed());
+            eprintln!(
+                "{} (z,w) boundaries walked lazily ({:.1?})",
+                total_zw,
+                start.elapsed()
+            );
             for (i, tuple) in tuples.iter().enumerate() {
-                eprintln!("  {} {} {} {}: pairs={}",
-                    tuple.x, tuple.y, tuple.z, tuple.w, tuple_pairs[i]);
+                eprintln!(
+                    "  {} {} {} {}: pairs={}",
+                    tuple.x, tuple.y, tuple.z, tuple.w, tuple_pairs[i]
+                );
             }
-            eprintln!("\nTotal: {} pairs, w={}/{}, sat_solutions={} sat_calls={} unsat={}",
-                grand_total_pairs, grand_w_ok, grand_w_gen, sat_solutions, sat_calls, sat_unsats);
+            eprintln!(
+                "\nTotal: {} pairs, w={}/{}, sat_solutions={} sat_calls={} unsat={}",
+                grand_total_pairs, grand_w_ok, grand_w_gen, sat_solutions, sat_calls, sat_unsats
+            );
         } else if phase == "phase-b" {
             let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
             let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
             for tuple in &tuples {
                 let mut stats = SearchStats::default();
                 let start = Instant::now();
-                let candidates = build_zw_candidates(problem, *tuple, &cfg, &spectral_z, &spectral_w, &mut stats, &AtomicBool::new(false));
-                println!("{} {} {} {}: z={}/{} w={}/{} pairs={} ({:.3?})",
-                    tuple.x, tuple.y, tuple.z, tuple.w,
-                    stats.z_spectral_ok, stats.z_generated,
-                    stats.w_spectral_ok, stats.w_generated,
-                    candidates.len(), start.elapsed());
+                let candidates = build_zw_candidates(
+                    problem,
+                    *tuple,
+                    &cfg,
+                    &spectral_z,
+                    &spectral_w,
+                    &mut stats,
+                    &AtomicBool::new(false),
+                );
+                println!(
+                    "{} {} {} {}: z={}/{} w={}/{} pairs={} ({:.3?})",
+                    tuple.x,
+                    tuple.y,
+                    tuple.z,
+                    tuple.w,
+                    stats.z_spectral_ok,
+                    stats.z_generated,
+                    stats.w_spectral_ok,
+                    stats.w_generated,
+                    candidates.len(),
+                    start.elapsed()
+                );
             }
         }
         return;
@@ -798,18 +1051,37 @@ fn main() {
         let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
         tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs()));
         let tuple = tuples[0];
-        println!("Dumping DIMACS for TT({}) tuple {} to {}", problem.n, tuple, path);
+        println!(
+            "Dumping DIMACS for TT({}) tuple {} to {}",
+            problem.n, tuple, path
+        );
         let (_enc, solver) = sat_encode(problem, tuple);
         let mut file = std::fs::File::create(path).expect("failed to create DIMACS file");
-        solver.dump_dimacs(&mut file).expect("failed to write DIMACS");
-        println!("Wrote {} vars, {} clauses", solver.num_vars(), solver.num_clauses());
+        solver
+            .dump_dimacs(&mut file)
+            .expect("failed to write DIMACS");
+        println!(
+            "Wrote {} vars, {} clauses",
+            solver.num_vars(),
+            solver.num_clauses()
+        );
         return;
     }
     if cfg.benchmark_repeats > 0 {
         run_benchmark(&cfg);
     } else if cfg.stochastic {
-        let report = stochastic_search(cfg.problem, cfg.test_tuple.as_ref(), true, cfg.stochastic_seconds);
-        println!("Stochastic search: found_solution={}, elapsed={:.3?}\n  {}", report.found_solution, report.elapsed, run_info());
+        let report = stochastic_search(
+            cfg.problem,
+            cfg.test_tuple.as_ref(),
+            true,
+            cfg.stochastic_seconds,
+        );
+        println!(
+            "Stochastic search: found_solution={}, elapsed={:.3?}\n  {}",
+            report.found_solution,
+            report.elapsed,
+            run_info()
+        );
     } else {
         // All three --wz modes funnel through the same unified runner.
         // The runner's monitor thread either enumerates Z × W pairs
@@ -828,10 +1100,27 @@ fn main() {
         let mut tuples = phase_a_tuples(cfg.problem, cfg.test_tuple.as_ref());
         if mode == WzMode::Cross {
             if cfg.problem.n >= 26 {
-                tuples.sort_by_key(|t| ((t.x - t.y).abs(), t.z.abs() + t.w.abs(), t.x.abs() + t.y.abs()));
+                tuples.sort_by_key(|t| {
+                    (
+                        (t.x - t.y).abs(),
+                        t.z.abs() + t.w.abs(),
+                        t.x.abs() + t.y.abs(),
+                    )
+                });
             } else {
-                tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
+                tuples.sort_by_key(|t| {
+                    (
+                        t.z.abs() + t.w.abs(),
+                        (t.x - t.y).abs(),
+                        t.x.abs() + t.y.abs(),
+                    )
+                });
             }
+        }
+        #[cfg(feature = "search-framework")]
+        if cfg.engine == EngineKind::New && matches!(mode, WzMode::Apart | WzMode::Together) {
+            run_framework_apart_together(cfg.problem, tuples, &cfg, true, mdd_k);
+            return;
         }
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, true, mdd_k);
         let label = match mode {
@@ -840,11 +1129,15 @@ fn main() {
             WzMode::Apart => "apart",
             WzMode::Sync => "sync",
         };
-        println!("Unified search (--wz={}): found_solution={}, elapsed={:.3?}\n  {}",
-            label, report.found_solution, report.elapsed, run_info());
+        println!(
+            "Unified search (--wz={}): found_solution={}, elapsed={:.3?}\n  {}",
+            label,
+            report.found_solution,
+            report.elapsed,
+            run_info()
+        );
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -928,10 +1221,14 @@ mod tests {
             conj_xy_product: false,
             conj_zw_bound: false,
             conj_tuple: false,
+            engine: EngineKind::Legacy,
         };
         let tuples = phase_a_tuples(cfg.problem, None);
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, false, cfg.mdd_k);
-        assert!(report.found_solution, "n=4 MDD-walker search should find canonical TT(4)");
+        assert!(
+            report.found_solution,
+            "n=4 MDD-walker search should find canonical TT(4)"
+        );
         assert!(report.elapsed.as_secs_f64() < 10.0, "n=4 should be fast");
     }
 
@@ -966,7 +1263,12 @@ mod tests {
         let ys: i32 = y_vals.iter().map(|&v| v as i32).sum();
         let zs: i32 = z_vals.iter().map(|&v| v as i32).sum();
         let ws: i32 = w_vals.iter().map(|&v| v as i32).sum();
-        let tuple = SumTuple { x: xs, y: ys, z: zs, w: ws };
+        let tuple = SumTuple {
+            x: xs,
+            y: ys,
+            z: zs,
+            w: ws,
+        };
 
         // Test 1: all-free encoding, fix all variables via unit clauses
         let (enc, mut solver) = sat_encode_quad_pb_unified(p, tuple, None, None, None, None)
@@ -974,35 +1276,85 @@ mod tests {
         let n = p.n;
         let m = p.m();
         for i in 0..n {
-            solver.add_clause([if x_vals[i] > 0 { enc.x_var(i) } else { -enc.x_var(i) }]);
-            solver.add_clause([if y_vals[i] > 0 { enc.y_var(i) } else { -enc.y_var(i) }]);
-            solver.add_clause([if z_vals[i] > 0 { enc.z_var(i) } else { -enc.z_var(i) }]);
+            solver.add_clause([if x_vals[i] > 0 {
+                enc.x_var(i)
+            } else {
+                -enc.x_var(i)
+            }]);
+            solver.add_clause([if y_vals[i] > 0 {
+                enc.y_var(i)
+            } else {
+                -enc.y_var(i)
+            }]);
+            solver.add_clause([if z_vals[i] > 0 {
+                enc.z_var(i)
+            } else {
+                -enc.z_var(i)
+            }]);
         }
         for i in 0..m {
-            solver.add_clause([if w_vals[i] > 0 { enc.w_var(i) } else { -enc.w_var(i) }]);
+            solver.add_clause([if w_vals[i] > 0 {
+                enc.w_var(i)
+            } else {
+                -enc.w_var(i)
+            }]);
         }
-        assert_eq!(solver.solve(), Some(true), "All-free quad PB should accept known TT(6)");
+        assert_eq!(
+            solver.solve(),
+            Some(true),
+            "All-free quad PB should accept known TT(6)"
+        );
 
         // Test 2: Z-fixed encoding (simulates --z-sat --quad-pb)
-        let (enc2, mut solver2) = sat_encode_quad_pb_unified(p, tuple, None, None, Some(z_vals), None)
-            .expect("Z-fixed quad PB should be feasible");
+        let (enc2, mut solver2) =
+            sat_encode_quad_pb_unified(p, tuple, None, None, Some(z_vals), None)
+                .expect("Z-fixed quad PB should be feasible");
         for i in 0..n {
-            solver2.add_clause([if x_vals[i] > 0 { enc2.x_var(i) } else { -enc2.x_var(i) }]);
-            solver2.add_clause([if y_vals[i] > 0 { enc2.y_var(i) } else { -enc2.y_var(i) }]);
+            solver2.add_clause([if x_vals[i] > 0 {
+                enc2.x_var(i)
+            } else {
+                -enc2.x_var(i)
+            }]);
+            solver2.add_clause([if y_vals[i] > 0 {
+                enc2.y_var(i)
+            } else {
+                -enc2.y_var(i)
+            }]);
         }
         for i in 0..m {
-            solver2.add_clause([if w_vals[i] > 0 { enc2.w_var(i) } else { -enc2.w_var(i) }]);
+            solver2.add_clause([if w_vals[i] > 0 {
+                enc2.w_var(i)
+            } else {
+                -enc2.w_var(i)
+            }]);
         }
-        assert_eq!(solver2.solve(), Some(true), "Z-fixed quad PB should accept known TT(6)");
+        assert_eq!(
+            solver2.solve(),
+            Some(true),
+            "Z-fixed quad PB should accept known TT(6)"
+        );
 
         // Test 3: Z+W fixed encoding (simulates hybrid --quad-pb)
-        let (enc3, mut solver3) = sat_encode_quad_pb_unified(p, tuple, None, None, Some(z_vals), Some(w_vals))
-            .expect("Z+W fixed quad PB should be feasible");
+        let (enc3, mut solver3) =
+            sat_encode_quad_pb_unified(p, tuple, None, None, Some(z_vals), Some(w_vals))
+                .expect("Z+W fixed quad PB should be feasible");
         for i in 0..n {
-            solver3.add_clause([if x_vals[i] > 0 { enc3.x_var(i) } else { -enc3.x_var(i) }]);
-            solver3.add_clause([if y_vals[i] > 0 { enc3.y_var(i) } else { -enc3.y_var(i) }]);
+            solver3.add_clause([if x_vals[i] > 0 {
+                enc3.x_var(i)
+            } else {
+                -enc3.x_var(i)
+            }]);
+            solver3.add_clause([if y_vals[i] > 0 {
+                enc3.y_var(i)
+            } else {
+                -enc3.y_var(i)
+            }]);
         }
-        assert_eq!(solver3.solve(), Some(true), "Z+W fixed quad PB should accept known TT(6)");
+        assert_eq!(
+            solver3.solve(),
+            Some(true),
+            "Z+W fixed quad PB should accept known TT(6)"
+        );
     }
 
     #[test]
@@ -1016,7 +1368,11 @@ mod tests {
     #[test]
     fn cardinality_encoding_exactly_2_of_4() {
         // Test: exactly 2 of 4 variables must be true
-        let mut enc = SatEncoder { n: 0, next_var: 5, xnor_triples: Vec::new() };
+        let mut enc = SatEncoder {
+            n: 0,
+            next_var: 5,
+            xnor_triples: Vec::new(),
+        };
         let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3, 4];
         enc.encode_cardinality_eq(&mut solver, &lits, 2);
@@ -1029,7 +1385,11 @@ mod tests {
 
     #[test]
     fn cardinality_encoding_exactly_0_of_3() {
-        let mut enc = SatEncoder { n: 0, next_var: 4, xnor_triples: Vec::new() };
+        let mut enc = SatEncoder {
+            n: 0,
+            next_var: 4,
+            xnor_triples: Vec::new(),
+        };
         let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3];
         enc.encode_cardinality_eq(&mut solver, &lits, 0);
@@ -1041,7 +1401,11 @@ mod tests {
 
     #[test]
     fn cardinality_encoding_exactly_3_of_3() {
-        let mut enc = SatEncoder { n: 0, next_var: 4, xnor_triples: Vec::new() };
+        let mut enc = SatEncoder {
+            n: 0,
+            next_var: 4,
+            xnor_triples: Vec::new(),
+        };
         let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3];
         enc.encode_cardinality_eq(&mut solver, &lits, 3);
@@ -1053,7 +1417,11 @@ mod tests {
 
     #[test]
     fn xnor_encoding_correct() {
-        let mut enc = SatEncoder { n: 0, next_var: 3, xnor_triples: Vec::new() };
+        let mut enc = SatEncoder {
+            n: 0,
+            next_var: 3,
+            xnor_triples: Vec::new(),
+        };
         let mut solver: radical::Solver = Default::default();
         // a=1, b=2, test all 4 combos
         let aux = enc.encode_xnor(&mut solver, 1, 2);
@@ -1076,24 +1444,36 @@ mod tests {
         // For each (a, b) ∈ {T, F}², check that the forced aux value matches a==b.
         for (a_val, b_val) in [(true, true), (true, false), (false, true), (false, false)] {
             let mut solver: radical::Solver = Default::default();
-            let a = 1i32; let b = 2i32; let aux = 3i32;
+            let a = 1i32;
+            let b = 2i32;
+            let aux = 3i32;
             // encode_xnor_agree uses variables 1, 2, 3 — add a noop clause first
             // to ensure var 3 exists in the solver's var range.
             solver.add_clause([aux, -aux]);
             encode_xnor_agree(&mut solver, aux, a, b);
             solver.add_clause([if a_val { a } else { -a }]);
             solver.add_clause([if b_val { b } else { -b }]);
-            assert_eq!(solver.solve(), Some(true),
-                "encode_xnor_agree UNSAT when pinning a={a_val} b={b_val}");
+            assert_eq!(
+                solver.solve(),
+                Some(true),
+                "encode_xnor_agree UNSAT when pinning a={a_val} b={b_val}"
+            );
             let expected = a_val == b_val;
-            assert_eq!(solver.value(aux), Some(expected),
-                "aux should be {expected} when a={a_val} b={b_val}");
+            assert_eq!(
+                solver.value(aux),
+                Some(expected),
+                "aux should be {expected} when a={a_val} b={b_val}"
+            );
         }
     }
 
     #[test]
     fn build_counter_exactly_2_of_3() {
-        let mut enc = SatEncoder { n: 0, next_var: 4, xnor_triples: Vec::new() };
+        let mut enc = SatEncoder {
+            n: 0,
+            next_var: 4,
+            xnor_triples: Vec::new(),
+        };
         let mut solver: radical::Solver = Default::default();
         let lits = vec![1, 2, 3];
         let ctr = enc.build_counter(&mut solver, &lits);
@@ -1121,7 +1501,10 @@ mod tests {
         };
         let tuples = phase_a_tuples(cfg.problem, None);
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, false, cfg.mdd_k);
-        assert!(report.found_solution, "MDD-walker search should find canonical TT(6)");
+        assert!(
+            report.found_solution,
+            "MDD-walker search should find canonical TT(6)"
+        );
     }
 
     #[test]
@@ -1136,17 +1519,33 @@ mod tests {
         // Z =: '+++-+-++++--+-+++-+++--++-++++---+--'  sum 8
         // W =: '+++-+---+------++-++++--++-+-++++-+'   sum 3
         let p = Problem::new(36);
-        let x = PackedSeq::from_values(&[1,1,1,-1,1,-1,1,1,-1,-1,-1,-1,-1,1,1,1,-1,-1,1,1,-1,-1,1,-1,1,1,1,-1,1,-1,-1,1,-1,-1,1,1]);
-        let y = PackedSeq::from_values(&[1,1,1,-1,1,-1,-1,1,-1,1,1,1,-1,-1,-1,1,-1,1,1,-1,1,-1,1,1,1,1,1,1,-1,-1,1,-1,1,1,-1,1]);
-        let z = PackedSeq::from_values(&[1,1,1,-1,1,-1,1,1,1,1,-1,-1,1,-1,1,1,1,-1,1,1,1,-1,-1,1,1,-1,1,1,1,1,-1,-1,-1,1,-1,-1]);
-        let w = PackedSeq::from_values(&[1,1,1,-1,1,-1,-1,-1,1,-1,-1,-1,-1,-1,-1,1,1,-1,1,1,1,1,-1,-1,1,1,-1,1,-1,1,1,1,1,-1,1]);
-        assert!(verify_tt(p, &x, &y, &z, &w), "Canonical TT(36) should verify");
+        let x = PackedSeq::from_values(&[
+            1, 1, 1, -1, 1, -1, 1, 1, -1, -1, -1, -1, -1, 1, 1, 1, -1, -1, 1, 1, -1, -1, 1, -1, 1,
+            1, 1, -1, 1, -1, -1, 1, -1, -1, 1, 1,
+        ]);
+        let y = PackedSeq::from_values(&[
+            1, 1, 1, -1, 1, -1, -1, 1, -1, 1, 1, 1, -1, -1, -1, 1, -1, 1, 1, -1, 1, -1, 1, 1, 1, 1,
+            1, 1, -1, -1, 1, -1, 1, 1, -1, 1,
+        ]);
+        let z = PackedSeq::from_values(&[
+            1, 1, 1, -1, 1, -1, 1, 1, 1, 1, -1, -1, 1, -1, 1, 1, 1, -1, 1, 1, 1, -1, -1, 1, 1, -1,
+            1, 1, 1, 1, -1, -1, -1, 1, -1, -1,
+        ]);
+        let w = PackedSeq::from_values(&[
+            1, 1, 1, -1, 1, -1, -1, -1, 1, -1, -1, -1, -1, -1, -1, 1, 1, -1, 1, 1, 1, 1, -1, -1, 1,
+            1, -1, 1, -1, 1, 1, 1, 1, -1, 1,
+        ]);
+        assert!(
+            verify_tt(p, &x, &y, &z, &w),
+            "Canonical TT(36) should verify"
+        );
         assert_eq!(x.sum(), 2);
         assert_eq!(y.sum(), 8);
         assert_eq!(z.sum(), 8);
         assert_eq!(w.sum(), 3);
         // Sum-squared invariant (6n-2 = 214 at n=36).
-        let ss = x.sum() * x.sum() + y.sum() * y.sum() + 2 * z.sum() * z.sum() + 2 * w.sum() * w.sum();
+        let ss =
+            x.sum() * x.sum() + y.sum() * y.sum() + 2 * z.sum() * z.sum() + 2 * w.sum() * w.sum();
         assert_eq!(ss, 214);
     }
 
@@ -1163,17 +1562,31 @@ mod tests {
         // Z =: '++-----+--++--+-+-++----+-'  sum -6
         // W =: '+++++-+--++-++---+----+-+'   sum  1
         let p = Problem::new(26);
-        let x = PackedSeq::from_values(&[1,1,-1,-1,-1,-1,1,1,-1,-1,-1,-1,-1,1,-1,1,-1,1,-1,-1,1,1,1,-1,-1,1]);
-        let y = PackedSeq::from_values(&[1,-1,1,1,1,1,1,-1,1,-1,1,-1,-1,-1,1,1,1,1,-1,1,1,1,1,-1,-1,1]);
-        let z = PackedSeq::from_values(&[1,1,-1,-1,-1,-1,-1,1,-1,-1,1,1,-1,-1,1,-1,1,-1,1,1,-1,-1,-1,-1,1,-1]);
-        let w = PackedSeq::from_values(&[1,1,1,1,1,-1,1,-1,-1,1,1,-1,1,1,-1,-1,-1,1,-1,-1,-1,-1,1,-1,1]);
-        assert!(verify_tt(p, &x, &y, &z, &w), "Canonical TT(26) should verify the Turyn identity");
+        let x = PackedSeq::from_values(&[
+            1, 1, -1, -1, -1, -1, 1, 1, -1, -1, -1, -1, -1, 1, -1, 1, -1, 1, -1, -1, 1, 1, 1, -1,
+            -1, 1,
+        ]);
+        let y = PackedSeq::from_values(&[
+            1, -1, 1, 1, 1, 1, 1, -1, 1, -1, 1, -1, -1, -1, 1, 1, 1, 1, -1, 1, 1, 1, 1, -1, -1, 1,
+        ]);
+        let z = PackedSeq::from_values(&[
+            1, 1, -1, -1, -1, -1, -1, 1, -1, -1, 1, 1, -1, -1, 1, -1, 1, -1, 1, 1, -1, -1, -1, -1,
+            1, -1,
+        ]);
+        let w = PackedSeq::from_values(&[
+            1, 1, 1, 1, 1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, -1, -1, 1, -1, -1, -1, -1, 1, -1, 1,
+        ]);
+        assert!(
+            verify_tt(p, &x, &y, &z, &w),
+            "Canonical TT(26) should verify the Turyn identity"
+        );
         assert_eq!(x.sum(), -4);
         assert_eq!(y.sum(), 8);
         assert_eq!(z.sum(), -6);
         assert_eq!(w.sum(), 1);
         // Sum-squared invariant (6n-2 = 154 at n=26).
-        let ss = x.sum() * x.sum() + y.sum() * y.sum() + 2 * z.sum() * z.sum() + 2 * w.sum() * w.sum();
+        let ss =
+            x.sum() * x.sum() + y.sum() * y.sum() + 2 * z.sum() * z.sum() + 2 * w.sum() * w.sum();
         assert_eq!(ss, 154);
 
         // Rule (i): x[0]=x[n-1]=y[0]=y[n-1]=z[0]=w[0]=+1.
@@ -1181,8 +1594,11 @@ mod tests {
         let y_v: Vec<i8> = (0..26).map(|i| y.get(i)).collect();
         let z_v: Vec<i8> = (0..26).map(|i| z.get(i)).collect();
         let w_v: Vec<i8> = (0..25).map(|i| w.get(i)).collect();
-        assert_eq!((x_v[0], x_v[25], y_v[0], y_v[25], z_v[0], w_v[0]), (1, 1, 1, 1, 1, 1),
-            "Rule (i): x[0]=x[n-1]=y[0]=y[n-1]=z[0]=w[0]=+1");
+        assert_eq!(
+            (x_v[0], x_v[25], y_v[0], y_v[25], z_v[0], w_v[0]),
+            (1, 1, 1, 1, 1, 1),
+            "Rule (i): x[0]=x[n-1]=y[0]=y[n-1]=z[0]=w[0]=+1"
+        );
     }
 
     #[test]
@@ -1205,15 +1621,16 @@ mod tests {
         // Verified externally; every rule-(i..vi) predicate holds and
         // the Turyn identity vanishes at every lag.
         let p = Problem::new(36);
-        let parse = |s: &str| -> Vec<i8> {
-            s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect()
-        };
+        let parse =
+            |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
         let known_x = parse("+++-+-++-----+++--++--+-+++-+--+--++");
         let known_y = parse("+++-+--+-+++---+-++-+-++++++--+-++-+");
-        let z_vals  = parse("+++-+-++++--+-+++-+++--++-++++---+--");
-        let w_vals  = parse("+++-+---+------++-++++--++-+-++++-+");
-        assert_eq!(known_x[0], 1);    assert_eq!(known_x[35], 1);
-        assert_eq!(known_y[0], 1);    assert_eq!(known_y[35], 1);
+        let z_vals = parse("+++-+-++++--+-+++-+++--++-++++---+--");
+        let w_vals = parse("+++-+---+------++-++++--++-+-++++-+");
+        assert_eq!(known_x[0], 1);
+        assert_eq!(known_x[35], 1);
+        assert_eq!(known_y[0], 1);
+        assert_eq!(known_y[35], 1);
         assert_eq!(z_vals[0], 1);
         assert_eq!(w_vals[0], 1);
         let z = PackedSeq::from_values(&z_vals);
@@ -1235,8 +1652,12 @@ mod tests {
             w: sum_i8(&w_vals),
         };
         // Test 1: can the SAT solver find X/Y from scratch?
-        let template = SatXYTemplate::build(p, tuple, &radical::SolverConfig::default()).expect("template should build");
-        assert!(template.is_feasible(&candidate), "known Z/W should be feasible");
+        let template = SatXYTemplate::build(p, tuple, &radical::SolverConfig::default())
+            .expect("template should build");
+        assert!(
+            template.is_feasible(&candidate),
+            "known Z/W should be feasible"
+        );
 
         // Test 2: hardcode the known X/Y and check consistency
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
@@ -1256,7 +1677,11 @@ mod tests {
             solver.add_clause([if known_y[i] == 1 { y_var(i) } else { -y_var(i) }]);
         }
         let result_hardcoded = solver.solve();
-        assert_eq!(result_hardcoded, Some(true), "known X/Y hardcoded into SAT should be consistent");
+        assert_eq!(
+            result_hardcoded,
+            Some(true),
+            "known X/Y hardcoded into SAT should be consistent"
+        );
 
         // Encoding verified correct (hardcoded test passed above).
         // Free SAT search for n=36 XY (~7K vars) needs radical optimizations.
@@ -1264,7 +1689,12 @@ mod tests {
 
     /// Encode autocorrelation constraints for all four sequences using
     /// XNOR + weighted agree selectors. Shared by sat_encode and tests.
-    fn encode_autocorr_xnor(n: usize, m: usize, enc: &mut SatEncoder, solver: &mut radical::Solver) {
+    fn encode_autocorr_xnor(
+        n: usize,
+        m: usize,
+        enc: &mut SatEncoder,
+        solver: &mut radical::Solver,
+    ) {
         for k in 1..n {
             let w_overlap = if k < m { m - k } else { 0 };
             let target = 2 * (n - k) + w_overlap;
@@ -1306,10 +1736,16 @@ mod tests {
     #[test]
     fn sat_counter_with_xnor_hardcoded() {
         // Minimal test: hardcode X=[1,1,1,1], check XY agree at lag 3 = exactly 2
-        let mut enc = SatEncoder { n: 4, next_var: 9, xnor_triples: Vec::new() }; // vars 1-4=X, 5-8=Y
+        let mut enc = SatEncoder {
+            n: 4,
+            next_var: 9,
+            xnor_triples: Vec::new(),
+        }; // vars 1-4=X, 5-8=Y
         let mut solver: radical::Solver = Default::default();
         // X = [T,T,T,T], Y = [T,F,T,T]
-        for v in 1..=4 { solver.add_clause([v]); } // all X = true
+        for v in 1..=4 {
+            solver.add_clause([v]);
+        } // all X = true
         solver.add_clause([5]); // Y[0]=T
         solver.add_clause([-6]); // Y[1]=F
         solver.add_clause([7]); // Y[2]=T
@@ -1326,7 +1762,11 @@ mod tests {
         // ctr[3] doesn't exist (len=3), so at-most-2 is automatic
 
         let result = solver.solve();
-        assert_eq!(result, Some(true), "hardcoded XY agrees at lag 3 should give exactly 2");
+        assert_eq!(
+            result,
+            Some(true),
+            "hardcoded XY agrees at lag 3 should give exactly 2"
+        );
     }
 
     #[test]
@@ -1343,16 +1783,44 @@ mod tests {
         let y = [1i8, -1, 1, 1];
         let z = [1i8, 1, -1, -1];
         let w = [1i8, -1, 1];
-        for i in 0..n { solver.add_clause([if x[i] == 1 { enc.x_var(i) } else { -enc.x_var(i) }]); }
-        for i in 0..n { solver.add_clause([if y[i] == 1 { enc.y_var(i) } else { -enc.y_var(i) }]); }
-        for i in 0..n { solver.add_clause([if z[i] == 1 { enc.z_var(i) } else { -enc.z_var(i) }]); }
-        for i in 0..m { solver.add_clause([if w[i] == 1 { enc.w_var(i) } else { -enc.w_var(i) }]); }
+        for i in 0..n {
+            solver.add_clause([if x[i] == 1 {
+                enc.x_var(i)
+            } else {
+                -enc.x_var(i)
+            }]);
+        }
+        for i in 0..n {
+            solver.add_clause([if y[i] == 1 {
+                enc.y_var(i)
+            } else {
+                -enc.y_var(i)
+            }]);
+        }
+        for i in 0..n {
+            solver.add_clause([if z[i] == 1 {
+                enc.z_var(i)
+            } else {
+                -enc.z_var(i)
+            }]);
+        }
+        for i in 0..m {
+            solver.add_clause([if w[i] == 1 {
+                enc.w_var(i)
+            } else {
+                -enc.w_var(i)
+            }]);
+        }
 
         // Add autocorrelation constraints
         encode_autocorr_xnor(n, m, &mut enc, &mut solver);
 
         let result = solver.solve();
-        assert_eq!(result, Some(true), "hardcoded TT(4) solution should be consistent with encoding");
+        assert_eq!(
+            result,
+            Some(true),
+            "hardcoded TT(4) solution should be consistent with encoding"
+        );
     }
 
     // At n=4 the Cross-mode spectral pair filter is too tight to recover
@@ -1372,7 +1840,10 @@ mod tests {
         };
         let tuples = phase_a_tuples(cfg.problem, None);
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, false, cfg.mdd_k);
-        assert!(report.found_solution, "MDD-walker search should find canonical TT(4)");
+        assert!(
+            report.found_solution,
+            "MDD-walker search should find canonical TT(4)"
+        );
     }
 
     #[test]
@@ -1380,10 +1851,10 @@ mod tests {
         // Known TT(14) solution (found via simulated annealing, x[0]=+1):
         let n = 14usize;
         let m = n - 1; // 13
-        let x_vals: Vec<i8> = vec![1,-1,1,-1,-1,-1,1,1,1,-1,-1,1,1,1];   // sum=2
-        let y_vals: Vec<i8> = vec![1,1,1,-1,1,-1,-1,1,-1,-1,1,-1,1,1];   // sum=2
-        let z_vals: Vec<i8> = vec![-1,-1,-1,1,-1,-1,1,1,-1,-1,-1,-1,-1,1]; // sum=-6
-        let w_vals: Vec<i8> = vec![1,1,1,-1,1,1,-1,1,-1,1,-1,-1,-1];     // sum=1
+        let x_vals: Vec<i8> = vec![1, -1, 1, -1, -1, -1, 1, 1, 1, -1, -1, 1, 1, 1]; // sum=2
+        let y_vals: Vec<i8> = vec![1, 1, 1, -1, 1, -1, -1, 1, -1, -1, 1, -1, 1, 1]; // sum=2
+        let z_vals: Vec<i8> = vec![-1, -1, -1, 1, -1, -1, 1, 1, -1, -1, -1, -1, -1, 1]; // sum=-6
+        let w_vals: Vec<i8> = vec![1, 1, 1, -1, 1, 1, -1, 1, -1, 1, -1, -1, -1]; // sum=1
 
         let px = PackedSeq::from_values(&x_vals);
         let py = PackedSeq::from_values(&y_vals);
@@ -1396,13 +1867,22 @@ mod tests {
         let sz = pz.sum();
         let sw = pw.sum();
         eprintln!("Sums: x={}, y={}, z={}, w={}", sx, sy, sz, sw);
-        eprintln!("Energy: x^2+y^2+2z^2+2w^2 = {}",
-            sx*sx + sy*sy + 2*sz*sz + 2*sw*sw);
+        eprintln!(
+            "Energy: x^2+y^2+2z^2+2w^2 = {}",
+            sx * sx + sy * sy + 2 * sz * sz + 2 * sw * sw
+        );
         eprintln!("Target energy: {}", 6 * n as i32 - 2);
-        assert!(verify_tt(Problem::new(n), &px, &py, &pz, &pw),
-            "Known TT(14) solution should verify");
+        assert!(
+            verify_tt(Problem::new(n), &px, &py, &pz, &pw),
+            "Known TT(14) solution should verify"
+        );
 
-        let tuple = SumTuple { x: sx, y: sy, z: sz, w: sw };
+        let tuple = SumTuple {
+            x: sx,
+            y: sy,
+            z: sz,
+            w: sw,
+        };
 
         // Step 1: Build the FULL encoding (matching sat_search exactly) plus
         // hardcode the known solution. Check if SAT.
@@ -1411,12 +1891,28 @@ mod tests {
 
             // Hardcode the known solution as unit clauses
             for i in 0..n {
-                solver.add_clause([if x_vals[i] == 1 { enc.x_var(i) } else { -enc.x_var(i) }]);
-                solver.add_clause([if y_vals[i] == 1 { enc.y_var(i) } else { -enc.y_var(i) }]);
-                solver.add_clause([if z_vals[i] == 1 { enc.z_var(i) } else { -enc.z_var(i) }]);
+                solver.add_clause([if x_vals[i] == 1 {
+                    enc.x_var(i)
+                } else {
+                    -enc.x_var(i)
+                }]);
+                solver.add_clause([if y_vals[i] == 1 {
+                    enc.y_var(i)
+                } else {
+                    -enc.y_var(i)
+                }]);
+                solver.add_clause([if z_vals[i] == 1 {
+                    enc.z_var(i)
+                } else {
+                    -enc.z_var(i)
+                }]);
             }
             for i in 0..m {
-                solver.add_clause([if w_vals[i] == 1 { enc.w_var(i) } else { -enc.w_var(i) }]);
+                solver.add_clause([if w_vals[i] == 1 {
+                    enc.w_var(i)
+                } else {
+                    -enc.w_var(i)
+                }]);
             }
 
             let result = solver.solve();
@@ -1480,12 +1976,28 @@ mod tests {
 
             // Hardcode the known solution
             for i in 0..n {
-                solver.add_clause([if x_vals[i] == 1 { enc.x_var(i) } else { -enc.x_var(i) }]);
-                solver.add_clause([if y_vals[i] == 1 { enc.y_var(i) } else { -enc.y_var(i) }]);
-                solver.add_clause([if z_vals[i] == 1 { enc.z_var(i) } else { -enc.z_var(i) }]);
+                solver.add_clause([if x_vals[i] == 1 {
+                    enc.x_var(i)
+                } else {
+                    -enc.x_var(i)
+                }]);
+                solver.add_clause([if y_vals[i] == 1 {
+                    enc.y_var(i)
+                } else {
+                    -enc.y_var(i)
+                }]);
+                solver.add_clause([if z_vals[i] == 1 {
+                    enc.z_var(i)
+                } else {
+                    -enc.z_var(i)
+                }]);
             }
             for i in 0..m {
-                solver.add_clause([if w_vals[i] == 1 { enc.w_var(i) } else { -enc.w_var(i) }]);
+                solver.add_clause([if w_vals[i] == 1 {
+                    enc.w_var(i)
+                } else {
+                    -enc.w_var(i)
+                }]);
             }
 
             let result = solver.solve();
@@ -1500,26 +2012,40 @@ mod tests {
                 // Count actual agree pairs from the known solution
                 let mut xy_agree = 0usize;
                 for i in 0..(n - k) {
-                    if x_vals[i] == x_vals[i + k] { xy_agree += 1; }
+                    if x_vals[i] == x_vals[i + k] {
+                        xy_agree += 1;
+                    }
                 }
                 for i in 0..(n - k) {
-                    if y_vals[i] == y_vals[i + k] { xy_agree += 1; }
+                    if y_vals[i] == y_vals[i + k] {
+                        xy_agree += 1;
+                    }
                 }
                 let mut zw_agree = 0usize;
                 for i in 0..(n - k) {
-                    if z_vals[i] == z_vals[i + k] { zw_agree += 1; }
+                    if z_vals[i] == z_vals[i + k] {
+                        zw_agree += 1;
+                    }
                 }
                 for i in 0..w_overlap {
-                    if w_vals[i] == w_vals[i + k] { zw_agree += 1; }
+                    if w_vals[i] == w_vals[i + k] {
+                        zw_agree += 1;
+                    }
                 }
 
                 let actual_combined = xy_agree + 2 * zw_agree;
 
                 eprintln!("LAG {} makes it UNSAT!", k);
-                eprintln!("  target (from formula) = 2*(n-k) + w_overlap = 2*{} + {} = {}",
-                    n - k, w_overlap, target);
-                eprintln!("  actual xy_agree={}, zw_agree={}, xy_agree + 2*zw_agree = {}",
-                    xy_agree, zw_agree, actual_combined);
+                eprintln!(
+                    "  target (from formula) = 2*(n-k) + w_overlap = 2*{} + {} = {}",
+                    n - k,
+                    w_overlap,
+                    target
+                );
+                eprintln!(
+                    "  actual xy_agree={}, zw_agree={}, xy_agree + 2*zw_agree = {}",
+                    xy_agree, zw_agree, actual_combined
+                );
                 eprintln!("  target == actual? {}", target == actual_combined);
 
                 // Also verify autocorrelation directly
@@ -1527,10 +2053,11 @@ mod tests {
                 let ny = py.autocorrelation(k);
                 let nz = pz.autocorrelation(k);
                 let nw = if k < m { pw.autocorrelation(k) } else { 0 };
-                eprintln!("  N_X({})={}, N_Y({})={}, N_Z({})={}, N_W({})={}",
-                    k, nx, k, ny, k, nz, k, nw);
-                eprintln!("  N_X+N_Y+2*N_Z+2*N_W = {}",
-                    nx + ny + 2*nz + 2*nw);
+                eprintln!(
+                    "  N_X({})={}, N_Y({})={}, N_Z({})={}, N_W({})={}",
+                    k, nx, k, ny, k, nz, k, nw
+                );
+                eprintln!("  N_X+N_Y+2*N_Z+2*N_W = {}", nx + ny + 2 * nz + 2 * nw);
 
                 // Check which selector splits are available
                 let xy_total = 2 * (n - k);
@@ -1539,12 +2066,17 @@ mod tests {
                 eprintln!("  Valid (c_xy, c_zw) splits for target={}:", target);
                 for c_zw in 0..=zw_total {
                     let rem = target as isize - 2 * c_zw as isize;
-                    if rem < 0 || rem as usize > xy_total { continue; }
+                    if rem < 0 || rem as usize > xy_total {
+                        continue;
+                    }
                     let c_xy = rem as usize;
                     let matches_actual = c_xy == xy_agree && c_zw == zw_agree;
-                    eprintln!("    c_xy={}, c_zw={} {}",
-                        c_xy, c_zw,
-                        if matches_actual { "<-- ACTUAL" } else { "" });
+                    eprintln!(
+                        "    c_xy={}, c_zw={} {}",
+                        c_xy,
+                        c_zw,
+                        if matches_actual { "<-- ACTUAL" } else { "" }
+                    );
                 }
 
                 if first_buggy_lag.is_none() {
@@ -1557,9 +2089,11 @@ mod tests {
         }
 
         // The test should fail if any lag is buggy
-        assert!(first_buggy_lag.is_none(),
+        assert!(
+            first_buggy_lag.is_none(),
             "Encoding is buggy starting at lag {}. See stderr for details.",
-            first_buggy_lag.unwrap_or(0));
+            first_buggy_lag.unwrap_or(0)
+        );
     }
 
     #[test]
@@ -1569,7 +2103,12 @@ mod tests {
         // Then try free search (no hardcoded solution).
         let n = 14usize;
         let m = 13usize;
-        let tuple = SumTuple { x: 2, y: 2, z: -6, w: 1 };
+        let tuple = SumTuple {
+            x: 2,
+            y: 2,
+            z: -6,
+            w: 1,
+        };
         let mut enc = SatEncoder::new(n);
         let mut solver: radical::Solver = Default::default();
 
@@ -1594,33 +2133,76 @@ mod tests {
             let w_overlap = if k < m { m - k } else { 0 };
             let target = 2 * (n - k) + w_overlap;
             let mut xy_lits_k = Vec::new();
-            for i in 0..(n - k) { xy_lits_k.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k))); }
-            for i in 0..(n - k) { xy_lits_k.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k))); }
+            for i in 0..(n - k) {
+                xy_lits_k.push(enc.encode_xnor(&mut solver, enc.x_var(i), enc.x_var(i + k)));
+            }
+            for i in 0..(n - k) {
+                xy_lits_k.push(enc.encode_xnor(&mut solver, enc.y_var(i), enc.y_var(i + k)));
+            }
             let mut zw_lits_k = Vec::new();
-            for i in 0..(n - k) { zw_lits_k.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k))); }
-            for i in 0..w_overlap { zw_lits_k.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k))); }
+            for i in 0..(n - k) {
+                zw_lits_k.push(enc.encode_xnor(&mut solver, enc.z_var(i), enc.z_var(i + k)));
+            }
+            for i in 0..w_overlap {
+                zw_lits_k.push(enc.encode_xnor(&mut solver, enc.w_var(i), enc.w_var(i + k)));
+            }
             let xy_ctr = enc.build_counter(&mut solver, &xy_lits_k);
             let zw_ctr = enc.build_counter(&mut solver, &zw_lits_k);
             let mut selectors = Vec::new();
             for c_zw in 0..=zw_lits_k.len() {
                 let rem = target as isize - 2 * c_zw as isize;
-                if rem < 0 || rem as usize > xy_lits_k.len() { continue; }
+                if rem < 0 || rem as usize > xy_lits_k.len() {
+                    continue;
+                }
                 let c_xy = rem as usize;
                 let sel = enc.fresh();
-                if c_xy > 0 { if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 { solver.add_clause([-sel, xy_ctr[c_xy]]); } else { solver.add_clause([-sel]); continue; } }
-                if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 { solver.add_clause([-sel, -xy_ctr[c_xy + 1]]); }
-                if c_zw > 0 { if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 { solver.add_clause([-sel, zw_ctr[c_zw]]); } else { solver.add_clause([-sel]); continue; } }
-                if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 { solver.add_clause([-sel, -zw_ctr[c_zw + 1]]); }
+                if c_xy > 0 {
+                    if c_xy < xy_ctr.len() && xy_ctr[c_xy] != 0 {
+                        solver.add_clause([-sel, xy_ctr[c_xy]]);
+                    } else {
+                        solver.add_clause([-sel]);
+                        continue;
+                    }
+                }
+                if c_xy + 1 < xy_ctr.len() && xy_ctr[c_xy + 1] != 0 {
+                    solver.add_clause([-sel, -xy_ctr[c_xy + 1]]);
+                }
+                if c_zw > 0 {
+                    if c_zw < zw_ctr.len() && zw_ctr[c_zw] != 0 {
+                        solver.add_clause([-sel, zw_ctr[c_zw]]);
+                    } else {
+                        solver.add_clause([-sel]);
+                        continue;
+                    }
+                }
+                if c_zw + 1 < zw_ctr.len() && zw_ctr[c_zw + 1] != 0 {
+                    solver.add_clause([-sel, -zw_ctr[c_zw + 1]]);
+                }
                 selectors.push(sel);
             }
-            if selectors.is_empty() { solver.add_clause(std::iter::empty::<i32>()); }
-            else { solver.add_clause(selectors.iter().copied()); }
+            if selectors.is_empty() {
+                solver.add_clause(std::iter::empty::<i32>());
+            } else {
+                solver.add_clause(selectors.iter().copied());
+            }
         }
 
-        eprintln!("Manual encoding: {} vars, {} clauses", solver.num_vars(), solver.num_clauses());
+        eprintln!(
+            "Manual encoding: {} vars, {} clauses",
+            solver.num_vars(),
+            solver.num_clauses()
+        );
         let result = solver.solve();
-        eprintln!("Result: {:?}, conflicts: {}", result, solver.num_conflicts());
-        assert_eq!(result, Some(true), "TT(14) manual encoding should be SAT for tuple (2,2,-6,1)");
+        eprintln!(
+            "Result: {:?}, conflicts: {}",
+            result,
+            solver.num_conflicts()
+        );
+        assert_eq!(
+            result,
+            Some(true),
+            "TT(14) manual encoding should be SAT for tuple (2,2,-6,1)"
+        );
     }
 
     #[test]
@@ -1631,7 +2213,12 @@ mod tests {
         //   Check: N_X(1)=1, N_Y(1)=1, N_Z(1)=-1, N_W(1)=0  ⇒  1+1-2+0 = 0 ✓
         //   Energy: 4+4+0+2 = 10 = 6·2-2 ✓
         let p = Problem::new(2);
-        let tuple = SumTuple { x: 2, y: 2, z: 0, w: 1 };
+        let tuple = SumTuple {
+            x: 2,
+            y: 2,
+            z: 0,
+            w: 1,
+        };
         let z = PackedSeq::from_values(&[1, -1]);
         let w = PackedSeq::from_values(&[1]);
         let mut zw = vec![0i32; p.n];
@@ -1652,78 +2239,150 @@ mod tests {
     #[test]
     fn z_sat_finds_known_tt22_z_middle() {
         // Known TT(22) solution
-        let z_full: Vec<i8> = vec![1,1,-1,-1,-1,1,1,-1,1,1,1,1,1,1,1,1,-1,1,-1,1,-1,1];
-        let w_full: Vec<i8> = vec![1,1,1,1,-1,-1,1,1,-1,-1,1,-1,1,1,-1,-1,-1,-1,1,-1,1];
+        let z_full: Vec<i8> = vec![
+            1, 1, -1, -1, -1, 1, 1, -1, 1, 1, 1, 1, 1, 1, 1, 1, -1, 1, -1, 1, -1, 1,
+        ];
+        let w_full: Vec<i8> = vec![
+            1, 1, 1, 1, -1, -1, 1, 1, -1, -1, 1, -1, 1, 1, -1, -1, -1, -1, 1, -1, 1,
+        ];
         let n = 22usize;
         let m = 21usize;
         let k = 3usize;
         let middle_n = n - 2 * k; // 16
-        let z_mid_sum: i32 = z_full[k..n-k].iter().map(|&v| v as i32).sum(); // 6
+        let z_mid_sum: i32 = z_full[k..n - k].iter().map(|&v| v as i32).sum(); // 6
 
         // Build Z boundary
         let mut z_boundary = vec![0i8; n];
         z_boundary[..k].copy_from_slice(&z_full[..k]);
-        z_boundary[n-k..].copy_from_slice(&z_full[n-k..]);
+        z_boundary[n - k..].copy_from_slice(&z_full[n - k..]);
 
         // Build Z SAT solver (same as pipeline)
         let z_tmpl = sat_z_middle::LagTemplate::new(n, k);
         let mut z_solver = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+            &mut z_solver,
+            &z_tmpl,
+            n,
+            m,
+            middle_n,
+            &z_boundary,
+            &w_full,
+        );
 
         // Test 1: does solve() find ANY Z middle?
         let result = z_solver.solve();
         eprintln!("Z SAT (no spectral): {:?}", result);
-        assert_eq!(result, Some(true), "Z SAT should find a solution for the known Z/W pair");
+        assert_eq!(
+            result,
+            Some(true),
+            "Z SAT should find a solution for the known Z/W pair"
+        );
 
         if result == Some(true) {
             let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
-            let found_mid: Vec<i8> = (0..middle_n).map(|i| {
-                if z_solver.value(z_mid_vars[i]).unwrap() { 1 } else { -1 }
-            }).collect();
-            let known_mid: Vec<i8> = z_full[k..n-k].to_vec();
+            let found_mid: Vec<i8> = (0..middle_n)
+                .map(|i| {
+                    if z_solver.value(z_mid_vars[i]).unwrap() {
+                        1
+                    } else {
+                        -1
+                    }
+                })
+                .collect();
+            let known_mid: Vec<i8> = z_full[k..n - k].to_vec();
             eprintln!("Found Z mid: {:?}", found_mid);
             eprintln!("Known Z mid: {:?}", known_mid);
         }
 
         // Test 2: enumerate ALL Z middles — how many exist?
         let mut z_solver_enum = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver_enum, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+            &mut z_solver_enum,
+            &z_tmpl,
+            n,
+            m,
+            middle_n,
+            &z_boundary,
+            &w_full,
+        );
         let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
         let mut z_enum_count = 0;
         loop {
             let r = z_solver_enum.solve();
-            if r != Some(true) { break; }
+            if r != Some(true) {
+                break;
+            }
             z_enum_count += 1;
-            let mid: Vec<i8> = (0..middle_n).map(|i| {
-                if z_solver_enum.value(z_mid_vars[i]).unwrap() { 1 } else { -1 }
-            }).collect();
+            let mid: Vec<i8> = (0..middle_n)
+                .map(|i| {
+                    if z_solver_enum.value(z_mid_vars[i]).unwrap() {
+                        1
+                    } else {
+                        -1
+                    }
+                })
+                .collect();
             eprintln!("  Z#{}: {:?}", z_enum_count, mid);
             // Add blocking clause
-            let block: Vec<i32> = z_mid_vars.iter().map(|&v| {
-                if z_solver_enum.value(v) == Some(true) { -v } else { v }
-            }).collect();
+            let block: Vec<i32> = z_mid_vars
+                .iter()
+                .map(|&v| {
+                    if z_solver_enum.value(v) == Some(true) {
+                        -v
+                    } else {
+                        v
+                    }
+                })
+                .collect();
             z_solver_enum.add_clause(block);
         }
         eprintln!("Total Z middles (no spectral): {}", z_enum_count);
 
         // Test 3: enumerate with spectral constraint
         let mut z_solver_spec = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver_spec, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+            &mut z_solver_spec,
+            &z_tmpl,
+            n,
+            m,
+            middle_n,
+            &z_boundary,
+            &w_full,
+        );
         let ztab = radical::SpectralTables::new(n, k, 256);
-        let z_spec = radical::SpectralConstraint::from_tables(&ztab, &z_boundary, (6*n as i32 - 2) as f64 / 2.0);
+        let z_spec = radical::SpectralConstraint::from_tables(
+            &ztab,
+            &z_boundary,
+            (6 * n as i32 - 2) as f64 / 2.0,
+        );
         z_solver_spec.spectral = Some(z_spec);
         let mut z_spec_count = 0;
         loop {
             let r = z_solver_spec.solve();
-            if r != Some(true) { break; }
+            if r != Some(true) {
+                break;
+            }
             z_spec_count += 1;
-            let mid: Vec<i8> = (0..middle_n).map(|i| {
-                if z_solver_spec.value(z_mid_vars[i]).unwrap() { 1 } else { -1 }
-            }).collect();
+            let mid: Vec<i8> = (0..middle_n)
+                .map(|i| {
+                    if z_solver_spec.value(z_mid_vars[i]).unwrap() {
+                        1
+                    } else {
+                        -1
+                    }
+                })
+                .collect();
             eprintln!("  Z_spec#{}: {:?}", z_spec_count, mid);
-            let block: Vec<i32> = z_mid_vars.iter().map(|&v| {
-                if z_solver_spec.value(v) == Some(true) { -v } else { v }
-            }).collect();
+            let block: Vec<i32> = z_mid_vars
+                .iter()
+                .map(|&v| {
+                    if z_solver_spec.value(v) == Some(true) {
+                        -v
+                    } else {
+                        v
+                    }
+                })
+                .collect();
             z_solver_spec.add_clause(block);
         }
         eprintln!("Total Z middles (with spectral): {}", z_spec_count);
@@ -1731,12 +2390,26 @@ mod tests {
 
         // Test 4: find Z#1, block it, verify state, test known Z
         let mut z_solver3 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver3, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+            &mut z_solver3,
+            &z_tmpl,
+            n,
+            m,
+            middle_n,
+            &z_boundary,
+            &w_full,
+        );
         let r1 = z_solver3.solve();
         assert_eq!(r1, Some(true));
-        let found1: Vec<i8> = (0..middle_n).map(|i| {
-            if z_solver3.value(z_mid_vars[i]).unwrap() { 1 } else { -1 }
-        }).collect();
+        let found1: Vec<i8> = (0..middle_n)
+            .map(|i| {
+                if z_solver3.value(z_mid_vars[i]).unwrap() {
+                    1
+                } else {
+                    -1
+                }
+            })
+            .collect();
         eprintln!("Before blocking: found {:?}", found1);
 
         // Verify state BEFORE blocking clause
@@ -1744,9 +2417,16 @@ mod tests {
         eprintln!("Quad PB state before blocking: {} mismatches", bad_before);
 
         // Add blocking clause (while model is still in place)
-        let block: Vec<i32> = z_mid_vars.iter().map(|&v| {
-            if z_solver3.value(v) == Some(true) { -v } else { v }
-        }).collect();
+        let block: Vec<i32> = z_mid_vars
+            .iter()
+            .map(|&v| {
+                if z_solver3.value(v) == Some(true) {
+                    -v
+                } else {
+                    v
+                }
+            })
+            .collect();
         z_solver3.add_clause(block.clone());
 
         // Verify state AFTER blocking clause
@@ -1764,12 +2444,21 @@ mod tests {
         eprintln!("Quad PB state after recompute: {} mismatches", bad_recomp);
 
         // Now test known Z with assumptions
-        let known_mid2: Vec<i8> = z_full[k..n-k].to_vec();
-        let known_assumptions: Vec<i32> = (0..middle_n).map(|i| {
-            if known_mid2[i] == 1 { z_mid_vars[i] } else { -z_mid_vars[i] }
-        }).collect();
+        let known_mid2: Vec<i8> = z_full[k..n - k].to_vec();
+        let known_assumptions: Vec<i32> = (0..middle_n)
+            .map(|i| {
+                if known_mid2[i] == 1 {
+                    z_mid_vars[i]
+                } else {
+                    -z_mid_vars[i]
+                }
+            })
+            .collect();
         let r2 = z_solver3.solve_with_assumptions(&known_assumptions);
-        eprintln!("After blocking Z#1, known Z assumptions (reused, with learnt): {:?}", r2);
+        eprintln!(
+            "After blocking Z#1, known Z assumptions (reused, with learnt): {:?}",
+            r2
+        );
 
         // Test 4b: same thing but clear learnt clauses first
         z_solver3.reset();
@@ -1779,17 +2468,36 @@ mod tests {
 
         // Test 4c: reset BEFORE adding blocking clause (the actual fix)
         let mut z_solver3c = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver3c, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+            &mut z_solver3c,
+            &z_tmpl,
+            n,
+            m,
+            middle_n,
+            &z_boundary,
+            &w_full,
+        );
         let _ = z_solver3c.solve();
-        let block2 = z_mid_vars.iter().map(|&v| {
-            if z_solver3c.value(v) == Some(true) { -v } else { v }
-        }).collect::<Vec<i32>>();
+        let block2 = z_mid_vars
+            .iter()
+            .map(|&v| {
+                if z_solver3c.value(v) == Some(true) {
+                    -v
+                } else {
+                    v
+                }
+            })
+            .collect::<Vec<i32>>();
         z_solver3c.reset(); // THE FIX: backtrack before adding blocking clause
         z_solver3c.add_clause(block2);
         eprintln!("ok flag after reset+add_clause: {}", z_solver3c.ok);
         let r2c = z_solver3c.solve_with_assumptions(&known_assumptions);
         eprintln!("With reset before block: {:?}", r2c);
-        assert_eq!(r2c, Some(true), "Reset before blocking clause should fix enumeration");
+        assert_eq!(
+            r2c,
+            Some(true),
+            "Reset before blocking clause should fix enumeration"
+        );
 
         // Test 5: binary search for the bad learnt clause
         let learnt = z_solver3.get_learnt_clauses();
@@ -1797,18 +2505,36 @@ mod tests {
         // Test each learnt clause: which one makes the known Z UNSAT?
         for (ci, lc) in learnt.iter().enumerate() {
             let mut ts = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-            sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut ts, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+            sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+                &mut ts,
+                &z_tmpl,
+                n,
+                m,
+                middle_n,
+                &z_boundary,
+                &w_full,
+            );
             ts.add_clause(block.clone()); // blocking clause for Z#1
-            ts.add_clause(lc.clone());    // one learnt clause
+            ts.add_clause(lc.clone()); // one learnt clause
             let r = ts.solve_with_assumptions(&known_assumptions);
             if r != Some(true) {
                 eprintln!("BAD LEARNT CLAUSE #{}: {:?} → {:?}", ci, lc, r);
                 // Also check: is this clause actually implied by the original constraints?
                 let mut ts2 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-                sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut ts2, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+                sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+                    &mut ts2,
+                    &z_tmpl,
+                    n,
+                    m,
+                    middle_n,
+                    &z_boundary,
+                    &w_full,
+                );
                 // Check if the negation of the clause is SAT (if so, clause is NOT implied)
                 let neg: Vec<i32> = lc.iter().map(|&l| -l).collect();
-                for &l in &neg { ts2.add_clause([l]); }
+                for &l in &neg {
+                    ts2.add_clause([l]);
+                }
                 let r3 = ts2.solve();
                 eprintln!("  Negation SAT? {:?} (if SAT, learnt clause is WRONG)", r3);
             }
@@ -1816,30 +2542,68 @@ mod tests {
 
         // Test 6: FRESH solver + blocking clause + known Z — is it the solver or the clause?
         let mut z_solver4 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver4, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+            &mut z_solver4,
+            &z_tmpl,
+            n,
+            m,
+            middle_n,
+            &z_boundary,
+            &w_full,
+        );
         z_solver4.add_clause(block.clone());
         let r3 = z_solver4.solve_with_assumptions(&known_assumptions);
         eprintln!("Fresh solver + blocking clause + known Z: {:?}", r3);
 
         // Test 6: FRESH solver, no blocking clause, known Z
         let mut z_solver5 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver5, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+            &mut z_solver5,
+            &z_tmpl,
+            n,
+            m,
+            middle_n,
+            &z_boundary,
+            &w_full,
+        );
         let r4 = z_solver5.solve_with_assumptions(&known_assumptions);
         eprintln!("Fresh solver, no block, known Z: {:?}", r4);
 
-        assert_eq!(r3, Some(true), "Fresh solver + blocking clause should find known Z");
+        assert_eq!(
+            r3,
+            Some(true),
+            "Fresh solver + blocking clause should find known Z"
+        );
 
         // Test 5: with known Z middle as assumptions, is it SAT?
         let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
-        let known_mid: Vec<i8> = z_full[k..n-k].to_vec();
-        let assumptions: Vec<i32> = (0..middle_n).map(|i| {
-            if known_mid[i] == 1 { z_mid_vars[i] } else { -z_mid_vars[i] }
-        }).collect();
+        let known_mid: Vec<i8> = z_full[k..n - k].to_vec();
+        let assumptions: Vec<i32> = (0..middle_n)
+            .map(|i| {
+                if known_mid[i] == 1 {
+                    z_mid_vars[i]
+                } else {
+                    -z_mid_vars[i]
+                }
+            })
+            .collect();
         let mut z_solver2 = z_tmpl.build_base_solver_quad_pb(middle_n, z_mid_sum);
-        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver2, &z_tmpl, n, m, middle_n, &z_boundary, &w_full);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+            &mut z_solver2,
+            &z_tmpl,
+            n,
+            m,
+            middle_n,
+            &z_boundary,
+            &w_full,
+        );
         let result2 = z_solver2.solve_with_assumptions(&assumptions);
         eprintln!("Z SAT with known Z middle assumptions: {:?}", result2);
-        assert_eq!(result2, Some(true), "Known Z middle should satisfy Z SAT constraints");
+        assert_eq!(
+            result2,
+            Some(true),
+            "Known Z middle should satisfy Z SAT constraints"
+        );
     }
 
     /// Check every spectral filter the n=18 pipeline applies against
@@ -1850,7 +2614,8 @@ mod tests {
     /// canonical Z is eventually among them.
     #[test]
     fn spectral_filters_accept_canonical_tt18() {
-        let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
+        let parse =
+            |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
         let z = parse("++-+++----+-+-++--");
         let w = parse("++----+--+--+++-+");
         let n = 18usize;
@@ -1891,7 +2656,8 @@ mod tests {
             spectral_pair_ok(&z_spectrum, &w_spectrum, pair_bound),
             "canonical (Z,W) must pass external spectral_pair_ok; max |Z|²+|W|² over the \
              128-FFT grid exceeded bound {pair_bound}: z={:?} w={:?}",
-             z_spectrum, w_spectrum,
+            z_spectrum,
+            w_spectrum,
         );
 
         // -----------------------------------------------------------------
@@ -1902,24 +2668,33 @@ mod tests {
         let z_tmpl = sat_z_middle::LagTemplate::new(n, k);
         let mut z_boundary = vec![0i8; n];
         z_boundary[..k].copy_from_slice(&z[..k]);
-        z_boundary[n-k..].copy_from_slice(&z[n-k..]);
+        z_boundary[n - k..].copy_from_slice(&z[n - k..]);
         let z_bnd_sum: i32 = z_boundary.iter().map(|&v| v as i32).sum();
         let abs_z = 0i32;
         let z_counts: Vec<u32> = if abs_z == 0 {
-            sigma_full_to_cnt(0, z_bnd_sum, middle_n).into_iter().collect()
+            sigma_full_to_cnt(0, z_bnd_sum, middle_n)
+                .into_iter()
+                .collect()
         } else {
-            [abs_z, -abs_z].iter()
+            [abs_z, -abs_z]
+                .iter()
                 .filter_map(|&s| sigma_full_to_cnt(s, z_bnd_sum, middle_n))
                 .collect()
         };
         let mut z_solver = z_tmpl.build_base_solver_quad_pb_pb_set(middle_n, &z_counts);
         sat_z_middle::fill_z_solver_quad_pb_with_boundary(
-            &mut z_solver, &z_tmpl, n, m, middle_n, &z_boundary, &w);
+            &mut z_solver,
+            &z_tmpl,
+            n,
+            m,
+            middle_n,
+            &z_boundary,
+            &w,
+        );
 
         // Attach the same per-freq spectral constraint SolveZ uses.
         let ztab = radical::SpectralTables::new(n, k, SPECTRAL_FREQS);
-        let mut z_spec = radical::SpectralConstraint::from_tables(
-            &ztab, &z_boundary, pair_bound);
+        let mut z_spec = radical::SpectralConstraint::from_tables(&ztab, &z_boundary, pair_bound);
         // Per-freq bound: pair_bound − |W(ω)|² computed at ztab's 167 freqs.
         let nf = ztab.num_freqs;
         let mut w_re = vec![0.0f64; nf];
@@ -1929,14 +2704,20 @@ mod tests {
             let cos_slice = &ztab.pos_cos[base..base + nf];
             let sin_slice = &ztab.pos_sin[base..base + nf];
             if wv > 0 {
-                for fi in 0..nf { w_re[fi] += cos_slice[fi]; w_im[fi] += sin_slice[fi]; }
+                for fi in 0..nf {
+                    w_re[fi] += cos_slice[fi];
+                    w_im[fi] += sin_slice[fi];
+                }
             } else {
-                for fi in 0..nf { w_re[fi] -= cos_slice[fi]; w_im[fi] -= sin_slice[fi]; }
+                for fi in 0..nf {
+                    w_re[fi] -= cos_slice[fi];
+                    w_im[fi] -= sin_slice[fi];
+                }
             }
         }
-        let pfb: Vec<f64> = (0..nf).map(|fi|
-            (pair_bound - w_re[fi]*w_re[fi] - w_im[fi]*w_im[fi]).max(0.0)
-        ).collect();
+        let pfb: Vec<f64> = (0..nf)
+            .map(|fi| (pair_bound - w_re[fi] * w_re[fi] - w_im[fi] * w_im[fi]).max(0.0))
+            .collect();
         // Check: the canonical Z's |Z(ω)|² at each ω must be ≤ pfb[ω].
         // If not, the in-SAT per-freq bound rejects canonical — a bug
         // since `spectral_pair_ok` above already passed.
@@ -1947,18 +2728,24 @@ mod tests {
             let cos_slice = &ztab.pos_cos[base..base + nf];
             let sin_slice = &ztab.pos_sin[base..base + nf];
             if zv > 0 {
-                for fi in 0..nf { z_full_re[fi] += cos_slice[fi]; z_full_im[fi] += sin_slice[fi]; }
+                for fi in 0..nf {
+                    z_full_re[fi] += cos_slice[fi];
+                    z_full_im[fi] += sin_slice[fi];
+                }
             } else {
-                for fi in 0..nf { z_full_re[fi] -= cos_slice[fi]; z_full_im[fi] -= sin_slice[fi]; }
+                for fi in 0..nf {
+                    z_full_re[fi] -= cos_slice[fi];
+                    z_full_im[fi] -= sin_slice[fi];
+                }
             }
         }
         for fi in 0..nf {
-            let zmag2 = z_full_re[fi]*z_full_re[fi] + z_full_im[fi]*z_full_im[fi];
+            let zmag2 = z_full_re[fi] * z_full_re[fi] + z_full_im[fi] * z_full_im[fi];
             assert!(
                 zmag2 <= pfb[fi] + 1e-6,
                 "in-SAT per-freq bound rejects canonical Z at freq {fi}: \
                  |Z|²={zmag2} > pfb={}",
-                 pfb[fi],
+                pfb[fi],
             );
         }
         z_spec.per_freq_bound = Some(pfb);
@@ -1970,32 +2757,45 @@ mod tests {
         let z_mid_vars: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
         let mut seen_mids: std::collections::HashSet<Vec<i8>> = std::collections::HashSet::new();
         let mut canonical_found_at: Option<usize> = None;
-        let canonical_mid: Vec<i8> = z[k..k+middle_n].to_vec();
+        let canonical_mid: Vec<i8> = z[k..k + middle_n].to_vec();
         for i in 0..64 {
             let r = z_solver.solve();
-            if r != Some(true) { break; }
+            if r != Some(true) {
+                break;
+            }
             let z_mid = extract_vals(&z_solver, |idx| z_mid_vars[idx], middle_n);
-            assert!(seen_mids.insert(z_mid.clone()), "SAT returned duplicate Z middle at iteration {i}");
+            assert!(
+                seen_mids.insert(z_mid.clone()),
+                "SAT returned duplicate Z middle at iteration {i}"
+            );
             if z_mid == canonical_mid && canonical_found_at.is_none() {
                 canonical_found_at = Some(i);
             }
             // Blocking clause.
-            let blk: Vec<i32> = z_mid_vars.iter().map(|&v| {
-                if z_solver.value(v) == Some(true) { -v } else { v }
-            }).collect();
+            let blk: Vec<i32> = z_mid_vars
+                .iter()
+                .map(|&v| {
+                    if z_solver.value(v) == Some(true) {
+                        -v
+                    } else {
+                        v
+                    }
+                })
+                .collect();
             z_solver.reset();
             z_solver.add_clause(blk);
         }
         eprintln!(
             "enumerated {} distinct Z middles; canonical found at iter {:?}",
-            seen_mids.len(), canonical_found_at,
+            seen_mids.len(),
+            canonical_found_at,
         );
         assert!(
             canonical_found_at.is_some(),
             "canonical Z middle not found in first {} SAT solutions — either \
              the in-SAT spectral rejects it (shouldn't, given (3) above passed) \
              or the SAT never reaches it",
-             seen_mids.len(),
+            seen_mids.len(),
         );
     }
 
@@ -2004,17 +2804,21 @@ mod tests {
     /// both signs of σ_W.
     #[test]
     fn pbseteq_w_middle_accepts_canonical_tt18() {
-        let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
+        let parse =
+            |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
         let w = parse("++----+--+--+++-+");
-        let n = 18usize; let m = n - 1; let k = 5usize;
+        let n = 18usize;
+        let m = n - 1;
+        let k = 5usize;
         let middle_m = m - 2 * k;
         let mut w_boundary = vec![0i8; m];
         w_boundary[..k].copy_from_slice(&w[..k]);
-        w_boundary[m-k..].copy_from_slice(&w[m-k..]);
+        w_boundary[m - k..].copy_from_slice(&w[m - k..]);
         let w_bnd_sum: i32 = w_boundary.iter().map(|&v| v as i32).sum();
         // |σ_W| = 1 for canonical TT(18); V_w covers +1 and -1.
         let abs_w = 1i32;
-        let counts: Vec<u32> = [abs_w, -abs_w].iter()
+        let counts: Vec<u32> = [abs_w, -abs_w]
+            .iter()
             .filter_map(|&s| sigma_full_to_cnt(s, w_bnd_sum, middle_m))
             .collect::<Vec<_>>();
         eprintln!("σ_W_bnd = {}, V_w = {:?}", w_bnd_sum, counts);
@@ -2025,42 +2829,66 @@ mod tests {
 
         // Hardcode canonical W middle.
         let mid_lits: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
-        for (i, &v) in w[k..k+middle_m].iter().enumerate() {
+        for (i, &v) in w[k..k + middle_m].iter().enumerate() {
             solver.add_clause([if v == 1 { mid_lits[i] } else { -mid_lits[i] }]);
         }
-        assert_eq!(solver.solve(), Some(true), "W middle SAT should accept canonical middle");
+        assert_eq!(
+            solver.solve(),
+            Some(true),
+            "W middle SAT should accept canonical middle"
+        );
     }
 
     /// Same for Z middle.
     #[test]
     fn pbseteq_z_middle_accepts_canonical_tt18() {
-        let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
+        let parse =
+            |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
         let z = parse("++-+++----+-+-++--");
         let w = parse("++----+--+--+++-+");
-        let n = 18usize; let m = n - 1; let k = 5usize;
+        let n = 18usize;
+        let m = n - 1;
+        let k = 5usize;
         let middle_n = n - 2 * k;
         let mut z_boundary = vec![0i8; n];
         z_boundary[..k].copy_from_slice(&z[..k]);
-        z_boundary[n-k..].copy_from_slice(&z[n-k..]);
+        z_boundary[n - k..].copy_from_slice(&z[n - k..]);
         let z_bnd_sum: i32 = z_boundary.iter().map(|&v| v as i32).sum();
         // |σ_Z| = 0 for canonical; single target.
         let abs_z = 0i32;
         let counts: Vec<u32> = if abs_z == 0 {
-            sigma_full_to_cnt(0, z_bnd_sum, middle_n).into_iter().collect()
+            sigma_full_to_cnt(0, z_bnd_sum, middle_n)
+                .into_iter()
+                .collect()
         } else {
-            [abs_z, -abs_z].iter().filter_map(|&s| sigma_full_to_cnt(s, z_bnd_sum, middle_n)).collect()
+            [abs_z, -abs_z]
+                .iter()
+                .filter_map(|&s| sigma_full_to_cnt(s, z_bnd_sum, middle_n))
+                .collect()
         };
         eprintln!("σ_Z_bnd = {}, V_z = {:?}", z_bnd_sum, counts);
 
         let z_tmpl = sat_z_middle::LagTemplate::new(n, k);
         let mut solver = z_tmpl.build_base_solver_quad_pb_pb_set(middle_n, &counts);
-        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut solver, &z_tmpl, n, m, middle_n, &z_boundary, &w);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+            &mut solver,
+            &z_tmpl,
+            n,
+            m,
+            middle_n,
+            &z_boundary,
+            &w,
+        );
 
         let mid_lits: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
-        for (i, &v) in z[k..k+middle_n].iter().enumerate() {
+        for (i, &v) in z[k..k + middle_n].iter().enumerate() {
             solver.add_clause([if v == 1 { mid_lits[i] } else { -mid_lits[i] }]);
         }
-        assert_eq!(solver.solve(), Some(true), "Z middle SAT should accept canonical middle");
+        assert_eq!(
+            solver.solve(),
+            Some(true),
+            "Z middle SAT should accept canonical middle"
+        );
     }
 
     /// Sanity check: build the XY template with the unsigned n=18 canonical
@@ -2069,14 +2897,20 @@ mod tests {
     /// sum encoding in `build_sat_xy_clauses`.
     #[test]
     fn pbseteq_xy_accepts_canonical_tt18() {
-        let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
+        let parse =
+            |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
         let x = parse("++-+++++++++-+--++");
         let y = parse("++----++-+---+-+-+");
         let z = parse("++-+++----+-+-++--");
         let w = parse("++----+--+--+++-+");
         let n = 18usize;
         let m = n - 1;
-        let tuple = SumTuple { x: 10, y: 2, z: 0, w: 1 };
+        let tuple = SumTuple {
+            x: 10,
+            y: 2,
+            z: 0,
+            w: 1,
+        };
         let pz = PackedSeq::from_values(&z);
         let pw = PackedSeq::from_values(&w);
         let mut zw = vec![0i32; n];
@@ -2086,17 +2920,24 @@ mod tests {
             zw[s] = 2 * nz + 2 * nw;
         }
         let candidate = CandidateZW { zw_autocorr: zw };
-        let template = SatXYTemplate::build(Problem::new(n), tuple, &radical::SolverConfig::default())
-            .expect("template should build");
+        let template =
+            SatXYTemplate::build(Problem::new(n), tuple, &radical::SolverConfig::default())
+                .expect("template should build");
         assert!(template.is_feasible(&candidate));
-        let mut solver = template.prepare_candidate_solver(&candidate).expect("prepare");
+        let mut solver = template
+            .prepare_candidate_solver(&candidate)
+            .expect("prepare");
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
         for i in 0..n {
             solver.add_clause([if x[i] == 1 { x_var(i) } else { -x_var(i) }]);
             solver.add_clause([if y[i] == 1 { y_var(i) } else { -y_var(i) }]);
         }
-        assert_eq!(solver.solve(), Some(true), "hardcoded canonical TT(18) should be SAT-consistent with PbSetEq XY template");
+        assert_eq!(
+            solver.solve(),
+            Some(true),
+            "hardcoded canonical TT(18) should be SAT-consistent with PbSetEq XY template"
+        );
     }
 
     /// The pipeline's XY path: build template, prepare_candidate_solver,
@@ -2190,9 +3031,11 @@ mod tests {
         let path = format!("data/turyn-type-{:02}", n);
         let contents = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(e) => panic!("failed to read {path}: {e}.  \
+            Err(e) => panic!(
+                "failed to read {path}: {e}.  \
                 The Kharaghani oracle needs `data/turyn-type-{n:02}` checked into \
-                the repo; re-run after rebasing on main."),
+                the repo; re-run after rebasing on main."
+            ),
         };
         let rows: Vec<String> = contents
             .lines()
@@ -2233,7 +3076,10 @@ mod tests {
         let rows = sample_kharaghani_rows(n);
         for (i, row) in rows.iter().enumerate() {
             let (x, y, z, w) = decode_kharaghani_hex(row, n);
-            eprintln!("kharaghani oracle n={n} k={k} sample {i}/{}: row={row}", rows.len());
+            eprintln!(
+                "kharaghani oracle n={n} k={k} sample {i}/{}: row={row}",
+                rows.len()
+            );
             kharaghani_oracle_check(&x, &y, &z, &w, k);
         }
     }
@@ -2245,7 +3091,8 @@ mod tests {
     /// first stage that rejects.  Shares steps (a)–(g2) with
     /// `sanity_check_canonical_tt`; only the final XY step is relaxed.
     fn kharaghani_oracle_check(x_str: &str, y_str: &str, z_str: &str, w_str: &str, k: usize) {
-        let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
+        let parse =
+            |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
         let x = parse(x_str);
         let y = parse(y_str);
         let z = parse(z_str);
@@ -2258,20 +3105,50 @@ mod tests {
         let py = PackedSeq::from_values(&y);
         let pz = PackedSeq::from_values(&z);
         let pw = PackedSeq::from_values(&w);
-        assert!(verify_tt(problem, &px, &py, &pz, &pw), "n={n}: fails verify_tt");
+        assert!(
+            verify_tt(problem, &px, &py, &pz, &pw),
+            "n={n}: fails verify_tt"
+        );
 
         // BDKR rules (i)–(vi).  These repeat the ones in
         // sanity_check_canonical_tt so failures on oracle data are easy
         // to attribute.
-        assert_eq!((x[0], x[n-1], y[0], y[n-1], z[0], w[0]), (1, 1, 1, 1, 1, 1),
-            "n={n}: rule (i) violated");
-        for i in 1..n/2 { if x[i] != x[n-1-i] { assert_eq!(x[i], 1, "n={n}: rule (ii)"); break; } }
-        for i in 1..n/2 { if y[i] != y[n-1-i] { assert_eq!(y[i], 1, "n={n}: rule (iii)"); break; } }
-        for i in 1..n/2 { if z[i] == z[n-1-i] { assert_eq!(z[i], 1, "n={n}: rule (iv)"); break; } }
-        let tail = w[m-1];
-        for i in 1..(m-1)/2 + 1 { if w[i] * w[m-1-i] != tail { assert_eq!(w[i], 1, "n={n}: rule (v)"); break; } }
-        if x[1] != y[1] { assert_eq!(x[1], 1, "n={n}: rule (vi)"); }
-        else { assert_eq!(x[n-2], 1, "n={n}: rule (vi)"); assert_eq!(y[n-2], -1, "n={n}: rule (vi)"); }
+        assert_eq!(
+            (x[0], x[n - 1], y[0], y[n - 1], z[0], w[0]),
+            (1, 1, 1, 1, 1, 1),
+            "n={n}: rule (i) violated"
+        );
+        for i in 1..n / 2 {
+            if x[i] != x[n - 1 - i] {
+                assert_eq!(x[i], 1, "n={n}: rule (ii)");
+                break;
+            }
+        }
+        for i in 1..n / 2 {
+            if y[i] != y[n - 1 - i] {
+                assert_eq!(y[i], 1, "n={n}: rule (iii)");
+                break;
+            }
+        }
+        for i in 1..n / 2 {
+            if z[i] == z[n - 1 - i] {
+                assert_eq!(z[i], 1, "n={n}: rule (iv)");
+                break;
+            }
+        }
+        let tail = w[m - 1];
+        for i in 1..(m - 1) / 2 + 1 {
+            if w[i] * w[m - 1 - i] != tail {
+                assert_eq!(w[i], 1, "n={n}: rule (v)");
+                break;
+            }
+        }
+        if x[1] != y[1] {
+            assert_eq!(x[1], 1, "n={n}: rule (vi)");
+        } else {
+            assert_eq!(x[n - 2], 1, "n={n}: rule (vi)");
+            assert_eq!(y[n - 2], -1, "n={n}: rule (vi)");
+        }
 
         let sigma_z: i32 = z.iter().map(|&b| b as i32).sum();
         let sigma_w: i32 = w.iter().map(|&b| b as i32).sum();
@@ -2279,28 +3156,39 @@ mod tests {
         // Middle boundaries at k.
         let mut z_boundary = vec![0i8; n];
         z_boundary[..k].copy_from_slice(&z[..k]);
-        z_boundary[n-k..].copy_from_slice(&z[n-k..]);
+        z_boundary[n - k..].copy_from_slice(&z[n - k..]);
         let mut w_boundary = vec![0i8; m];
         w_boundary[..k].copy_from_slice(&w[..k]);
-        w_boundary[m-k..].copy_from_slice(&w[m-k..]);
+        w_boundary[m - k..].copy_from_slice(&w[m - k..]);
         let middle_n = n - 2 * k;
         let middle_m = m - 2 * k;
         let z_bnd_sum: i32 = z_boundary.iter().map(|&v| v as i32).sum();
         let w_bnd_sum: i32 = w_boundary.iter().map(|&v| v as i32).sum();
 
         let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
-        assert_ne!(rule_iv_state, sat_z_middle::BoundaryRuleState::ViolatedAtBoundary,
-            "n={n}: rule (iv) pre-filter rejects canonical Z boundary");
+        assert_ne!(
+            rule_iv_state,
+            sat_z_middle::BoundaryRuleState::ViolatedAtBoundary,
+            "n={n}: rule (iv) pre-filter rejects canonical Z boundary"
+        );
         let rule_v_state = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
-        assert_ne!(rule_v_state, sat_z_middle::BoundaryRuleState::ViolatedAtBoundary,
-            "n={n}: rule (v) pre-filter rejects canonical W boundary");
+        assert_ne!(
+            rule_v_state,
+            sat_z_middle::BoundaryRuleState::ViolatedAtBoundary,
+            "n={n}: rule (v) pre-filter rejects canonical W boundary"
+        );
 
         // W-middle SAT must accept the canonical middle.
         let abs_w = sigma_w.abs();
         let w_counts: Vec<u32> = if abs_w == 0 {
-            sigma_full_to_cnt(0, w_bnd_sum, middle_m).into_iter().collect()
+            sigma_full_to_cnt(0, w_bnd_sum, middle_m)
+                .into_iter()
+                .collect()
         } else {
-            [abs_w, -abs_w].iter().filter_map(|&s| sigma_full_to_cnt(s, w_bnd_sum, middle_m)).collect()
+            [abs_w, -abs_w]
+                .iter()
+                .filter_map(|&s| sigma_full_to_cnt(s, w_bnd_sum, middle_m))
+                .collect()
         };
         assert!(!w_counts.is_empty(), "n={n}: empty V_w");
         let w_tmpl = sat_z_middle::LagTemplate::new(m, k);
@@ -2308,30 +3196,66 @@ mod tests {
         sat_z_middle::fill_w_solver(&mut w_solver, &w_tmpl, m, &w_boundary);
         if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
             let mut nv = (w_solver.num_vars() + 1) as i32;
-            sat_z_middle::add_rule_v_middle_clauses(&mut w_solver, m, k, &w_boundary, |pf| (pf - k + 1) as i32, &mut nv);
+            sat_z_middle::add_rule_v_middle_clauses(
+                &mut w_solver,
+                m,
+                k,
+                &w_boundary,
+                |pf| (pf - k + 1) as i32,
+                &mut nv,
+            );
         }
         let w_mid_lits: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
-        for (i, &v) in w[k..k+middle_m].iter().enumerate() {
-            w_solver.add_clause([if v == 1 { w_mid_lits[i] } else { -w_mid_lits[i] }]);
+        for (i, &v) in w[k..k + middle_m].iter().enumerate() {
+            w_solver.add_clause([if v == 1 {
+                w_mid_lits[i]
+            } else {
+                -w_mid_lits[i]
+            }]);
         }
-        assert_eq!(w_solver.solve(), Some(true), "n={n}: W-middle SAT rejects canonical W middle");
+        assert_eq!(
+            w_solver.solve(),
+            Some(true),
+            "n={n}: W-middle SAT rejects canonical W middle"
+        );
 
         // Z-middle SAT must accept the canonical middle.
         let abs_z = sigma_z.abs();
         let z_counts: Vec<u32> = if abs_z == 0 {
-            sigma_full_to_cnt(0, z_bnd_sum, middle_n).into_iter().collect()
+            sigma_full_to_cnt(0, z_bnd_sum, middle_n)
+                .into_iter()
+                .collect()
         } else {
-            [abs_z, -abs_z].iter().filter_map(|&s| sigma_full_to_cnt(s, z_bnd_sum, middle_n)).collect()
+            [abs_z, -abs_z]
+                .iter()
+                .filter_map(|&s| sigma_full_to_cnt(s, z_bnd_sum, middle_n))
+                .collect()
         };
         assert!(!z_counts.is_empty(), "n={n}: empty V_z");
         let z_tmpl = sat_z_middle::LagTemplate::new(n, k);
         let mut z_solver = z_tmpl.build_base_solver_quad_pb_pb_set(middle_n, &z_counts);
-        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver, &z_tmpl, n, m, middle_n, &z_boundary, &w);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+            &mut z_solver,
+            &z_tmpl,
+            n,
+            m,
+            middle_n,
+            &z_boundary,
+            &w,
+        );
         let z_mid_lits: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
-        for (i, &v) in z[k..k+middle_n].iter().enumerate() {
-            z_solver.add_clause([if v == 1 { z_mid_lits[i] } else { -z_mid_lits[i] }]);
+        for (i, &v) in z[k..k + middle_n].iter().enumerate() {
+            z_solver.add_clause([if v == 1 {
+                z_mid_lits[i]
+            } else {
+                -z_mid_lits[i]
+            }]);
         }
-        assert_eq!(z_solver.solve(), Some(true), "n={n}: Z-middle SAT rejects canonical Z middle");
+        assert_eq!(
+            z_solver.solve(),
+            Some(true),
+            "n={n}: Z-middle SAT rejects canonical Z middle"
+        );
 
         // External spectral pair filter.
         let spectral_z = SpectralFilter::new(n, 128);
@@ -2343,8 +3267,10 @@ mod tests {
             .unwrap_or_else(|| panic!("n={n}: canonical W fails individual spectral filter"));
         let mut z_spec = vec![0.0; w_spec.len()];
         compute_spectrum_into(&z, &spectral_z, &mut fft_z, &mut z_spec);
-        assert!(spectral_pair_ok(&z_spec, &w_spec, pair_bound),
-            "n={n}: canonical (Z, W) fails external spectral_pair_ok");
+        assert!(
+            spectral_pair_ok(&z_spec, &w_spec, pair_bound),
+            "n={n}: canonical (Z, W) fails external spectral_pair_ok"
+        );
 
         // XY SAT: try_candidate must accept the canonical boundary.
         // Whatever (X, Y) it returns must be a valid TT with the
@@ -2358,7 +3284,12 @@ mod tests {
             zw[s] = 2 * nz + 2 * nw;
         }
         let candidate = CandidateZW { zw_autocorr: zw };
-        let tuple = SumTuple { x: sigma_x, y: sigma_y, z: sigma_z, w: sigma_w };
+        let tuple = SumTuple {
+            x: sigma_x,
+            y: sigma_y,
+            z: sigma_z,
+            w: sigma_w,
+        };
         let template = SatXYTemplate::build(problem, tuple, &radical::SolverConfig::default())
             .expect("template should build");
         let mut state = SolveXyPerCandidate::new(problem, &candidate, &template, k)
@@ -2366,10 +3297,18 @@ mod tests {
         let mut x_bits = 0u32;
         let mut y_bits = 0u32;
         for i in 0..k {
-            if x[i] == 1 { x_bits |= 1 << i; }
-            if x[n - k + i] == 1 { x_bits |= 1 << (k + i); }
-            if y[i] == 1 { y_bits |= 1 << i; }
-            if y[n - k + i] == 1 { y_bits |= 1 << (k + i); }
+            if x[i] == 1 {
+                x_bits |= 1 << i;
+            }
+            if x[n - k + i] == 1 {
+                x_bits |= 1 << (k + i);
+            }
+            if y[i] == 1 {
+                y_bits |= 1 << i;
+            }
+            if y[n - k + i] == 1 {
+                y_bits |= 1 << (k + i);
+            }
         }
         let (result, _stats) = state.try_candidate(x_bits, y_bits);
         match result {
@@ -2378,68 +3317,101 @@ mod tests {
                 let fy: Vec<i8> = (0..n).map(|i| found_y.get(i)).collect();
                 let pfx = PackedSeq::from_values(&fx);
                 let pfy = PackedSeq::from_values(&fy);
-                assert!(verify_tt(problem, &pfx, &pfy, &pz, &pw),
-                    "n={n}: SAT returned non-TT completion for canonical (Z, W) + x_bits=0b{x_bits:b}, y_bits=0b{y_bits:b}");
+                assert!(
+                    verify_tt(problem, &pfx, &pfy, &pz, &pw),
+                    "n={n}: SAT returned non-TT completion for canonical (Z, W) + x_bits=0b{x_bits:b}, y_bits=0b{y_bits:b}"
+                );
             }
             XyTryResult::Unsat => panic!(
                 "n={n}: try_candidate returned UNSAT for canonical TT — rule/template/PbSetEq bug. \
                  tuple=({}, {}, {}, {}), x_bits=0b{x_bits:b}, y_bits=0b{y_bits:b}",
-                tuple.x, tuple.y, tuple.z, tuple.w),
-            XyTryResult::Pruned => panic!("n={n}: try_candidate pruned canonical at GJ/lag pre-filter"),
+                tuple.x, tuple.y, tuple.z, tuple.w
+            ),
+            XyTryResult::Pruned => {
+                panic!("n={n}: try_candidate pruned canonical at GJ/lag pre-filter")
+            }
             XyTryResult::Timeout => panic!("n={n}: try_candidate timed out"),
         }
     }
 
     #[test]
-    fn kharaghani_oracle_n6() { run_kharaghani_sample(6, 2); }
+    fn kharaghani_oracle_n6() {
+        run_kharaghani_sample(6, 2);
+    }
 
     #[test]
-    fn kharaghani_oracle_n8() { run_kharaghani_sample(8, 2); }
+    fn kharaghani_oracle_n8() {
+        run_kharaghani_sample(8, 2);
+    }
 
     #[test]
-    fn kharaghani_oracle_n10() { run_kharaghani_sample(10, 3); }
+    fn kharaghani_oracle_n10() {
+        run_kharaghani_sample(10, 3);
+    }
 
     #[test]
-    fn kharaghani_oracle_n12() { run_kharaghani_sample(12, 3); }
+    fn kharaghani_oracle_n12() {
+        run_kharaghani_sample(12, 3);
+    }
 
     #[test]
-    fn kharaghani_oracle_n14() { run_kharaghani_sample(14, 4); }
+    fn kharaghani_oracle_n14() {
+        run_kharaghani_sample(14, 4);
+    }
 
     #[test]
-    fn kharaghani_oracle_n16() { run_kharaghani_sample(16, 4); }
+    fn kharaghani_oracle_n16() {
+        run_kharaghani_sample(16, 4);
+    }
 
     #[test]
-    fn kharaghani_oracle_n18() { run_kharaghani_sample(18, 5); }
+    fn kharaghani_oracle_n18() {
+        run_kharaghani_sample(18, 5);
+    }
 
     #[test]
-    fn kharaghani_oracle_n20() { run_kharaghani_sample(20, 5); }
+    fn kharaghani_oracle_n20() {
+        run_kharaghani_sample(20, 5);
+    }
 
     // Larger n are slower (bigger SAT instances).  Gate n≥22 behind
     // `--ignored` so the default `cargo test` run stays quick.  Run the
     // full oracle with `cargo test -- --ignored kharaghani`.
     #[test]
     #[ignore = "slow; run via `cargo test -- --ignored kharaghani`"]
-    fn kharaghani_oracle_n22() { run_kharaghani_sample(22, 6); }
+    fn kharaghani_oracle_n22() {
+        run_kharaghani_sample(22, 6);
+    }
 
     #[test]
     #[ignore = "slow"]
-    fn kharaghani_oracle_n24() { run_kharaghani_sample(24, 6); }
+    fn kharaghani_oracle_n24() {
+        run_kharaghani_sample(24, 6);
+    }
 
     #[test]
     #[ignore = "slow"]
-    fn kharaghani_oracle_n26() { run_kharaghani_sample(26, 7); }
+    fn kharaghani_oracle_n26() {
+        run_kharaghani_sample(26, 7);
+    }
 
     #[test]
     #[ignore = "slow"]
-    fn kharaghani_oracle_n28() { run_kharaghani_sample(28, 7); }
+    fn kharaghani_oracle_n28() {
+        run_kharaghani_sample(28, 7);
+    }
 
     #[test]
     #[ignore = "slow"]
-    fn kharaghani_oracle_n30() { run_kharaghani_sample(30, 7); }
+    fn kharaghani_oracle_n30() {
+        run_kharaghani_sample(30, 7);
+    }
 
     #[test]
     #[ignore = "slow"]
-    fn kharaghani_oracle_n32() { run_kharaghani_sample(32, 8); }
+    fn kharaghani_oracle_n32() {
+        run_kharaghani_sample(32, 8);
+    }
 
     /// Regression test for the `--outfix` middle-pin wiring.  Pre-fix,
     /// `outfix_z_mid_pins` and `outfix_w_mid_pins` were only honoured
@@ -2469,7 +3441,10 @@ mod tests {
         let exe = format!("{}/target/release/turyn", env!("CARGO_MANIFEST_DIR"));
         let out = Command::new(exe)
             .args([
-                "--n=28", "--wz=apart", "--mdd-k=9", "--sat-secs=5",
+                "--n=28",
+                "--wz=apart",
+                "--mdd-k=9",
+                "--sat-secs=5",
                 "--outfix=0000067cde3e50...0639ab46135aa51",
             ])
             .output()
@@ -2477,8 +3452,10 @@ mod tests {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let all = format!("{stdout}{stderr}");
-        assert!(all.contains("found_solution=true"),
-            "--outfix with fully-pinning prefix+suffix should find a TT(28)\nfull output:\n{all}");
+        assert!(
+            all.contains("found_solution=true"),
+            "--outfix with fully-pinning prefix+suffix should find a TT(28)\nfull output:\n{all}"
+        );
     }
 
     /// Smaller variant at n=16 (row 1 of `data/turyn-type-16`, all-positive σ).
@@ -2491,14 +3468,23 @@ mod tests {
         let exe = format!("{}/target/release/turyn", env!("CARGO_MANIFEST_DIR"));
         let out = Command::new(exe)
             .args([
-                "--n=16", "--wz=apart", "--mdd-k=4", "--sat-secs=5",
+                "--n=16",
+                "--wz=apart",
+                "--mdd-k=4",
+                "--sat-secs=5",
                 "--outfix=00007e4b0e53...19561",
             ])
             .output()
             .expect("turyn binary should run");
-        let all = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        assert!(all.contains("found_solution=true"),
-            "--outfix with fully-pinning prefix+suffix should find a TT(16)\nfull output:\n{all}");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            all.contains("found_solution=true"),
+            "--outfix with fully-pinning prefix+suffix should find a TT(16)\nfull output:\n{all}"
+        );
     }
 
     /// Known-broken repro for the minimal-outfix (boundary-only) case on
@@ -2519,14 +3505,23 @@ mod tests {
         let exe = format!("{}/target/release/turyn", env!("CARGO_MANIFEST_DIR"));
         let out = Command::new(exe)
             .args([
-                "--n=28", "--wz=apart", "--mdd-k=9", "--sat-secs=10",
+                "--n=28",
+                "--wz=apart",
+                "--mdd-k=9",
+                "--sat-secs=10",
                 "--outfix=0000067cd...146135aa51",
             ])
             .output()
             .expect("turyn binary should run");
-        let all = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        assert!(all.contains("found_solution=true"),
-            "minimal --outfix (boundary-only) should find a TT(28)\noutput:\n{all}");
+        let all = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            all.contains("found_solution=true"),
+            "minimal --outfix (boundary-only) should find a TT(28)\noutput:\n{all}"
+        );
     }
 
     /// Same for canonical TT(36).
@@ -2548,13 +3543,16 @@ mod tests {
     ///   (c) the pipeline's XY SAT path accepts the canonical
     ///       (x_bits, y_bits) boundary with the canonical tuple.
     fn sanity_check_canonical_tt(x_str: &str, y_str: &str, z_str: &str, w_str: &str, k: usize) {
-        let parse = |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
+        let parse =
+            |s: &str| -> Vec<i8> { s.bytes().map(|b| if b == b'+' { 1 } else { -1 }).collect() };
         let x = parse(x_str);
         let y = parse(y_str);
         let z = parse(z_str);
         let w = parse(w_str);
         let n = x.len();
-        assert_eq!(y.len(), n); assert_eq!(z.len(), n); assert_eq!(w.len(), n - 1);
+        assert_eq!(y.len(), n);
+        assert_eq!(z.len(), n);
+        assert_eq!(w.len(), n - 1);
         let m = n - 1;
 
         // (a) Turyn identity.
@@ -2563,24 +3561,53 @@ mod tests {
         let py = PackedSeq::from_values(&y);
         let pz = PackedSeq::from_values(&z);
         let pw = PackedSeq::from_values(&w);
-        assert!(verify_tt(problem, &px, &py, &pz, &pw),
-            "n={n}: canonical TT fails verify_tt");
+        assert!(
+            verify_tt(problem, &px, &py, &pz, &pw),
+            "n={n}: canonical TT fails verify_tt"
+        );
 
         // (b) Rules (i)-(vi).
-        assert_eq!((x[0], x[n-1], y[0], y[n-1], z[0], w[0]), (1, 1, 1, 1, 1, 1),
-            "n={n}: rule (i) violated");
+        assert_eq!(
+            (x[0], x[n - 1], y[0], y[n - 1], z[0], w[0]),
+            (1, 1, 1, 1, 1, 1),
+            "n={n}: rule (i) violated"
+        );
         // Rule (ii): first i with x[i] != x[n-1-i] must have x[i]=+1.
-        for i in 1..n/2 { if x[i] != x[n-1-i] { assert_eq!(x[i], 1, "n={n}: rule (ii) violated at i={i}"); break; } }
+        for i in 1..n / 2 {
+            if x[i] != x[n - 1 - i] {
+                assert_eq!(x[i], 1, "n={n}: rule (ii) violated at i={i}");
+                break;
+            }
+        }
         // Rule (iii): same for y.
-        for i in 1..n/2 { if y[i] != y[n-1-i] { assert_eq!(y[i], 1, "n={n}: rule (iii) violated at i={i}"); break; } }
+        for i in 1..n / 2 {
+            if y[i] != y[n - 1 - i] {
+                assert_eq!(y[i], 1, "n={n}: rule (iii) violated at i={i}");
+                break;
+            }
+        }
         // Rule (iv): first i with z[i] == z[n-1-i] must have z[i]=+1.
-        for i in 1..n/2 { if z[i] == z[n-1-i] { assert_eq!(z[i], 1, "n={n}: rule (iv) violated at i={i}"); break; } }
+        for i in 1..n / 2 {
+            if z[i] == z[n - 1 - i] {
+                assert_eq!(z[i], 1, "n={n}: rule (iv) violated at i={i}");
+                break;
+            }
+        }
         // Rule (v): first i with w[i]*w[m-1-i] != w[m-1] must have w[i]=+1.
-        let tail = w[m-1];
-        for i in 1..(m-1)/2 + 1 { if w[i] * w[m-1-i] != tail { assert_eq!(w[i], 1, "n={n}: rule (v) violated at i={i}"); break; } }
+        let tail = w[m - 1];
+        for i in 1..(m - 1) / 2 + 1 {
+            if w[i] * w[m - 1 - i] != tail {
+                assert_eq!(w[i], 1, "n={n}: rule (v) violated at i={i}");
+                break;
+            }
+        }
         // Rule (vi): if x[1]!=y[1] then x[1]=+1; else x[n-2]=+1 AND y[n-2]=-1.
-        if x[1] != y[1] { assert_eq!(x[1], 1, "n={n}: rule (vi) case-1 violated"); }
-        else { assert_eq!(x[n-2], 1, "n={n}: rule (vi) case-2 x[n-2] violated"); assert_eq!(y[n-2], -1, "n={n}: rule (vi) case-2 y[n-2] violated"); }
+        if x[1] != y[1] {
+            assert_eq!(x[1], 1, "n={n}: rule (vi) case-1 violated");
+        } else {
+            assert_eq!(x[n - 2], 1, "n={n}: rule (vi) case-2 x[n-2] violated");
+            assert_eq!(y[n - 2], -1, "n={n}: rule (vi) case-2 y[n-2] violated");
+        }
 
         let sigma_x: i32 = x.iter().map(|&b| b as i32).sum();
         let sigma_y: i32 = y.iter().map(|&b| b as i32).sum();
@@ -2590,10 +3617,10 @@ mod tests {
         // (c) Middle boundaries: encode (z_bits, w_bits) and extract middle values.
         let mut z_boundary = vec![0i8; n];
         z_boundary[..k].copy_from_slice(&z[..k]);
-        z_boundary[n-k..].copy_from_slice(&z[n-k..]);
+        z_boundary[n - k..].copy_from_slice(&z[n - k..]);
         let mut w_boundary = vec![0i8; m];
         w_boundary[..k].copy_from_slice(&w[..k]);
-        w_boundary[m-k..].copy_from_slice(&w[m-k..]);
+        w_boundary[m - k..].copy_from_slice(&w[m - k..]);
         let middle_n = n - 2 * k;
         let middle_m = m - 2 * k;
         let z_bnd_sum: i32 = z_boundary.iter().map(|&v| v as i32).sum();
@@ -2601,58 +3628,103 @@ mod tests {
 
         // (d) Rule-(iv)/(v) boundary pre-filters must not reject canonical.
         let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
-        assert_ne!(rule_iv_state, sat_z_middle::BoundaryRuleState::ViolatedAtBoundary,
-            "n={n}: rule (iv) boundary pre-filter rejects canonical Z boundary");
+        assert_ne!(
+            rule_iv_state,
+            sat_z_middle::BoundaryRuleState::ViolatedAtBoundary,
+            "n={n}: rule (iv) boundary pre-filter rejects canonical Z boundary"
+        );
         let rule_v_state = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
-        assert_ne!(rule_v_state, sat_z_middle::BoundaryRuleState::ViolatedAtBoundary,
-            "n={n}: rule (v) boundary pre-filter rejects canonical W boundary");
+        assert_ne!(
+            rule_v_state,
+            sat_z_middle::BoundaryRuleState::ViolatedAtBoundary,
+            "n={n}: rule (v) boundary pre-filter rejects canonical W boundary"
+        );
 
         // (e) W-middle SAT: V_w covers both σ_W signs of the tuple's |σ_W|.
         let abs_w = sigma_w.abs();
         let w_counts: Vec<u32> = if abs_w == 0 {
-            sigma_full_to_cnt(0, w_bnd_sum, middle_m).into_iter().collect()
+            sigma_full_to_cnt(0, w_bnd_sum, middle_m)
+                .into_iter()
+                .collect()
         } else {
-            [abs_w, -abs_w].iter()
+            [abs_w, -abs_w]
+                .iter()
                 .filter_map(|&s| sigma_full_to_cnt(s, w_bnd_sum, middle_m))
                 .collect::<Vec<_>>()
         };
-        assert!(!w_counts.is_empty(),
-            "n={n}: sigma_full_to_cnt gives empty V_w for |σ_W|={abs_w}, bnd_sum={w_bnd_sum}");
+        assert!(
+            !w_counts.is_empty(),
+            "n={n}: sigma_full_to_cnt gives empty V_w for |σ_W|={abs_w}, bnd_sum={w_bnd_sum}"
+        );
         let w_tmpl = sat_z_middle::LagTemplate::new(m, k);
         let mut w_solver = w_tmpl.build_base_solver_pb_set(middle_m, &w_counts);
         sat_z_middle::fill_w_solver(&mut w_solver, &w_tmpl, m, &w_boundary);
         if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
             let mut nv = (w_solver.num_vars() + 1) as i32;
-            sat_z_middle::add_rule_v_middle_clauses(&mut w_solver, m, k, &w_boundary, |pf| (pf - k + 1) as i32, &mut nv);
+            sat_z_middle::add_rule_v_middle_clauses(
+                &mut w_solver,
+                m,
+                k,
+                &w_boundary,
+                |pf| (pf - k + 1) as i32,
+                &mut nv,
+            );
         }
         // Pin the canonical W middle as unit clauses.
         let w_mid_lits: Vec<i32> = (0..middle_m).map(|i| (i + 1) as i32).collect();
-        for (i, &v) in w[k..k+middle_m].iter().enumerate() {
-            w_solver.add_clause([if v == 1 { w_mid_lits[i] } else { -w_mid_lits[i] }]);
+        for (i, &v) in w[k..k + middle_m].iter().enumerate() {
+            w_solver.add_clause([if v == 1 {
+                w_mid_lits[i]
+            } else {
+                -w_mid_lits[i]
+            }]);
         }
-        assert_eq!(w_solver.solve(), Some(true),
-            "n={n}: W-middle SAT rejects canonical W middle (V_w={w_counts:?}, σ_W={sigma_w})");
+        assert_eq!(
+            w_solver.solve(),
+            Some(true),
+            "n={n}: W-middle SAT rejects canonical W middle (V_w={w_counts:?}, σ_W={sigma_w})"
+        );
 
         // (f) Z-middle SAT (with full canonical W): V_z covers both σ_Z signs.
         let abs_z = sigma_z.abs();
         let z_counts: Vec<u32> = if abs_z == 0 {
-            sigma_full_to_cnt(0, z_bnd_sum, middle_n).into_iter().collect()
+            sigma_full_to_cnt(0, z_bnd_sum, middle_n)
+                .into_iter()
+                .collect()
         } else {
-            [abs_z, -abs_z].iter()
+            [abs_z, -abs_z]
+                .iter()
                 .filter_map(|&s| sigma_full_to_cnt(s, z_bnd_sum, middle_n))
                 .collect::<Vec<_>>()
         };
-        assert!(!z_counts.is_empty(),
-            "n={n}: sigma_full_to_cnt gives empty V_z for |σ_Z|={abs_z}, bnd_sum={z_bnd_sum}");
+        assert!(
+            !z_counts.is_empty(),
+            "n={n}: sigma_full_to_cnt gives empty V_z for |σ_Z|={abs_z}, bnd_sum={z_bnd_sum}"
+        );
         let z_tmpl = sat_z_middle::LagTemplate::new(n, k);
         let mut z_solver = z_tmpl.build_base_solver_quad_pb_pb_set(middle_n, &z_counts);
-        sat_z_middle::fill_z_solver_quad_pb_with_boundary(&mut z_solver, &z_tmpl, n, m, middle_n, &z_boundary, &w);
+        sat_z_middle::fill_z_solver_quad_pb_with_boundary(
+            &mut z_solver,
+            &z_tmpl,
+            n,
+            m,
+            middle_n,
+            &z_boundary,
+            &w,
+        );
         let z_mid_lits: Vec<i32> = (0..middle_n).map(|i| (i + 1) as i32).collect();
-        for (i, &v) in z[k..k+middle_n].iter().enumerate() {
-            z_solver.add_clause([if v == 1 { z_mid_lits[i] } else { -z_mid_lits[i] }]);
+        for (i, &v) in z[k..k + middle_n].iter().enumerate() {
+            z_solver.add_clause([if v == 1 {
+                z_mid_lits[i]
+            } else {
+                -z_mid_lits[i]
+            }]);
         }
-        assert_eq!(z_solver.solve(), Some(true),
-            "n={n}: Z-middle SAT rejects canonical Z middle (V_z={z_counts:?}, σ_Z={sigma_z})");
+        assert_eq!(
+            z_solver.solve(),
+            Some(true),
+            "n={n}: Z-middle SAT rejects canonical Z middle (V_z={z_counts:?}, σ_Z={sigma_z})"
+        );
 
         // (g) External spectral pair filter must accept canonical (Z, W).
         let spectral_z = SpectralFilter::new(n, 128);
@@ -2664,8 +3736,10 @@ mod tests {
             .unwrap_or_else(|| panic!("n={n}: canonical W fails individual spectral filter"));
         let mut z_spec = vec![0.0; w_spec.len()];
         compute_spectrum_into(&z, &spectral_z, &mut fft_z, &mut z_spec);
-        assert!(spectral_pair_ok(&z_spec, &w_spec, pair_bound),
-            "n={n}: canonical (Z, W) fails external spectral_pair_ok");
+        assert!(
+            spectral_pair_ok(&z_spec, &w_spec, pair_bound),
+            "n={n}: canonical (Z, W) fails external spectral_pair_ok"
+        );
 
         // (g2) In-SAT 167-freq per-freq spectral bound must accept canonical
         // Z given canonical W.  The pipeline's SolveZ computes pfb[ω] =
@@ -2682,14 +3756,20 @@ mod tests {
             let cos_slice = &ztab.pos_cos[base..base + nf];
             let sin_slice = &ztab.pos_sin[base..base + nf];
             if wv > 0 {
-                for fi in 0..nf { w_re[fi] += cos_slice[fi]; w_im[fi] += sin_slice[fi]; }
+                for fi in 0..nf {
+                    w_re[fi] += cos_slice[fi];
+                    w_im[fi] += sin_slice[fi];
+                }
             } else {
-                for fi in 0..nf { w_re[fi] -= cos_slice[fi]; w_im[fi] -= sin_slice[fi]; }
+                for fi in 0..nf {
+                    w_re[fi] -= cos_slice[fi];
+                    w_im[fi] -= sin_slice[fi];
+                }
             }
         }
-        let pfb: Vec<f64> = (0..nf).map(|fi|
-            (pair_bound - w_re[fi]*w_re[fi] - w_im[fi]*w_im[fi]).max(0.0)
-        ).collect();
+        let pfb: Vec<f64> = (0..nf)
+            .map(|fi| (pair_bound - w_re[fi] * w_re[fi] - w_im[fi] * w_im[fi]).max(0.0))
+            .collect();
         let mut zr = vec![0.0f64; nf];
         let mut zi = vec![0.0f64; nf];
         for (pos, &zv) in z.iter().enumerate() {
@@ -2697,16 +3777,24 @@ mod tests {
             let cs = &ztab.pos_cos[base..base + nf];
             let sn = &ztab.pos_sin[base..base + nf];
             if zv > 0 {
-                for fi in 0..nf { zr[fi] += cs[fi]; zi[fi] += sn[fi]; }
+                for fi in 0..nf {
+                    zr[fi] += cs[fi];
+                    zi[fi] += sn[fi];
+                }
             } else {
-                for fi in 0..nf { zr[fi] -= cs[fi]; zi[fi] -= sn[fi]; }
+                for fi in 0..nf {
+                    zr[fi] -= cs[fi];
+                    zi[fi] -= sn[fi];
+                }
             }
         }
         for fi in 0..nf {
-            let zmag2 = zr[fi]*zr[fi] + zi[fi]*zi[fi];
-            assert!(zmag2 <= pfb[fi] + 1e-6,
+            let zmag2 = zr[fi] * zr[fi] + zi[fi] * zi[fi];
+            assert!(
+                zmag2 <= pfb[fi] + 1e-6,
                 "n={n}: in-SAT 167-freq bound rejects canonical Z at freq {fi}: |Z|²={zmag2} > pfb={}",
-                pfb[fi]);
+                pfb[fi]
+            );
         }
 
         // (h) XY SAT accepts the canonical (x_bits, y_bits).
@@ -2717,7 +3805,12 @@ mod tests {
             zw[s] = 2 * nz + 2 * nw;
         }
         let candidate = CandidateZW { zw_autocorr: zw };
-        let tuple = SumTuple { x: sigma_x, y: sigma_y, z: sigma_z, w: sigma_w };
+        let tuple = SumTuple {
+            x: sigma_x,
+            y: sigma_y,
+            z: sigma_z,
+            w: sigma_w,
+        };
         let template = SatXYTemplate::build(problem, tuple, &radical::SolverConfig::default())
             .expect("template should build");
         let mut state = SolveXyPerCandidate::new(problem, &candidate, &template, k)
@@ -2726,10 +3819,18 @@ mod tests {
         let mut x_bits = 0u32;
         let mut y_bits = 0u32;
         for i in 0..k {
-            if x[i] == 1 { x_bits |= 1 << i; }
-            if x[n - k + i] == 1 { x_bits |= 1 << (k + i); }
-            if y[i] == 1 { y_bits |= 1 << i; }
-            if y[n - k + i] == 1 { y_bits |= 1 << (k + i); }
+            if x[i] == 1 {
+                x_bits |= 1 << i;
+            }
+            if x[n - k + i] == 1 {
+                x_bits |= 1 << (k + i);
+            }
+            if y[i] == 1 {
+                y_bits |= 1 << i;
+            }
+            if y[n - k + i] == 1 {
+                y_bits |= 1 << (k + i);
+            }
         }
         let (result, _stats) = state.try_candidate(x_bits, y_bits);
         match result {
@@ -2744,9 +3845,10 @@ mod tests {
                  tuple=({}, {}, {}, {}), x_bits=0b{:b}, y_bits=0b{:b}",
                 tuple.x, tuple.y, tuple.z, tuple.w, x_bits, y_bits,
             ),
-            XyTryResult::Pruned => panic!("n={n}: try_candidate pruned canonical at GJ/lag pre-filter"),
+            XyTryResult::Pruned => {
+                panic!("n={n}: try_candidate pruned canonical at GJ/lag pre-filter")
+            }
             XyTryResult::Timeout => panic!("n={n}: try_candidate timed out"),
         }
     }
-
 }
