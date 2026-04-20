@@ -140,6 +140,65 @@ Typical pattern observed at `n=18`:
 - Levels `n-3 .. n-1` do 99% of propagation work — expected because
   DFS spends most of its time near leaves.
 
+
+## Smart-clause feature audit (what moves PropKind numbers vs not)
+
+The `prop_by_kind` counters are incremented **only** when `enqueue(...)`
+assigns a previously-unset variable with a non-`Decision` reason.
+So these numbers are "forced literals by reason family", not total CPU
+spent in each mechanism.
+
+### Correctly reflected in current counters
+
+- **CNF clause BCP** (including binary implications and learnt clauses)
+  increments `clause` via `Reason::Clause`.
+- **PB / quad-PB / PB-set-eq** propagations increment `pb`, `quadpb`,
+  `pbseteq` respectively.
+- **Native XOR constraints** (when added via `add_xor`) increment `xor`.
+- **MDD forced literals** increment `mdd`.
+
+### Not (fully) reflected / currently misleading
+
+1. **Binary-watch fastpath (`bin_watch_fastpath`)**
+   - Changes clause-propagation cost, but not reason type.
+   - Effect appears only indirectly in wall-clock/TTC, not as a new
+     per-feature counter.
+
+2. **Clause DB maintenance (`reduce_db`, vivification, compaction)**
+   - Can materially change runtime and future clause quality.
+   - Not represented in `prop_by_kind`; only downstream clause forcing
+     may change.
+
+3. **Peer clause import (`add_clause_deferred`)**
+   - Import activity is tracked separately (`peer_imports`), but imports
+     do not increment `clause` until they later force literals.
+
+4. **Spectral pruning in current code path**
+   - The active spectral path learns/returns a clause conflict
+     (`Reason::Clause`), so pruning work is attributed to `clause`, not
+     `spect`.
+   - `spect` only increments if spectral unit-propagation enqueues
+     literals with `Reason::Spectral` (currently disabled in this path).
+
+5. **Tseitin-encoded XOR logic**
+   - If modeled as CNF clauses (current sync setup), effects are counted
+     under `clause`, not `xor`.
+   - `xor` counter represents only native XOR propagator activity.
+
+6. **`xor_propagation` config flag caveat**
+   - `SolverConfig` exposes this flag, but propagation is currently gated
+     by constraint presence (`xor_constraints`) rather than the flag in
+     the hot `propagate()` path. Treat this as a wiring gap when
+     interpreting "feature on/off" experiments.
+
+### Practical TTC implication
+
+A SAT feature can improve TTC without moving the corresponding
+`PropKind` bucket if it changes cost per propagation (fast paths,
+vivification, clause exchange) instead of changing which propagator
+*caused* assignments. Use PropKind together with wall-time and stage
+throughput, not as a standalone cost model.
+
 ## How to read a run together
 
 1. Block 2's `TTC_parallel` is the headline. If it's too large to

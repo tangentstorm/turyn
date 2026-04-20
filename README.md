@@ -140,6 +140,7 @@ TURYN_THREADS=8 target/release/turyn --n=56 --wz=apart --mdd-k=10 --sat-secs=30
 - `docs/CANONICAL.md` — Turyn symmetry group (T1..T4) and BDKR canonical form.
 - `docs/PROFILING.md` — how to profile in this environment.
 - `IDEAS.md` — experiment log with per-idea TTC measurements.
+- `docs/TTC.md` — per-`--wz` TTC formulas and the uniform TTC contract.
 
 ## References
 
