@@ -20,23 +20,55 @@ target/release/gen_mdd 7
 target/release/gen_mdd 10
 
 # Default: --wz=together with auto-selected mdd-k, parallel across all cores.
-target/release/turyn --n=26
+target/release/turyn search --n=26
 
 # Other producers for the same XY SAT fast path:
-target/release/turyn --n=26 --wz=cross                 # brute-force Z × W
-target/release/turyn --n=26 --wz=apart --mdd-k=7       # MDD walker, SolveW → SolveZ
-target/release/turyn --n=26 --wz=together --mdd-k=7    # MDD walker, combined W+Z SAT
-target/release/turyn --n=56 --wz=apart --mdd-k=10 --sat-secs=60
+target/release/turyn search --n=26 --wz=cross                 # brute-force Z × W
+target/release/turyn search --n=26 --wz=apart --mdd-k=7       # MDD walker, SolveW → SolveZ
+target/release/turyn search --n=26 --wz=together --mdd-k=7    # MDD walker, combined W+Z SAT
+target/release/turyn search --n=56 --wz=apart --mdd-k=10 --sat-secs=60
 
 # Unified 4-sequence walker — no MDD file needed:
-target/release/turyn --n=18 --wz=sync --sat-secs=30
+target/release/turyn search --n=18 --wz=sync --sat-secs=30
 
 # Stochastic local search (simulated annealing), works up to TT(18):
-target/release/turyn --n=16 --stochastic
+target/release/turyn guess --n=16 --stochastic-secs=10
 ```
 
-Run `target/release/turyn -h` for the full flag list (problem parameters,
-tuning knobs, debugging helpers).
+Run `target/release/turyn help` for the full verb+flag list.
+
+## CLI protocol (verb-first)
+
+The CLI is verb-first. High-level flow:
+
+- `turyn search ...`  
+  Exhaustive SAT/MDD pipeline search (`--wz=cross|apart|together|sync`),
+  including SAT tuning, MDD controls, and conjecture flags. This path
+  always reports TTC-style progress.
+
+- `turyn guess ...`  
+  Non-exhaustive guess mode (currently stochastic local search).
+
+- `turyn verify ...`  
+  Verify one candidate TT quadruple.
+  - `turyn verify X,Y,Z,W`
+  - or `turyn verify --verify=X,Y,Z,W`
+
+- `turyn tuples --n=<N>`  
+  Print Phase-A tuple shells (`--phase-a` equivalent).
+
+- `turyn dump --n=<N> --dump-dimacs=<PATH> ...`  
+  Build the SAT encoding and write DIMACS instead of running search.
+
+- `turyn list --n=<N>`  
+  Print known TT(n) entries from `known_solutions.txt` in project format
+  plus a copy/paste `--verify=...` line.
+
+- `turyn help` (or no args)  
+  Show help.
+
+Legacy compatibility remains: `turyn --n=... [OPTIONS]` still maps to
+`turyn search ...`.
 
 ## Search architecture
 
@@ -49,7 +81,7 @@ Enumerate integer 4-tuples `(x, y, z, w)` satisfying
 `x² + y² + 2z² + 2w² = 6n − 2`, where x, y, z are even and w is odd. These
 fix the required sum of each sequence. Typically ~100-300 tuples per n.
 
-### Producer modes (`--wz`)
+### Producer modes (`search --wz=...`)
 
 All four modes feed into the same XY SAT fast path
 (`SolveXyPerCandidate::try_candidate`); they differ only in how the
@@ -98,13 +130,13 @@ express the quadratic PB / spectral / MDD propagators.
 ### Correctness smoke test (finds TT(18) in <1 s)
 
 ```bash
-target/release/turyn --n=18 --wz=apart --mdd-k=5 --sat-secs=10
+target/release/turyn search --n=18 --wz=apart --mdd-k=5 --sat-secs=10
 ```
 
 ### Time-to-cover throughput (n=56, primary optimisation metric)
 
 ```bash
-target/release/turyn --n=56 --wz=apart --mdd-k=10 --sat-secs=30
+target/release/turyn search --n=56 --wz=apart --mdd-k=10 --sat-secs=30
 ```
 
 The "Time to cover" (TTC) line is the headline metric —
@@ -128,7 +160,7 @@ prints a cross-size TTC summary after divan's wall-clock table.
 ### Override thread count
 
 ```bash
-TURYN_THREADS=8 target/release/turyn --n=56 --wz=apart --mdd-k=10 --sat-secs=30
+TURYN_THREADS=8 target/release/turyn search --n=56 --wz=apart --mdd-k=10 --sat-secs=30
 ```
 
 ## Docs

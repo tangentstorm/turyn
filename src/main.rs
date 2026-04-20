@@ -42,14 +42,30 @@ use crate::xy_sat::*;
 /// covers a dense-enough grid that post-hoc FFT still finds near-zero false-negatives.
 pub(crate) const SPECTRAL_FREQS: usize = 64;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliVerb {
+    Search,
+    Guess,
+    Verify,
+    Tuples,
+    Dump,
+    List,
+    Help,
+}
+
 fn print_help() {
     eprintln!("turyn - Find Turyn-type sequences TT(n) for constructing Hadamard matrices");
     eprintln!();
-    eprintln!("Searches for four {{+1,-1}} sequences (X,Y,Z,W) whose combined aperiodic");
-    eprintln!("autocorrelations vanish. Pipeline: Phase A enumerates sum-tuples, Phase B");
-    eprintln!("generates Z/W candidates with spectral filtering, Phase C solves X/Y via SAT.");
+    eprintln!("Verb-first CLI:");
+    eprintln!("  turyn help                          Show this help");
+    eprintln!("  turyn search [OPTIONS]              SAT/MDD/conjecture exhaustive search (tracks TTC)");
+    eprintln!("  turyn guess [OPTIONS]               Non-exhaustive guess mode (currently stochastic)");
+    eprintln!("  turyn verify [SEQ_OR_OPTIONS]       Verify one candidate");
+    eprintln!("  turyn tuples --n=<N>                Print Phase-A tuple shells");
+    eprintln!("  turyn dump --n=<N> --dump-dimacs=<PATH> [search options]");
+    eprintln!("  turyn list --n=<N>                  Print known TT(n) entries from known_solutions.txt");
     eprintln!();
-    eprintln!("USAGE: turyn --n=<N> [OPTIONS]");
+    eprintln!("Legacy compatibility: `turyn --n=... [OPTIONS]` still maps to `turyn search ...`.");
     eprintln!();
     eprintln!("  --n=<N>                  Sequence length to search (required)");
     eprintln!();
@@ -68,7 +84,7 @@ fn print_help() {
     eprintln!("                           levels by running autocorrelation pressure. Persistent");
     eprintln!("                           SAT solver enforces full BDKR (i)–(vi). See sync_walker.");
     eprintln!("  --stochastic             Stochastic local search over all four sequences");
-    eprintln!("  --stochastic-secs=<S>    Stochastic search, stop after S seconds (default: 10)");
+    eprintln!("  --stochastic-secs=<S>    Stochastic guess/search cutoff in seconds (default: 10)");
     eprintln!();
     eprintln!("SEARCH TUNING:");
     eprintln!("  --theta=<N>              Number of angle samples for spectral power filtering in");
@@ -88,7 +104,7 @@ fn print_help() {
     eprintln!("  --probing                Run failed literal probing before each SAT solve");
     eprintln!("  --rephasing              Periodically reset phase saving heuristic");
     eprintln!();
-    eprintln!("SEARCH CONJECTURES (hypothetical, off by default):");
+    eprintln!("SEARCH CONJECTURES (implemented, off by default):");
     eprintln!("  --conj-xy-product        XY product-law conjecture: U_i = x_i*y_i satisfies");
     eprintln!("                           U_1 = U_n = +1 and U_i = -U_{{n+1-i}} (2<=i<=n-1).");
     eprintln!("                           Implies X·Y=2. See conjectures/xy-product.md.");
@@ -99,7 +115,7 @@ fn print_help() {
     eprintln!("                           search space (min binomial product) and restrict");
     eprintln!("                           search to it, like --tuple= but automatic.");
     eprintln!();
-    eprintln!("DEBUGGING / TESTING:");
+    eprintln!("VERIFY / DEBUGGING / TESTING:");
     eprintln!("  --verify=<X,Y,Z,W>      Check if four +/- sequences form a valid TT(n)");
     eprintln!("                           Example: --verify=++--+-,+-+-++,+++-,+-+-");
     eprintln!("  --test-zw=<Z,W>          Fix Z/W and only run Phase C (SAT X/Y) on them");
@@ -123,24 +139,20 @@ fn print_help() {
     eprintln!("  -h, --help               Show this help message");
     eprintln!();
     eprintln!("EXAMPLES:");
-    eprintln!("  turyn --n=26                           # auto-selects --wz=together if MDD exists");
-    eprintln!("  turyn --n=26 --wz=cross                # force brute-force Z×W mode");
-    eprintln!("  turyn --n=26 --wz=apart --mdd-k=7      # MDD boundary walker, SolveW→SolveZ");
-    eprintln!("  turyn --n=26 --wz=together --mdd-k=7   # MDD boundary walker, combined W+Z SAT");
-    eprintln!("  turyn --n=18 --mdd-k=5                 # shorthand: implies --wz=apart");
-    eprintln!("  turyn --n=16 --benchmark=3             # benchmark Phase B throughput");
-    eprintln!("  turyn --verify=++--+-,+-+-++,+++-,+-+- # verify a candidate solution");
+    eprintln!("  turyn search --n=26                           # auto-selects --wz=together if MDD exists");
+    eprintln!("  turyn search --n=26 --wz=cross                # force brute-force Z×W mode");
+    eprintln!("  turyn search --n=26 --wz=apart --mdd-k=7      # MDD boundary walker, SolveW→SolveZ");
+    eprintln!("  turyn search --n=26 --wz=together --mdd-k=7   # MDD boundary walker, combined W+Z SAT");
+    eprintln!("  turyn guess --n=26 --stochastic-secs=10       # stochastic non-exhaustive guess");
+    eprintln!("  turyn tuples --n=26                           # print tuple shells");
+    eprintln!("  turyn verify ++--+-,+-+-++,+++-,+-+-          # verify a candidate solution");
+    eprintln!("  turyn dump --n=26 --dump-dimacs=tt26.cnf      # write CNF instead of searching");
+    eprintln!("  turyn list --n=26                             # show known TT(26) entries");
 }
 
 
-fn parse_args() -> SearchConfig {
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
-        print_help();
-        std::process::exit(0);
-    }
-    let mut cfg = SearchConfig::default();
-    for arg in &args {
+fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
+    for arg in args {
         if let Some(v) = arg.strip_prefix("--n=") {
             if let Ok(n) = v.parse::<usize>() {
                 cfg.problem = Problem::new(n);
@@ -198,10 +210,6 @@ fn parse_args() -> SearchConfig {
                 cfg.test_tuple = Some(SumTuple { x: parts[0], y: parts[1], z: parts[2], w: parts[3] });
             }
         } else if let Some(v) = arg.strip_prefix("--outfix=") {
-            // Requires both `--n=` and `--mdd-k=` to be parsed first so
-            // we know how many hex digits to expect.  CLI loop processes
-            // args in order; if `--outfix=` comes first, the user will
-            // see a nice error.
             if cfg.problem.n == 0 {
                 eprintln!("error: --outfix requires --n=<N> first");
                 std::process::exit(2);
@@ -215,13 +223,9 @@ fn parse_args() -> SearchConfig {
         } else if arg == "--no-quad-pb" {
             cfg.quad_pb = false;
         } else if arg == "--wz-together" {
-            // Legacy alias: equivalent to --wz=together. Kept for
-            // backward compat; the canonical flag is --wz=together.
             cfg.wz_together = true;
             if cfg.wz_mode.is_none() { cfg.wz_mode = Some(WzMode::Together); }
         } else if let Some(v) = arg.strip_prefix("--wz=") {
-            // Canonical (Z, W) producer selection. Explicit --wz always
-            // wins over any shorthand that may have implied a mode.
             let mode = match v {
                 "cross" => WzMode::Cross,
                 "together" => WzMode::Together,
@@ -237,7 +241,6 @@ fn parse_args() -> SearchConfig {
             cfg.wz_together = matches!(mode, WzMode::Together);
         } else if let Some(v) = arg.strip_prefix("--mdd-k=") {
             cfg.mdd_k = v.parse().unwrap_or(8);
-            // Shorthand: --mdd-k=N alone implies --wz=apart.
             if cfg.wz_mode.is_none() { cfg.wz_mode = Some(WzMode::Apart); }
         } else if let Some(v) = arg.strip_prefix("--mdd-extend=") {
             cfg.mdd_extend = v.parse().unwrap_or(0);
@@ -262,8 +265,81 @@ fn parse_args() -> SearchConfig {
             std::process::exit(1);
         }
     }
-    // --n is required unless --verify or --test-zw supply their own sequences
-    if cfg.problem.n == 0 && cfg.verify_seqs.is_none() && cfg.test_zw.is_none() {
+}
+
+fn parse_args() -> (CliVerb, SearchConfig) {
+    let raw_args: Vec<String> = env::args().skip(1).collect();
+    if raw_args.is_empty() {
+        print_help();
+        std::process::exit(0);
+    }
+    if raw_args[0] == "-h" || raw_args[0] == "--help" || raw_args[0] == "help" {
+        return (CliVerb::Help, SearchConfig::default());
+    }
+    let (verb, args): (CliVerb, Vec<String>) = if raw_args[0].starts_with('-') {
+        // Legacy compatibility: no explicit verb means `search`.
+        (CliVerb::Search, raw_args)
+    } else {
+        let verb = match raw_args[0].as_str() {
+            "search" => CliVerb::Search,
+            "guess" => CliVerb::Guess,
+            "verify" => CliVerb::Verify,
+            "tuples" => CliVerb::Tuples,
+            "dump" => CliVerb::Dump,
+            "list" => CliVerb::List,
+            "help" => CliVerb::Help,
+            other => {
+                eprintln!("error: unknown verb '{}'\n", other);
+                print_help();
+                std::process::exit(1);
+            }
+        };
+        (verb, raw_args[1..].to_vec())
+    };
+    let mut cfg = SearchConfig::default();
+    match verb {
+        CliVerb::Help => {}
+        CliVerb::Verify => {
+            if args.len() == 1 && !args[0].starts_with("--") {
+                let parts: Vec<&str> = args[0].split(',').collect();
+                if parts.len() == 4 {
+                    cfg.verify_seqs = Some([parts[0].to_string(), parts[1].to_string(), parts[2].to_string(), parts[3].to_string()]);
+                } else {
+                    eprintln!("error: verify expects one comma-separated X,Y,Z,W payload");
+                    std::process::exit(1);
+                }
+            } else {
+                parse_search_like_options(&args, &mut cfg);
+            }
+            if cfg.verify_seqs.is_none() {
+                eprintln!("error: verify requires `turyn verify X,Y,Z,W` or `--verify=...`");
+                std::process::exit(1);
+            }
+        }
+        CliVerb::Tuples => {
+            parse_search_like_options(&args, &mut cfg);
+            cfg.phase_only = Some("phase-a".to_string());
+        }
+        CliVerb::Dump => {
+            parse_search_like_options(&args, &mut cfg);
+            if cfg.dump_dimacs.is_none() {
+                eprintln!("error: dump requires --dump-dimacs=<PATH>");
+                std::process::exit(1);
+            }
+        }
+        CliVerb::Guess => {
+            parse_search_like_options(&args, &mut cfg);
+            cfg.stochastic = true;
+        }
+        CliVerb::List | CliVerb::Search => {
+            parse_search_like_options(&args, &mut cfg);
+        }
+    }
+    if verb == CliVerb::Help {
+        return (verb, cfg);
+    }
+    // --n is required unless verify/test-zw provide their own sequences
+    if cfg.problem.n == 0 && cfg.verify_seqs.is_none() && cfg.test_zw.is_none() && verb != CliVerb::Verify {
         eprintln!("error: --n=<N> is required\n");
         print_help();
         std::process::exit(1);
@@ -290,7 +366,7 @@ fn parse_args() -> SearchConfig {
             eprintln!("warning: --conj-tuple found no valid sum-tuples for n={}", cfg.problem.n);
         }
     }
-    cfg
+    (verb, cfg)
 }
 
 
@@ -375,15 +451,59 @@ fn run_info() -> String {
     format!("host={}, commit={}", hostname, git_hash)
 }
 
+fn list_known_solutions(n_filter: Option<usize>) {
+    let text = match std::fs::read_to_string("known_solutions.txt") {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: failed to read known_solutions.txt: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let mut matched = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 { continue; }
+        let Ok(n) = parts[0].parse::<usize>() else { continue; };
+        if let Some(want) = n_filter {
+            if n != want { continue; }
+        }
+        let x = parts[1];
+        let y = parts[2];
+        let z = parts[3];
+        let w = parts[4];
+        println!("TT({}):", n);
+        println!("  X={}", x);
+        println!("  Y={}", y);
+        println!("  Z={}", z);
+        println!("  W={}", w);
+        println!("  --verify={},{},{},{}", x, y, z, w);
+        matched += 1;
+    }
+    if matched == 0 {
+        if let Some(n) = n_filter {
+            println!("No known TT({}) entries in known_solutions.txt", n);
+        } else {
+            println!("No entries found in known_solutions.txt");
+        }
+    }
+}
+
 
 fn main() {
-    let mut cfg = parse_args();
+    let (verb, mut cfg) = parse_args();
+    if verb == CliVerb::Help {
+        print_help();
+        return;
+    }
     // Resolve auto-defaults up-front so we can echo the fully-filled-in
     // settings as the very first line of output. Only the unified search
     // branch picks --wz / --mdd-k automatically; the other branches
     // (verify, phase-only, dump-dimacs, benchmark, stochastic) just use
     // what the user passed.
-    let going_to_unified_search = cfg.verify_seqs.is_none()
+    let going_to_unified_search = matches!(verb, CliVerb::Search)
+        && cfg.verify_seqs.is_none()
         && cfg.test_zw.is_none()
         && cfg.phase_only.is_none()
         && cfg.dump_dimacs.is_none()
@@ -400,6 +520,10 @@ fn main() {
         resolved_mode_k.map(|(_, k)| k),
     ));
     let cfg = cfg;
+    if verb == CliVerb::List {
+        list_known_solutions(Some(cfg.problem.n));
+        return;
+    }
     if let Some(ref seqs) = cfg.verify_seqs {
         let x = parse_seq(&seqs[0]);
         let y = parse_seq(&seqs[1]);

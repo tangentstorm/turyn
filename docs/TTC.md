@@ -22,6 +22,26 @@ A mode is TTC-consistent if it defines:
    subproblems and fractional credit to partially explored ones,
 3. a rate derived from that same numerator.
 
+## Canonical metric set (keep this narrow)
+
+To avoid metric sprawl, treat these as the **only primary metrics** for
+optimization decisions:
+
+1. **TTC (parallel)**
+   - Main success metric (`Time to cover` in pipeline modes,
+     `TTC_parallel`/direct parallel TTC in sync).
+2. **Effective coverage progress**
+   - `effective / total_mass` as reported in progress lines.
+3. **Timeout coverage quality**
+   - XY timeout rate + average timeout coverage credit (so TTC deltas are
+     not confused with changed timeout behavior).
+4. **Conjecture activity counters (only when enabled)**
+   - Currently just `--conj-zw-bound rejects`.
+
+Everything else (per-stage solve counts, propagator-family splits,
+per-level tables) is **diagnostic-only** and should be consulted only
+when one of the four primary metrics moves unexpectedly.
+
 ## Path-by-path implementation
 
 ## 1) `--wz=cross`
@@ -189,72 +209,86 @@ credit even when raw solves/sec is flat.
 
 ## Search-conjecture options and TTC impact
 
-### Implementation status in this checkout
+### Implementation status (April 20, 2026)
 
-The current CLI/parser in this tree does **not** yet expose the
-conjectural flags. Help + parser currently recognize the existing mode
-and SAT tuning flags, and unknown flags error out.
+The conjectural search flags are now implemented and wired through the
+CLI/parser:
 
-So at this revision, `--tuple-mode`, `--xy-product-law`, and
-`--zw-u-bound-tight` should be treated as **design-plan options**, not
-runtime options.
+- `--conj-xy-product` / `--no-conj-xy-product`
+- `--conj-zw-bound` / `--no-conj-zw-bound`
+- `--conj-tuple` / `--no-conj-tuple`
 
-### Planned conjecture knobs (from search-plan docs)
+Current behavior by mode:
 
-The conjecture-oriented plan files describe three optional search knobs:
+- `--conj-xy-product`: applied where an XY SAT template is built
+  (`cross`, `apart`, `together`).
+- `--conj-zw-bound`: applied as an XY-stage prefilter on candidate
+  `(Z, W)` extensions (`cross`, `apart`, `together`), with explicit
+  reject counts in pipeline summary.
+- `--conj-tuple`: auto-picks one tuple (if `--test-tuple` is absent)
+  and restricts tuple enumeration to that single shell.
+- `--wz=sync`: currently ignores these conjecture toggles; sync TTC
+  remains governed by walker telemetry (`project_ttc` and direct
+  coverage-product TTC).
 
-- `--tuple-mode=signed|positive`
-- `--xy-product-law`
-- `--zw-u-bound-tight`
+### Quick TTC sanity check (`n=18`, `--wz=apart`, `--mdd-k=7`, `--sat-secs=8`)
 
-(See `best-search-plan.md` and the conjecture notes.)
+Single-sample runs (2 threads) showed:
 
-### `--tuple-mode=positive`
+- baseline: `Time to cover ≈ 1.3m`
+- `--conj-xy-product`: `≈ 1.3m`
+- `--conj-zw-bound`: `≈ 1.4m` (`--conj-zw-bound rejects: 0` in sample)
+- `--conj-tuple`: `≈ 1.2m` with much larger reported progress
+  (`~10%` vs `<1%` baseline)
+- all three flags: `≈ 1.2m`
 
-Expected TTC effect:
-- **Denominator drop** if positive tuples are treated as orbit
-  representatives and the omitted signed tuples are provably redundant.
-- If implemented as a pure "do less search" heuristic without a proof
-  of full-orbit recovery, this changes the solved problem definition
-  rather than just improving TTC.
+Interpretation: in `apart/together`, TTC denominator is still
+`live_zw_paths`, so XY-only pruning mainly changes the rate term. Tuple
+restriction can make progress look much faster while denominator still
+references the unconstrained MDD boundary mass.
 
-Contract guidance:
-- Only count as TTC improvement for the *same* problem when coverage of
-  omitted signed shells is guaranteed by symmetry reconstruction.
+### Flag-by-flag TTC expectations
 
-### `--xy-product-law`
+#### `--conj-tuple`
 
-Expected TTC effect:
-- Directly trims XY subspace by forcing mirror-product relations
-  (`x_i y_i x_{n+1-i} y_{n+1-i} = -1` interior), so denominator should
-  drop materially.
-- In current instrumentation, this drop is only partially reflected:
-  cross sees fewer candidates pushed; apart/together may not fully
-  reflect per-boundary XY-mass reduction if boundary count is unchanged.
+Expected effect:
+- Strong cut in tuple-space work by restricting to one shell.
+- In current TTC instrumentation this can inflate apparent progress if
+  denominator is interpreted as unconstrained boundary mass.
+
+Contract note:
+- Treat this as **problem-restriction mode** unless you separately
+  account for symmetry/completeness recovery over omitted tuples.
+
+#### `--conj-xy-product`
+
+Expected effect:
+- Trims XY subspace via mirror-product equalities (`U_i = -U_{n+1-i}`),
+  typically reducing candidate solves and/or SAT work per boundary.
 
 Contract risk:
-- If conjectural law is false for some valid TT instances, TTC can look
-  dramatically better while completeness is silently lost.
+- If conjecture fails on valid instances, TTC may improve by excluding
+  real solutions.
 
-### `--zw-u-bound-tight`
+#### `--conj-zw-bound`
 
-Expected TTC effect:
-- Adds high-lag ZW equality constraints derived from `U`, pruning ZW
-  candidates earlier and increasing effective coverage rate.
-- Should reduce denominator in modes where the pruned ZW boundaries are
-  removed before XY solving.
+Expected effect:
+- Adds high-lag equality checks tied to `U`, pruning `(Z,W)` candidates
+  before expensive XY solve attempts.
+- Telemetry includes `--conj-zw-bound rejects` to expose whether the
+  rule is active at the sampled `n`/`k`.
 
 Contract risk:
-- As with `--xy-product-law`, this is conjectural. A wrong equality rule
-  yields optimistic TTC by cutting away valid search mass.
+- Same as above: if incorrect, TTC becomes optimistic through invalid
+  pruning.
 
-### Recommendation for conjecture-mode TTC reporting
+### Reporting rule for conjecture runs
 
-When any conjectural option is enabled, print TTC with an explicit mode
-qualifier, e.g.:
+When any `--conj-*` option is enabled, report TTC with a qualifier:
 
 - `TTC (conjecture-constrained)`
 - `TTC (unconstrained baseline)`
 
-and never compare those two as like-for-like unless a proof (or an
-independent completeness argument) is provided.
+Do not compare these as apples-to-apples unless completeness of the
+constrained run is justified (proof, or independent reconstruction of
+omitted search mass).
