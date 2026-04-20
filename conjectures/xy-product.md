@@ -41,7 +41,7 @@ since negating exactly one of `X` or `Y` flips the sign of `U`.
 
 ## Why This Looks Plausible
 
-Empirically, the Kharaghani corpus up to `n = 32` satisfies:
+Empirically, the current published data corpus up to `n = 32` satisfies:
 
 - `U_1 = U_n = +1`
 - `U_i = -U_{n+1-i}` for every interior index
