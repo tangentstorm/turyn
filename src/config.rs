@@ -288,8 +288,22 @@ pub(crate) struct SearchConfig {
     /// U_i = -U_{n+1-i} for 2 <= i <= n-1. Endpoint pins already hold
     /// from rule (i) (x_0=y_0=x_{n-1}=y_{n-1}=+1), so only the middle
     /// pairwise equalities are added. Enabled via `--conj-xy-product`
-    /// (implies `X · Y = 2`; see best-search-plan.md §3).
+    /// (implies `X · Y = 2`; see conjectures/xy-product.md).
     pub(crate) conj_xy_product: bool,
+    /// ZW high-lag U-bound tightness conjecture: enforce equality
+    /// `|N_Z(s) + N_W(s)| = ((n - s) + N_U(s)) / 2` at s in
+    /// {n-1, n-2, n-3}, where `N_U(s) = Σ_i u_i u_{i+s}`,
+    /// `u_i = x_i y_i`. Applied as an XY-stage pre-filter on known
+    /// z,w boundary bits + x,y boundary bits. Enabled via
+    /// `--conj-zw-bound` (see conjectures/zw-u-bound-tight.md).
+    pub(crate) conj_zw_bound: bool,
+    /// Auto-select a single sum-tuple with the fewest raw candidate
+    /// sequences (minimising `C(n,·) * C(n,·) * C(n,·) * C(n-1,·)`)
+    /// and restrict the search to it, like `--tuple=` but automatic.
+    /// If `--tuple=` is also provided it takes priority and this flag
+    /// is a no-op. Enabled via `--conj-tuple` (see
+    /// conjectures/positive-tuple.md).
+    pub(crate) conj_tuple: bool,
 }
 
 
@@ -347,6 +361,8 @@ impl Default for SearchConfig {
             wz_together: false,
             wz_mode: None,
             conj_xy_product: false,
+            conj_zw_bound: false,
+            conj_tuple: false,
         }
     }
 }
