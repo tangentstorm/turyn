@@ -1,0 +1,139 @@
+use std::fmt;
+use std::time::Duration;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
+pub struct MassValue(pub f64);
+
+impl MassValue {
+    pub const ZERO: Self = Self(0.0);
+
+    pub fn saturating_sub(self, rhs: Self) -> Self {
+        Self((self.0 - rhs.0).max(0.0))
+    }
+}
+
+impl fmt::Display for MassValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:.6}", self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoverageQuality {
+    Exact,
+    Estimated,
+    LowerBound,
+    Hybrid,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MassDelta {
+    pub covered_exact: MassValue,
+    pub covered_partial: MassValue,
+}
+
+impl MassDelta {
+    pub fn total_covered(self) -> MassValue {
+        MassValue(self.covered_exact.0 + self.covered_partial.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MassSnapshot {
+    pub total: MassValue,
+    pub covered_exact: MassValue,
+    pub covered_partial: MassValue,
+}
+
+impl MassSnapshot {
+    pub fn new(total: MassValue) -> Self {
+        Self {
+            total,
+            covered_exact: MassValue::ZERO,
+            covered_partial: MassValue::ZERO,
+        }
+    }
+
+    pub fn apply_delta(&mut self, delta: MassDelta) {
+        self.covered_exact = MassValue((self.covered_exact.0 + delta.covered_exact.0).max(0.0));
+        self.covered_partial =
+            MassValue((self.covered_partial.0 + delta.covered_partial.0).max(0.0));
+
+        if self.covered_exact.0 > self.total.0 {
+            self.covered_exact = self.total;
+        }
+
+        let partial_cap = (self.total.0 - self.covered_exact.0).max(0.0);
+        if self.covered_partial.0 > partial_cap {
+            self.covered_partial = MassValue(partial_cap);
+        }
+    }
+
+    pub fn covered(&self) -> MassValue {
+        MassValue(self.covered_exact.0 + self.covered_partial.0)
+    }
+
+    pub fn remaining(&self) -> MassValue {
+        self.total.saturating_sub(self.covered())
+    }
+
+    pub fn throughput_per_sec(&self, elapsed: Duration) -> MassValue {
+        let secs = elapsed.as_secs_f64();
+        if secs <= f64::EPSILON {
+            MassValue::ZERO
+        } else {
+            MassValue(self.covered().0 / secs)
+        }
+    }
+
+    pub fn ttc(&self, elapsed: Duration) -> Option<Duration> {
+        let rate = self.throughput_per_sec(elapsed).0;
+        if rate <= f64::EPSILON {
+            None
+        } else {
+            Some(Duration::from_secs_f64(self.remaining().0 / rate))
+        }
+    }
+}
+
+pub trait SearchMassModel: Send + Sync {
+    fn total_mass(&self) -> MassValue;
+    fn covered_mass(&self) -> MassValue;
+    fn quality(&self) -> CoverageQuality;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remaining_mass_never_negative() {
+        let mut snap = MassSnapshot::new(MassValue(10.0));
+        snap.apply_delta(MassDelta {
+            covered_exact: MassValue(12.0),
+            covered_partial: MassValue(1.0),
+        });
+        assert_eq!(snap.covered().0, 10.0);
+        assert_eq!(snap.remaining().0, 0.0);
+    }
+
+    #[test]
+    fn covered_mass_is_monotone_for_positive_deltas() {
+        let mut snap = MassSnapshot::new(MassValue(10.0));
+        let mut prev = snap.covered().0;
+        for _ in 0..4 {
+            snap.apply_delta(MassDelta {
+                covered_exact: MassValue(1.0),
+                covered_partial: MassValue(0.5),
+            });
+            assert!(snap.covered().0 >= prev);
+            prev = snap.covered().0;
+        }
+    }
+
+    #[test]
+    fn ttc_is_none_when_rate_is_zero() {
+        let snap = MassSnapshot::new(MassValue(10.0));
+        assert!(snap.ttc(Duration::from_secs(5)).is_none());
+    }
+}
