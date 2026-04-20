@@ -111,35 +111,74 @@ This makes the mod-4 condition visible:
 
 but it does not by itself force the next skew relation. The proof has to use more structure than parity alone.
 
-## What Is Already Proved
+## Minimal Canonical Assumptions
 
-The first two interior skew identities can be derived from the top-lag equations and the standard canonical boundary rules.
+The argument below appears to need only the endpoint part of the canonical orientation:
 
-### Step 1
+- `x_1 = y_1 = x_n = y_n = +1`
 
-The relation
+Equivalently:
+
+- `U_1 = U_n = +1`
+
+No use is made of the deeper least-index BDKR rules in the induction step itself.
+
+This is stronger than originally expected: if the derivation is correct, the interior skew law is a consequence of the Turyn identities plus the endpoint normalization.
+
+## Base Cases
+
+The induction starts at `k = 2`.
+
+### Base case k = 2
+
+At lag `s = n - 2`:
+
+- `T_2 = N_X(n-2) + N_Y(n-2)`
+- `= x_{n-1}(1 + U_{n-1}) + x_2(1 + U_2)`
+
+There are no interior terms yet.
+
+By the endpoint-pair analysis from the induction step:
+
+- `T_2 ≡ 2 (mod 4)` if and only if `U_{n-1} = -U_2`
+
+But the parity hammer gives:
+
+- `T_2 ≡ 2 (mod 4)`
+
+Hence:
 
 - `U_{n-1} = -U_2`
 
-is proved from:
+### Base case k = 3
 
-- the `s = n - 2` Turyn equation
-- the standard canonical top-boundary rules
-- the already-fixed endpoint values
+At lag `s = n - 3`:
 
-### Step 2
+- `T_3 = x_{n-2}(1 + U_{n-2}) + x_2 x_{n-1}(1 + U_2 U_{n-1}) + x_3(1 + U_3)`
 
-The relation
+From the `k = 2` base case:
+
+- `U_{n-1} = -U_2`
+
+so the middle term is exactly:
+
+- `x_2 x_{n-1}(1 - U_2^2) = 0`
+
+Therefore:
+
+- `T_3 = x_{n-2}(1 + U_{n-2}) + x_3(1 + U_3)`
+
+and again:
+
+- `T_3 ≡ 2 (mod 4)` if and only if `U_{n-2} = -U_3`
+
+Using the parity hammer:
+
+- `T_3 ≡ 2 (mod 4)`
+
+Hence:
 
 - `U_{n-2} = -U_3`
-
-is also derivable from the `s = n - 3` equation.
-
-After simplification, the `XY` side is forced into a `±2` pattern compatible with the parity hammer, and under the local canonical rules this is equivalent to the second skew step.
-
-So the conjecture is no longer purely empirical:
-
-- the first two interior mirror-product identities are genuinely proved
 
 ## The Intended Induction
 
@@ -190,21 +229,146 @@ That is the right indexing pattern for a proof of:
 
 The main unresolved task is to simplify the paired sum cleanly enough that the mod-4 condition isolates the new mirror relation.
 
-## Current Gap
+## Paired-Term Derivation
 
-The missing lemma is essentially:
+The key quantity is:
 
-- under the previously established skew relations near the boundary,
-- the lag-`n-k` `XY` contribution satisfies
-  - `T_k ≡ 2 (mod 4)` if and only if `U_k = -U_{n+1-k}`
+- `T_k = N_X(n-k) + N_Y(n-k)`
+- `= sum_{i=1}^k x_i x_{n-k+i} (1 + U_i U_{n-k+i})`
 
-This has been checked locally for small depths by explicit boundary-state enumeration, but it has not yet been proved in general.
+Assume inductively that:
 
-So the present status is:
+- `U_{n+1-j} = -U_j` for every `2 <= j < k`
 
-- base cases: proved for the first two interior mirror-product relations
-- induction pattern: strongly suggested
-- general step: still open
+We now separate `T_k` into:
+
+- the endpoint terms `i = 1` and `i = k`
+- interior pairs `i` and `k + 1 - i`
+- if `k` is odd, the middle term `i = (k + 1)/2`
+
+### Interior pair formula
+
+For `2 <= i <= k - 1`, pair term `i` with term `k + 1 - i`.
+
+Define:
+
+- `P_{i,k} := x_i x_{n-k+i}(1 + U_i U_{n-k+i})`
+- `+ x_{k+1-i} x_{n+1-i}(1 + U_{k+1-i} U_{n+1-i})`
+
+By the induction hypothesis:
+
+- `U_{n+1-i} = -U_i`
+- `U_{n-k+i} = U_{n+1-(k+1-i)} = -U_{k+1-i}`
+
+So:
+
+- `P_{i,k}`
+- `= x_i x_{n-k+i}(1 - U_i U_{k+1-i})`
+- `+ x_{k+1-i} x_{n+1-i}(1 - U_{k+1-i} U_i)`
+- `= (1 - U_i U_{k+1-i}) (x_i x_{n-k+i} + x_{k+1-i} x_{n+1-i})`
+
+Now:
+
+- `1 - U_i U_{k+1-i}` is either `0` or `2`
+- `x_i x_{n-k+i} + x_{k+1-i} x_{n+1-i}` is in `{-2, 0, 2}`
+
+Therefore:
+
+- every interior pair `P_{i,k}` is a multiple of `4`
+
+### Middle term when k is odd
+
+If `k` is odd, let `m = (k + 1)/2`.
+
+Then the middle summand is:
+
+- `x_m x_{n+1-m} (1 + U_m U_{n+1-m})`
+
+Since `m < k` for `k >= 3`, the induction hypothesis gives:
+
+- `U_{n+1-m} = -U_m`
+
+Hence:
+
+- `1 + U_m U_{n+1-m} = 1 - U_m^2 = 0`
+
+So the middle term vanishes exactly.
+
+### Endpoint pair
+
+The remaining terms are:
+
+- `E_k := x_1 x_{n+1-k}(1 + U_{n+1-k}) + x_k x_n(1 + U_k)`
+
+In the canonical orientation:
+
+- `x_1 = x_n = +1`
+
+so:
+
+- `E_k = x_{n+1-k}(1 + U_{n+1-k}) + x_k(1 + U_k)`
+
+Each factor `1 + U_*` is either:
+
+- `0` if `U_* = -1`
+- `2` if `U_* = +1`
+
+Thus:
+
+- if `U_{n+1-k} = -U_k`, then exactly one of the two endpoint terms is active, so `E_k = ±2`, hence `E_k ≡ 2 (mod 4)`
+- if `U_{n+1-k} = U_k = -1`, then `E_k = 0`
+- if `U_{n+1-k} = U_k = +1`, then `E_k = 2x_{n+1-k} + 2x_k`, which is `0` or `4`, hence `E_k ≡ 0 (mod 4)`
+
+So in every case:
+
+- `E_k ≡ 2 (mod 4)` if and only if `U_{n+1-k} = -U_k`
+
+### Conclusion of the induction step
+
+The full sum `T_k` is:
+
+- `T_k = E_k +` (sum of interior pairs) `+` (optional middle term)
+
+and:
+
+- every interior pair is `0 (mod 4)`
+- the middle term, when present, is exactly `0`
+
+Therefore:
+
+- `T_k ≡ E_k (mod 4)`
+
+But by the parity hammer:
+
+- `T_k ≡ 2 (mod 4)`
+
+Hence:
+
+- `E_k ≡ 2 (mod 4)`
+
+and therefore:
+
+- `U_{n+1-k} = -U_k`
+
+This is exactly the next skew step.
+
+So modulo the base cases and the canonical endpoint assumptions, the induction is complete.
+
+## Updated Status
+
+The proof picture is now:
+
+- base cases: explicit at `k = 2` and `k = 3`
+- general induction step: given by the paired-term derivation above
+- assumptions used: currently just the canonical endpoint pins `x_1 = y_1 = x_n = y_n = +1`
+
+So the main remaining task is no longer algebraic discovery. It is proof cleanup:
+
+1. rewrite the whole argument as a single clean induction theorem
+2. check all indexing carefully in one convention
+3. verify there is no hidden use of stronger BDKR rules
+
+If that all survives, the product law is no longer conjectural in canonical orientation.
 
 ## Solver Interpretation
 
@@ -244,11 +408,54 @@ This is a separate, weaker conjectural search rule, documented in the search pla
 
 ## Next Proof Tasks
 
-The most concrete next steps are:
+At this point the next task is not discovery but cleanup.
 
-1. derive a symbolic paired-term formula for `T_k`
-2. isolate the dependence on `U_k` and `U_{n+1-k}`
-3. prove the interior paired contribution is always `0 (mod 4)`
-4. close the induction
+## Clean Theorem Shape
 
-If that works, the product law becomes a theorem rather than a corpus pattern.
+The statement that now looks provable is:
+
+> **Theorem candidate.**
+> Let `(X, Y, Z, W)` be a Turyn quadruple with
+> `x_1 = y_1 = x_n = y_n = +1`.
+> Define `U_i = x_i y_i`.
+> Then for every `2 <= i <= n - 1`,
+> `U_i = -U_{n+1-i}`.
+
+### Proof skeleton
+
+1. For each `k >= 2`, define
+   - `T_k := N_X(n-k) + N_Y(n-k)`.
+2. By the parity hammer,
+   - `T_k ≡ 2 (mod 4)`.
+3. Base case `k = 2` gives
+   - `U_{n-1} = -U_2`.
+4. Base case `k = 3` gives
+   - `U_{n-2} = -U_3`.
+5. For the induction step:
+   - assume `U_{n+1-j} = -U_j` for `2 <= j < k`
+   - decompose `T_k` into endpoint terms, interior mirror-pairs, and the optional middle term
+   - interior pairs are all `0 (mod 4)`
+   - the middle term is exactly `0`
+   - so `T_k ≡ E_k (mod 4)`
+   - and `E_k ≡ 2 (mod 4)` if and only if `U_{n+1-k} = -U_k`
+   - hence `U_{n+1-k} = -U_k`
+
+This proves the full interior skew law.
+
+## What Should Be Checked Next
+
+The remaining checks are:
+
+1. convert everything to one indexing convention, preferably 0-based to match the Rust code or 1-based to match BDKR, but not both
+2. verify the theorem really uses only:
+   - the Turyn lag identities
+   - the sequence lengths
+   - the endpoint normalization
+3. test the proof statement against a few known examples in both indexing conventions
+4. then formalize the theorem in Lean
+
+So the next serious move is:
+
+- write the proof once in a fully clean, minimal theorem-proof format
+
+rather than continue exploratory algebra.
