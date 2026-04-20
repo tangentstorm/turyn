@@ -3210,3 +3210,215 @@ post-hoc spectrum. Removed the FFT call and the now-unused
   the default (no-tuple) benchmark. Commit removes a stale
   `let _ = &w_spectrum; // used by pair_power below` comment that
   outlived the pair_power check it documented.
+
+## S-series continuation (April 20 2026, autonomous) — sync-focused
+
+**Starting baseline** (post-R8c + backbone): n=22 `--wz=sync --sat-secs=30`
+→ 31.86 M nodes, 468 M cap_rejects (14.7× nodes), 790 K sat_unsat, 0 leaves,
+TTC_parallel ≈ 247,007 s, direct TTC ≈ 522,700 s, per-feature forcings
+86.3 % clause / 13.0 % quadpb / 0.7 % pbseteq. Rate = 1.06 M nodes/s
+aggregate across 16 workers. **Key anomaly**: peer_imports = 128 / 30 s →
+ClauseExchange dormant at MAX_SHARED_LEN=2. **Key concentration**:
+level 18 alone emits 5.4 M clause propagations (79 % of all clause work).
+
+Ten candidate ideas generated this session; top four tried. Priority-
+sorted (highest expected EV first) at the time of writing, *before*
+measurement.
+
+### S29. Raise `MAX_SHARED_LEN` to 3–4 and publish every nogood
+- **TTC mechanism**: rate — lift peer_imports from 4/s to ~1000/s
+  across workers; shared nogoods prune the 468 M cap_reject avalanche.
+- **Evidence**: `avg_nogood = 9.3 / 4.0` (0.43× shrink) — most learnts
+  are 3–10 lits, so MAX=2 filters > 95 % out.
+- **Detection**: peer_imports count, cap_rejects drop, TTC delta.
+- **Risk**: R6 precedent at n=26 saw regressions for MAX ∈ {8, 32, 64}.
+
+### S30. Batch-read `propagations_by_kind_all() → [u64; 7]`
+- **TTC mechanism**: rate — remove 14 counter reads per sibling.
+  32 M nodes × ~3 siblings/node = ~100 M sibling iters × 14 = 1.4 B
+  reads/run used only for per-level telemetry.
+- **Upper-bound check first**: gate the entire pre/post kind-counter
+  block behind `verbose`. A `>3 %` rate shift would greenlight the
+  batched accessor.
+
+### S31. Short-circuit `capacity_violated` inside delta apply
+- **TTC mechanism**: rate × 14× reject-path multiplier.
+- **Idea**: after each delta-event write, check
+  `|sums[ev.lag]| > max_remaining[lvl][ev.lag]` and return early.
+- **Risk (surfaced during implementation)**: multiple events can
+  write the same lag at the same level — partial sums can violate
+  while final sums are feasible. Fundamentally unsound in the
+  mid-delta form.
+
+### S32. Stack-allocate `saved_all_bits` / `saved_sums` / `spec_parent_sums`
+- **TTC mechanism**: rate — remove three per-dfs_body `Vec::clone()`
+  (~8n bytes = ~5.6 GB over a 30-s n=22 run). Expected 2–5 % rate if
+  allocator lock was contended.
+
+### S33. Skip post-harvest `capacity_violated` when `n_harvested == 0`
+- **TTC mechanism**: rate — when harvest sets no new walker bits,
+  state.sums is unchanged from a pre-SAT state that already passed
+  capacity_violated during candidate-building. Post-harvest check is
+  guaranteed-pass.
+
+### S34. Level-18 targeted conflict-limited `solve_with_assumptions` probe
+- **TTC mechanism**: rate — level 18 emits 5.4 M clause forcings
+  (80 % of clause total). Mine dense Tseitin chains into short nogoods
+  per level-18 entry.
+- **Risk**: may not produce unit / binary clauses usable at depth 18;
+  conflict analysis is less productive with dense assumption stacks.
+
+### S35. Trail counter instead of O(n) `num_assigned_in_range(4n)`
+- **TTC mechanism**: rate — called 2× per sibling; O(n) scan each.
+  ~200 M sibling iters × O(n) per scan is small but visible.
+
+### S36. Bit-pack `state.bits` into u64-aligned 16-byte blob
+- **TTC mechanism**: rate — cache footprint 8×; per-sibling
+  `copy_from_slice` becomes a u64 load-store.
+- **Complexity**: requires rewriting `set_bit`, `bit()`,
+  `apply_sum_delta_at`'s bit iteration. Non-trivial.
+
+### S37. Dual-solver pattern: hot SAT-path vs. disposable UNSAT learning
+- **TTC mechanism**: rate — learnt clauses accumulate across all DFS
+  frames; even with `reduce_db()`, watch lists grow over a 30-s run.
+  Disposable 2nd solver for UNSAT analysis keeps hot-path lean.
+
+### S38. Order candidates by watch-list depth of candidate lits
+- **TTC mechanism**: rate — bias sibling order toward
+  "finds-UNSAT-fast" so each frame trims the tree earlier.
+
+---
+
+### Session results (April 20 2026) — **all 4 tried ideas rejected**
+
+Baseline at n=22 `--wz=sync --sat-secs=30` (16 workers):
+- nodes ~31.9M, cap_rejects ~468M (14.7× nodes), sat_unsat ~790K
+- TTC_parallel ≈ 247,000 s, direct TTC ≈ 523,000 s
+- peer_imports = 128 over 30 s (sharing effectively off)
+- level 18 emits 79 % of all clause propagations
+
+Noise floor on this machine:
+- sequential n=18 (deterministic, 132,164 nodes): ±0.9 % elapsed spread
+- parallel n=22 30 s: ~1–1.2 % across back-to-back runs
+
+#### S33 (skip post-harvest `capacity_violated` when `n_harvested == 0`) — **rejected, in noise**
+
+Guarded the line-1853 `capacity_violated` check on `n_harvested > 0`.
+Rationale: when harvest sets no new walker bits, `state.sums` is
+unchanged from the pre-SAT state that already passed capacity_violated
+during candidate-building.
+
+- **Measured**: TTC +0.4 % run 1, −0.7 % run 2 — both inside noise.
+- **Interpretation**: either the post-harvest check is rare (SAT
+  branch hits harvest primarily at shallow levels where there's
+  little sibling activity), or `capacity_violated`'s auto-vectorized
+  O(n) sweep is already so cheap that removing it is invisible.
+- **Counter**: cap_rejects distribution identical (expected; this
+  only affects the SAT-succeeded branch).
+
+#### S29 (raise `MAX_SHARED_LEN` from 2 to 4) — **rejected, catastrophic regression**
+
+Wanted to address `peer_imports = 128 / 30 s` anomaly. At MAX=2 only
+binaries get shared; avg_nogood = 9.3 so most learnts are filtered
+out.
+
+- **Measured**: TT(18) baseline finds in 1.3 s.  With MAX=4 across
+  3 runs of 15 s budget, max_lvl only reached 17 (never hit the leaf
+  at depth 18); total nodes ~1.15 M vs typical 1 M in 1 s. Rate
+  collapsed ~30 × — zero solutions found.
+- **Interpretation**: matches R6's earlier finding. With 16 workers
+  learning ~26 K nogoods/s, even `len ≤ 4` admits enough sharing to
+  bloat each worker's watch lists catastrophically. Each shared
+  ternary goes into 2 watch lists, each shared quad into 2; propagation
+  in `push_assume_frame` slows from µs to ms.
+- **Note**: `add_clause_deferred` is not enough to tame this — volume
+  is the problem, not eager vs. deferred addition.
+
+#### S31 (fused `apply_sum_delta + capacity_violated` with mid-delta short-circuit) — **rejected, UNSOUND**
+
+Hypothesis: check `|sums[ev.lag]| > caps[ev.lag]` after each delta
+event; return early on violation. Would skip remaining events + the
+untouched-lag post-sweep.
+
+- **Bug surfaced by debug_assert at n=10 sibling build**:
+
+  ```
+  level=3  caps=[0,42,46,40,34,28,22,10,0,...]
+  partial (fused mid-loop) sums=[0,0,0,0,0,0,0,2,2,0,...]  ← lag 8 exceeds cap 0!
+  full (ref)           sums=[0,0,0,0,0,0,0,4,0,0,...]     ← lag 8 back at 0
+  ```
+
+- **Root cause**: at a given level, multiple closure events can
+  write the same lag. Event A bumps `sums[lag]` past cap; a later
+  event B cancels it back. The final sum is feasible; the partial
+  sum is not.
+- **Invariant**: capacity must be checked AFTER all deltas applied,
+  not during. This kills the "early-exit during delta" optimization.
+- **Rescue variant** (not attempted here, deferred): after full delta
+  application, scan *touched* lags first then untouched. Saves up to
+  n/2 comparisons on the early-violate case. Expected effect ≤ 1 %
+  given capacity_violated is already auto-vectorized.
+
+#### S40 (stack-local `spec_parent_sums` / `saved_all_bits` / `saved_sums`) — **rejected, slight sequential regression**
+
+Replaced three per-dfs_body `Vec::clone()` calls (total ~8n bytes
+= ~5.6 GB allocations over a 30-s n=22 run) with stack-local
+`[u8; 4 * MAX_N]` / `[i16; MAX_SUMS]` buffers (MAX_N=64).
+
+- **Parallel measurement** (n=22, 30 s, 4 runs each):
+  - Baseline mean TTC ≈ 246,766 s (246K–248K range)
+  - S40 mean TTC ≈ 242,668 s (240K–246K range)
+  - Δ = −1.7 %, distributions overlap — inside parallel noise.
+- **Sequential measurement** (n=18, deterministic 132,164 nodes,
+  4 runs each):
+  - Baseline mean 1.238 s (1.208–1.260 s)
+  - S40 mean 1.258 s (1.248–1.270 s)
+  - Δ = **+1.6 % sequential slowdown** (above 0.9 % noise floor)
+- **Interpretation**: heap allocator hot-path reuses the same
+  free-slots across `clone()` calls, so per-clone cost is already
+  tiny. Stack-array copies incur the same byte-copy work, plus
+  forfeit the allocator's cache-local reuse. Sequential path sees
+  this as a pure regression. Parallel path sees a slight win from
+  reduced allocator contention, but not enough to exceed parallel
+  noise floor of ~11 %.
+- **Lesson**: `Vec::clone()` at this size and frequency is not the
+  bottleneck; don't bother replacing it without a concrete allocator
+  contention signal.
+
+#### Session conclusion — 4 rejects, 0 lands
+
+Four plausible ideas in a row did not clear the noise bar. Prior
+sessions' harvest of easy wins (R1/R8/R8c/backbone = −99.3 % TTC)
+has evidently already picked the low-hanging fruit in the sync
+walker. Further wins likely need:
+
+1. **Architectural denominator work** — MDD-equivalent boundary
+   pre-pruning for sync (noted as next-lever priority #4 in the
+   continuation-session summary above).
+2. **Solver-internal changes** — chronological backtracking, gate
+   recognition, vivification.
+3. **Combined-level walking** (place 2 levels / 8 lits per
+   push_assume_frame) — halves the decision-stack manipulation
+   overhead but needs careful handling of candidate enumeration.
+
+None of these are single-commit "decisive win" material — they are
+multi-session structural work.
+
+#### Ideas generated but not yet tried (for the next session)
+
+- **S31-rescue**: post-delta touched-first capacity scan (sound
+  version).
+- **S32**: bit-pack `state.bits` to u64-aligned 16-byte blob (cache
+  footprint 8×).
+- **S34**: level-18 conflict-budgeted `solve_with_assumptions`
+  probe — aim to mine dense Tseitin chains into short nogoods.
+- **S35**: replace O(n) `num_assigned_in_range(4n)` with a trail
+  counter exposed via radical.
+- **S37**: dual-solver pattern (hot SAT-path vs. disposable UNSAT
+  learning).
+- **S38**: candidate ordering by watch-list depth of the candidate's
+  lits to bias toward "finds-UNSAT-fast" siblings.
+- **Level-concentration attack**: levels 18–20 account for virtually
+  all clause/quadpb work. A targeted propagator or CNF
+  reformulation specialized to that depth range is the highest-EV
+  untried direction.
