@@ -86,6 +86,7 @@ TURYN_THREADS=8 target/release/turyn --n=56 --wz=apart --mdd-k=10 --sat-secs=30
 ## Docs
 
 - `docs/PIPELINE.md`: Overview of all four `--wz` modes and shared building blocks.
+- `docs/UNIFIED_SEARCH_FRAMEWORK_SPEC.md`: Proposed single-engine architecture and migration plan for all `turyn search` paths.
 - `docs/TELEMETRY.md`: Reader's guide to the `--wz=sync` output (per-level table, per-feature forcings, per-(level, kind) matrix, direct/projected TTC).
 - `docs/OPTIMIZATION_LOG.md`: Measured before/after for every optimization.
 - `docs/MDD-OPTIMIZATION-LOG.md`: MDD generation optimizations.
