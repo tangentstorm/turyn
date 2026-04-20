@@ -8,6 +8,8 @@ mod config;
 mod enumerate;
 mod legacy_search;
 mod mdd_pipeline;
+#[cfg(feature = "search-framework")]
+mod search_framework;
 mod spectrum;
 mod stochastic;
 mod sync_walker;
