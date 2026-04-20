@@ -297,11 +297,11 @@ pub(crate) struct SearchConfig {
     /// z,w boundary bits + x,y boundary bits. Enabled via
     /// `--conj-zw-bound` (see conjectures/zw-u-bound-tight.md).
     pub(crate) conj_zw_bound: bool,
-    /// Auto-select a single sum-tuple whose known-solution density
-    /// is highest — `log2(#solutions in data/turyn-type-{n:02}) -
-    /// log2(C(n,·) * C(n,·) * C(n,·) * C(n-1,·))` — and restrict the
-    /// search to it, like `--tuple=` but automatic.  Falls back to
-    /// smallest-space pick when the corpus file is absent.  If
+    /// Auto-select a single sum-tuple with the smallest search space
+    /// (minimum `C(n,·) * C(n,·) * C(n,·) * C(n-1,·)`) and restrict
+    /// the search to it, like `--tuple=` but automatic.  Density
+    /// (#solutions / space) is unknowable a priori at open n, so we
+    /// pick the best proxy we can compute: minimum space.  If
     /// `--tuple=` is also provided it takes priority and this flag
     /// is a no-op. Enabled via `--conj-tuple` (see
     /// conjectures/positive-tuple.md).
