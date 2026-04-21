@@ -340,4 +340,228 @@ lemma middle_term_zero {n : Nat} (S : TurynTypeSeq n) (k : Nat)
     rw [h_neg]; ring
   · omega
 
+/-! ### Paired-sum mod 4 helpers -/
+
+/-
+General pairing lemma: if `f i + f (2m − 1 − i) ≡ 0 (mod 4)`
+for every `i < m`, then `∑_{i<2m} f i ≡ 0 (mod 4)`.
+Proved by induction: peel off the outer pair and apply IH to the shifted function.
+-/
+private lemma sum_paired_mod4 : ∀ (m : Nat) (f : Nat → Int),
+    (∀ i, i < m → (f i + f (2 * m - 1 - i)) % 4 = 0) →
+    (∑ i ∈ Finset.range (2 * m), f i) % 4 = 0 := by
+  -- Rewrite the sum as a sum of pairs.
+  have h_pair : ∀ m : ℕ, ∀ f : ℕ → ℤ,
+      (∑ i ∈ Finset.range (2 * m), f i) =
+      ∑ i ∈ Finset.range m, (f i + f (2 * m - 1 - i)) := by
+    intro m f
+    rw [show 2 * m = m + m from by omega, Finset.sum_range_add]
+    have h_reflect : ∑ i ∈ Finset.range m, f (m + i) =
+        ∑ i ∈ Finset.range m, f (m + m - 1 - i) := by
+      rw [← Finset.sum_range_reflect]
+      exact Finset.sum_congr rfl fun x hx =>
+        congr_arg f (by have := Finset.mem_range.mp hx; omega)
+    rw [h_reflect, ← Finset.sum_add_distrib]
+  exact fun m f hf =>
+    h_pair m f ▸ Int.emod_eq_zero_of_dvd
+      (Finset.dvd_sum fun i hi => Int.dvd_of_emod_eq_zero (hf i (Finset.mem_range.mp hi)))
+
+/-
+Odd-length variant: if `f i + f (2m − i) ≡ 0 (mod 4)` for `i < m` and
+`f m = 0`, then `∑_{i<2m+1} f i ≡ 0 (mod 4)`.
+-/
+private lemma sum_paired_with_middle_mod4 : ∀ (m : Nat) (f : Nat → Int),
+    (∀ i, i < m → (f i + f (2 * m - i)) % 4 = 0) →
+    f m = 0 →
+    (∑ i ∈ Finset.range (2 * m + 1), f i) % 4 = 0 := by
+  intro m f hf hmid
+  -- Rewrite: ∑ range (2m+1) f = f m + ∑ range m (f(·) + f(2m-·))
+  have h_split : ∑ i ∈ Finset.range (2 * m + 1), f i =
+      f m + ∑ i ∈ Finset.range m, (f i + f (2 * m - i)) := by
+    rw [show 2 * m + 1 = m + 1 + m from by omega, Finset.sum_range_add,
+        Finset.sum_range_succ]
+    have h_reflect : ∑ i ∈ Finset.range m, f (m + 1 + i) =
+        ∑ i ∈ Finset.range m, f (2 * m - i) := by
+      rw [← Finset.sum_range_reflect]
+      exact Finset.sum_congr rfl fun x hx =>
+        congr_arg f (by have := Finset.mem_range.mp hx; omega)
+    rw [h_reflect]
+    have h_distrib : ∑ i ∈ Finset.range m, (f i + f (2 * m - i)) =
+        ∑ i ∈ Finset.range m, f i + ∑ i ∈ Finset.range m, f (2 * m - i) :=
+      Finset.sum_add_distrib
+    linarith [h_distrib]
+  rw [h_split, hmid, zero_add]
+  exact Int.emod_eq_zero_of_dvd
+    (Finset.dvd_sum fun i hi => Int.dvd_of_emod_eq_zero (hf i (Finset.mem_range.mp hi)))
+
+/-! ### Interior-sum vanishing mod 4 -/
+
+/-
+The interior sum (indices `1` to `k−2` in the `T_k` expansion) is
+divisible by 4, given the induction hypothesis on smaller indices.
+-/
+private lemma interior_sum_mod4_zero {n : Nat} (S : TurynTypeSeq n) (k : Nat)
+    (hk : 4 ≤ k) (hkn : k ≤ n - 1) (_hc : Canonical1 n S)
+    (IH : ∀ j, 2 ≤ j → j < k → uAt S (n + 1 - j) = -(uAt S j)) :
+    (∑ i ∈ Finset.Ico 1 (k - 1),
+      aAt S (i + 1) * aAt S (i + 1 + (n - k)) *
+        (1 + uAt S (i + 1) * uAt S (i + 1 + (n - k)))) % 4 = 0 := by
+  -- Reindex via sum_Ico_eq_sum_range
+  rw [Finset.sum_Ico_eq_sum_range]
+  -- Now goal is about ∑ j ∈ range (k-1-1), f(1+j)
+  -- where f(1+j) uses index 1+j+1 in the summand
+  -- Normalize the range length and summand indices
+  have hkk : k - 1 - 1 = k - 2 := by omega
+  rw [hkk]
+  -- Suffices to show (∑ j ∈ range (k-2), g(j)) % 4 = 0
+  -- where g(j) = aAt S (j+2) * aAt S (j+2+(n-k)) * (1 + uAt S (j+2) * uAt S (j+2+(n-k)))
+  -- We prove g(j) = f(1+j) by showing 1+j+1 = j+2
+  have h_norm : ∀ j, aAt S (1 + j + 1) * aAt S (1 + j + 1 + (n - k)) *
+      (1 + uAt S (1 + j + 1) * uAt S (1 + j + 1 + (n - k))) =
+      aAt S (j + 2) * aAt S (j + 2 + (n - k)) *
+      (1 + uAt S (j + 2) * uAt S (j + 2 + (n - k))) := by
+    intro j; rw [show 1 + j + 1 = j + 2 from by omega]
+  simp only [h_norm]
+  -- Now the sum is over g(j) = aAt S (j+2) * ...
+  by_cases hk_even : k % 2 = 0
+  · -- Even case: k-2 = 2*((k-2)/2)
+    have hlen : k - 2 = 2 * ((k - 2) / 2) := by omega
+    rw [hlen]
+    apply sum_paired_mod4
+    intro j hj
+    -- Need: (g(j) + g(2*((k-2)/2)-1-j)) % 4 = 0
+    -- g(j) = summand at position j+2
+    -- g(2*((k-2)/2)-1-j) = summand at position (2*((k-2)/2)-1-j)+2 = k-1-j = k+1-(j+2)
+    rw [show 2 * ((k - 2) / 2) - 1 - j + 2 = k + 1 - (j + 2) from by omega]
+    exact interior_pair_mod4 S k hk hkn IH
+      (show 2 ≤ j + 2 from by omega)
+      (show 2 * (j + 2) ≤ k from by omega)
+      (show j + 2 < k + 1 - (j + 2) from by omega)
+  · -- Odd case: k-2 = 2*((k-3)/2) + 1
+    have hlen : k - 2 = 2 * ((k - 3) / 2) + 1 := by omega
+    rw [hlen]
+    apply sum_paired_with_middle_mod4
+    · -- Pairing condition
+      intro j hj
+      rw [show 2 * ((k - 3) / 2) - j + 2 = k + 1 - (j + 2) from by omega]
+      exact interior_pair_mod4 S k hk hkn IH
+        (show 2 ≤ j + 2 from by omega)
+        (show 2 * (j + 2) ≤ k from by omega)
+        (show j + 2 < k + 1 - (j + 2) from by omega)
+    · -- Middle term = 0
+      have hk_odd : k % 2 = 1 := by omega
+      rw [show (k - 3) / 2 + 2 = (k + 1) / 2 from by omega]
+      exact middle_term_zero S k hk hkn hk_odd IH
+
+/-! ### First and last summand simplification -/
+
+/-
+The first summand (i = 0) simplifies under `Canonical1`.
+-/
+private lemma first_summand_eq {n : Nat} (S : TurynTypeSeq n) (k : Nat)
+    (hk : 2 ≤ k) (hkn : k ≤ n - 1) (hc : Canonical1 n S) :
+    aAt S (0 + 1) * aAt S (0 + 1 + (n - k)) *
+      (1 + uAt S (0 + 1) * uAt S (0 + 1 + (n - k))) =
+    aAt S (n + 1 - k) * (1 + uAt S (n + 1 - k)) := by
+  rw [ show n + 1 - k = 1 + ( n - k ) by omega ];
+  rw [ show aAt S 1 = 1 by exact hc.1, show uAt S 1 = 1 by exact uAt_one_of_canonical1_head hc ] ; ring
+
+/-
+The last summand (i = k − 1) simplifies under `Canonical1`.
+-/
+private lemma last_summand_eq {n : Nat} (S : TurynTypeSeq n) (k : Nat)
+    (hk : 2 ≤ k) (hkn : k ≤ n - 1) (hc : Canonical1 n S) :
+    aAt S (k - 1 + 1) * aAt S (k - 1 + 1 + (n - k)) *
+      (1 + uAt S (k - 1 + 1) * uAt S (k - 1 + 1 + (n - k))) =
+    aAt S k * (1 + uAt S k) := by
+  rw [ Nat.sub_add_cancel ( by linarith ) ];
+  rw [ Nat.add_sub_of_le ( by omega ) ];
+  -- Since $n \neq 0$, we can use the fact that $aAt S n = 1$ and $uAt S n = 1$ from $hc$.
+  have h_an : aAt S n = 1 := by
+    exact hc.2.1
+  have h_un : uAt S n = 1 := by
+    have h_bn : bAt S n = 1 := by
+      exact hc.2.2.2.1;
+    unfold uAt; rw [h_an, h_bn]; ring
+  rw [ h_an, h_un ] ; ring
+
+/-! ### Main XY product-law theorem -/
+
+/-
+**XY product law** (Best–Đoković–Kharaghani–Ramp).
+For a canonical Turyn sequence of length `n ≥ 4`,
+`uAt S (n+1−k) = −uAt S k` for all `2 ≤ k ≤ n−1`.
+-/
+theorem xy_product_law {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
+    (hc : Canonical1 n S) :
+    ∀ k, 2 ≤ k → k ≤ n - 1 → uAt S (n + 1 - k) = -(uAt S k) := by
+  intros k hk2 hkn
+  induction' k using Nat.strongRecOn with k ih;
+  by_cases hk : k < 4;
+  · -- k = 2 or k = 3
+    have hk23 : k = 2 ∨ k = 3 := by omega
+    rcases hk23 with rfl | rfl
+    · -- k = 2
+      rw [show n + 1 - 2 = n - 1 from by omega]
+      exact xy_base_k2 S (by linarith) hc
+    · -- k = 3
+      rw [show n + 1 - 3 = n - 2 from by omega]
+      exact xy_base_k3 S hn hc
+  · -- The sum decomposition: T_k = endpoint + interior.
+    -- Let f i denote the summand.
+    let f := fun i => aAt S (i + 1) * aAt S (i + 1 + (n - k)) *
+        (1 + uAt S (i + 1) * uAt S (i + 1 + (n - k)))
+    -- Split: ∑ range k f = f 0 + ∑ Ico 1 (k-1) f + f (k-1)
+    have h_range_split : ∑ i ∈ Finset.range k, f i =
+        f 0 + ∑ i ∈ Finset.Ico 1 (k - 1), f i + f (k - 1) := by
+      have h1 : Finset.range k = {0} ∪ Finset.Ico 1 (k - 1) ∪ {k - 1} := by
+        ext x; simp only [Finset.mem_union, Finset.mem_range, Finset.mem_Ico,
+          Finset.mem_singleton]; omega
+      have h2 : Disjoint ({0} ∪ Finset.Ico 1 (k - 1)) {k - 1} := by
+        simp only [Finset.disjoint_singleton_right, Finset.mem_union, Finset.mem_singleton,
+          Finset.mem_Ico]; omega
+      have h3 : Disjoint ({0} : Finset Nat) (Finset.Ico 1 (k - 1)) := by
+        simp only [Finset.disjoint_singleton_left, Finset.mem_Ico]; omega
+      rw [h1, Finset.sum_union h2, Finset.sum_union h3,
+          Finset.sum_singleton, Finset.sum_singleton]
+    -- Simplify f 0 and f (k-1) using canonical conditions
+    have hf0 : f 0 = aAt S (n + 1 - k) * (1 + uAt S (n + 1 - k)) :=
+      first_summand_eq S k hk2 hkn hc
+    have hfk : f (k - 1) = aAt S k * (1 + uAt S k) :=
+      last_summand_eq S k hk2 hkn hc
+    have hTsum : aperiodicAutocorr S.A (n - k) + aperiodicAutocorr S.B (n - k) =
+      (aAt S (n + 1 - k) * (1 + uAt S (n + 1 - k)) + aAt S k * (1 + uAt S k)) +
+      (∑ i ∈ Finset.Ico 1 (k - 1),
+        aAt S (i + 1) * aAt S (i + 1 + (n - k)) *
+          (1 + uAt S (i + 1) * uAt S (i + 1 + (n - k)))) := by
+      rw [T_k_as_U_sum S k hk2 hkn, h_range_split, hf0, hfk]; ring
+    -- By the induction hypothesis, the interior sum is congruent to 0 modulo 4.
+    have h_interior : (∑ i ∈ Finset.Ico 1 (k - 1),
+        aAt S (i + 1) * aAt S (i + 1 + (n - k)) *
+          (1 + uAt S (i + 1) * uAt S (i + 1 + (n - k)))) % 4 = 0 := by
+            apply interior_sum_mod4_zero S k (by linarith) (by linarith) hc (fun j hj1 hj2 => ih j (by linarith) hj1 (by omega));
+    -- By the parity hammer, the total sum is congruent to 2 modulo 4.
+    have h_total : (aperiodicAutocorr S.A (n - k) + aperiodicAutocorr S.B (n - k)) % 4 = 2 := by
+      apply parity_hammer S k hk2 hkn;
+    -- By the endpoint pair modulo 4 lemma, if the endpoint sum is congruent to 2 modulo 4, then the uAt values must be negatives of each other.
+    apply (endpoint_pair_mod4 S k hk2 hkn hc).mp;
+    omega
+
+/-
+**Corollary**: The product of `aAt S k * bAt S k` and
+`aAt S (n+1−k) * bAt S (n+1−k)` equals `−1` for `2 ≤ k ≤ n−1`.
+-/
+theorem xy_product_eq_neg_one {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
+    (hc : Canonical1 n S) :
+    ∀ k, 2 ≤ k → k ≤ n - 1 →
+      aAt S k * bAt S k * aAt S (n + 1 - k) * bAt S (n + 1 - k) = -1 := by
+  intro k hk2 hkn
+  have h := xy_product_law S hn hc k hk2 hkn
+  have hprod : aAt S k * bAt S k * aAt S (n + 1 - k) * bAt S (n + 1 - k) =
+      uAt S k * uAt S (n + 1 - k) := by
+    unfold uAt; ring
+  rw [hprod, h]
+  have hsq := uAt_sq S k (by omega) (by omega)
+  linarith
+
 end Turyn
