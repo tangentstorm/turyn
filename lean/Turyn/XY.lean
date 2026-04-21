@@ -110,4 +110,79 @@ theorem T_k_as_U_sum {n : Nat} (S : TurynTypeSeq n) (k : Nat) (hk : 2 ≤ k) (hk
         · omega;
         · linarith [ Finset.mem_range.mp hi, Nat.sub_add_cancel ( show k ≤ n from hkn.trans ( Nat.pred_le _ ) ) ]
 
+/-! ### Parity-hammer helpers -/
+
+/-
+Each term of an autocorrelation of a ±1 sequence is itself ±1.
+-/
+lemma autocorr_term_pm {X : PmSeq} (hpm : AllPmOne X) {s : Nat} (hs : s < X.length)
+    {i : Nat} (hi : i < X.length - s) :
+    X.getD i 0 * X.getD (i + s) 0 = 1 ∨ X.getD i 0 * X.getD (i + s) 0 = -1 := by
+  -- Since $X$ is a list of pm-ones, each element in $X$ is either 1 or -1.
+  have h_getD : ∀ i, i < X.length → X.getD i 0 = 1 ∨ X.getD i 0 = -1 := by
+    exact fun i a => pm_entry_of_getD hpm a
+  grind
+
+/-
+Autocorrelation of a ±1 sequence mod 2 equals the number of summation terms mod 2.
+-/
+lemma autocorr_mod_two {X : PmSeq} (hpm : AllPmOne X) {s : Nat} (hs : s < X.length) :
+    aperiodicAutocorr X s % 2 = ((X.length - s : Nat) : Int) % 2 := by
+  convert sum_of_pm_ones_mod_two ( List.length X - s ) ( fun i => X.getD i 0 * X.getD ( i + s ) 0 ) _;
+  · unfold aperiodicAutocorr; aesop;
+  · exact fun i hi => autocorr_term_pm hpm hs ( Finset.mem_range.mp hi )
+
+/-
+From the vanishing condition: N_A(s) + N_B(s) = −2·(N_C(s) + N_D(s)).
+-/
+lemma AB_eq_neg2_CD {n : Nat} (S : TurynTypeSeq n) {s : Nat}
+    (hs1 : 1 ≤ s) (hsn : s < n) :
+    aperiodicAutocorr S.A s + aperiodicAutocorr S.B s =
+    -2 * (aperiodicAutocorr S.C s + aperiodicAutocorr S.D s) := by
+  have := S.isTuryn.vanishing s hs1 hsn;
+  unfold combinedAutocorr at this; linarith;
+
+/-
+The sum N_C(s) + N_D(s) is odd for 1 ≤ s ≤ n − 2.
+-/
+lemma autocorr_CD_sum_odd {n : Nat} (S : TurynTypeSeq n) {s : Nat}
+    (hs1 : 1 ≤ s) (hsn : s ≤ n - 2) :
+    (aperiodicAutocorr S.C s + aperiodicAutocorr S.D s) % 2 = 1 := by
+  -- Since $s \leq n - 2$, we have $s < n$.
+  have hs_lt_n : s < n := by
+    omega;
+  -- Apply the autocorr_mod_two lemma to C and D.
+  have hC : aperiodicAutocorr S.C s % 2 = ((S.C.length - s : Nat) : Int) % 2 := by
+    apply autocorr_mod_two;
+    · exact S.isTuryn.z_pm;
+    · exact hs_lt_n.trans_le ( by linarith [ S.isTuryn.z_len ] )
+  have hD : aperiodicAutocorr S.D s % 2 = ((S.D.length - s : Nat) : Int) % 2 := by
+    apply autocorr_mod_two;
+    · exact S.isTuryn.w_pm;
+    · have := S.isTuryn.w_len; omega;
+  norm_num [ Int.add_emod, hC, hD ];
+  rw [ S.isTuryn.z_len, S.isTuryn.w_len ] ; omega;
+
+/-
+−2 times an odd integer is congruent to 2 modulo 4.
+-/
+lemma neg2_mul_odd_mod4 (m : Int) (hm : m % 2 = 1) : (-2 * m) % 4 = 2 := by
+  omega
+
+/-
+**Parity hammer**: the sum N_A(n−k) + N_B(n−k) is congruent to 2 modulo 4
+    for 2 ≤ k ≤ n − 1.  (Best–Đoković–Kharaghani–Ramp, arXiv:1206.4107)
+-/
+theorem parity_hammer {n : Nat} (S : TurynTypeSeq n) (k : Nat) (hk : 2 ≤ k) (hkn : k ≤ n - 1) :
+    (aperiodicAutocorr S.A (n - k) + aperiodicAutocorr S.B (n - k)) % 4 = 2 := by
+  -- Use AB_eq_neg2_CD S hs1 hsn to rewrite LHS as (-2 * (autocorr C s + autocorr D s)) % 4.
+  have h_sum : (aperiodicAutocorr S.A (n - k) + aperiodicAutocorr S.B (n - k)) = -2 * (aperiodicAutocorr S.C (n - k) + aperiodicAutocorr S.D (n - k)) := by
+    exact AB_eq_neg2_CD S ( Nat.sub_pos_of_lt ( by omega ) ) ( Nat.sub_lt ( by omega ) ( by omega ) );
+  -- Use autocorr_CD_sum_odd S hs1 hsn2 to get (autocorr C s + autocorr D s) % 2 = 1.
+  have h_odd : (aperiodicAutocorr S.C (n - k) + aperiodicAutocorr S.D (n - k)) % 2 = 1 := by
+    apply autocorr_CD_sum_odd;
+    · omega;
+    · omega;
+  omega
+
 end Turyn
