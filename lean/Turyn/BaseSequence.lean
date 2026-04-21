@@ -39,7 +39,7 @@ def IsTurynType.toTyped {n : Nat} {x y z w : PmSeq}
   (IsTurynType.toProp h).toTyped
 
 /-- Negate every entry in a sequence. -/
-def negSeq (a : List Int) : List Int := a.map (· * (-1))
+def negSeq (a : List Int) : List Int := a.map (fun x => -x)
 
 /-- Base sequences from TT(n) = (X, Y, Z, W):
     A = Z ++ W, B = Z ++ (-W), C = X, D = Y. -/
@@ -81,7 +81,7 @@ lemma AllPmOne_negSeq {a : List Int} (ha : AllPmOne a) : AllPmOne (negSeq a) := 
 
 /-- Indexing into negSeq negates the value. -/
 lemma negSeq_getD (w : List Int) (i : Nat) :
-    (negSeq w).getD i 0 = w.getD i 0 * (-1) := by
+    (negSeq w).getD i 0 = -(w.getD i 0) := by
   simp only [negSeq, List.getD_eq_getElem?_getD, List.getElem?_map]
   cases w[i]? <;> simp
 

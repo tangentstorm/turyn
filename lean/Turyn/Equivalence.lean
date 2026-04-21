@@ -1,4 +1,5 @@
 import Turyn.TurynType
+import Turyn.BaseSequence
 import Mathlib
 
 /-!
@@ -30,26 +31,20 @@ open Finset BigOperators
 
 /-! ### Sequence operations -/
 
-/-- Negation of a ±1 sequence. -/
-def Turyn.negSeq (X : PmSeq) : PmSeq := X.map (fun x => -x)
-
 /-- Alternation of a sequence: entry at 0-indexed position `i` gets factor `(-1)^i`. -/
 def Turyn.altSeq (X : PmSeq) : PmSeq :=
   (List.range X.length).map (fun i => ((if i % 2 = 0 then 1 else -1) : Int) * X.getD i 0)
 
 /-! ### Length preservation -/
 
-@[simp] lemma Turyn.negSeq_length (X : PmSeq) : (Turyn.negSeq X).length = X.length := by
-  simp [Turyn.negSeq]
-
 @[simp] lemma Turyn.altSeq_length (X : PmSeq) : (Turyn.altSeq X).length = X.length := by
   simp [Turyn.altSeq]
 
 /-! ### AllPmOne preservation -/
 
-lemma AllPmOne_neg {X : PmSeq} (h : AllPmOne X) : AllPmOne (Turyn.negSeq X) := by
+lemma AllPmOne_neg {X : PmSeq} (h : AllPmOne X) : AllPmOne (negSeq X) := by
   intro v hv
-  simp only [Turyn.negSeq, List.mem_map] at hv
+  simp only [negSeq, List.mem_map] at hv
   obtain ⟨u, hu, rfl⟩ := hv
   rcases h u hu with rfl | rfl <;> simp
 
@@ -65,8 +60,8 @@ lemma AllPmOne_alt {X : PmSeq} (h : AllPmOne X) : AllPmOne (Turyn.altSeq X) := b
 
 /-- Negation preserves aperiodic autocorrelation: `N_{-X}(s) = N_X(s)`. -/
 lemma aperiodicAutocorr_neg (a : PmSeq) (s : Nat) :
-    aperiodicAutocorr (Turyn.negSeq a) s = aperiodicAutocorr a s := by
-      unfold Turyn.negSeq aperiodicAutocorr;
+    aperiodicAutocorr (negSeq a) s = aperiodicAutocorr a s := by
+      unfold negSeq aperiodicAutocorr;
       grind +splitImp
 
 /-- Reversal preserves aperiodic autocorrelation: `N_{X*}(s) = N_X(s)`. -/
@@ -90,8 +85,8 @@ lemma aperiodicAutocorr_alt (a : PmSeq) (s : Nat) :
 /-! ### IsTurynTypeProp preservation under each elementary transformation -/
 
 lemma turynProp_negA {n : Nat} {A B C D : PmSeq}
-    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n (Turyn.negSeq A) B C D where
-  x_len := by simp [Turyn.negSeq, h.x_len]
+    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n (negSeq A) B C D where
+  x_len := by simp [negSeq, h.x_len]
   y_len := h.y_len
   z_len := h.z_len
   w_len := h.w_len
@@ -104,9 +99,9 @@ lemma turynProp_negA {n : Nat} {A B C D : PmSeq}
     unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_neg]; exact this
 
 lemma turynProp_negB {n : Nat} {A B C D : PmSeq}
-    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A (Turyn.negSeq B) C D where
+    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A (negSeq B) C D where
   x_len := h.x_len
-  y_len := by simp [Turyn.negSeq, h.y_len]
+  y_len := by simp [negSeq, h.y_len]
   z_len := h.z_len
   w_len := h.w_len
   x_pm := h.x_pm
@@ -118,10 +113,10 @@ lemma turynProp_negB {n : Nat} {A B C D : PmSeq}
     unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_neg]; exact this
 
 lemma turynProp_negC {n : Nat} {A B C D : PmSeq}
-    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B (Turyn.negSeq C) D where
+    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B (negSeq C) D where
   x_len := h.x_len
   y_len := h.y_len
-  z_len := by simp [Turyn.negSeq, h.z_len]
+  z_len := by simp [negSeq, h.z_len]
   w_len := h.w_len
   x_pm := h.x_pm
   y_pm := h.y_pm
@@ -132,11 +127,11 @@ lemma turynProp_negC {n : Nat} {A B C D : PmSeq}
     unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_neg]; exact this
 
 lemma turynProp_negD {n : Nat} {A B C D : PmSeq}
-    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B C (Turyn.negSeq D) where
+    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B C (negSeq D) where
   x_len := h.x_len
   y_len := h.y_len
   z_len := h.z_len
-  w_len := by simp [Turyn.negSeq, h.w_len]
+  w_len := by simp [negSeq, h.w_len]
   x_pm := h.x_pm
   y_pm := h.y_pm
   z_pm := h.z_pm
@@ -400,14 +395,6 @@ theorem lemma1_endpoint_constraint
       linarith
 
 /-! ### Helper lemmas for step proofs -/
-
-/-
-negSeq flips the sign at each index.
--/
-lemma negSeq_getD (X : PmSeq) (i : Nat) :
-    (negSeq X).getD i 0 = -(X.getD i 0) := by
-      unfold negSeq;
-      grind
 
 /-
 altSeq multiplies by (-1)^i at each valid index.
