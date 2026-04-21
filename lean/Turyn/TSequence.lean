@@ -311,15 +311,46 @@ lemma aperiodicAutocorr_append_zeros (a : List Int) (k s : Nat) :
 /-- Prepending zeros does not change the aperiodic autocorrelation. -/
 lemma aperiodicAutocorr_prepend_zeros (a : List Int) (k s : Nat) :
     aperiodicAutocorr (zeroSeq k ++ a) s = aperiodicAutocorr a s := by
-  unfold aperiodicAutocorr;
-  split_ifs <;> simp_all +decide [ zeroSeq ];
-  · linarith;
-  · rw [ Finset.sum_eq_zero ] ; intros ; simp_all +decide [ List.getElem?_append ];
-    grind;
-  · rw [ show k + a.length - s = ( a.length - s ) + k by omega, add_comm, Finset.sum_range_add ];
-    simp +decide [ List.getElem?_append, List.getElem?_replicate ];
-    simp +decide [add_assoc];
-    exact Finset.sum_eq_zero fun x hx => by aesop;
+  unfold aperiodicAutocorr
+  have hlen : (zeroSeq k ++ a).length = k + a.length := by
+    rw [List.length_append, zeroSeq_length]
+  rw [hlen]
+  by_cases h1 : s ≥ k + a.length
+  · -- s ≥ k + a.length implies s ≥ a.length
+    have h2 : s ≥ a.length := by omega
+    rw [if_pos h1, if_pos h2]
+  · push_neg at h1
+    rw [if_neg (by omega)]
+    by_cases h2 : s ≥ a.length
+    · -- s ≥ a.length: RHS = 0, sum over indices < k so all hit zero region
+      rw [if_pos h2]
+      apply Finset.sum_eq_zero
+      intro i hi
+      rw [Finset.mem_range] at hi
+      have hik : i < k := by omega
+      rw [List.getD_append _ _ _ _ (by rw [zeroSeq_length]; exact hik),
+          zeroSeq_getD, zero_mul]
+    · -- s < a.length: main case
+      push_neg at h2
+      rw [if_neg (by omega)]
+      have hsplit : k + a.length - s = k + (a.length - s) := by omega
+      rw [hsplit, Finset.sum_range_add]
+      -- First k terms: index hits zeroSeq, so each is 0
+      have hfirst : ∑ x ∈ range k,
+          (zeroSeq k ++ a).getD x 0 * (zeroSeq k ++ a).getD (x + s) 0 = 0 := by
+        apply Finset.sum_eq_zero
+        intro i hi
+        rw [Finset.mem_range] at hi
+        rw [List.getD_append _ _ _ _ (by rw [zeroSeq_length]; exact hi),
+            zeroSeq_getD, zero_mul]
+      rw [hfirst, zero_add]
+      -- Remaining terms: shift by k reduces to original sum
+      apply Finset.sum_congr rfl
+      intro i hi
+      rw [List.getD_append_right _ _ _ _ (by rw [zeroSeq_length]; omega),
+          zeroSeq_length, show k + i - k = i from Nat.add_sub_cancel_left k i,
+          List.getD_append_right _ _ _ _ (by rw [zeroSeq_length]; omega),
+          zeroSeq_length, show k + i + s - k = i + s from by omega]
 
 /-- Half-sum/half-difference autocorrelation identity for ±1 sequences. -/
 lemma sumHalf_diffHalf_autocorr (a b : List Int) (s : Nat)
