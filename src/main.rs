@@ -8,7 +8,6 @@ mod config;
 mod enumerate;
 mod legacy_search;
 mod mdd_pipeline;
-#[cfg(feature = "search-framework")]
 mod search_framework;
 mod spectrum;
 mod stochastic;
@@ -34,17 +33,11 @@ use crate::config::*;
 use crate::enumerate::*;
 use crate::legacy_search::*;
 use crate::mdd_pipeline::*;
-#[cfg(feature = "search-framework")]
 use crate::search_framework::engine::{EngineConfig, SearchEngine, SearchModeAdapter};
-#[cfg(feature = "search-framework")]
 use crate::search_framework::events::SearchEvent;
-#[cfg(feature = "search-framework")]
 use crate::search_framework::mode_adapters::mdd_stages::{MddPayload, MddStagesAdapter};
-#[cfg(feature = "search-framework")]
 use crate::search_framework::mode_adapters::stochastic::{StochasticAdapter, StochasticPayload};
-#[cfg(feature = "search-framework")]
 use crate::search_framework::mode_adapters::sync::{SyncAdapter, SyncPayload};
-#[cfg(feature = "search-framework")]
 use crate::search_framework::queue::GoldThenWork;
 use crate::spectrum::*;
 use crate::stochastic::*;
@@ -326,7 +319,6 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
     }
 }
 
-#[cfg(feature = "search-framework")]
 fn run_framework_mdd_mode(
     problem: Problem,
     tuples: Vec<SumTuple>,
@@ -415,7 +407,6 @@ fn run_framework_mdd_mode(
     let _ = engine_cancel; // keep the Arc alive until the end
 }
 
-#[cfg(feature = "search-framework")]
 fn run_framework_stochastic_mode(
     problem: Problem,
     test_tuple: Option<SumTuple>,
@@ -454,7 +445,6 @@ fn run_framework_stochastic_mode(
     );
 }
 
-#[cfg(feature = "search-framework")]
 fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) {
     let sync_cfg = crate::sync_walker::SyncConfig {
         sat_secs: cfg.sat_secs,
@@ -1208,7 +1198,6 @@ fn main() {
     if cfg.benchmark_repeats > 0 {
         run_benchmark(&cfg);
     } else if cfg.stochastic {
-        #[cfg(feature = "search-framework")]
         if cfg.engine == EngineKind::New {
             run_framework_stochastic_mode(
                 cfg.problem,
@@ -1265,12 +1254,10 @@ fn main() {
                 });
             }
         }
-        #[cfg(feature = "search-framework")]
         if cfg.engine == EngineKind::New && matches!(mode, WzMode::Cross | WzMode::Apart | WzMode::Together) {
             run_framework_mdd_mode(cfg.problem, tuples, &cfg, true, mdd_k);
             return;
         }
-        #[cfg(feature = "search-framework")]
         if cfg.engine == EngineKind::New && mode == WzMode::Sync {
             run_framework_sync_mode(cfg.problem, &cfg, true);
             return;

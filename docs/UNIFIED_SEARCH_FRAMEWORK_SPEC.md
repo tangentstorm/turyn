@@ -10,8 +10,7 @@ Target date for first implementation slice: **April–May 2026**.
 **Progress (April 2026):**
 
 - Phases 0–3a landed: framework skeleton (`src/search_framework/`),
-  apart/together adapter (single-stage wrap), cross mode routing,
-  gated behind the `search-framework` feature + `--engine=new` flag.
+  apart/together adapter (single-stage wrap), cross mode routing.
 - Universal-search-review pass landed: 2-D forcings registry in
   radical (`prop_by_kind_level`), `ForcingDelta` + `Continuation`
   on `StageOutcome`, `TtcQuality { Direct, Projected, Hybrid }`,

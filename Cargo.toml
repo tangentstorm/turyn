@@ -9,7 +9,6 @@ default-run = "turyn"
 
 [features]
 cadical = ["dep:cadical"]
-search-framework = []
 
 [dependencies]
 rustfft = "6"
