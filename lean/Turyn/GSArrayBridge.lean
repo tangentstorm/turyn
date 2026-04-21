@@ -84,45 +84,57 @@ def tseqCombine4 {m : Nat} (T : TSequence m) : List Int :=
   rw [List.getD_eq_getElem _ _ (by simpa [tseqCombine4] using hj)]
   simp [tseqCombine4]
 
+private lemma natAbs_four_sum_eq_one_pmOne (a b c d : Int)
+    (sb sc sd : Int)
+    (hsb : sb = 1 ∨ sb = -1) (hsc : sc = 1 ∨ sc = -1) (hsd : sd = 1 ∨ sd = -1)
+    (h_support : a.natAbs + b.natAbs + c.natAbs + d.natAbs = 1) :
+    (a + sb * b + sc * c + sd * d) = 1 ∨
+    (a + sb * b + sc * c + sd * d) = -1 := by
+  rcases hsb with rfl | rfl <;> rcases hsc with rfl | rfl <;> rcases hsd with rfl | rfl <;> omega
+
 /-- Entries of `tseqCombine1` are `±1`. -/
 lemma tseqCombine1_pmOne {m : Nat} (T : TSequence m) :
     ∀ j, j < m → (tseqCombine1 T).getD j 0 = 1 ∨ (tseqCombine1 T).getD j 0 = -1 := by
   intro j hj
-  have h_support :
-      Int.natAbs (T.a.getD j 0) + Int.natAbs (T.b.getD j 0) +
-        Int.natAbs (T.c.getD j 0) + Int.natAbs (T.d.getD j 0) = 1 := by
-    exact T.support j hj
-  grind +locals
+  rw [tseqCombine1_getD T hj]
+  have h_support := T.support j hj
+  have : T.a.getD j 0 + 1 * T.b.getD j 0 + 1 * T.c.getD j 0 + 1 * T.d.getD j 0 =
+      T.a.getD j 0 + T.b.getD j 0 + T.c.getD j 0 + T.d.getD j 0 := by ring
+  rw [← this]
+  exact natAbs_four_sum_eq_one_pmOne _ _ _ _ 1 1 1 (Or.inl rfl) (Or.inl rfl) (Or.inl rfl) h_support
 
 /-- Entries of `tseqCombine2` are `±1`. -/
 lemma tseqCombine2_pmOne {m : Nat} (T : TSequence m) :
     ∀ j, j < m → (tseqCombine2 T).getD j 0 = 1 ∨ (tseqCombine2 T).getD j 0 = -1 := by
   intro j hj
-  have h_support :
-      Int.natAbs (T.a.getD j 0) + Int.natAbs (T.b.getD j 0) +
-        Int.natAbs (T.c.getD j 0) + Int.natAbs (T.d.getD j 0) = 1 := by
-    exact T.support j hj
-  grind +locals
+  rw [tseqCombine2_getD T hj]
+  have h_support := T.support j hj
+  have : T.a.getD j 0 + 1 * T.b.getD j 0 + (-1) * T.c.getD j 0 + (-1) * T.d.getD j 0 =
+      T.a.getD j 0 + T.b.getD j 0 - T.c.getD j 0 - T.d.getD j 0 := by ring
+  rw [← this]
+  exact natAbs_four_sum_eq_one_pmOne _ _ _ _ 1 (-1) (-1) (Or.inl rfl) (Or.inr rfl) (Or.inr rfl) h_support
 
 /-- Entries of `tseqCombine3` are `±1`. -/
 lemma tseqCombine3_pmOne {m : Nat} (T : TSequence m) :
     ∀ j, j < m → (tseqCombine3 T).getD j 0 = 1 ∨ (tseqCombine3 T).getD j 0 = -1 := by
   intro j hj
-  have h_support :
-      Int.natAbs (T.a.getD j 0) + Int.natAbs (T.b.getD j 0) +
-        Int.natAbs (T.c.getD j 0) + Int.natAbs (T.d.getD j 0) = 1 := by
-    exact T.support j hj
-  grind +locals
+  rw [tseqCombine3_getD T hj]
+  have h_support := T.support j hj
+  have : T.a.getD j 0 + (-1) * T.b.getD j 0 + 1 * T.c.getD j 0 + (-1) * T.d.getD j 0 =
+      T.a.getD j 0 - T.b.getD j 0 + T.c.getD j 0 - T.d.getD j 0 := by ring
+  rw [← this]
+  exact natAbs_four_sum_eq_one_pmOne _ _ _ _ (-1) 1 (-1) (Or.inr rfl) (Or.inl rfl) (Or.inr rfl) h_support
 
 /-- Entries of `tseqCombine4` are `±1`. -/
 lemma tseqCombine4_pmOne {m : Nat} (T : TSequence m) :
     ∀ j, j < m → (tseqCombine4 T).getD j 0 = 1 ∨ (tseqCombine4 T).getD j 0 = -1 := by
   intro j hj
-  have h_support :
-      Int.natAbs (T.a.getD j 0) + Int.natAbs (T.b.getD j 0) +
-        Int.natAbs (T.c.getD j 0) + Int.natAbs (T.d.getD j 0) = 1 := by
-    exact T.support j hj
-  grind +locals
+  rw [tseqCombine4_getD T hj]
+  have h_support := T.support j hj
+  have : T.a.getD j 0 + (-1) * T.b.getD j 0 + (-1) * T.c.getD j 0 + 1 * T.d.getD j 0 =
+      T.a.getD j 0 - T.b.getD j 0 - T.c.getD j 0 + T.d.getD j 0 := by ring
+  rw [← this]
+  exact natAbs_four_sum_eq_one_pmOne _ _ _ _ (-1) (-1) 1 (Or.inr rfl) (Or.inr rfl) (Or.inl rfl) h_support
 
 /-- Summand-level GS identity for a single coordinate pair. -/
 lemma tseqCombine_summand_identity {m : Nat} (T : TSequence m) (i j : Nat) :
