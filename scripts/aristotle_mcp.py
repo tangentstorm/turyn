@@ -95,6 +95,29 @@ TOOLS = [
         },
     },
     {
+        "name": "diff_result",
+        "description": (
+            "Diff a file from an extracted Aristotle result against the current working tree. "
+            "Path is relative to the lean/ project root (e.g. 'Turyn/Equivalence.lean'). "
+            "Requires `result` to have been called first on the project_id. "
+            "Auto-detects tarball layout (project_aristotle/<path> or project_aristotle/lean/<path>)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "project_id": {
+                    "type": "string",
+                    "description": "UUID of the Aristotle job whose result has been extracted.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File path relative to lean/ (e.g. 'Turyn/Equivalence.lean').",
+                },
+            },
+            "required": ["project_id", "path"],
+        },
+    },
+    {
         "name": "git_commit",
         "description": (
             "Stage the listed files and create a commit in the turyn repo root. "
@@ -180,6 +203,36 @@ def run_git(args: list, timeout: int = 60, input_text: str | None = None) -> str
     return out
 
 
+def handle_diff_result(project_id: str, path: str) -> str:
+    extract_dir = Path(tempfile.gettempdir()) / f"aristotle-{project_id}"
+    if not extract_dir.exists():
+        return f"ERROR: extracted directory not found: {extract_dir}\n(Call `result` first.)"
+    # Auto-detect layout: new (lean/ at root of project_aristotle/) or old (project_aristotle/lean/...)
+    candidates = [
+        extract_dir / "project_aristotle" / path,
+        extract_dir / "project_aristotle" / "lean" / path,
+    ]
+    tarball_file = next((c for c in candidates if c.exists()), None)
+    if tarball_file is None:
+        return f"ERROR: {path} not found in tarball for {project_id}. Tried: {[str(c) for c in candidates]}"
+    working_file = LEAN_DIR / path
+    if not working_file.exists():
+        return f"ERROR: {path} not present in working tree at {working_file}"
+    try:
+        r = subprocess.run(
+            ["diff", "-u", str(working_file), str(tarball_file)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except FileNotFoundError:
+        return "ERROR: `diff` not found on PATH"
+    out = r.stdout or ""
+    if r.returncode == 0:
+        out = "(files are identical)"
+    return out
+
+
 def handle_git_commit(files: list, message: str) -> str:
     if not files:
         return "ERROR: no files to commit"
@@ -240,6 +293,8 @@ def process(msg: dict) -> None:
                 text = handle_result(args["project_id"])
             elif name == "cancel":
                 text = handle_cancel(args["project_id"])
+            elif name == "diff_result":
+                text = handle_diff_result(args["project_id"], args["path"])
             elif name == "git_commit":
                 text = handle_git_commit(args["files"], args["message"])
             else:
