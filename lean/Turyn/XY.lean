@@ -119,19 +119,22 @@ Each term of an autocorrelation of a ±1 sequence is itself ±1.
 lemma autocorr_term_pm {X : PmSeq} (hpm : AllPmOne X) {s : Nat} (hs : s < X.length)
     {i : Nat} (hi : i < X.length - s) :
     X.getD i 0 * X.getD (i + s) 0 = 1 ∨ X.getD i 0 * X.getD (i + s) 0 = -1 := by
-  -- Since $X$ is a list of pm-ones, each element in $X$ is either 1 or -1.
-  have h_getD : ∀ i, i < X.length → X.getD i 0 = 1 ∨ X.getD i 0 = -1 := by
-    exact fun i a => pm_entry_of_getD hpm a
-  grind
+  have hi_lt : i < X.length := by omega
+  have his_lt : i + s < X.length := by omega
+  rcases pm_entry_of_getD hpm hi_lt with h1 | h1 <;>
+    rcases pm_entry_of_getD hpm his_lt with h2 | h2 <;>
+    (rw [h1, h2]; decide)
 
 /-
 Autocorrelation of a ±1 sequence mod 2 equals the number of summation terms mod 2.
 -/
 lemma autocorr_mod_two {X : PmSeq} (hpm : AllPmOne X) {s : Nat} (hs : s < X.length) :
     aperiodicAutocorr X s % 2 = ((X.length - s : Nat) : Int) % 2 := by
-  convert sum_of_pm_ones_mod_two ( List.length X - s ) ( fun i => X.getD i 0 * X.getD ( i + s ) 0 ) _;
-  · unfold aperiodicAutocorr; aesop;
-  · exact fun i hi => autocorr_term_pm hpm hs ( Finset.mem_range.mp hi )
+  convert sum_of_pm_ones_mod_two (List.length X - s)
+    (fun i => X.getD i 0 * X.getD (i + s) 0) _
+  · unfold aperiodicAutocorr
+    rw [if_neg (by omega)]
+  · exact fun i hi => autocorr_term_pm hpm hs (Finset.mem_range.mp hi)
 
 /-
 From the vanishing condition: N_A(s) + N_B(s) = −2·(N_C(s) + N_D(s)).
