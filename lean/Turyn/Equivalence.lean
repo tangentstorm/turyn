@@ -828,7 +828,19 @@ theorem step3_condition3
     · exfalso
       exact hB ⟨i, hi1, hi2, hi3, hi4, h_neg⟩
 
-set_option maxHeartbeats 800000 in
+/--
+Accessor for `cAt` after `doRevC` then `doNegC` (the `−C*` transform):
+`cAt S.doRevC.doNegC j = -(cAt S (n + 1 - j))` for `1 ≤ j ≤ n`.
+-/
+private lemma cAt_doNegRevC {n : Nat} (S : TurynTypeSeq n)
+    {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    cAt S.doRevC.doNegC j = -(cAt S (n + 1 - j)) := by
+  unfold cAt TurynTypeSeq.doNegC TurynTypeSeq.doRevC
+  simp only [negSeq_getD]; congr 1
+  rw [List.getD_eq_getElem?_getD, List.getD_eq_getElem?_getD]; congr 1
+  rw [List.getElem?_reverse (by rw [S.isTuryn.z_len]; omega)]
+  congr 1; rw [S.isTuryn.z_len]; omega
+
 /-- Step 4: enforce condition (4) by optional `−C*`. -/
 theorem step4_condition4
     (n : Nat) (hn : 2 ≤ n) (S : TurynTypeSeq n)
@@ -836,32 +848,62 @@ theorem step4_condition4
     ∃ S4 : TurynTypeSeq n,
       Equivalent n S S4 ∧ Canonical1 n S4 ∧ Canonical2 n S4 ∧
       Canonical3 n S4 ∧ Canonical4 n S4 := by
-        by_cases h_exists : ∃ i, 1 ≤ i ∧ i ≤ n ∧ (∀ j, 1 ≤ j → j < i → cAt S j ≠ cAt S (n + 1 - j)) ∧ cAt S i = cAt S (n + 1 - i) ∧ cAt S i = -1;
-        · obtain ⟨i, hi⟩ := h_exists
-          use ⟨S.A, S.B, negSeq (S.C.reverse), S.D, by
-            exact turynProp_negC ( turynProp_revC S.isTuryn )⟩
-          generalize_proofs at *;
-          refine' ⟨ _, _, _, _, _ ⟩;
-          · exact Relation.ReflTransGen.single ( Elementary.revC _ ) |> Relation.ReflTransGen.trans <| Relation.ReflTransGen.single ( Elementary.negC _ );
-          · unfold Canonical1 at *;
-            have := S.isTuryn; rcases this with ⟨ hA, hB, hC, hD, hA', hB', hC', hD', h ⟩ ; simp_all +decide [ negSeq ] ;
-            have := lemma1_endpoint_constraint n hn S; simp_all +decide [ cAt ] ;
-            unfold Canonical1 at this; simp_all +decide [ aAt, bAt, cAt, dAt ] ;
-            grind;
-          · exact h123.2.1;
-          · exact h123.2.2;
-          · intro j hj₁ hj₂ hj₃; simp_all +decide [ negSeq ] ;
-            contrapose! hj₃;
-            refine' ⟨ i, hi.1, _, _ ⟩ <;> simp_all +decide [ cAt ];
-            · grind +suggestions;
-            · grind +suggestions;
-        · refine' ⟨ S, _, h123.1, h123.2.1, h123.2.2, fun i hi₁ hi₂ hi₃ hi₄ => _ ⟩;
-          · constructor;
-          · have h_c_i : cAt S i = 1 ∨ cAt S i = -1 := by
-              have := S.isTuryn.z_pm; simp_all +decide [ cAt ] ;
-              have := pm_entry_of_getD this ( show n + 1 - i - 1 < S.C.length from ?_ ) ; aesop;
-              rw [ S.isTuryn.z_len ] ; omega;
-            grind
+  by_cases h_exists : ∃ i, 1 ≤ i ∧ i ≤ n ∧
+      (∀ j, 1 ≤ j → j < i → cAt S j ≠ cAt S (n + 1 - j)) ∧
+      cAt S i = cAt S (n + 1 - i) ∧ cAt S i = -1
+  · -- Positive case: apply the −C* transform (reverse C, then negate C)
+    obtain ⟨i, hi1, hi2, hi3, hi4, hi5⟩ := h_exists
+    refine ⟨S.doRevC.doNegC, ?_, ?_, h123.2.1, h123.2.2, ?_⟩
+    · -- Equivalence: revC followed by negC
+      exact (Relation.ReflTransGen.single (Elementary.revC S)).trans
+        (Relation.ReflTransGen.single (Elementary.negC S.doRevC))
+    · -- Canonical1 is preserved (only cAt S' 1 needs work)
+      have hcn : cAt S n = -1 := lemma1_endpoint_constraint n (by omega) S h123.1
+      unfold Canonical1 at *
+      obtain ⟨ha1, han, hb1, hbn, _, hd1⟩ := h123.1
+      refine ⟨ha1, han, hb1, hbn, ?_, hd1⟩
+      -- cAt S.doRevC.doNegC 1 = -(cAt S n) = -(-1) = 1
+      unfold cAt TurynTypeSeq.doNegC TurynTypeSeq.doRevC
+      simp only [negSeq_getD]
+      rw [List.getD_eq_getElem?_getD]
+      rw [List.getElem?_reverse (by rw [S.isTuryn.z_len]; omega)]
+      rw [S.isTuryn.z_len]
+      unfold cAt at hcn; rw [List.getD_eq_getElem?_getD] at hcn
+      have h0 : n - 1 - 0 = n - 1 := by omega
+      rw [h0]; linarith
+    · -- Canonical4: the first symmetric index of C is now +1
+      intro j hj1 hj2 hj3 hj4
+      -- Translate the precondition: all j' < j are asymmetric in the original S
+      have hj3' : ∀ j', 1 ≤ j' → j' < j → cAt S j' ≠ cAt S (n + 1 - j') := by
+        intro j' hj'1 hj'2
+        have h := hj3 j' hj'1 hj'2
+        rw [cAt_doNegRevC S hj'1 (by omega),
+            cAt_doNegRevC S (by omega : 1 ≤ n + 1 - j') (by omega)] at h
+        intro heq; apply h
+        have : n + 1 - (n + 1 - j') = j' := by omega
+        rw [this]; linarith
+      -- Translate the equality: j is symmetric in the original S
+      have hj4' : cAt S j = cAt S (n + 1 - j) := by
+        rw [cAt_doNegRevC S hj1 hj2,
+            cAt_doNegRevC S (by omega : 1 ≤ n + 1 - j) (by omega)] at hj4
+        have : n + 1 - (n + 1 - j) = j := by omega
+        rw [this] at hj4; linarith
+      -- Since i is the first symmetric index and j is symmetric with all j' < j
+      -- asymmetric, we must have j = i.
+      have hji : j ≤ i := by
+        by_contra h; exact hj3' i hi1 (by omega) hi4
+      have hij : i ≤ j := by
+        by_contra h; exact hi3 j hj1 (by omega) hj4'
+      have heq : j = i := by omega
+      subst heq
+      rw [cAt_doNegRevC S hj1 hj2, ← hi4, hi5]; norm_num
+  · -- Negative case: S itself already satisfies Canonical4
+    refine ⟨S, Relation.ReflTransGen.refl, h123.1, h123.2.1, h123.2.2, ?_⟩
+    intro i hi1 hi2 hi3 hi4
+    rcases pm_entry_of_getD S.isTuryn.z_pm
+      (show i - 1 < S.C.length by rw [S.isTuryn.z_len]; omega) with h | h
+    · exact h
+    · exfalso; exact h_exists ⟨i, hi1, hi2, hi3, hi4, h⟩
 set_option maxHeartbeats 800000 in
 /-- Step 5: enforce condition (5) by optional `D*` or `−D*`. -/
 theorem step5_condition5
