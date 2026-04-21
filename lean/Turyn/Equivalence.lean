@@ -578,7 +578,7 @@ private lemma canonical1_doRevA {n : Nat} (hn : 2 ≤ n) (S : TurynTypeSeq n)
   · rw [cAt_doRevA_eq]; exact hc1
   · rw [dAt_doRevA_eq]; exact hd1
 
-private lemma aAt_pm {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+private lemma aAt_pm_A {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
     aAt S j = 1 ∨ aAt S j = -1 := by
   unfold aAt
   exact pm_entry_of_getD S.isTuryn.x_pm (by rw [S.isTuryn.x_len]; omega)
@@ -599,7 +599,7 @@ theorem step2_condition2
         by_contra h_no_witness
         push_neg at h_no_witness
         exact h_neg ⟨S, Relation.ReflTransGen.refl, h1, fun j hj1 hj2 hj3 hj4 =>
-          (aAt_pm S hj1 hj2).resolve_right (h_no_witness j hj1 hj2 hj3 hj4)⟩
+          (aAt_pm_A S hj1 hj2).resolve_right (h_no_witness j hj1 hj2 hj3 hj4)⟩
       -- We claim S.doRevA satisfies Canonical1 and Canonical2.
       exact h_neg ⟨S.doRevA, Relation.ReflTransGen.single (Elementary.revA S),
         canonical1_doRevA hn S h1, fun j hj1 hj2 hj3 hj4 => by
@@ -619,7 +619,7 @@ theorem step2_condition2
             -- We know aAt S i = -1, so aAt S (n+1-i) must be 1 (since they differ and are ±1).
             subst hjeq
             rw [h_fwd]
-            have h_mirror_pm := aAt_pm S (show 1 ≤ n + 1 - j from by omega) (show n + 1 - j ≤ n from by omega)
+            have h_mirror_pm := aAt_pm_A S (show 1 ≤ n + 1 - j from by omega) (show n + 1 - j ≤ n from by omega)
             rcases h_mirror_pm with h_one | h_neg1
             · exact h_one
             · exact absurd (show aAt S j = aAt S (n + 1 - j) by rw [hi_val, h_neg1]) hi_neq
@@ -631,50 +631,202 @@ theorem step2_condition2
             -- So aAt S (n+1-i) = aAt S i, contradicting hi_neq.
             exact absurd h_sym_i.symm hi_neq⟩
 
-set_option maxHeartbeats 800000 in
+/-
+Reversal of a list maps index j to (length-1-j).
+-/
+lemma revD_getD {D : PmSeq} {j : Nat} (hj : j < D.length) :
+    D.reverse.getD j 0 = D.getD (D.length - 1 - j) 0 := by
+      grind
+
+/-
+After reversing D (length n-1) in a TurynTypeSeq, the 1-indexed accessor
+satisfies dAt(j) = old dAt(n-j) for 1 ≤ j ≤ n-1.
+-/
+lemma dAt_doRevD {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n - 1) :
+    dAt S.doRevD j = dAt S (n - j) := by
+      convert revD_getD _ using 2;
+      · rw [ S.isTuryn.w_len ];
+        rw [ show n - 1 - 1 - ( j - 1 ) = n - j - 1 by omega ];
+        rfl;
+      · convert Nat.lt_of_lt_of_le ( Nat.sub_lt hj1 zero_lt_one ) hj2 using 1;
+        exact S.isTuryn.w_len
+
+/-
+After reversing and negating D, the 1-indexed accessor
+satisfies dAt(j) = -(old dAt(n-j)) for 1 ≤ j ≤ n-1.
+-/
+lemma dAt_doNegRevD {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n - 1) :
+    dAt (TurynTypeSeq.doNegD S.doRevD) j = -(dAt S (n - j)) := by
+      have h_negD : dAt (TurynTypeSeq.doNegD (TurynTypeSeq.doRevD S)) j = -(dAt (TurynTypeSeq.doRevD S) j) := by
+        convert negSeq_getD _ _ using 1;
+      rw [ h_negD, dAt_doRevD S hj1 hj2 ]
+
+/-! ### Reversal accessor lemmas -/
+
+lemma aAt_doRevA_at {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    aAt S.doRevA j = aAt S (n + 1 - j) := by
+  unfold aAt TurynTypeSeq.doRevA
+  simp only
+  convert revD_getD (D := S.A) _ using 2
+  · rw [S.isTuryn.x_len]; omega
+  · convert Nat.lt_of_lt_of_le (Nat.sub_lt hj1 zero_lt_one) hj2 using 1
+    exact S.isTuryn.x_len
+
+lemma aAt_doRevA_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    aAt S.doRevA (n + 1 - j) = aAt S j := by
+  have h1 : 1 ≤ n + 1 - j := by omega
+  have h2 : n + 1 - j ≤ n := by omega
+  rw [aAt_doRevA_at S h1 h2]; congr 1; omega
+
+lemma bAt_doRevB_at {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    bAt S.doRevB j = bAt S (n + 1 - j) := by
+  unfold bAt TurynTypeSeq.doRevB
+  simp only
+  convert revD_getD (D := S.B) _ using 2
+  · rw [S.isTuryn.y_len]; omega
+  · convert Nat.lt_of_lt_of_le (Nat.sub_lt hj1 zero_lt_one) hj2 using 1
+    exact S.isTuryn.y_len
+
+lemma bAt_doRevB_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    bAt S.doRevB (n + 1 - j) = bAt S j := by
+  have h1 : 1 ≤ n + 1 - j := by omega
+  have h2 : n + 1 - j ≤ n := by omega
+  rw [bAt_doRevB_at S h1 h2]; congr 1; omega
+
+lemma cAt_doRevC_at {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    cAt S.doRevC j = cAt S (n + 1 - j) := by
+  unfold cAt TurynTypeSeq.doRevC
+  simp only
+  convert revD_getD (D := S.C) _ using 2
+  · rw [S.isTuryn.z_len]; omega
+  · convert Nat.lt_of_lt_of_le (Nat.sub_lt hj1 zero_lt_one) hj2 using 1
+    exact S.isTuryn.z_len
+
+lemma cAt_doRevC_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    cAt S.doRevC (n + 1 - j) = cAt S j := by
+  have h1 : 1 ≤ n + 1 - j := by omega
+  have h2 : n + 1 - j ≤ n := by omega
+  rw [cAt_doRevC_at S h1 h2]; congr 1; omega
+
+lemma dAt_doRevD_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n - 1) :
+    dAt S.doRevD (n - j) = dAt S j := by
+  have h1 : 1 ≤ n - j := by omega
+  have h2 : n - j ≤ n - 1 := by omega
+  rw [dAt_doRevD S h1 h2]; congr 1; omega
+
+/-! ### doRevB preserves other accessors -/
+
+private lemma aAt_doRevB {n : Nat} (S : TurynTypeSeq n) (i : Nat) :
+    aAt S.doRevB i = aAt S i := rfl
+
+private lemma cAt_doRevB {n : Nat} (S : TurynTypeSeq n) (i : Nat) :
+    cAt S.doRevB i = cAt S i := rfl
+
+private lemma dAt_doRevB {n : Nat} (S : TurynTypeSeq n) (i : Nat) :
+    dAt S.doRevB i = dAt S i := rfl
+
 /-- Step 3: enforce condition (3) by optional reversal of `B`. -/
 theorem step3_condition3
     (n : Nat) (hn : 2 ≤ n) (S : TurynTypeSeq n)
     (h12 : Canonical1 n S ∧ Canonical2 n S) :
     ∃ S3 : TurynTypeSeq n,
       Equivalent n S S3 ∧ Canonical1 n S3 ∧ Canonical2 n S3 ∧ Canonical3 n S3 := by
-        by_contra h_contra;
-        -- If `B` does not satisfy condition (3), we reverse `B`.
-        by_cases hB : ∃ i, 1 ≤ i ∧ i ≤ n ∧ (∀ j, 1 ≤ j → j < i → bAt S j = bAt S (n + 1 - j)) ∧ bAt S i ≠ bAt S (n + 1 - i) ∧ bAt S i = -1;
-        · refine' h_contra ⟨ TurynTypeSeq.doRevB S, _, _, _, _ ⟩ <;> simp_all +decide [ TurynTypeSeq.doRevB ];
-          · exact .single ( Elementary.revB S );
-          · unfold Canonical1 at *;
-            unfold aAt bAt cAt dAt at *;
-            simp_all +decide;
-            rw [ List.getElem?_reverse, List.getElem?_reverse ];
-            · have := S.isTuryn; cases this; aesop;
-            · grind;
-            · linarith [ S.isTuryn.x_len, S.isTuryn.y_len, S.isTuryn.z_len, S.isTuryn.w_len ];
-          · intro j hj1 hj2 hj3 hj4; have := h12.2 j hj1 hj2; simp_all +decide ;
-            unfold aAt at *; aesop;
-          · intro j hj1 hj2 hj3 hj4; simp_all +decide [ bAt ] ;
-            rw [ List.getElem?_reverse, List.getElem?_reverse ] at * ; simp_all +decide [ Nat.sub_sub ];
-            · have := S.isTuryn.y_pm; simp_all +decide [ AllPmOne ] ;
-              cases this ( S.B[List.length S.B - j]?.getD 0 ) ( by
-                have := S.isTuryn.y_len; simp_all +decide ;
-                grind +ring ) <;> simp_all +decide;
-              have := S.isTuryn.y_len; simp_all +decide ;
-              grind +ring;
-            · have := S.isTuryn.y_len; simp_all +decide [ Nat.sub_sub ] ;
-              exact ⟨ by linarith, by linarith ⟩;
-            · exact lt_of_lt_of_le ( Nat.sub_lt hj1 zero_lt_one ) ( by simpa [ S.isTuryn.y_len ] using hj2 );
-            · exact lt_of_lt_of_le ( Nat.sub_lt hj1 zero_lt_one ) ( by simpa [ S.isTuryn.y_len ] using hj2 );
-        · refine' h_contra ⟨ S, _, _, _, _ ⟩;
-          · constructor;
-          · exact h12.1;
-          · exact h12.2;
-          · intro i hi₁ hi₂ hi₃ hi₄;
-            have h_bAt : bAt S i = 1 ∨ bAt S i = -1 := by
-              have hB : AllPmOne S.B := by
-                exact S.isTuryn.y_pm;
-              convert pm_entry_of_getD hB _;
-              exact lt_of_lt_of_le ( Nat.sub_lt hi₁ zero_lt_one ) ( by linarith [ S.isTuryn.y_len ] );
-            grind
+  -- Decide whether B already satisfies Canonical3 or needs reversal.
+  by_cases hB : ∃ i, 1 ≤ i ∧ i ≤ n ∧
+      (∀ j, 1 ≤ j → j < i → bAt S j = bAt S (n + 1 - j)) ∧
+      bAt S i ≠ bAt S (n + 1 - i) ∧ bAt S i = -1
+  -- Case 1: there exists a first asymmetric index i with bAt S i = -1; reverse B.
+  · rcases hB with ⟨i, hi1, hi2, hsym, hasym, hval⟩
+    refine ⟨S.doRevB, ?_, ?_, ?_, ?_⟩
+    -- (a) Equivalence: single elementary step.
+    · exact Relation.ReflTransGen.single (Elementary.revB S)
+    -- (b) Canonical1 is preserved.
+    · have hc1 := h12.1
+      unfold Canonical1 at hc1 ⊢
+      rcases hc1 with ⟨ha1, han, hb1, hbn, hc1v, hd1⟩
+      refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+      -- aAt is unchanged by doRevB
+      · rw [aAt_doRevB]; exact ha1
+      · rw [aAt_doRevB]; exact han
+      -- bAt endpoints swap under reversal
+      · rw [bAt_doRevB_at S (by omega : 1 ≤ 1) (by omega : 1 ≤ n)]
+        have : n + 1 - 1 = n := by omega
+        rw [this]; exact hbn
+      · rw [bAt_doRevB_at S (by omega : 1 ≤ n) le_rfl]
+        have : n + 1 - n = 1 := by omega
+        rw [this]; exact hb1
+      -- cAt and dAt are unchanged by doRevB
+      · rw [cAt_doRevB]; exact hc1v
+      · rw [dAt_doRevB]; exact hd1
+    -- (c) Canonical2 is preserved (A is unchanged by doRevB).
+    · intro j hj1 hj2 hj3 hj4
+      have : aAt S.doRevB j = aAt S j := aAt_doRevB S j
+      have : aAt S.doRevB (n + 1 - j) = aAt S (n + 1 - j) := aAt_doRevB S (n + 1 - j)
+      have hj3' : ∀ k, 1 ≤ k → k < j → aAt S k = aAt S (n + 1 - k) := by
+        intro k hk1 hk2
+        have := hj3 k hk1 hk2
+        rw [aAt_doRevB, aAt_doRevB] at this
+        exact this
+      have hj4' : aAt S j ≠ aAt S (n + 1 - j) := by
+        rw [← aAt_doRevB S j, ← aAt_doRevB S (n + 1 - j)]
+        exact hj4
+      rw [aAt_doRevB]
+      exact h12.2 j hj1 hj2 hj3' hj4'
+    -- (d) Canonical3 holds after reversal.
+    · intro j hj1 hj2 hj3 hj4
+      -- Translate the symmetry/asymmetry conditions back to S.
+      have hrev_j : bAt S.doRevB j = bAt S (n + 1 - j) :=
+        bAt_doRevB_at S hj1 hj2
+      have hrev_mirror : bAt S.doRevB (n + 1 - j) = bAt S j :=
+        bAt_doRevB_mirror S hj1 hj2
+      -- All predecessors of j are symmetric in doRevB, hence in S.
+      have hsym_S : ∀ k, 1 ≤ k → k < j → bAt S k = bAt S (n + 1 - k) := by
+        intro k hk1 hk2
+        have hk2n : k ≤ n := le_trans (le_of_lt hk2) hj2
+        have := hj3 k hk1 hk2
+        rw [bAt_doRevB_at S hk1 hk2n, bAt_doRevB_mirror S hk1 hk2n] at this
+        exact this.symm
+      -- j is asymmetric in S.
+      have hasym_S : bAt S j ≠ bAt S (n + 1 - j) := by
+        intro heq
+        exact hj4 (by rw [hrev_j, hrev_mirror]; exact heq.symm)
+      -- bAt S (n + 1 - j) is ±1.
+      have hpm : bAt S (n + 1 - j) = 1 ∨ bAt S (n + 1 - j) = -1 := by
+        have hpm_B : AllPmOne S.B := S.isTuryn.y_pm
+        exact pm_entry_of_getD hpm_B (by rw [S.isTuryn.y_len]; omega)
+      -- bAt S j is ±1.
+      have hpm_j : bAt S j = 1 ∨ bAt S j = -1 := by
+        have hpm_B : AllPmOne S.B := S.isTuryn.y_pm
+        exact pm_entry_of_getD hpm_B (by rw [S.isTuryn.y_len]; omega)
+      -- Since bAt S j ≠ bAt S (n+1-j) and both are ±1, they are opposite.
+      -- We need bAt S.doRevB j = bAt S (n+1-j) = 1.
+      rw [hrev_j]
+      rcases hpm_j with hj_one | hj_neg
+      · -- bAt S j = 1. We show this case is impossible.
+        -- j must satisfy j ≤ i: if j < i, hsym gives symmetry contradiction;
+        -- if j = i, bAt S i = -1 contradicts hj_one; if j > i, i is a predecessor.
+        exfalso
+        by_cases hjle : j < i
+        · exact hasym_S (hsym j hj1 hjle)
+        · by_cases hjeq : j = i
+          · rw [hjeq] at hj_one; linarith [hval]
+          · have hilt : i < j := by omega
+            exact hasym (hsym_S i hi1 hilt)
+      · -- bAt S j = -1, so bAt S (n+1-j) ≠ -1, hence bAt S (n+1-j) = 1.
+        rcases hpm with hm_one | hm_neg
+        · exact hm_one
+        · exfalso; exact hasym_S (by rw [hj_neg, hm_neg])
+  -- Case 2: no first asymmetric index has bAt S i = -1; S already satisfies Canonical3.
+  · refine ⟨S, Relation.ReflTransGen.refl, h12.1, h12.2, ?_⟩
+    intro i hi1 hi2 hi3 hi4
+    -- bAt S i is ±1.
+    have hpm : bAt S i = 1 ∨ bAt S i = -1 := by
+      exact pm_entry_of_getD S.isTuryn.y_pm (by rw [S.isTuryn.y_len]; omega)
+    -- If bAt S i = -1, then hB would be satisfied, contradiction.
+    rcases hpm with h_one | h_neg
+    · exact h_one
+    · exfalso
+      exact hB ⟨i, hi1, hi2, hi3, hi4, h_neg⟩
 
 set_option maxHeartbeats 800000 in
 /-- Step 4: enforce condition (4) by optional `−C*`. -/
@@ -710,101 +862,6 @@ theorem step4_condition4
               have := pm_entry_of_getD this ( show n + 1 - i - 1 < S.C.length from ?_ ) ; aesop;
               rw [ S.isTuryn.z_len ] ; omega;
             grind
-
-/-
-Reversal of a list maps index j to (length-1-j).
--/
-lemma revD_getD {D : PmSeq} {j : Nat} (hj : j < D.length) :
-    D.reverse.getD j 0 = D.getD (D.length - 1 - j) 0 := by
-      grind
-
-/-
-After reversing D (length n-1) in a TurynTypeSeq, the 1-indexed accessor
-satisfies dAt(j) = old dAt(n-j) for 1 ≤ j ≤ n-1.
--/
-lemma dAt_doRevD {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n - 1) :
-    dAt S.doRevD j = dAt S (n - j) := by
-      convert revD_getD _ using 2;
-      · rw [ S.isTuryn.w_len ];
-        rw [ show n - 1 - 1 - ( j - 1 ) = n - j - 1 by omega ];
-        rfl;
-      · convert Nat.lt_of_lt_of_le ( Nat.sub_lt hj1 zero_lt_one ) hj2 using 1;
-        exact S.isTuryn.w_len
-
-/-
-After reversing and negating D, the 1-indexed accessor
-satisfies dAt(j) = -(old dAt(n-j)) for 1 ≤ j ≤ n-1.
--/
-lemma dAt_doNegRevD {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n - 1) :
-    dAt (TurynTypeSeq.doNegD S.doRevD) j = -(dAt S (n - j)) := by
-      -- By definition of `doNegD`, we have `dAt (doNegD S) j = -dAt S j`.
-      have h_negD : dAt (TurynTypeSeq.doNegD (TurynTypeSeq.doRevD S)) j = -(dAt (TurynTypeSeq.doRevD S) j) := by
-        convert negSeq_getD _ _ using 1;
-      rw [ h_negD, dAt_doRevD S hj1 hj2 ]
-
-/-! ### Reversal accessor lemmas -/
-
-/--
-Reversal of a length-`n` list maps 1-indexed position `j` to `n + 1 - j`.
--/
-lemma aAt_doRevA_at {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
-    aAt S.doRevA j = aAt S (n + 1 - j) := by
-  unfold aAt TurynTypeSeq.doRevA
-  simp only
-  convert revD_getD (D := S.A) _ using 2
-  · rw [S.isTuryn.x_len]
-    omega
-  · convert Nat.lt_of_lt_of_le (Nat.sub_lt hj1 zero_lt_one) hj2 using 1
-    exact S.isTuryn.x_len
-
-lemma aAt_doRevA_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
-    aAt S.doRevA (n + 1 - j) = aAt S j := by
-  have h1 : 1 ≤ n + 1 - j := by omega
-  have h2 : n + 1 - j ≤ n := by omega
-  rw [aAt_doRevA_at S h1 h2]
-  congr 1; omega
-
-lemma bAt_doRevB_at {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
-    bAt S.doRevB j = bAt S (n + 1 - j) := by
-  unfold bAt TurynTypeSeq.doRevB
-  simp only
-  convert revD_getD (D := S.B) _ using 2
-  · rw [S.isTuryn.y_len]
-    omega
-  · convert Nat.lt_of_lt_of_le (Nat.sub_lt hj1 zero_lt_one) hj2 using 1
-    exact S.isTuryn.y_len
-
-lemma bAt_doRevB_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
-    bAt S.doRevB (n + 1 - j) = bAt S j := by
-  have h1 : 1 ≤ n + 1 - j := by omega
-  have h2 : n + 1 - j ≤ n := by omega
-  rw [bAt_doRevB_at S h1 h2]
-  congr 1; omega
-
-lemma cAt_doRevC_at {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
-    cAt S.doRevC j = cAt S (n + 1 - j) := by
-  unfold cAt TurynTypeSeq.doRevC
-  simp only
-  convert revD_getD (D := S.C) _ using 2
-  · rw [S.isTuryn.z_len]
-    omega
-  · convert Nat.lt_of_lt_of_le (Nat.sub_lt hj1 zero_lt_one) hj2 using 1
-    exact S.isTuryn.z_len
-
-lemma cAt_doRevC_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
-    cAt S.doRevC (n + 1 - j) = cAt S j := by
-  have h1 : 1 ≤ n + 1 - j := by omega
-  have h2 : n + 1 - j ≤ n := by omega
-  rw [cAt_doRevC_at S h1 h2]
-  congr 1; omega
-
-lemma dAt_doRevD_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n - 1) :
-    dAt S.doRevD (n - j) = dAt S j := by
-  have h1 : 1 ≤ n - j := by omega
-  have h2 : n - j ≤ n - 1 := by omega
-  rw [dAt_doRevD S h1 h2]
-  congr 1; omega
-
 set_option maxHeartbeats 800000 in
 /-- Step 5: enforce condition (5) by optional `D*` or `−D*`. -/
 theorem step5_condition5
