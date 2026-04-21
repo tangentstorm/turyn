@@ -50,4 +50,14 @@ theorem aperiodicAutocorr_A_via_aAt {n : Nat} (S : TurynTypeSeq n) (s : Nat) (hs
   unfold aAt
   simp
 
+theorem aperiodicAutocorr_B_via_aAt {n : Nat} (S : TurynTypeSeq n) (s : Nat) (hs : s < n) :
+    aperiodicAutocorr S.B s = ∑ i ∈ Finset.range (n - s), bAt S (i + 1) * bAt S (i + 1 + s) := by
+  unfold aperiodicAutocorr
+  rw [if_neg (by rw [S.isTuryn.y_len]; omega)]
+  rw [show S.B.length - s = n - s from by rw [S.isTuryn.y_len]]
+  apply Finset.sum_congr rfl
+  intro i _
+  unfold bAt
+  simp
+
 end Turyn
