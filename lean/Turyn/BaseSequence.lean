@@ -80,7 +80,7 @@ lemma AllPmOne_negSeq {a : List Int} (ha : AllPmOne a) : AllPmOne (negSeq a) := 
   rcases ha u hu with h | h <;> subst h <;> decide
 
 /-- Indexing into negSeq negates the value. -/
-lemma negSeq_getD (w : List Int) (i : Nat) :
+@[simp] lemma negSeq_getD (w : List Int) (i : Nat) :
     (negSeq w).getD i 0 = -(w.getD i 0) := by
   simp only [negSeq, List.getD_eq_getElem?_getD, List.getElem?_map]
   cases w[i]? <;> simp

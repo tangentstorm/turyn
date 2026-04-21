@@ -14,6 +14,7 @@ namespace Turyn
 def listToIntVec {n : Nat} (xs : List Int) : IntVec n :=
   fun i => xs.getD i.1 0
 
+/-- Applying `listToIntVec` is `List.getD`. -/
 @[simp] theorem listToIntVec_apply {n : Nat} (xs : List Int) (i : Fin n) :
     listToIntVec xs i = xs.getD i.1 0 := rfl
 
@@ -39,42 +40,51 @@ def tseqCombine4 {m : Nat} (T : TSequence m) : List Int :=
   (List.range m).map fun j =>
     T.a.getD j 0 - T.b.getD j 0 - T.c.getD j 0 + T.d.getD j 0
 
+/-- Length of `tseqCombine1`. -/
 @[simp] lemma tseqCombine1_length {m : Nat} (T : TSequence m) :
     (tseqCombine1 T).length = m := by simp [tseqCombine1]
 
+/-- Length of `tseqCombine2`. -/
 @[simp] lemma tseqCombine2_length {m : Nat} (T : TSequence m) :
     (tseqCombine2 T).length = m := by simp [tseqCombine2]
 
+/-- Length of `tseqCombine3`. -/
 @[simp] lemma tseqCombine3_length {m : Nat} (T : TSequence m) :
     (tseqCombine3 T).length = m := by simp [tseqCombine3]
 
+/-- Length of `tseqCombine4`. -/
 @[simp] lemma tseqCombine4_length {m : Nat} (T : TSequence m) :
     (tseqCombine4 T).length = m := by simp [tseqCombine4]
 
+/-- Indexing into `tseqCombine1`. -/
 @[simp] lemma tseqCombine1_getD {m : Nat} (T : TSequence m) {j : Nat} (hj : j < m) :
     (tseqCombine1 T).getD j 0 =
       T.a.getD j 0 + T.b.getD j 0 + T.c.getD j 0 + T.d.getD j 0 := by
   rw [List.getD_eq_getElem _ _ (by simpa [tseqCombine1] using hj)]
   simp [tseqCombine1]
 
+/-- Indexing into `tseqCombine2`. -/
 @[simp] lemma tseqCombine2_getD {m : Nat} (T : TSequence m) {j : Nat} (hj : j < m) :
     (tseqCombine2 T).getD j 0 =
       T.a.getD j 0 + T.b.getD j 0 - T.c.getD j 0 - T.d.getD j 0 := by
   rw [List.getD_eq_getElem _ _ (by simpa [tseqCombine2] using hj)]
   simp [tseqCombine2]
 
+/-- Indexing into `tseqCombine3`. -/
 @[simp] lemma tseqCombine3_getD {m : Nat} (T : TSequence m) {j : Nat} (hj : j < m) :
     (tseqCombine3 T).getD j 0 =
       T.a.getD j 0 - T.b.getD j 0 + T.c.getD j 0 - T.d.getD j 0 := by
   rw [List.getD_eq_getElem _ _ (by simpa [tseqCombine3] using hj)]
   simp [tseqCombine3]
 
+/-- Indexing into `tseqCombine4`. -/
 @[simp] lemma tseqCombine4_getD {m : Nat} (T : TSequence m) {j : Nat} (hj : j < m) :
     (tseqCombine4 T).getD j 0 =
       T.a.getD j 0 - T.b.getD j 0 - T.c.getD j 0 + T.d.getD j 0 := by
   rw [List.getD_eq_getElem _ _ (by simpa [tseqCombine4] using hj)]
   simp [tseqCombine4]
 
+/-- Entries of `tseqCombine1` are `±1`. -/
 lemma tseqCombine1_pmOne {m : Nat} (T : TSequence m) :
     ∀ j, j < m → (tseqCombine1 T).getD j 0 = 1 ∨ (tseqCombine1 T).getD j 0 = -1 := by
   intro j hj
@@ -84,6 +94,7 @@ lemma tseqCombine1_pmOne {m : Nat} (T : TSequence m) :
     exact T.support j hj
   grind +locals
 
+/-- Entries of `tseqCombine2` are `±1`. -/
 lemma tseqCombine2_pmOne {m : Nat} (T : TSequence m) :
     ∀ j, j < m → (tseqCombine2 T).getD j 0 = 1 ∨ (tseqCombine2 T).getD j 0 = -1 := by
   intro j hj
@@ -93,6 +104,7 @@ lemma tseqCombine2_pmOne {m : Nat} (T : TSequence m) :
     exact T.support j hj
   grind +locals
 
+/-- Entries of `tseqCombine3` are `±1`. -/
 lemma tseqCombine3_pmOne {m : Nat} (T : TSequence m) :
     ∀ j, j < m → (tseqCombine3 T).getD j 0 = 1 ∨ (tseqCombine3 T).getD j 0 = -1 := by
   intro j hj
@@ -102,6 +114,7 @@ lemma tseqCombine3_pmOne {m : Nat} (T : TSequence m) :
     exact T.support j hj
   grind +locals
 
+/-- Entries of `tseqCombine4` are `±1`. -/
 lemma tseqCombine4_pmOne {m : Nat} (T : TSequence m) :
     ∀ j, j < m → (tseqCombine4 T).getD j 0 = 1 ∨ (tseqCombine4 T).getD j 0 = -1 := by
   intro j hj
@@ -125,6 +138,7 @@ lemma tseqCombine_summand_identity {m : Nat} (T : TSequence m) (i j : Nat) :
         T.c.getD i 0 * T.c.getD j 0 + T.d.getD i 0 * T.d.getD j 0) := by
   ring
 
+/-- Periodic summand identity for GS combinations at a single index. -/
 lemma tseqCombine_periodic_summand_identity {m : Nat} (T : TSequence m) (s i : Nat) :
     (tseqCombine1 T).getD i 0 * (tseqCombine1 T).getD ((i + s) % m) 0 +
       (tseqCombine2 T).getD i 0 * (tseqCombine2 T).getD ((i + s) % m) 0 +
@@ -163,6 +177,7 @@ lemma tseqCombine_periodic_summand_identity {m : Nat} (T : TSequence m) (s i : N
     rw [h1, h2, h3, h4, ha, hb, hc, hd]
     ring
 
+/-- Periodic sum identity: sum over range of GS summand identities. -/
 lemma tseqCombine_periodic_sum_identity {m : Nat} (T : TSequence m) (s : Nat) :
     ∑ i ∈ Finset.range m,
       ((tseqCombine1 T).getD i 0 * (tseqCombine1 T).getD ((i + s) % m) 0 +
@@ -178,6 +193,7 @@ lemma tseqCombine_periodic_sum_identity {m : Nat} (T : TSequence m) (s : Nat) :
   intro i hi
   exact tseqCombine_periodic_summand_identity T s i
 
+/-- Combined periodic autocorrelation of GS combinations equals 4× the original. -/
 theorem tseqCombine_periodic_identity {m : Nat} (T : TSequence m) :
     ∀ s, combinedPeriodicAutocorr (tseqCombine1 T) (tseqCombine2 T)
       (tseqCombine3 T) (tseqCombine4 T) s =
@@ -221,6 +237,7 @@ theorem tseqCombine_periodic_identity {m : Nat} (T : TSequence m) :
               congr 1
               rw [Finset.sum_add_distrib, Finset.sum_add_distrib, Finset.sum_add_distrib]
 
+/-- Combined periodic autocorrelation of GS combinations vanishes at positive lags. -/
 theorem tseqCombine_periodic_vanishing {m : Nat} (T : TSequence m) :
     ∀ s, 1 ≤ s → s < m →
       combinedPeriodicAutocorr (tseqCombine1 T) (tseqCombine2 T)
@@ -263,6 +280,7 @@ def gsSequenceQuadOfTSequence {m : Nat} (T : TSequence m) : GSSequenceQuad m :=
     x4_pm := tseqCombine4_pmOne T
     periodic_vanishing := tseqCombine_periodic_vanishing T }
 
+/-- Typed periodic autocorrelation agrees with list-based periodic autocorrelation. -/
 lemma typed_periodicAutocorr_eq_list {n : Nat} (xs : List Int) (hxs : xs.length = n) (s : Fin n) :
     Turyn.periodicAutocorr (listToIntVec xs) s = _root_.periodicAutocorr xs s.1 := by
   by_cases hn : n = 0
@@ -280,6 +298,7 @@ lemma typed_periodicAutocorr_eq_list {n : Nat} (xs : List Int) (hxs : xs.length 
       (Fin.sum_univ_eq_sum_range (n := n)
         (f := fun i : Nat => xs.getD i 0 * xs.getD ((i + s.1) % n) 0))
 
+/-- Combined typed periodic autocorrelation agrees with list-based version. -/
 lemma typed_combinedPeriodic_eq_list {m : Nat} (Q : GSSequenceQuad m) (s : Fin m) :
     Turyn.periodicAutocorr (listToIntVec Q.x1) s +
     Turyn.periodicAutocorr (listToIntVec Q.x2) s +
@@ -330,11 +349,13 @@ def gsDataOfTSequence {m : Nat} (T : TSequence m) : CertifiedGSData m :=
 def typedGsMatrixOfTSequence {m : Nat} (T : TSequence m) : IntMat (4 * m) :=
   gsMatrix (gsDataOfTSequence T).toGSData
 
+/-- The typed GS matrix satisfies M·Mᵀ = 4m·I. -/
 theorem typedGsMatrix_target {m : Nat} (T : TSequence m) :
     typedGsMatrixOfTSequence T * Matrix.transpose (typedGsMatrixOfTSequence T) =
       (4 * m : Int) • (1 : IntMat (4 * m)) := by
   simpa [typedGsMatrixOfTSequence, GSTarget] using gsMatrix_target (gsDataOfTSequence T)
 
+/-- The typed GS matrix is a Hadamard matrix. -/
 theorem typedGsMatrix_isHadamard {m : Nat} (T : TSequence m) :
     IsHadamardMat (typedGsMatrixOfTSequence T) := by
   simpa [typedGsMatrixOfTSequence] using gsMatrix_isHadamard (gsDataOfTSequence T)

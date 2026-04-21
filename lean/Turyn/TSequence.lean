@@ -68,12 +68,15 @@ structure TSequence (m : Nat) where
 def step2a {n : Nat} (T : TurynType n) : List Int :=
   T.z.data ++ zeroSeq (2 * n - 1)
 
+/-- Second raw list component for Step 2: zero-padded W. -/
 def step2b {n : Nat} (T : TurynType n) : List Int :=
   zeroSeq n ++ (T.w.data ++ zeroSeq n)
 
+/-- Third raw list component for Step 2: zero-padded half-sum of X and Y. -/
 def step2c {n : Nat} (T : TurynType n) : List Int :=
   zeroSeq (2 * n - 1) ++ seqSumHalf T.x.data T.y.data
 
+/-- Fourth raw list component for Step 2: zero-padded half-difference of X and Y. -/
 def step2d {n : Nat} (T : TurynType n) : List Int :=
   zeroSeq (2 * n - 1) ++ seqDiffHalf T.x.data T.y.data
 
@@ -253,9 +256,7 @@ lemma periodic_eq_aperiodic_sum (a : List Int) (s : Nat) (hs : 0 < s) (hsm : s <
       exact Nat.mod_eq_of_lt (by omega)]
     ring_nf
 
-/-
-Appending zeros does not change the aperiodic autocorrelation.
--/
+/-- Appending zeros does not change the aperiodic autocorrelation. -/
 lemma aperiodicAutocorr_append_zeros (a : List Int) (k s : Nat) :
     aperiodicAutocorr (a ++ zeroSeq k) s = aperiodicAutocorr a s := by
   unfold aperiodicAutocorr;
@@ -270,9 +271,7 @@ lemma aperiodicAutocorr_append_zeros (a : List Int) (k s : Nat) :
     refine' Finset.sum_eq_zero fun x hx => _;
     grind +revert
 
-/-
-Prepending zeros does not change the aperiodic autocorrelation.
--/
+/-- Prepending zeros does not change the aperiodic autocorrelation. -/
 lemma aperiodicAutocorr_prepend_zeros (a : List Int) (k s : Nat) :
     aperiodicAutocorr (zeroSeq k ++ a) s = aperiodicAutocorr a s := by
   unfold aperiodicAutocorr;
@@ -285,9 +284,7 @@ lemma aperiodicAutocorr_prepend_zeros (a : List Int) (k s : Nat) :
     simp +decide [add_assoc];
     exact Finset.sum_eq_zero fun x hx => by aesop;
 
-/-
-Half-sum/half-difference autocorrelation identity for ±1 sequences.
--/
+/-- Half-sum/half-difference autocorrelation identity for ±1 sequences. -/
 lemma sumHalf_diffHalf_autocorr (a b : List Int) (s : Nat)
     (hab : a.length = b.length) (ha : AllPmOne a) (hb : AllPmOne b) :
     2 * (aperiodicAutocorr (seqSumHalf a b) s +
