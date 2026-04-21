@@ -458,8 +458,11 @@ lemma pm_entry_of_getD {X : PmSeq} (hpm : AllPmOne X) {i : Nat} (hi : i < X.leng
 
 lemma aperiodicAutocorr_last {n : Nat} {a : PmSeq} (ha : a.length = n) (hn : 1 < n) :
     aperiodicAutocorr a (n - 1) = a.getD 0 0 * a.getD (n - 1) 0 := by
-      unfold aperiodicAutocorr;
-      rcases n with ( _ | _ | n ) <;> simp_all +decide
+  unfold aperiodicAutocorr
+  rw [if_neg (by rw [ha]; omega)]
+  rw [show a.length - (n - 1) = 1 from by rw [ha]; omega]
+  rw [Finset.sum_range_one]
+  rw [Nat.zero_add]
 
 lemma endpoint_relation {n : Nat} (hn : 1 < n) (S : TurynTypeSeq n) :
     aAt S 1 * aAt S n + bAt S 1 * bAt S n + 2 * (cAt S 1 * cAt S n) = 0 := by
@@ -477,8 +480,11 @@ theorem lemma1_endpoint_constraint
     (n : Nat) (hn : 1 < n) (S : TurynTypeSeq n)
     (h1 : Canonical1 n S) :
     cAt S n = -1 := by
-      have := endpoint_relation hn S; simp_all +decide [ Canonical1 ] ;
-      linarith
+  have hep := endpoint_relation hn S
+  unfold Canonical1 at h1
+  obtain ⟨ha1, han, hb1, hbn, hc1, _⟩ := h1
+  rw [ha1, han, hb1, hbn, hc1] at hep
+  linarith
 
 /-! ### Helper lemmas for step proofs -/
 
@@ -781,7 +787,10 @@ Reversal of a list maps index j to (length-1-j).
 -/
 lemma revD_getD {D : PmSeq} {j : Nat} (hj : j < D.length) :
     D.reverse.getD j 0 = D.getD (D.length - 1 - j) 0 := by
-      grind
+  have h1 : j < D.reverse.length := by rw [List.length_reverse]; exact hj
+  have h2 : D.length - 1 - j < D.length := by omega
+  rw [List.getD_eq_getElem _ _ h1, List.getD_eq_getElem _ _ h2]
+  rw [List.getElem_reverse]
 
 /-
 After reversing D (length n-1) in a TurynTypeSeq, the 1-indexed accessor
