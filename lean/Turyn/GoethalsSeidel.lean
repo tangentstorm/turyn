@@ -278,13 +278,13 @@ theorem gsMatrix_eq_reindex_gsBlockMatrix {n : Nat} (G : GSData n) :
   · ext i j
     obtain ⟨p, rfl⟩ := (gsBlockEquiv n).surjective i
     obtain ⟨q, rfl⟩ := (gsBlockEquiv n).surjective j
-    simp +decide [Matrix.reindex_apply]
+    simp only [Matrix.reindex_apply, Equiv.symm_apply_apply, Matrix.submatrix_apply]
     rcases p with ((p | p) | (p | p)) <;> rcases q with ((q | q) | (q | q)) <;>
-    simp +decide [gsMatrix, gsMatrixEntry, gsBlockMatrix, Matrix.submatrix_apply,
+    simp only [gsMatrix, gsMatrixEntry, gsBlockMatrix,
       Equiv.symm_apply_apply, Matrix.fromBlocks_apply₁₁, Matrix.fromBlocks_apply₁₂,
-      Matrix.fromBlocks_apply₂₁, Matrix.fromBlocks_apply₂₂, div_block0 _, div_block1 _,
-      div_block2 _, div_block3 _, mod_block0 _, mod_block1 _, mod_block2 _,
-      mod_block3 _]
+      Matrix.fromBlocks_apply₂₁, Matrix.fromBlocks_apply₂₂, div_block0, div_block1,
+      div_block2, div_block3, mod_block0, mod_block1, mod_block2,
+      mod_block3, Matrix.neg_apply]
 
 /-! ### Core algebraic helper lemmas -/
 
@@ -293,19 +293,25 @@ Circulant self-product entry equals periodic autocorrelation.
 -/
 lemma circulant_mul_transpose_eq_periodicAutocorr {n : Nat} (x : IntVec n) (i j : Fin n) :
     (circulant x * (circulant x)ᵀ) i j = periodicAutocorr x (i - j) := by
-  -- Apply the circulant_mul_transpose_apply lemma to rewrite the left-hand side.
-  rw [circulant_mul_transpose_apply];
-  rcases n with ( _ | n ) <;> simp_all +decide [ periodicAutocorr ];
-  rw [ ← Equiv.sum_comp ( Equiv.addRight i ) ] ; norm_num [ sub_eq_add_neg, add_assoc ] ;
+  rcases n with _ | n
+  · exact Fin.elim0 i
+  · rw [circulant_mul_transpose_apply]
+    unfold periodicAutocorr
+    rw [← Equiv.sum_comp (Equiv.addRight i)]
+    congr 1; ext k
+    simp only [Equiv.coe_addRight]
+    congr 1 <;> congr 1 <;> abel
 
 /-
 Periodic autocorrelation at zero gives n for ±1 vectors.
 -/
 lemma periodicAutocorr_zero_pmOne {n : Nat} [NeZero n] (x : IntVec n) (hx : IsPmOneVec x) :
     periodicAutocorr x 0 = (n : Int) := by
-  convert Finset.sum_congr rfl fun i _ => show x i * x i = 1 by cases hx i <;> simp +decide [ * ];
-  rotate_right;
-  exacts [ Finset.univ, by unfold periodicAutocorr; simp +decide, by simp +decide ]
+  unfold periodicAutocorr
+  have h : ∀ i : Fin n, x i * x (i + 0) = 1 := by
+    intro i; simp only [add_zero]; rcases hx i with h | h <;> rw [h] <;> norm_num
+  rw [Finset.sum_congr rfl (fun i _ => h i), Finset.sum_const, Finset.card_univ,
+      Fintype.card_fin, Nat.smul_one_eq_cast]
 
 /-
 Periodic autocorrelation is an even function.
@@ -318,29 +324,32 @@ lemma periodicAutocorr_neg {n : Nat} (x : IntVec n) (s : Fin n) :
   · rw [ ← Equiv.sum_comp ( Equiv.addRight s ) ] ; norm_num;
     ac_rfl
 
-/-- `Cᵀ * C = C * Cᵀ` for circulant matrices (both give periodic autocorrelation). -/
+/-
+`Cᵀ * C = C * Cᵀ` for circulant matrices (both give periodic autocorrelation).
+-/
 lemma circulant_transpose_mul_self_comm {n : Nat} (x : IntVec n) :
     (circulant x)ᵀ * circulant x = circulant x * (circulant x)ᵀ := by
   rcases n with _ | n
-  · ext i; exact absurd i.2 (by simp)
-  · haveI : NeZero (n + 1) := ⟨by omega⟩
-    ext i j
-    simp +decide [Matrix.mul_apply, circulant_transpose_apply, circulant_apply]
+  · ext i; exact Fin.elim0 i
+  · ext i j
+    simp only [Matrix.mul_apply, circulant_transpose_apply, circulant_apply]
     conv_lhs =>
       arg 2; ext k
-      rw [show i - k = (i + j) - k - j from by abel]
-      rw [show j - k = (i + j) - k - i from by abel]
-      rw [mul_comm]
+      rw [show i - k = (i + j) - k - j from by abel,
+          show j - k = (i + j) - k - i from by abel, mul_comm]
     rw [← Equiv.sum_comp (Equiv.subLeft (i + j))]
-    simp [Equiv.subLeft]
+    congr 1; ext k
+    simp only [Equiv.subLeft_apply]
+    congr 1 <;> congr 1 <;> abel
 
 /-
 `(M * R) * (M * R)ᵀ = M * Mᵀ` using `Rᵀ = R` and `R² = I`.
 -/
 lemma mul_reversalMatrix_mul_transpose_self {n : Nat} (M : IntMat n) :
     (M * reversalMatrix n) * (M * reversalMatrix n)ᵀ = M * Mᵀ := by
-  simp +decide [ Matrix.mul_assoc, Matrix.transpose_mul, reversalMatrix_transpose ];
-  simp_all +decide [ ← Matrix.mul_assoc, reversalMatrix_mul_reversalMatrix ]
+  rw [Matrix.transpose_mul, reversalMatrix_transpose,
+      Matrix.mul_assoc, ← Matrix.mul_assoc (reversalMatrix n) (reversalMatrix n),
+      reversalMatrix_mul_reversalMatrix, Matrix.one_mul]
 
 /-
 `trCirculant x * (trCirculant x)ᵀ = circulant x * (circulant x)ᵀ`.
@@ -436,6 +445,17 @@ lemma circulant_reversalMatrix_transpose_comm {n : Nat} (x y : IntVec n) :
       circulant_transpose_mul_comm x y,
       ← Matrix.mul_assoc, ← circulant_reversalMatrix y]
 
+
+private lemma fin_sub_val_ne_zero {n : Nat} {i j : Fin n} (hij : i ≠ j) : (i - j).val ≠ 0 := by
+  intro h; apply hij; rw [Fin.ext_iff]
+  simp only [Fin.val_sub] at h
+  have hi := i.isLt; have hj := j.2
+  by_cases hij2 : j.val ≤ i.val
+  · rw [show n - j.val + i.val = i.val - j.val + n from by omega, Nat.add_mod_right,
+        Nat.mod_eq_of_lt (by omega : i.val - j.val < n)] at h; omega
+  · push_neg at hij2
+    rw [Nat.mod_eq_of_lt (by omega : n - j.val + i.val < n)] at h; omega
+
 /-
 The combined sum of four circulant self-products equals `(4n) • I`.
 -/
@@ -443,22 +463,30 @@ lemma four_circulant_products_eq {n : Nat} (G : CertifiedGSData n) :
     gsA G.toGSData * (gsA G.toGSData)ᵀ + gsB G.toGSData * (gsB G.toGSData)ᵀ +
     gsC G.toGSData * (gsC G.toGSData)ᵀ + gsD G.toGSData * (gsD G.toGSData)ᵀ =
     (4 * ↑n : Int) • (1 : IntMat n) := by
-  ext i j; by_cases hij : i = j <;> simp_all +decide [Matrix.mul_apply] ;
-  · -- Since each entry in the circulant matrices is ±1, the square of each entry is 1. Therefore, the sum of the squares of the entries in each row is n.
-    have h_sum_squares : ∀ (x : IntVec n) (hx : IsPmOneVec x), ∀ j : Fin n, ∑ x_1 : Fin n, x (x_1 - j) * x (x_1 - j) = n := by
-      intro x hx j; rw [ Finset.sum_congr rfl fun i hi => by rw [ show x ( i - j ) * x ( i - j ) = 1 by rcases hx ( i - j ) with h | h <;> rw [ h ] <;> norm_num ] ] ; simp +decide ;
-    linarith! [ h_sum_squares G.x1 G.x1_pm j, h_sum_squares G.x2 G.x2_pm j, h_sum_squares G.x3 G.x3_pm j, h_sum_squares G.x4 G.x4_pm j ];
-  · have h_combined : combinedPeriodic G.toGSData (i - j) = 0 := by
-      apply G.periodic_vanishing;
-      simp_all +decide [ Fin.ext_iff, Fin.val_sub ];
-      contrapose! hij; have := Nat.mod_add_div ( n - j + i ) n; simp_all +decide ;
-      nlinarith [ show ( n - j + i : ℕ ) / n = 1 by nlinarith [ Fin.is_lt i, Fin.is_lt j, Nat.sub_add_cancel ( show ( j : ℕ ) ≤ n from j.2.le ) ], Nat.sub_add_cancel ( show ( j : ℕ ) ≤ n from j.2.le ) ];
-    have h_combined : ∀ x : IntVec n, (circulant x * (circulant x)ᵀ) i j = periodicAutocorr x (i - j) := by
-      exact fun x => circulant_mul_transpose_eq_periodicAutocorr x i j;
-    unfold gsA gsB gsC gsD; simp_all +decide [Matrix.mul_apply] ;
-    (expose_names;
-      exact Eq.symm ((fun {a b} => Int.neg_inj.mp) (congrArg Neg.neg (id (Eq.symm h_combined_1)))))
-
+  ext i j
+  simp only [Matrix.add_apply, Matrix.smul_apply, Matrix.one_apply, smul_eq_mul]
+  by_cases hij : i = j
+  · subst hij
+    haveI : NeZero n := ⟨fun h => by subst h; exact (Nat.not_lt_zero _ i.2).elim⟩
+    unfold gsA gsB gsC gsD
+    rw [circulant_mul_transpose_eq_periodicAutocorr, circulant_mul_transpose_eq_periodicAutocorr,
+        circulant_mul_transpose_eq_periodicAutocorr, circulant_mul_transpose_eq_periodicAutocorr,
+        sub_self,
+        periodicAutocorr_zero_pmOne _ G.x1_pm,
+        periodicAutocorr_zero_pmOne _ G.x2_pm,
+        periodicAutocorr_zero_pmOne _ G.x3_pm,
+        periodicAutocorr_zero_pmOne _ G.x4_pm]
+    simp only [if_pos rfl]; push_cast; ring
+  · simp only [if_neg hij, mul_zero]
+    have h_periodic : combinedPeriodic G.toGSData (i - j) = 0 :=
+      G.periodic_vanishing _ (fin_sub_val_ne_zero hij)
+    unfold combinedPeriodic at h_periodic
+    rw [← circulant_mul_transpose_eq_periodicAutocorr,
+        ← circulant_mul_transpose_eq_periodicAutocorr,
+        ← circulant_mul_transpose_eq_periodicAutocorr,
+        ← circulant_mul_transpose_eq_periodicAutocorr] at h_periodic
+    unfold gsA gsB gsC gsD
+    linarith
 /-! ### Block matrix computations -/
 
 /-- The 4×4 block GS matrix is entrywise `±1`. -/
@@ -514,12 +542,30 @@ theorem gsBlockMatrix_diag_blocks {n : Nat} (G : CertifiedGSData n) :
     Matrix.toBlocks₂₂ (Matrix.toBlocks₁₁ M) = (4 * n : Int) • (1 : IntMat n) ∧
     Matrix.toBlocks₁₁ (Matrix.toBlocks₂₂ M) = (4 * n : Int) • (1 : IntMat n) ∧
     Matrix.toBlocks₂₂ (Matrix.toBlocks₂₂ M) = (4 * n : Int) • (1 : IntMat n) := by
-  unfold gsBlockMatrix; simp +decide [ Matrix.fromBlocks_transpose, Matrix.fromBlocks_multiply ] ;
-  simp +decide [Matrix.toBlocks₁₁, Matrix.toBlocks₂₂] at *;
-  simp_all +decide [← Matrix.mul_assoc, trCirculant_mul_transpose_self];
-  simp_all +decide [ mul_assoc, reversalMatrix_transpose, reversalMatrix_mul_reversalMatrix ];
-  have := four_circulant_products_eq G; simp_all +decide [ ← add_assoc, ← Matrix.ext_iff ] ;
-  exact ⟨ fun i j => by linarith! [ this i j ], fun i j => by linarith! [ this i j ], fun i j => by linarith! [ this i j ] ⟩
+  refine' ⟨ _, _, _, _ ⟩;
+  · convert four_circulant_products_eq G using 1;
+    simp [ gsBlockMatrix, Matrix.fromBlocks_transpose, Matrix.fromBlocks_multiply ];
+    simp [ Matrix.toBlocks₁₁, Matrix.toBlocks₂₂, Matrix.fromBlocks_multiply ];
+    ext i j; simp [ Matrix.mul_assoc, Matrix.mul_add, Matrix.add_mul, Matrix.mul_one, Matrix.one_mul, mul_reversalMatrix_mul_transpose_self, reversalMatrix_transpose, reversalMatrix_mul_reversalMatrix ] ; ring;
+    simp [ ← Matrix.mul_assoc, reversalMatrix_mul_reversalMatrix ];
+  · convert four_circulant_products_eq G using 1;
+    unfold gsBlockMatrix;
+    simp [ Matrix.fromBlocks_transpose, Matrix.fromBlocks_multiply, Matrix.toBlocks₁₁, Matrix.toBlocks₂₂ ];
+    ext i j; simp [ ← Matrix.mul_assoc, trCirculant_mul_transpose_self, mul_reversalMatrix_mul_transpose_self ] ;
+    simp [ ← Matrix.mul_assoc, reversalMatrix_transpose, reversalMatrix_mul_reversalMatrix ] ; ring!;
+    simp [ Matrix.mul_assoc, reversalMatrix_mul_reversalMatrix ] ; ring;
+  · rw [ gsBlockMatrix ];
+    simp [ Matrix.fromBlocks_transpose, Matrix.fromBlocks_multiply, Matrix.toBlocks₁₁, Matrix.toBlocks₂₂ ];
+    convert four_circulant_products_eq G using 1;
+    · ext i j; simp [ Matrix.mul_assoc, Matrix.mul_add, Matrix.add_mul, Matrix.mul_one, Matrix.one_mul, trCirculant_mul_transpose_self ] ; ring;
+      simp [ ← Matrix.mul_assoc, reversalMatrix_transpose, reversalMatrix_mul_reversalMatrix ] ; ring!;
+    · norm_num [ Algebra.smul_def ];
+  · convert four_circulant_products_eq G using 1;
+    unfold gsBlockMatrix;
+    simp [ Matrix.fromBlocks_transpose, Matrix.fromBlocks_multiply ];
+    simp [ ← Matrix.mul_assoc, trCirculant_mul_transpose_self, mul_reversalMatrix_mul_transpose_self, reversalMatrix_transpose, reversalMatrix_mul_reversalMatrix ];
+    ext i j; simp [ Matrix.toBlocks₂₂, Matrix.fromBlocks ] ;
+    simp [ Matrix.mul_assoc, reversalMatrix_transpose, reversalMatrix_mul_reversalMatrix ] ; ring!
 
 /-
 The upper-right block of `gsBlockMatrix * gsBlockMatrixᵀ` vanishes.
@@ -527,39 +573,41 @@ The upper-right block of `gsBlockMatrix * gsBlockMatrixᵀ` vanishes.
 theorem gsBlockMatrix_upper_right_zero {n : Nat} (G : CertifiedGSData n) :
     Matrix.toBlocks₁₂ (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ) = 0 := by
   unfold gsBlockMatrix;
-  simp +decide [Matrix.toBlocks₁₂, Matrix.fromBlocks_multiply, Matrix.fromBlocks_transpose,
-    reversalMatrix_transpose, Matrix.mul_assoc, neg_mul, mul_neg];
-  ext i j;
-  rcases i with ( i | i ) <;> rcases j with ( j | j ) <;> simp +decide [ Matrix.fromBlocks ];
-  · unfold gsA gsB gsC gsD trCirculant;
-    simp +decide [← Matrix.mul_assoc, ← circulant_reversalMatrix,
-      ← circulant_transpose_reversalMatrix, ← circulant_mul_circulant_comm,
-      reversalMatrix_transpose];
-    ring;
-  · unfold gsA gsB gsC gsD trCirculant; simp +decide [ ← Matrix.mul_assoc ] ; ring_nf;
-    simp +decide [ Matrix.mul_assoc, reversalMatrix_transpose ];
-    simp +decide [ ← Matrix.mul_assoc, reversalMatrix_mul_reversalMatrix ];
-    simp_all +decide [ circulant_reversalMatrix_transpose_comm, circulant_mul_circulant_comm ];
-  · unfold trCirculant; simp +decide [ Matrix.mul_assoc, Matrix.transpose_mul ] ;
-    simp +decide [ ← Matrix.mul_assoc, reversalMatrix_transpose, reversalMatrix_mul_reversalMatrix ];
-    unfold gsA gsB gsC; simp +decide [ Matrix.mul_assoc, circulant_mul_circulant_transpose_comm, circulant_reversalMatrix, circulant_transpose_reversalMatrix ] ;
-    ring;
-  · simp +decide [ ← Matrix.mul_assoc, trCirculant ];
-    simp +decide [ gsA, gsB, gsD, reversalMatrix_transpose, reversalMatrix_mul_reversalMatrix, Matrix.mul_assoc ];
-    simp +decide [ ← Matrix.mul_assoc, circulant_mul_circulant_transpose_comm ];
-    simp +decide [Matrix.mul_assoc, circulant_reversalMatrix, circulant_transpose_reversalMatrix,
-      circulant_mul_circulant_transpose_comm];
-    grind
+  simp [ Matrix.fromBlocks_multiply, Matrix.fromBlocks_transpose ];
+  ext ( i j );
+  rcases i with ( i | i ) <;> rcases j with ( j | j ) <;> norm_num [ Matrix.mul_assoc, Matrix.transpose_mul, Matrix.transpose_one, Matrix.transpose_neg, Matrix.transpose_add, Matrix.transpose_smul, Matrix.transpose_transpose ];
+  · unfold trCirculant;
+    simp [ ← Matrix.mul_assoc, reversalMatrix_transpose ];
+    simp [ Matrix.mul_assoc, reversalMatrix_mul_reversalMatrix ];
+    simp [ ← Matrix.mul_assoc, circulant_reversalMatrix_transpose_comm, circulant_mul_circulant_comm, circulant_mul_circulant_transpose_comm, circulant_reversalMatrix, circulant_transpose_reversalMatrix ];
+    simp [ gsA, gsB, gsC, gsD, circulant_reversalMatrix_transpose_comm ];
+    rw [ circulant_mul_circulant_comm ] ; ring;
+  · unfold trCirculant; simp [ Matrix.mul_assoc, Matrix.transpose_mul, Matrix.transpose_neg, Matrix.transpose_transpose ] ;
+    simp [ ← Matrix.mul_assoc, reversalMatrix_transpose, reversalMatrix_mul_reversalMatrix ];
+    simp [ gsA, gsB, gsC, gsD, circulant_reversalMatrix_transpose_comm ];
+    rw [ circulant_mul_circulant_comm ] ; ring;
+  · unfold gsA gsB trCirculant;
+    simp [ ← Matrix.mul_assoc, reversalMatrix_transpose, reversalMatrix_mul_reversalMatrix ];
+    simp [ Matrix.mul_assoc, circulant_reversalMatrix_transpose_comm, circulant_mul_circulant_comm, circulant_mul_circulant_transpose_comm, circulant_reversalMatrix, circulant_transpose_reversalMatrix ];
+    rw [ show gsC G.toGSData = circulant G.x3 from rfl ] ; simp [ ← Matrix.mul_assoc, circulant_mul_circulant_comm, circulant_mul_circulant_transpose_comm, circulant_reversalMatrix, circulant_transpose_reversalMatrix ] ; ring;
+  · simp [ ← Matrix.mul_assoc, reversalMatrix_transpose, trCirculant ];
+    simp [ Matrix.mul_assoc, reversalMatrix_mul_reversalMatrix ];
+    simp [ ← Matrix.mul_assoc, ← circulant_reversalMatrix, ← circulant_transpose_reversalMatrix, ← circulant_mul_circulant_comm, ← circulant_mul_circulant_transpose_comm, ← circulant_reversalMatrix_transpose_comm ];
+    simp [ Matrix.mul_assoc, ← circulant_mul_circulant_comm, ← circulant_mul_circulant_transpose_comm, ← circulant_reversalMatrix_transpose_comm, ← circulant_reversalMatrix, ← circulant_transpose_reversalMatrix, gsA, gsB, gsC, gsD ];
+    simp [ ← Matrix.mul_assoc, ← circulant_mul_circulant_transpose_comm, ← circulant_reversalMatrix_transpose_comm, ← circulant_reversalMatrix, ← circulant_transpose_reversalMatrix, gsA, gsB, gsC, gsD ];
+    ring
 
 /-
 The lower-left block of `gsBlockMatrix * gsBlockMatrixᵀ` vanishes.
 -/
 theorem gsBlockMatrix_lower_left_zero {n : Nat} (G : CertifiedGSData n) :
     Matrix.toBlocks₂₁ (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ) = 0 := by
-  ext i j; simp +decide [ Matrix.toBlocks₂₁ ] ;
-  convert congr_arg ( fun m => m j i ) ( gsBlockMatrix_upper_right_zero G ) using 1;
-  simp +decide [ Matrix.toBlocks₁₂, Matrix.mul_apply ];
-  ac_rfl
+  -- By symmetry, the lower-left block is the transpose of the upper-right block.
+  have h_symm : (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ).toBlocks₂₁ = ((gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ).toBlocks₁₂)ᵀ := by
+    ext i j; simp [ Matrix.toBlocks₁₂, Matrix.toBlocks₂₁ ] ;
+    simp [ Matrix.mul_apply, Matrix.transpose_apply ];
+    ac_rfl;
+  rw [ h_symm, gsBlockMatrix_upper_right_zero G, Matrix.transpose_zero ]
 
 /-! ### Helpers for the explicit proof of `gsBlockMatrix_target_from_blocks` -/
 
@@ -715,13 +763,15 @@ Typed GS orthogonality target.
 -/
 theorem gsMatrix_target {n : Nat} (G : CertifiedGSData n) :
     GSTarget G.toGSData := by
-  convert gsBlockMatrix_target_from_blocks G using 1;
-  funext n G;
-  rw [ GSTarget, GSBlockTarget ];
-  rw [ gsMatrix_eq_reindex_gsBlockMatrix ];
-  simp +decide [ Matrix.smul_eq_diagonal_mul ];
-  constructor <;> intro h <;> ext i j <;> simp_all +decide [ Matrix.submatrix, Matrix.diagonal ];
-  simpa using congr_fun ( congr_fun h ( gsBlockEquiv n i ) ) ( gsBlockEquiv n j )
+      rw [ GSTarget, gsMatrix_eq_reindex_gsBlockMatrix ];
+      -- By definition of reindex, we can rewrite the left-hand side as the submatrix of the block product.
+      have h_reindex : (reindex (gsBlockEquiv n) (gsBlockEquiv n)) (gsBlockMatrix G.toGSData) = (gsBlockMatrix G.toGSData).submatrix (gsBlockEquiv n).symm (gsBlockEquiv n).symm := by
+        exact reindex_apply (gsBlockEquiv n) (gsBlockEquiv n) (gsBlockMatrix G.toGSData);
+      rw [ h_reindex, Matrix.transpose_submatrix ];
+      convert congr_arg ( fun m => m.submatrix ( gsBlockEquiv n |> Equiv.symm ) ( gsBlockEquiv n |> Equiv.symm ) ) ( gsBlockMatrix_target_from_blocks G ) using 1;
+      · exact submatrix_mul_equiv (gsBlockMatrix G.toGSData) (gsBlockMatrix G.toGSData)ᵀ (⇑(gsBlockEquiv n).symm) (gsBlockEquiv n).symm ⇑(gsBlockEquiv n).symm;
+      · ext i j; simp [ Matrix.smul_eq_diagonal_mul ] ;
+        by_cases hij : i = j <;> simp [ hij, Matrix.one_apply ]
 
 /-- Final typed GS Hadamard theorem. -/
 theorem gsMatrix_isHadamard {n : Nat} (G : CertifiedGSData n) :
