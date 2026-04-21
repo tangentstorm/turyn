@@ -136,6 +136,16 @@ impl StageHandler<MddPayload> for BoundaryStage {
         let emitted_raw = process_boundary(bnd, &self.ctx, &self.metrics, self.use_wz_mode);
         let mut out = StageOutcome::default();
         out.emitted = wrap_items(emitted_raw, &parent_meta);
+        // Credit one boundary-unit of coverage per Boundary call so
+        // `MassSnapshot::covered` grows linearly from 0 to
+        // `total_mass = seed_boundaries.len()`. Produces a
+        // meaningful `ProgressSnapshot::ttc` in the universal TTC
+        // formula `remaining / rate`. Coverage-bits upgrade (log2
+        // of the residual sub-cube per boundary) is a follow-up.
+        out.mass_delta = crate::search_framework::mass::MassDelta {
+            covered_exact: crate::search_framework::mass::MassValue(1.0),
+            covered_partial: crate::search_framework::mass::MassValue::ZERO,
+        };
         out
     }
 }
