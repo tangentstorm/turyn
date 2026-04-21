@@ -442,89 +442,161 @@ theorem equivalent_trans
     Equivalent n S T → Equivalent n T U → Equivalent n S U :=
   Relation.ReflTransGen.trans
 
+/-! ### Private helpers for step1_condition1 -/
+
+private lemma step1_aAt_doNegA {n : Nat} (S : TurynTypeSeq n) (i : Nat) :
+    aAt S.doNegA i = -(aAt S i) := by
+  unfold aAt TurynTypeSeq.doNegA; exact negSeq_getD _ _
+
+private lemma step1_bAt_doNegB {n : Nat} (S : TurynTypeSeq n) (i : Nat) :
+    bAt S.doNegB i = -(bAt S i) := by
+  unfold bAt TurynTypeSeq.doNegB; exact negSeq_getD _ _
+
+private lemma step1_cAt_doNegC {n : Nat} (S : TurynTypeSeq n) (i : Nat) :
+    cAt S.doNegC i = -(cAt S i) := by
+  unfold cAt TurynTypeSeq.doNegC; exact negSeq_getD _ _
+
+private lemma step1_dAt_doNegD {n : Nat} (S : TurynTypeSeq n) (i : Nat) :
+    dAt S.doNegD i = -(dAt S i) := by
+  unfold dAt TurynTypeSeq.doNegD; exact negSeq_getD _ _
+
+private lemma step1_aAt_doAltAll_first {n : Nat} (S : TurynTypeSeq n) (hn : 1 ≤ n) :
+    aAt S.doAltAll 1 = aAt S 1 := by
+  unfold aAt TurynTypeSeq.doAltAll
+  exact altSeq_getD_zero S.A (by rw [S.isTuryn.x_len]; omega)
+
+private lemma step1_bAt_doAltAll_first {n : Nat} (S : TurynTypeSeq n) (hn : 1 ≤ n) :
+    bAt S.doAltAll 1 = bAt S 1 := by
+  unfold bAt TurynTypeSeq.doAltAll
+  exact altSeq_getD_zero S.B (by rw [S.isTuryn.y_len]; omega)
+
+private lemma step1_cAt_doAltAll_first {n : Nat} (S : TurynTypeSeq n) (hn : 1 ≤ n) :
+    cAt S.doAltAll 1 = cAt S 1 := by
+  unfold cAt TurynTypeSeq.doAltAll
+  exact altSeq_getD_zero S.C (by rw [S.isTuryn.z_len]; omega)
+
+private lemma step1_dAt_doAltAll_first {n : Nat} (S : TurynTypeSeq n) (hn : 2 ≤ n) :
+    dAt S.doAltAll 1 = dAt S 1 := by
+  unfold dAt TurynTypeSeq.doAltAll
+  exact altSeq_getD_zero S.D (by rw [S.isTuryn.w_len]; omega)
+
+private lemma step1_aAt_doAltAll_last {n : Nat} (S : TurynTypeSeq n)
+    (hn_even : n % 2 = 0) (hn : 2 ≤ n) :
+    aAt S.doAltAll n = -(aAt S n) := by
+  unfold aAt TurynTypeSeq.doAltAll
+  have hlen := S.isTuryn.x_len
+  have h := altSeq_getD_last S.A (by rw [hlen]; exact hn_even) (by rw [hlen]; exact hn)
+  rw [hlen] at h; exact h
+
+private lemma step1_bAt_doAltAll_last {n : Nat} (S : TurynTypeSeq n)
+    (hn_even : n % 2 = 0) (hn : 2 ≤ n) :
+    bAt S.doAltAll n = -(bAt S n) := by
+  unfold bAt TurynTypeSeq.doAltAll
+  have hlen := S.isTuryn.y_len
+  have h := altSeq_getD_last S.B (by rw [hlen]; exact hn_even) (by rw [hlen]; exact hn)
+  rw [hlen] at h; exact h
+
 /-- Step 1: enforce condition (1) — normalize endpoint signs. -/
 theorem step1_condition1
     (n : Nat) (hn_even : n % 2 = 0) (hn : 2 ≤ n) (S : TurynTypeSeq n) :
     ∃ S1 : TurynTypeSeq n, Equivalent n S S1 ∧ Canonical1 n S1 := by
-      -- By negating components if necessary, we can ensure that the first elements of A, B, C, and D are all 1.
-      have h_neg : ∃ S1 : TurynTypeSeq n, Equivalent n S S1 ∧ (aAt S1 1 = 1 ∧ bAt S1 1 = 1 ∧ cAt S1 1 = 1 ∧ dAt S1 1 = 1) := by
-        obtain ⟨S1, hS1⟩ : ∃ S1 : TurynTypeSeq n, Equivalent n S S1 ∧ aAt S1 1 = 1 ∧ bAt S1 1 = 1 ∧ cAt S1 1 = 1 := by
-          obtain ⟨S1, hS1⟩ : ∃ S1 : TurynTypeSeq n, Equivalent n S S1 ∧ aAt S1 1 = 1 ∧ bAt S1 1 = 1 := by
-            obtain ⟨S1, hS1⟩ : ∃ S1 : TurynTypeSeq n, Equivalent n S S1 ∧ aAt S1 1 = 1 := by
-              by_cases h : aAt S 1 = 1;
-              · exact ⟨ S, Relation.ReflTransGen.refl, h ⟩;
-              · use S.doNegA
-                constructor
-                · exact Relation.ReflTransGen.single (Elementary.negA S)
-                ·
-                  have := S.isTuryn.x_pm ( S.A.getD 0 0 ) ; simp_all +decide [ aAt ] ;
-                  by_cases h' : 0 < S.A.length <;> simp_all +decide [ TurynTypeSeq.doNegA ];
-                  · unfold negSeq; aesop;
-                  · have := S.isTuryn.x_len; aesop;
-            by_cases h : bAt S1 1 = 1;
-            · exact ⟨ S1, hS1.1, hS1.2, h ⟩;
-            · use S1.doNegB;
-              refine' ⟨ _, _, _ ⟩;
-              · exact hS1.1.trans ( Relation.ReflTransGen.single ( Elementary.negB _ ) );
-              · unfold aAt at *; aesop;
-              · have h_bAt_neg : bAt S1 1 = -1 := by
-                  have := S1.isTuryn.y_pm;
-                  exact Or.resolve_left ( pm_entry_of_getD this ( show 0 < S1.B.length from by linarith [ S1.isTuryn.y_len ] ) ) h;
-                have h_bAt_neg : bAt S1.doNegB 1 = -(bAt S1 1) := by
-                  exact negSeq_getD _ _;
-                grind;
-          by_cases hc : cAt S1 1 = 1;
-          · exact ⟨ S1, hS1.1, hS1.2.1, hS1.2.2, hc ⟩;
-          · use S1.doNegC;
-            refine' ⟨ _, _, _, _ ⟩;
-            · exact hS1.1.trans ( Relation.ReflTransGen.single ( Elementary.negC _ ) );
-            · unfold aAt TurynTypeSeq.doNegC; aesop;
-            · exact hS1.2.2;
-            · unfold cAt at *;
-              have := S1.isTuryn.x_pm 0; have := S1.isTuryn.y_pm 0; have := S1.isTuryn.z_pm 0; have := S1.isTuryn.w_pm 0; simp_all +decide [ TurynTypeSeq.doNegC ] ;
-              cases h : S1.C <;> simp_all +decide [ negSeq ];
-              · have := S1.isTuryn.z_len; aesop;
-              · have := S1.isTuryn.z_pm; simp_all +decide [ AllPmOne ] ;
-        by_cases hd1 : dAt S1 1 = 1;
-        · exact ⟨ S1, hS1.1, hS1.2.1, hS1.2.2.1, hS1.2.2.2, hd1 ⟩;
-        · refine' ⟨ TurynTypeSeq.doNegD S1, _, _, _, _, _ ⟩ <;> simp_all +decide [ TurynTypeSeq.doNegD ];
-          · exact hS1.1.trans ( Relation.ReflTransGen.single ( Elementary.negD _ ) );
-          · exact hS1.2.1;
-          · exact hS1.2.2.1;
-          · exact hS1.2.2.2;
-          · -- Since $dAt S1 1 \neq 1$, we have $dAt S1 1 = -1$.
-            have hd1_neg : dAt S1 1 = -1 := by
-              exact Or.resolve_left ( pm_entry_of_getD ( show AllPmOne S1.D from S1.isTuryn.w_pm ) ( show 0 < S1.D.length from by linarith [ S1.isTuryn.w_len, Nat.sub_add_cancel ( by linarith : 1 ≤ n ) ] ) ) ( by aesop );
-            convert congr_arg Neg.neg hd1_neg using 1;
-            exact negSeq_getD _ _;
-      obtain ⟨ S1, hS1, ha, hb, hc, hd ⟩ := h_neg;
-      -- If $aAt n = bAt n = -1$, apply `doAltAll` to flip the signs of the last elements.
-      by_cases h_last : aAt S1 n = -1 ∧ bAt S1 n = -1;
-      · refine' ⟨ S1.doAltAll, hS1.trans ( Elementary.toEquivalent ( Elementary.altAll S1 ) ), _, _, _, _, _ ⟩ <;> simp_all +decide [ TurynTypeSeq.doAltAll ];
-        · convert ha using 1;
-          exact altSeq_getD_zero _ ( by linarith [ S1.isTuryn.x_len ] );
-        · grind +locals;
-        · convert hb using 1;
-          exact altSeq_getD_zero _ ( by linarith [ S1.isTuryn.x_len, S1.isTuryn.y_len, S1.isTuryn.z_len, S1.isTuryn.w_len ] );
-        · unfold bAt at *;
-          unfold altSeq; simp +decide [*] ;
-          grind +splitImp;
-        · simp_all +decide [ aAt, bAt, cAt, dAt, altSeq ];
-          grind;
-      · have h_last : aAt S1 n = 1 ∧ bAt S1 n = 1 := by
-          have h_last : aAt S1 n * aAt S1 1 + bAt S1 n * bAt S1 1 + 2 * (cAt S1 n * cAt S1 1) = 0 := by
-            convert endpoint_relation ( show 1 < n from hn ) S1 using 1 ; ring;
-          have h_last : aAt S1 n = 1 ∨ aAt S1 n = -1 := by
-            apply pm_entry_of_getD S1.isTuryn.x_pm;
-            exact S1.isTuryn.x_len.symm ▸ Nat.pred_lt ( ne_bot_of_gt hn )
-          have h_last' : bAt S1 n = 1 ∨ bAt S1 n = -1 := by
-            apply pm_entry_of_getD S1.isTuryn.y_pm (by
-            rw [ S1.isTuryn.y_len ] ; omega)
-          have h_last'' : cAt S1 n = 1 ∨ cAt S1 n = -1 := by
-            have := S1.isTuryn.z_pm;
-            exact pm_entry_of_getD this ( show n - 1 < S1.C.length from by { have := S1.isTuryn.z_len; omega } )
-          aesop;
-        exact ⟨ S1, hS1, ⟨ ha, h_last.1, hb, h_last.2, hc, hd ⟩ ⟩
+  -- Phase 1: Normalize first entries of A, B, C, D to +1 by optional negations.
+  -- Step 1a: Normalize aAt 1 to +1.
+  have ha_pm : aAt S 1 = 1 ∨ aAt S 1 = -1 :=
+    pm_entry_of_getD S.isTuryn.x_pm (by rw [S.isTuryn.x_len]; omega)
+  obtain ⟨Sa, hSa_eq, hSa_a1⟩ : ∃ Sa : TurynTypeSeq n,
+      Equivalent n S Sa ∧ aAt Sa 1 = 1 := by
+    rcases ha_pm with ha1 | ha1
+    · exact ⟨S, Relation.ReflTransGen.refl, ha1⟩
+    · exact ⟨S.doNegA, Relation.ReflTransGen.single (Elementary.negA S),
+        by rw [step1_aAt_doNegA, ha1]; norm_num⟩
+  -- Step 1b: Normalize bAt 1 to +1 (doNegB preserves A).
+  have hb_pm : bAt Sa 1 = 1 ∨ bAt Sa 1 = -1 :=
+    pm_entry_of_getD Sa.isTuryn.y_pm (by rw [Sa.isTuryn.y_len]; omega)
+  obtain ⟨Sb, hSb_eq, hSb_a1, hSb_b1⟩ : ∃ Sb : TurynTypeSeq n,
+      Equivalent n Sa Sb ∧ aAt Sb 1 = 1 ∧ bAt Sb 1 = 1 := by
+    rcases hb_pm with hb1 | hb1
+    · exact ⟨Sa, Relation.ReflTransGen.refl, hSa_a1, hb1⟩
+    · exact ⟨Sa.doNegB, Relation.ReflTransGen.single (Elementary.negB Sa),
+        hSa_a1, -- aAt Sa.doNegB 1 = aAt Sa 1 = 1 (definitional)
+        by rw [step1_bAt_doNegB, hb1]; norm_num⟩
+  -- Step 1c: Normalize cAt 1 to +1 (doNegC preserves A, B).
+  have hc_pm : cAt Sb 1 = 1 ∨ cAt Sb 1 = -1 :=
+    pm_entry_of_getD Sb.isTuryn.z_pm (by rw [Sb.isTuryn.z_len]; omega)
+  obtain ⟨Sc, hSc_eq, hSc_a1, hSc_b1, hSc_c1⟩ : ∃ Sc : TurynTypeSeq n,
+      Equivalent n Sb Sc ∧ aAt Sc 1 = 1 ∧ bAt Sc 1 = 1 ∧ cAt Sc 1 = 1 := by
+    rcases hc_pm with hc1 | hc1
+    · exact ⟨Sb, Relation.ReflTransGen.refl, hSb_a1, hSb_b1, hc1⟩
+    · exact ⟨Sb.doNegC, Relation.ReflTransGen.single (Elementary.negC Sb),
+        hSb_a1, -- aAt Sb.doNegC 1 = aAt Sb 1 (definitional)
+        hSb_b1, -- bAt Sb.doNegC 1 = bAt Sb 1 (definitional)
+        by rw [step1_cAt_doNegC, hc1]; norm_num⟩
+  -- Step 1d: Normalize dAt 1 to +1 (doNegD preserves A, B, C).
+  have hd_pm : dAt Sc 1 = 1 ∨ dAt Sc 1 = -1 :=
+    pm_entry_of_getD Sc.isTuryn.w_pm (by rw [Sc.isTuryn.w_len]; omega)
+  obtain ⟨Sd, hSd_eq, hSd_a1, hSd_b1, hSd_c1, hSd_d1⟩ : ∃ Sd : TurynTypeSeq n,
+      Equivalent n Sc Sd ∧ aAt Sd 1 = 1 ∧ bAt Sd 1 = 1 ∧ cAt Sd 1 = 1 ∧ dAt Sd 1 = 1 := by
+    rcases hd_pm with hd1 | hd1
+    · exact ⟨Sc, Relation.ReflTransGen.refl, hSc_a1, hSc_b1, hSc_c1, hd1⟩
+    · exact ⟨Sc.doNegD, Relation.ReflTransGen.single (Elementary.negD Sc),
+        hSc_a1, hSc_b1, hSc_c1,
+        by rw [step1_dAt_doNegD, hd1]; norm_num⟩
+  -- Chain equivalences: S ~ Sa ~ Sb ~ Sc ~ Sd.
+  have hS_Sd : Equivalent n S Sd :=
+    (hSa_eq.trans hSb_eq).trans (hSc_eq.trans hSd_eq)
+  -- Phase 2: Handle last entries aAt n and bAt n.
+  -- Obtain ±1 witnesses for positions n.
+  have ha_n_pm : aAt Sd n = 1 ∨ aAt Sd n = -1 :=
+    pm_entry_of_getD Sd.isTuryn.x_pm (by rw [Sd.isTuryn.x_len]; omega)
+  have hb_n_pm : bAt Sd n = 1 ∨ bAt Sd n = -1 :=
+    pm_entry_of_getD Sd.isTuryn.y_pm (by rw [Sd.isTuryn.y_len]; omega)
+  have hc_n_pm : cAt Sd n = 1 ∨ cAt Sd n = -1 :=
+    pm_entry_of_getD Sd.isTuryn.z_pm (by rw [Sd.isTuryn.z_len]; omega)
+  -- Endpoint relation with known first entries substituted.
+  have h_ep_raw := endpoint_relation (show 1 < n by omega) Sd
+  rw [hSd_a1, hSd_b1, hSd_c1] at h_ep_raw
+  -- h_ep_raw : 1 * aAt Sd n + 1 * bAt Sd n + 2 * (1 * cAt Sd n) = 0
+  have h_ep : aAt Sd n + bAt Sd n + 2 * cAt Sd n = 0 := by linarith
+  -- Case split: are both last entries -1?
+  by_cases h_both_neg : aAt Sd n = -1 ∧ bAt Sd n = -1
+  · -- Both aAt n and bAt n are -1: apply doAltAll to flip signs of last entries.
+    obtain ⟨ha_neg, hb_neg⟩ := h_both_neg
+    have hAltAll_a1 : aAt Sd.doAltAll 1 = 1 := by
+      rw [step1_aAt_doAltAll_first Sd (by omega)]; exact hSd_a1
+    have hAltAll_an : aAt Sd.doAltAll n = 1 := by
+      rw [step1_aAt_doAltAll_last Sd hn_even hn, ha_neg]; norm_num
+    have hAltAll_b1 : bAt Sd.doAltAll 1 = 1 := by
+      rw [step1_bAt_doAltAll_first Sd (by omega)]; exact hSd_b1
+    have hAltAll_bn : bAt Sd.doAltAll n = 1 := by
+      rw [step1_bAt_doAltAll_last Sd hn_even hn, hb_neg]; norm_num
+    have hAltAll_c1 : cAt Sd.doAltAll 1 = 1 := by
+      rw [step1_cAt_doAltAll_first Sd (by omega)]; exact hSd_c1
+    have hAltAll_d1 : dAt Sd.doAltAll 1 = 1 := by
+      rw [step1_dAt_doAltAll_first Sd hn]; exact hSd_d1
+    exact ⟨Sd.doAltAll,
+      hS_Sd.trans (Elementary.toEquivalent (Elementary.altAll Sd)),
+      hAltAll_a1, hAltAll_an, hAltAll_b1, hAltAll_bn, hAltAll_c1, hAltAll_d1⟩
+  · -- Not both -1: deduce both must be +1 via exhaustive ±1 case analysis.
+    have h_last : aAt Sd n = 1 ∧ bAt Sd n = 1 := by
+      rcases ha_n_pm with ha_n | ha_n <;> rcases hb_n_pm with hb_n | hb_n <;>
+          rcases hc_n_pm with hc_n | hc_n
+      -- aAt=1, bAt=1, cAt=1: 1+1+2*1=4≠0
+      · rw [ha_n, hb_n, hc_n] at h_ep; norm_num at h_ep
+      -- aAt=1, bAt=1, cAt=-1: 1+1+2*(-1)=0 ✓
+      · exact ⟨ha_n, hb_n⟩
+      -- aAt=1, bAt=-1, cAt=1: 1+(-1)+2*1=2≠0
+      · rw [ha_n, hb_n, hc_n] at h_ep; norm_num at h_ep
+      -- aAt=1, bAt=-1, cAt=-1: 1+(-1)+2*(-1)=-2≠0
+      · rw [ha_n, hb_n, hc_n] at h_ep; norm_num at h_ep
+      -- aAt=-1, bAt=1, cAt=1: -1+1+2*1=2≠0
+      · rw [ha_n, hb_n, hc_n] at h_ep; norm_num at h_ep
+      -- aAt=-1, bAt=1, cAt=-1: -1+1+2*(-1)=-2≠0
+      · rw [ha_n, hb_n, hc_n] at h_ep; norm_num at h_ep
+      -- aAt=-1, bAt=-1, cAt=1: contradicts ¬(both=-1)
+      · exact absurd ⟨ha_n, hb_n⟩ h_both_neg
+      -- aAt=-1, bAt=-1, cAt=-1: -1+(-1)+2*(-1)=-4≠0
+      · rw [ha_n, hb_n, hc_n] at h_ep; norm_num at h_ep
+    exact ⟨Sd, hS_Sd, hSd_a1, h_last.1, hSd_b1, h_last.2, hSd_c1, hSd_d1⟩
 
 /-! ### Private helpers for step2 -/
 
