@@ -52,24 +52,17 @@ pub enum TtcQuality {
 pub type CoverageQuality = TtcQuality;
 
 impl TtcQuality {
+    /// Backward-compat alias: the original enum spelled this
+    /// variant `Exact`. The three `Direct | Projected | Hybrid`
+    /// labels from TELEMETRY.md replace it directly.
     #[allow(non_upper_case_globals)]
     pub const Exact: Self = TtcQuality::Direct;
-    #[allow(non_upper_case_globals)]
-    pub const Estimated: Self = TtcQuality::Projected;
-    #[allow(non_upper_case_globals)]
-    pub const LowerBound: Self = TtcQuality::Projected;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MassDelta {
     pub covered_exact: MassValue,
     pub covered_partial: MassValue,
-}
-
-impl MassDelta {
-    pub fn total_covered(self) -> MassValue {
-        MassValue(self.covered_exact.0 + self.covered_partial.0)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
