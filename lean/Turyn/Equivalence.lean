@@ -52,35 +52,104 @@ lemma AllPmOne_reverse {X : PmSeq} (h : AllPmOne X) : AllPmOne X.reverse := by
   intro v hv; exact h v (List.mem_reverse.mp hv)
 
 lemma AllPmOne_alt {X : PmSeq} (h : AllPmOne X) : AllPmOne (Turyn.altSeq X) := by
-  intro x hx; simp_all +decide [ Turyn.altSeq ];
-  rcases hx with ⟨ a, ha, rfl ⟩;
-  cases h ( X[a]?.getD 0 ) ( by simp [ ha ] ) <;> split_ifs <;> simp_all +decide
+  intro x hx
+  simp only [Turyn.altSeq, List.mem_map, List.mem_range] at hx
+  obtain ⟨i, hi, rfl⟩ := hx
+  have hmem : X.getD i 0 ∈ X := by
+    rw [List.getD_eq_getElem?_getD, List.getElem?_eq_getElem hi]
+    exact List.getElem_mem hi
+  have hv := h (X.getD i 0) hmem
+  rcases hv with h1 | h1 <;> rw [h1] <;> split_ifs <;> norm_num
+
+/-! ### Private helpers for autocorrelation proofs -/
+
+private lemma list_reverse_getD (a : List Int) (i : Nat) (hi : i < a.length) :
+    a.reverse.getD i 0 = a.getD (a.length - 1 - i) 0 := by
+  rw [List.getD_eq_getElem?_getD, List.getD_eq_getElem?_getD]
+  have hi' : i < a.reverse.length := by rwa [List.length_reverse]
+  rw [List.getElem?_eq_getElem hi', List.getElem_reverse hi']
+  rw [List.getElem?_eq_getElem (by rw [List.length_reverse] at hi'; omega)]
+
+private lemma ite_mod2_eq_neg_one_pow (n : Nat) :
+    (if n % 2 = 0 then (1:Int) else -1) = (-1) ^ n := by
+  induction n with
+  | zero => norm_num
+  | succ k ih =>
+    rw [pow_succ]
+    by_cases hk : k % 2 = 0
+    · rw [if_neg (by omega), ← ih, if_pos hk]; ring
+    · rw [if_pos (by omega), ← ih, if_neg hk]; ring
+
+private lemma sign_product_eq (i s : Nat) :
+    ((if i % 2 = 0 then (1:Int) else -1) * (if (i + s) % 2 = 0 then (1:Int) else -1)) =
+    (-1 : Int) ^ s := by
+  rw [ite_mod2_eq_neg_one_pow, ite_mod2_eq_neg_one_pow, ← pow_add]
+  rw [show i + (i + s) = 2 * i + s from by ring, pow_add, pow_mul, neg_one_sq, one_pow, one_mul]
+
+private lemma altSeq_getD_aux (X : PmSeq) (i : Nat) (hi : i < X.length) :
+    (Turyn.altSeq X).getD i 0 = (if i % 2 = 0 then 1 else -1) * X.getD i 0 := by
+  unfold Turyn.altSeq
+  rw [List.getD_eq_getElem?_getD, List.getElem?_map]
+  have hi2 : i < (List.range X.length).length := by rw [List.length_range]; exact hi
+  rw [List.getElem?_eq_getElem hi2]
+  simp only [Option.map, Option.getD, List.getElem_range]
 
 /-! ### Autocorrelation preservation -/
 
 /-- Negation preserves aperiodic autocorrelation: `N_{-X}(s) = N_X(s)`. -/
 lemma aperiodicAutocorr_neg (a : PmSeq) (s : Nat) :
     aperiodicAutocorr (negSeq a) s = aperiodicAutocorr a s := by
-      unfold negSeq aperiodicAutocorr;
-      grind +splitImp
+  unfold aperiodicAutocorr
+  rw [negSeq_length_eq]
+  split_ifs with h
+  · rfl
+  · exact Finset.sum_congr rfl fun i _ => by rw [negSeq_getD, negSeq_getD, neg_mul_neg]
 
 /-- Reversal preserves aperiodic autocorrelation: `N_{X*}(s) = N_X(s)`. -/
 lemma aperiodicAutocorr_rev (a : PmSeq) (s : Nat) :
     aperiodicAutocorr a.reverse s = aperiodicAutocorr a s := by
-      unfold aperiodicAutocorr;
-      split_ifs <;> simp_all +decide;
-      rw [ ← Finset.sum_range_reflect ];
-      refine' Finset.sum_congr rfl fun i hi => _;
-      grind
+  unfold aperiodicAutocorr
+  rw [List.length_reverse]
+  split_ifs with h
+  · rfl
+  · push_neg at h
+    set n := a.length
+    apply Finset.sum_nbij (fun i => n - 1 - s - i)
+    · intro i hi
+      exact Finset.mem_range.mpr (by rw [Finset.mem_range] at hi; omega)
+    · intro i₁ hi₁ i₂ hi₂ heq
+      rw [Finset.mem_coe, Finset.mem_range] at hi₁ hi₂
+      change n - 1 - s - i₁ = n - 1 - s - i₂ at heq
+      omega
+    · intro j hj
+      rw [Finset.mem_coe, Finset.mem_range] at hj
+      refine ⟨n - 1 - s - j, ?_, ?_⟩
+      · rw [Finset.mem_coe, Finset.mem_range]; omega
+      · show n - 1 - s - (n - 1 - s - j) = j; omega
+    · intro i hi
+      have hir := Finset.mem_range.mp hi
+      rw [list_reverse_getD a i (by omega), list_reverse_getD a (i + s) (by omega)]
+      have h1 : n - 1 - i = (n - 1 - s - i) + s := by omega
+      have h2 : n - 1 - (i + s) = n - 1 - s - i := by omega
+      rw [h1, h2, mul_comm]
 
 /-- Alternation scales autocorrelation by `(-1)^s`: `N_{X̂}(s) = (-1)^s · N_X(s)`. -/
 lemma aperiodicAutocorr_alt (a : PmSeq) (s : Nat) :
     aperiodicAutocorr (Turyn.altSeq a) s = (-1 : Int) ^ s * aperiodicAutocorr a s := by
-      unfold aperiodicAutocorr Turyn.altSeq;
-      split_ifs <;> simp_all +decide [ Finset.mul_sum _ _ _ ];
-      refine' Finset.sum_congr rfl fun i hi => _;
-      by_cases hi' : i < List.length a <;> by_cases hi'' : i + s < List.length a <;> simp_all +decide [Nat.mod_two_of_bodd];
-      rcases Nat.even_or_odd' i with ⟨ k, rfl | rfl ⟩ <;> rcases Nat.even_or_odd' s with ⟨ l, rfl | rfl ⟩ <;> norm_num [ pow_add, pow_mul, Nat.mul_mod, Nat.pow_mod ]
+  unfold aperiodicAutocorr
+  rw [Turyn.altSeq_length]
+  split_ifs with h
+  · rw [mul_zero]
+  · push_neg at h
+    rw [Finset.mul_sum]
+    exact Finset.sum_congr rfl fun i hi => by
+      have hir := Finset.mem_range.mp hi
+      rw [altSeq_getD_aux a i (by omega), altSeq_getD_aux a (i + s) (by omega)]
+      rw [show (if i % 2 = 0 then (1:Int) else -1) * a.getD i 0 *
+          ((if (i + s) % 2 = 0 then (1:Int) else -1) * a.getD (i + s) 0) =
+          ((if i % 2 = 0 then (1:Int) else -1) * (if (i + s) % 2 = 0 then (1:Int) else -1)) *
+          (a.getD i 0 * a.getD (i + s) 0) from by ring]
+      rw [sign_product_eq]
 
 /-! ### IsTurynTypeProp preservation under each elementary transformation -/
 
@@ -417,22 +486,26 @@ theorem lemma1_endpoint_constraint
 altSeq multiplies by (-1)^i at each valid index.
 -/
 lemma altSeq_getD (X : PmSeq) (i : Nat) (hi : i < X.length) :
-    (altSeq X).getD i 0 = (if i % 2 = 0 then 1 else -1) * X.getD i 0 := by
-      unfold altSeq; aesop;
+    (altSeq X).getD i 0 = (if i % 2 = 0 then 1 else -1) * X.getD i 0 :=
+  altSeq_getD_aux X i hi
 
 /-
 altSeq preserves position 0 (factor = 1).
 -/
 lemma altSeq_getD_zero (X : PmSeq) (hX : 0 < X.length) :
     (altSeq X).getD 0 0 = X.getD 0 0 := by
-      unfold altSeq; aesop;
+  rw [altSeq_getD X 0 hX]
+  norm_num
 
 /-
 For even length ≥ 2, altSeq at position length-1 has factor -1.
 -/
 lemma altSeq_getD_last (X : PmSeq) (hn : X.length % 2 = 0) (hX : 2 ≤ X.length) :
     (altSeq X).getD (X.length - 1) 0 = -(X.getD (X.length - 1) 0) := by
-      grind +suggestions
+  rw [altSeq_getD X (X.length - 1) (by omega)]
+  have hodd : (X.length - 1) % 2 = 1 := by omega
+  rw [if_neg (by omega)]
+  ring
 
 /-! ### Step theorems -/
 
