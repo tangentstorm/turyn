@@ -1,5 +1,5 @@
-//! Phase-1 placeholders for legacy mode adapters.
-pub mod apart_together;
+//! Framework mode adapters — one module per `--wz` / `--stochastic`
+//! entry point. All five search modes route through these.
 pub mod mdd_stages;
 pub mod stochastic;
 pub mod sync;

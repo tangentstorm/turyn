@@ -326,9 +326,13 @@ pub(crate) struct SearchConfig {
     /// is a no-op. Enabled via `--conj-tuple` (see
     /// conjectures/positive-tuple.md).
     pub(crate) conj_tuple: bool,
-    /// Hidden migration toggle for the unified search framework.
-    /// `legacy` keeps the existing direct pipeline; `new` routes selected
-    /// modes through `search_framework::engine`.
+    /// Engine selector for the unified search framework.
+    /// `new` (default) routes every mode through
+    /// `search_framework::engine` — `--wz=apart|together|cross` via
+    /// `MddStagesAdapter`, `--wz=sync` via `SyncAdapter`,
+    /// `--stochastic` via `StochasticAdapter`. `legacy` keeps the
+    /// direct `run_mdd_sat_search` pipeline as an escape hatch
+    /// while the framework matures at larger `n`.
     pub(crate) engine: EngineKind,
 }
 
@@ -393,7 +397,7 @@ impl Default for SearchConfig {
             conj_xy_product: false,
             conj_zw_bound: false,
             conj_tuple: false,
-            engine: EngineKind::Legacy,
+            engine: EngineKind::New,
         }
     }
 }
