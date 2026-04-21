@@ -309,4 +309,16 @@ lemma interior_pair_mod4 {n : Nat} (S : TurynTypeSeq n) (k : Nat)
     (uAt_pm S m (by omega) (by omega))
     (uAt_pm S (k + 1 - m) (by omega) (by omega))
 
+lemma middle_term_zero {n : Nat} (S : TurynTypeSeq n) (k : Nat)
+    (hk : 4 ≤ k) (hkn : k ≤ n - 1) (hk_odd : k % 2 = 1)
+    (IH : ∀ j, 2 ≤ j → j < k → uAt S (n + 1 - j) = -(uAt S j)) :
+    aAt S ((k + 1) / 2) * aAt S ((k + 1) / 2 + (n - k)) *
+      (1 + uAt S ((k + 1) / 2) * uAt S ((k + 1) / 2 + (n - k))) = 0 := by
+  rw [ show ( k + 1 ) / 2 + ( n - k ) = n + 1 - ( ( k + 1 ) / 2 ) from ?_ ];
+  · rw [ IH ( ( k + 1 ) / 2 ) ( by omega ) ( by omega ) ];
+    have h_sq := uAt_sq S ( ( k + 1 ) / 2 ) ( by omega ) ( by omega )
+    have h_neg : uAt S ((k + 1) / 2) * -uAt S ((k + 1) / 2) = -1 := by linarith [h_sq]
+    rw [h_neg]; ring
+  · omega
+
 end Turyn
