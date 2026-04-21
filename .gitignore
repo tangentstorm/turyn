@@ -2,3 +2,5 @@
 gmon.out
 *.bin
 lean/.lake/
+aristotle-key.sh
+.claude/

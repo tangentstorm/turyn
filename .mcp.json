@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "aristotle": {
+      "command": "python",
+      "args": ["scripts/aristotle_mcp.py"]
+    }
+  }
+}
