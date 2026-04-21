@@ -397,6 +397,125 @@ pub(crate) struct PhaseBContext {
 
 
 
+/// Metric atomics shared across workers in the MDD pipeline. Also
+/// passed as a bundle into the per-stage handler helpers
+/// (`process_boundary` and friends) so that both the legacy worker
+/// loop in `run_mdd_sat_search` and the framework `StageHandler`
+/// adapters update the same counters. Each field is an `Arc` so it
+/// can be cheaply cloned into each worker thread.
+pub(crate) struct PipelineMetrics {
+    pub(crate) flow_bnd_sum_fail: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-stage enter counters, indexed 0..4 (Boundary/SolveW/SolveZ/SolveXY).
+    pub(crate) stage_enter: Vec<Arc<std::sync::atomic::AtomicU64>>,
+    pub(crate) stage_exit: Vec<Arc<std::sync::atomic::AtomicU64>>,
+    /// Tracks how many Boundary items are pending in the queue or
+    /// mid-processing; decremented when the Boundary stage starts.
+    pub(crate) pending_boundaries: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Boundary (stage 0) handler body, callable from both the legacy
+/// worker loop (`run_mdd_sat_search`) and the framework
+/// `BoundaryStage` adapter. Returns the 0-or-1 follow-up
+/// `PipelineWork` items the boundary expands into (either a
+/// `SolveWZ` under `use_wz_mode=true` or a `SolveW`).
+///
+/// Side effects:
+/// - decrements `metrics.pending_boundaries` on entry,
+/// - increments `metrics.flow_bnd_sum_fail` for each dropped tuple,
+/// - increments `metrics.stage_enter[1]` once if any tuple survives,
+/// - increments `metrics.stage_exit[0]` on return (whether or not
+///   anything was emitted).
+pub(crate) fn process_boundary(
+    bnd: BoundaryWork,
+    ctx: &PhaseBContext,
+    metrics: &PipelineMetrics,
+    use_wz_mode: bool,
+) -> Vec<PipelineWork> {
+    let trace_bnd = bnd.z_bits == 43 && bnd.w_bits == 47;
+    if trace_bnd {
+        eprintln!(
+            "TRACE: found target boundary z=43 w=47 xy_root={}",
+            bnd.xy_root
+        );
+    }
+    // Boundary dequeued — the walker is free to push another.
+    metrics
+        .pending_boundaries
+        .fetch_sub(1, AtomicOrdering::Relaxed);
+
+    let z_bnd_sum = 2 * (bnd.z_bits.count_ones() as i32) - ctx.max_bnd_sum;
+    let w_bnd_sum = 2 * (bnd.w_bits.count_ones() as i32) - ctx.max_bnd_sum;
+
+    let mut candidate_tuples: Vec<SumTuple> = Vec::with_capacity(ctx.tuples.len());
+    for &tuple in &ctx.tuples {
+        // Both ±|σ_W|, ±|σ_Z| allowed — feasible if AT LEAST ONE sign
+        // of each is in range and parity.
+        let z_feas = [tuple.z.abs(), -tuple.z.abs()].iter().any(|&s| {
+            crate::spectrum::sigma_full_to_cnt(s, z_bnd_sum, ctx.middle_n).is_some()
+        });
+        let w_feas = [tuple.w.abs(), -tuple.w.abs()].iter().any(|&s| {
+            crate::spectrum::sigma_full_to_cnt(s, w_bnd_sum, ctx.middle_m).is_some()
+        });
+        if !z_feas || !w_feas {
+            metrics
+                .flow_bnd_sum_fail
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            continue;
+        }
+        // MDD-guided fail-fast on XY sub-tree compatibility.
+        if !crate::xy_sat::any_valid_xy(
+            bnd.xy_root,
+            0,
+            ctx.xy_zw_depth,
+            0,
+            0,
+            &ctx.xy_pos_order,
+            &ctx.mdd.nodes,
+            ctx.max_bnd_sum,
+            ctx.middle_n as i32,
+            tuple,
+        ) {
+            metrics
+                .flow_bnd_sum_fail
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            continue;
+        }
+        candidate_tuples.push(tuple);
+    }
+    if candidate_tuples.is_empty() {
+        metrics.stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
+        return Vec::new();
+    }
+    // Use the first candidate as the representative for legacy fields
+    // (z_mid_sum, w_mid_sum, tuple).
+    let rep = candidate_tuples[0];
+    metrics.stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
+    let work = if use_wz_mode {
+        PipelineWork::SolveWZ(SolveWZWork {
+            tuple: rep,
+            z_bits: bnd.z_bits,
+            w_bits: bnd.w_bits,
+            xy_root: bnd.xy_root,
+            candidate_tuples,
+            attempt: 0,
+            prior_blocks: Vec::new(),
+        })
+    } else {
+        PipelineWork::SolveW(SolveWWork {
+            tuple: rep,
+            z_bits: bnd.z_bits,
+            w_bits: bnd.w_bits,
+            xy_root: bnd.xy_root,
+            candidate_tuples,
+        })
+    };
+    if trace_bnd {
+        eprintln!("TRACE: emitting ONE SolveW for canonical TT(18) boundary");
+    }
+    metrics.stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
+    vec![work]
+}
+
 /// MDD pipeline search: unified priority queue with stages MDD→W→Z→XY.
 /// All workers are identical — they grab the highest-stage item from the queue.
 /// Later stages (closer to producing a result) always get processed first.
@@ -864,6 +983,17 @@ pub(crate) fn run_mdd_sat_search(
             let n = ctx.problem.n;
             let m = ctx.problem.m();
             let use_wz_mode = ctx.wz_together;
+            // Bundle the metrics atomics this worker shares with its
+            // peers into one struct, so stage helpers (`process_boundary`
+            // and its siblings) can take a single reference. Framework
+            // `StageHandler` adapters construct their own `PipelineMetrics`
+            // the same way and thus update the same counters.
+            let metrics = PipelineMetrics {
+                flow_bnd_sum_fail: Arc::clone(&flow_bnd_sum_fail),
+                stage_enter: stage_enter.clone(),
+                stage_exit: stage_exit.clone(),
+                pending_boundaries: Arc::clone(&pending_boundaries),
+            };
 
             loop {
                 let Some(work) = wq.pop_blocking(&ctx.found, &mut rng) else { break; };
@@ -872,72 +1002,10 @@ pub(crate) fn run_mdd_sat_search(
 
                 match work {
                     PipelineWork::Boundary(bnd) => {
-                        // TRACE: check if this is the known solution's boundary
-                        let trace_bnd = bnd.z_bits == 43 && bnd.w_bits == 47;
-                        if trace_bnd { eprintln!("TRACE: found target boundary z=43 w=47 xy_root={}", bnd.xy_root); }
-                        // Boundary dequeued — the walker is free to push another.
-                        pending_boundaries.fetch_sub(1, AtomicOrdering::Relaxed);
-                        // Check sum feasibility for each tuple, emit SolveW items
-                        let z_bnd_sum = 2 * (bnd.z_bits.count_ones() as i32) - ctx.max_bnd_sum;
-                        let w_bnd_sum = 2 * (bnd.w_bits.count_ones() as i32) - ctx.max_bnd_sum;
-                        // Collect all tuples this boundary is compatible with
-                        // (at least one sign of σ_W, σ_Z in range + right parity,
-                        // and the XY sub-MDD has a matching leaf).  Emit ONE
-                        // SolveW (or SolveWZ) carrying the whole candidate
-                        // list — the stage builds V_w as the union of
-                        // ±|σ_W|-counts over candidate tuples and lets the
-                        // SAT pick any of them.  Downstream stages narrow
-                        // the list by the decoded σ.
-                        let mut candidate_tuples: Vec<SumTuple> = Vec::with_capacity(ctx.tuples.len());
-                        for &tuple in &ctx.tuples {
-                            // Both ±|σ_W|, ±|σ_Z| allowed — feasible if AT
-                            // LEAST ONE sign of each is in range and parity.
-                            let z_feas = [tuple.z.abs(), -tuple.z.abs()].iter().any(|&s| {
-                                sigma_full_to_cnt(s, z_bnd_sum, ctx.middle_n).is_some()
-                            });
-                            let w_feas = [tuple.w.abs(), -tuple.w.abs()].iter().any(|&s| {
-                                sigma_full_to_cnt(s, w_bnd_sum, ctx.middle_m).is_some()
-                            });
-                            if !z_feas || !w_feas {
-                                flow_bnd_sum_fail.fetch_add(1, AtomicOrdering::Relaxed); continue;
-                            }
-                            // MDD-guided fail-fast on XY sub-tree compatibility.
-                            if !any_valid_xy(
-                                bnd.xy_root, 0, ctx.xy_zw_depth, 0, 0,
-                                &ctx.xy_pos_order, &ctx.mdd.nodes,
-                                ctx.max_bnd_sum, ctx.middle_n as i32, tuple,
-                            ) {
-                                flow_bnd_sum_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                                continue;
-                            }
-                            candidate_tuples.push(tuple);
+                        let emitted = process_boundary(bnd, &ctx, &metrics, use_wz_mode);
+                        if !emitted.is_empty() {
+                            wq.push_batch(emitted);
                         }
-                        if candidate_tuples.is_empty() {
-                            stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
-                            continue;
-                        }
-                        // Use the first candidate as the representative for
-                        // legacy fields (z_mid_sum, w_mid_sum, tuple).
-                        let rep = candidate_tuples[0];
-                        stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
-                        let work = if use_wz_mode {
-                            PipelineWork::SolveWZ(SolveWZWork {
-                                tuple: rep, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
-                                xy_root: bnd.xy_root,
-                                candidate_tuples,
-                                attempt: 0,
-                                prior_blocks: Vec::new(),
-                            })
-                        } else {
-                            PipelineWork::SolveW(SolveWWork {
-                                tuple: rep, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
-                                xy_root: bnd.xy_root,
-                                candidate_tuples,
-                            })
-                        };
-                        if trace_bnd { eprintln!("TRACE: emitting ONE SolveW for canonical TT(18) boundary"); }
-                        wq.push_batch(vec![work]);
-                        stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
                     }
 
                     PipelineWork::SolveW(sw) => {
