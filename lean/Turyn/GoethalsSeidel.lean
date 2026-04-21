@@ -278,9 +278,9 @@ theorem gsMatrix_eq_reindex_gsBlockMatrix {n : Nat} (G : GSData n) :
   · ext i j
     obtain ⟨p, rfl⟩ := (gsBlockEquiv n).surjective i
     obtain ⟨q, rfl⟩ := (gsBlockEquiv n).surjective j
-    simp only [Matrix.reindex_apply]
+    simp +decide [Matrix.reindex_apply]
     rcases p with ((p | p) | (p | p)) <;> rcases q with ((q | q) | (q | q)) <;>
-    simp only [gsMatrix, gsMatrixEntry, gsBlockMatrix, Matrix.submatrix_apply,
+    simp +decide [gsMatrix, gsMatrixEntry, gsBlockMatrix, Matrix.submatrix_apply,
       Equiv.symm_apply_apply, Matrix.fromBlocks_apply₁₁, Matrix.fromBlocks_apply₁₂,
       Matrix.fromBlocks_apply₂₁, Matrix.fromBlocks_apply₂₂, div_block0 _, div_block1 _,
       div_block2 _, div_block3 _, mod_block0 _, mod_block1 _, mod_block2 _,
@@ -325,7 +325,7 @@ lemma circulant_transpose_mul_self_comm {n : Nat} (x : IntVec n) :
   · ext i; exact absurd i.2 (by simp)
   · haveI : NeZero (n + 1) := ⟨by omega⟩
     ext i j
-    simp only [Matrix.mul_apply, circulant_transpose_apply, circulant_apply]
+    simp +decide [Matrix.mul_apply, circulant_transpose_apply, circulant_apply]
     conv_lhs =>
       arg 2; ext k
       rw [show i - k = (i + j) - k - j from by abel]
@@ -549,28 +549,142 @@ theorem gsBlockMatrix_lower_left_zero {n : Nat} (G : CertifiedGSData n) :
   simp +decide [ Matrix.toBlocks₁₂, Matrix.mul_apply ];
   ac_rfl
 
+/-! ### Helpers for the explicit proof of `gsBlockMatrix_target_from_blocks` -/
+
+/-- Reconstruct a matrix over `(α ⊕ α) ⊕ (α ⊕ α)` from its four blocks
+    when those blocks are `c • 1`, `0`, `0`, `c • 1`. -/
+private lemma fromBlocks_eq_smul_one {n : Nat} (c : ℤ)
+    {M : Matrix ((Fin n ⊕ Fin n) ⊕ (Fin n ⊕ Fin n)) ((Fin n ⊕ Fin n) ⊕ (Fin n ⊕ Fin n)) ℤ}
+    (h11 : M.toBlocks₁₁ = c • 1)
+    (h12 : M.toBlocks₁₂ = 0)
+    (h21 : M.toBlocks₂₁ = 0)
+    (h22 : M.toBlocks₂₂ = c • 1) :
+    M = c • 1 := by
+  conv_lhs => rw [← Matrix.fromBlocks_toBlocks M]
+  rw [h11, h12, h21, h22]
+  ext (i | i) (j | j) <;>
+  simp only [Matrix.fromBlocks_apply₁₁, Matrix.fromBlocks_apply₁₂,
+    Matrix.fromBlocks_apply₂₁, Matrix.fromBlocks_apply₂₂,
+    Matrix.smul_apply, Matrix.one_apply, Matrix.zero_apply,
+    Sum.inl.injEq, Sum.inr.injEq, reduceCtorEq, ite_false, smul_eq_mul, mul_zero]
+
+/-- Reconstruct a `(Fin n ⊕ Fin n)` matrix from its four `Fin n`-indexed blocks. -/
+private lemma inner_fromBlocks_eq_smul_one {n : Nat} (c : ℤ)
+    {M : Matrix (Fin n ⊕ Fin n) (Fin n ⊕ Fin n) ℤ}
+    (h11 : M.toBlocks₁₁ = c • 1)
+    (h12 : M.toBlocks₁₂ = 0)
+    (h21 : M.toBlocks₂₁ = 0)
+    (h22 : M.toBlocks₂₂ = c • 1) :
+    M = c • 1 := by
+  conv_lhs => rw [← Matrix.fromBlocks_toBlocks M]
+  rw [h11, h12, h21, h22]
+  ext (i | i) (j | j) <;>
+  simp only [Matrix.fromBlocks_apply₁₁, Matrix.fromBlocks_apply₁₂,
+    Matrix.fromBlocks_apply₂₁, Matrix.fromBlocks_apply₂₂,
+    Matrix.smul_apply, Matrix.one_apply, Matrix.zero_apply,
+    Sum.inl.injEq, Sum.inr.injEq, reduceCtorEq, ite_false, smul_eq_mul, mul_zero]
+
+/-- `H * Hᵀ` is symmetric. -/
+private lemma gsProduct_symmetric {n : Nat} (G : CertifiedGSData n) :
+    (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ)ᵀ =
+    gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ := by
+  rw [Matrix.transpose_mul, Matrix.transpose_transpose]
+
+/-
+Off-diagonal (1,2) sub-block of the upper-left quadrant of M·Mᵀ vanishes.
+
+The block expands to:
+  -A·(B·R)ᵀ + B·R·Aᵀ + C·R·(D'ᵀ) + D·R·(-C')ᵀ
+where A,B,C,D are circulants and D' = (circ x4)ᵀ·R, C' = (circ x3)ᵀ·R.
+The first pair cancels by `circulant_reversalMatrix_transpose_comm`,
+the second by `circulant_mul_circulant_comm`.
+-/
+private lemma gsBlock_offdiag_upper_left_12 {n : Nat} (G : CertifiedGSData n) :
+    (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ).toBlocks₁₁.toBlocks₁₂ = 0 := by
+  ext i j; simp [ gsBlockMatrix ] ; ring;
+  unfold gsBlockMatrix at *; simp [ Matrix.fromBlocks_transpose, Matrix.fromBlocks_multiply ] ;
+  unfold gsC gsD gsA gsB at *; simp [ Matrix.mul_assoc, Matrix.transpose_mul, Matrix.transpose_transpose, reversalMatrix_transpose ] ;
+  unfold trCirculant at *; simp [ Matrix.mul_assoc, Matrix.transpose_mul, Matrix.transpose_transpose, reversalMatrix_transpose ] ;
+  simp [ ← Matrix.mul_assoc, reversalMatrix_mul_reversalMatrix ];
+  simp [ Matrix.toBlocks₁₂, Matrix.toBlocks₂₁, Matrix.toBlocks₂₂, Matrix.toBlocks₁₁, circulant_reversalMatrix_transpose_comm, circulant_mul_circulant_comm ]
+
+/-
+Off-diagonal (2,1) sub-block of the upper-left quadrant of M·Mᵀ vanishes.
+Follows from (1,2) by symmetry of M·Mᵀ: since M = Mᵀ, the (2,1) sub-block
+is the transpose of the (1,2) sub-block.
+-/
+private lemma gsBlock_offdiag_upper_left_21 {n : Nat} (G : CertifiedGSData n) :
+    (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ).toBlocks₁₁.toBlocks₂₁ = 0 := by
+  -- By symmetry of the matrix, the (2,1) sub-block is the transpose of the (1,2) sub-block.
+  have h_symm : (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ).toBlocks₁₁.toBlocks₂₁ = (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ).toBlocks₁₁.toBlocks₁₂.transpose := by
+    have h_symm : ∀ (M : Matrix ((Fin n ⊕ Fin n) ⊕ (Fin n ⊕ Fin n)) ((Fin n ⊕ Fin n) ⊕ (Fin n ⊕ Fin n)) ℤ), M.transpose = M → M.toBlocks₁₁.toBlocks₂₁ = M.toBlocks₁₁.toBlocks₁₂.transpose := by
+      intros M hM_symm
+      ext i j
+      simp [hM_symm, Matrix.transpose];
+      exact congr_fun ( congr_fun hM_symm _ ) _;
+    exact h_symm _ ( by rw [ Matrix.transpose_mul, Matrix.transpose_transpose ] );
+  rw [ h_symm, gsBlock_offdiag_upper_left_12, Matrix.transpose_zero ]
+
+/-
+Off-diagonal (1,2) sub-block of the lower-right quadrant of M·Mᵀ vanishes.
+
+The block expands to:
+  circ x3·(circ x4)ᵀ − (circ x4)ᵀ·circ x3 − circ x1·R·circ x2 + (circ x2)ᵀ·R·(circ x1)ᵀ
+The first pair cancels by `circulant_mul_circulant_transpose_comm`,
+the second by `circulant_reversalMatrix`, `circulant_transpose_reversalMatrix`,
+and `circulant_mul_circulant_transpose_comm`.
+-/
+private lemma gsBlock_offdiag_lower_right_12 {n : Nat} (G : CertifiedGSData n) :
+    (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ).toBlocks₂₂.toBlocks₁₂ = 0 := by
+  unfold gsBlockMatrix;
+  simp [ ← Matrix.ext_iff, Matrix.mul_apply, Matrix.fromBlocks_multiply ];
+  simp [ fromBlocks_transpose, Matrix.mul_apply, Matrix.fromBlocks_multiply ];
+  simp [ Matrix.toBlocks₁₂, Matrix.toBlocks₂₁, Matrix.toBlocks₂₂, Matrix.fromBlocks ];
+  unfold trCirculant; simp [ Matrix.mul_assoc ] ;
+  simp [ ← Matrix.mul_assoc, reversalMatrix_transpose, reversalMatrix_mul_reversalMatrix ];
+  simp [ gsA, gsB, gsC, gsD, circulant_mul_circulant_comm, circulant_mul_circulant_transpose_comm, circulant_reversalMatrix, circulant_transpose_reversalMatrix ];
+  simp [ Matrix.mul_assoc, circulant_mul_circulant_comm, circulant_mul_circulant_transpose_comm, circulant_reversalMatrix, circulant_transpose_reversalMatrix ]
+
+/-
+Off-diagonal (2,1) sub-block of the lower-right quadrant of M·Mᵀ vanishes.
+Follows from (1,2) by symmetry of M·Mᵀ.
+-/
+private lemma gsBlock_offdiag_lower_right_21 {n : Nat} (G : CertifiedGSData n) :
+    (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ).toBlocks₂₂.toBlocks₂₁ = 0 := by
+  -- Apply the auxiliary lemma that the transpose of zero is zero.
+  have := gsBlock_offdiag_lower_right_12 G;
+  ext i j;
+  convert congr_arg ( fun m => m j i ) this using 1;
+  simp [ Matrix.toBlocks₂₂, Matrix.toBlocks₂₁, Matrix.toBlocks₁₂, Matrix.transpose_apply ];
+  rw [ ← Matrix.transpose_apply ( gsBlockMatrix G.toGSData * ( gsBlockMatrix G.toGSData ) ᵀ ), gsProduct_symmetric ]
+
+/-- The upper-left (2n×2n) block of M·Mᵀ equals (4n)•I. -/
+private lemma gsBlock_diag_upper_left {n : Nat} (G : CertifiedGSData n) :
+    (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ).toBlocks₁₁ =
+    (4 * ↑n : ℤ) • (1 : Matrix (Fin n ⊕ Fin n) (Fin n ⊕ Fin n) ℤ) := by
+  have ⟨h1, h2, _, _⟩ := gsBlockMatrix_diag_blocks G
+  exact inner_fromBlocks_eq_smul_one _ h1 (gsBlock_offdiag_upper_left_12 G)
+    (gsBlock_offdiag_upper_left_21 G) h2
+
+/-- The lower-right (2n×2n) block of M·Mᵀ equals (4n)•I. -/
+private lemma gsBlock_diag_lower_right {n : Nat} (G : CertifiedGSData n) :
+    (gsBlockMatrix G.toGSData * (gsBlockMatrix G.toGSData)ᵀ).toBlocks₂₂ =
+    (4 * ↑n : ℤ) • (1 : Matrix (Fin n ⊕ Fin n) (Fin n ⊕ Fin n) ℤ) := by
+  have ⟨_, _, h3, h4⟩ := gsBlockMatrix_diag_blocks G
+  exact inner_fromBlocks_eq_smul_one _ h3 (gsBlock_offdiag_lower_right_12 G)
+    (gsBlock_offdiag_lower_right_21 G) h4
+
 /-
 The full block product collapses to `(4n) • 1`.
 -/
-set_option maxHeartbeats 800000 in
 theorem gsBlockMatrix_target_from_blocks {n : Nat} (G : CertifiedGSData n) :
     GSBlockTarget G.toGSData := by
-  unfold GSBlockTarget;
-  unfold gsBlockMatrix;
-  simp +decide [ Matrix.fromBlocks_multiply, Matrix.fromBlocks_transpose ];
-  unfold gsA gsB gsC gsD trCirculant at *;
-  simp +decide [Matrix.mul_assoc, Matrix.transpose_mul, reversalMatrix_transpose] at *;
-  simp +decide [← Matrix.mul_assoc, ← circulant_mul_circulant_comm,
-    ← circulant_mul_circulant_transpose_comm, ← circulant_reversalMatrix,
-    ← circulant_transpose_reversalMatrix] at *;
-  simp +decide [ ← Matrix.ext_iff ] at *;
-  simp +decide [ show ( 4 * n : Matrix ( GSBlockIndex n ) ( GSBlockIndex n ) ℤ ) = ( 4 * n : ℤ ) • 1 from by norm_num ] at *;
-  simp +decide [ Matrix.one_apply, add_assoc, add_left_comm, add_comm ] at *;
-  have := four_circulant_products_eq G; simp_all +decide [ ← Matrix.ext_iff ] ;
-  simp_all +decide [ ← add_assoc, gsA, gsB, gsC, gsD ];
-  simp_all +decide [ circulant_transpose_mul_comm ];
-  simp +decide [ show ( 4 * n : Matrix ( Fin n ) ( Fin n ) ℤ ) = ( 4 * n : ℤ ) • 1 from by norm_num ];
-  simp +decide [ Matrix.one_apply ]
+  unfold GSBlockTarget
+  exact fromBlocks_eq_smul_one _
+    (gsBlock_diag_upper_left G)
+    (gsBlockMatrix_upper_right_zero G)
+    (gsBlockMatrix_lower_left_zero G)
+    (gsBlock_diag_lower_right G)
 
 /-- Block-matrix GS orthogonality theorem. -/
 theorem gsBlockMatrix_target {n : Nat} (G : CertifiedGSData n) :
