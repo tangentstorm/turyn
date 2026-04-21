@@ -8,6 +8,7 @@ import Turyn.Hadamard
 import Turyn.Energy
 import Turyn.Equivalence
 import Turyn.Examples
+import Turyn.XY
 
 /-!
 # Turyn Library Exports
