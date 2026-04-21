@@ -41,6 +41,8 @@ use crate::search_framework::events::SearchEvent;
 #[cfg(feature = "search-framework")]
 use crate::search_framework::mode_adapters::mdd_stages::{MddPayload, MddStagesAdapter};
 #[cfg(feature = "search-framework")]
+use crate::search_framework::mode_adapters::stochastic::{StochasticAdapter, StochasticPayload};
+#[cfg(feature = "search-framework")]
 use crate::search_framework::mode_adapters::sync::{SyncAdapter, SyncPayload};
 #[cfg(feature = "search-framework")]
 use crate::search_framework::queue::GoldThenWork;
@@ -411,6 +413,45 @@ fn run_framework_mdd_mode(
         );
     }
     let _ = engine_cancel; // keep the Arc alive until the end
+}
+
+#[cfg(feature = "search-framework")]
+fn run_framework_stochastic_mode(
+    problem: Problem,
+    test_tuple: Option<SumTuple>,
+    cfg: &SearchConfig,
+    verbose: bool,
+) {
+    let time_limit = if cfg.stochastic_seconds > 0 {
+        cfg.stochastic_seconds
+    } else {
+        10
+    };
+    let (adapter, found) = StochasticAdapter::build(problem, test_tuple, verbose, time_limit);
+    let mut engine = SearchEngine::<StochasticPayload>::new(
+        EngineConfig::default(),
+        Box::new(GoldThenWork::new(32)),
+    );
+    engine.run(&adapter, |event| match event {
+        SearchEvent::Progress(p) => {
+            if verbose {
+                eprintln!(
+                    "[framework:stochastic] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?} (estimate-only)",
+                    p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc
+                );
+            }
+        }
+        SearchEvent::Finished(p) => {
+            println!(
+                "Framework search (--stochastic): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?} (quality={:?})",
+                p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc, p.quality
+            );
+        }
+    });
+    println!(
+        "Framework search (--stochastic): found_solution={}",
+        found.load(std::sync::atomic::Ordering::Relaxed)
+    );
 }
 
 #[cfg(feature = "search-framework")]
@@ -1167,6 +1208,16 @@ fn main() {
     if cfg.benchmark_repeats > 0 {
         run_benchmark(&cfg);
     } else if cfg.stochastic {
+        #[cfg(feature = "search-framework")]
+        if cfg.engine == EngineKind::New {
+            run_framework_stochastic_mode(
+                cfg.problem,
+                cfg.test_tuple.clone(),
+                &cfg,
+                true,
+            );
+            return;
+        }
         let report = stochastic_search(
             cfg.problem,
             cfg.test_tuple.as_ref(),
