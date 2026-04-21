@@ -41,6 +41,8 @@ use crate::search_framework::events::SearchEvent;
 #[cfg(feature = "search-framework")]
 use crate::search_framework::mode_adapters::mdd_stages::{MddPayload, MddStagesAdapter};
 #[cfg(feature = "search-framework")]
+use crate::search_framework::mode_adapters::sync::{SyncAdapter, SyncPayload};
+#[cfg(feature = "search-framework")]
 use crate::search_framework::queue::GoldThenWork;
 use crate::spectrum::*;
 use crate::stochastic::*;
@@ -409,6 +411,53 @@ fn run_framework_mdd_mode(
         );
     }
     let _ = engine_cancel; // keep the Arc alive until the end
+}
+
+#[cfg(feature = "search-framework")]
+fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) {
+    let sync_cfg = crate::sync_walker::SyncConfig {
+        sat_secs: cfg.sat_secs,
+        sat_config: cfg.sat_config.clone(),
+        conflict_limit: cfg.conflict_limit,
+        random_seed: None,
+        cancel: None,
+        exchange: None,
+    };
+    let (adapter, result_rx) = SyncAdapter::build(problem, sync_cfg, verbose);
+    let mut engine = SearchEngine::<SyncPayload>::new(
+        EngineConfig::default(),
+        Box::new(GoldThenWork::new(32)),
+    );
+    let drain_handle = std::thread::spawn(move || {
+        let mut solutions = Vec::new();
+        while let Ok(sol) = result_rx.recv() {
+            solutions.push(sol);
+        }
+        solutions
+    });
+    engine.run(&adapter, |event| match event {
+        SearchEvent::Progress(p) => {
+            if verbose {
+                eprintln!(
+                    "[framework:sync] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}",
+                    p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc
+                );
+            }
+        }
+        SearchEvent::Finished(p) => {
+            println!(
+                "Framework search (--wz=sync): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?}",
+                p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc
+            );
+        }
+    });
+    drop(adapter);
+    let solutions = drain_handle.join().unwrap_or_default();
+    println!(
+        "Framework search (--wz=sync): found_solution={} ({} solution(s))",
+        !solutions.is_empty(),
+        solutions.len()
+    );
 }
 
 fn parse_args() -> (CliVerb, SearchConfig) {
@@ -1168,6 +1217,11 @@ fn main() {
         #[cfg(feature = "search-framework")]
         if cfg.engine == EngineKind::New && matches!(mode, WzMode::Cross | WzMode::Apart | WzMode::Together) {
             run_framework_mdd_mode(cfg.problem, tuples, &cfg, true, mdd_k);
+            return;
+        }
+        #[cfg(feature = "search-framework")]
+        if cfg.engine == EngineKind::New && mode == WzMode::Sync {
+            run_framework_sync_mode(cfg.problem, &cfg, true);
             return;
         }
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, true, mdd_k);
