@@ -25,6 +25,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 KEY_FILE = REPO_ROOT / "aristotle-key.sh"
 LEAN_DIR = REPO_ROOT / "lean"
+STAGING_DIR = REPO_ROOT / "aristotle-staging"
 
 
 def load_key() -> None:
@@ -167,9 +168,10 @@ def handle_list() -> str:
 
 
 def handle_result(project_id: str) -> str:
-    dest = Path(tempfile.gettempdir()) / f"aristotle-{project_id}.tar.gz"
+    STAGING_DIR.mkdir(exist_ok=True)
+    dest = STAGING_DIR / f"{project_id}.tar.gz"
     out = run_cli(["result", project_id, "--destination", str(dest)], timeout=300)
-    extract_dir = Path(tempfile.gettempdir()) / f"aristotle-{project_id}"
+    extract_dir = STAGING_DIR / project_id
     extract_dir.mkdir(exist_ok=True)
     try:
         with tarfile.open(dest, "r:gz") as tf:
@@ -204,7 +206,7 @@ def run_git(args: list, timeout: int = 60, input_text: str | None = None) -> str
 
 
 def handle_diff_result(project_id: str, path: str) -> str:
-    extract_dir = Path(tempfile.gettempdir()) / f"aristotle-{project_id}"
+    extract_dir = STAGING_DIR / project_id
     if not extract_dir.exists():
         return f"ERROR: extracted directory not found: {extract_dir}\n(Call `result` first.)"
     # Auto-detect layout: new (lean/ at root of project_aristotle/) or old (project_aristotle/lean/...)
