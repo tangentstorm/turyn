@@ -402,7 +402,10 @@ pub(crate) struct PhaseBContext {
 /// (`process_boundary` and friends) so that both the legacy worker
 /// loop in `run_mdd_sat_search` and the framework `StageHandler`
 /// adapters update the same counters. Each field is an `Arc` so it
-/// can be cheaply cloned into each worker thread.
+/// can be cheaply cloned into each worker thread. `Clone` on
+/// `PipelineMetrics` clones only the Arcs, so every handler
+/// instance keeps pointing at the same underlying counters.
+#[derive(Clone)]
 pub(crate) struct PipelineMetrics {
     // Shared
     pub(crate) flow_bnd_sum_fail: Arc<std::sync::atomic::AtomicU64>,
