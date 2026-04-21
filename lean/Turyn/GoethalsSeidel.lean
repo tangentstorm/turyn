@@ -353,16 +353,34 @@ lemma trCirculant_mul_transpose_self {n : Nat} (x : IntVec n) :
   convert h_prop _ using 1;
   rw [ Matrix.transpose_transpose, circulant_transpose_mul_self_comm ]
 
+/-- `revFin j - i = revFin i - j`: the reversal-based subtraction is symmetric. -/
+private lemma revFin_sub_comm {n : Nat} (i j : Fin n) : revFin j - i = revFin i - j := by
+  rcases n with _ | n
+  · exact Fin.elim0 i
+  · apply Fin.ext; simp only [revFin_val, Fin.val_sub]; congr 1; omega
+
+/-- `i - revFin j = j - revFin i`: subtraction from a reversed index is symmetric. -/
+private lemma sub_revFin_comm {n : Nat} (i j : Fin n) : i - revFin j = j - revFin i := by
+  rcases n with _ | n
+  · exact Fin.elim0 i
+  · apply Fin.ext; simp only [revFin_val, Fin.val_sub]; congr 1; omega
+
 /-
 Circulant matrices commute.
 -/
 lemma circulant_mul_circulant_comm {n : Nat} (x y : IntVec n) :
     circulant x * circulant y = circulant y * circulant x := by
-  ext i j; simp +decide [ circulant_apply, Matrix.mul_apply ] ; ring_nf;
-  rcases n with ( _ | _ | n ) <;> norm_cast at *;
-  · fin_cases i ; fin_cases j ; simp +decide [ mul_comm ];
-  · rw [ ← Equiv.sum_comp ( Equiv.subLeft j ) ] ; simp +decide [ mul_comm ] ; ring_nf;
-    rw [ ← Equiv.sum_comp ( Equiv.subRight i ) ] ; simp +decide [ mul_comm, sub_sub ] ;
+  rcases n with _ | n
+  · ext i; exact Fin.elim0 i
+  · ext i j
+    simp only [Matrix.mul_apply, circulant_apply]
+    rw [← Equiv.sum_comp (Equiv.subLeft (i + j))]
+    simp only [Equiv.subLeft_apply]
+    apply Finset.sum_congr rfl
+    intro k _
+    have h1 : i + j - k - i = j - k := by abel
+    have h2 : j - (i + j - k) = k - i := by abel
+    rw [h1, h2, mul_comm]
 
 /-- Circulant transposes also commute. -/
 lemma circulant_transpose_mul_comm {n : Nat} (x y : IntVec n) :
@@ -376,32 +394,37 @@ Circulant commutes with circulant transpose.
 -/
 lemma circulant_mul_circulant_transpose_comm {n : Nat} (x y : IntVec n) :
     circulant x * (circulant y)ᵀ = (circulant y)ᵀ * circulant x := by
-  ext i j; simp +decide [mul_apply, circulant_apply] ;
-  rcases n with ( _ | _ | n ) <;> norm_num [ Finset.sum_range, Fin.mod_def ];
-  · simp +decide [ Fin.eq_zero, mul_comm ];
-  · rw [ ← Equiv.sum_comp ( Equiv.subLeft ( i + j ) ) ] ; simp +decide [sub_eq_add_neg];
-    grind
+  rcases n with _ | n
+  · ext i; exact Fin.elim0 i
+  · ext i j
+    simp only [Matrix.mul_apply, circulant_apply, circulant_transpose_apply]
+    rw [← Equiv.sum_comp (Equiv.subLeft (i + j))]
+    simp only [Equiv.subLeft_apply]
+    apply Finset.sum_congr rfl
+    intro k _
+    have h1 : i + j - k - i = j - k := by abel
+    have h2 : i + j - k - j = i - k := by abel
+    rw [h1, h2, mul_comm]
 
 /-
 `circulant x * R = R * (circulant x)ᵀ`.
 -/
 lemma circulant_reversalMatrix {n : Nat} (x : IntVec n) :
     circulant x * reversalMatrix n = reversalMatrix n * (circulant x)ᵀ := by
-  -- By definition of matrix multiplication and the properties of the reversal matrix, we can show that the entries of the two matrices are equal.
-  ext i j; simp [Matrix.mul_apply, reversalMatrix];
-  rw [ Finset.sum_eq_single ( revFin j ) ] <;> simp +decide [ revFin ];
-  · grind;
-  · grind
+  ext i j
+  simp only [mul_reversalMatrix_apply, reversalMatrix_mul_apply,
+    circulant_apply, circulant_transpose_apply]
+  exact congr_arg x (revFin_sub_comm i j)
 
 /-
 `(circulant x)ᵀ * R = R * circulant x`.
 -/
 lemma circulant_transpose_reversalMatrix {n : Nat} (x : IntVec n) :
     (circulant x)ᵀ * reversalMatrix n = reversalMatrix n * circulant x := by
-  ext i j; simp +decide [ Matrix.mul_apply ] ;
-  rw [ Finset.sum_eq_single ( revFin j ) ] <;> simp +decide [ revFin ];
-  · grind;
-  · grind
+  ext i j
+  simp only [mul_reversalMatrix_apply, reversalMatrix_mul_apply,
+    circulant_transpose_apply, circulant_apply]
+  exact congr_arg x (sub_revFin_comm i j)
 
 /-
 Key symmetry: `C_x * R * C_yᵀ = C_y * R * C_xᵀ` for circulants.
@@ -409,20 +432,9 @@ Key symmetry: `C_x * R * C_yᵀ = C_y * R * C_xᵀ` for circulants.
 lemma circulant_reversalMatrix_transpose_comm {n : Nat} (x y : IntVec n) :
     circulant x * reversalMatrix n * (circulant y)ᵀ =
     circulant y * reversalMatrix n * (circulant x)ᵀ := by
-  -- By circulant_transpose_mul_comm, we have circulant x * R = R * (circulant x)^T.
-  have h1 : circulant x * reversalMatrix n = reversalMatrix n * (circulant x)ᵀ := by
-    -- By definition of circulant matrices and the reversal matrix, we can show that they commute.
-    ext i j; simp [circulant];
-    unfold revFin;
-    grind;
-  rw [ h1, Matrix.mul_assoc, circulant_transpose_mul_comm ];
-  -- By circulant_transpose_mul_comm, we have circulant y * R = R * (circulant y)^T.
-  have h2 : circulant y * reversalMatrix n = reversalMatrix n * (circulant y)ᵀ := by
-    ext i j; simp +decide [ *, Matrix.mul_apply ] ;
-    rw [ Finset.sum_eq_single ( revFin j ) ] <;> simp +decide [ revFin ];
-    · grind +splitImp;
-    · grind
-  rw [ h2, Matrix.mul_assoc ]
+  rw [circulant_reversalMatrix x, Matrix.mul_assoc,
+      circulant_transpose_mul_comm x y,
+      ← Matrix.mul_assoc, ← circulant_reversalMatrix y]
 
 /-
 The combined sum of four circulant self-products equals `(4n) • I`.
