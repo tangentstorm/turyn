@@ -236,7 +236,10 @@ lemma periodic_eq_aperiodic_sum (a : List Int) (s : Nat) (hs : 0 < s) (hsm : s <
   have hper : periodicAutocorr a s = ∑ i ∈ range m, a.getD i 0 * a.getD ((i + s) % m) 0 := by
     simp only [periodicAutocorr]
     split
-    next h => exfalso; simp_all [beq_iff_eq]
+    next h =>
+      exfalso
+      rw [beq_iff_eq] at h
+      omega
     next => rfl
   have hap1 : aperiodicAutocorr a s = ∑ i ∈ range (m - s), a.getD i 0 * a.getD (i + s) 0 := by
     unfold aperiodicAutocorr; exact if_neg (by omega)
