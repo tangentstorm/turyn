@@ -40,4 +40,14 @@ lemma uAt_sq {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i �
   have h := uAt_pm S i hi1 hi2
   rcases h with h | h <;> rw [h] <;> ring
 
+theorem aperiodicAutocorr_A_via_aAt {n : Nat} (S : TurynTypeSeq n) (s : Nat) (hs : s < n) :
+    aperiodicAutocorr S.A s = ∑ i ∈ Finset.range (n - s), aAt S (i + 1) * aAt S (i + 1 + s) := by
+  unfold aperiodicAutocorr
+  rw [if_neg (by rw [S.isTuryn.x_len]; omega)]
+  rw [show S.A.length - s = n - s from by rw [S.isTuryn.x_len]]
+  apply Finset.sum_congr rfl
+  intro i _
+  unfold aAt
+  simp
+
 end Turyn
