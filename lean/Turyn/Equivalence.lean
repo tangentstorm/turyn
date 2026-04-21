@@ -695,6 +695,69 @@ lemma dAt_doNegRevD {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj
         convert negSeq_getD _ _ using 1;
       rw [ h_negD, dAt_doRevD S hj1 hj2 ]
 
+/-! ### Reversal accessor lemmas -/
+
+/--
+Reversal of a length-`n` list maps 1-indexed position `j` to `n + 1 - j`.
+-/
+lemma aAt_doRevA_at {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    aAt S.doRevA j = aAt S (n + 1 - j) := by
+  unfold aAt TurynTypeSeq.doRevA
+  simp only
+  convert revD_getD (D := S.A) _ using 2
+  · rw [S.isTuryn.x_len]
+    omega
+  · convert Nat.lt_of_lt_of_le (Nat.sub_lt hj1 zero_lt_one) hj2 using 1
+    exact S.isTuryn.x_len
+
+lemma aAt_doRevA_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    aAt S.doRevA (n + 1 - j) = aAt S j := by
+  have h1 : 1 ≤ n + 1 - j := by omega
+  have h2 : n + 1 - j ≤ n := by omega
+  rw [aAt_doRevA_at S h1 h2]
+  congr 1; omega
+
+lemma bAt_doRevB_at {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    bAt S.doRevB j = bAt S (n + 1 - j) := by
+  unfold bAt TurynTypeSeq.doRevB
+  simp only
+  convert revD_getD (D := S.B) _ using 2
+  · rw [S.isTuryn.y_len]
+    omega
+  · convert Nat.lt_of_lt_of_le (Nat.sub_lt hj1 zero_lt_one) hj2 using 1
+    exact S.isTuryn.y_len
+
+lemma bAt_doRevB_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    bAt S.doRevB (n + 1 - j) = bAt S j := by
+  have h1 : 1 ≤ n + 1 - j := by omega
+  have h2 : n + 1 - j ≤ n := by omega
+  rw [bAt_doRevB_at S h1 h2]
+  congr 1; omega
+
+lemma cAt_doRevC_at {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    cAt S.doRevC j = cAt S (n + 1 - j) := by
+  unfold cAt TurynTypeSeq.doRevC
+  simp only
+  convert revD_getD (D := S.C) _ using 2
+  · rw [S.isTuryn.z_len]
+    omega
+  · convert Nat.lt_of_lt_of_le (Nat.sub_lt hj1 zero_lt_one) hj2 using 1
+    exact S.isTuryn.z_len
+
+lemma cAt_doRevC_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    cAt S.doRevC (n + 1 - j) = cAt S j := by
+  have h1 : 1 ≤ n + 1 - j := by omega
+  have h2 : n + 1 - j ≤ n := by omega
+  rw [cAt_doRevC_at S h1 h2]
+  congr 1; omega
+
+lemma dAt_doRevD_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n - 1) :
+    dAt S.doRevD (n - j) = dAt S j := by
+  have h1 : 1 ≤ n - j := by omega
+  have h2 : n - j ≤ n - 1 := by omega
+  rw [dAt_doRevD S h1 h2]
+  congr 1; omega
+
 set_option maxHeartbeats 800000 in
 /-- Step 5: enforce condition (5) by optional `D*` or `−D*`. -/
 theorem step5_condition5
