@@ -1,6 +1,15 @@
 use std::fmt;
 use std::time::Duration;
 
+/// A mass value measured in **search-space bits**:
+/// `log2(|cube|)` for the sub-cube it represents.
+///
+/// `total_mass` for a run is `log2` of the fully-free search space
+/// enumeration count. `covered_mass` accumulates the log-size of
+/// every sub-cube eliminated (by a solved leaf, a deferred credit,
+/// or a forced-literal shrink). Throughput is therefore bits/second
+/// and TTC is `remaining_bits / bits_per_sec` — one dimensionless
+/// unit across every mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
 pub struct MassValue(pub f64);
 
@@ -18,12 +27,37 @@ impl fmt::Display for MassValue {
     }
 }
 
+/// Quality label for a published TTC estimate.
+///
+/// * [`TtcQuality::Direct`] — computed as `elapsed /
+///   cumulative_coverage`, where cumulative coverage is the product
+///   of per-level covered fractions observed so far. Exact iff the
+///   run will continue to forced-literal proportions the sample
+///   implies.
+/// * [`TtcQuality::Projected`] — computed from an explicit model of
+///   the remaining search (e.g. branching-factor extrapolation).
+///   Used when coverage is too small to trust the direct form.
+/// * [`TtcQuality::Hybrid`] — blend; typically the direct form with
+///   projected smoothing on the tail.
+///
+/// Older enum name retained via the `CoverageQuality` alias for
+/// existing call sites; migrate to `TtcQuality`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CoverageQuality {
-    Exact,
-    Estimated,
-    LowerBound,
+pub enum TtcQuality {
+    Direct,
+    Projected,
     Hybrid,
+}
+
+pub type CoverageQuality = TtcQuality;
+
+impl TtcQuality {
+    #[allow(non_upper_case_globals)]
+    pub const Exact: Self = TtcQuality::Direct;
+    #[allow(non_upper_case_globals)]
+    pub const Estimated: Self = TtcQuality::Projected;
+    #[allow(non_upper_case_globals)]
+    pub const LowerBound: Self = TtcQuality::Projected;
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]

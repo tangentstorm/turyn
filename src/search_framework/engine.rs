@@ -3,11 +3,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::search_framework::events::{
-    EdgeFlowCounters, FanoutRootCounters, ProgressSnapshot, SearchEvent,
+    EdgeFlowCounters, FanoutRootCounters, ForcingRollups, ProgressSnapshot, SearchEvent,
 };
-use crate::search_framework::mass::{CoverageQuality, MassSnapshot, SearchMassModel};
+use crate::search_framework::mass::{MassSnapshot, SearchMassModel, TtcQuality};
 use crate::search_framework::queue::SchedulerPolicy;
-use crate::search_framework::stage::{StageContext, StageHandler, StageId, WorkItem};
+use crate::search_framework::stage::{Continuation, StageContext, StageHandler, StageId, WorkItem};
 
 pub struct AdapterInit<T> {
     pub seed_items: Vec<WorkItem<T>>,
@@ -64,6 +64,7 @@ impl<T: Send + 'static> SearchEngine<T> {
         let mut last_progress = start;
         let mut edge_flow: BTreeMap<(String, String), EdgeFlowCounters> = BTreeMap::new();
         let mut fanout_roots: BTreeMap<u64, FanoutRootCounters> = BTreeMap::new();
+        let mut forcings = ForcingRollups::default();
 
         let mut mass = MassSnapshot::new(adapter.mass_model().total_mass());
         let stages = adapter.stages();
@@ -84,9 +85,10 @@ impl<T: Send + 'static> SearchEngine<T> {
                     now_millis: start.elapsed().as_millis(),
                     adapter_name: adapter.name(),
                 };
-                let from_stage = item.stage_id.to_string();
+                let from_stage: StageId = item.stage_id;
                 let outcome = stage.handle(item, &ctx);
                 mass.apply_delta(outcome.mass_delta);
+                forcings.apply(from_stage, &outcome.forcings);
 
                 let emitted_len = outcome.emitted.len() as u64;
                 fanout_roots
@@ -101,12 +103,34 @@ impl<T: Send + 'static> SearchEngine<T> {
                     .live_descendants += emitted_len;
 
                 for child in outcome.emitted {
-                    let to_stage = child.stage_id.to_string();
+                    let to_stage = child.stage_id;
                     edge_flow
-                        .entry((from_stage.clone(), to_stage))
+                        .entry((from_stage.to_string(), to_stage.to_string()))
                         .or_default()
                         .spawned += 1;
                     self.scheduler.push(child);
+                }
+
+                // Deferral: push continuation work back for later pickup.
+                // Under the universal contract, `mass_delta` above has
+                // already credited the portion of the sub-cube this call
+                // actually covered; the continuation represents *only*
+                // the residual that still needs to be searched.
+                match outcome.continuation {
+                    Continuation::None => {}
+                    Continuation::Split(items) => {
+                        for child in items {
+                            let to_stage = child.stage_id;
+                            edge_flow
+                                .entry((from_stage.to_string(), to_stage.to_string()))
+                                .or_default()
+                                .spawned += 1;
+                            self.scheduler.push(child);
+                        }
+                    }
+                    Continuation::Resume(child) => {
+                        self.scheduler.push(child);
+                    }
                 }
 
                 if last_progress.elapsed() >= self.cfg.progress_interval {
@@ -114,9 +138,10 @@ impl<T: Send + 'static> SearchEngine<T> {
                     on_event(SearchEvent::Progress(build_snapshot(
                         start.elapsed(),
                         &mass,
-                        CoverageQuality::Hybrid,
+                        TtcQuality::Hybrid,
                         &edge_flow,
                         &fanout_roots,
+                        &forcings,
                     )));
                 }
             }
@@ -128,6 +153,7 @@ impl<T: Send + 'static> SearchEngine<T> {
             adapter.mass_model().quality(),
             &edge_flow,
             &fanout_roots,
+            &forcings,
         )));
     }
 }
@@ -135,9 +161,10 @@ impl<T: Send + 'static> SearchEngine<T> {
 fn build_snapshot(
     elapsed: Duration,
     mass: &MassSnapshot,
-    quality: CoverageQuality,
+    quality: TtcQuality,
     edge_flow: &BTreeMap<(String, String), EdgeFlowCounters>,
     fanout_roots: &BTreeMap<u64, FanoutRootCounters>,
+    forcings: &ForcingRollups,
 ) -> ProgressSnapshot {
     ProgressSnapshot {
         elapsed,
@@ -149,5 +176,6 @@ fn build_snapshot(
         quality,
         edge_flow: edge_flow.clone(),
         fanout_roots: fanout_roots.clone(),
+        forcings: forcings.clone(),
     }
 }

@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::time::Duration;
 
-use crate::search_framework::mass::{CoverageQuality, MassValue};
+use crate::search_framework::mass::{MassValue, TtcQuality};
+use crate::search_framework::stage::StageId;
 
 #[derive(Clone, Debug, Default)]
 pub struct EdgeFlowCounters {
@@ -20,6 +21,32 @@ pub struct FanoutRootCounters {
     pub credited_mass: MassValue,
 }
 
+/// Two 2-D forcing rollups owned by the coordinator (the third —
+/// `[feature, level]` — is read directly from radical's
+/// `propagations_by_kind_level`). Both maps accumulate across the
+/// whole run, fed by each `StageOutcome::forcings` delta.
+#[derive(Clone, Debug, Default)]
+pub struct ForcingRollups {
+    /// `[stage, decision_level] -> forced literal count`.
+    pub stage_level: BTreeMap<(StageId, u16), u64>,
+    /// `[stage, PropKind as u8] -> forced literal count`.
+    pub stage_feature: BTreeMap<(StageId, u8), u64>,
+}
+
+impl ForcingRollups {
+    pub fn apply(
+        &mut self,
+        stage: StageId,
+        delta: &crate::search_framework::stage::ForcingDelta,
+    ) {
+        for &(level, feature, count) in &delta.by_level_feature {
+            let c = count as u64;
+            *self.stage_level.entry((stage, level)).or_insert(0) += c;
+            *self.stage_feature.entry((stage, feature)).or_insert(0) += c;
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ProgressSnapshot {
     pub elapsed: Duration,
@@ -28,9 +55,10 @@ pub struct ProgressSnapshot {
     pub total_mass: MassValue,
     pub remaining_mass: MassValue,
     pub ttc: Option<Duration>,
-    pub quality: CoverageQuality,
+    pub quality: TtcQuality,
     pub edge_flow: BTreeMap<(String, String), EdgeFlowCounters>,
     pub fanout_roots: BTreeMap<u64, FanoutRootCounters>,
+    pub forcings: ForcingRollups,
 }
 
 #[derive(Clone, Debug)]
