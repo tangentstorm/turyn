@@ -904,7 +904,49 @@ theorem step4_condition4
       (show i - 1 < S.C.length by rw [S.isTuryn.z_len]; omega) with h | h
     · exact h
     · exfalso; exact h_exists ⟨i, hi1, hi2, hi3, hi4, h⟩
-set_option maxHeartbeats 800000 in
+private lemma dAt_doNegRevD_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat}
+    (hj1 : 1 ≤ j) (hj2 : j ≤ n - 1) :
+    dAt (TurynTypeSeq.doNegD S.doRevD) (n - j) = -(dAt S j) := by
+  have h1 : 1 ≤ n - j := by omega
+  have h2 : n - j ≤ n - 1 := by omega
+  rw [dAt_doNegRevD S h1 h2]
+  have h3 : n - (n - j) = j := by omega
+  rw [h3]
+
+private lemma dAt_pm' {n : Nat} (S : TurynTypeSeq n) {i : Nat}
+    (hi1 : 1 ≤ i) (hi2 : i ≤ n - 1) :
+    dAt S i = 1 ∨ dAt S i = -1 :=
+  pm_entry_of_getD S.isTuryn.w_pm (by rw [S.isTuryn.w_len]; omega)
+
+private lemma dAt_doRevD_n1 {n : Nat} (S : TurynTypeSeq n) (hn : 2 ≤ n) :
+    dAt S.doRevD (n - 1) = dAt S 1 := by
+  rw [dAt_doRevD S (show 1 ≤ n - 1 from by omega) (show n - 1 ≤ n - 1 from le_refl _)]
+  congr 1; omega
+
+private lemma dAt_doNegRevD_n1 {n : Nat} (S : TurynTypeSeq n) (hn : 2 ≤ n) :
+    dAt (TurynTypeSeq.doNegD S.doRevD) (n - 1) = -(dAt S 1) := by
+  rw [dAt_doNegRevD S (show 1 ≤ n - 1 from by omega) (show n - 1 ≤ n - 1 from le_refl _)]
+  have h : n - (n - 1) = 1 := by omega
+  rw [h]
+
+/-- In the doRevD case, the product `dAt S' k * dAt S' (n - k)` equals
+    the original product `dAt S k * dAt S (n - k)` by commutativity. -/
+private lemma doRevD_product_eq {n : Nat} (S : TurynTypeSeq n) {k : Nat}
+    (hk1 : 1 ≤ k) (hk2 : k ≤ n - 1) :
+    dAt S.doRevD k * dAt S.doRevD (n - k) = dAt S k * dAt S (n - k) := by
+  rw [dAt_doRevD S hk1 hk2, dAt_doRevD_mirror S hk1 hk2]
+  ring
+
+/-- In the doNegRevD case, the product `dAt S5 k * dAt S5 (n - k)` equals
+    the original product `dAt S k * dAt S (n - k)`. -/
+private lemma doNegRevD_product_eq {n : Nat} (S : TurynTypeSeq n) {k : Nat}
+    (hk1 : 1 ≤ k) (hk2 : k ≤ n - 1) :
+    dAt (TurynTypeSeq.doNegD S.doRevD) k *
+      dAt (TurynTypeSeq.doNegD S.doRevD) (n - k) =
+    dAt S k * dAt S (n - k) := by
+  rw [dAt_doNegRevD S hk1 hk2, dAt_doNegRevD_mirror S hk1 hk2]
+  ring
+
 /-- Step 5: enforce condition (5) by optional `D*` or `−D*`. -/
 theorem step5_condition5
     (n : Nat) (hn : 2 ≤ n) (S : TurynTypeSeq n)
@@ -913,109 +955,118 @@ theorem step5_condition5
       Equivalent n S S5 ∧
       Canonical1 n S5 ∧ Canonical2 n S5 ∧ Canonical3 n S5 ∧
       Canonical4 n S5 ∧ Canonical5 n S5 := by
-        by_contra h_contra;
-        -- By definition of negation, there exists some $i$ such that $1 \leq i \leq n - 1$ and the product condition fails.
-        obtain ⟨i, hi1, hi2⟩ : ∃ i, 1 ≤ i ∧ i ≤ n - 1 ∧ (∀ j, 1 ≤ j → j < i → dAt S j * dAt S (n - j) = dAt S (n - 1)) ∧ dAt S i * dAt S (n - i) ≠ dAt S (n - 1) ∧ dAt S i ≠ 1 := by
-          simp_all +decide [ Canonical5 ];
-          exact h_contra S ( Relation.ReflTransGen.refl ) h1234.1 h1234.2.1 h1234.2.2.1 h1234.2.2.2;
-        -- Consider two cases: $dAt S (n - 1) = 1$ or $dAt S (n - 1) = -1$.
-        by_cases h_case : dAt S (n - 1) = 1;
-        · refine' h_contra ⟨ S.doRevD, _, _, _, _, _, _ ⟩;
-          exact Relation.ReflTransGen.single ( Elementary.revD S );
-          · unfold Canonical1 at *;
-            unfold aAt bAt cAt dAt at *;
-            rcases n with ( _ | _ | n ) <;> simp_all +decide [ TurynTypeSeq.doRevD ];
-            have := S.isTuryn.w_len; simp_all +decide ;
-          · exact h1234.2.1;
-          · exact h1234.2.2.1;
-          · exact h1234.2.2.2;
-          · intro j hj1 hj2 hj3 hj4;
-            -- By definition of `doRevD`, we have `dAt S.doRevD j = dAt S (n - j)`.
-            have h_revD : dAt S.doRevD j = dAt S (n - j) := by
-              exact dAt_doRevD S hj1 hj2;
-            by_cases hj5 : j < i;
-            · have h_revD : dAt S.doRevD (n - j) = dAt S j := by
-                convert dAt_doRevD S ( show 1 ≤ n - j from Nat.sub_pos_of_lt ( by omega ) ) ( show n - j ≤ n - 1 from Nat.sub_le_sub_left ( by omega ) _ ) using 1;
-                rw [ Nat.sub_sub_self ( by omega ) ];
-              have h_revD : dAt S.doRevD (n - 1) = dAt S 1 := by
-                convert dAt_doRevD S ( show 1 ≤ n - 1 from Nat.sub_pos_of_lt hn ) ( show n - 1 ≤ n - 1 from le_rfl ) using 1;
-                rw [ Nat.sub_sub_self ( by linarith ) ];
-              grind;
-            · cases lt_or_eq_of_le ( le_of_not_gt hj5 ) <;> simp_all +decide;
-              · have h_revD_i : dAt S.doRevD i = dAt S (n - i) := by
-                  exact dAt_doRevD S hi1 ( by omega )
-                have h_revD_n_i : dAt S.doRevD (n - i) = dAt S i := by
-                  convert dAt_doRevD S ( show 1 ≤ n - i from Nat.sub_pos_of_lt ( by omega ) ) ( show n - i ≤ n - 1 from Nat.sub_le_sub_left ( by omega ) _ ) using 1;
-                  rw [ Nat.sub_sub_self ( by omega ) ]
-                have h_revD_n_1 : dAt S.doRevD (n - 1) = dAt S 1 := by
-                  convert dAt_doRevD S ( show 1 ≤ n - 1 from Nat.sub_pos_of_lt hn ) ( show n - 1 ≤ n - 1 from le_rfl ) using 1;
-                  lia;
-                grind +locals;
-              · have h_pm : dAt S j = 1 ∨ dAt S j = -1 := by
-                  apply pm_entry_of_getD;
-                  · exact S.isTuryn.w_pm;
-                  · exact lt_of_lt_of_le ( Nat.sub_lt hj1 zero_lt_one ) ( by simpa [ S.isTuryn.w_len ] using by omega );
-                have h_pm : dAt S (n - j) = 1 ∨ dAt S (n - j) = -1 := by
-                  have h_pm : ∀ i, 1 ≤ i → i ≤ n - 1 → dAt S i = 1 ∨ dAt S i = -1 := by
-                    intros i hi1 hi2;
-                    have := S.isTuryn.w_pm;
-                    convert pm_entry_of_getD this _;
-                    have := S.isTuryn.w_len; omega;
-                  exact h_pm _ ( Nat.sub_pos_of_lt ( by omega ) ) ( Nat.sub_le_sub_left hj1 _ );
-                grind;
-        · -- Since $dAt S (n - 1) \neq 1$, we have $dAt S (n - 1) = -1$.
-          have h_case_neg : dAt S (n - 1) = -1 := by
-            have h_case_neg : dAt S (n - 1) = 1 ∨ dAt S (n - 1) = -1 := by
-              apply pm_entry_of_getD;
-              · exact S.isTuryn.w_pm;
-              · have := S.isTuryn.w_len; aesop;
-            exact h_case_neg.resolve_left h_case;
-          -- Apply doRevD then doNegD to S.
-          set S5 := TurynTypeSeq.doNegD (TurynTypeSeq.doRevD S);
-          refine' h_contra ⟨ S5, _, _, _, _, _, _ ⟩;
-          exact .single ( Elementary.revD S ) |> Relation.ReflTransGen.trans <| .single ( Elementary.negD _ );
-          · unfold Canonical1 at *;
-            convert dAt_doNegRevD S ( by linarith : 1 ≤ 1 ) ( by omega ) using 1 ; aesop;
-          · exact h1234.2.1;
-          · exact h1234.2.2.1;
-          · exact h1234.2.2.2;
-          · intro j hj1 hj2 hj3 hj4;
-            -- By definition of $S5$, we know that $dAt S5 j = -(dAt S (n - j))$ and $dAt S5 (n - j) = -(dAt S j)$.
-            have h_dAt_S5 : dAt S5 j = -(dAt S (n - j)) ∧ dAt S5 (n - j) = -(dAt S j) := by
-              have h_dAt_S5 : dAt S5 j = -(dAt S (n - j)) := by
-                grind +suggestions
-              have h_dAt_S5' : dAt S5 (n - j) = -(dAt S j) := by
-                convert dAt_doNegRevD S ( show 1 ≤ n - j from Nat.sub_pos_of_lt ( by omega ) ) ( show n - j ≤ n - 1 from Nat.sub_le_sub_left ( by omega ) _ ) using 1;
-                rw [ Nat.sub_sub_self ( by omega ) ]
-              exact ⟨h_dAt_S5, h_dAt_S5'⟩;
-            by_cases hi : i < j;
-            · specialize hj3 i hi1 hi;
-              have h_dAt_S5_i : dAt S5 i = -(dAt S (n - i)) ∧ dAt S5 (n - i) = -(dAt S i) := by
-                apply And.intro;
-                · apply dAt_doNegRevD;
-                  · grind +splitIndPred;
-                  · linarith;
-                · convert dAt_doNegRevD S ( show 1 ≤ n - i from Nat.sub_pos_of_lt ( by omega ) ) ( show n - i ≤ n - 1 from Nat.sub_le_sub_left ( by omega ) _ ) using 1;
-                  rw [ Nat.sub_sub_self ( by omega ) ];
-              have h_dAt_S5_n_minus_1 : dAt S5 (n - 1) = -(dAt S 1) := by
-                convert dAt_doNegRevD S ( show 1 ≤ n - 1 from Nat.le_sub_one_of_lt hn ) ( show n - 1 ≤ n - 1 from le_rfl ) using 1;
-                rw [ Nat.sub_sub_self ( by linarith ) ];
-              have := h1234.1.2.2.2.2.2; simp_all +decide [ mul_comm ] ;
-            · cases lt_or_eq_of_le ( le_of_not_gt hi ) <;> simp_all +decide;
-              · have := hi2.2.1 j hj1 ‹_›;
-                cases' Int.eq_one_or_neg_one_of_mul_eq_neg_one this with h h <;> simp_all +decide;
-                exact hj4 ( by rw [ show dAt S5 ( n - 1 ) = - ( dAt S 1 ) by
-                                      convert dAt_doNegRevD S ( show 1 ≤ n - 1 from Nat.sub_pos_of_lt hn ) ( show n - 1 ≤ n - 1 from le_rfl ) using 1;
-                                      rw [ Nat.sub_sub_self ( by linarith ) ] ] ; linarith [ h1234.1.2.2.2.2.2 ] );
-              · have h_dAt_S_i : dAt S i = 1 ∨ dAt S i = -1 := by
-                  have := S.isTuryn.w_pm;
-                  have := this ( S.D.getD ( i - 1 ) 0 ) ; simp_all +decide [ dAt ] ;
-                  grind
-                have h_dAt_S_n_i : dAt S (n - i) = 1 ∨ dAt S (n - i) = -1 := by
-                  have := S.isTuryn.w_pm;
-                  apply pm_entry_of_getD this;
-                  rw [ S.isTuryn.w_len ] ; omega;
-                grind
+  -- If S already satisfies Canonical5, we are done.
+  by_cases h5 : Canonical5 n S
+  · exact ⟨S, Relation.ReflTransGen.refl, h1234.1, h1234.2.1, h1234.2.2.1, h1234.2.2.2, h5⟩
+  · -- Extract the first failing index i from ¬Canonical5.
+    unfold Canonical5 at h5
+    push_neg at h5
+    obtain ⟨i, hi1, hi2, hi3, hi4, hi5⟩ := h5
+    -- Obtain dAt S 1 = 1 from Canonical1.
+    have hdS1 : dAt S 1 = 1 := h1234.1.2.2.2.2.2
+    -- Case split on dAt S (n - 1).
+    by_cases h_case : dAt S (n - 1) = 1
+    · /-  Case dAt S (n - 1) = 1: use S.doRevD as the witness.  -/
+      refine ⟨S.doRevD, ?_, ?_, ?_, ?_, ?_, ?_⟩
+      -- Equivalence
+      · exact Relation.ReflTransGen.single (Elementary.revD S)
+      -- Canonical1: only dAt changes; dAt S.doRevD 1 = dAt S (n - 1) = 1
+      · exact ⟨h1234.1.1, h1234.1.2.1, h1234.1.2.2.1, h1234.1.2.2.2.1, h1234.1.2.2.2.2.1,
+               by rw [dAt_doRevD S (by omega : 1 ≤ 1) (by omega : 1 ≤ n - 1)]; exact h_case⟩
+      -- Canonical2 (A unchanged)
+      · exact h1234.2.1
+      -- Canonical3 (B unchanged)
+      · exact h1234.2.2.1
+      -- Canonical4 (C unchanged)
+      · exact h1234.2.2.2
+      -- Canonical5 for S.doRevD
+      · intro j hj1 hj2 hj3 hj4
+        -- Rewrite product and reference value
+        rw [doRevD_product_eq S hj1 hj2, dAt_doRevD_n1 S hn, hdS1] at hj4
+        -- hj4 : dAt S j * dAt S (n - j) ≠ 1
+        rw [dAt_doRevD S hj1 hj2]
+        -- Goal: dAt S (n - j) = 1
+        -- Three sub-cases: j < i, j = i, j > i.
+        by_cases hji_lt : j < i
+        · -- j < i: the original hi3 says the product equals dAt S (n - 1) = 1.
+          have := hi3 j hj1 hji_lt
+          rw [h_case] at this
+          exact absurd this hj4
+        · by_cases hji_eq : j = i
+          · -- j = i: dAt S i = −1 (since ≠ 1 and ±1).
+            subst hji_eq
+            have hdi_neg : dAt S j = -1 := by
+              rcases dAt_pm' S hj1 hj2 with h | h
+              · exact absurd h hi5
+              · exact h
+            -- dAt S (n − j) must be 1 (otherwise product = (−1)(−1) = 1, contradiction).
+            rcases dAt_pm' S (show 1 ≤ n - j from by omega) (show n - j ≤ n - 1 from by omega)
+              with h | h
+            · exact h
+            · exfalso; apply hj4; rw [hdi_neg, h]; norm_num
+          · -- j > i: hj3 at k = i contradicts hi4.
+            have hji_gt : i < j := by omega
+            have hk_eq := hj3 i hi1 hji_gt
+            rw [doRevD_product_eq S hi1 hi2, dAt_doRevD_n1 S hn, hdS1] at hk_eq
+            -- hk_eq : dAt S i * dAt S (n - i) = 1
+            rw [h_case] at hi4
+            exact absurd hk_eq hi4
+    · /- Case dAt S (n - 1) = −1: use doNegD (doRevD S) as the witness. -/
+      have h_neg : dAt S (n - 1) = -1 := by
+        rcases dAt_pm' S (show 1 ≤ n - 1 from by omega) (show n - 1 ≤ n - 1 from le_refl _)
+          with h | h
+        · exact absurd h h_case
+        · exact h
+      set S5 := TurynTypeSeq.doNegD S.doRevD with hS5_def
+      refine ⟨S5, ?_, ?_, ?_, ?_, ?_, ?_⟩
+      -- Equivalence: revD then negD
+      · exact Relation.ReflTransGen.trans
+          (Relation.ReflTransGen.single (Elementary.revD S))
+          (Relation.ReflTransGen.single (Elementary.negD _))
+      -- Canonical1: dAt S5 1 = −(dAt S (n − 1)) = −(−1) = 1
+      · refine ⟨h1234.1.1, h1234.1.2.1, h1234.1.2.2.1, h1234.1.2.2.2.1, h1234.1.2.2.2.2.1, ?_⟩
+        rw [dAt_doNegRevD S (by omega : 1 ≤ 1) (by omega : 1 ≤ n - 1)]
+        rw [h_neg]; norm_num
+      -- Canonical2 (A unchanged)
+      · exact h1234.2.1
+      -- Canonical3 (B unchanged)
+      · exact h1234.2.2.1
+      -- Canonical4 (C unchanged)
+      · exact h1234.2.2.2
+      -- Canonical5 for S5 = doNegD (doRevD S)
+      · intro j hj1 hj2 hj3 hj4
+        -- Rewrite product and reference value
+        rw [doNegRevD_product_eq S hj1 hj2, dAt_doNegRevD_n1 S hn, hdS1] at hj4
+        -- hj4 : dAt S j * dAt S (n - j) ≠ -(1) = −1
+        have hj4' : dAt S j * dAt S (n - j) ≠ -1 := by norm_num at hj4 ⊢; exact hj4
+        rw [dAt_doNegRevD S hj1 hj2]
+        -- Goal: -(dAt S (n - j)) = 1, i.e., dAt S (n - j) = −1
+        -- Three sub-cases: j < i, j = i, j > i.
+        by_cases hji_lt : j < i
+        · -- j < i: hi3 says product = dAt S (n − 1) = −1, contradiction.
+          have := hi3 j hj1 hji_lt
+          rw [h_neg] at this
+          exact absurd this hj4'
+        · by_cases hji_eq : j = i
+          · -- j = i: dAt S i = −1, so dAt S (n − i) = −1, and −(−1) = 1.
+            subst hji_eq
+            have hdi_neg : dAt S j = -1 := by
+              rcases dAt_pm' S hj1 hj2 with h | h
+              · exact absurd h hi5
+              · exact h
+            rcases dAt_pm' S (show 1 ≤ n - j from by omega) (show n - j ≤ n - 1 from by omega)
+              with h | h
+            · -- dAt S (n - j) = 1: product = (−1)(1) = −1, contradicts hj4'
+              exfalso; apply hj4'; rw [hdi_neg, h]; norm_num
+            · -- dAt S (n - j) = −1: −(−1) = 1 ✓
+              rw [h]; norm_num
+          · -- j > i: hj3 at k = i contradicts hi4.
+            have hji_gt : i < j := by omega
+            have hk_eq := hj3 i hi1 hji_gt
+            rw [doNegRevD_product_eq S hi1 hi2, dAt_doNegRevD_n1 S hn, hdS1] at hk_eq
+            rw [h_neg] at hi4
+            have hk_eq' : dAt S i * dAt S (n - i) = -1 := by linarith
+            exact absurd hk_eq' hi4
 
 set_option maxHeartbeats 800000 in
 /-- Step 6: enforce condition (6) using optional swap. -/
