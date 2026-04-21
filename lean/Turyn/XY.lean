@@ -1,4 +1,5 @@
 import Turyn.Equivalence
+import Turyn.PmSum
 
 namespace Turyn
 
@@ -184,5 +185,64 @@ theorem parity_hammer {n : Nat} (S : TurynTypeSeq n) (k : Nat) (hk : 2 ≤ k) (h
     · omega;
     · omega;
   omega
+
+/-- aAt S i is ±1 for valid indices. -/
+lemma aAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
+    aAt S i = 1 ∨ aAt S i = -1 := by
+  exact pm_entry_of_getD S.isTuryn.x_pm (by rw [S.isTuryn.x_len]; omega)
+
+/-
+Pure integer case analysis: if a₁, a₂, u₁, u₂ are all ±1 and
+    a₁*(1+u₁) + a₂*(1+u₂) ≡ 2 (mod 4), then u₁ = -u₂.
+-/
+private lemma xy_base_common (a₁ a₂ u₁ u₂ : Int)
+    (ha1 : a₁ = 1 ∨ a₁ = -1) (ha2 : a₂ = 1 ∨ a₂ = -1)
+    (hu1 : u₁ = 1 ∨ u₁ = -1) (hu2 : u₂ = 1 ∨ u₂ = -1)
+    (hmod : (a₁ * (1 + u₁) + a₂ * (1 + u₂)) % 4 = 2) :
+    u₁ = -u₂ := by
+  rcases ha1 with rfl | rfl <;> rcases ha2 with rfl | rfl <;>
+    rcases hu1 with rfl | rfl <;> rcases hu2 with rfl | rfl <;> omega
+
+theorem xy_base_k2 {n : Nat} (S : TurynTypeSeq n) (hn : 3 ≤ n)
+    (hc : Canonical1 n S) : uAt S (n - 1) = -(uAt S 2) := by
+      -- Apply the parity hammer lemma to get the congruence.
+      have h_parity : (aAt S (n - 1) * (1 + uAt S (n - 1)) + aAt S 2 * (1 + uAt S 2)) % 4 = 2 := by
+        have := parity_hammer S 2 ( by decide ) ( by omega ) ; ( rw [ T_k_as_U_sum S 2 ( by decide ) ( by omega ) ] at this; );
+        rcases n with ( _ | _ | n ) <;> simp_all +decide [ Finset.sum_range_succ ];
+        simp_all +decide [ add_comm 1, add_comm 2, uAt ];
+        have := hc.1; have := hc.2.1; have := hc.2.2.1; have := hc.2.2.2.1; have := hc.2.2.2.2.1; have := hc.2.2.2.2.2; simp_all +decide [ aAt, bAt ] ;
+      grind +suggestions
+
+theorem xy_base_k3 {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
+    (hc : Canonical1 n S) : uAt S (n - 2) = -(uAt S 3) := by
+      -- Apply xy_base_common with the given conditions.
+      apply xy_base_common (aAt S (n - 2)) (aAt S 3) (uAt S (n - 2)) (uAt S 3) (aAt_pm S (n - 2) (by omega) (by omega)) (aAt_pm S 3 (by omega) (by omega)) (uAt_pm S (n - 2) (by omega) (by omega)) (uAt_pm S 3 (by omega) (by omega));
+      have hT3_mod4 : (aperiodicAutocorr S.A (n - 3) + aperiodicAutocorr S.B (n - 3)) % 4 = 2 := by
+        apply parity_hammer S 3 (by omega) (by omega);
+      convert hT3_mod4 using 1;
+      rw [ Turyn.T_k_as_U_sum S 3 ( by omega ) ( by omega ) ] ; norm_num [ Finset.sum_range_succ ] ; ring;
+      rw [ show 3 + ( n - 3 ) = n by omega, show 1 + ( n - 3 ) = n - 2 by omega, show 2 + ( n - 3 ) = n - 1 by omega ] ; ring;
+      rw [ show aAt S 1 = 1 by exact hc.1, show aAt S n = 1 by exact hc.2.1, show uAt S 1 = 1 by exact uAt_one_of_canonical1_head hc, show uAt S n = 1 by exact uAt_one_of_canonical1_tail ( by linarith ) hc ] ; ring;
+      rw [ show uAt S ( n - 1 ) = -uAt S 2 by exact xy_base_k2 S ( by omega ) hc ] ; ring;
+      rw [ show uAt S 2 ^ 2 = 1 by rw [ sq, uAt_sq S 2 ( by linarith ) ( by omega ) ] ] ; ring
+
+/-
+Endpoint-pair mod-4 lemma: the expression
+`aAt S (n+1-k) * (1 + uAt S (n+1-k)) + aAt S k * (1 + uAt S k)`
+is congruent to 2 mod 4 if and only if the `u`-values at the two
+endpoints are negatives of each other. This generalises the k = 2
+base-case analysis to arbitrary k and is used by the main XY
+induction step.
+-/
+lemma endpoint_pair_mod4 {n : Nat} (S : TurynTypeSeq n) (k : Nat)
+    (hk : 2 ≤ k) (hkn : k ≤ n - 1) (_hc : Canonical1 n S) :
+    (aAt S (n + 1 - k) * (1 + uAt S (n + 1 - k)) + aAt S k * (1 + uAt S k)) % 4 = 2 ↔
+      uAt S (n + 1 - k) = -(uAt S k) := by
+  -- Let's simplify the expression using the fact that `aAt` and `uAt` are ±1.
+  have h_simp : ∀ i, 1 ≤ i → i ≤ n → aAt S i = 1 ∨ aAt S i = -1 := by
+    exact fun i a a_1 => aAt_pm S i a a_1
+  have h_simp_u : ∀ i, 1 ≤ i → i ≤ n → uAt S i = 1 ∨ uAt S i = -1 := by
+    exact fun i a a_1 => uAt_pm S i a a_1
+  grind
 
 end Turyn
