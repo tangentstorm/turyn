@@ -1068,7 +1068,240 @@ theorem step5_condition5
             have hk_eq' : dAt S i * dAt S (n - i) = -1 := by linarith
             exact absurd hk_eq' hi4
 
-set_option maxHeartbeats 800000 in
+/-! ### Helper lemmas for step 6 -/
+
+private lemma doSwap_aAt {n : Nat} (S : TurynTypeSeq n) (i : Nat) :
+    aAt S.doSwap i = bAt S i := by
+  unfold aAt bAt TurynTypeSeq.doSwap; rfl
+
+private lemma doSwap_bAt {n : Nat} (S : TurynTypeSeq n) (i : Nat) :
+    bAt S.doSwap i = aAt S i := by
+  unfold aAt bAt TurynTypeSeq.doSwap; rfl
+
+private lemma doSwap_cAt {n : Nat} (S : TurynTypeSeq n) (i : Nat) :
+    cAt S.doSwap i = cAt S i := by
+  unfold cAt TurynTypeSeq.doSwap; rfl
+
+private lemma doSwap_dAt {n : Nat} (S : TurynTypeSeq n) (i : Nat) :
+    dAt S.doSwap i = dAt S i := by
+  unfold dAt TurynTypeSeq.doSwap; rfl
+
+private lemma canonical1_doSwap {n : Nat} {S : TurynTypeSeq n}
+    (h1 : Canonical1 n S) : Canonical1 n S.doSwap := by
+  unfold Canonical1 at *
+  exact ⟨by rw [doSwap_aAt]; exact h1.2.2.1,
+         by rw [doSwap_aAt]; exact h1.2.2.2.1,
+         by rw [doSwap_bAt]; exact h1.1,
+         by rw [doSwap_bAt]; exact h1.2.1,
+         by rw [doSwap_cAt]; exact h1.2.2.2.2.1,
+         by rw [doSwap_dAt]; exact h1.2.2.2.2.2⟩
+
+private lemma canonical2_doSwap_of_canonical3 {n : Nat} {S : TurynTypeSeq n}
+    (h3 : Canonical3 n S) : Canonical2 n S.doSwap := by
+  intro i hi₁ hi₂ hi₃ hi₄
+  have hi₃' : ∀ j, 1 ≤ j → j < i → bAt S j = bAt S (n + 1 - j) := by
+    intro j hj₁ hj₂
+    have := hi₃ j hj₁ hj₂
+    rw [doSwap_aAt, doSwap_aAt] at this
+    exact this
+  have hi₄' : bAt S i ≠ bAt S (n + 1 - i) := by
+    rw [doSwap_aAt, doSwap_aAt] at hi₄
+    exact hi₄
+  have := h3 i hi₁ hi₂ hi₃' hi₄'
+  rw [doSwap_aAt]
+  exact this
+
+private lemma canonical3_doSwap_of_canonical2 {n : Nat} {S : TurynTypeSeq n}
+    (h2 : Canonical2 n S) : Canonical3 n S.doSwap := by
+  intro i hi₁ hi₂ hi₃ hi₄
+  have hi₃' : ∀ j, 1 ≤ j → j < i → aAt S j = aAt S (n + 1 - j) := by
+    intro j hj₁ hj₂
+    have := hi₃ j hj₁ hj₂
+    rw [doSwap_bAt, doSwap_bAt] at this
+    exact this
+  have hi₄' : aAt S i ≠ aAt S (n + 1 - i) := by
+    rw [doSwap_bAt, doSwap_bAt] at hi₄
+    exact hi₄
+  have := h2 i hi₁ hi₂ hi₃' hi₄'
+  rw [doSwap_bAt]
+  exact this
+
+private lemma canonical4_doSwap {n : Nat} {S : TurynTypeSeq n}
+    (h4 : Canonical4 n S) : Canonical4 n S.doSwap := by
+  intro i hi₁ hi₂ hi₃ hi₄
+  have hi₃' : ∀ j, 1 ≤ j → j < i → cAt S j ≠ cAt S (n + 1 - j) := by
+    intro j hj₁ hj₂
+    have := hi₃ j hj₁ hj₂
+    rw [doSwap_cAt, doSwap_cAt] at this
+    exact this
+  have hi₄' : cAt S i = cAt S (n + 1 - i) := by
+    rw [doSwap_cAt, doSwap_cAt] at hi₄
+    exact hi₄
+  have := h4 i hi₁ hi₂ hi₃' hi₄'
+  rw [doSwap_cAt]
+  exact this
+
+private lemma canonical5_doSwap {n : Nat} {S : TurynTypeSeq n}
+    (h5 : Canonical5 n S) : Canonical5 n S.doSwap := by
+  intro i hi₁ hi₂ hi₃ hi₄
+  have hi₃' : ∀ j, 1 ≤ j → j < i → dAt S j * dAt S (n - j) = dAt S (n - 1) := by
+    intro j hj₁ hj₂
+    have := hi₃ j hj₁ hj₂
+    rw [doSwap_dAt, doSwap_dAt, doSwap_dAt] at this
+    exact this
+  have hi₄' : dAt S i * dAt S (n - i) ≠ dAt S (n - 1) := by
+    rw [doSwap_dAt, doSwap_dAt, doSwap_dAt] at hi₄
+    exact hi₄
+  have := h5 i hi₁ hi₂ hi₃' hi₄'
+  rw [doSwap_dAt]
+  exact this
+
+private lemma step6_aAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi : i - 1 < n) :
+    aAt S i = 1 ∨ aAt S i = -1 := by
+  exact pm_entry_of_getD S.isTuryn.x_pm (by rw [S.isTuryn.x_len]; exact hi)
+
+private lemma step6_bAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi : i - 1 < n) :
+    bAt S i = 1 ∨ bAt S i = -1 := by
+  exact pm_entry_of_getD S.isTuryn.y_pm (by rw [S.isTuryn.y_len]; exact hi)
+
+private lemma step6_cAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi : i - 1 < n) :
+    cAt S i = 1 ∨ cAt S i = -1 := by
+  exact pm_entry_of_getD S.isTuryn.z_pm (by rw [S.isTuryn.z_len]; exact hi)
+
+private lemma step6_dAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi : i - 1 < n - 1) :
+    dAt S i = 1 ∨ dAt S i = -1 := by
+  exact pm_entry_of_getD S.isTuryn.w_pm (by rw [S.isTuryn.w_len]; exact hi)
+
+/-
+Autocorrelation of a length-(m+2) sequence at lag m has exactly 2 terms.
+-/
+private lemma autocorr_two_terms (X : PmSeq) (m : Nat) (hlen : X.length = m + 2) :
+    aperiodicAutocorr X m = X.getD 0 0 * X.getD m 0 + X.getD 1 0 * X.getD (m + 1) 0 := by
+  unfold aperiodicAutocorr
+  have hge : ¬(m ≥ X.length) := by omega
+  rw [if_neg hge]
+  have hlen2 : X.length - m = 2 := by omega
+  rw [hlen2]
+  rw [Finset.sum_range_succ, Finset.sum_range_succ, Finset.sum_range_zero]
+  simp only [zero_add, Nat.add_comm 1 m]
+
+/-
+Autocorrelation of a length-(m+1) sequence at lag m has exactly 1 term.
+-/
+private lemma autocorr_one_term (X : PmSeq) (m : Nat) (hlen : X.length = m + 1) :
+    aperiodicAutocorr X m = X.getD 0 0 * X.getD m 0 := by
+  unfold aperiodicAutocorr
+  have hge : ¬(m ≥ X.length) := by omega
+  rw [if_neg hge]
+  have hlen1 : X.length - m = 1 := by omega
+  rw [hlen1]
+  rw [Finset.sum_range_succ, Finset.sum_range_zero]
+  simp only [zero_add]
+
+/-
+The autocorrelation identity at lag n-2 for Turyn sequences with Canonical1.
+-/
+private lemma step6_autocorr_lag_n_sub_2
+    (n : Nat) (hn3 : 3 ≤ n) (S : TurynTypeSeq n)
+    (h1 : Canonical1 n S) :
+    aAt S (n - 1) + aAt S 2 + (bAt S (n - 1) + bAt S 2) +
+    2 * (cAt S (n - 1) + cAt S 2 * cAt S n) +
+    2 * dAt S (n - 1) = 0 := by
+  -- Get vanishing at lag n-2
+  have hv := S.isTuryn.vanishing (n - 2) (by omega) (by omega)
+  unfold combinedAutocorr at hv
+  -- Expand each aperiodicAutocorr
+  rw [autocorr_two_terms S.A (n - 2) (by rw [S.isTuryn.x_len]; omega),
+      autocorr_two_terms S.B (n - 2) (by rw [S.isTuryn.y_len]; omega),
+      autocorr_two_terms S.C (n - 2) (by rw [S.isTuryn.z_len]; omega),
+      autocorr_one_term S.D (n - 2) (by rw [S.isTuryn.w_len]; omega)] at hv
+  -- Express aAt/bAt/cAt/dAt as getD
+  have eqa_n1 : aAt S (n - 1) = S.A.getD (n - 2) 0 := by
+    show S.A.getD (n - 1 - 1) 0 = S.A.getD (n - 2) 0; congr 1
+  have eqa_2 : aAt S 2 = S.A.getD 1 0 := rfl
+  have eqb_n1 : bAt S (n - 1) = S.B.getD (n - 2) 0 := by
+    show S.B.getD (n - 1 - 1) 0 = S.B.getD (n - 2) 0; congr 1
+  have eqb_2 : bAt S 2 = S.B.getD 1 0 := rfl
+  have eqc_n1 : cAt S (n - 1) = S.C.getD (n - 2) 0 := by
+    show S.C.getD (n - 1 - 1) 0 = S.C.getD (n - 2) 0; congr 1
+  have eqc_2 : cAt S 2 = S.C.getD 1 0 := rfl
+  have eqc_n : cAt S n = S.C.getD (n - 1) 0 := rfl
+  have eqd_n1 : dAt S (n - 1) = S.D.getD (n - 2) 0 := by
+    show S.D.getD (n - 1 - 1) 0 = S.D.getD (n - 2) 0; congr 1
+  -- Rewrite the goal to use getD
+  rw [eqa_n1, eqa_2, eqb_n1, eqb_2, eqc_n1, eqc_2, eqc_n, eqd_n1]
+  -- Get Canonical1 in getD form
+  have h_a0 : S.A.getD 0 0 = 1 := by
+    have := h1.1; unfold aAt at this; exact this
+  have h_an1 : S.A.getD (n - 1) 0 = 1 := by
+    have := h1.2.1; unfold aAt at this; exact this
+  have h_b0 : S.B.getD 0 0 = 1 := by
+    have := h1.2.2.1; unfold bAt at this; exact this
+  have h_bn1 : S.B.getD (n - 1) 0 = 1 := by
+    have := h1.2.2.2.1; unfold bAt at this; exact this
+  have h_c0 : S.C.getD 0 0 = 1 := by
+    have := h1.2.2.2.2.1; unfold cAt at this; exact this
+  have h_d0 : S.D.getD 0 0 = 1 := by
+    have := h1.2.2.2.2.2; unfold dAt at this; exact this
+  -- First normalize n-2+1 to n-1 in hv
+  have hn21 : n - 2 + 1 = n - 1 := by omega
+  rw [hn21] at hv
+  -- Substitute Canonical1 values into hv
+  rw [h_a0, h_an1, h_b0, h_bn1, h_c0, h_d0] at hv
+  -- Simplify
+  linarith
+
+/-
+If a,b are ±1, c,d,e*f,g are ±1, and a+b + 2c + 2d + 2(ef) + 2g = 0, then a+b = 0.
+-/
+private lemma step6_sum_forces_zero
+    (a b c d g : Int) (ef : Int)
+    (ha : a = 1 ∨ a = -1) (hb : b = 1 ∨ b = -1)
+    (hc : c = 1 ∨ c = -1) (hd : d = 1 ∨ d = -1)
+    (hef : ef = 1 ∨ ef = -1) (hg : g = 1 ∨ g = -1)
+    (hsum : a + b + 2 * c + 2 * d + 2 * ef + 2 * g = 0) :
+    a + b = 0 := by
+  rcases ha with rfl | rfl <;> rcases hb with rfl | rfl <;>
+    rcases hc with rfl | rfl <;> rcases hd with rfl | rfl <;>
+    rcases hef with rfl | rfl <;> rcases hg with rfl | rfl <;>
+    (norm_num at hsum) <;> norm_num
+
+private lemma step6_opposite_signs
+    (n : Nat) (hn_even : n % 2 = 0) (hn : 2 ≤ n) (S : TurynTypeSeq n)
+    (h1 : Canonical1 n S) (h_eq : aAt S 2 = bAt S 2) :
+    n ≤ 2 ∨
+    (aAt S (n - 1) = 1 ∧ bAt S (n - 1) = -1) ∨
+    (aAt S (n - 1) = -1 ∧ bAt S (n - 1) = 1) := by
+  by_cases hn3 : 3 ≤ n;
+  · have h_sum : aAt S (n - 1) + bAt S (n - 1) + 2 * aAt S 2 + 2 * cAt S (n - 1) + 2 * (cAt S 2 * cAt S n) + 2 * dAt S (n - 1) = 0 := by
+      convert step6_autocorr_lag_n_sub_2 n hn3 S h1 using 1 ; rw [ h_eq ] ; ring!;
+    have h_cases : aAt S (n - 1) = 1 ∨ aAt S (n - 1) = -1 := by
+      exact step6_aAt_pm S ( n - 1 ) ( by omega )
+    have h_cases' : bAt S (n - 1) = 1 ∨ bAt S (n - 1) = -1 := by
+      exact step6_bAt_pm S ( n - 1 ) ( by omega )
+    have h_cases'' : aAt S 2 = 1 ∨ aAt S 2 = -1 := by
+      exact step6_aAt_pm S 2 ( by omega )
+    have h_cases''' : cAt S (n - 1) = 1 ∨ cAt S (n - 1) = -1 := by
+      apply step6_cAt_pm; omega;
+    have h_cases'''' : cAt S 2 * cAt S n = 1 ∨ cAt S 2 * cAt S n = -1 := by
+      have h_cases'''' : cAt S 2 = 1 ∨ cAt S 2 = -1 := by
+        apply step6_cAt_pm; omega;
+      have h_cases''''' : cAt S n = 1 ∨ cAt S n = -1 := by
+        apply step6_cAt_pm; omega;
+      rcases h_cases'''' with h|h <;> rcases h_cases''''' with j|j <;> norm_num [ h, j ]
+    have h_cases''''' : dAt S (n - 1) = 1 ∨ dAt S (n - 1) = -1 := by
+      apply step6_dAt_pm; omega;
+    have hab0 := step6_sum_forces_zero
+      (aAt S (n - 1)) (bAt S (n - 1)) (aAt S 2) (cAt S (n - 1))
+      (dAt S (n - 1)) (cAt S 2 * cAt S n)
+      h_cases h_cases' h_cases'' h_cases''' h_cases'''' h_cases''''' h_sum
+    rcases h_cases with ha1 | ha_neg1
+    · have hb : bAt S (n - 1) = -1 := by linarith
+      exact Or.inr (Or.inl ⟨ha1, hb⟩)
+    · have hb : bAt S (n - 1) = 1 := by linarith
+      exact Or.inr (Or.inr ⟨ha_neg1, hb⟩)
+  · exact Or.inl (by omega)
+
 /-- Step 6: enforce condition (6) using optional swap. -/
 theorem step6_condition6
     (n : Nat) (hn_even : n % 2 = 0) (hn : 2 ≤ n) (S : TurynTypeSeq n)
@@ -1078,56 +1311,54 @@ theorem step6_condition6
       Equivalent n S S6 ∧
       Canonical1 n S6 ∧ Canonical2 n S6 ∧ Canonical3 n S6 ∧
       Canonical4 n S6 ∧ Canonical5 n S6 ∧ Canonical6 n S6 := by
-        -- Consider two cases: $aAt 2 \neq bAt 2$ and $aAt 2 = bAt 2$.
-        by_cases h_cases : aAt S 2 ≠ bAt S 2;
-        · by_cases h_a2 : aAt S 2 = 1;
-          · exact ⟨ S, by constructor, h12345.1, h12345.2.1, h12345.2.2.1, h12345.2.2.2.1, h12345.2.2.2.2, by unfold Canonical6; aesop ⟩;
-          · -- If `aAt 2 = -1`, then `bAt 2 = 1` (since they're ±1 and different). Apply `doSwap` to satisfy `Canonical6`.
-            have h_b2 : bAt S 2 = 1 := by
-              have h_b2 : bAt S 2 = 1 ∨ bAt S 2 = -1 := by
-                apply pm_entry_of_getD;
-                · exact S.isTuryn.y_pm;
-                · have := S.isTuryn.y_len; aesop;
-              have h_a2 : aAt S 2 = 1 ∨ aAt S 2 = -1 := by
-                apply pm_entry_of_getD;
-                · exact S.isTuryn.x_pm;
-                · have := S.isTuryn.x_len; aesop;
-              grind;
-            refine' ⟨ S.doSwap, _, _, _, _, _, _ ⟩ <;> simp_all +decide [ Equivalent ];
-            exact .single ( Elementary.swap S );
-            · exact ⟨ h12345.1.2.2.1, h12345.1.2.2.2.1, h12345.1.1, h12345.1.2.1, h12345.1.2.2.2.2.1, h12345.1.2.2.2.2.2 ⟩;
-            · grind +locals;
-            · exact h12345.2.1;
-            · intro i hi₁ hi₂ hi₃ hi₄; have := h12345.2.2.2.1 i hi₁ hi₂; simp_all +decide [ TurynTypeSeq.doSwap ] ;
-              exact this ( fun j hj₁ hj₂ => by simpa using hi₃ j hj₁ hj₂ ) ( by simpa using hi₄ ) |> fun h => by simpa using h;
-            · unfold Canonical5 Canonical6; simp_all +decide [ TurynTypeSeq.doSwap ] ;
-              unfold aAt bAt dAt at * ; aesop ( simp_config := { singlePass := true } ) ;
-        · use if aAt S (n - 1) = 1 ∧ bAt S (n - 1) = -1 then S else S.doSwap;
-          split_ifs <;> simp_all +decide [ Canonical6 ];
-          · constructor;
-          · refine' ⟨ _, _, _, _, _, _, _ ⟩;
-            exact .single ( Elementary.swap S );
-            all_goals unfold Canonical1 at *; simp_all +decide [ TurynTypeSeq.doSwap ] ;
-            all_goals unfold aAt bAt cAt dAt at *; simp_all +decide
-            · grind +locals;
-            · exact h12345.2.1;
-            · exact h12345.2.2.2.1;
-            · exact h12345.2.2.2.2;
-            · rcases n with ( _ | _ | _ | n ) <;> simp_all +decide;
-              have := S.isTuryn; rcases this with ⟨ hA, hB, hC, hD, hA', hB', hC', hD', h ⟩ ; simp_all +decide [Nat.mod_two_of_bodd] ;
-              cases hA' ( S.A[n + 1] ) ( by simp ) <;> cases hB' ( S.B[n + 1] ) ( by simp ) <;> simp_all +decide only
-              · specialize h ( n + 1 ) ; simp_all +decide [ combinedAutocorr ] ;
-                unfold aperiodicAutocorr at h; simp_all +decide
-                simp_all +decide [ Finset.sum_range_succ ];
-                simp_all +decide [add_comm 1]
-                cases hB' ( S.B[1] ) ( by simp ) <;> cases hC' ( S.C[n + 1] ) ( by simp ) <;> cases hC' ( S.C[1] ) ( by simp ) <;> cases hC' ( S.C[n + 1 + 1] ) ( by simp ) <;> cases hD' ( S.D[n + 1] ) ( by simp ) <;> simp_all ( config := { decide := Bool.true } ) only [ ] ;
-              · norm_num;
-              · specialize h ( n + 1 ) ; simp_all +decide [ combinedAutocorr ];
-                unfold aperiodicAutocorr at h; simp_all +decide
-                simp_all +decide [ Finset.sum_range_succ ];
-                simp_all +decide [add_comm 1]
-                cases hB' ( S.B[1] ) ( by simp ) <;> cases hC' ( S.C[n + 1] ) ( by simp ) <;> cases hC' ( S.C[n + 1 + 1] ) ( by simp ) <;> cases hD' ( S.D[n + 1] ) ( by simp ) <;> simp_all +decide only
-                all_goals cases hC' ( S.C[1] ) ( by simp ) <;> simp_all +decide only ;
+  obtain ⟨h1, h2, h3, h4, h5⟩ := h12345
+  -- Case split: aAt S 2 ≠ bAt S 2 vs aAt S 2 = bAt S 2
+  by_cases h_neq : aAt S 2 ≠ bAt S 2
+  · -- Sub-case: aAt S 2 = 1
+    rcases step6_aAt_pm S 2 (by omega) with h_a2_1 | h_a2_neg1
+    · -- aAt S 2 = 1: S itself works
+      exact ⟨S, Relation.ReflTransGen.refl, h1, h2, h3, h4, h5,
+             Or.inr (Or.inl ⟨h_neq, h_a2_1⟩)⟩
+    · -- aAt S 2 = -1: then bAt S 2 = 1 (since they differ and are ±1)
+      have h_b2 : bAt S 2 = 1 := by
+        rcases step6_bAt_pm S 2 (by omega) with h | h
+        · exact h
+        · exfalso; exact h_neq (by rw [h_a2_neg1, h])
+      -- Use S.doSwap
+      refine ⟨S.doSwap, Relation.ReflTransGen.single (Elementary.swap S),
+              canonical1_doSwap h1,
+              canonical2_doSwap_of_canonical3 h3,
+              canonical3_doSwap_of_canonical2 h2,
+              canonical4_doSwap h4,
+              canonical5_doSwap h5,
+              ?_⟩
+      -- Show Canonical6 for doSwap
+      unfold Canonical6
+      right; left
+      exact ⟨by rw [doSwap_aAt, doSwap_bAt]; exact fun h => h_neq h.symm,
+             by rw [doSwap_aAt]; exact h_b2⟩
+  · -- aAt S 2 = bAt S 2
+    push_neg at h_neq
+    -- Use step6_opposite_signs to get sign information at position n-1
+    rcases step6_opposite_signs n hn_even hn S h1 h_neq with h_le2 | ⟨ha_pos, hb_neg⟩ | ⟨ha_neg, hb_pos⟩
+    · -- n ≤ 2: Canonical6 is trivially satisfied
+      exact ⟨S, Relation.ReflTransGen.refl, h1, h2, h3, h4, h5, Or.inl h_le2⟩
+    · -- aAt S (n-1) = 1, bAt S (n-1) = -1: S works directly
+      exact ⟨S, Relation.ReflTransGen.refl, h1, h2, h3, h4, h5,
+             Or.inr (Or.inr ⟨h_neq, ha_pos, hb_neg⟩)⟩
+    · -- aAt S (n-1) = -1, bAt S (n-1) = 1: use S.doSwap
+      refine ⟨S.doSwap, Relation.ReflTransGen.single (Elementary.swap S),
+              canonical1_doSwap h1,
+              canonical2_doSwap_of_canonical3 h3,
+              canonical3_doSwap_of_canonical2 h2,
+              canonical4_doSwap h4,
+              canonical5_doSwap h5,
+              ?_⟩
+      unfold Canonical6
+      right; right
+      exact ⟨by rw [doSwap_aAt, doSwap_bAt]; exact h_neq.symm,
+             by rw [doSwap_aAt]; exact hb_pos,
+             by rw [doSwap_bAt]; exact ha_neg⟩
 
 /-- Every equivalence class of Turyn-type sequences has a canonical representative.
 
