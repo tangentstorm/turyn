@@ -9,6 +9,7 @@ import Turyn.Energy
 import Turyn.Equivalence
 import Turyn.Examples
 import Turyn.XY
+import Turyn.PmSum
 
 /-!
 # Turyn Library Exports
