@@ -205,13 +205,22 @@ private lemma xy_base_common (a₁ a₂ u₁ u₂ : Int)
 
 theorem xy_base_k2 {n : Nat} (S : TurynTypeSeq n) (hn : 3 ≤ n)
     (hc : Canonical1 n S) : uAt S (n - 1) = -(uAt S 2) := by
-      -- Apply the parity hammer lemma to get the congruence.
-      have h_parity : (aAt S (n - 1) * (1 + uAt S (n - 1)) + aAt S 2 * (1 + uAt S 2)) % 4 = 2 := by
-        have := parity_hammer S 2 ( by decide ) ( by omega ) ; ( rw [ T_k_as_U_sum S 2 ( by decide ) ( by omega ) ] at this; );
-        rcases n with ( _ | _ | n ) <;> simp_all +decide [ Finset.sum_range_succ ];
-        simp_all +decide [ add_comm 1, add_comm 2, uAt ];
-        have := hc.1; have := hc.2.1; have := hc.2.2.1; have := hc.2.2.2.1; have := hc.2.2.2.2.1; have := hc.2.2.2.2.2; simp_all +decide [ aAt, bAt ] ;
-      grind +suggestions
+  apply xy_base_common (aAt S (n - 1)) (aAt S 2) (uAt S (n - 1)) (uAt S 2)
+    (aAt_pm S (n - 1) (by omega) (by omega))
+    (aAt_pm S 2 (by omega) (by omega))
+    (uAt_pm S (n - 1) (by omega) (by omega))
+    (uAt_pm S 2 (by omega) (by omega))
+  -- Need: (aAt S (n-1) * (1 + uAt S (n-1)) + aAt S 2 * (1 + uAt S 2)) % 4 = 2
+  have hph := parity_hammer S 2 (by decide) (by omega)
+  rw [T_k_as_U_sum S 2 (by decide) (by omega)] at hph
+  rw [show (2 : ℕ) = 0 + 1 + 1 from by norm_num] at hph
+  rw [Finset.sum_range_succ, Finset.sum_range_succ, Finset.sum_range_zero] at hph
+  simp only [zero_add] at hph
+  have h1n : 1 + (n - 2) = n - 1 := by omega
+  have h2n : 2 + (n - 2) = n := by omega
+  rw [h1n, h2n] at hph
+  rw [hc.1, hc.2.1, uAt_one_of_canonical1_head hc, uAt_one_of_canonical1_tail (by omega) hc] at hph
+  convert hph using 2 <;> ring
 
 theorem xy_base_k3 {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
     (hc : Canonical1 n S) : uAt S (n - 2) = -(uAt S 3) := by
@@ -234,16 +243,23 @@ endpoints are negatives of each other. This generalises the k = 2
 base-case analysis to arbitrary k and is used by the main XY
 induction step.
 -/
+private lemma endpoint_pair_mod4_pure (a_p a_q u_p u_q : Int)
+    (ha_p : a_p = 1 ∨ a_p = -1) (ha_q : a_q = 1 ∨ a_q = -1)
+    (hu_p : u_p = 1 ∨ u_p = -1) (hu_q : u_q = 1 ∨ u_q = -1) :
+    (a_p * (1 + u_p) + a_q * (1 + u_q)) % 4 = 2 ↔ u_p = -u_q := by
+  rcases ha_p with rfl | rfl <;> rcases ha_q with rfl | rfl <;>
+    rcases hu_p with rfl | rfl <;> rcases hu_q with rfl | rfl <;> decide
+
 lemma endpoint_pair_mod4 {n : Nat} (S : TurynTypeSeq n) (k : Nat)
     (hk : 2 ≤ k) (hkn : k ≤ n - 1) (_hc : Canonical1 n S) :
     (aAt S (n + 1 - k) * (1 + uAt S (n + 1 - k)) + aAt S k * (1 + uAt S k)) % 4 = 2 ↔
       uAt S (n + 1 - k) = -(uAt S k) := by
-  -- Let's simplify the expression using the fact that `aAt` and `uAt` are ±1.
-  have h_simp : ∀ i, 1 ≤ i → i ≤ n → aAt S i = 1 ∨ aAt S i = -1 := by
-    exact fun i a a_1 => aAt_pm S i a a_1
-  have h_simp_u : ∀ i, 1 ≤ i → i ≤ n → uAt S i = 1 ∨ uAt S i = -1 := by
-    exact fun i a a_1 => uAt_pm S i a a_1
-  grind
+  exact endpoint_pair_mod4_pure
+    (aAt S (n + 1 - k)) (aAt S k) (uAt S (n + 1 - k)) (uAt S k)
+    (aAt_pm S (n + 1 - k) (by omega) (by omega))
+    (aAt_pm S k (by omega) (by omega))
+    (uAt_pm S (n + 1 - k) (by omega) (by omega))
+    (uAt_pm S k (by omega) (by omega))
 
 /--
 Pure integer algebra: for ±1 values a₁, a₂, a₃, a₄, u₁, u₃,
