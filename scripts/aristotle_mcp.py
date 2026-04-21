@@ -94,6 +94,28 @@ TOOLS = [
             "required": ["project_id"],
         },
     },
+    {
+        "name": "git_commit",
+        "description": (
+            "Stage the listed files and create a commit in the turyn repo root. "
+            "File paths are relative to the repo root. Scoped to this repo only."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Relative paths to stage with `git add` before committing.",
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Full commit message (heredoc, may include newlines and co-author trailers).",
+                },
+            },
+            "required": ["files", "message"],
+        },
+    },
 ]
 
 
@@ -137,6 +159,40 @@ def handle_result(project_id: str) -> str:
 
 def handle_cancel(project_id: str) -> str:
     return run_cli(["cancel", project_id], timeout=30)
+
+
+def run_git(args: list, timeout: int = 60, input_text: str | None = None) -> str:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            input=input_text,
+        )
+    except subprocess.TimeoutExpired:
+        return f"ERROR: git {' '.join(args[:2])} timed out after {timeout}s"
+    except FileNotFoundError:
+        return "ERROR: `git` not found on PATH"
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        out += f"\n(git exited {r.returncode})"
+    return out
+
+
+def handle_git_commit(files: list, message: str) -> str:
+    if not files:
+        return "ERROR: no files to commit"
+    for f in files:
+        # reject absolute paths and paths escaping repo root
+        p = (REPO_ROOT / f).resolve()
+        try:
+            p.relative_to(REPO_ROOT)
+        except ValueError:
+            return f"ERROR: refusing file outside repo root: {f}"
+    add_out = run_git(["add", "--", *files])
+    commit_out = run_git(["commit", "-F", "-"], input_text=message)
+    return f"--- git add ---\n{add_out}\n--- git commit ---\n{commit_out}"
 
 
 def respond(msg_id, result=None, error=None) -> None:
@@ -184,6 +240,8 @@ def process(msg: dict) -> None:
                 text = handle_result(args["project_id"])
             elif name == "cancel":
                 text = handle_cancel(args["project_id"])
+            elif name == "git_commit":
+                text = handle_git_commit(args["files"], args["message"])
             else:
                 respond(msg_id, error={"code": -32601, "message": f"Unknown tool: {name}"})
                 return
