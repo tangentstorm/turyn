@@ -404,6 +404,7 @@ pub(crate) struct PhaseBContext {
 /// adapters update the same counters. Each field is an `Arc` so it
 /// can be cheaply cloned into each worker thread.
 pub(crate) struct PipelineMetrics {
+    // Shared
     pub(crate) flow_bnd_sum_fail: Arc<std::sync::atomic::AtomicU64>,
     /// Per-stage enter counters, indexed 0..4 (Boundary/SolveW/SolveZ/SolveXY).
     pub(crate) stage_enter: Vec<Arc<std::sync::atomic::AtomicU64>>,
@@ -411,6 +412,17 @@ pub(crate) struct PipelineMetrics {
     /// Tracks how many Boundary items are pending in the queue or
     /// mid-processing; decremented when the Boundary stage starts.
     pub(crate) pending_boundaries: Arc<std::sync::atomic::AtomicU64>,
+
+    // SolveW stage
+    pub(crate) flow_w_unsat: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_solutions: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_spec_fail: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_spec_pass: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_solves: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_decisions: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_propagations: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_root_forced: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_free_sum: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Boundary (stage 0) handler body, callable from both the legacy
@@ -514,6 +526,241 @@ pub(crate) fn process_boundary(
     }
     metrics.stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
     vec![work]
+}
+
+/// SolveW (stage 1) handler body, callable from both the legacy
+/// worker loop (`run_mdd_sat_search`) and the framework
+/// `SolveWStage` adapter. Returns the `SolveZ` follow-up items
+/// produced by enumerating W middles that pass the spectral filter.
+///
+/// Per-worker scratch is passed in as `&mut`: `w_bases` is the
+/// HashMap caching SAT-base solvers across calls, `spectral_w` and
+/// `fft_buf_w` back the FFT spectral check, and `rng` is the
+/// worker's xorshift state (also advanced here so the branching
+/// phase decisions differ across retries).
+///
+/// Side effects on `metrics`:
+/// - `flow_w_solutions` +1 per solver hit,
+/// - `flow_w_spec_fail` / `flow_w_spec_pass` +1 per FFT verdict,
+/// - `flow_w_unsat` +1 if no W passed at all,
+/// - `flow_w_solves`, `flow_w_decisions`, `flow_w_propagations`,
+///   `flow_w_root_forced`, `flow_w_free_sum` aggregated over the
+///   SAT path,
+/// - `stage_enter[2]` +1 per emitted SolveZ,
+/// - `stage_exit[1]` +1 on return.
+pub(crate) fn process_solve_w(
+    sw: SolveWWork,
+    ctx: &PhaseBContext,
+    metrics: &PipelineMetrics,
+    w_bases: &mut HashMap<i32, radical::Solver>,
+    spectral_w: &SpectralFilter,
+    fft_buf_w: &mut FftScratch,
+    rng: &mut u64,
+) -> Vec<PipelineWork> {
+    let k = ctx.k;
+    let m = ctx.problem.m();
+    let trace_w = sw.z_bits == 43 && sw.w_bits == 47 && sw.tuple.z == 8 && sw.tuple.w == 1;
+    if trace_w {
+        eprintln!("TRACE: SolveW for target boundary, |σ_W|={}", sw.tuple.w);
+    }
+    let (w_prefix, w_suffix) = expand_boundary_bits(sw.w_bits, k);
+    let mut w_boundary = vec![0i8; m];
+    w_boundary[..k].copy_from_slice(&w_prefix);
+    w_boundary[m - k..].copy_from_slice(&w_suffix);
+
+    // BDKR rule (v) boundary pre-filter. Skip this SolveW if the W
+    // boundary already fails rule (v). Legacy `continue` skipped
+    // the stage_exit[1] bump; preserved here for exact parity.
+    let rule_v_state = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
+    if rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary {
+        return Vec::new();
+    }
+
+    // Compute V_w = union over `sw.candidate_tuples` of
+    // {cnt(+|σ_W|), cnt(-|σ_W|)}. One SAT call per boundary finds
+    // any W middle landing on any valid σ_W — the decoded count
+    // then narrows the tuple list for SolveZ.
+    let w_bnd_sum_local: i32 = w_boundary.iter().map(|&v| v as i32).sum();
+    let w_counts: Vec<u32> = {
+        let mut cs: Vec<u32> = Vec::new();
+        for t in &sw.candidate_tuples {
+            let abs_w = t.w.abs();
+            let signs: &[i32] = if abs_w == 0 { &[0] } else { &[1, -1] };
+            for &sg in signs {
+                if let Some(c) = crate::spectrum::sigma_full_to_cnt(sg * abs_w, w_bnd_sum_local, ctx.middle_m) {
+                    if !cs.contains(&c) {
+                        cs.push(c);
+                    }
+                }
+            }
+        }
+        cs.sort_unstable();
+        cs
+    };
+    if w_counts.is_empty() {
+        metrics.stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
+        return Vec::new();
+    }
+
+    // For small middle: brute-force W enumeration (proven to find
+    // solutions). For large middle: SAT-based W generation.
+    let mut w_found_any = false;
+    let mut trace_w_total = 0u64;
+    let mut trace_w_pass = 0u64;
+    let mut out_batch: Vec<PipelineWork> = Vec::new();
+    if ctx.middle_m <= 20 {
+        let mut spec_buf: Vec<f64> = Vec::new();
+        for &cnt in &w_counts {
+            let mid_sum_iter = 2 * cnt as i32 - ctx.middle_m as i32;
+            crate::enumerate::generate_sequences_permuted(ctx.middle_m, mid_sum_iter, false, false, 200_000, |w_mid| {
+                if ctx.found.load(AtomicOrdering::Relaxed) { return false; }
+                if !ctx.outfix_w_mid_pins.is_empty() {
+                    let pin_ok = ctx.outfix_w_mid_pins.iter()
+                        .all(|&(mid, val)| mid >= ctx.middle_m || w_mid[mid] == val);
+                    if !pin_ok { return true; }
+                }
+                let mut w_vals = w_boundary.clone();
+                w_vals[k..k + ctx.middle_m].copy_from_slice(w_mid);
+                metrics.flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
+                if trace_w { trace_w_total += 1; }
+                if sat_z_middle::check_w_boundary_rule_v(m, m, &w_vals)
+                    == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
+                {
+                    return true;
+                }
+                if crate::spectrum::spectrum_into_if_ok(&w_vals, spectral_w, ctx.individual_bound, fft_buf_w, &mut spec_buf) {
+                    if trace_w { trace_w_pass += 1; }
+                    metrics.flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
+                    w_found_any = true;
+                    let sigma_w_full: i32 = w_vals.iter().map(|&v| v as i32).sum();
+                    let narrowed: Vec<SumTuple> = sw.candidate_tuples.iter()
+                        .copied()
+                        .filter(|t| t.w.abs() == sigma_w_full.abs())
+                        .collect();
+                    if narrowed.is_empty() { return true; }
+                    metrics.stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
+                    let rep = narrowed[0];
+                    out_batch.push(PipelineWork::SolveZ(SolveZWork {
+                        tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
+                        w_vals, w_spectrum: spec_buf.clone(), xy_root: sw.xy_root,
+                        candidate_tuples: narrowed,
+                    }));
+                } else {
+                    metrics.flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                true
+            });
+        }
+    } else {
+        // SAT-based W generation.
+        let mut w_solver = w_bases.remove(&0i32).unwrap_or_else(||
+            ctx.w_tmpl.build_base_solver_pb_set(ctx.middle_m, &w_counts)
+        );
+        let w_cp = w_solver.save_checkpoint();
+        sat_z_middle::fill_w_solver(&mut w_solver, &ctx.w_tmpl, m, &w_boundary);
+        if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
+            let mut nv = (w_solver.num_vars() + 1) as i32;
+            sat_z_middle::add_rule_v_middle_clauses(
+                &mut w_solver, m, k, &w_boundary,
+                |pf| (pf - k + 1) as i32,
+                &mut nv,
+            );
+        }
+        if let Some(ref wtab) = ctx.w_spectral_tables {
+            w_solver.spectral = Some(radical::SpectralConstraint::from_tables(
+                wtab, &w_boundary, ctx.individual_bound,
+            ));
+        }
+
+        for &(mid, val) in &ctx.outfix_w_mid_pins {
+            if mid < ctx.middle_m {
+                let lit = (mid + 1) as i32;
+                w_solver.add_clause([if val > 0 { lit } else { -lit }]);
+            }
+        }
+
+        let w_d0 = w_solver.num_decisions();
+        let w_p0 = w_solver.num_propagations();
+        let w_l0 = w_solver.num_level0_vars();
+        let w_nv = w_solver.num_vars();
+
+        let max_w_per_boundary: usize = std::env::var("TURYN_MAX_W_PER_BND")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+        let w_conflict_budget: u64 = std::env::var("TURYN_W_CONFL")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(5000);
+        let mut w_iter_count: usize = 0;
+        loop {
+            if ctx.found.load(AtomicOrdering::Relaxed) { break; }
+            if w_iter_count >= max_w_per_boundary { break; }
+            w_iter_count += 1;
+            let phases: Vec<bool> = (0..ctx.middle_m)
+                .map(|_| {
+                    *rng ^= *rng << 13;
+                    *rng ^= *rng >> 7;
+                    *rng ^= *rng << 17;
+                    *rng & 1 == 1
+                }).collect();
+            w_solver.set_phase(&phases);
+            if w_conflict_budget > 0 { w_solver.set_conflict_budget(w_conflict_budget); }
+            if w_solver.solve() != Some(true) { break; }
+            metrics.flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
+
+            let w_mid = extract_vals(&w_solver, |i| ctx.w_mid_vars[i], ctx.middle_m);
+            let mut w_vals = w_boundary.clone();
+            w_vals[k..k + ctx.middle_m].copy_from_slice(&w_mid);
+
+            let w_block: Vec<i32> = ctx.w_mid_vars.iter().map(|&v| {
+                if w_solver.value(v) == Some(true) { -v } else { v }
+            }).collect();
+            w_solver.reset();
+            w_solver.add_clause(w_block);
+
+            let w_spectrum = match crate::spectrum::spectrum_if_ok(&w_vals, spectral_w, ctx.individual_bound, fft_buf_w) {
+                Some(s) => s,
+                None => {
+                    metrics.flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                    continue;
+                }
+            };
+            metrics.flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
+            w_found_any = true;
+
+            let sigma_w_full: i32 = w_vals.iter().map(|&v| v as i32).sum();
+            let narrowed: Vec<SumTuple> = sw.candidate_tuples.iter()
+                .copied()
+                .filter(|t| t.w.abs() == sigma_w_full.abs())
+                .collect();
+            if narrowed.is_empty() { continue; }
+            metrics.stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
+            let rep = narrowed[0];
+            out_batch.push(PipelineWork::SolveZ(SolveZWork {
+                tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
+                w_vals, w_spectrum, xy_root: sw.xy_root,
+                candidate_tuples: narrowed,
+            }));
+        }
+
+        let w_decisions = w_solver.num_decisions().saturating_sub(w_d0);
+        let w_propagations = w_solver.num_propagations().saturating_sub(w_p0);
+        let w_pre_forced = w_l0 as u64;
+        let w_free_vars = w_nv.saturating_sub(w_l0) as u64;
+        metrics.flow_w_solves.fetch_add(1, AtomicOrdering::Relaxed);
+        metrics.flow_w_decisions.fetch_add(w_decisions, AtomicOrdering::Relaxed);
+        metrics.flow_w_propagations.fetch_add(w_propagations, AtomicOrdering::Relaxed);
+        metrics.flow_w_root_forced.fetch_add(w_pre_forced, AtomicOrdering::Relaxed);
+        metrics.flow_w_free_sum.fetch_add(w_free_vars, AtomicOrdering::Relaxed);
+
+        w_solver.spectral = None;
+        w_solver.restore_checkpoint(w_cp);
+        w_bases.insert(0i32, w_solver);
+    }
+    if !w_found_any { metrics.flow_w_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
+    if trace_w {
+        eprintln!("TRACE: SolveW done: {} W middles checked, {} passed spectral",
+            trace_w_total, trace_w_pass);
+    }
+    metrics.stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
+    out_batch
 }
 
 /// MDD pipeline search: unified priority queue with stages MDD→W→Z→XY.
@@ -993,6 +1240,15 @@ pub(crate) fn run_mdd_sat_search(
                 stage_enter: stage_enter.clone(),
                 stage_exit: stage_exit.clone(),
                 pending_boundaries: Arc::clone(&pending_boundaries),
+                flow_w_unsat: Arc::clone(&flow_w_unsat),
+                flow_w_solutions: Arc::clone(&flow_w_solutions),
+                flow_w_spec_fail: Arc::clone(&flow_w_spec_fail),
+                flow_w_spec_pass: Arc::clone(&flow_w_spec_pass),
+                flow_w_solves: Arc::clone(&flow_w_solves),
+                flow_w_decisions: Arc::clone(&flow_w_decisions),
+                flow_w_propagations: Arc::clone(&flow_w_propagations),
+                flow_w_root_forced: Arc::clone(&flow_w_root_forced),
+                flow_w_free_sum: Arc::clone(&flow_w_free_sum),
             };
 
             loop {
@@ -1009,283 +1265,18 @@ pub(crate) fn run_mdd_sat_search(
                     }
 
                     PipelineWork::SolveW(sw) => {
-                        let trace_w = sw.z_bits == 43 && sw.w_bits == 47 && sw.tuple.z == 8 && sw.tuple.w == 1;
-                        if trace_w { eprintln!("TRACE: SolveW for target boundary, |σ_W|={}", sw.tuple.w); }
-                        let (w_prefix, w_suffix) = expand_boundary_bits(sw.w_bits, k);
-                        let mut w_boundary = vec![0i8; m];
-                        w_boundary[..k].copy_from_slice(&w_prefix);
-                        w_boundary[m-k..].copy_from_slice(&w_suffix);
-
-                        // BDKR rule (v) boundary pre-filter.  Skip this
-                        // SolveW if the W boundary already fails rule (v).
-                        let rule_v_state = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
-                        if rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary {
-                            continue;
+                        let emitted = process_solve_w(
+                            sw,
+                            &ctx,
+                            &metrics,
+                            &mut w_bases,
+                            &spectral_w,
+                            &mut fft_buf_w,
+                            &mut rng,
+                        );
+                        if !emitted.is_empty() {
+                            wq.push_batch(emitted);
                         }
-
-                        // Compute V_w = union over `sw.candidate_tuples` of
-                        // {cnt(+|σ_W|), cnt(-|σ_W|)}.  One SAT call per
-                        // boundary finds any W middle landing on any valid
-                        // σ_W — the decoded count then narrows the tuple
-                        // list for SolveZ.
-                        let w_bnd_sum_local: i32 = w_boundary.iter().map(|&v| v as i32).sum();
-                        let w_counts: Vec<u32> = {
-                            let mut cs: Vec<u32> = Vec::new();
-                            for t in &sw.candidate_tuples {
-                                let abs_w = t.w.abs();
-                                let signs: &[i32] = if abs_w == 0 { &[0] } else { &[1, -1] };
-                                for &sg in signs {
-                                    if let Some(c) = sigma_full_to_cnt(sg * abs_w, w_bnd_sum_local, ctx.middle_m) {
-                                        if !cs.contains(&c) { cs.push(c); }
-                                    }
-                                }
-                            }
-                            cs.sort_unstable();
-                            cs
-                        };
-                        if w_counts.is_empty() {
-                            stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
-                            continue;
-                        }
-
-                        // For small middle: brute-force W enumeration (proven to find solutions).
-                        // For large middle: SAT-based W generation (handles big search spaces).
-                        let mut w_found_any = false;
-                        let mut trace_w_total = 0u64;
-                        let mut trace_w_pass = 0u64;
-                        if ctx.middle_m <= 20 {
-                            // Collect all passing W candidates into a batch so we push
-                            // them to the queue with a single lock. This eliminates
-                            // per-W mutex contention when middle_m is small and many
-                            // W candidates pass the spectral filter.
-                            let mut batch: Vec<PipelineWork> = Vec::new();
-                            // Reusable spectrum buffer; we only materialize an
-                            // owned Vec at push time, so failed candidates (~85%)
-                            // never allocate a Vec<f64>.
-                            let mut spec_buf: Vec<f64> = Vec::new();
-                            // Iterate each count in V_w (one per feasible sign of σ_W).
-                            // generate_sequences_permuted takes a signed mid_sum
-                            // target — decode it from the count as 2·cnt − middle_m.
-                            for &cnt in &w_counts {
-                              let mid_sum_iter = 2 * cnt as i32 - ctx.middle_m as i32;
-                              generate_sequences_permuted(ctx.middle_m, mid_sum_iter, false, false, 200_000, |w_mid| {
-                                if ctx.found.load(AtomicOrdering::Relaxed) { return false; }
-                                // --outfix middle pins: skip W middles that
-                                // disagree with the user-specified pin.
-                                // Without this filter the outfix boundary is
-                                // honoured but the middle is free, so the
-                                // pipeline enumerates many W completions that
-                                // differ from the one the user wanted to test.
-                                if !ctx.outfix_w_mid_pins.is_empty() {
-                                    let pin_ok = ctx.outfix_w_mid_pins.iter()
-                                        .all(|&(mid, val)| mid >= ctx.middle_m || w_mid[mid] == val);
-                                    if !pin_ok { return true; }
-                                }
-                                let mut w_vals = w_boundary.clone();
-                                w_vals[k..k+ctx.middle_m].copy_from_slice(w_mid);
-                                flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
-                                if trace_w { trace_w_total += 1; }
-                                // BDKR rule (v): check the full W sequence.
-                                // `check_w_boundary_rule_v` works for any
-                                // prefix extent; using the full m here
-                                // catches violations in the middle too.
-                                if sat_z_middle::check_w_boundary_rule_v(m, m, &w_vals)
-                                    == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
-                                {
-                                    return true; // skip non-canonical w_mid
-                                }
-                                if spectrum_into_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w, &mut spec_buf) {
-                                    if trace_w { trace_w_pass += 1; }
-                                    flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
-                                    w_found_any = true;
-                                    // Decode σ_W and narrow the tuple list.
-                                    let sigma_w_full: i32 = w_vals.iter().map(|&v| v as i32).sum();
-                                    let narrowed: Vec<SumTuple> = sw.candidate_tuples.iter()
-                                        .copied()
-                                        .filter(|t| t.w.abs() == sigma_w_full.abs())
-                                        .collect();
-                                    if narrowed.is_empty() { return true; }
-                                    stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
-                                    let rep = narrowed[0];
-                                    batch.push(PipelineWork::SolveZ(SolveZWork {
-                                        tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
-                                        w_vals, w_spectrum: spec_buf.clone(), xy_root: sw.xy_root,
-                                        candidate_tuples: narrowed,
-                                    }));
-                                } else {
-                                    flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                                }
-                                true
-                              });
-                            } // end for &cnt
-                            if !batch.is_empty() {
-                                wq.push_batch(batch);
-                            }
-                        } else {
-                            // SAT-based W generation.  Build with a PbSetEq
-                            // so the SAT may pick any count in V_w (i.e.,
-                            // either sign of σ_W).  Cache key is 0 — we
-                            // don't reuse the solver across boundaries
-                            // because V_w depends on the boundary.
-                            let mut w_solver = w_bases.remove(&0i32).unwrap_or_else(||
-                                ctx.w_tmpl.build_base_solver_pb_set(ctx.middle_m, &w_counts)
-                            );
-                            let w_cp = w_solver.save_checkpoint();
-                            sat_z_middle::fill_w_solver(&mut w_solver, &ctx.w_tmpl, m, &w_boundary);
-                            // Rule (v) middle clauses when boundary left
-                            // the rule DeferredToMiddle.
-                            if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
-                                let mut nv = (w_solver.num_vars() + 1) as i32;
-                                sat_z_middle::add_rule_v_middle_clauses(
-                                    &mut w_solver, m, k, &w_boundary,
-                                    |pf| (pf - k + 1) as i32,
-                                    &mut nv,
-                                );
-                            }
-                            if let Some(ref wtab) = ctx.w_spectral_tables {
-                                w_solver.spectral = Some(radical::SpectralConstraint::from_tables(
-                                    wtab, &w_boundary, ctx.individual_bound,
-                                ));
-                            }
-
-                            // --outfix middle pins for W: force middle
-                            // positions to user-specified values.  Matches
-                            // the brute-force path above.
-                            for &(mid, val) in &ctx.outfix_w_mid_pins {
-                                if mid < ctx.middle_m {
-                                    let lit = (mid + 1) as i32;
-                                    w_solver.add_clause([if val > 0 { lit } else { -lit }]);
-                                }
-                            }
-
-                            // Snapshot solver search stats before the enumeration
-                            // loop. We diff against post-loop values to get this
-                            // boundary's contribution to the W-stage diagnostics
-                            // (decisions, propagations, level-0 forced, free vars).
-                            let w_d0 = w_solver.num_decisions();
-                            let w_p0 = w_solver.num_propagations();
-                            let w_l0 = w_solver.num_level0_vars();
-                            let w_nv = w_solver.num_vars();
-
-                            // Collect passing W candidates into a batch to reduce
-                            // queue lock contention, same as the brute-force path above.
-                            let mut batch: Vec<PipelineWork> = Vec::new();
-                            // N1: cap W enumeration per boundary.  At large
-                            // middle_m the SAT path can loop for thousands
-                            // of solutions per boundary (each with a long
-                            // UNSAT proof between finds), monopolising a
-                            // worker for seconds.  A small cap lets workers
-                            // move on to fresh boundaries — each capped
-                            // boundary still feeds the Z stage dozens of
-                            // (Z, W) pairs, which is plenty.  Matches the
-                            // spirit of `max_z.min(16)` at line 518.
-                            let max_w_per_boundary: usize = std::env::var("TURYN_MAX_W_PER_BND")
-                                .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
-                            // N2: per-call conflict budget so one pathological
-                            // solve() can't freeze a worker past sat_secs and
-                            // can't monopolise the attention past what's
-                            // useful.  5k matches the XY pattern for n > 30.
-                            let w_conflict_budget: u64 = std::env::var("TURYN_W_CONFL")
-                                .ok().and_then(|s| s.parse().ok()).unwrap_or(5000);
-                            let mut w_iter_count: usize = 0;
-                            loop {
-                                if ctx.found.load(AtomicOrdering::Relaxed) { break; }
-                                if w_iter_count >= max_w_per_boundary { break; }
-                                w_iter_count += 1;
-                                let phases: Vec<bool> = (0..ctx.middle_m)
-                                    .map(|_| next_rng!() & 1 == 1).collect();
-                                w_solver.set_phase(&phases);
-                                if w_conflict_budget > 0 { w_solver.set_conflict_budget(w_conflict_budget); }
-                                if w_solver.solve() != Some(true) { break; }
-                                flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
-
-                                let w_mid = extract_vals(&w_solver, |i| ctx.w_mid_vars[i], ctx.middle_m);
-                                let mut w_vals = w_boundary.clone();
-                                w_vals[k..k+ctx.middle_m].copy_from_slice(&w_mid);
-
-                                let w_block: Vec<i32> = ctx.w_mid_vars.iter().map(|&v| {
-                                    if w_solver.value(v) == Some(true) { -v } else { v }
-                                }).collect();
-                                w_solver.reset(); // backtrack before blocking clause
-                                w_solver.add_clause(w_block);
-
-                                let w_spectrum = match spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) {
-                                    Some(s) => s,
-                                    None => {
-                                        flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                                        if std::env::var("TRACE_SPEC").is_ok() && flow_w_spec_fail.load(AtomicOrdering::Relaxed) <= 3 {
-                                            // Direct re-compute both: in-SAT-style DFT on the full W
-                                            // and external FFT, report peak |W|² at aligned ω.
-                                            let mut external = vec![0.0; 129];
-                                            compute_spectrum_into(&w_vals, &spectral_w, &mut fft_buf_w, &mut external);
-                                            use std::f64::consts::PI;
-                                            let mut insat = vec![0.0; 129];
-                                            for fi in 0..129 {
-                                                let om = fi as f64 * PI / 128.0;
-                                                let mut re = 0.0; let mut im = 0.0;
-                                                for (pos, &wv) in w_vals.iter().enumerate() {
-                                                    re += wv as f64 * (om * pos as f64).cos();
-                                                    im += wv as f64 * (om * pos as f64).sin();
-                                                }
-                                                insat[fi] = re*re + im*im;
-                                            }
-                                            let max_ext = external.iter().cloned().fold(0.0, f64::max);
-                                            let max_ins = insat.iter().cloned().fold(0.0, f64::max);
-                                            let ext_violating: Vec<usize> = (0..129).filter(|&i| external[i] > ctx.individual_bound).collect();
-                                            eprintln!("[TRACE_SPEC] W failed: {} chars, max_ext={:.4}, max_insat={:.4}, bound={:.1}",
-                                                w_vals.iter().map(|&v| if v>0 {'+'} else {'-'}).collect::<String>(),
-                                                max_ext, max_ins, ctx.individual_bound);
-                                            eprintln!("  external violates at bins: {:?}", ext_violating);
-                                            for &fi in ext_violating.iter().take(3) {
-                                                eprintln!("  bin {fi} (ω={:.4}π): external={:.4}, in-SAT-style={:.4}",
-                                                    fi as f64 / 128.0, external[fi], insat[fi]);
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                };
-                                flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
-                                w_found_any = true;
-
-                                let sigma_w_full: i32 = w_vals.iter().map(|&v| v as i32).sum();
-                                let narrowed: Vec<SumTuple> = sw.candidate_tuples.iter()
-                                    .copied()
-                                    .filter(|t| t.w.abs() == sigma_w_full.abs())
-                                    .collect();
-                                if narrowed.is_empty() { continue; }
-                                stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
-                                let rep = narrowed[0];
-                                batch.push(PipelineWork::SolveZ(SolveZWork {
-                                    tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
-                                    w_vals, w_spectrum, xy_root: sw.xy_root,
-                                    candidate_tuples: narrowed,
-                                }));
-                            }
-                            if !batch.is_empty() {
-                                wq.push_batch(batch);
-                            }
-
-                            // Aggregate W-stage SAT search stats for this boundary.
-                            // Record level-0 forced count from the pre-solve snapshot
-                            // (constraint propagation pruning) — this is what gets
-                            // displayed as "vars forced before SAT runs".
-                            let w_decisions    = w_solver.num_decisions().saturating_sub(w_d0);
-                            let w_propagations = w_solver.num_propagations().saturating_sub(w_p0);
-                            let w_pre_forced   = w_l0 as u64;
-                            let w_free_vars    = w_nv.saturating_sub(w_l0) as u64;
-                            flow_w_solves.fetch_add(1, AtomicOrdering::Relaxed);
-                            flow_w_decisions.fetch_add(w_decisions, AtomicOrdering::Relaxed);
-                            flow_w_propagations.fetch_add(w_propagations, AtomicOrdering::Relaxed);
-                            flow_w_root_forced.fetch_add(w_pre_forced, AtomicOrdering::Relaxed);
-                            flow_w_free_sum.fetch_add(w_free_vars, AtomicOrdering::Relaxed);
-
-                            w_solver.spectral = None;
-                            w_solver.restore_checkpoint(w_cp);
-                            w_bases.insert(0i32, w_solver);
-                        }
-                        if !w_found_any { flow_w_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
-                        if trace_w { eprintln!("TRACE: SolveW done: {} W middles checked, {} passed spectral", trace_w_total, trace_w_pass); }
-                        stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
                     }
 
                     PipelineWork::SolveWZ(swz) => {
