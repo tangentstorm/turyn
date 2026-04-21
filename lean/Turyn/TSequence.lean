@@ -352,19 +352,52 @@ lemma aperiodicAutocorr_prepend_zeros (a : List Int) (k s : Nat) :
           List.getD_append_right _ _ _ _ (by rw [zeroSeq_length]; omega),
           zeroSeq_length, show k + i + s - k = i + s from by omega]
 
+/-- Pointwise identity: for ±1 values u, v, u', v',
+    2 * ((u+v)/2 * ((u'+v')/2) + (u-v)/2 * ((u'-v')/2)) = u*u' + v*v'. -/
+private lemma pointwise_half_sq (u v u' v' : Int)
+    (hu : u = 1 ∨ u = -1) (hv : v = 1 ∨ v = -1)
+    (hu' : u' = 1 ∨ u' = -1) (hv' : v' = 1 ∨ v' = -1) :
+    2 * ((u + v) / 2 * ((u' + v') / 2) + (u - v) / 2 * ((u' - v') / 2)) =
+    u * u' + v * v' := by
+  rcases hu with rfl | rfl <;> rcases hv with rfl | rfl <;>
+    rcases hu' with rfl | rfl <;> rcases hv' with rfl | rfl <;> norm_num
+
+/-- For a ±1 list, `getD i 0` is ±1 when `i < length`. -/
+private lemma allPmOne_getD (a : List Int) (ha : AllPmOne a) (i : Nat) (hi : i < a.length) :
+    a.getD i 0 = 1 ∨ a.getD i 0 = -1 := by
+  rw [List.getD_eq_getElem _ _ hi]
+  exact ha _ (List.getElem_mem hi)
+
 /-- Half-sum/half-difference autocorrelation identity for ±1 sequences. -/
 lemma sumHalf_diffHalf_autocorr (a b : List Int) (s : Nat)
     (hab : a.length = b.length) (ha : AllPmOne a) (hb : AllPmOne b) :
     2 * (aperiodicAutocorr (seqSumHalf a b) s +
          aperiodicAutocorr (seqDiffHalf a b) s) =
     aperiodicAutocorr a s + aperiodicAutocorr b s := by
-  unfold aperiodicAutocorr;
-  split_ifs <;> simp_all +decide [ seqSumHalf, seqDiffHalf ];
-  rw [ ← Finset.sum_add_distrib, ← Finset.sum_add_distrib ];
-  rw [ Finset.mul_sum _ _ _ ];
-  refine' Finset.sum_congr rfl fun i hi => _;
-  by_cases hi' : i < a.length <;> by_cases hi'' : i + s < a.length <;> simp_all +decide;
-  have := ha ( a[i] ) ( by simp ) ; have := hb ( b[i] ) ( by simp ) ; have := ha ( a[i + s] ) ( by simp ) ; have := hb ( b[i + s] ) ( by simp ) ; aesop
+  have hSlen : (seqSumHalf a b).length = a.length := by
+    simp only [seqSumHalf, List.length_zipWith, hab, Nat.min_self]
+  have hDlen : (seqDiffHalf a b).length = a.length := by
+    simp only [seqDiffHalf, List.length_zipWith, hab, Nat.min_self]
+  unfold aperiodicAutocorr
+  by_cases hs : s ≥ a.length
+  · rw [if_pos (by omega), if_pos (by omega), if_pos hs, if_pos (by omega)]
+    norm_num
+  · push_neg at hs
+    rw [if_neg (by omega), if_neg (by omega), if_neg (by omega), if_neg (by omega),
+        hSlen, hDlen, ← hab, ← Finset.sum_add_distrib, Finset.mul_sum,
+        ← Finset.sum_add_distrib]
+    apply Finset.sum_congr rfl
+    intro i hi
+    rw [Finset.mem_range] at hi
+    have hi_lt : i < a.length := by omega
+    have his_lt : i + s < a.length := by omega
+    rw [seqSumHalf_getD hab hi_lt, seqSumHalf_getD hab his_lt,
+        seqDiffHalf_getD hab hi_lt, seqDiffHalf_getD hab his_lt]
+    exact pointwise_half_sq _ _ _ _
+      (allPmOne_getD a ha i hi_lt)
+      (allPmOne_getD b hb i (by omega))
+      (allPmOne_getD a ha (i + s) his_lt)
+      (allPmOne_getD b hb (i + s) (by omega))
 
 /-- Length of seqSumHalf. -/
 @[simp] lemma seqSumHalf_length (a b : List Int) :
