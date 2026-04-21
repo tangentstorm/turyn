@@ -284,6 +284,23 @@ def TurynTypeSeq.doAltAll {n : Nat} (S : TurynTypeSeq n) : TurynTypeSeq n :=
 def TurynTypeSeq.doSwap {n : Nat} (S : TurynTypeSeq n) : TurynTypeSeq n :=
   ⟨S.B, S.A, S.C, S.D, turynProp_swapAB S.isTuryn⟩
 
+/-! ### Bridge to typed TurynType -/
+
+/-- Convert a `TurynTypeSeq` to the typed `TurynType` wrapper. -/
+def TurynTypeSeq.toTyped {n : Nat} (S : TurynTypeSeq n) : TurynType n := S.isTuryn.toTyped
+
+@[simp] lemma TurynTypeSeq.toTyped_x_data {n : Nat} (S : TurynTypeSeq n) :
+    (S.toTyped).x.data = S.A := rfl
+
+@[simp] lemma TurynTypeSeq.toTyped_y_data {n : Nat} (S : TurynTypeSeq n) :
+    (S.toTyped).y.data = S.B := rfl
+
+@[simp] lemma TurynTypeSeq.toTyped_z_data {n : Nat} (S : TurynTypeSeq n) :
+    (S.toTyped).z.data = S.C := rfl
+
+@[simp] lemma TurynTypeSeq.toTyped_w_data {n : Nat} (S : TurynTypeSeq n) :
+    (S.toTyped).w.data = S.D := rfl
+
 /-! ### Elementary transformations -/
 
 /-- Elementary transformations between Turyn-type sequences.
