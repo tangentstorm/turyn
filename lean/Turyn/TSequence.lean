@@ -256,20 +256,57 @@ lemma periodic_eq_aperiodic_sum (a : List Int) (s : Nat) (hs : 0 < s) (hsm : s <
       exact Nat.mod_eq_of_lt (by omega)]
     ring_nf
 
+/-- Accessing `a ++ zeroSeq k` via `getD` always agrees with accessing `a`. -/
+private lemma getD_append_zeroSeq (a : List Int) (k i : Nat) :
+    (a ++ zeroSeq k).getD i 0 = a.getD i 0 := by
+  by_cases hi : i < a.length
+  · rw [List.getD_append _ _ _ _ hi]
+  · push_neg at hi
+    rw [List.getD_eq_default a 0 hi]
+    rw [List.getD_append_right _ _ _ _ hi]
+    rw [zeroSeq_getD]
+
 /-- Appending zeros does not change the aperiodic autocorrelation. -/
 lemma aperiodicAutocorr_append_zeros (a : List Int) (k s : Nat) :
     aperiodicAutocorr (a ++ zeroSeq k) s = aperiodicAutocorr a s := by
-  unfold aperiodicAutocorr;
-  split_ifs <;> simp_all +decide;
-  · linarith;
-  · rw [ Finset.sum_eq_zero ] ; intros ; simp_all +decide [ List.getElem?_append, zeroSeq ];
-    grind +revert;
-  · rw [ ← Finset.sum_range_add_sum_Ico _ ( show a.length - s ≤ a.length + k - s from by omega ) ];
-    simp +decide [ List.getElem?_append, zeroSeq ];
-    rw [ Finset.sum_congr rfl fun x hx => by rw [ if_pos ( by linarith [ Finset.mem_range.mp hx, Nat.sub_add_cancel ( by linarith : s ≤ a.length ) ] ), if_pos ( by linarith [ Finset.mem_range.mp hx, Nat.sub_add_cancel ( by linarith : s ≤ a.length ) ] ) ] ];
-    simp +zetaDelta at *;
-    refine' Finset.sum_eq_zero fun x hx => _;
-    grind +revert
+  unfold aperiodicAutocorr
+  simp only [List.length_append, zeroSeq_length]
+  by_cases hs : s ≥ a.length
+  · -- RHS: if_pos
+    rw [if_pos hs]
+    by_cases hsk : s ≥ a.length + k
+    · -- LHS: if_pos
+      rw [if_pos hsk]
+    · -- LHS: if_neg, but every term is 0 since i + s ≥ a.length
+      push_neg at hsk
+      rw [if_neg (by omega)]
+      apply Finset.sum_eq_zero
+      intro i hi
+      rw [getD_append_zeroSeq, getD_append_zeroSeq]
+      have : a.getD (i + s) 0 = 0 :=
+        List.getD_eq_default a 0 (by rw [Finset.mem_range] at hi; omega)
+      rw [this, mul_zero]
+  · -- Both sides compute sums
+    push_neg at hs
+    rw [if_neg (by omega), if_neg (by omega)]
+    -- Split LHS sum: range (a.length + k - s) = range (a.length - s) ∪ Ico ...
+    rw [← Finset.sum_range_add_sum_Ico _ (show a.length - s ≤ a.length + k - s by omega)]
+    -- First part: terms agree with RHS
+    have h_agree : ∀ i ∈ Finset.range (a.length - s),
+        (a ++ zeroSeq k).getD i 0 * (a ++ zeroSeq k).getD (i + s) 0 =
+        a.getD i 0 * a.getD (i + s) 0 := by
+      intro i _
+      rw [getD_append_zeroSeq, getD_append_zeroSeq]
+    -- Second part: each term is 0 since i + s ≥ a.length
+    have h_zero : ∀ i ∈ Finset.Ico (a.length - s) (a.length + k - s),
+        (a ++ zeroSeq k).getD i 0 * (a ++ zeroSeq k).getD (i + s) 0 = 0 := by
+      intro i hi
+      rw [getD_append_zeroSeq, getD_append_zeroSeq]
+      rw [Finset.mem_Ico] at hi
+      have : a.getD (i + s) 0 = 0 :=
+        List.getD_eq_default a 0 (by omega)
+      rw [this, mul_zero]
+    rw [Finset.sum_congr rfl h_agree, Finset.sum_eq_zero h_zero, add_zero]
 
 /-- Prepending zeros does not change the aperiodic autocorrelation. -/
 lemma aperiodicAutocorr_prepend_zeros (a : List Int) (k s : Nat) :
