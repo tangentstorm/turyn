@@ -186,35 +186,25 @@ pub(crate) fn load_best_mdd(max_k: usize, verbose: bool) -> Option<mdd_reorder::
 }
 
 
-/// Unified pipeline work item. Priority = stage (higher = closer to result).
+/// Items the five stage helpers (`process_boundary`,
+/// `process_solve_w`, `process_solve_wz`, `process_solve_z`,
+/// `process_solve_xy`) emit as follow-up work. The framework
+/// `MddStagesAdapter` wraps these into its own `MddPayload` and
+/// pushes them back onto `SearchEngine`'s scheduler.
+///
+/// The Boundary / SolveXY / Shutdown variants the legacy worker
+/// loop used were trimmed with the legacy removal: nothing
+/// constructs them anymore. The adapter delivers Boundary items
+/// via its `MddPayload::Boundary` seed; SolveXY items are pushed
+/// by `process_solve_z` only via the `MddPayload::SolveXY`
+/// wrapper, not via `PipelineWork::SolveXY`.
 pub(crate) enum PipelineWork {
-    /// Stage 0: Check boundary feasibility + extension filter → emit SolveW.
-    Boundary(BoundaryWork),
-    /// Stage 1: SAT-solve W given boundary + tuple. Enumerate W with blocking clauses.
+    /// Stage 1: SAT-solve W given boundary + tuple.
     SolveW(SolveWWork),
     /// Stage 1 (alt): SAT-solve W+Z simultaneously in one call.
     SolveWZ(SolveWZWork),
-    /// Stage 2: SAT-solve Z given boundary + W. Enumerate Z with blocking clauses.
+    /// Stage 2: SAT-solve Z given boundary + W.
     SolveZ(SolveZWork),
-    /// Stage 3: run the XY SAT fast path for a fully-specified (Z, W)
-    /// candidate. Cross mode's producer pushes these directly after
-    /// Phase B enumeration + spectral pair filtering.
-    SolveXY(SolveXYWork),
-    Shutdown,
-}
-
-
-impl PipelineWork {
-    pub(crate) fn stage(&self) -> u8 {
-        match self {
-            PipelineWork::Boundary(_) => 0,
-            PipelineWork::SolveW(_) => 1,
-            PipelineWork::SolveWZ(_) => 1,
-            PipelineWork::SolveZ(_) => 2,
-            PipelineWork::SolveXY(_) => 3,
-            PipelineWork::Shutdown => 255,
-        }
-    }
 }
 
 
@@ -289,53 +279,6 @@ pub(crate) struct SolveXYWork {
 }
 
 
-/// Navigate the MDD to a specific (z_bits, w_bits) boundary, returning
-/// the XY sub-root anchored at that boundary.  Returns `None` if the
-/// boundary does not exist in the MDD (pruned away during gen).
-pub(crate) fn mdd_navigate_to_outfix(
-    root: u32, zw_depth: usize, pos_order: &[usize], nodes: &[[u32; 4]],
-    z_bits: u32, w_bits: u32,
-) -> Option<u32> {
-    let mut nid = root;
-    for level in 0..zw_depth {
-        if nid == mdd_reorder::DEAD { return None; }
-        let pos = pos_order[level];
-        let z_bit = (z_bits >> pos) & 1;
-        let w_bit = (w_bits >> pos) & 1;
-        let branch = (z_bit | (w_bit << 1)) as usize;
-        if nid != mdd_reorder::LEAF {
-            nid = nodes[nid as usize][branch];
-            if nid == mdd_reorder::DEAD { return None; }
-        }
-    }
-    Some(nid)
-}
-
-
-/// Navigate the MDD along a deterministic path to reach one boundary.
-/// Returns (z_bits, w_bits, xy_root) or None if the path hits DEAD.
-pub(crate) fn mdd_navigate_path(
-    root: u32, zw_depth: usize, path: u64,
-    pos_order: &[usize], nodes: &[[u32; 4]],
-) -> Option<(u32, u32, u32)> {
-    let mut nid = root;
-    let mut z_acc = 0u32;
-    let mut w_acc = 0u32;
-    for level in 0..zw_depth {
-        if nid == mdd_reorder::DEAD { return None; }
-        let branch = ((path >> (2 * level)) & 3) as usize;
-        let pos = pos_order[level];
-        z_acc |= ((branch & 1) as u32) << pos;
-        w_acc |= (((branch >> 1) & 1) as u32) << pos;
-        if nid != mdd_reorder::LEAF {
-            nid = nodes[nid as usize][branch];
-            if nid == mdd_reorder::DEAD { return None; }
-        }
-    }
-    Some((z_acc, w_acc, nid))
-}
-
-
 /// Read-only context shared across all workers (via Arc). Populated
 /// once in `run_mdd_sat_search` before spawning workers and read-only
 /// thereafter.
@@ -357,9 +300,6 @@ pub(crate) struct PhaseBContext {
     pub(crate) pair_bound: f64,
     pub(crate) theta: usize,
     pub(crate) mdd_extend: usize,
-    /// Use the combined SolveWZ stage instead of the default SolveW →
-    /// SolveZ two-stage pipeline. Plumbed from cfg.wz_together.
-    pub(crate) wz_together: bool,
     /// Optional XY product-law conjecture (`U_i = -U_{n+1-i}` for
     /// 2 <= i <= n-1, with U_i = x_i*y_i). Plumbed from
     /// cfg.conj_xy_product; only consulted by stages that build an
@@ -1948,7 +1888,6 @@ pub(crate) fn build_phase_b_context(
         pair_bound: cfg.max_spectral.unwrap_or(problem.spectral_bound()),
         theta: cfg.theta_samples,
         mdd_extend: cfg.mdd_extend,
-        wz_together: cfg.wz_together,
         conj_xy_product: cfg.conj_xy_product,
         conj_zw_bound: cfg.conj_zw_bound,
         xy_mdd_mode: std::env::var("XY_MDD").ok().as_deref() == Some("1"),

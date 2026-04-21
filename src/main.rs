@@ -670,25 +670,6 @@ fn parse_seq(s: &str) -> PackedSeq {
     PackedSeq::from_values(&vals)
 }
 
-fn run_info() -> String {
-    let hostname = std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let git_hash = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    format!("host={}, commit={}", hostname, git_hash)
-}
-
 fn list_known_solutions(n_filter: Option<usize>) {
     let text = match std::fs::read_to_string("known_solutions.txt") {
         Ok(t) => t,

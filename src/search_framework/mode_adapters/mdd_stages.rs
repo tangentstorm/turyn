@@ -66,13 +66,15 @@ impl MddPayload {
 }
 
 fn from_pipeline_work(work: PipelineWork) -> Option<MddPayload> {
+    // The five stage helpers only emit SolveW / SolveWZ / SolveZ
+    // as pipeline follow-ups today. Boundary items enter the queue
+    // via the adapter's seed, and SolveXY items are pushed directly
+    // inside `process_solve_z` without routing through
+    // `PipelineWork` (see comment on that helper).
     match work {
-        PipelineWork::Boundary(b) => Some(MddPayload::Boundary(b)),
         PipelineWork::SolveW(w) => Some(MddPayload::SolveW(w)),
         PipelineWork::SolveWZ(wz) => Some(MddPayload::SolveWZ(wz)),
         PipelineWork::SolveZ(z) => Some(MddPayload::SolveZ(z)),
-        PipelineWork::SolveXY(xy) => Some(MddPayload::SolveXY(xy)),
-        PipelineWork::Shutdown => None,
     }
 }
 
