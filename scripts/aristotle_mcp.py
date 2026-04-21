@@ -149,6 +149,8 @@ def run_cli(args: list, cwd=None, timeout: int = 300) -> str:
             ["aristotle", *args],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             cwd=cwd,
             timeout=timeout,
         )
@@ -192,6 +194,8 @@ def run_git(args: list, timeout: int = 60, input_text: str | None = None) -> str
             ["git", "-C", str(REPO_ROOT), *args],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             input=input_text,
         )
@@ -225,6 +229,8 @@ def handle_diff_result(project_id: str, path: str) -> str:
             ["diff", "-u", str(working_file), str(tarball_file)],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
         )
     except FileNotFoundError:
