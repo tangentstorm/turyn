@@ -22,9 +22,8 @@ use std::sync::{Arc, Mutex};
 use crate::config::SearchConfig;
 use crate::mdd_pipeline::{
     build_phase_b_context, enumerate_live_boundaries, new_pipeline_metrics, process_boundary,
-    process_solve_w, process_solve_wz, process_solve_xy, process_solve_z, BoundaryWork,
-    PhaseBContext, PipelineMetrics, PipelineWork, SolveWWork, SolveWZWork, SolveXYWork,
-    SolveZWork, ZStageScratch,
+    process_solve_w, process_solve_wz, process_solve_z, BoundaryWork, PhaseBContext,
+    PipelineMetrics, PipelineWork, SolveWWork, SolveWZWork, SolveZWork, ZStageScratch,
 };
 use crate::search_framework::engine::{AdapterInit, SearchModeAdapter};
 use crate::search_framework::mass::{CoverageQuality, MassValue, SearchMassModel};
@@ -40,17 +39,16 @@ pub const STAGE_BOUNDARY: StageId = "mdd.boundary";
 pub const STAGE_SOLVE_W: StageId = "mdd.solve_w";
 pub const STAGE_SOLVE_WZ: StageId = "mdd.solve_wz";
 pub const STAGE_SOLVE_Z: StageId = "mdd.solve_z";
-pub const STAGE_SOLVE_XY: StageId = "mdd.solve_xy";
 
 /// Payload discriminator for the framework `WorkItem<MddPayload>`.
-/// Mirrors `PipelineWork` (minus the internal `Shutdown`) so each
-/// stage handler can pull out its expected variant.
+/// One variant per scheduled stage. SolveXY is not scheduled via
+/// the queue — `process_solve_z` fires XY solves inline per
+/// `(Z, W)` pair — so there is no `SolveXY` variant here.
 pub enum MddPayload {
     Boundary(BoundaryWork),
     SolveW(SolveWWork),
     SolveWZ(SolveWZWork),
     SolveZ(SolveZWork),
-    SolveXY(SolveXYWork),
 }
 
 impl MddPayload {
@@ -60,7 +58,6 @@ impl MddPayload {
             MddPayload::SolveW(_) => STAGE_SOLVE_W,
             MddPayload::SolveWZ(_) => STAGE_SOLVE_WZ,
             MddPayload::SolveZ(_) => STAGE_SOLVE_Z,
-            MddPayload::SolveXY(_) => STAGE_SOLVE_XY,
         }
     }
 }
@@ -104,14 +101,13 @@ fn wrap_items(items: Vec<PipelineWork>, parent: &WorkItemMeta) -> Vec<WorkItem<M
 }
 
 fn default_priority_for_stage(stage: StageId) -> i32 {
-    // The legacy scheduler prioritizes later stages and high-
-    // quality gold XY candidates. Approximate: Boundary=0,
-    // SolveW/SolveWZ=1, SolveZ=2, SolveXY=3 (gold).
+    // Later stages run first: SolveZ drains before SolveW feeds
+    // more, so solutions land quickly. Boundary=0, SolveW / SolveWZ=1,
+    // SolveZ=2.
     match stage {
         STAGE_BOUNDARY => 0,
         STAGE_SOLVE_W | STAGE_SOLVE_WZ => 1,
         STAGE_SOLVE_Z => 2,
-        STAGE_SOLVE_XY => 3,
         _ => 0,
     }
 }
@@ -330,54 +326,6 @@ impl StageHandler<MddPayload> for SolveZStage {
     }
 }
 
-struct SolveXYScratch {
-    template_cache: HashMap<Vec<(i32, i32, i32, i32)>, SatXYTemplate>,
-    warm: WarmStartState,
-}
-
-pub struct SolveXYStage {
-    ctx: Arc<PhaseBContext>,
-    metrics: PipelineMetrics,
-    sat_config: Arc<radical::SolverConfig>,
-    result_tx: std::sync::mpsc::Sender<(
-        crate::types::PackedSeq,
-        crate::types::PackedSeq,
-        crate::types::PackedSeq,
-        crate::types::PackedSeq,
-    )>,
-    scratch: Mutex<SolveXYScratch>,
-}
-
-impl StageHandler<MddPayload> for SolveXYStage {
-    fn id(&self) -> StageId {
-        STAGE_SOLVE_XY
-    }
-    fn handle(
-        &self,
-        item: WorkItem<MddPayload>,
-        _ctx: &StageContext<'_>,
-    ) -> StageOutcome<MddPayload> {
-        let MddPayload::SolveXY(xy) = item.payload else {
-            return StageOutcome::default();
-        };
-        let mut guard = self.scratch.lock().unwrap();
-        let SolveXYScratch {
-            template_cache,
-            warm,
-        } = &mut *guard;
-        process_solve_xy(
-            xy,
-            &self.ctx,
-            &self.metrics,
-            template_cache,
-            warm,
-            &self.sat_config,
-            &self.result_tx,
-        );
-        StageOutcome::default()
-    }
-}
-
 /// Coverage-bits mass model for the staged MDD adapter.
 /// `total_mass = log2(live_boundaries)` — the number of bits
 /// needed to enumerate every live ZW path through the MDD.
@@ -586,22 +534,6 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                         inject_phase: true,
                     },
                     rng: 0xFEEDFACE_BAADF00D,
-                }),
-            }),
-        );
-        m.insert(
-            STAGE_SOLVE_XY,
-            Box::new(SolveXYStage {
-                ctx: Arc::clone(&self.ctx),
-                metrics: self.metrics.clone(),
-                sat_config: Arc::clone(&self.sat_config),
-                result_tx: self.result_tx.clone(),
-                scratch: Mutex::new(SolveXYScratch {
-                    template_cache: HashMap::new(),
-                    warm: WarmStartState {
-                        phase: None,
-                        inject_phase: true,
-                    },
                 }),
             }),
         );

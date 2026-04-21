@@ -676,17 +676,6 @@ impl SatXYTemplate {
         Self::build_multi(problem, std::slice::from_ref(&tuple), sat_config)
     }
 
-    /// Like `build`, but with the XY product-law conjecture toggled
-    /// by `conj_xy_product` (see `add_xy_product_law`).
-    pub(crate) fn build_opts(
-        problem: Problem,
-        tuple: SumTuple,
-        sat_config: &radical::SolverConfig,
-        conj_xy_product: bool,
-    ) -> Option<Self> {
-        Self::build_multi_opts(problem, std::slice::from_ref(&tuple), sat_config, conj_xy_product)
-    }
-
     /// Multi-tuple template: `PbSetEq` on X and Y unions the ±|σ| counts
     /// across every tuple in `tuples`.  A single solver covers every
     /// unsigned (σ_X, σ_Y) pair in the list — the SAT picks a

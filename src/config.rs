@@ -31,13 +31,10 @@ use crate::xy_sat::*;
 /// with LSB = leftmost position.
 #[derive(Clone, Debug)]
 pub(crate) struct OutfixSpec {
-    /// MDD-boundary Z bits (packed as in `expand_boundary_bits`): bits
-    /// 0..k-1 = prefix Z[0..k], bits k..2k-1 = suffix Z[n-k..n].
-    pub(crate) z_bits: u32,
-    /// Same for W.
-    pub(crate) w_bits: u32,
-    /// Optional XY pinning (same encoding as z_bits/w_bits).  When set,
-    /// the XY search is restricted to this single (x_bits, y_bits).
+    /// Optional XY pinning — packed bits: bits 0..k-1 = prefix
+    /// X[0..k], bits k..2k-1 = suffix X[n-k..n] (and same for Y).
+    /// When set, the XY search is restricted to this single
+    /// (x_bits, y_bits).
     pub(crate) xy_bits: Option<(u32, u32)>,
     /// Middle-position pins for Z: `(middle_idx, value)` where
     /// `middle_idx ∈ 0..middle_n` indexes `Z[k+middle_idx]` and `value`
@@ -242,8 +239,6 @@ pub(crate) fn parse_outfix(s: &str, n: usize, k: usize) -> Result<OutfixSpec, St
     }
 
     Ok(OutfixSpec {
-        z_bits,
-        w_bits,
         xy_bits: Some((x_bits, y_bits)),
         z_middle_pins,
         w_middle_pins,

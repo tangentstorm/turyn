@@ -228,11 +228,6 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
             cfg.sat_config.xor_propagation = true;
         } else if arg == "--no-xor" {
             cfg.sat_config.xor_propagation = false;
-        } else if arg.starts_with("--engine=") {
-            // Accepted for backward compatibility; every value
-            // routes through the same unified framework runner
-            // now. Warn so users know the flag is no-op.
-            eprintln!("warning: --engine is a no-op; all modes use the unified framework runner");
         } else if arg == "--phase-a" || arg == "--phase-b" {
             cfg.phase_only = Some(arg[2..].to_string());
         } else if let Some(v) = arg.strip_prefix("--tuple=") {

@@ -25,19 +25,6 @@ use crate::xy_sat::*;
 use crate::SPECTRAL_FREQS;
 
 
-/// A fully-specified `(Z, W)` candidate ready for the XY SAT stage.
-/// Wrapped in `SolveXYWork` and pushed onto the unified runner's gold
-/// queue by the cross-mode producer.
-pub(crate) struct SatWorkItem {
-    pub(crate) tuple: SumTuple,
-    pub(crate) z: PackedSeq,
-    pub(crate) w: PackedSeq,
-    /// Pre-computed 2·N_Z(s) + 2·N_W(s) for s in 1..n.
-    pub(crate) zw_autocorr: Vec<i32>,
-    /// Maximum spectral pair power across the realfft frequency grid.
-    /// Lower = higher priority (best candidates get solved first).
-    pub(crate) priority: f64,
-}
 
 
 pub(crate) fn compute_zw_autocorr(problem: Problem, z: &PackedSeq, w: &PackedSeq) -> Vec<i32> {
@@ -274,9 +261,6 @@ pub(crate) struct SolveZWork {
 }
 
 
-pub(crate) struct SolveXYWork {
-    pub(crate) item: SatWorkItem,
-}
 
 
 /// Read-only context shared across all workers (via Arc). Populated
@@ -369,7 +353,6 @@ pub(crate) struct PipelineMetrics {
 
     // SolveXY / cross-mode XY stage
     pub(crate) items_completed: Arc<std::sync::atomic::AtomicU64>,
-    pub(crate) xy_item_in_flight: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_z_prep_fail: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_xy_zw_bound_rej: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_xy_sat: Arc<std::sync::atomic::AtomicU64>,
@@ -755,127 +738,6 @@ pub(crate) fn process_solve_w(
     out_batch
 }
 
-/// SolveXY (stage 3) handler body for cross-mode items where the
-/// `(Z, W)` pair is already fully known. Walks the MDD to the
-/// `xy_root` for the boundary, builds a `SolveXyPerCandidate`, and
-/// enumerates `(X, Y)` via `walk_xy_sub_mdd`, firing the shared XY
-/// SAT fast path per leaf.
-///
-/// A solution is reported via `result_tx`; `ctx.found` is set so
-/// other workers stop.
-pub(crate) fn process_solve_xy(
-    xy: SolveXYWork,
-    ctx: &PhaseBContext,
-    metrics: &PipelineMetrics,
-    template_cache: &mut HashMap<Vec<(i32, i32, i32, i32)>, SatXYTemplate>,
-    warm: &mut WarmStartState,
-    sat_config: &radical::SolverConfig,
-    result_tx: &std::sync::mpsc::Sender<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
-) {
-    let k = ctx.k;
-    let n = ctx.problem.n;
-    let m = ctx.problem.m();
-
-    metrics.xy_item_in_flight.fetch_add(1, AtomicOrdering::Relaxed);
-    let item = xy.item;
-    let z_seq = item.z.clone();
-    let w_seq = item.w.clone();
-    let candidate = CandidateZW { zw_autocorr: item.zw_autocorr.clone() };
-
-    // Extract (z_bits, w_bits) from the boundary of each sequence
-    // and navigate the ZW half of the MDD to the xy_root node
-    // anchoring the XY sub-tree.
-    let mut z_bits = 0u32;
-    let mut w_bits = 0u32;
-    for i in 0..k {
-        if z_seq.get(i) == 1 { z_bits |= 1 << i; }
-        if z_seq.get(n - k + i) == 1 { z_bits |= 1 << (k + i); }
-        if w_seq.get(i) == 1 { w_bits |= 1 << i; }
-        if w_seq.get(m - k + i) == 1 { w_bits |= 1 << (k + i); }
-    }
-    let mut nid = ctx.mdd.root;
-    let mut live = true;
-    for level in 0..ctx.zw_depth {
-        if nid == mdd_reorder::DEAD { live = false; break; }
-        let pos = ctx.xy_pos_order[level];
-        let z_val = (z_bits >> pos) & 1;
-        let w_val = (w_bits >> pos) & 1;
-        let branch = (z_val | (w_val << 1)) as usize;
-        if nid != mdd_reorder::LEAF {
-            nid = ctx.mdd.nodes[nid as usize][branch];
-        }
-    }
-    if !live || nid == mdd_reorder::DEAD {
-        metrics.flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
-        metrics.items_completed.fetch_add(1, AtomicOrdering::Relaxed);
-        metrics.stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
-        metrics.xy_item_in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
-        return;
-    }
-    let xy_root = nid;
-
-    let tuple_key: Vec<(i32, i32, i32, i32)> = vec![(
-        item.tuple.x, item.tuple.y, item.tuple.z, item.tuple.w)];
-    let template = template_cache.entry(tuple_key).or_insert_with(||
-        SatXYTemplate::build_opts(ctx.problem, item.tuple, sat_config, ctx.conj_xy_product).unwrap()
-    );
-
-    if let Some(mut state) = SolveXyPerCandidate::new(
-        ctx.problem, &candidate, template, k,
-    ) {
-        if n > 30 { state.solver.set_conflict_limit(5000); }
-        if warm.inject_phase {
-            if let Some(ref ph) = warm.phase { state.solver.set_phase(ph); }
-        }
-
-        walk_xy_sub_mdd(
-            xy_root, 0, ctx.xy_zw_depth, 0, 0,
-            &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
-            ctx.middle_n as i32, std::slice::from_ref(&item.tuple),
-            &mut |x_bits, y_bits| {
-                if ctx.found.load(AtomicOrdering::Relaxed) { return; }
-                if let Some((fx, fy)) = ctx.outfix_xy {
-                    if x_bits != fx || y_bits != fy { return; }
-                }
-                if ctx.conj_zw_bound
-                    && !check_conj_zw_bound(n, k, x_bits, y_bits, &z_seq, &w_seq)
-                {
-                    metrics.flow_xy_zw_bound_rej.fetch_add(1, AtomicOrdering::Relaxed);
-                    return;
-                }
-                metrics.stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
-                let (result, stats) = state.try_candidate(x_bits, y_bits);
-                metrics.items_completed.fetch_add(1, AtomicOrdering::Relaxed);
-                metrics.stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
-                match &result {
-                    XyTryResult::Sat(_, _) => { metrics.flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed); }
-                    XyTryResult::Unsat | XyTryResult::Pruned => { metrics.flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
-                    XyTryResult::Timeout => {
-                        metrics.flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed);
-                        metrics.flow_xy_timeout_cov_micro.fetch_add(stats.cover_micro, AtomicOrdering::Relaxed);
-                    }
-                };
-                if !matches!(result, XyTryResult::Pruned) {
-                    metrics.flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
-                    metrics.flow_xy_decisions.fetch_add(stats.decisions, AtomicOrdering::Relaxed);
-                    metrics.flow_xy_propagations.fetch_add(stats.propagations, AtomicOrdering::Relaxed);
-                    metrics.flow_xy_root_forced.fetch_add(stats.vars_pre_forced, AtomicOrdering::Relaxed);
-                    metrics.flow_xy_free_sum.fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
-                }
-                if let XyTryResult::Sat(x, y) = result {
-                    if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
-                        ctx.found.store(true, AtomicOrdering::Relaxed);
-                        let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
-                    }
-                }
-            },
-        );
-        warm.phase = Some(state.solver.get_phase());
-    } else {
-        metrics.flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
-    }
-    metrics.xy_item_in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
-}
 
 /// SolveZ (stage 2) handler body. Enumerates Z middles under the
 /// spectral pair bound and the BDKR rule (iv) filter, then drives
@@ -2039,7 +1901,6 @@ pub(crate) fn new_pipeline_metrics() -> PipelineMetrics {
         flow_w_root_forced: z(),
         flow_w_free_sum: z(),
         items_completed: z(),
-        xy_item_in_flight: z(),
         flow_z_prep_fail: z(),
         flow_xy_zw_bound_rej: z(),
         flow_xy_sat: z(),
