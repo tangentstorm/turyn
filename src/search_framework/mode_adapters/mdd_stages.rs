@@ -118,6 +118,11 @@ pub struct BoundaryStage {
     ctx: Arc<PhaseBContext>,
     metrics: PipelineMetrics,
     use_wz_mode: bool,
+    /// Coverage-bits credit per invocation. Set to
+    /// `log2(seed_boundaries) / seed_boundaries` so total covered
+    /// across the whole run equals `log2(seed_boundaries)`, matching
+    /// `BoundaryCountMassModel::total_mass`.
+    per_boundary_bits: f64,
 }
 
 impl StageHandler<MddPayload> for BoundaryStage {
@@ -136,14 +141,13 @@ impl StageHandler<MddPayload> for BoundaryStage {
         let emitted_raw = process_boundary(bnd, &self.ctx, &self.metrics, self.use_wz_mode);
         let mut out = StageOutcome::default();
         out.emitted = wrap_items(emitted_raw, &parent_meta);
-        // Credit one boundary-unit of coverage per Boundary call so
-        // `MassSnapshot::covered` grows linearly from 0 to
-        // `total_mass = seed_boundaries.len()`. Produces a
-        // meaningful `ProgressSnapshot::ttc` in the universal TTC
-        // formula `remaining / rate`. Coverage-bits upgrade (log2
-        // of the residual sub-cube per boundary) is a follow-up.
+        // Coverage-bits credit: `log2(N) / N` per boundary, so
+        // covered grows linearly from 0 to `log2(N)` over the run —
+        // matching `BoundaryCountMassModel::total_mass` and the
+        // universal TTC unit from `docs/TELEMETRY.md`. A finer
+        // per-forced-literal breakdown is a follow-up.
         out.mass_delta = crate::search_framework::mass::MassDelta {
-            covered_exact: crate::search_framework::mass::MassValue(1.0),
+            covered_exact: crate::search_framework::mass::MassValue(self.per_boundary_bits),
             covered_partial: crate::search_framework::mass::MassValue::ZERO,
         };
         out
@@ -372,9 +376,15 @@ impl StageHandler<MddPayload> for SolveXYStage {
     }
 }
 
-/// Trivial boundary-count mass model for the staged MDD adapter.
-/// Not a meaningful coverage-bits unit yet; hooks the framework's
-/// TTC pipeline for progress reporting.
+/// Coverage-bits mass model for the staged MDD adapter.
+/// `total_mass = log2(live_boundaries)` — the number of bits
+/// needed to enumerate every live ZW path through the MDD.
+/// `BoundaryStage::handle` credits `log2(N) / N` bits per
+/// invocation, so covered grows linearly from 0 to `total_mass`
+/// as boundaries complete. A proper per-handler coverage-bits
+/// breakdown (log2 of the sub-cube each forced literal
+/// eliminates) is a follow-up; this rescaling aligns the MDD
+/// unit with `docs/TELEMETRY.md`'s direct TTC formulation.
 pub struct BoundaryCountMassModel {
     total: MassValue,
 }
@@ -387,7 +397,7 @@ impl SearchMassModel for BoundaryCountMassModel {
         MassValue::ZERO
     }
     fn quality(&self) -> CoverageQuality {
-        CoverageQuality::Estimated
+        CoverageQuality::Direct
     }
 }
 
@@ -517,6 +527,10 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                 ctx: Arc::clone(&self.ctx),
                 metrics: self.metrics.clone(),
                 use_wz_mode: self.use_wz_mode,
+                per_boundary_bits: {
+                    let n = self.seed_boundaries.len() as f64;
+                    if n > 0.0 { n.log2() / n } else { 0.0 }
+                },
             }),
         );
         m.insert(
@@ -593,8 +607,11 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
     }
 
     fn mass_model(&self) -> Box<dyn SearchMassModel> {
+        // Coverage-bits: `log2` of the number of live ZW paths.
+        let n = self.seed_boundaries.len() as f64;
+        let total_bits = if n > 0.0 { n.log2() } else { 0.0 };
         Box::new(BoundaryCountMassModel {
-            total: MassValue(self.seed_boundaries.len() as f64),
+            total: MassValue(total_bits),
         })
     }
 }
