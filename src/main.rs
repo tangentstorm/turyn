@@ -228,15 +228,11 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
             cfg.sat_config.xor_propagation = true;
         } else if arg == "--no-xor" {
             cfg.sat_config.xor_propagation = false;
-        } else if let Some(v) = arg.strip_prefix("--engine=") {
-            cfg.engine = match v {
-                "legacy" => EngineKind::Legacy,
-                "new" => EngineKind::New,
-                _ => {
-                    eprintln!("error: --engine must be one of legacy|new (got '{}')", v);
-                    std::process::exit(1);
-                }
-            };
+        } else if arg.starts_with("--engine=") {
+            // Accepted for backward compatibility; every value
+            // routes through the same unified framework runner
+            // now. Warn so users know the flag is no-op.
+            eprintln!("warning: --engine is a no-op; all modes use the unified framework runner");
         } else if arg == "--phase-a" || arg == "--phase-b" {
             cfg.phase_only = Some(arg[2..].to_string());
         } else if let Some(v) = arg.strip_prefix("--tuple=") {
@@ -1198,27 +1194,13 @@ fn main() {
     if cfg.benchmark_repeats > 0 {
         run_benchmark(&cfg);
     } else if cfg.stochastic {
-        if cfg.engine == EngineKind::New {
-            run_framework_stochastic_mode(
-                cfg.problem,
-                cfg.test_tuple.clone(),
-                &cfg,
-                true,
-            );
-            return;
-        }
-        let report = stochastic_search(
+        run_framework_stochastic_mode(
             cfg.problem,
-            cfg.test_tuple.as_ref(),
+            cfg.test_tuple.clone(),
+            &cfg,
             true,
-            cfg.stochastic_seconds,
         );
-        println!(
-            "Stochastic search: found_solution={}, elapsed={:.3?}\n  {}",
-            report.found_solution,
-            report.elapsed,
-            run_info()
-        );
+        return;
     } else {
         // All three --wz modes funnel through the same unified runner.
         // The runner's monitor thread either enumerates Z × W pairs
@@ -1254,28 +1236,11 @@ fn main() {
                 });
             }
         }
-        if cfg.engine == EngineKind::New && matches!(mode, WzMode::Cross | WzMode::Apart | WzMode::Together) {
+        if matches!(mode, WzMode::Cross | WzMode::Apart | WzMode::Together) {
             run_framework_mdd_mode(cfg.problem, tuples, &cfg, true, mdd_k);
-            return;
-        }
-        if cfg.engine == EngineKind::New && mode == WzMode::Sync {
+        } else {
             run_framework_sync_mode(cfg.problem, &cfg, true);
-            return;
         }
-        let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, true, mdd_k);
-        let label = match mode {
-            WzMode::Cross => "cross",
-            WzMode::Together => "together",
-            WzMode::Apart => "apart",
-            WzMode::Sync => "sync",
-        };
-        println!(
-            "Unified search (--wz={}): found_solution={}, elapsed={:.3?}\n  {}",
-            label,
-            report.found_solution,
-            report.elapsed,
-            run_info()
-        );
     }
 }
 
@@ -1361,7 +1326,6 @@ mod tests {
             conj_xy_product: false,
             conj_zw_bound: false,
             conj_tuple: false,
-            engine: EngineKind::Legacy,
         };
         let tuples = phase_a_tuples(cfg.problem, None);
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, false, cfg.mdd_k);

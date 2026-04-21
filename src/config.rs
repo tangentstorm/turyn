@@ -326,14 +326,6 @@ pub(crate) struct SearchConfig {
     /// is a no-op. Enabled via `--conj-tuple` (see
     /// conjectures/positive-tuple.md).
     pub(crate) conj_tuple: bool,
-    /// Engine selector for the unified search framework.
-    /// `new` (default) routes every mode through
-    /// `search_framework::engine` — `--wz=apart|together|cross` via
-    /// `MddStagesAdapter`, `--wz=sync` via `SyncAdapter`,
-    /// `--stochastic` via `StochasticAdapter`. `legacy` keeps the
-    /// direct `run_mdd_sat_search` pipeline as an escape hatch
-    /// while the framework matures at larger `n`.
-    pub(crate) engine: EngineKind,
 }
 
 /// Which (Z, W) candidate producer feeds the shared XY SAT stage.
@@ -361,12 +353,6 @@ pub(crate) enum WzMode {
     /// solver absorbs full BDKR (i)–(vi) + Turyn identity as per-lag
     /// quad PB; learned clauses persist across the walk. See `sync_walker`.
     Sync,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EngineKind {
-    Legacy,
-    New,
 }
 
 impl Default for SearchConfig {
@@ -397,7 +383,6 @@ impl Default for SearchConfig {
             conj_xy_product: false,
             conj_zw_bound: false,
             conj_tuple: false,
-            engine: EngineKind::New,
         }
     }
 }
@@ -502,9 +487,6 @@ impl SearchConfig {
         }
         if let Some(d) = self.dump_dimacs.as_ref() {
             parts.push(format!("--dump-dimacs={d}"));
-        }
-        if self.engine == EngineKind::New {
-            parts.push("--engine=new".into());
         }
         let threads = std::env::var("TURYN_THREADS")
             .ok()
