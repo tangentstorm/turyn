@@ -60,4 +60,54 @@ theorem aperiodicAutocorr_B_via_aAt {n : Nat} (S : TurynTypeSeq n) (s : Nat) (hs
   unfold bAt
   simp
 
+lemma aAt_sq {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
+    aAt S i * aAt S i = 1 := by
+      -- Apply the lemma that states the product of a number with itself is 1 if the number is either 1 or -1.
+      have h_sq : aAt S i = 1 ∨ aAt S i = -1 := by
+        apply pm_entry_of_getD; exact S.isTuryn.x_pm; exact (by
+        rw [ S.isTuryn.x_len ] ; omega)
+      exact h_sq.elim (fun h => by rw [h]; norm_num) (fun h => by rw [h]; norm_num)
+
+lemma bAt_eq_aAt_mul_uAt {n : Nat} (S : TurynTypeSeq n) (i : Nat)
+    (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
+    bAt S i = aAt S i * uAt S i := by
+      unfold uAt;
+      rw [ ← mul_assoc, aAt_sq S i hi1 hi2, one_mul ]
+
+private lemma summand_identity {n : Nat} (S : TurynTypeSeq n) (i : Nat)
+    (hi1 : 1 ≤ i) (hi2 : i ≤ n) (j : Nat) (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
+    aAt S i * aAt S j + bAt S i * bAt S j =
+    aAt S i * aAt S j * (1 + uAt S i * uAt S j) := by
+      -- Apply the lemma to rewrite the bAt terms in the LHS.
+      have h_lhs_rewrite : aAt S i * aAt S j + bAt S i * bAt S j = aAt S i * aAt S j + (aAt S i * aAt S j) * (aAt S i * aAt S i) * (uAt S i * uAt S j) := by
+        rw [ bAt_eq_aAt_mul_uAt, bAt_eq_aAt_mul_uAt ];
+        · rw [ show aAt S i * aAt S i = 1 by exact aAt_sq S i hi1 hi2 ] ; ring;
+        · linarith;
+        · lia;
+        · linarith;
+        · linarith;
+      rw [ h_lhs_rewrite, aAt_sq S i hi1 hi2 ] ; ring
+
+theorem T_k_as_U_sum {n : Nat} (S : TurynTypeSeq n) (k : Nat) (hk : 2 ≤ k) (hkn : k ≤ n - 1) :
+    aperiodicAutocorr S.A (n - k) + aperiodicAutocorr S.B (n - k) =
+    ∑ i ∈ Finset.range k,
+      aAt S (i + 1) * aAt S (i + 1 + (n - k)) * (1 + uAt S (i + 1) * uAt S (i + 1 + (n - k))) := by
+        have h1 : aperiodicAutocorr S.A (n - k) = ∑ i ∈ Finset.range k, aAt S (i + 1) * aAt S (i + 1 + (n - k)) := by
+          convert aperiodicAutocorr_A_via_aAt S ( n - k ) _ using 1;
+          · rw [ Nat.sub_sub_self ( by omega ) ];
+          · omega
+        have h2 : aperiodicAutocorr S.B (n - k) = ∑ i ∈ Finset.range k, bAt S (i + 1) * bAt S (i + 1 + (n - k)) := by
+          convert aperiodicAutocorr_B_via_aAt S ( n - k ) _ using 1;
+          · rw [ Nat.sub_sub_self ( by omega ) ];
+          · omega;
+        rw [ h1, h2, ← Finset.sum_add_distrib ];
+        -- Apply the summand_identity to each term in the sum.
+        apply Finset.sum_congr rfl
+        intro i hi
+        apply summand_identity;
+        · linarith;
+        · linarith [ Finset.mem_range.mp hi, Nat.sub_add_cancel ( show 1 ≤ n from by omega ) ];
+        · omega;
+        · linarith [ Finset.mem_range.mp hi, Nat.sub_add_cancel ( show k ≤ n from hkn.trans ( Nat.pred_le _ ) ) ]
+
 end Turyn
