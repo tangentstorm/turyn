@@ -1871,6 +1871,267 @@ pub(crate) fn process_solve_wz(
     deferred
 }
 
+/// Build a `PhaseBContext` populated from the given problem / tuple
+/// list / search config. Duplicates the setup block at the top of
+/// `run_mdd_sat_search` so the framework `MddStagesAdapter` can own
+/// an identical context without invoking the legacy worker loop.
+///
+/// Panics / exits if no usable MDD file is available (matches
+/// `run_mdd_sat_search`'s exit behavior).
+pub(crate) fn build_phase_b_context(
+    problem: Problem,
+    tuples: &[SumTuple],
+    cfg: &SearchConfig,
+    verbose: bool,
+    k: usize,
+) -> Arc<PhaseBContext> {
+    let n = problem.n;
+    let m = problem.m();
+    let try_k = k.min((n - 1) / 2);
+    let mdd = match load_best_mdd(try_k, verbose) {
+        Some(m) => {
+            if m.k != try_k {
+                eprintln!(
+                    "error: requested --mdd-k={} but only mdd-{}.bin found (k={})",
+                    k, m.k, m.k
+                );
+                eprintln!(
+                    "Generate the exact MDD: target/release/gen_mdd {}",
+                    try_k
+                );
+                std::process::exit(1);
+            }
+            Arc::new(m)
+        }
+        None => {
+            eprintln!(
+                "No MDD file found (tried mdd-1.bin through mdd-{}.bin)",
+                try_k
+            );
+            eprintln!(
+                "Generate one with: cargo build --release --bin gen_mdd && target/release/gen_mdd {}",
+                k
+            );
+            std::process::exit(1);
+        }
+    };
+    let k = mdd.k;
+    assert!(2 * k <= n, "k={} too large for n={}: need 2k <= n", k, n);
+    assert!(2 * k <= m, "k={} too large for m={}: need 2k <= m", k, m);
+    let middle_n = n - 2 * k;
+    let middle_m = m - 2 * k;
+    let max_bnd_sum = (2 * k) as i32;
+    let zw_depth = 2 * k;
+    let full_pos_order: Vec<usize> = {
+        let mut v = Vec::with_capacity(2 * k);
+        for t in 0..k {
+            v.push(t);
+            v.push(2 * k - 1 - t);
+        }
+        v
+    };
+    Arc::new(PhaseBContext {
+        mdd: Arc::clone(&mdd),
+        xy_pos_order: full_pos_order,
+        tuples: tuples.to_vec(),
+        w_tmpl: sat_z_middle::LagTemplate::new(m, k),
+        z_tmpl: sat_z_middle::LagTemplate::new(n, k),
+        problem,
+        k,
+        zw_depth,
+        xy_zw_depth: zw_depth,
+        middle_n,
+        middle_m,
+        max_bnd_sum,
+        max_z: cfg.max_z.min(16),
+        individual_bound: problem.spectral_bound(),
+        pair_bound: cfg.max_spectral.unwrap_or(problem.spectral_bound()),
+        theta: cfg.theta_samples,
+        mdd_extend: cfg.mdd_extend,
+        wz_together: cfg.wz_together,
+        conj_xy_product: cfg.conj_xy_product,
+        conj_zw_bound: cfg.conj_zw_bound,
+        xy_mdd_mode: std::env::var("XY_MDD").ok().as_deref() == Some("1"),
+        w_mid_vars: (0..middle_m).map(|i| (i + 1) as i32).collect(),
+        z_mid_vars: (0..middle_n).map(|i| (i + 1) as i32).collect(),
+        z_spectral_tables: if middle_n >= 8 {
+            Some(radical::SpectralTables::new(n, k, SPECTRAL_FREQS))
+        } else {
+            None
+        },
+        w_spectral_tables: if middle_m >= 8 {
+            Some(radical::SpectralTables::new(m, k, SPECTRAL_FREQS))
+        } else {
+            None
+        },
+        found: Arc::new(AtomicBool::new(false)),
+        outfix_xy: cfg.test_outfix.as_ref().and_then(|o| o.xy_bits),
+        outfix_z_mid_pins: cfg
+            .test_outfix
+            .as_ref()
+            .map(|o| o.z_middle_pins.clone())
+            .unwrap_or_default(),
+        outfix_w_mid_pins: cfg
+            .test_outfix
+            .as_ref()
+            .map(|o| o.w_middle_pins.clone())
+            .unwrap_or_default(),
+        outfix_x_mid_pins: cfg
+            .test_outfix
+            .as_ref()
+            .map(|o| o.x_middle_pins.clone())
+            .unwrap_or_default(),
+        outfix_y_mid_pins: cfg
+            .test_outfix
+            .as_ref()
+            .map(|o| o.y_middle_pins.clone())
+            .unwrap_or_default(),
+    })
+}
+
+/// Enumerate every live boundary path through the first `zw_depth`
+/// levels of the MDD, returning a `BoundaryWork` per path. Used by
+/// the framework `MddStagesAdapter` to seed its queue upfront; the
+/// legacy worker loop instead pulls boundaries on demand via its
+/// monitor's LCG path walker.
+///
+/// A path is "live" iff none of its nodes are `mdd_reorder::DEAD`
+/// — i.e. it terminates at some non-DEAD XY-sub-tree root.
+pub(crate) fn enumerate_live_boundaries(ctx: &PhaseBContext) -> Vec<BoundaryWork> {
+    let mdd = &*ctx.mdd;
+    let zw_depth = ctx.zw_depth;
+    let xy_pos_order = &ctx.xy_pos_order;
+    let mut out: Vec<BoundaryWork> = Vec::new();
+
+    fn walk(
+        nid: u32,
+        level: usize,
+        z_bits: u32,
+        w_bits: u32,
+        depth: usize,
+        order: &[usize],
+        nodes: &[[u32; 4]],
+        out: &mut Vec<BoundaryWork>,
+    ) {
+        if nid == mdd_reorder::DEAD {
+            return;
+        }
+        if level == depth {
+            out.push(BoundaryWork {
+                z_bits,
+                w_bits,
+                xy_root: nid,
+            });
+            return;
+        }
+        if nid == mdd_reorder::LEAF {
+            // A LEAF reached before depth means the full (z,w)
+            // prefix is unconstrained at the remaining levels —
+            // enumerate all 4 branches.
+            let pos = order[level];
+            for b in 0..4u32 {
+                let z = b & 1;
+                let w = (b >> 1) & 1;
+                walk(
+                    mdd_reorder::LEAF,
+                    level + 1,
+                    z_bits | (z << pos),
+                    w_bits | (w << pos),
+                    depth,
+                    order,
+                    nodes,
+                    out,
+                );
+            }
+            return;
+        }
+        let pos = order[level];
+        for b in 0..4u32 {
+            let child = nodes[nid as usize][b as usize];
+            if child == mdd_reorder::DEAD {
+                continue;
+            }
+            let z = b & 1;
+            let w = (b >> 1) & 1;
+            walk(
+                child,
+                level + 1,
+                z_bits | (z << pos),
+                w_bits | (w << pos),
+                depth,
+                order,
+                nodes,
+                out,
+            );
+        }
+    }
+
+    walk(
+        mdd.root,
+        0,
+        0,
+        0,
+        zw_depth,
+        xy_pos_order,
+        &mdd.nodes,
+        &mut out,
+    );
+    out
+}
+
+/// Bundle of freshly-constructed `PipelineMetrics` counters. Used
+/// by framework callers that run the staged adapter outside the
+/// legacy `run_mdd_sat_search` closure.
+pub(crate) fn new_pipeline_metrics() -> PipelineMetrics {
+    use std::sync::atomic::AtomicU64;
+    let z = || Arc::new(AtomicU64::new(0));
+    PipelineMetrics {
+        flow_bnd_sum_fail: z(),
+        stage_enter: (0..4).map(|_| z()).collect(),
+        stage_exit: (0..4).map(|_| z()).collect(),
+        pending_boundaries: z(),
+        flow_w_unsat: z(),
+        flow_w_solutions: z(),
+        flow_w_spec_fail: z(),
+        flow_w_spec_pass: z(),
+        flow_w_solves: z(),
+        flow_w_decisions: z(),
+        flow_w_propagations: z(),
+        flow_w_root_forced: z(),
+        flow_w_free_sum: z(),
+        items_completed: z(),
+        xy_item_in_flight: z(),
+        flow_z_prep_fail: z(),
+        flow_xy_zw_bound_rej: z(),
+        flow_xy_sat: z(),
+        flow_xy_unsat: z(),
+        flow_xy_timeout: z(),
+        flow_xy_timeout_cov_micro: z(),
+        flow_xy_solves: z(),
+        flow_xy_decisions: z(),
+        flow_xy_propagations: z(),
+        flow_xy_root_forced: z(),
+        flow_xy_free_sum: z(),
+        flow_z_unsat: z(),
+        flow_z_solutions: z(),
+        flow_z_spec_fail: z(),
+        flow_z_pair_fail: z(),
+        flow_z_solves: z(),
+        flow_z_decisions: z(),
+        flow_z_propagations: z(),
+        flow_z_root_forced: z(),
+        flow_z_free_sum: z(),
+        extensions_pruned: z(),
+        flow_wz_empty_v: z(),
+        flow_wz_rule_viol: z(),
+        flow_wz_sat_calls: z(),
+        flow_wz_first_unsat: z(),
+        flow_wz_solutions: z(),
+        flow_wz_exhausted: z(),
+        flow_wz_budget_hit: z(),
+    }
+}
+
 /// MDD pipeline search: unified priority queue with stages MDD→W→Z→XY.
 /// All workers are identical — they grab the highest-stage item from the queue.
 /// Later stages (closer to producing a result) always get processed first.

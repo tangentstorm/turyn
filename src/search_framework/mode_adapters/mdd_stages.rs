@@ -21,9 +21,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::SearchConfig;
 use crate::mdd_pipeline::{
-    process_boundary, process_solve_w, process_solve_wz, process_solve_xy, process_solve_z,
-    BoundaryWork, PhaseBContext, PipelineMetrics, PipelineWork, SolveWWork, SolveWZWork,
-    SolveXYWork, SolveZWork, ZStageScratch,
+    build_phase_b_context, enumerate_live_boundaries, new_pipeline_metrics, process_boundary,
+    process_solve_w, process_solve_wz, process_solve_xy, process_solve_z, BoundaryWork,
+    PhaseBContext, PipelineMetrics, PipelineWork, SolveWWork, SolveWZWork, SolveXYWork,
+    SolveZWork, ZStageScratch,
 };
 use crate::search_framework::engine::{AdapterInit, SearchModeAdapter};
 use crate::search_framework::mass::{CoverageQuality, MassValue, SearchMassModel};
@@ -385,6 +386,23 @@ impl SearchMassModel for BoundaryCountMassModel {
 /// `run_mdd_sat_search` builds, plus a shared
 /// `PipelineMetrics`/result channel so legacy and framework paths
 /// roll up to identical counters.
+/// Alias for the solution-reporting channel the staged handlers
+/// write into. Same 4-tuple shape as the legacy `run_mdd_sat_search`
+/// channel, so callers can drain it identically.
+pub type SolutionChannel = std::sync::mpsc::Sender<(
+    crate::types::PackedSeq,
+    crate::types::PackedSeq,
+    crate::types::PackedSeq,
+    crate::types::PackedSeq,
+)>;
+
+pub type SolutionReceiver = std::sync::mpsc::Receiver<(
+    crate::types::PackedSeq,
+    crate::types::PackedSeq,
+    crate::types::PackedSeq,
+    crate::types::PackedSeq,
+)>;
+
 pub struct MddStagesAdapter {
     pub ctx: Arc<PhaseBContext>,
     pub metrics: PipelineMetrics,
@@ -398,6 +416,45 @@ pub struct MddStagesAdapter {
     pub use_wz_mode: bool,
     pub seed_boundaries: Vec<BoundaryWork>,
     pub mode_name: &'static str,
+}
+
+impl MddStagesAdapter {
+    /// Build an adapter ready to hand to `SearchEngine::run`. Constructs
+    /// a fresh `PhaseBContext` (via `build_phase_b_context`), enumerates
+    /// every live boundary through the ZW half of the MDD (upfront —
+    /// the framework engine's scheduler replaces the legacy monitor's
+    /// on-demand walker), allocates a fresh `PipelineMetrics` bundle,
+    /// and pairs the adapter with a `SolutionReceiver` the caller
+    /// drains after the run completes.
+    pub fn build(
+        problem: Problem,
+        tuples: Vec<SumTuple>,
+        cfg: &SearchConfig,
+        k: usize,
+        verbose: bool,
+        mode_name: &'static str,
+    ) -> (Self, SolutionReceiver) {
+        let ctx = build_phase_b_context(problem, &tuples, cfg, verbose, k);
+        let seed_boundaries = enumerate_live_boundaries(&ctx);
+        if verbose {
+            eprintln!(
+                "[framework:{}] seed_boundaries={} (pre-enumerated upfront)",
+                mode_name,
+                seed_boundaries.len()
+            );
+        }
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let adapter = MddStagesAdapter {
+            ctx,
+            metrics: new_pipeline_metrics(),
+            sat_config: Arc::new(cfg.sat_config.clone()),
+            result_tx,
+            use_wz_mode: cfg.wz_together,
+            seed_boundaries,
+            mode_name,
+        };
+        (adapter, result_rx)
+    }
 }
 
 impl SearchModeAdapter<MddPayload> for MddStagesAdapter {

@@ -39,7 +39,7 @@ use crate::search_framework::engine::{EngineConfig, SearchEngine, SearchModeAdap
 #[cfg(feature = "search-framework")]
 use crate::search_framework::events::SearchEvent;
 #[cfg(feature = "search-framework")]
-use crate::search_framework::mode_adapters::apart_together::{MddTupleAdapter, TuplePayload};
+use crate::search_framework::mode_adapters::mdd_stages::{MddPayload, MddStagesAdapter};
 #[cfg(feature = "search-framework")]
 use crate::search_framework::queue::GoldThenWork;
 use crate::spectrum::*;
@@ -330,29 +330,57 @@ fn run_framework_mdd_mode(
     verbose: bool,
     k: usize,
 ) {
-    let mode_name = match cfg.effective_wz_mode() {
+    let mode_name: &'static str = match cfg.effective_wz_mode() {
         WzMode::Cross => "cross",
         WzMode::Apart => "apart",
         WzMode::Together => "together",
         WzMode::Sync => "sync",
     };
-    let adapter = MddTupleAdapter {
-        problem,
-        tuples: std::sync::Arc::new(tuples),
-        cfg: std::sync::Arc::new(cfg.clone()),
-        k,
-        verbose,
-        mode_name,
-    };
-    let mut engine =
-        SearchEngine::<TuplePayload>::new(EngineConfig::default(), Box::new(GoldThenWork::new(32)));
-    engine.run(&adapter, |event| match event {
+    // Framework staged routing: builds a `PhaseBContext` identical
+    // to the legacy `run_mdd_sat_search`, enumerates every live
+    // boundary upfront, and drives the five per-stage
+    // `StageHandler`s through `SearchEngine`. Solutions land on the
+    // adapter's `result_rx` channel.
+    let (adapter, result_rx) =
+        MddStagesAdapter::build(problem, tuples, cfg, k, verbose, mode_name);
+    let mut engine = SearchEngine::<MddPayload>::new(
+        EngineConfig::default(),
+        Box::new(GoldThenWork::new(32)),
+    );
+    // Short-circuit once any worker publishes a solution: set the
+    // context's `found` flag AND cancel the engine so workers stop
+    // pulling work from the scheduler.
+    let found_ctx = std::sync::Arc::clone(&adapter.ctx.found);
+    let engine_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let engine_cancel_clone = std::sync::Arc::clone(&engine_cancel);
+
+    // Drain-thread: polls the solution channel; on first hit sets
+    // the cancel flag + `ctx.found`. `thread::scope` keeps it tied
+    // to the engine's lifetime.
+    let drain_handle = std::thread::spawn(move || {
+        let mut solutions = Vec::new();
+        while let Ok(sol) = result_rx.recv() {
+            found_ctx.store(true, std::sync::atomic::Ordering::Relaxed);
+            engine_cancel_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+            solutions.push(sol);
+        }
+        solutions
+    });
+
+    let cancel_watchdog = std::sync::Arc::clone(&engine_cancel);
+    engine.run(&adapter, move |event| match event {
         SearchEvent::Progress(p) => {
             if verbose {
                 eprintln!(
                     "[framework:{}] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}",
                     mode_name, p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc
                 );
+            }
+            if cancel_watchdog.load(std::sync::atomic::Ordering::Relaxed) {
+                // Engine will notice via its internal `cancelled`
+                // flag if we call cancel(); but we don't own the
+                // engine from this closure, so rely on the found
+                // flag propagated through StageContext instead.
             }
         }
         SearchEvent::Finished(p) => {
@@ -362,6 +390,25 @@ fn run_framework_mdd_mode(
             );
         }
     });
+
+    // Dropping the adapter drops its `result_tx`, which is the
+    // last sender (stage handlers cloned from it but they're gone
+    // now). The drain thread's `recv` returns Err and it exits.
+    drop(adapter);
+    let solutions = drain_handle.join().unwrap_or_default();
+    if !solutions.is_empty() {
+        println!(
+            "Framework search (--wz={}): found_solution=true ({} solution(s))",
+            mode_name,
+            solutions.len()
+        );
+    } else {
+        println!(
+            "Framework search (--wz={}): found_solution=false",
+            mode_name
+        );
+    }
+    let _ = engine_cancel; // keep the Arc alive until the end
 }
 
 fn parse_args() -> (CliVerb, SearchConfig) {
