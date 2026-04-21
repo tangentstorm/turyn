@@ -245,4 +245,68 @@ lemma endpoint_pair_mod4 {n : Nat} (S : TurynTypeSeq n) (k : Nat)
     exact fun i a a_1 => uAt_pm S i a a_1
   grind
 
+/--
+Pure integer algebra: for ±1 values a₁, a₂, a₃, a₄, u₁, u₃,
+the paired sum `a₁·a₂·(1 + u₁·(−u₃)) + a₃·a₄·(1 + u₃·(−u₁))` is divisible by 4.
+
+This factors as `(1 − u₁·u₃)·(a₁·a₂ + a₃·a₄)`.
+- `1 − u₁·u₃ ∈ {0, 2}` (product of two ±1's is ±1).
+- `a₁·a₂ + a₃·a₄ ∈ {−2, 0, 2}` (sum of two ±1's).
+So the product is always in `{0, ±4}`, hence divisible by 4.
+-/
+private lemma pm_pair_sum_mod4 (a1 a2 a3 a4 u1 u3 : Int)
+    (ha1 : a1 = 1 ∨ a1 = -1) (ha2 : a2 = 1 ∨ a2 = -1)
+    (ha3 : a3 = 1 ∨ a3 = -1) (ha4 : a4 = 1 ∨ a4 = -1)
+    (hu1 : u1 = 1 ∨ u1 = -1) (hu3 : u3 = 1 ∨ u3 = -1) :
+    (a1 * a2 * (1 + u1 * (-u3)) + a3 * a4 * (1 + u3 * (-u1))) % 4 = 0 := by
+  rcases ha1 with rfl | rfl <;> rcases ha2 with rfl | rfl <;>
+  rcases ha3 with rfl | rfl <;> rcases ha4 with rfl | rfl <;>
+  rcases hu1 with rfl | rfl <;> rcases hu3 with rfl | rfl <;> decide
+
+/--
+**Interior-pair mod-4 lemma.**  The central induction-step ingredient for the
+XY product-law proof.
+
+Given the induction hypothesis `IH` (all mirrors up to index `k` are negated),
+the paired contribution of prose positions `m` and `k+1−m` in `T_k`'s sum is
+divisible by 4.
+
+The proof rewrites the two "far" `uAt` values via `IH`, then closes by an
+explicit 64-case split on the ±1 values.
+-/
+lemma interior_pair_mod4 {n : Nat} (S : TurynTypeSeq n) (k : Nat)
+    (hk : 4 ≤ k) (hkn : k ≤ n - 1)
+    (IH : ∀ j, 2 ≤ j → j < k → uAt S (n + 1 - j) = -(uAt S j))
+    {m : Nat} (hm1 : 2 ≤ m) (hm2 : 2 * m ≤ k) (hm3 : m < k + 1 - m) :
+    (aAt S m * aAt S (m + (n - k)) * (1 + uAt S m * uAt S (m + (n - k))) +
+     aAt S (k + 1 - m) * aAt S ((k + 1 - m) + (n - k)) *
+        (1 + uAt S (k + 1 - m) * uAt S ((k + 1 - m) + (n - k)))) % 4 = 0 := by
+  -- Step 1: Establish the key index identities (Nat arithmetic).
+  have hidx1 : m + (n - k) = n + 1 - (k + 1 - m) := by omega
+  have hidx2 : (k + 1 - m) + (n - k) = n + 1 - m := by omega
+  -- Step 2: Apply IH to rewrite the "far" uAt values.
+  -- IH at j = k+1−m: uAt S (n+1−(k+1−m)) = −(uAt S (k+1−m)),
+  --   i.e. uAt S (m+(n−k)) = −(uAt S (k+1−m)).
+  have hih1 : uAt S (m + (n - k)) = -(uAt S (k + 1 - m)) := by
+    rw [hidx1]
+    exact IH (k + 1 - m) (by omega) (by omega)
+  -- IH at j = m: uAt S (n+1−m) = −(uAt S m),
+  --   i.e. uAt S ((k+1−m)+(n−k)) = −(uAt S m).
+  have hih2 : uAt S ((k + 1 - m) + (n - k)) = -(uAt S m) := by
+    rw [hidx2]
+    exact IH m hm1 (by omega)
+  -- Step 3: Substitute into the goal.
+  rw [hih1, hih2]
+  -- Step 4: Apply the pure-integer 64-case lemma.
+  exact pm_pair_sum_mod4
+    (aAt S m) (aAt S (m + (n - k)))
+    (aAt S (k + 1 - m)) (aAt S ((k + 1 - m) + (n - k)))
+    (uAt S m) (uAt S (k + 1 - m))
+    (aAt_pm S m (by omega) (by omega))
+    (aAt_pm S (m + (n - k)) (by omega) (by omega))
+    (aAt_pm S (k + 1 - m) (by omega) (by omega))
+    (aAt_pm S ((k + 1 - m) + (n - k)) (by omega) (by omega))
+    (uAt_pm S m (by omega) (by omega))
+    (uAt_pm S (k + 1 - m) (by omega) (by omega))
+
 end Turyn
