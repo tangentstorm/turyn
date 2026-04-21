@@ -1,10 +1,122 @@
-# Telemetry output (`--wz=sync`)
+# Telemetry
+
+This doc has two parts:
+
+1. **Universal schema** (below) — the shared `ProgressSnapshot` that
+   every mode (`cross`, `apart`, `together`, `sync`, `stochastic`)
+   emits through `SearchEngine`. Describes the one TTC metric, the
+   three 2-D forcing rollups, and the fan-out / edge-flow counters.
+2. **`--wz=sync` specifics** — the five historical
+   text blocks the sync walker prints after a run. These remain
+   because the walker has rich, sync-specific diagnostics that
+   aren't yet folded into the universal snapshot; they read cleanly
+   against the universal schema below.
+
+## Universal schema
+
+Every run emits `ProgressSnapshot`s on a fixed tick (`EngineConfig::progress_interval`,
+default 1 s) and one final `SearchEvent::Finished` snapshot. The
+schema is defined in `src/search_framework/events.rs`:
+
+```rust
+pub struct ProgressSnapshot {
+    pub elapsed: Duration,
+    pub throughput_per_sec: MassValue,   // bits / second
+    pub covered_mass: MassValue,         // bits covered so far
+    pub total_mass: MassValue,           // log2(|full search space|)
+    pub remaining_mass: MassValue,
+    pub ttc: Option<Duration>,           // remaining_mass / throughput
+    pub quality: TtcQuality,             // Direct | Projected | Hybrid
+    pub edge_flow: BTreeMap<(String, String), EdgeFlowCounters>,
+    pub fanout_roots: BTreeMap<u64, FanoutRootCounters>,
+    pub forcings: ForcingRollups,        // stage×level + stage×feature
+}
+```
+
+### TTC (mode-agnostic)
+
+One metric, one unit across every mode:
+
+- **unit:** search-space bits, `log2(|cube|)`.
+- **`total_mass`:** `log2` of the enumeration size of the mode's
+  fully-free search space (e.g. `log2(2^n × 2^n × ...)` for
+  binary-valued sequence searches).
+- **`covered_mass`:** Σ over stage handler calls of
+  `log2(|sub-cube eliminated|)`. A handler that forces one variable
+  at a decision level where `k` variables remain unfixed contributes
+  `1 bit` (it halved the residual). A handler that proves a whole
+  sub-tree UNSAT contributes the full `log2` of that sub-tree.
+- **`throughput_per_sec`:** `covered_mass / elapsed` — bits per
+  second.
+- **`ttc`:** `remaining_mass / throughput_per_sec`, labelled with
+  `TtcQuality`:
+  - `Direct` — sampled coverage is trusted to continue; TTC is
+    `elapsed / cumulative_coverage_fraction`.
+  - `Projected` — TTC from an explicit branching-factor extrapolation
+    (currently only sync-mode Block 2).
+  - `Hybrid` — direct with projected smoothing on the remainder.
+
+The coverage-bits unit replaces all pre-universal-review mode-specific
+units (XY candidate solves, boundary count, walker nodes). Nothing
+outside `ProgressSnapshot` should carry an ad-hoc TTC denominator.
+
+### Forcing rollups (three 2-D tables)
+
+`ForcingRollups` is published on every tick. Two of its tables are
+owned by the framework coordinator; the third is read directly from
+radical when the snapshot is built.
+
+| Axis pair         | Owner        | Source                                                 |
+|-------------------|--------------|--------------------------------------------------------|
+| `[feature, level]` | `radical`    | `Solver::propagations_by_kind_level()` (2-D `Vec`)     |
+| `[stage, level]`   | coordinator  | Sum of `ForcingDelta::by_level_feature` per stage     |
+| `[stage, feature]` | coordinator  | Same source, rolled up along the other axis          |
+
+"Feature" is a `PropKind` (`Clause`, `Pb`, `QuadPb`, `Xor`,
+`Spectral`, `Mdd`, `PbSetEq`). "Level" is the SAT solver's decision
+level at the moment the literal was forced. "Stage" is the framework
+`StageId` of the handler that produced the forcing event (e.g.
+`"boundary"`, `"solve_w"`, `"solve_z"`, `"solve_xy"`).
+
+Sum of any one rollup equals `Solver::num_propagations()` — this is
+the main correctness invariant to assert in tests.
+
+### Fan-out and edge flow
+
+`edge_flow: BTreeMap<(from_stage, to_stage), EdgeFlowCounters>`
+tracks per-edge lifecycle counts (`spawned`, `dropped`, `queued`,
+`started`, `completed`). `fanout_roots: BTreeMap<fanout_root_id,
+FanoutRootCounters>` tracks the live-descendants / completed-
+descendants / credited-mass for each subtree root.
+
+Together these support the "Sankey-like text flow report" and
+"per-level cut attribution" required by §8.1 of
+`UNIFIED_SEARCH_FRAMEWORK_SPEC.md`.
+
+### Deferrals, not timeouts
+
+Stage handlers do not return "timed out". On budget exhaustion they
+return a `MassDelta` (bits actually covered) plus a `Continuation`:
+either `Split(children)` (residual branched into smaller items) or
+`Resume(item)` (same sub-cube, saved-solver-checkpoint payload).
+Both variants add their items to the same `edge_flow` and forcing
+rollups as fresh work.
+
+The TTC denominator therefore never double-counts coverage: a
+handler only credits the sub-cube it actually eliminated; the rest
+goes back to the queue as a smaller problem.
+
+---
+
+# `--wz=sync` blocks
 
 A verbose run of `--wz=sync` emits four blocks after the search ends
 (whether it found a solution, hit `--sat-secs` timeout, or exhausted
 the tree). All four are written to stderr so they survive timeouts
 and redirections that only capture stdout. This doc is the reader's
-guide to those blocks.
+guide to those blocks. The blocks pre-date the universal schema
+above and remain until the sync walker is ported onto the framework
+engine (see `UNIFIED_SEARCH_FRAMEWORK_SPEC.md` §5.3).
 
 Example invocation used throughout:
 
