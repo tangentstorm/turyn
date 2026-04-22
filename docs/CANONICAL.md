@@ -185,6 +185,22 @@ Remaining items, by diminishing returns:
   earlier, at `Boundary` emission, to prune non-canonical boundaries
   before they multiply out over tuples.
 
+- **`z[n-1] = -1` tail pin in the MDD builder (experimental).**  Rule (i)
+  pins `z[0]=x[0]=y[0]=x[n-1]=y[n-1]=+1`; combined with the lag-(n-1)
+  vanishing identity (where `W` contributes nothing since `len(W)=n-1`),
+  this forces `z[n-1]=-1`.  Enable with `MDD_PIN_Z_TAIL=1` in
+  `gen_mdd` to skip the `Z`-bit=+1 half at sub-MDD position `2k-1`
+  (level 1 in bouncing order) up-front.  Measured on sequential builds:
+  final node count is unchanged (k=5: 600→600; k=7: 13989→13989 —
+  the pruned branches were already collapsing to memoized dead
+  states via later lag checks), but DFS work drops ~half
+  (`zw_memo` entries at k=5 4054→1928, at k=7 210210→96700).
+  Correctness smoke: `--n=18 --wz=apart --mdd-k=5` still finds
+  TT(18); full test suite (50 tests) passes with `MDD_PIN_Z_TAIL=1`.
+  Gated on `ctx.symmetry_break` so `build_extension` (which sets
+  `symmetry_break=false` and inherits the tail bit from base bits)
+  is unaffected.
+
 ### Original encoding sketches (for the record)
 
 #### Rules (ii), (iii), (iv) — palindromic-break chain

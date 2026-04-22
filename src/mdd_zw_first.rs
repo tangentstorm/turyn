@@ -691,6 +691,7 @@ impl ZwFirstMdd {
             close_pair_at_level: close_pair_at_level.clone(),
             w_tail_pos,
             target_pair_offset: 0,
+            pin_z_tail: std::env::var("MDD_PIN_Z_TAIL").is_ok(),
         };
         let xy_ctx = XyBuildCtx {
             pos_order: pos_order.clone(),
@@ -929,6 +930,13 @@ pub struct ZwBuildCtx {
     /// the main build; equal to `base_k` in `build_extension` where the
     /// extension MDD starts at target pair `base_k`.
     pub target_pair_offset: usize,
+    /// Experimental: pin `z[n-1] = -1` at MDD position `2k-1` (Z-bit = 0).
+    /// Consequence of rule (i) `z[0]=x[0]=y[0]=x[n-1]=y[n-1]=+1` plus the
+    /// lag-(n-1) vanishing identity (W contributes zero at lag n-1 since
+    /// `len(W) = n-1`): `2·z[n-1] + x[0]·x[n-1] + y[0]·y[n-1] = 0` ⇒
+    /// `z[n-1] = -1`.  Enabled via `MDD_PIN_Z_TAIL=1`; off in
+    /// `build_extension` (no new Z tail there).
+    pub pin_z_tail: bool,
 }
 
 /// DFS builder for ZW half. At the boundary, delegates to build_xy_dfs.
@@ -1017,6 +1025,14 @@ pub fn build_zw_dfs(
     let mut children = [DEAD; 4];
     for branch in 0u32..4 {
         if ctx.symmetry_break && new_pos == 0 && branch != 0b11 { continue; }
+        // Rule (i) consequence: z[n-1] = -1.  MDD position 2k-1 holds z[n-1],
+        // and Z-bit = branch & 1 with bit=1 ⇒ z=+1.  Skip Z-bit=1 branches
+        // there so only z[n-1]=-1 survives.  Gated on symmetry_break (the XY
+        // half's x[n-1]=y[n-1]=+1 pin, which the derivation relies on, is
+        // also gated on symmetry_break).
+        if ctx.pin_z_tail && ctx.symmetry_break
+            && new_pos == 2 * ctx.k - 1
+            && (branch & 0b01) != 0 { continue; }
         if !ctx.restrict_branches.is_empty() {
             let mut skip = false;
             for &(rlevel, rbranch) in &ctx.restrict_branches {
@@ -1950,6 +1966,9 @@ pub fn build_extension(
         // position ever matches and the DFS never re-snapshots.
         w_tail_pos: usize::MAX,
         target_pair_offset: base_k,
+        // Z tail pin is applied only in the base build; extension inherits
+        // the pinned value via the base's bits.
+        pin_z_tail: false,
     };
     let ext_xy_ctx = XyBuildCtx {
         pos_order,
