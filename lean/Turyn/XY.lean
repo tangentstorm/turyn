@@ -223,7 +223,7 @@ theorem xy_base_k2 {n : Nat} (S : TurynTypeSeq n) (hn : 3 ≤ n)
   have h2n : 2 + (n - 2) = n := by omega
   rw [h1n, h2n] at hph
   rw [hc.1, hc.2.1, uAt_one_of_canonical1_head hc, uAt_one_of_canonical1_tail (by omega) hc] at hph
-  convert hph using 2 <;> ring
+  convert hph using 2 ; ring
 
 theorem xy_base_k3 {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
     (hc : Canonical1 n S) : uAt S (n - 2) = -(uAt S 3) := by
@@ -232,11 +232,11 @@ theorem xy_base_k3 {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
       have hT3_mod4 : (aperiodicAutocorr S.A (n - 3) + aperiodicAutocorr S.B (n - 3)) % 4 = 2 := by
         apply parity_hammer S 3 (by omega) (by omega);
       convert hT3_mod4 using 1;
-      rw [ Turyn.T_k_as_U_sum S 3 ( by omega ) ( by omega ) ] ; norm_num [ Finset.sum_range_succ ] ; ring;
-      rw [ show 3 + ( n - 3 ) = n by omega, show 1 + ( n - 3 ) = n - 2 by omega, show 2 + ( n - 3 ) = n - 1 by omega ] ; ring;
-      rw [ show aAt S 1 = 1 by exact hc.1, show aAt S n = 1 by exact hc.2.1, show uAt S 1 = 1 by exact uAt_one_of_canonical1_head hc, show uAt S n = 1 by exact uAt_one_of_canonical1_tail ( by linarith ) hc ] ; ring;
-      rw [ show uAt S ( n - 1 ) = -uAt S 2 by exact xy_base_k2 S ( by omega ) hc ] ; ring;
-      rw [ show uAt S 2 ^ 2 = 1 by rw [ sq, uAt_sq S 2 ( by linarith ) ( by omega ) ] ] ; ring
+      rw [ Turyn.T_k_as_U_sum S 3 ( by omega ) ( by omega ) ] ; norm_num [ Finset.sum_range_succ ] ; ring_nf;
+      rw [ show 3 + ( n - 3 ) = n by omega, show 1 + ( n - 3 ) = n - 2 by omega, show 2 + ( n - 3 ) = n - 1 by omega ] ; ring_nf;
+      rw [ show aAt S 1 = 1 by exact hc.1, show aAt S n = 1 by exact hc.2.1, show uAt S 1 = 1 by exact uAt_one_of_canonical1_head hc, show uAt S n = 1 by exact uAt_one_of_canonical1_tail ( by linarith ) hc ] ; ring_nf;
+      rw [ show uAt S ( n - 1 ) = -uAt S 2 by exact xy_base_k2 S ( by omega ) hc ] ; ring_nf;
+      rw [ show uAt S 2 ^ 2 = 1 by rw [ sq, uAt_sq S 2 ( by linarith ) ( by omega ) ] ] ; ring_nf
 
 /-
 Endpoint-pair mod-4 lemma: the expression
