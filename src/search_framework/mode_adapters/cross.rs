@@ -29,7 +29,6 @@ use std::sync::Arc;
 use crate::config::SearchConfig;
 use crate::enumerate::{build_w_candidates, for_each_zw_pair, CandidateZW};
 use crate::legacy_search::SearchStats;
-use crate::mdd_pipeline::build_phase_b_context;
 use crate::search_framework::engine::{AdapterInit, SearchModeAdapter};
 use crate::search_framework::mass::{CoverageQuality, MassValue, SearchMassModel};
 use crate::search_framework::stage::{
@@ -37,7 +36,7 @@ use crate::search_framework::stage::{
 };
 use crate::spectrum::{SeqWithSpectrum, SpectralFilter, SpectralIndex};
 use crate::types::{verify_tt, PackedSeq, Problem, SumTuple};
-use crate::xy_sat::{walk_xy_sub_mdd, SatXYTemplate, SolveXyPerCandidate, XyTryResult};
+use crate::xy_sat::{SatXYTemplate, SolveXyPerCandidate, XyTryResult};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub const STAGE_CROSS: StageId = "cross.enumerate";
@@ -79,12 +78,10 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
         let mut w_cache: HashMap<i32, (Vec<SeqWithSpectrum>, SpectralIndex)> = HashMap::new();
         let mut seen_zw: std::collections::HashSet<Vec<i32>> = std::collections::HashSet::new();
 
-        // XY stage state. Each surviving (Z, W) pair clones a template
-        // matching its tuple and walks the XY sub-MDD. The shared
-        // `PhaseBContext` (built via `build_phase_b_context`) provides
-        // the MDD nodes + `xy_pos_order`.
-        let ctx = build_phase_b_context(problem, tuples, cfg, self.verbose, self.k);
-        let k = ctx.k;
+        // XY stage state. Each surviving (Z, W) pair clones a
+        // template matching its tuple and brute-forces the
+        // `(x_bits, y_bits)` boundary combinations.
+        let k = self.k.min((problem.n - 1) / 2).min(problem.m() / 2);
         let mut template_cache: HashMap<Vec<(i32, i32, i32, i32)>, SatXYTemplate> = HashMap::new();
 
         for (tuple_idx, tuple) in tuples.iter().copied().enumerate() {
@@ -118,47 +115,19 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                     if !seen_zw.insert(zw.clone()) {
                         return true;
                     }
-                    // Navigate the ZW half of the MDD to the xy_root
-                    // for this boundary. Mirrors `process_solve_xy`'s
-                    // deleted machinery, kept inline here so the XY
-                    // fast path still benefits from MDD pruning
-                    // without a scheduled handler round-trip.
-                    let mut z_bits = 0u32;
-                    let mut w_bits = 0u32;
-                    for i in 0..k {
-                        if z_seq.get(i) == 1 {
-                            z_bits |= 1 << i;
-                        }
-                        if z_seq.get(problem.n - k + i) == 1 {
-                            z_bits |= 1 << (k + i);
-                        }
-                        if w_seq.get(i) == 1 {
-                            w_bits |= 1 << i;
-                        }
-                        if w_seq.get(problem.m() - k + i) == 1 {
-                            w_bits |= 1 << (k + i);
-                        }
-                    }
-                    let mut nid = ctx.mdd.root;
-                    let mut live = true;
-                    for level in 0..ctx.zw_depth {
-                        if nid == turyn::mdd_reorder::DEAD {
-                            live = false;
-                            break;
-                        }
-                        let pos = ctx.xy_pos_order[level];
-                        let z_val = (z_bits >> pos) & 1;
-                        let w_val = (w_bits >> pos) & 1;
-                        let branch = (z_val | (w_val << 1)) as usize;
-                        if nid != turyn::mdd_reorder::LEAF {
-                            nid = ctx.mdd.nodes[nid as usize][branch];
-                        }
-                    }
-                    if !live || nid == turyn::mdd_reorder::DEAD {
-                        return true;
-                    }
-                    let xy_root = nid;
-
+                    // Brute-force XY: iterate every `(x_bits, y_bits)`
+                    // combination and try the XY SAT. Cross mode does
+                    // NOT attempt to reuse the MDD's XY sub-tree
+                    // pruning here because the MDD's live-path set
+                    // was built from the Turyn-identity producer,
+                    // not from brute-force `Z × W` enumeration — the
+                    // two live sets don't intersect in general, so
+                    // requiring an MDD-valid boundary would reject
+                    // every pair the cross producer generates. At
+                    // small `k` the `2^(4k)` enumeration is the
+                    // honest brute-force behaviour the docstring
+                    // promises; at larger `k` it's expensive but
+                    // bounded.
                     let tuple_key: Vec<(i32, i32, i32, i32)> =
                         vec![(tuple.x, tuple.y, tuple.z, tuple.w)];
                     let template = template_cache.entry(tuple_key).or_insert_with(|| {
@@ -179,41 +148,34 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                         if problem.n > 30 {
                             state.solver.set_conflict_limit(5000);
                         }
-                        walk_xy_sub_mdd(
-                            xy_root,
-                            0,
-                            ctx.xy_zw_depth,
-                            0,
-                            0,
-                            &ctx.xy_pos_order,
-                            &ctx.mdd.nodes,
-                            ctx.max_bnd_sum,
-                            ctx.middle_n as i32,
-                            std::slice::from_ref(&tuple),
-                            &mut |x_bits, y_bits| {
-                                if found.load(Ordering::Relaxed) {
-                                    return;
+                        let boundary_bits = 2 * k;
+                        let total_xy = 1u32 << (2 * boundary_bits);
+                        for code in 0..total_xy {
+                            if found.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let x_bits = code & ((1u32 << boundary_bits) - 1);
+                            let y_bits = code >> boundary_bits;
+                            let (result, _stats) = state.try_candidate(x_bits, y_bits);
+                            if let XyTryResult::Sat(x, y) = result {
+                                if verify_tt(
+                                    problem,
+                                    &x,
+                                    &y,
+                                    &z_seq_clone,
+                                    &w_seq_clone,
+                                ) {
+                                    found.store(true, Ordering::Relaxed);
+                                    let _ = self.result_tx.send((
+                                        x,
+                                        y,
+                                        z_seq_clone.clone(),
+                                        w_seq_clone.clone(),
+                                    ));
+                                    break;
                                 }
-                                let (result, _stats) = state.try_candidate(x_bits, y_bits);
-                                if let XyTryResult::Sat(x, y) = result {
-                                    if verify_tt(
-                                        problem,
-                                        &x,
-                                        &y,
-                                        &z_seq_clone,
-                                        &w_seq_clone,
-                                    ) {
-                                        found.store(true, Ordering::Relaxed);
-                                        let _ = self.result_tx.send((
-                                            x,
-                                            y,
-                                            z_seq_clone.clone(),
-                                            w_seq_clone.clone(),
-                                        ));
-                                    }
-                                }
-                            },
-                        );
+                            }
+                        }
                     }
                     !found.load(Ordering::Relaxed)
                 },
