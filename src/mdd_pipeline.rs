@@ -799,9 +799,15 @@ pub(crate) fn process_solve_z(
         return;
     }
 
-    let mut z_solver = scratch.z_bases.remove(&0i32).unwrap_or_else(||
-        ctx.z_tmpl.build_base_solver_quad_pb_pb_set(ctx.middle_n, &z_counts)
-    );
+    // Always build a fresh z_solver per call. The earlier
+    // `scratch.z_bases` cache (keyed by a constant `0i32`) reused a
+    // solver across calls via `save_checkpoint`/`restore_checkpoint`
+    // — but that reuse silently produced spurious UNSATs at small
+    // middle_n (e.g. n=4 middle_n=2), making the canonical TT(n)
+    // unreachable in the framework path. `build_base_solver_quad_pb_pb_set`
+    // is cheap; rebuilding each call trades a tiny per-call cost for
+    // correctness.
+    let mut z_solver = ctx.z_tmpl.build_base_solver_quad_pb_pb_set(ctx.middle_n, &z_counts);
     let z_cp = z_solver.save_checkpoint();
     if scratch.z_prep_z_bits != Some(sz.z_bits) {
         scratch.z_prep.rebuild(&ctx.z_tmpl, ctx.middle_n, &z_boundary);
@@ -1082,9 +1088,13 @@ pub(crate) fn process_solve_z(
     metrics.flow_z_root_forced.fetch_add(z_pre_forced, AtomicOrdering::Relaxed);
     metrics.flow_z_free_sum.fetch_add(z_free_vars, AtomicOrdering::Relaxed);
 
+    // No cache-insert: the fresh-per-call policy above makes the
+    // HashMap unused; keep the slot drained so future readers see
+    // it isn't populated. The restore_checkpoint + spectral=None
+    // are harmless but redundant now.
+    let _ = z_cp;
     z_solver.spectral = None;
-    z_solver.restore_checkpoint(z_cp);
-    scratch.z_bases.insert(0i32, z_solver);
+    let _ = &mut scratch.z_bases;
     metrics.stage_exit[2].fetch_add(1, AtomicOrdering::Relaxed);
 }
 
