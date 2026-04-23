@@ -348,13 +348,14 @@ fn run_framework_mdd_mode(
         WzMode::Together => "together",
         WzMode::Sync => "sync",
     };
+    // Clock starts here — *before* `MddStagesAdapter::build`, which
+    // loads the MDD file and enumerates every live boundary
+    // (~18M entries at n=26 k=7). Both the `--sat-secs` watchdog
+    // and the engine's `elapsed` reporting need to cover that
+    // setup; pass `start` into `engine.run_since` below.
+    let start = std::time::Instant::now();
     // Construct the engine up front so we can pull its live cancel
-    // flag *before* the adapter does any expensive setup. The
-    // `MddStagesAdapter::build` call below loads the MDD file and
-    // enumerates every live boundary (~18M entries at n=26 k=7) —
-    // work that can dominate the wall-clock budget — and the
-    // watchdog must be armed before it starts so `--sat-secs`
-    // actually bounds the full command lifecycle.
+    // flag *before* the adapter does any expensive setup.
     let mut engine = SearchEngine::<MddPayload>::new(
         EngineConfig::default(),
         Box::new(GoldThenWork::new(32)),
@@ -381,7 +382,7 @@ fn run_framework_mdd_mode(
         solutions
     });
 
-    engine.run(&adapter, move |event| match event {
+    engine.run_since(start, &adapter, move |event| match event {
         SearchEvent::Progress(p) => {
             if verbose {
                 eprintln!(
@@ -476,6 +477,7 @@ fn run_framework_stochastic_mode(
     cfg: &SearchConfig,
     verbose: bool,
 ) {
+    let start = std::time::Instant::now();
     let time_limit = if cfg.stochastic_seconds > 0 {
         cfg.stochastic_seconds
     } else {
@@ -486,7 +488,7 @@ fn run_framework_stochastic_mode(
         EngineConfig::default(),
         Box::new(GoldThenWork::new(32)),
     );
-    engine.run(&adapter, |event| match event {
+    engine.run_since(start, &adapter, |event| match event {
         SearchEvent::Progress(p) => {
             if verbose {
                 eprintln!(
@@ -516,6 +518,9 @@ fn run_framework_cross_mode(
     k: usize,
 ) {
     use crate::search_framework::mode_adapters::cross::{CrossAdapter, CrossPayload};
+    // Clock starts before adapter build so Finished `elapsed`
+    // includes the setup phase the `--sat-secs` watchdog covers.
+    let start = std::time::Instant::now();
     let (adapter, result_rx) = CrossAdapter::build(problem, tuples, cfg.clone(), verbose, k);
     let mut engine = SearchEngine::<CrossPayload>::new(
         EngineConfig::default(),
@@ -535,7 +540,7 @@ fn run_framework_cross_mode(
     });
     let watchdog_handle =
         spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
-    engine.run(&adapter, |event| match event {
+    engine.run_since(start, &adapter, |event| match event {
         SearchEvent::Progress(p) => {
             if verbose {
                 eprintln!(
@@ -566,6 +571,10 @@ fn run_framework_cross_mode(
 }
 
 fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) {
+    // Sync walker's setup is cheap (no MDD load, no boundary
+    // enumeration) but we still clock from here so Finished
+    // `elapsed` is comparable across modes.
+    let start = std::time::Instant::now();
     let mut engine = SearchEngine::<SyncPayload>::new(
         EngineConfig::default(),
         Box::new(GoldThenWork::new(32)),
@@ -596,7 +605,7 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
     });
     let watchdog_handle =
         spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
-    engine.run(&adapter, |event| match event {
+    engine.run_since(start, &adapter, |event| match event {
         SearchEvent::Progress(p) => {
             if verbose {
                 eprintln!(

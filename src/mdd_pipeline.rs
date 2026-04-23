@@ -2047,7 +2047,7 @@ pub(crate) fn run_mdd_sat_search(
             }
             found
         });
-        engine.run(&adapter, |_| {});
+        engine.run_since(start, &adapter, |_| {});
         drop(adapter);
         let found = drain.join().unwrap_or(None);
         if verbose {
@@ -2093,7 +2093,7 @@ pub(crate) fn run_mdd_sat_search(
         }
         found
     });
-    engine.run(&adapter, |event| {
+    engine.run_since(start, &adapter, |event| {
         if let SearchEvent::Progress(p) = event {
             if verbose {
                 eprintln!(

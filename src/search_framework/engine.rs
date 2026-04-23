@@ -93,9 +93,24 @@ impl<T: Send + 'static> SearchEngine<T> {
     pub fn run(
         &mut self,
         adapter: &dyn SearchModeAdapter<T>,
+        on_event: impl FnMut(SearchEvent),
+    ) {
+        self.run_since(Instant::now(), adapter, on_event)
+    }
+
+    /// Variant of [`run`] that takes a caller-provided `start` so
+    /// `ProgressSnapshot::elapsed` covers pre-engine setup work
+    /// (MDD load, seed-boundary enumeration, scheduler fill) the
+    /// caller already did before handing control over. Without
+    /// this override the Finished summary reported `elapsed=0.3s`
+    /// after the user actually spent ~1s — `--sat-secs` fires in
+    /// the setup phase and the coordinator loop barely runs.
+    pub fn run_since(
+        &mut self,
+        start: Instant,
+        adapter: &dyn SearchModeAdapter<T>,
         mut on_event: impl FnMut(SearchEvent),
     ) {
-        let start = Instant::now();
         let mut last_progress = start;
         let mut edge_flow: BTreeMap<(String, String), EdgeFlowCounters> = BTreeMap::new();
         let mut fanout_roots: BTreeMap<u64, FanoutRootCounters> = BTreeMap::new();
