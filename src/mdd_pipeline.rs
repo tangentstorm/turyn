@@ -1992,9 +1992,13 @@ pub(crate) fn run_mdd_sat_search(
             EngineConfig::default(),
             Box::new(GoldThenWork::new(32)),
         );
+        let cancel_flag = engine.cancel_flag();
         let drain = std::thread::spawn(move || {
             let mut found = None;
             while let Ok(sol) = result_rx.recv() {
+                // See comment in the MDD branch below for the
+                // cancel-on-first-solution rationale.
+                cancel_flag.store(true, AtomicOrdering::Relaxed);
                 found = Some(sol);
             }
             found
@@ -2032,10 +2036,15 @@ pub(crate) fn run_mdd_sat_search(
         Box::new(GoldThenWork::new(32)),
     );
     let found_ctx = Arc::clone(&adapter.ctx.found);
+    let cancel_flag = engine.cancel_flag();
     let drain = std::thread::spawn(move || {
         let mut found = false;
         while let Ok(_sol) = result_rx.recv() {
             found_ctx.store(true, AtomicOrdering::Relaxed);
+            // Stop the engine on first solution — otherwise the
+            // coordinator drains the rest of the queue before
+            // `engine.run` returns, wasting work.
+            cancel_flag.store(true, AtomicOrdering::Relaxed);
             found = true;
         }
         found

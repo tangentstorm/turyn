@@ -82,6 +82,14 @@ impl<T: Send + 'static> SearchEngine<T> {
         self.cancelled.store(true, Ordering::Relaxed);
     }
 
+    /// Hand out a clone of the internal cancel flag. Lets external
+    /// threads (e.g. the solution drain) stop the search without
+    /// holding a `&SearchEngine` reference (which is borrowed by the
+    /// main thread running `run()`).
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+
     pub fn run(
         &mut self,
         adapter: &dyn SearchModeAdapter<T>,
