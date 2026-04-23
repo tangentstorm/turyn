@@ -436,6 +436,53 @@ fn run_framework_stochastic_mode(
     );
 }
 
+fn run_framework_cross_mode(
+    problem: Problem,
+    tuples: Vec<SumTuple>,
+    cfg: &SearchConfig,
+    verbose: bool,
+    k: usize,
+) {
+    use crate::search_framework::mode_adapters::cross::{CrossAdapter, CrossPayload};
+    let (adapter, result_rx) = CrossAdapter::build(problem, tuples, cfg.clone(), verbose, k);
+    let mut engine = SearchEngine::<CrossPayload>::new(
+        EngineConfig::default(),
+        Box::new(GoldThenWork::new(32)),
+    );
+    let found_flag = std::sync::Arc::clone(&adapter.found);
+    let drain = std::thread::spawn(move || {
+        let mut solutions = Vec::new();
+        while let Ok(sol) = result_rx.recv() {
+            found_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            solutions.push(sol);
+        }
+        solutions
+    });
+    engine.run(&adapter, |event| match event {
+        SearchEvent::Progress(p) => {
+            if verbose {
+                eprintln!(
+                    "[framework:cross] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}",
+                    p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc
+                );
+            }
+        }
+        SearchEvent::Finished(p) => {
+            println!(
+                "Framework search (--wz=cross): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?}",
+                p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc
+            );
+        }
+    });
+    drop(adapter);
+    let solutions = drain.join().unwrap_or_default();
+    println!(
+        "Framework search (--wz=cross): found_solution={} ({} solution(s))",
+        !solutions.is_empty(),
+        solutions.len()
+    );
+}
+
 fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) {
     let sync_cfg = crate::sync_walker::SyncConfig {
         sat_secs: cfg.sat_secs,
@@ -1212,10 +1259,12 @@ fn main() {
                 });
             }
         }
-        if matches!(mode, WzMode::Cross | WzMode::Apart | WzMode::Together) {
-            run_framework_mdd_mode(cfg.problem, tuples, &cfg, true, mdd_k);
-        } else {
-            run_framework_sync_mode(cfg.problem, &cfg, true);
+        match mode {
+            WzMode::Cross => run_framework_cross_mode(cfg.problem, tuples, &cfg, true, mdd_k),
+            WzMode::Apart | WzMode::Together => {
+                run_framework_mdd_mode(cfg.problem, tuples, &cfg, true, mdd_k)
+            }
+            WzMode::Sync => run_framework_sync_mode(cfg.problem, &cfg, true),
         }
     }
 }

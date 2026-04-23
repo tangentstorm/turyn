@@ -50,28 +50,30 @@ impl StageHandler<SyncPayload> for SyncWalkStage {
         if let Some(sol) = found {
             let _ = self.result_tx.send(sol);
         }
-        let mut out = StageOutcome::default();
-        out.mass_delta = MassDelta {
-            covered_exact: MassValue(1.0),
-            covered_partial: MassValue::ZERO,
-        };
-        out
+        // Do NOT credit any `covered` here. Credit the full 1.0 when
+        // the wrapper returns would falsely drive the universal
+        // summary to `covered=1.000/1.000 ttc=0` regardless of what
+        // the walker's own per-level coverage reports. The
+        // universal schema marks the walk as
+        // `TtcQuality::Projected`; its own Block-2/Block-3 TTC
+        // table is authoritative. (PR review flagged this as
+        // actively misleading.)
+        StageOutcome::default()
     }
 }
 
 pub struct SyncWalkMassModel;
 
 impl SearchMassModel for SyncWalkMassModel {
-    fn total_mass(&self) -> MassValue {
-        MassValue(1.0)
-    }
     fn covered_mass(&self) -> MassValue {
         MassValue::ZERO
     }
     fn quality(&self) -> CoverageQuality {
-        // The walker is exhaustive within its budget, but the single
-        // `1.0` unit is coarse; mark as projected pending the
-        // per-level coverage-bits upgrade.
+        // The walker is exhaustive within its budget but the
+        // single-wrapper handler has no additive coverage signal
+        // to feed the universal `MassSnapshot`. `Projected` tells
+        // consumers the universal TTC is not meaningful for this
+        // mode — the sync walker's own telemetry is authoritative.
         CoverageQuality::Projected
     }
 }

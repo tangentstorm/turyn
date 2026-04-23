@@ -116,11 +116,17 @@ pub struct BoundaryStage {
     ctx: Arc<PhaseBContext>,
     metrics: PipelineMetrics,
     use_wz_mode: bool,
-    /// Coverage-bits credit per invocation. Set to
-    /// `log2(seed_boundaries) / seed_boundaries` so total covered
-    /// across the whole run equals `log2(seed_boundaries)`, matching
-    /// `CoverageBitsMassModel::total_mass`.
-    per_boundary_bits: f64,
+    /// Fraction of the search space eliminated when a boundary
+    /// gets filtered out at stage 0 (every candidate tuple fails
+    /// the sum-feasibility or `any_valid_xy` checks). Set to
+    /// `1 / seed_boundaries`. Boundaries that instead emit a
+    /// SolveW or SolveWZ item credit **nothing** here — the
+    /// sub-cube is still alive, and `SolveZStage` will credit
+    /// when it's actually dispatched. Without this split the
+    /// progress meter shot to 100% immediately after queue drain
+    /// even though the real downstream SAT work hadn't happened
+    /// yet (the issue flagged in the PR review).
+    per_boundary_fraction: f64,
 }
 
 impl StageHandler<MddPayload> for BoundaryStage {
@@ -138,16 +144,18 @@ impl StageHandler<MddPayload> for BoundaryStage {
         };
         let emitted_raw = process_boundary(bnd, &self.ctx, &self.metrics, self.use_wz_mode);
         let mut out = StageOutcome::default();
+        let filtered_out = emitted_raw.is_empty();
         out.emitted = wrap_items(emitted_raw, &parent_meta);
-        // Coverage-bits credit: `log2(N) / N` per boundary, so
-        // covered grows linearly from 0 to `log2(N)` over the run —
-        // matching `CoverageBitsMassModel::total_mass` and the
-        // universal TTC unit from `docs/TELEMETRY.md`. A finer
-        // per-forced-literal breakdown is a follow-up.
-        out.mass_delta = crate::search_framework::mass::MassDelta {
-            covered_exact: crate::search_framework::mass::MassValue(self.per_boundary_bits),
-            covered_partial: crate::search_framework::mass::MassValue::ZERO,
-        };
+        if filtered_out {
+            // Stage-0 filter eliminated the whole sub-cube —
+            // credit the boundary's 1/N share now.
+            out.mass_delta = crate::search_framework::mass::MassDelta {
+                covered_exact: crate::search_framework::mass::MassValue(
+                    self.per_boundary_fraction,
+                ),
+                covered_partial: crate::search_framework::mass::MassValue::ZERO,
+            };
+        }
         out
     }
 }
@@ -281,6 +289,13 @@ pub struct SolveZStage {
         crate::types::PackedSeq,
     )>,
     scratch: Mutex<SolveZScratch>,
+    /// Fraction of the search space eliminated per `SolveZ`
+    /// invocation. Set to `1 / seed_boundaries`. `SolveZ` is
+    /// terminal for its (z_bits, w_middle) sub-cube: every XY
+    /// SAT attempt fires inline before this handler returns, so
+    /// crediting here gives progress that tracks real downstream
+    /// work rather than the fast `BoundaryStage` dispatch loop.
+    per_solve_z_fraction: f64,
 }
 
 impl StageHandler<MddPayload> for SolveZStage {
@@ -322,27 +337,34 @@ impl StageHandler<MddPayload> for SolveZStage {
             &self.result_tx,
             rng,
         );
-        StageOutcome::default()
+        let mut out = StageOutcome::default();
+        // Credit the sub-cube eliminated by this completed SolveZ
+        // (and its inline XY walk). Typically several SolveZ items
+        // fire per boundary; `apply_delta` clamps `covered` at the
+        // total so overshoot is harmless. The effect is that
+        // `covered` tracks real SAT work rather than boundary
+        // dispatch — addresses the "front-loaded coverage" issue
+        // flagged in the PR review.
+        out.mass_delta = crate::search_framework::mass::MassDelta {
+            covered_exact: crate::search_framework::mass::MassValue(self.per_solve_z_fraction),
+            covered_partial: crate::search_framework::mass::MassValue::ZERO,
+        };
+        out
     }
 }
 
-/// Coverage-bits mass model for the staged MDD adapter.
-/// `total_mass = log2(live_boundaries)` — the number of bits
-/// needed to enumerate every live ZW path through the MDD.
-/// `BoundaryStage::handle` credits `log2(N) / N` bits per
-/// invocation, so covered grows linearly from 0 to `total_mass`
-/// as boundaries complete. A proper per-handler coverage-bits
-/// breakdown (log2 of the sub-cube each forced literal
-/// eliminates) is a follow-up; this rescaling aligns the MDD
-/// unit with `docs/TELEMETRY.md`'s direct TTC formulation.
-pub struct CoverageBitsMassModel {
-    total: MassValue,
-}
+/// Fractional mass model for the staged MDD adapter.
+/// `total_mass = 1.0` (the whole search space). `BoundaryStage`
+/// credits `1/N` when a boundary is filter-rejected outright (no
+/// SolveW emitted); `SolveZStage` credits `1/N` when a downstream
+/// `(z_bits, w_middle)` sub-cube is fully searched (inline XY
+/// included). Both sites use fractions, which are additive over
+/// disjoint cubes — see `mass::MassValue` for the reasoning. The
+/// sum across all completed work can exceed `1.0` when many
+/// `SolveZ` items per boundary terminate; `apply_delta` clamps.
+pub struct McddFractionMassModel;
 
-impl SearchMassModel for CoverageBitsMassModel {
-    fn total_mass(&self) -> MassValue {
-        self.total
-    }
+impl SearchMassModel for McddFractionMassModel {
     fn covered_mass(&self) -> MassValue {
         MassValue::ZERO
     }
@@ -477,9 +499,9 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                 ctx: Arc::clone(&self.ctx),
                 metrics: self.metrics.clone(),
                 use_wz_mode: self.use_wz_mode,
-                per_boundary_bits: {
+                per_boundary_fraction: {
                     let n = self.seed_boundaries.len() as f64;
-                    if n > 0.0 { n.log2() / n } else { 0.0 }
+                    if n > 0.0 { 1.0 / n } else { 0.0 }
                 },
             }),
         );
@@ -535,18 +557,17 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                     },
                     rng: 0xFEEDFACE_BAADF00D,
                 }),
+                per_solve_z_fraction: {
+                    let n = self.seed_boundaries.len() as f64;
+                    if n > 0.0 { 1.0 / n } else { 0.0 }
+                },
             }),
         );
         m
     }
 
     fn mass_model(&self) -> Box<dyn SearchMassModel> {
-        // Coverage-bits: `log2` of the number of live ZW paths.
-        let n = self.seed_boundaries.len() as f64;
-        let total_bits = if n > 0.0 { n.log2() } else { 0.0 };
-        Box::new(CoverageBitsMassModel {
-            total: MassValue(total_bits),
-        })
+        Box::new(McddFractionMassModel)
     }
 }
 

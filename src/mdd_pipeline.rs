@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use rustfft::num_complex::Complex;
 
+use turyn::mdd_bfs;
 use turyn::mdd_reorder;
 use turyn::mdd_zw_first;
 use turyn::sat_z_middle;
@@ -1706,15 +1707,21 @@ pub(crate) fn build_phase_b_context(
             Arc::new(m)
         }
         None => {
-            eprintln!(
-                "No MDD file found (tried mdd-1.bin through mdd-{}.bin)",
-                try_k
-            );
-            eprintln!(
-                "Generate one with: cargo build --release --bin gen_mdd && target/release/gen_mdd {}",
-                k
-            );
-            std::process::exit(1);
+            // No `mdd-<k>.bin` available — build one in memory via
+            // `mdd_bfs::build_bfs_mdd`. Fast for small k; identical
+            // structure to what `target/release/gen_mdd` writes. Prevents
+            // the PR-review-flagged regression where `--wz=cross`
+            // aborted on small n whenever the repo lacked a precomputed
+            // MDD file. For larger `k` (n ≥ 26 territory) the user
+            // should still precompute for performance, but it's no
+            // longer a hard requirement.
+            if verbose {
+                eprintln!(
+                    "No mdd-{}.bin file; building in-memory MDD via BFS (one-shot)...",
+                    try_k
+                );
+            }
+            Arc::new(mdd_bfs::build_bfs_mdd(try_k))
         }
     };
     let k = mdd.k;

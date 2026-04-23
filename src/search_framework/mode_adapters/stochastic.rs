@@ -48,21 +48,18 @@ impl StageHandler<StochasticPayload> for StochasticStage {
             self.found
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        let mut out = StageOutcome::default();
-        out.mass_delta = MassDelta {
-            covered_exact: MassValue(1.0),
-            covered_partial: MassValue::ZERO,
-        };
-        out
+        // Stochastic search is non-exhaustive by construction;
+        // crediting `covered=1.0` on return would falsely hit the
+        // universal TTC=0 case. Leave covered at 0 and let the
+        // `TtcQuality::Projected` label signal that the universal
+        // summary is not meaningful for this mode.
+        StageOutcome::default()
     }
 }
 
 pub struct StochasticMassModel;
 
 impl SearchMassModel for StochasticMassModel {
-    fn total_mass(&self) -> MassValue {
-        MassValue(1.0)
-    }
     fn covered_mass(&self) -> MassValue {
         MassValue::ZERO
     }

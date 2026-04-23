@@ -1,20 +1,33 @@
 use std::fmt;
 use std::time::Duration;
 
-/// A mass value measured in **search-space bits**:
-/// `log2(|cube|)` for the sub-cube it represents.
+/// A mass value measured as a **fraction** of the total search
+/// space, in `[0, 1]` (clamped on aggregation). `total_mass` is
+/// always `1.0` by contract — it represents the whole space to be
+/// searched. `covered_mass` is the fraction of that space that a
+/// handler has provably ruled out (either directly, or as the
+/// product of accepted filters).
 ///
-/// `total_mass` for a run is `log2` of the fully-free search space
-/// enumeration count. `covered_mass` accumulates the log-size of
-/// every sub-cube eliminated (by a solved leaf, a deferred credit,
-/// or a forced-literal shrink). Throughput is therefore bits/second
-/// and TTC is `remaining_bits / bits_per_sec` — one dimensionless
-/// unit across every mode.
+/// Fractions are additive over **disjoint** sub-cubes, which makes
+/// this the right unit for the universal TTC formula
+/// `remaining / (covered / elapsed)`. A previous iteration of this
+/// type used `log2(|sub-cube|)` bits; that was mathematically
+/// unsound because logs of disjoint cube sizes do not sum to the
+/// log of the union. Handlers that want to report in bits can
+/// compute `log2(1 / (1 - covered))` at display time without
+/// changing the stored unit.
+///
+/// Handlers that can't cheaply compute a fraction (e.g. the sync
+/// walker and the stochastic sampler) should credit `ZERO` and
+/// set [`TtcQuality::Projected`] so the summary clearly signals
+/// "no universal coverage; see mode-specific telemetry."
 #[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
 pub struct MassValue(pub f64);
 
 impl MassValue {
     pub const ZERO: Self = Self(0.0);
+    /// Convenience: `total_mass = ONE` for every run.
+    pub const ONE: Self = Self(1.0);
 
     pub fn saturating_sub(self, rhs: Self) -> Self {
         Self((self.0 - rhs.0).max(0.0))
@@ -29,19 +42,16 @@ impl fmt::Display for MassValue {
 
 /// Quality label for a published TTC estimate.
 ///
-/// * [`TtcQuality::Direct`] — computed as `elapsed /
-///   cumulative_coverage`, where cumulative coverage is the product
-///   of per-level covered fractions observed so far. Exact iff the
-///   run will continue to forced-literal proportions the sample
-///   implies.
-/// * [`TtcQuality::Projected`] — computed from an explicit model of
-///   the remaining search (e.g. branching-factor extrapolation).
-///   Used when coverage is too small to trust the direct form.
-/// * [`TtcQuality::Hybrid`] — blend; typically the direct form with
-///   projected smoothing on the tail.
-///
-/// Older enum name retained via the `CoverageQuality` alias for
-/// existing call sites; migrate to `TtcQuality`.
+/// * [`TtcQuality::Direct`] — `covered_mass` is a real additive
+///   fraction of the full search space; TTC is trustworthy as a
+///   leading indicator.
+/// * [`TtcQuality::Projected`] — `covered_mass` is estimate-only
+///   (e.g. sync walker, stochastic sampler). The number is
+///   present for dashboard continuity; mode-specific telemetry is
+///   authoritative.
+/// * [`TtcQuality::Hybrid`] — blend; used by adapters that report
+///   a real partial fraction but rely on a tail projection for
+///   the remainder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TtcQuality {
     Direct,
@@ -124,7 +134,12 @@ impl MassSnapshot {
 }
 
 pub trait SearchMassModel: Send + Sync {
-    fn total_mass(&self) -> MassValue;
+    /// Always `MassValue::ONE` under the current fraction-based
+    /// contract. Kept as a method so modes can override for
+    /// diagnostic displays (e.g. report a scaled bit count).
+    fn total_mass(&self) -> MassValue {
+        MassValue::ONE
+    }
     fn covered_mass(&self) -> MassValue;
     fn quality(&self) -> CoverageQuality;
 }
@@ -135,23 +150,23 @@ mod tests {
 
     #[test]
     fn remaining_mass_never_negative() {
-        let mut snap = MassSnapshot::new(MassValue(10.0));
+        let mut snap = MassSnapshot::new(MassValue::ONE);
         snap.apply_delta(MassDelta {
-            covered_exact: MassValue(12.0),
-            covered_partial: MassValue(1.0),
+            covered_exact: MassValue(1.2),
+            covered_partial: MassValue(0.1),
         });
-        assert_eq!(snap.covered().0, 10.0);
+        assert_eq!(snap.covered().0, 1.0);
         assert_eq!(snap.remaining().0, 0.0);
     }
 
     #[test]
     fn covered_mass_is_monotone_for_positive_deltas() {
-        let mut snap = MassSnapshot::new(MassValue(10.0));
+        let mut snap = MassSnapshot::new(MassValue::ONE);
         let mut prev = snap.covered().0;
         for _ in 0..4 {
             snap.apply_delta(MassDelta {
-                covered_exact: MassValue(1.0),
-                covered_partial: MassValue(0.5),
+                covered_exact: MassValue(0.1),
+                covered_partial: MassValue(0.05),
             });
             assert!(snap.covered().0 >= prev);
             prev = snap.covered().0;
@@ -160,7 +175,25 @@ mod tests {
 
     #[test]
     fn ttc_is_none_when_rate_is_zero() {
-        let snap = MassSnapshot::new(MassValue(10.0));
+        let snap = MassSnapshot::new(MassValue::ONE);
         assert!(snap.ttc(Duration::from_secs(5)).is_none());
+    }
+
+    #[test]
+    fn disjoint_fractions_sum_to_one() {
+        // The core reason we use fractions, not log2(sub-cube size):
+        // disjoint sub-cubes are additive, so N chunks of size 1/N
+        // sum to exactly 1. With log2(size) they would sum to
+        // -N·log2(N), which is nonsense for "total space covered".
+        let mut snap = MassSnapshot::new(MassValue::ONE);
+        let n = 10;
+        let chunk = 1.0 / n as f64;
+        for _ in 0..n {
+            snap.apply_delta(MassDelta {
+                covered_exact: MassValue(chunk),
+                covered_partial: MassValue::ZERO,
+            });
+        }
+        assert!((snap.covered().0 - 1.0).abs() < 1e-9);
     }
 }
