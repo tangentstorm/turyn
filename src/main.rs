@@ -378,6 +378,9 @@ fn run_framework_mdd_mode(
         }
     });
 
+    // Hold a clone of the metrics so per-stage counters are
+    // readable after `adapter` is dropped below.
+    let metrics = adapter.metrics.clone();
     // Dropping the adapter drops its `result_tx`, which is the
     // last sender (stage handlers cloned from it but they're gone
     // now). The drain thread's `recv` returns Err and it exits.
@@ -395,6 +398,48 @@ fn run_framework_mdd_mode(
             mode_name
         );
     }
+    // Per-stage pruning summary. Surfaces the counters the universal
+    // progress snapshot doesn't carry — where items actually die on
+    // the way to a solution. Matches the shape of the deleted
+    // pre-framework `print_stage_pruning_block` (PR review #7).
+    use std::sync::atomic::Ordering as Ord;
+    let stage_exit: Vec<u64> = metrics.stage_exit.iter().map(|c| c.load(Ord::Relaxed)).collect();
+    eprintln!(
+        "[framework:{}] stage_exit bnd/W/Z/XY = {}/{}/{}/{}",
+        mode_name,
+        stage_exit.first().copied().unwrap_or(0),
+        stage_exit.get(1).copied().unwrap_or(0),
+        stage_exit.get(2).copied().unwrap_or(0),
+        stage_exit.get(3).copied().unwrap_or(0),
+    );
+    eprintln!(
+        "[framework:{}] flow W: unsat={} sol={} spec_fail={} spec_pass={} solves={}",
+        mode_name,
+        metrics.flow_w_unsat.load(Ord::Relaxed),
+        metrics.flow_w_solutions.load(Ord::Relaxed),
+        metrics.flow_w_spec_fail.load(Ord::Relaxed),
+        metrics.flow_w_spec_pass.load(Ord::Relaxed),
+        metrics.flow_w_solves.load(Ord::Relaxed),
+    );
+    eprintln!(
+        "[framework:{}] flow Z: unsat={} sol={} pair_fail={} spec_fail={} solves={}",
+        mode_name,
+        metrics.flow_z_unsat.load(Ord::Relaxed),
+        metrics.flow_z_solutions.load(Ord::Relaxed),
+        metrics.flow_z_pair_fail.load(Ord::Relaxed),
+        metrics.flow_z_spec_fail.load(Ord::Relaxed),
+        metrics.flow_z_solves.load(Ord::Relaxed),
+    );
+    eprintln!(
+        "[framework:{}] flow XY: sat={} unsat={} timeout={} solves={} zw_bound_rej={} ext_pruned={}",
+        mode_name,
+        metrics.flow_xy_sat.load(Ord::Relaxed),
+        metrics.flow_xy_unsat.load(Ord::Relaxed),
+        metrics.flow_xy_timeout.load(Ord::Relaxed),
+        metrics.flow_xy_solves.load(Ord::Relaxed),
+        metrics.flow_xy_zw_bound_rej.load(Ord::Relaxed),
+        metrics.extensions_pruned.load(Ord::Relaxed),
+    );
     let _ = engine_cancel; // keep the Arc alive until the end
 }
 
