@@ -491,6 +491,7 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
         random_seed: None,
         cancel: None,
         exchange: None,
+        projected_fraction_ppm: None,
     };
     let (adapter, result_rx) = SyncAdapter::build(problem, sync_cfg, verbose);
     let mut engine = SearchEngine::<SyncPayload>::new(

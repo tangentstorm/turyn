@@ -9,16 +9,19 @@
 //! schema (elapsed, covered/total, TTC, forcings rollups) applies
 //! uniformly.
 //!
-//! Coverage semantics: `total_mass = 1.0`, credited as `1.0` on
-//! completion (one walker-node unit). When future work lifts the
-//! per-level coverage product from `SyncStats` into
-//! `StageOutcome::forcings`, this becomes true coverage-bits.
+//! Coverage semantics: `total_mass = 1.0`; `covered_mass` is read
+//! from the walker's projected-fraction hook at end of run
+//! (`SyncConfig::projected_fraction_ppm`), so the universal
+//! `ProgressSnapshot.ttc` is non-`None` for sync mode. Quality stays
+//! `Projected` — the sync walker's own Block-2/Block-3 telemetry is
+//! authoritative for mid-run progress.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::search_framework::engine::{AdapterInit, SearchModeAdapter};
-use crate::search_framework::mass::{CoverageQuality, MassDelta, MassValue, SearchMassModel};
+use crate::search_framework::mass::{CoverageQuality, MassValue, SearchMassModel};
 use crate::search_framework::stage::{
     StageContext, StageHandler, StageId, StageOutcome, WorkItem, WorkItemMeta,
 };
@@ -50,30 +53,34 @@ impl StageHandler<SyncPayload> for SyncWalkStage {
         if let Some(sol) = found {
             let _ = self.result_tx.send(sol);
         }
-        // Do NOT credit any `covered` here. Credit the full 1.0 when
-        // the wrapper returns would falsely drive the universal
-        // summary to `covered=1.000/1.000 ttc=0` regardless of what
-        // the walker's own per-level coverage reports. The
-        // universal schema marks the walk as
-        // `TtcQuality::Projected`; its own Block-2/Block-3 TTC
-        // table is authoritative. (PR review flagged this as
-        // actively misleading.)
+        // No `mass_delta` credit here. The walker's projected-
+        // fraction covered flows through the pull-polled mass
+        // model (`SyncWalkMassModel::covered_mass`), so the
+        // universal `ProgressSnapshot.ttc` reflects the walker's
+        // own projection rather than a bogus "1.0 at end"
+        // saturation the handler would otherwise trigger.
         StageOutcome::default()
     }
 }
 
-pub struct SyncWalkMassModel;
+pub struct SyncWalkMassModel {
+    projected_fraction_ppm: Arc<AtomicU64>,
+}
 
 impl SearchMassModel for SyncWalkMassModel {
     fn covered_mass(&self) -> MassValue {
-        MassValue::ZERO
+        // Walker writes its projected-fraction covered as
+        // parts-per-million. Engine polls this on each progress
+        // tick and at Finished — at which point it's non-zero and
+        // `ProgressSnapshot.ttc` becomes meaningful.
+        let ppm = self.projected_fraction_ppm.load(Ordering::Relaxed);
+        MassValue(ppm as f64 / 1_000_000.0)
     }
     fn quality(&self) -> CoverageQuality {
-        // The walker is exhaustive within its budget but the
-        // single-wrapper handler has no additive coverage signal
-        // to feed the universal `MassSnapshot`. `Projected` tells
-        // consumers the universal TTC is not meaningful for this
-        // mode — the sync walker's own telemetry is authoritative.
+        // Fraction is derived from a branching-factor projection —
+        // not a direct count of covered nodes — so quality stays
+        // `Projected`. Consumers should pair it with the walker's
+        // own per-level telemetry for authoritative analysis.
         CoverageQuality::Projected
     }
 }
@@ -83,24 +90,31 @@ pub struct SyncAdapter {
     pub cfg: Arc<SyncConfig>,
     pub verbose: bool,
     pub result_tx: std::sync::mpsc::Sender<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+    pub projected_fraction_ppm: Arc<AtomicU64>,
 }
 
 impl SyncAdapter {
     pub fn build(
         problem: Problem,
-        cfg: SyncConfig,
+        mut cfg: SyncConfig,
         verbose: bool,
     ) -> (
         Self,
         std::sync::mpsc::Receiver<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
     ) {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
+        // Install the projected-fraction sink on the cloned cfg the
+        // walker sees. A fresh atomic per adapter so concurrent runs
+        // don't clobber each other.
+        let projected_fraction_ppm = Arc::new(AtomicU64::new(0));
+        cfg.projected_fraction_ppm = Some(Arc::clone(&projected_fraction_ppm));
         (
             SyncAdapter {
                 problem,
                 cfg: Arc::new(cfg),
                 verbose,
                 result_tx,
+                projected_fraction_ppm,
             },
             result_rx,
         )
@@ -145,6 +159,8 @@ impl SearchModeAdapter<SyncPayload> for SyncAdapter {
         m
     }
     fn mass_model(&self) -> Box<dyn SearchMassModel> {
-        Box::new(SyncWalkMassModel)
+        Box::new(SyncWalkMassModel {
+            projected_fraction_ppm: Arc::clone(&self.projected_fraction_ppm),
+        })
     }
 }

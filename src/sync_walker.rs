@@ -22,7 +22,7 @@
 #![allow(unused_imports)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use crate::types::{PackedSeq, Problem, SumTuple};
@@ -52,6 +52,14 @@ pub(crate) struct SyncConfig {
     pub cancel: Option<Arc<AtomicBool>>,
     /// Shared learnt-clause exchange. `None` for single-worker mode.
     pub exchange: Option<Arc<ClauseExchange>>,
+    /// Shared sink for the walker's latest projected fraction covered
+    /// (`elapsed / TTC_parallel`), stored as parts-per-million (so an
+    /// atomic integer roundtrip is lossless). Written by the walker
+    /// each progress tick; read by `SyncWalkMassModel::covered_mass`
+    /// so the universal `ProgressSnapshot` carries a non-zero
+    /// fraction for sync mode. `None` when no framework adapter is
+    /// attached.
+    pub projected_fraction_ppm: Option<Arc<AtomicU64>>,
 }
 
 /// Immutable context computed once per search.
@@ -1079,6 +1087,17 @@ fn search_sync_parallel(
 
     let elapsed = start.elapsed();
     let stats = stats_agg.lock().unwrap().clone();
+    // Surface the walker's projected-fraction covered through the
+    // `SyncConfig::projected_fraction_ppm` hook so the framework
+    // adapter's `SyncWalkMassModel` sees a non-zero `covered_mass`
+    // at Finished time. Live mid-run updates are a follow-up — the
+    // walker has no natural progress tick today.
+    if let (Some(ref sink), Some(f)) = (
+        cfg.projected_fraction_ppm.as_ref(),
+        projected_fraction(&stats, problem.n, elapsed.as_secs_f64(), n_workers),
+    ) {
+        sink.store((f * 1_000_000.0) as u64, AtomicOrdering::Relaxed);
+    }
     let found = result.lock().unwrap().clone();
     if verbose {
         eprintln!(
@@ -1269,6 +1288,59 @@ fn format_per_level_telemetry(stats: &SyncStats) -> String {
 /// TTC_serial  = N_total / rate,   TTC_parallel = TTC_serial / n_workers
 /// where rate = nodes_visited / elapsed (aggregate across workers in
 /// parallel mode, so this is already a parallel rate).
+/// Compute the walker's projected-fraction covered — i.e.
+/// `elapsed / TTC_parallel` clamped to `[0, 1]`. Returns `None`
+/// when sample size is insufficient to produce a meaningful
+/// projection (same early-exit condition as `project_ttc`).
+///
+/// The returned value is what `SyncConfig::projected_fraction_ppm`
+/// stores (scaled by 1e6 for atomic-integer roundtrip).
+pub(crate) fn projected_fraction(
+    stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize,
+) -> Option<f64> {
+    const NOISY_THRESHOLD: u64 = 32;
+    let depth = n;
+    if elapsed_secs <= 0.0 || stats.nodes_visited == 0 {
+        return None;
+    }
+    struct Bee { b: f64, sampled: bool, noisy: bool }
+    let mut b_eff: Vec<Bee> = Vec::with_capacity(depth);
+    for l in 0..depth {
+        let parent = stats.nodes_by_level.get(l).copied().unwrap_or(0);
+        let child = stats.children_by_level.get(l).copied().unwrap_or(0);
+        if parent == 0 {
+            b_eff.push(Bee { b: 0.0, sampled: false, noisy: false });
+        } else {
+            b_eff.push(Bee {
+                b: child as f64 / parent as f64,
+                sampled: true,
+                noisy: parent < NOISY_THRESHOLD,
+            });
+        }
+    }
+    let mut clean_bs: Vec<f64> =
+        b_eff.iter().filter(|x| x.sampled && !x.noisy).map(|x| x.b).collect();
+    clean_bs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let fallback = if clean_bs.is_empty() { 1.0 } else { clean_bs[clean_bs.len() / 2] };
+    let mut projected_nodes = 1.0_f64;
+    let mut running_product = 1.0_f64;
+    for l in 0..depth {
+        let b = match b_eff.get(l) {
+            Some(Bee { b, sampled: true, .. }) => *b,
+            _ => fallback,
+        };
+        running_product *= b;
+        projected_nodes += running_product;
+        if !running_product.is_finite() { break; }
+    }
+    let rate = stats.nodes_visited as f64 / elapsed_secs;
+    if rate <= 0.0 || !projected_nodes.is_finite() { return None; }
+    let ttc_parallel = projected_nodes / rate;
+    let _ = n_workers;
+    if ttc_parallel <= 0.0 || !ttc_parallel.is_finite() { return None; }
+    Some((elapsed_secs / ttc_parallel).clamp(0.0, 1.0))
+}
+
 fn project_ttc(stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize) -> String {
     const NOISY_THRESHOLD: u64 = 32;
     let depth = n;  // bouncing-order depth = n for even n

@@ -1985,6 +1985,7 @@ pub(crate) fn run_mdd_sat_search(
             random_seed: None,
             cancel: None,
             exchange: None,
+            projected_fraction_ppm: None,
         };
         let _ = tuples;
         let (adapter, result_rx) = SyncAdapter::build(problem, sync_cfg, verbose);
