@@ -22,9 +22,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::SearchConfig;
 use crate::mdd_pipeline::{
-    build_phase_b_context, enumerate_live_boundaries, new_pipeline_metrics, process_boundary,
-    process_solve_w, process_solve_wz, process_solve_z, BoundaryWork, PhaseBContext,
-    PipelineMetrics, PipelineWork, SolveWWork, SolveWZWork, SolveZWork, ZStageScratch,
+    build_phase_b_context, enumerate_live_boundaries, mdd_navigate_to_outfix,
+    new_pipeline_metrics, process_boundary, process_solve_w, process_solve_wz, process_solve_z,
+    BoundaryWork, PhaseBContext, PipelineMetrics, PipelineWork, SolveWWork, SolveWZWork,
+    SolveZWork, ZStageScratch,
 };
 use crate::search_framework::engine::{AdapterInit, SearchModeAdapter};
 use crate::search_framework::mass::{CoverageQuality, MassValue, SearchMassModel};
@@ -456,7 +457,28 @@ impl MddStagesAdapter {
         mode_name: &'static str,
     ) -> (Self, SolutionReceiver) {
         let ctx = build_phase_b_context(problem, &tuples, cfg, verbose, k);
-        let seed_boundaries = enumerate_live_boundaries(&ctx);
+        // When `--outfix` pins the ZW boundary, seed a single
+        // `BoundaryWork` rather than enumerating every live boundary.
+        // At k≥9 the enumeration returns hundreds of millions of
+        // entries and OOMs the process; the pin collapses that to one.
+        let seed_boundaries = if let Some(ref outfix) = cfg.test_outfix {
+            let (z_bits, w_bits) = outfix.zw_bits;
+            match mdd_navigate_to_outfix(
+                ctx.mdd.root, ctx.zw_depth, &ctx.xy_pos_order, &ctx.mdd.nodes,
+                z_bits, w_bits,
+            ) {
+                Some(xy_root) => vec![BoundaryWork { z_bits, w_bits, xy_root }],
+                None => {
+                    eprintln!(
+                        "[framework:{}] --outfix boundary (z_bits={:#x}, w_bits={:#x}) is not live in the MDD (pruned during gen); cannot search.",
+                        mode_name, z_bits, w_bits,
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            enumerate_live_boundaries(&ctx)
+        };
         if verbose {
             eprintln!(
                 "[framework:{}] seed_boundaries={} (pre-enumerated upfront)",

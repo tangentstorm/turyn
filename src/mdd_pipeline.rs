@@ -1807,6 +1807,33 @@ pub(crate) fn build_phase_b_context(
     })
 }
 
+/// Navigate the MDD to a specific `(z_bits, w_bits)` boundary, returning
+/// the XY sub-root anchored at that boundary. Returns `None` if the
+/// boundary is not live (pruned away during MDD gen).
+///
+/// Used by the framework `MddStagesAdapter` to seed a single
+/// `BoundaryWork` when `--outfix` pins the boundary explicitly —
+/// avoids enumerating hundreds of millions of boundaries at large
+/// `k` just to find the one the caller wants.
+pub(crate) fn mdd_navigate_to_outfix(
+    root: u32, zw_depth: usize, pos_order: &[usize], nodes: &[[u32; 4]],
+    z_bits: u32, w_bits: u32,
+) -> Option<u32> {
+    let mut nid = root;
+    for level in 0..zw_depth {
+        if nid == mdd_reorder::DEAD { return None; }
+        let pos = pos_order[level];
+        let z_bit = (z_bits >> pos) & 1;
+        let w_bit = (w_bits >> pos) & 1;
+        let branch = (z_bit | (w_bit << 1)) as usize;
+        if nid != mdd_reorder::LEAF {
+            nid = nodes[nid as usize][branch];
+            if nid == mdd_reorder::DEAD { return None; }
+        }
+    }
+    Some(nid)
+}
+
 /// Enumerate every live boundary path through the first `zw_depth`
 /// levels of the MDD, returning a `BoundaryWork` per path. Used by
 /// the framework `MddStagesAdapter` to seed its queue upfront; the

@@ -36,6 +36,13 @@ pub(crate) struct OutfixSpec {
     /// When set, the XY search is restricted to this single
     /// (x_bits, y_bits).
     pub(crate) xy_bits: Option<(u32, u32)>,
+    /// ZW boundary bits: same packed encoding (bits 0..k-1 = prefix,
+    /// bits k..2k-1 = suffix).  Always populated by `parse_outfix`.
+    /// The framework adapter uses these to seed a single boundary
+    /// (via `mdd_navigate_to_outfix`) instead of enumerating every
+    /// live boundary — which is mandatory at k≥9 where there are
+    /// hundreds of millions of boundaries.
+    pub(crate) zw_bits: (u32, u32),
     /// Middle-position pins for Z: `(middle_idx, value)` where
     /// `middle_idx ∈ 0..middle_n` indexes `Z[k+middle_idx]` and `value`
     /// is ±1.  Forces the corresponding SAT var in SolveWZ.
@@ -240,6 +247,7 @@ pub(crate) fn parse_outfix(s: &str, n: usize, k: usize) -> Result<OutfixSpec, St
 
     Ok(OutfixSpec {
         xy_bits: Some((x_bits, y_bits)),
+        zw_bits: (z_bits, w_bits),
         z_middle_pins,
         w_middle_pins,
         x_middle_pins,
