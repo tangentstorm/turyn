@@ -42,6 +42,68 @@ pub const STAGE_SOLVE_W: StageId = "mdd.solve_w";
 pub const STAGE_SOLVE_WZ: StageId = "mdd.solve_wz";
 pub const STAGE_SOLVE_Z: StageId = "mdd.solve_z";
 
+/// Per-boundary fan-out tracker. One boundary (identified by
+/// `fanout_root_id` = its seed index) may dispatch through multiple
+/// stage handlers: Boundary → SolveW → SolveZ, or Boundary →
+/// SolveWZ, with stage 2/3 sometimes emitting zero follow-ups
+/// because of filter rejection or re-queue semantics. The mass
+/// model treats a boundary as "complete" when *all* of its in-
+/// flight descendants have finished — not when any one stage
+/// returns — so the published fraction equals `completed_boundaries
+/// / seed_boundaries.len()`, a real additive-over-disjoint
+/// coverage measure.
+///
+/// Algorithm: each stage handler calls `note_handled` with its
+/// item's `fanout_root_id` plus the number of children emitted.
+/// The pending count for that boundary decreases by 1 (this item
+/// done) and increases by `emitted`. When pending hits 0 the
+/// boundary is removed from the map and `completed` ticks up.
+/// Seed boundaries start at `pending = 1` lazily when first seen —
+/// `or_insert(1)` matches the one-unit-per-processed-item
+/// invariant below.
+pub struct BoundaryProgress {
+    pending: Mutex<HashMap<u64, u64>>,
+    completed: AtomicU64,
+    total: u64,
+}
+
+impl BoundaryProgress {
+    pub fn new(total: u64) -> Self {
+        Self {
+            pending: Mutex::new(HashMap::new()),
+            completed: AtomicU64::new(0),
+            total,
+        }
+    }
+
+    /// Record that a stage handler just finished processing an item
+    /// belonging to `fanout_root_id` and emitted `emitted` child
+    /// items. Returns `true` when this was the last in-flight
+    /// descendant of the boundary (i.e. the boundary is now
+    /// complete).
+    pub fn note_handled(&self, fanout_root_id: u64, emitted: u64) -> bool {
+        let mut guard = self.pending.lock().unwrap();
+        let entry = guard.entry(fanout_root_id).or_insert(1);
+        *entry = entry.saturating_sub(1) + emitted;
+        if *entry == 0 {
+            guard.remove(&fanout_root_id);
+            self.completed.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn covered_fraction(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            let done = self.completed.load(Ordering::Relaxed);
+            (done as f64 / self.total as f64).clamp(0.0, 1.0)
+        }
+    }
+}
+
 /// Payload discriminator for the framework `WorkItem<MddPayload>`.
 /// One variant per scheduled stage. SolveXY is not scheduled via
 /// the queue — `process_solve_z` fires XY solves inline per
@@ -127,18 +189,8 @@ pub struct BoundaryStage {
     ctx: Arc<PhaseBContext>,
     metrics: PipelineMetrics,
     use_wz_mode: bool,
-    /// Fraction of the search space eliminated when a boundary
-    /// gets filtered out at stage 0 (every candidate tuple fails
-    /// the sum-feasibility or `any_valid_xy` checks). Set to
-    /// `1 / seed_boundaries`. Boundaries that instead emit a
-    /// SolveW or SolveWZ item credit **nothing** here — the
-    /// sub-cube is still alive, and `SolveZStage` will credit
-    /// when it's actually dispatched. Without this split the
-    /// progress meter shot to 100% immediately after queue drain
-    /// even though the real downstream SAT work hadn't happened
-    /// yet (the issue flagged in the PR review).
-    per_boundary_fraction: f64,
     item_ids: Arc<AtomicU64>,
+    progress: Arc<BoundaryProgress>,
 }
 
 impl StageHandler<MddPayload> for BoundaryStage {
@@ -159,18 +211,14 @@ impl StageHandler<MddPayload> for BoundaryStage {
         };
         let emitted_raw = process_boundary(bnd, &self.ctx, &self.metrics, self.use_wz_mode);
         let mut out = StageOutcome::default();
-        let filtered_out = emitted_raw.is_empty();
         out.emitted = wrap_items(emitted_raw, &parent_meta, &self.item_ids);
-        if filtered_out {
-            // Stage-0 filter eliminated the whole sub-cube —
-            // credit the boundary's 1/N share now.
-            out.mass_delta = crate::search_framework::mass::MassDelta {
-                covered_exact: crate::search_framework::mass::MassValue(
-                    self.per_boundary_fraction,
-                ),
-                covered_partial: crate::search_framework::mass::MassValue::ZERO,
-            };
-        }
+        // Mass credit flows through `BoundaryProgress`: this item
+        // consumes 1 pending unit and adds one per emitted child.
+        // If the boundary has no more live descendants (filter-
+        // rejected outright, or a later stage just finished its
+        // last child) the poll-based `covered_fraction` ticks up.
+        self.progress
+            .note_handled(parent_meta.fanout_root_id, out.emitted.len() as u64);
         out
     }
 }
@@ -187,6 +235,7 @@ pub struct SolveWStage {
     spectral_w: Arc<SpectralFilter>,
     scratch: Mutex<SolveWScratch>,
     item_ids: Arc<AtomicU64>,
+    progress: Arc<BoundaryProgress>,
 }
 
 impl StageHandler<MddPayload> for SolveWStage {
@@ -222,6 +271,14 @@ impl StageHandler<MddPayload> for SolveWStage {
         );
         let mut out = StageOutcome::default();
         out.emitted = wrap_items(emitted_raw, &parent_meta, &self.item_ids);
+        // Handoff to the boundary's pending-counter: this SolveW
+        // item consumes one unit and emits `out.emitted.len()` new
+        // ones. If that takes the boundary's pending count to zero
+        // (e.g. no SolveZ candidates survived and this was the last
+        // in-flight W) the boundary is counted complete — so a
+        // pruned sub-cube still credits coverage.
+        self.progress
+            .note_handled(parent_meta.fanout_root_id, out.emitted.len() as u64);
         out
     }
 }
@@ -243,6 +300,7 @@ pub struct SolveWZStage {
     )>,
     scratch: Mutex<SolveWZScratch>,
     item_ids: Arc<AtomicU64>,
+    progress: Arc<BoundaryProgress>,
 }
 
 impl StageHandler<MddPayload> for SolveWZStage {
@@ -288,6 +346,12 @@ impl StageHandler<MddPayload> for SolveWZStage {
                 })
                 .collect();
         }
+        // Either we emitted a deferred re-queue (pending stays at
+        // 1 — same boundary still in flight) or we finished for
+        // good (pending drops to 0 — boundary complete, emit no
+        // follow-up, the `(Z, W)` search was exhausted).
+        self.progress
+            .note_handled(parent_meta.fanout_root_id, out.emitted.len() as u64);
         out
     }
 }
@@ -312,13 +376,7 @@ pub struct SolveZStage {
         crate::types::PackedSeq,
     )>,
     scratch: Mutex<SolveZScratch>,
-    /// Fraction of the search space eliminated per `SolveZ`
-    /// invocation. Set to `1 / seed_boundaries`. `SolveZ` is
-    /// terminal for its (z_bits, w_middle) sub-cube: every XY
-    /// SAT attempt fires inline before this handler returns, so
-    /// crediting here gives progress that tracks real downstream
-    /// work rather than the fast `BoundaryStage` dispatch loop.
-    per_solve_z_fraction: f64,
+    progress: Arc<BoundaryProgress>,
 }
 
 impl StageHandler<MddPayload> for SolveZStage {
@@ -333,7 +391,7 @@ impl StageHandler<MddPayload> for SolveZStage {
         if ctx.cancelled {
             return StageOutcome::default();
         }
-        let _parent_meta = item.meta;
+        let parent_meta = item.meta;
         let MddPayload::SolveZ(sz) = item.payload else {
             return StageOutcome::default();
         };
@@ -363,36 +421,36 @@ impl StageHandler<MddPayload> for SolveZStage {
             &self.result_tx,
             rng,
         );
-        let mut out = StageOutcome::default();
-        // Credit the sub-cube eliminated by this completed SolveZ
-        // (and its inline XY walk). Typically several SolveZ items
-        // fire per boundary; `apply_delta` clamps `covered` at the
-        // total so overshoot is harmless. The effect is that
-        // `covered` tracks real SAT work rather than boundary
-        // dispatch — addresses the "front-loaded coverage" issue
-        // flagged in the PR review.
-        out.mass_delta = crate::search_framework::mass::MassDelta {
-            covered_exact: crate::search_framework::mass::MassValue(self.per_solve_z_fraction),
-            covered_partial: crate::search_framework::mass::MassValue::ZERO,
-        };
-        out
+        // Mass credit: one more pending descendant of this
+        // boundary is done. When the last SolveZ for a boundary
+        // returns, `note_handled` drops the pending count to zero
+        // and the poll-based `covered_fraction` ticks up by
+        // exactly `1/N`. No push-based `mass_delta` here —
+        // relying on push would overcount whenever one boundary
+        // fans out to multiple `SolveZ`s.
+        self.progress.note_handled(parent_meta.fanout_root_id, 0);
+        StageOutcome::default()
     }
 }
 
 /// Fractional mass model for the staged MDD adapter.
-/// `total_mass = 1.0` (the whole search space). `BoundaryStage`
-/// credits `1/N` when a boundary is filter-rejected outright (no
-/// SolveW emitted); `SolveZStage` credits `1/N` when a downstream
-/// `(z_bits, w_middle)` sub-cube is fully searched (inline XY
-/// included). Both sites use fractions, which are additive over
-/// disjoint cubes — see `mass::MassValue` for the reasoning. The
-/// sum across all completed work can exceed `1.0` when many
-/// `SolveZ` items per boundary terminate; `apply_delta` clamps.
-pub struct McddFractionMassModel;
+/// `total_mass = 1.0` (the whole search space). Coverage is
+/// polled from the adapter's `BoundaryProgress` and equals
+/// `completed_boundaries / seed_boundaries`: a boundary only
+/// counts as complete once every one of its descendants (SolveW,
+/// SolveWZ, SolveZ, or the inline XY walk) has returned, so the
+/// fraction is a real additive-over-disjoint coverage measure.
+/// No push-based `mass_delta` — relying on push would double-
+/// count when one boundary fans out to multiple SolveZs, and
+/// undercount when SolveW / SolveWZ prune a whole sub-tree
+/// without emitting (issues flagged in the PR review).
+pub struct McddFractionMassModel {
+    progress: Arc<BoundaryProgress>,
+}
 
 impl SearchMassModel for McddFractionMassModel {
     fn covered_mass(&self) -> MassValue {
-        MassValue::ZERO
+        MassValue(self.progress.covered_fraction())
     }
     fn quality(&self) -> CoverageQuality {
         CoverageQuality::Direct
@@ -438,6 +496,10 @@ pub struct MddStagesAdapter {
     /// child fetch-adds to get a unique id, instead of reusing
     /// `parent.item_id + 1` which collides across siblings.
     pub item_ids: Arc<AtomicU64>,
+    /// Per-boundary fan-out tracker feeding the mass model's
+    /// `covered_mass()` poll; see [`BoundaryProgress`] for the
+    /// invariants.
+    pub progress: Arc<BoundaryProgress>,
 }
 
 impl MddStagesAdapter {
@@ -490,6 +552,7 @@ impl MddStagesAdapter {
         // Seed boundaries use `item_id = 0..N`; start the counter
         // past that so child items never collide with a seed id.
         let item_ids = Arc::new(AtomicU64::new(seed_boundaries.len() as u64));
+        let progress = Arc::new(BoundaryProgress::new(seed_boundaries.len() as u64));
         let adapter = MddStagesAdapter {
             ctx,
             metrics: new_pipeline_metrics(),
@@ -499,6 +562,7 @@ impl MddStagesAdapter {
             seed_boundaries,
             mode_name,
             item_ids,
+            progress,
         };
         (adapter, result_rx)
     }
@@ -554,11 +618,8 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                 ctx: Arc::clone(&self.ctx),
                 metrics: self.metrics.clone(),
                 use_wz_mode: self.use_wz_mode,
-                per_boundary_fraction: {
-                    let n = self.seed_boundaries.len() as f64;
-                    if n > 0.0 { 1.0 / n } else { 0.0 }
-                },
                 item_ids: Arc::clone(&self.item_ids),
+                progress: Arc::clone(&self.progress),
             }),
         );
         m.insert(
@@ -573,6 +634,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                     rng: 0xDEADBEEF_CAFEBABE,
                 }),
                 item_ids: Arc::clone(&self.item_ids),
+                progress: Arc::clone(&self.progress),
             }),
         );
         m.insert(
@@ -587,6 +649,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                     rng: 0xCAFEBABE_DEADBEEF,
                 }),
                 item_ids: Arc::clone(&self.item_ids),
+                progress: Arc::clone(&self.progress),
             }),
         );
         m.insert(
@@ -615,17 +678,16 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                     },
                     rng: 0xFEEDFACE_BAADF00D,
                 }),
-                per_solve_z_fraction: {
-                    let n = self.seed_boundaries.len() as f64;
-                    if n > 0.0 { 1.0 / n } else { 0.0 }
-                },
+                progress: Arc::clone(&self.progress),
             }),
         );
         m
     }
 
     fn mass_model(&self) -> Box<dyn SearchMassModel> {
-        Box::new(McddFractionMassModel)
+        Box::new(McddFractionMassModel {
+            progress: Arc::clone(&self.progress),
+        })
     }
 }
 

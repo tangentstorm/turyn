@@ -88,7 +88,6 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
             if found.load(Ordering::Relaxed) {
                 break;
             }
-            self.tuples_done.store(tuple_idx, Ordering::Relaxed);
             if !w_cache.contains_key(&tuple.w) {
                 let w_candidates =
                     build_w_candidates(problem, tuple.w, cfg, &spectral_w, &mut stats, found);
@@ -99,6 +98,10 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
             if found.load(Ordering::Relaxed) {
                 break;
             }
+            // Tuple about to be processed. `tuples_done` reports
+            // the number of *completed* tuples; publish the count
+            // only after this tuple's `for_each_zw_pair` returns
+            // below so the live fraction isn't one tuple behind.
             for_each_zw_pair(
                 problem,
                 tuple.z,
@@ -180,6 +183,13 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                     !found.load(Ordering::Relaxed)
                 },
             );
+            // Tuple (tuple_idx) fully processed — publish
+            // `tuple_idx + 1` tuples done. The earlier placement
+            // at loop-top stored the zero-based index *before*
+            // processing, making the live fraction one tuple
+            // behind and the TTC readout systematically pessimistic
+            // (PR review follow-up).
+            self.tuples_done.store(tuple_idx + 1, Ordering::Relaxed);
         }
         self.tuples_done
             .store(tuples.len(), Ordering::Relaxed);
