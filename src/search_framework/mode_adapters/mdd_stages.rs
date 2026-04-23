@@ -17,6 +17,7 @@
 //! `run_mdd_sat_search`'s own parallelism is retired.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::config::SearchConfig;
@@ -75,12 +76,21 @@ fn from_pipeline_work(work: PipelineWork) -> Option<MddPayload> {
     }
 }
 
-fn wrap_items(items: Vec<PipelineWork>, parent: &WorkItemMeta) -> Vec<WorkItem<MddPayload>> {
+fn wrap_items(
+    items: Vec<PipelineWork>,
+    parent: &WorkItemMeta,
+    item_ids: &AtomicU64,
+) -> Vec<WorkItem<MddPayload>> {
     items
         .into_iter()
         .filter_map(|pw| {
             let payload = from_pipeline_work(pw)?;
             let stage_id = payload.stage_id();
+            // Fetch-add gives every sibling a unique id, avoiding the
+            // prior `parent.item_id.wrapping_add(1)` collision where all
+            // children of the same parent shared the same id (PR review
+            // #8).
+            let item_id = item_ids.fetch_add(1, Ordering::Relaxed);
             Some(WorkItem {
                 stage_id,
                 priority: default_priority_for_stage(stage_id),
@@ -88,7 +98,7 @@ fn wrap_items(items: Vec<PipelineWork>, parent: &WorkItemMeta) -> Vec<WorkItem<M
                 replay_key: parent.item_id,
                 mass_hint: None,
                 meta: WorkItemMeta {
-                    item_id: parent.item_id.wrapping_add(1),
+                    item_id,
                     parent_item_id: Some(parent.item_id),
                     fanout_root_id: parent.fanout_root_id,
                     depth_from_root: parent.depth_from_root.saturating_add(1),
@@ -127,6 +137,7 @@ pub struct BoundaryStage {
     /// even though the real downstream SAT work hadn't happened
     /// yet (the issue flagged in the PR review).
     per_boundary_fraction: f64,
+    item_ids: Arc<AtomicU64>,
 }
 
 impl StageHandler<MddPayload> for BoundaryStage {
@@ -145,7 +156,7 @@ impl StageHandler<MddPayload> for BoundaryStage {
         let emitted_raw = process_boundary(bnd, &self.ctx, &self.metrics, self.use_wz_mode);
         let mut out = StageOutcome::default();
         let filtered_out = emitted_raw.is_empty();
-        out.emitted = wrap_items(emitted_raw, &parent_meta);
+        out.emitted = wrap_items(emitted_raw, &parent_meta, &self.item_ids);
         if filtered_out {
             // Stage-0 filter eliminated the whole sub-cube —
             // credit the boundary's 1/N share now.
@@ -171,6 +182,7 @@ pub struct SolveWStage {
     metrics: PipelineMetrics,
     spectral_w: Arc<SpectralFilter>,
     scratch: Mutex<SolveWScratch>,
+    item_ids: Arc<AtomicU64>,
 }
 
 impl StageHandler<MddPayload> for SolveWStage {
@@ -202,7 +214,7 @@ impl StageHandler<MddPayload> for SolveWStage {
             rng,
         );
         let mut out = StageOutcome::default();
-        out.emitted = wrap_items(emitted_raw, &parent_meta);
+        out.emitted = wrap_items(emitted_raw, &parent_meta, &self.item_ids);
         out
     }
 }
@@ -223,6 +235,7 @@ pub struct SolveWZStage {
         crate::types::PackedSeq,
     )>,
     scratch: Mutex<SolveWZScratch>,
+    item_ids: Arc<AtomicU64>,
 }
 
 impl StageHandler<MddPayload> for SolveWZStage {
@@ -257,7 +270,7 @@ impl StageHandler<MddPayload> for SolveWZStage {
             // Framework priority is i32 (coarse tag); legacy f64
             // continuation priority is dropped. Re-enqueue as
             // low-priority "maybe".
-            out.emitted = wrap_items(vec![item], &parent_meta)
+            out.emitted = wrap_items(vec![item], &parent_meta, &self.item_ids)
                 .into_iter()
                 .map(|mut w| {
                     w.priority = 1;
@@ -408,6 +421,10 @@ pub struct MddStagesAdapter {
     pub use_wz_mode: bool,
     pub seed_boundaries: Vec<BoundaryWork>,
     pub mode_name: &'static str,
+    /// Monotonic counter for `WorkItem.meta.item_id`. Every emitted
+    /// child fetch-adds to get a unique id, instead of reusing
+    /// `parent.item_id + 1` which collides across siblings.
+    pub item_ids: Arc<AtomicU64>,
 }
 
 impl MddStagesAdapter {
@@ -436,6 +453,9 @@ impl MddStagesAdapter {
             );
         }
         let (result_tx, result_rx) = std::sync::mpsc::channel();
+        // Seed boundaries use `item_id = 0..N`; start the counter
+        // past that so child items never collide with a seed id.
+        let item_ids = Arc::new(AtomicU64::new(seed_boundaries.len() as u64));
         let adapter = MddStagesAdapter {
             ctx,
             metrics: new_pipeline_metrics(),
@@ -444,6 +464,7 @@ impl MddStagesAdapter {
             use_wz_mode: cfg.wz_together,
             seed_boundaries,
             mode_name,
+            item_ids,
         };
         (adapter, result_rx)
     }
@@ -503,6 +524,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                     let n = self.seed_boundaries.len() as f64;
                     if n > 0.0 { 1.0 / n } else { 0.0 }
                 },
+                item_ids: Arc::clone(&self.item_ids),
             }),
         );
         m.insert(
@@ -516,6 +538,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                     fft_buf_w: FftScratch::new(&spectral_w),
                     rng: 0xDEADBEEF_CAFEBABE,
                 }),
+                item_ids: Arc::clone(&self.item_ids),
             }),
         );
         m.insert(
@@ -529,6 +552,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                     template_cache: HashMap::new(),
                     rng: 0xCAFEBABE_DEADBEEF,
                 }),
+                item_ids: Arc::clone(&self.item_ids),
             }),
         );
         m.insert(
