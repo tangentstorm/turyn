@@ -92,7 +92,13 @@ impl<T: Send + 'static> SearchEngine<T> {
         let mut edge_flow: BTreeMap<(String, String), EdgeFlowCounters> = BTreeMap::new();
         let mut fanout_roots: BTreeMap<u64, FanoutRootCounters> = BTreeMap::new();
         let mut forcings = ForcingRollups::default();
-        let mut mass = MassSnapshot::new(adapter.mass_model().total_mass());
+        // Hold the mass model across the run so progress ticks can
+        // publish the adapter's current `quality()` rather than a
+        // hardcoded placeholder — addresses the PR review point
+        // about the live stream claiming a different quality class
+        // than the final snapshot.
+        let mass_model = adapter.mass_model();
+        let mut mass = MassSnapshot::new(mass_model.total_mass());
 
         let stages_map: BTreeMap<StageId, Arc<dyn StageHandler<T>>> = adapter
             .stages()
@@ -218,7 +224,7 @@ impl<T: Send + 'static> SearchEngine<T> {
                     on_event(SearchEvent::Progress(build_snapshot(
                         start.elapsed(),
                         &mass,
-                        TtcQuality::Hybrid,
+                        mass_model.quality(),
                         &edge_flow,
                         &fanout_roots,
                         &forcings,
@@ -250,7 +256,7 @@ impl<T: Send + 'static> SearchEngine<T> {
         on_event(SearchEvent::Finished(build_snapshot(
             start.elapsed(),
             &mass,
-            adapter.mass_model().quality(),
+            mass_model.quality(),
             &edge_flow,
             &fanout_roots,
             &forcings,

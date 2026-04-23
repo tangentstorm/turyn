@@ -62,32 +62,51 @@ outside `ProgressSnapshot` should carry an ad-hoc TTC denominator.
 
 ### Forcing rollups (three 2-D tables)
 
-`ForcingRollups` is published on every tick. Two of its tables are
-owned by the framework coordinator; the third is read directly from
-radical when the snapshot is built.
+**Status (this PR): `[feature, level]` is plumbed; the two
+`[stage, *]` rollups are plumbed but **not yet populated by
+adapters**.** `StageOutcome::forcings` currently returns an
+empty `ForcingDelta` from every MDD / sync / cross / stochastic
+handler in `mode_adapters/`. `ForcingRollups::apply` is ready
+to aggregate the deltas the moment adapters start returning
+them — but until that lands, `progress.forcings.stage_level`
+and `progress.forcings.stage_feature` are empty. Readers should
+fall back to `Solver::propagations_by_kind_level()` (radical)
+for the `[feature, level]` axis.
 
-| Axis pair         | Owner        | Source                                                 |
-|-------------------|--------------|--------------------------------------------------------|
-| `[feature, level]` | `radical`    | `Solver::propagations_by_kind_level()` (2-D `Vec`)     |
-| `[stage, level]`   | coordinator  | Sum of `ForcingDelta::by_level_feature` per stage     |
-| `[stage, feature]` | coordinator  | Same source, rolled up along the other axis          |
+`ForcingRollups` is published on every tick. When all three are
+wired, the schema will be:
+
+| Axis pair         | Owner        | Source                                                 | Wired today? |
+|-------------------|--------------|--------------------------------------------------------|--------------|
+| `[feature, level]` | `radical`    | `Solver::propagations_by_kind_level()` (2-D `Vec`)     | yes          |
+| `[stage, level]`   | coordinator  | Sum of `ForcingDelta::by_level_feature` per stage     | not yet      |
+| `[stage, feature]` | coordinator  | Same source, rolled up along the other axis          | not yet      |
 
 "Feature" is a `PropKind` (`Clause`, `Pb`, `QuadPb`, `Xor`,
 `Spectral`, `Mdd`, `PbSetEq`). "Level" is the SAT solver's decision
 level at the moment the literal was forced. "Stage" is the framework
 `StageId` of the handler that produced the forcing event (e.g.
-`"boundary"`, `"solve_w"`, `"solve_z"`, `"solve_xy"`).
+`"boundary"`, `"solve_w"`, `"solve_z"`).
 
-Sum of any one rollup equals `Solver::num_propagations()` — this is
-the main correctness invariant to assert in tests.
+Sum of `[feature, level]` equals `Solver::num_propagations()` — the
+main correctness invariant; the matching check for the `[stage, *]`
+rollups is deferred until adapters populate them.
 
 ### Fan-out and edge flow
 
+**Status (this PR):** only per-edge `spawned` and per-root
+`live_descendants` are populated. The other proposed lifecycle
+columns (`dropped`, `queued`, `started`, `completed`,
+`completed_descendants`, `credited_mass`) live in
+`UNIFIED_SEARCH_FRAMEWORK_SPEC.md` §8.1 and will land once the
+coordinator tracks per-edge item transitions; they're removed
+from the current struct definitions so nothing downstream sees
+an apparently-richer surface than the data supports.
+
 `edge_flow: BTreeMap<(from_stage, to_stage), EdgeFlowCounters>`
-tracks per-edge lifecycle counts (`spawned`, `dropped`, `queued`,
-`started`, `completed`). `fanout_roots: BTreeMap<fanout_root_id,
-FanoutRootCounters>` tracks the live-descendants / completed-
-descendants / credited-mass for each subtree root.
+counts items pushed by each stage → child-stage edge. The
+companion `fanout_roots: BTreeMap<fanout_root_id,
+FanoutRootCounters>` carries `live_descendants` per subtree root.
 
 Together these support the "Sankey-like text flow report" and
 "per-level cut attribution" required by §8.1 of

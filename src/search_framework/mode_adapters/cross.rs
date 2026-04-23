@@ -221,7 +221,18 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
         }
         self.tuples_done
             .store(tuples.len(), Ordering::Relaxed);
-        StageOutcome::default()
+        // Emit the full fraction at the end so the engine's
+        // accumulated `MassSnapshot` matches what the mass model
+        // now reports (`tuples_done / tuples_total == 1.0`). With
+        // a single one-shot handler call we can't stream
+        // intermediate progress via `mass_delta`; callers that
+        // want per-tuple updates can poll `tuples_done`.
+        let mut out = StageOutcome::default();
+        out.mass_delta = crate::search_framework::mass::MassDelta {
+            covered_exact: crate::search_framework::mass::MassValue(1.0),
+            covered_partial: crate::search_framework::mass::MassValue::ZERO,
+        };
+        out
     }
 }
 

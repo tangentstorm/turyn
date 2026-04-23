@@ -5,20 +5,27 @@ use std::time::Duration;
 use crate::search_framework::mass::{MassValue, TtcQuality};
 use crate::search_framework::stage::StageId;
 
+/// Per-edge lifecycle counter. Only `spawned` is populated today
+/// (every `WorkItem` pushed from a parent stage to a child stage
+/// is counted). `dropped` / `queued` / `started` / `completed`
+/// were part of the originally-proposed Sankey schema but the
+/// engine does not track item lifecycle transitions yet; they are
+/// deliberately not in this struct to avoid publishing an
+/// apparently-richer surface than the data supports. Restore them
+/// once the coordinator tracks queue depth + start / completion
+/// per edge.
 #[derive(Clone, Debug, Default)]
 pub struct EdgeFlowCounters {
     pub spawned: u64,
-    pub dropped: u64,
-    pub queued: u64,
-    pub started: u64,
-    pub completed: u64,
 }
 
+/// Per-fan-out-root counter. Only `live_descendants` is tracked
+/// today. `completed_descendants` / `credited_mass` are part of
+/// the proposed fan-out viz schema but not wired; see the
+/// [`EdgeFlowCounters`] note above.
 #[derive(Clone, Debug, Default)]
 pub struct FanoutRootCounters {
     pub live_descendants: u64,
-    pub completed_descendants: u64,
-    pub credited_mass: MassValue,
 }
 
 /// Two 2-D forcing rollups owned by the coordinator (the third —
@@ -75,15 +82,16 @@ pub struct LevelCutAttribution {
     pub cut_share: f64,
 }
 
+/// Minimal Sankey-flavoured text dump. Today only the `spawned`
+/// column is meaningful — see [`EdgeFlowCounters`]. The full
+/// `in → filtered → queued → started → completed` layout from
+/// `UNIFIED_SEARCH_FRAMEWORK_SPEC.md` §8.1 lands when those fields
+/// get wired.
 pub fn render_sankey_text(edge_flow: &BTreeMap<(String, String), EdgeFlowCounters>) -> String {
     let mut out = String::new();
-    out.push_str("edge | spawned -> dropped -> queued -> started -> completed\n");
+    out.push_str("edge | spawned\n");
     for ((from, to), c) in edge_flow {
-        let _ = writeln!(
-            out,
-            "{}->{} | {} -> {} -> {} -> {} -> {}",
-            from, to, c.spawned, c.dropped, c.queued, c.started, c.completed
-        );
+        let _ = writeln!(out, "{}->{} | {}", from, to, c.spawned);
     }
     out
 }
