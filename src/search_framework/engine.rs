@@ -124,11 +124,22 @@ impl<T: Send + 'static> SearchEngine<T> {
             .expect("SearchEngine::run called twice on the same engine");
         let scheduler = Arc::new((Mutex::new(scheduler_box), Condvar::new()));
 
-        // Seed
+        // Seed. Poll the engine's cancel flag every 64k pushes so
+        // the `--sat-secs` watchdog can short-circuit construction
+        // on adapters with very large seed sets (e.g. 18M boundaries
+        // at apart/together n=26 k=8). Without this check, pushing
+        // 18M items into a `BinaryHeap` dominates the wall-clock
+        // budget even when the adapter's `init()` already bailed.
+        const SEED_CANCEL_POLL_STRIDE: usize = 1 << 16;
         {
             let (lock, _) = &*scheduler;
             let mut guard = lock.lock().unwrap();
-            for seed in adapter.init().seed_items {
+            for (i, seed) in adapter.init().seed_items.into_iter().enumerate() {
+                if i & (SEED_CANCEL_POLL_STRIDE - 1) == 0
+                    && self.cancelled.load(Ordering::Relaxed)
+                {
+                    break;
+                }
                 guard.push(seed);
             }
         }

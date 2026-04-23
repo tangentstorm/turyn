@@ -105,8 +105,15 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                 break;
             }
             if !w_cache.contains_key(&tuple.w) {
-                let w_candidates =
-                    build_w_candidates(problem, tuple.w, cfg, &spectral_w, &mut stats, found);
+                let w_candidates = build_w_candidates(
+                    problem,
+                    tuple.w,
+                    cfg,
+                    &spectral_w,
+                    &mut stats,
+                    found,
+                    ctx.cancelled,
+                );
                 let w_index = SpectralIndex::build(&w_candidates);
                 w_cache.insert(tuple.w, (w_candidates, w_index));
             }
@@ -127,6 +134,7 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                 &spectral_z,
                 &mut stats,
                 found,
+                ctx.cancelled,
                 |z_seq, w_seq, zw, _z_spec, _w_spec| {
                     if found.load(Ordering::Relaxed) || ctx.is_cancelled() {
                         return false;

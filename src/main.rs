@@ -348,22 +348,22 @@ fn run_framework_mdd_mode(
         WzMode::Together => "together",
         WzMode::Sync => "sync",
     };
-    // Framework staged routing: builds a `PhaseBContext` identical
-    // to the legacy `run_mdd_sat_search`, enumerates every live
-    // boundary upfront, and drives the five per-stage
-    // `StageHandler`s through `SearchEngine`. Solutions land on the
-    // adapter's `result_rx` channel.
-    let (adapter, result_rx) =
-        MddStagesAdapter::build(problem, tuples, cfg, k, verbose, mode_name);
+    // Construct the engine up front so we can pull its live cancel
+    // flag *before* the adapter does any expensive setup. The
+    // `MddStagesAdapter::build` call below loads the MDD file and
+    // enumerates every live boundary (~18M entries at n=26 k=7) —
+    // work that can dominate the wall-clock budget — and the
+    // watchdog must be armed before it starts so `--sat-secs`
+    // actually bounds the full command lifecycle.
     let mut engine = SearchEngine::<MddPayload>::new(
         EngineConfig::default(),
         Box::new(GoldThenWork::new(32)),
     );
-    // The engine's live cancel flag. Handed to the solution drain
-    // (to stop on first `(X,Y,Z,W)`) and to the `--sat-secs`
-    // watchdog (to stop on wall-clock limit). Handlers read it
-    // via `StageContext::is_cancelled`.
     let engine_cancel = engine.cancel_flag();
+    let watchdog_handle =
+        spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
+    let (adapter, result_rx) =
+        MddStagesAdapter::build(problem, tuples, cfg, k, verbose, mode_name, &engine_cancel);
     let found_ctx = std::sync::Arc::clone(&adapter.ctx.found);
 
     let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
@@ -380,12 +380,6 @@ fn run_framework_mdd_mode(
         }
         solutions
     });
-
-    // Wall-clock watchdog: if the caller set `--sat-secs`,
-    // trip the engine's cancel flag once the deadline hits.
-    // `sat_secs == 0` means "no limit" (SearchConfig default).
-    let watchdog_handle =
-        spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
 
     engine.run(&adapter, move |event| match event {
         SearchEvent::Progress(p) => {
@@ -1276,6 +1270,7 @@ fn main() {
                     &spectral_z,
                     &spectral_w,
                     &mut stats,
+                    &AtomicBool::new(false),
                     &AtomicBool::new(false),
                 );
                 println!(

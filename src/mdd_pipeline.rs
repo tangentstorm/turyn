@@ -1842,7 +1842,10 @@ pub(crate) fn mdd_navigate_to_outfix(
 ///
 /// A path is "live" iff none of its nodes are `mdd_reorder::DEAD`
 /// — i.e. it terminates at some non-DEAD XY-sub-tree root.
-pub(crate) fn enumerate_live_boundaries(ctx: &PhaseBContext) -> Vec<BoundaryWork> {
+pub(crate) fn enumerate_live_boundaries(
+    ctx: &PhaseBContext,
+    cancelled: &AtomicBool,
+) -> Vec<BoundaryWork> {
     let mdd = &*ctx.mdd;
     let zw_depth = ctx.zw_depth;
     let xy_pos_order = &ctx.xy_pos_order;
@@ -1857,7 +1860,17 @@ pub(crate) fn enumerate_live_boundaries(ctx: &PhaseBContext) -> Vec<BoundaryWork
         order: &[usize],
         nodes: &[[u32; 4]],
         out: &mut Vec<BoundaryWork>,
+        cancelled: &AtomicBool,
     ) {
+        // Poll the shared cancel flag once per visited node. At
+        // n=26 k=7 this walk visits ~18M nodes; the watchdog set
+        // by `--sat-secs` flips this flag and we bail with a
+        // partial boundary list. The adapter treats that as a
+        // legitimate (if incomplete) seed set so the framework
+        // can still print honest telemetry.
+        if cancelled.load(AtomicOrdering::Relaxed) {
+            return;
+        }
         if nid == mdd_reorder::DEAD {
             return;
         }
@@ -1886,6 +1899,7 @@ pub(crate) fn enumerate_live_boundaries(ctx: &PhaseBContext) -> Vec<BoundaryWork
                     order,
                     nodes,
                     out,
+                    cancelled,
                 );
             }
             return;
@@ -1907,6 +1921,7 @@ pub(crate) fn enumerate_live_boundaries(ctx: &PhaseBContext) -> Vec<BoundaryWork
                 order,
                 nodes,
                 out,
+                cancelled,
             );
         }
     }
@@ -1920,6 +1935,7 @@ pub(crate) fn enumerate_live_boundaries(ctx: &PhaseBContext) -> Vec<BoundaryWork
         xy_pos_order,
         &mdd.nodes,
         &mut out,
+        cancelled,
     );
     out
 }
@@ -2057,14 +2073,14 @@ pub(crate) fn run_mdd_sat_search(
         WzMode::Together => "together",
         WzMode::Sync => unreachable!("sync branched above"),
     };
-    let (adapter, result_rx) =
-        MddStagesAdapter::build(problem, tuples.to_vec(), cfg, k, verbose, mode_name);
     let mut engine = SearchEngine::<MddPayload>::new(
         EngineConfig::default(),
         Box::new(GoldThenWork::new(32)),
     );
-    let found_ctx = Arc::clone(&adapter.ctx.found);
     let cancel_flag = engine.cancel_flag();
+    let (adapter, result_rx) =
+        MddStagesAdapter::build(problem, tuples.to_vec(), cfg, k, verbose, mode_name, &cancel_flag);
+    let found_ctx = Arc::clone(&adapter.ctx.found);
     let drain = std::thread::spawn(move || {
         let mut found = false;
         while let Ok(_sol) = result_rx.recv() {

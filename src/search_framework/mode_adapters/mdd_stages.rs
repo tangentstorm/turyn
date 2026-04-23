@@ -500,6 +500,13 @@ pub struct MddStagesAdapter {
     /// `covered_mass()` poll; see [`BoundaryProgress`] for the
     /// invariants.
     pub progress: Arc<BoundaryProgress>,
+    /// Shared cancel flag (clone of `engine.cancel_flag()`). Used by
+    /// `init()` to stop seeding early when the `--sat-secs`
+    /// watchdog flips it mid-construction — without this check,
+    /// a 18M-boundary seed list at n=26 k=8 can spend ~40s
+    /// materializing `WorkItem`s into the scheduler even after
+    /// the deadline has passed.
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MddStagesAdapter {
@@ -517,12 +524,21 @@ impl MddStagesAdapter {
         k: usize,
         verbose: bool,
         mode_name: &'static str,
+        cancel: &Arc<std::sync::atomic::AtomicBool>,
     ) -> (Self, SolutionReceiver) {
         let ctx = build_phase_b_context(problem, &tuples, cfg, verbose, k);
         // When `--outfix` pins the ZW boundary, seed a single
         // `BoundaryWork` rather than enumerating every live boundary.
         // At k≥9 the enumeration returns hundreds of millions of
         // entries and OOMs the process; the pin collapses that to one.
+        //
+        // Otherwise poll `cancel` inside the recursive MDD walk —
+        // `enumerate_live_boundaries` at n=26 k=7 visits ~18M nodes,
+        // so the `--sat-secs` watchdog must be able to interrupt it
+        // to make the wall-clock limit cover the full command
+        // lifecycle. Cancelled mid-walk returns a partial list;
+        // the adapter treats that as a legitimate (if incomplete)
+        // seed set.
         let seed_boundaries = if let Some(ref outfix) = cfg.test_outfix {
             let (z_bits, w_bits) = outfix.zw_bits;
             match mdd_navigate_to_outfix(
@@ -539,7 +555,7 @@ impl MddStagesAdapter {
                 }
             }
         } else {
-            enumerate_live_boundaries(&ctx)
+            enumerate_live_boundaries(&ctx, cancel)
         };
         if verbose {
             eprintln!(
@@ -563,6 +579,7 @@ impl MddStagesAdapter {
             mode_name,
             item_ids,
             progress,
+            cancel: Arc::clone(cancel),
         };
         (adapter, result_rx)
     }
@@ -574,11 +591,21 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
     }
 
     fn init(&self) -> AdapterInit<MddPayload> {
-        let seed_items = self
-            .seed_boundaries
-            .iter()
-            .enumerate()
-            .map(|(i, b)| WorkItem {
+        // Materialize every live boundary into a `WorkItem`. At
+        // large k the seed set can be tens of millions of items,
+        // so poll the shared cancel flag every 64k entries to let
+        // the `--sat-secs` watchdog short-circuit the seeding
+        // loop instead of waiting for ~1.8 GB of allocations to
+        // finish.
+        const CANCEL_POLL_STRIDE: usize = 1 << 16;
+        let mut seed_items = Vec::with_capacity(self.seed_boundaries.len());
+        for (i, b) in self.seed_boundaries.iter().enumerate() {
+            if i & (CANCEL_POLL_STRIDE - 1) == 0
+                && self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                break;
+            }
+            seed_items.push(WorkItem {
                 stage_id: STAGE_BOUNDARY,
                 priority: 0,
                 cost_hint: 1,
@@ -596,8 +623,8 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                     w_bits: b.w_bits,
                     xy_root: b.xy_root,
                 }),
-            })
-            .collect();
+            });
+        }
         AdapterInit { seed_items }
     }
 

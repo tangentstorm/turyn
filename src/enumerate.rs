@@ -395,12 +395,19 @@ pub(crate) fn build_w_candidates(
     spectral_w: &SpectralFilter,
     stats: &mut SearchStats,
     found: &AtomicBool,
+    cancelled: &AtomicBool,
 ) -> Vec<SeqWithSpectrum> {
     let individual_bound = problem.spectral_bound();
     let mut w_candidates: Vec<SeqWithSpectrum> = Vec::new();
     let mut fft_buf = FftScratch::new(spectral_w);
     generate_sequences_permuted(problem.m(), w_sum, true, false, cfg.max_w, |values| {
-        if found.load(AtomicOrdering::Relaxed) { return false; }
+        // Honor both the "solution found" flag and the engine's
+        // live cancel flag — without the latter, `--sat-secs` (a
+        // watchdog that only flips cancel) can't interrupt this
+        // O(enumeration) loop.
+        if found.load(AtomicOrdering::Relaxed) || cancelled.load(AtomicOrdering::Relaxed) {
+            return false;
+        }
         stats.w_generated += 1;
         if let Some(spectrum) =
             spectrum_if_ok(values, spectral_w, individual_bound, &mut fft_buf)
@@ -430,6 +437,7 @@ pub(crate) fn for_each_zw_pair(
     spectral_z: &SpectralFilter,
     stats: &mut SearchStats,
     found: &AtomicBool,
+    cancelled: &AtomicBool,
     mut emit: impl FnMut(&PackedSeq, &PackedSeq, Vec<i32>, &[f64], &[f64]) -> bool,
 ) {
     let individual_bound = problem.spectral_bound();
@@ -437,7 +445,9 @@ pub(crate) fn for_each_zw_pair(
     let mut fft_buf = FftScratch::new(spectral_z);
     let mut idx_buf = Vec::new();
     generate_sequences_permuted(problem.n, z_sum, true, true, cfg.max_z, |values| {
-        if found.load(AtomicOrdering::Relaxed) { return false; }
+        if found.load(AtomicOrdering::Relaxed) || cancelled.load(AtomicOrdering::Relaxed) {
+            return false;
+        }
         stats.z_generated += 1;
         let Some(z_spectrum) =
             spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf) else { return true; };
@@ -466,13 +476,16 @@ pub(crate) fn stream_zw_candidates(
     spectral_z: &SpectralFilter,
     stats: &mut SearchStats,
     found: &AtomicBool,
+    cancelled: &AtomicBool,
 ) -> Vec<CandidateZW> {
     let mut out = Vec::new();
-    for_each_zw_pair(problem, z_sum, w_candidates, w_index, cfg, spectral_z, stats, found,
+    for_each_zw_pair(
+        problem, z_sum, w_candidates, w_index, cfg, spectral_z, stats, found, cancelled,
         |_z_seq, _w_seq, zw, _, _| {
             out.push(CandidateZW { zw_autocorr: zw });
             true
-        });
+        },
+    );
     out
 }
 
@@ -485,10 +498,24 @@ pub(crate) fn build_zw_candidates(
     spectral_w: &SpectralFilter,
     stats: &mut SearchStats,
     found: &AtomicBool,
+    cancelled: &AtomicBool,
 ) -> Vec<CandidateZW> {
-    let w_candidates = build_w_candidates(problem, tuple.w, cfg, spectral_w, stats, found);
-    if found.load(AtomicOrdering::Relaxed) { return Vec::new(); }
+    let w_candidates =
+        build_w_candidates(problem, tuple.w, cfg, spectral_w, stats, found, cancelled);
+    if found.load(AtomicOrdering::Relaxed) || cancelled.load(AtomicOrdering::Relaxed) {
+        return Vec::new();
+    }
     let w_index = SpectralIndex::build(&w_candidates);
-    stream_zw_candidates(problem, tuple.z, &w_candidates, &w_index, cfg, spectral_z, stats, found)
+    stream_zw_candidates(
+        problem,
+        tuple.z,
+        &w_candidates,
+        &w_index,
+        cfg,
+        spectral_z,
+        stats,
+        found,
+        cancelled,
+    )
 }
 
