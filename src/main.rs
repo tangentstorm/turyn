@@ -310,6 +310,31 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
     }
 }
 
+/// Spawn a wall-clock watchdog that flips `cancel` once `sat_secs`
+/// seconds have passed. Caller is responsible for joining the
+/// returned handle *after* also flipping `cancel` (or dropping the
+/// engine) so the watchdog doesn't outlive the search. Returns
+/// `None` when `sat_secs == 0` (no limit).
+fn spawn_sat_secs_watchdog(
+    sat_secs: u64,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    if sat_secs == 0 {
+        return None;
+    }
+    let deadline = std::time::Duration::from_secs(sat_secs);
+    Some(std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return; // already cancelled by drain/solution
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }))
+}
+
 fn run_framework_mdd_mode(
     problem: Problem,
     tuples: Vec<SumTuple>,
@@ -334,27 +359,34 @@ fn run_framework_mdd_mode(
         EngineConfig::default(),
         Box::new(GoldThenWork::new(32)),
     );
-    // Short-circuit once any worker publishes a solution: set the
-    // context's `found` flag AND cancel the engine so workers stop
-    // pulling work from the scheduler.
+    // The engine's live cancel flag. Handed to the solution drain
+    // (to stop on first `(X,Y,Z,W)`) and to the `--sat-secs`
+    // watchdog (to stop on wall-clock limit). Handlers read it
+    // via `StageContext::is_cancelled`.
+    let engine_cancel = engine.cancel_flag();
     let found_ctx = std::sync::Arc::clone(&adapter.ctx.found);
-    let engine_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let engine_cancel_clone = std::sync::Arc::clone(&engine_cancel);
 
+    let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
     // Drain-thread: polls the solution channel; on first hit sets
-    // the cancel flag + `ctx.found`. `thread::scope` keeps it tied
-    // to the engine's lifetime.
+    // the context's `found` flag *and* the engine's cancel flag so
+    // in-flight handlers exit fast and the coordinator stops
+    // dispatching.
     let drain_handle = std::thread::spawn(move || {
         let mut solutions = Vec::new();
         while let Ok(sol) = result_rx.recv() {
             found_ctx.store(true, std::sync::atomic::Ordering::Relaxed);
-            engine_cancel_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+            cancel_for_drain.store(true, std::sync::atomic::Ordering::Relaxed);
             solutions.push(sol);
         }
         solutions
     });
 
-    let cancel_watchdog = std::sync::Arc::clone(&engine_cancel);
+    // Wall-clock watchdog: if the caller set `--sat-secs`,
+    // trip the engine's cancel flag once the deadline hits.
+    // `sat_secs == 0` means "no limit" (SearchConfig default).
+    let watchdog_handle =
+        spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
+
     engine.run(&adapter, move |event| match event {
         SearchEvent::Progress(p) => {
             if verbose {
@@ -362,12 +394,6 @@ fn run_framework_mdd_mode(
                     "[framework:{}] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}",
                     mode_name, p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc
                 );
-            }
-            if cancel_watchdog.load(std::sync::atomic::Ordering::Relaxed) {
-                // Engine will notice via its internal `cancelled`
-                // flag if we call cancel(); but we don't own the
-                // engine from this closure, so rely on the found
-                // flag propagated through StageContext instead.
             }
         }
         SearchEvent::Finished(p) => {
@@ -377,6 +403,13 @@ fn run_framework_mdd_mode(
             );
         }
     });
+
+    // Engine has returned — make the watchdog exit if it's still
+    // sleeping, so we can join cleanly below.
+    engine_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = watchdog_handle {
+        let _ = h.join();
+    }
 
     // Hold a clone of the metrics so per-stage counters are
     // readable after `adapter` is dropped below.
@@ -494,15 +527,20 @@ fn run_framework_cross_mode(
         EngineConfig::default(),
         Box::new(GoldThenWork::new(32)),
     );
+    let engine_cancel = engine.cancel_flag();
     let found_flag = std::sync::Arc::clone(&adapter.found);
+    let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
     let drain = std::thread::spawn(move || {
         let mut solutions = Vec::new();
         while let Ok(sol) = result_rx.recv() {
             found_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            cancel_for_drain.store(true, std::sync::atomic::Ordering::Relaxed);
             solutions.push(sol);
         }
         solutions
     });
+    let watchdog_handle =
+        spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
     engine.run(&adapter, |event| match event {
         SearchEvent::Progress(p) => {
             if verbose {
@@ -519,6 +557,11 @@ fn run_framework_cross_mode(
             );
         }
     });
+    // Engine returned — release the watchdog so we can join.
+    engine_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = watchdog_handle {
+        let _ = h.join();
+    }
     drop(adapter);
     let solutions = drain.join().unwrap_or_default();
     println!(
@@ -529,27 +572,36 @@ fn run_framework_cross_mode(
 }
 
 fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) {
+    let mut engine = SearchEngine::<SyncPayload>::new(
+        EngineConfig::default(),
+        Box::new(GoldThenWork::new(32)),
+    );
+    let engine_cancel = engine.cancel_flag();
+    // Forward the same cancel flag into the walker so its internal
+    // parallel DFS (which runs inside a single StageHandler call)
+    // respects `--sat-secs` / drain cancellation alongside the
+    // universal `StageContext::is_cancelled` path.
     let sync_cfg = crate::sync_walker::SyncConfig {
         sat_secs: cfg.sat_secs,
         sat_config: cfg.sat_config.clone(),
         conflict_limit: cfg.conflict_limit,
         random_seed: None,
-        cancel: None,
+        cancel: Some(std::sync::Arc::clone(&engine_cancel)),
         exchange: None,
         projected_fraction_ppm: None,
     };
     let (adapter, result_rx) = SyncAdapter::build(problem, sync_cfg, verbose);
-    let mut engine = SearchEngine::<SyncPayload>::new(
-        EngineConfig::default(),
-        Box::new(GoldThenWork::new(32)),
-    );
+    let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
     let drain_handle = std::thread::spawn(move || {
         let mut solutions = Vec::new();
         while let Ok(sol) = result_rx.recv() {
+            cancel_for_drain.store(true, std::sync::atomic::Ordering::Relaxed);
             solutions.push(sol);
         }
         solutions
     });
+    let watchdog_handle =
+        spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
     engine.run(&adapter, |event| match event {
         SearchEvent::Progress(p) => {
             if verbose {
@@ -566,6 +618,10 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
             );
         }
     });
+    engine_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = watchdog_handle {
+        let _ = h.join();
+    }
     drop(adapter);
     let solutions = drain_handle.join().unwrap_or_default();
     println!(
