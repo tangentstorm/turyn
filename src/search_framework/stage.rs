@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::search_framework::mass::MassDelta;
@@ -138,10 +139,27 @@ impl<T> Default for StageOutcome<T> {
     }
 }
 
+/// Context passed into every `StageHandler::handle` call.
+///
+/// `cancelled` is a **live** handle into the engine's cancel flag —
+/// long-running handlers (e.g. cross's O(2^(4k)) brute-force
+/// enumeration) should poll it inside their inner loops so the
+/// engine's `cancel()` or the drain thread's solution-found hook
+/// actually stops work in flight. Use [`StageContext::is_cancelled`]
+/// for a `bool` snapshot at poll time.
 pub struct StageContext<'a> {
-    pub cancelled: bool,
+    pub cancelled: &'a AtomicBool,
     pub now_millis: u128,
     pub adapter_name: &'a str,
+}
+
+impl StageContext<'_> {
+    /// Snapshot of the live cancel flag. Safe to call in a tight loop
+    /// — one relaxed atomic load.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 pub trait StageHandler<T>: Send + Sync {

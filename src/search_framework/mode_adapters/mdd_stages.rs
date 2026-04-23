@@ -202,7 +202,7 @@ impl StageHandler<MddPayload> for BoundaryStage {
         item: WorkItem<MddPayload>,
         ctx: &StageContext<'_>,
     ) -> StageOutcome<MddPayload> {
-        if ctx.cancelled {
+        if ctx.is_cancelled() {
             return StageOutcome::default();
         }
         let parent_meta = item.meta;
@@ -247,7 +247,7 @@ impl StageHandler<MddPayload> for SolveWStage {
         item: WorkItem<MddPayload>,
         ctx: &StageContext<'_>,
     ) -> StageOutcome<MddPayload> {
-        if ctx.cancelled {
+        if ctx.is_cancelled() {
             return StageOutcome::default();
         }
         let parent_meta = item.meta;
@@ -312,7 +312,7 @@ impl StageHandler<MddPayload> for SolveWZStage {
         item: WorkItem<MddPayload>,
         ctx: &StageContext<'_>,
     ) -> StageOutcome<MddPayload> {
-        if ctx.cancelled {
+        if ctx.is_cancelled() {
             return StageOutcome::default();
         }
         let parent_meta = item.meta;
@@ -388,7 +388,7 @@ impl StageHandler<MddPayload> for SolveZStage {
         item: WorkItem<MddPayload>,
         ctx: &StageContext<'_>,
     ) -> StageOutcome<MddPayload> {
-        if ctx.cancelled {
+        if ctx.is_cancelled() {
             return StageOutcome::default();
         }
         let parent_meta = item.meta;

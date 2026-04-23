@@ -64,7 +64,7 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
     fn handle(
         &self,
         _item: WorkItem<CrossPayload>,
-        _ctx: &StageContext<'_>,
+        ctx: &StageContext<'_>,
     ) -> StageOutcome<CrossPayload> {
         let problem = self.problem;
         let cfg = &*self.cfg;
@@ -81,11 +81,27 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
         // XY stage state. Each surviving (Z, W) pair clones a
         // template matching its tuple and brute-forces the
         // `(x_bits, y_bits)` boundary combinations.
-        let k = self.k.min((problem.n - 1) / 2).min(problem.m() / 2);
+        //
+        // Cap `k` so `2 * k` fits inside a `u32` shift (x_bits and
+        // y_bits are `u32` at the SAT boundary). Without this,
+        // `--wz=cross --mdd-k=9` panicked at `1u32 << (2 * 2 * 9) =
+        // 1u32 << 36`. The brute-force producer isn't meant for
+        // large `k` in the first place — users who need larger
+        // boundary widths should switch to `--wz=apart|together`.
+        const MAX_BOUNDARY_BITS: usize = 16; // k ≤ 8; 2^32 XY codes per (Z,W)
+        let raw_k = self.k.min((problem.n - 1) / 2).min(problem.m() / 2);
+        let k = raw_k.min(MAX_BOUNDARY_BITS / 2);
+        if k < raw_k {
+            eprintln!(
+                "cross: mdd_k={} caps the brute-force XY enumeration at 2^{} per (Z,W); \
+                 reducing to mdd_k={} (boundary_bits={}). Use --wz=apart|together for k>{}.",
+                raw_k, 4 * raw_k, k, 2 * k, MAX_BOUNDARY_BITS / 2,
+            );
+        }
         let mut template_cache: HashMap<Vec<(i32, i32, i32, i32)>, SatXYTemplate> = HashMap::new();
 
         for (tuple_idx, tuple) in tuples.iter().copied().enumerate() {
-            if found.load(Ordering::Relaxed) {
+            if found.load(Ordering::Relaxed) || ctx.is_cancelled() {
                 break;
             }
             if !w_cache.contains_key(&tuple.w) {
@@ -95,7 +111,7 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                 w_cache.insert(tuple.w, (w_candidates, w_index));
             }
             let (w_candidates, w_index) = w_cache.get(&tuple.w).unwrap();
-            if found.load(Ordering::Relaxed) {
+            if found.load(Ordering::Relaxed) || ctx.is_cancelled() {
                 break;
             }
             // Tuple about to be processed. `tuples_done` reports
@@ -112,7 +128,7 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                 &mut stats,
                 found,
                 |z_seq, w_seq, zw, _z_spec, _w_spec| {
-                    if found.load(Ordering::Relaxed) {
+                    if found.load(Ordering::Relaxed) || ctx.is_cancelled() {
                         return false;
                     }
                     if !seen_zw.insert(zw.clone()) {
@@ -152,13 +168,25 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                             state.solver.set_conflict_limit(5000);
                         }
                         let boundary_bits = 2 * k;
-                        let total_xy = 1u32 << (2 * boundary_bits);
+                        // Widen to u64 before shifting: the old `1u32 <<
+                        // (2 * boundary_bits)` overflowed once
+                        // boundary_bits exceeded 15 (k≥8). `k` is now
+                        // capped to `MAX_BOUNDARY_BITS / 2 = 8` up
+                        // above so this shift stays ≤ `1u64 << 32`,
+                        // but the u64 widening is the defensive fix.
+                        let total_xy: u64 = 1u64 << (2 * boundary_bits);
                         for code in 0..total_xy {
-                            if found.load(Ordering::Relaxed) {
+                            // Poll both found (a peer signalled
+                            // success) and the engine's live cancel
+                            // flag every iteration — the brute-force
+                            // loop can span billions of XY attempts
+                            // and must be interruptible without a
+                            // dispatch-time snapshot.
+                            if found.load(Ordering::Relaxed) || ctx.is_cancelled() {
                                 break;
                             }
-                            let x_bits = code & ((1u32 << boundary_bits) - 1);
-                            let y_bits = code >> boundary_bits;
+                            let x_bits = (code & ((1u64 << boundary_bits) - 1)) as u32;
+                            let y_bits = (code >> boundary_bits) as u32;
                             let (result, _stats) = state.try_candidate(x_bits, y_bits);
                             if let XyTryResult::Sat(x, y) = result {
                                 if verify_tt(

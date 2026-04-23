@@ -176,8 +176,13 @@ impl<T: Send + 'static> SearchEngine<T> {
                             in_flight.fetch_sub(1, Ordering::AcqRel);
                             continue;
                         };
+                        // `ctx.cancelled` is now a live `&AtomicBool`
+                        // reference into the engine's flag so handlers
+                        // running long internal loops (cross's
+                        // brute-force XY walk, sync's DFS) can poll it
+                        // without relying on a dispatch-time snapshot.
                         let ctx = StageContext {
-                            cancelled: cancelled.load(Ordering::Relaxed),
+                            cancelled: &cancelled,
                             now_millis: start_clone.elapsed().as_millis(),
                             adapter_name,
                         };
