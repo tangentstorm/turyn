@@ -102,10 +102,10 @@ impl<T: Send + 'static> SearchEngine<T> {
         let mut forcings = ForcingRollups::default();
         // Hold the mass model across the run so progress ticks can
         // publish the adapter's current `quality()` rather than a
-        // hardcoded placeholder — addresses the PR review point
-        // about the live stream claiming a different quality class
-        // than the final snapshot.
-        let mass_model = adapter.mass_model();
+        // hardcoded placeholder, and so the coordinator can poll
+        // `covered_mass()` each tick to surface pull-based
+        // coverage (e.g. sync's projected fraction).
+        let mass_model: Arc<dyn SearchMassModel> = Arc::from(adapter.mass_model());
         let mut mass = MassSnapshot::new(mass_model.total_mass());
 
         let stages_map: BTreeMap<StageId, Arc<dyn StageHandler<T>>> = adapter
@@ -229,6 +229,15 @@ impl<T: Send + 'static> SearchEngine<T> {
 
                 if last_progress.elapsed() >= self.cfg.progress_interval {
                     last_progress = Instant::now();
+                    // Pull any live-polled coverage from the mass
+                    // model. Adapters with a running counter (e.g.
+                    // `tuples_done`) surface progress here even when
+                    // they don't push `MassDelta` per handler. Takes
+                    // the max so push-based deltas aren't clobbered.
+                    let polled = mass_model.covered_mass();
+                    if polled.0 > mass.covered_exact.0 {
+                        mass.covered_exact = polled;
+                    }
                     on_event(SearchEvent::Progress(build_snapshot(
                         start.elapsed(),
                         &mass,
@@ -261,6 +270,12 @@ impl<T: Send + 'static> SearchEngine<T> {
             }
         });
 
+        // Final poll for any live-counted coverage the last tick
+        // missed — same policy as the in-loop tick.
+        let polled = mass_model.covered_mass();
+        if polled.0 > mass.covered_exact.0 {
+            mass.covered_exact = polled;
+        }
         on_event(SearchEvent::Finished(build_snapshot(
             start.elapsed(),
             &mass,
