@@ -372,19 +372,25 @@ fn apply_report<T>(
     mass.apply_delta(outcome.mass_delta);
     forcings.apply(from_stage, &outcome.forcings);
 
-    let emitted_len = outcome.emitted.len() as u64;
-    // Update `live_descendants` as a true *in-flight* subtree
-    // count: +1 per emitted child, and -1 for the item we just
-    // finished processing. Previously only the emissions were
-    // counted, so `fanout_roots.live_descendants` monotonically
-    // grew and misled consumers. Seed items never pass through
-    // here unless they themselves emit, so subtract 1 only when
-    // this item completes (every call of `apply_report`).
+    // `live_descendants` is a true *in-flight* subtree count: every
+    // continuation path that creates a new scheduler-visible work
+    // item adds 1; the item we just finished subtracts 1. Per
+    // docs/TELEMETRY.md §3 the counter MUST include split children
+    // and — under this engine's chosen Resume model — resumed work
+    // as well (see the Resume arm below).
+    let split_count = match &outcome.continuation {
+        Continuation::None => 0u64,
+        Continuation::Split(items) => items.len() as u64,
+        // Resume re-enters the scheduler as a live logical item, so
+        // it keeps the boundary alive exactly like a split child.
+        Continuation::Resume(_) => 1,
+    };
+    let new_live = outcome.emitted.len() as u64 + split_count;
     {
         let entry = fanout_roots.entry(fanout_root_id).or_default();
         entry.live_descendants = entry
             .live_descendants
-            .saturating_add(emitted_len)
+            .saturating_add(new_live)
             .saturating_sub(1);
     }
 
@@ -404,6 +410,9 @@ fn apply_report<T>(
         match outcome.continuation {
             Continuation::None => {}
             Continuation::Split(items) => {
+                // Per docs/TELEMETRY.md §2, each split child is a
+                // logical work transition and MUST contribute one
+                // `spawned` count on its own edge.
                 for child in items {
                     let to_stage = child.stage_id;
                     edge_flow
@@ -415,6 +424,18 @@ fn apply_report<T>(
                 }
             }
             Continuation::Resume(child) => {
+                // This engine adopts the "explicit self-edge"
+                // Resume model from docs/TELEMETRY.md §2.
+                // Resuming the same logical subproblem counts as
+                // one logical work transition on the
+                // `(from_stage, same_stage)` edge, so resume
+                // volume is observable in `edge_flow` and matches
+                // the `live_descendants` accounting above.
+                let to_stage = child.stage_id;
+                edge_flow
+                    .entry((from_stage.to_string(), to_stage.to_string()))
+                    .or_default()
+                    .spawned += 1;
                 guard.push(child);
                 notify = true;
             }
@@ -600,6 +621,205 @@ mod tests {
     fn coordinator_drains_and_exits_multiple_workers() {
         let (count, _) = run_with_workers(8, 4);
         assert_eq!(count, 8 * 3);
+    }
+
+    /// Stage that uses `Continuation::Split` once then stops.
+    /// Each handled item with `payload < depth` splits into two
+    /// children (same stage, same fanout_root) via Continuation; no
+    /// `emitted` entries. Lets us verify split-child accounting in
+    /// isolation from the `emitted` path.
+    struct SplitStage {
+        depth: u64,
+        counter: Arc<AtomicU64>,
+    }
+    impl StageHandler<u64> for SplitStage {
+        fn id(&self) -> StageId { "split" }
+        fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+            let mut out = StageOutcome::default();
+            if item.payload < self.depth {
+                let mk_child = |bump: u64| WorkItem {
+                    stage_id: "split",
+                    priority: 0,
+                    cost_hint: 1,
+                    replay_key: 0,
+                    mass_hint: None,
+                    meta: WorkItemMeta {
+                        item_id: item.meta.item_id * 10 + bump,
+                        parent_item_id: Some(item.meta.item_id),
+                        fanout_root_id: item.meta.fanout_root_id,
+                        depth_from_root: item.meta.depth_from_root + 1,
+                        spawn_seq: bump as u32,
+                    },
+                    payload: item.payload + 1,
+                };
+                out.continuation = Continuation::Split(vec![mk_child(1), mk_child(2)]);
+            }
+            out
+        }
+    }
+
+    struct SplitAdapter { counter: Arc<AtomicU64>, depth: u64 }
+    impl SearchModeAdapter<u64> for SplitAdapter {
+        fn name(&self) -> &'static str { "split" }
+        fn init(&self) -> AdapterInit<u64> {
+            AdapterInit {
+                seed_items: vec![WorkItem {
+                    stage_id: "split",
+                    priority: 0,
+                    cost_hint: 1,
+                    replay_key: 0,
+                    mass_hint: None,
+                    meta: WorkItemMeta {
+                        item_id: 1,
+                        parent_item_id: None,
+                        fanout_root_id: 42,
+                        depth_from_root: 0,
+                        spawn_seq: 0,
+                    },
+                    payload: 0,
+                }],
+            }
+        }
+        fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<u64>>> {
+            let mut m: BTreeMap<StageId, Box<dyn StageHandler<u64>>> = BTreeMap::new();
+            m.insert("split", Box::new(SplitStage {
+                depth: self.depth,
+                counter: Arc::clone(&self.counter),
+            }));
+            m
+        }
+        fn mass_model(&self) -> Box<dyn SearchMassModel> {
+            Box::new(CounterMass { total: MassValue::ONE })
+        }
+    }
+
+    /// Stage that resumes its own item `resumes` times, then stops.
+    /// Uses `Continuation::Resume` so we can verify Resume
+    /// bookkeeping independently of `emitted` and `Split`.
+    struct ResumeStage {
+        resumes: u64,
+        counter: Arc<AtomicU64>,
+    }
+    impl StageHandler<u64> for ResumeStage {
+        fn id(&self) -> StageId { "resume" }
+        fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+            let mut out = StageOutcome::default();
+            if item.payload < self.resumes {
+                out.continuation = Continuation::Resume(WorkItem {
+                    stage_id: "resume",
+                    priority: 0,
+                    cost_hint: 1,
+                    replay_key: 0,
+                    mass_hint: None,
+                    meta: WorkItemMeta {
+                        item_id: item.meta.item_id,
+                        parent_item_id: item.meta.parent_item_id,
+                        fanout_root_id: item.meta.fanout_root_id,
+                        depth_from_root: item.meta.depth_from_root,
+                        spawn_seq: item.meta.spawn_seq.saturating_add(1),
+                    },
+                    payload: item.payload + 1,
+                });
+            }
+            out
+        }
+    }
+
+    struct ResumeAdapter { counter: Arc<AtomicU64>, resumes: u64 }
+    impl SearchModeAdapter<u64> for ResumeAdapter {
+        fn name(&self) -> &'static str { "resume" }
+        fn init(&self) -> AdapterInit<u64> {
+            AdapterInit {
+                seed_items: vec![WorkItem {
+                    stage_id: "resume",
+                    priority: 0,
+                    cost_hint: 1,
+                    replay_key: 0,
+                    mass_hint: None,
+                    meta: WorkItemMeta {
+                        item_id: 1,
+                        parent_item_id: None,
+                        fanout_root_id: 7,
+                        depth_from_root: 0,
+                        spawn_seq: 0,
+                    },
+                    payload: 0,
+                }],
+            }
+        }
+        fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<u64>>> {
+            let mut m: BTreeMap<StageId, Box<dyn StageHandler<u64>>> = BTreeMap::new();
+            m.insert("resume", Box::new(ResumeStage {
+                resumes: self.resumes,
+                counter: Arc::clone(&self.counter),
+            }));
+            m
+        }
+        fn mass_model(&self) -> Box<dyn SearchMassModel> {
+            Box::new(CounterMass { total: MassValue::ONE })
+        }
+    }
+
+    fn final_snapshot<T: Send + 'static>(
+        adapter: &dyn SearchModeAdapter<T>,
+    ) -> ProgressSnapshot {
+        let cfg = EngineConfig {
+            progress_interval: Duration::from_millis(50),
+            worker_count: 1,
+        };
+        let mut engine = SearchEngine::<T>::new(cfg, Box::new(GoldThenWork::new(4)));
+        let mut final_snap: Option<ProgressSnapshot> = None;
+        engine.run(adapter, |event| {
+            if let SearchEvent::Finished(p) = event {
+                final_snap = Some(p);
+            }
+        });
+        final_snap.expect("Finished event was not emitted")
+    }
+
+    #[test]
+    fn split_children_count_on_edge_flow_and_live_descendants() {
+        // One seed, depth 2 ⇒ tree: seed(1) splits into 2 children,
+        // each splits into 2 leaves. Handles: 1 + 2 + 4 = 7.
+        // Every split child edge is a logical work transition
+        // between `split -> split` per docs/TELEMETRY.md §2; the
+        // seed subtree fully drains so `live_descendants` ends at 0.
+        let counter = Arc::new(AtomicU64::new(0));
+        let adapter = SplitAdapter { counter: Arc::clone(&counter), depth: 2 };
+        let p = final_snapshot::<u64>(&adapter);
+        assert_eq!(counter.load(Ordering::Relaxed), 7);
+        // 3 split parents × 2 children each = 6 spawned edges.
+        let spawned = p
+            .edge_flow
+            .get(&("split".to_string(), "split".to_string()))
+            .map(|c| c.spawned)
+            .unwrap_or(0);
+        assert_eq!(spawned, 6, "Continuation::Split children MUST contribute to edge_flow.spawned");
+        let live = p.fanout_roots.get(&42).map(|c| c.live_descendants).unwrap_or(0);
+        assert_eq!(live, 0, "subtree fully drained — live_descendants must decay to 0");
+    }
+
+    #[test]
+    fn resume_as_self_edge_counts_each_resumption() {
+        // Engine's declared Resume model (docs/TELEMETRY.md §2
+        // option 1): Resume IS an explicit self-edge in edge_flow
+        // and IS a live descendant while it sits in the queue.
+        // One seed, 3 resumes ⇒ 4 handle() calls, 3 resume edges
+        // on (resume -> resume).
+        let counter = Arc::new(AtomicU64::new(0));
+        let adapter = ResumeAdapter { counter: Arc::clone(&counter), resumes: 3 };
+        let p = final_snapshot::<u64>(&adapter);
+        assert_eq!(counter.load(Ordering::Relaxed), 4);
+        let spawned = p
+            .edge_flow
+            .get(&("resume".to_string(), "resume".to_string()))
+            .map(|c| c.spawned)
+            .unwrap_or(0);
+        assert_eq!(spawned, 3, "Continuation::Resume MUST count as one self-edge per resumption under the engine's declared model");
+        let live = p.fanout_roots.get(&7).map(|c| c.live_descendants).unwrap_or(0);
+        assert_eq!(live, 0, "resume chain must terminate at zero live descendants");
     }
 
     #[test]

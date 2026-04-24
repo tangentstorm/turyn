@@ -30,7 +30,7 @@ use crate::mdd_pipeline::{
 use crate::search_framework::engine::{AdapterInit, SearchModeAdapter};
 use crate::search_framework::mass::{CoverageQuality, MassValue, SearchMassModel};
 use crate::search_framework::stage::{
-    StageContext, StageHandler, StageId, StageOutcome, WorkItem, WorkItemMeta,
+    ForcingDelta, StageContext, StageHandler, StageId, StageOutcome, WorkItem, WorkItemMeta,
 };
 use crate::xy_sat::SatXYTemplate;
 use crate::legacy_search::WarmStartState;
@@ -305,6 +305,7 @@ impl StageHandler<MddPayload> for SolveWStage {
             fft_buf_w,
             rng,
         } = &mut *guard;
+        let mut forcings: Vec<(u16, u8, u32)> = Vec::new();
         let emitted_raw = process_solve_w(
             sw,
             &self.ctx,
@@ -313,8 +314,10 @@ impl StageHandler<MddPayload> for SolveWStage {
             &self.spectral_w,
             fft_buf_w,
             rng,
+            &mut forcings,
         );
         let mut out = StageOutcome::default();
+        out.forcings = ForcingDelta { by_level_feature: forcings };
         out.emitted = wrap_items(emitted_raw, &parent_meta, &self.item_ids);
         // Handoff to the boundary's pending-counter: this SolveW
         // item consumes one unit and emits `out.emitted.len()` new
@@ -369,6 +372,17 @@ impl StageHandler<MddPayload> for SolveWZStage {
             template_cache,
             rng,
         } = &mut *guard;
+        // Snapshot `flow_xy_timeout_cov_micro` before/after so any
+        // timeout-capable XY work triggered inside `process_solve_wz`
+        // contributes partial credit to the same boundary-mass
+        // ledger `SolveZ` uses. Without this, `--wz=together`
+        // undercounts `covered_partial`; see `docs/TTC.md` §4.2
+        // (bundled-stage rule) and §7.2 (apart/together parity).
+        let cov_micro_before = self
+            .metrics
+            .flow_xy_timeout_cov_micro
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let mut forcings: Vec<(u16, u8, u32)> = Vec::new();
         let deferred = process_solve_wz(
             swz,
             &self.ctx,
@@ -377,8 +391,16 @@ impl StageHandler<MddPayload> for SolveWZStage {
             &self.sat_config,
             &self.result_tx,
             rng,
+            &mut forcings,
         );
+        let cov_micro_after = self
+            .metrics
+            .flow_xy_timeout_cov_micro
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.progress
+            .add_partial_cov_micro(cov_micro_after.saturating_sub(cov_micro_before));
         let mut out = StageOutcome::default();
+        out.forcings = ForcingDelta { by_level_feature: forcings };
         if let Some((item, _priority)) = deferred {
             // Framework priority is i32 (coarse tag); legacy f64
             // continuation priority is dropped. Re-enqueue as
@@ -461,6 +483,7 @@ impl StageHandler<MddPayload> for SolveZStage {
             .metrics
             .flow_xy_timeout_cov_micro
             .load(std::sync::atomic::Ordering::Relaxed);
+        let mut forcings: Vec<(u16, u8, u32)> = Vec::new();
         process_solve_z(
             sz,
             &self.ctx,
@@ -473,6 +496,7 @@ impl StageHandler<MddPayload> for SolveZStage {
             &self.sat_config,
             &self.result_tx,
             rng,
+            &mut forcings,
         );
         let cov_micro_after = self
             .metrics
@@ -490,7 +514,9 @@ impl StageHandler<MddPayload> for SolveZStage {
         // `covered_partial`, matching the timeout-shortfall
         // credit described in `docs/TTC.md`.
         self.progress.note_handled(parent_meta.fanout_root_id, 0);
-        StageOutcome::default()
+        let mut out = StageOutcome::default();
+        out.forcings = ForcingDelta { by_level_feature: forcings };
+        out
     }
 }
 
@@ -793,3 +819,65 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
 // constructor doesn't need a separate import edit.
 #[allow(dead_code)]
 fn _marker(_cfg: &SearchConfig, _problem: Problem, _tuples: &[SumTuple]) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TTC spec §4.2 "bundled-stage rule" + §7.2 "apart/together
+    /// parity": any timeout-capable XY attempt, regardless of which
+    /// stage path triggered it, MUST contribute partial credit to
+    /// the same boundary-mass ledger. This test reproduces the bug
+    /// that was in `SolveWZStage`: if `add_partial_cov_micro` is
+    /// skipped, `partial_fraction` stays at 0 even though XY
+    /// timeouts were recorded elsewhere.
+    #[test]
+    fn partial_credit_ledger_is_additive_across_stage_paths() {
+        let progress = BoundaryProgress::new(10);
+        // Simulate SolveZ reporting 500_000 cov-micros from an XY
+        // timeout (half the full sub-cube credit).
+        progress.add_partial_cov_micro(500_000);
+        // Simulate SolveWZ reporting another 250_000 cov-micros.
+        // Per the spec this MUST increase `partial_fraction`; if
+        // the adapter skips this call, `partial_fraction` would
+        // under-report.
+        progress.add_partial_cov_micro(250_000);
+        let frac = progress.partial_fraction();
+        // total=10, so denom = 10 * 1_000_000. Sum = 750_000 ⇒
+        // fraction = 750_000 / 10_000_000 = 0.075.
+        assert!((frac - 0.075).abs() < 1e-9,
+            "covered_partial must accumulate credit from every stage path, got {}", frac);
+    }
+
+    /// Regression test: the pre-fix `SolveWZStage` skipped
+    /// `add_partial_cov_micro`. If we credit only SolveZ-style
+    /// calls and leave SolveWZ credit on the floor, the result is
+    /// an under-report of `covered_partial`. Verifies the fraction
+    /// diverges between the correct (both credited) and buggy
+    /// (only one credited) ledgers.
+    #[test]
+    fn only_solve_z_credit_would_under_report_partial_vs_unified() {
+        let unified = BoundaryProgress::new(4);
+        let only_solve_z = BoundaryProgress::new(4);
+        // Pretend SolveZ reported 400_000 cov-micro, SolveWZ reported
+        // 600_000. The unified ledger credits both; the buggy
+        // "only SolveZ" ledger credits just 400_000.
+        unified.add_partial_cov_micro(400_000);
+        unified.add_partial_cov_micro(600_000);
+        only_solve_z.add_partial_cov_micro(400_000);
+        assert!(unified.partial_fraction() > only_solve_z.partial_fraction(),
+            "spec requires every timeout-capable XY path to contribute; only-SolveZ must under-report vs unified");
+        assert!((unified.partial_fraction() - 0.25).abs() < 1e-9);
+        assert!((only_solve_z.partial_fraction() - 0.10).abs() < 1e-9);
+    }
+
+    /// TTC §3 mass invariants: partial_fraction is clamped to
+    /// [0, 1] even if cov_micro overflows the denominator.
+    #[test]
+    fn partial_fraction_is_clamped_to_one() {
+        let progress = BoundaryProgress::new(1);
+        progress.add_partial_cov_micro(5_000_000); // 5× the denom.
+        let frac = progress.partial_fraction();
+        assert!(frac <= 1.0 && frac >= 0.0, "partial_fraction MUST stay in [0, 1]; got {}", frac);
+    }
+}

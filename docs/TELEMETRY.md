@@ -216,7 +216,14 @@ As of this tree:
 - `[feature, level]` exists in `radical`
 - the coordinator rollups `[stage, level]` and `[stage, feature]` are wired in
   the schema
-- adapters may still leave `StageOutcome::forcings` empty
+- the MDD adapter stages (`mdd.solve_w`, `mdd.solve_wz`, `mdd.solve_z`)
+  populate `StageOutcome::forcings` from their primary middle-solver's
+  `propagations_by_kind_level()` delta
+- inline XY-path solvers inside `process_solve_z` / `process_solve_wz`
+  are not yet attributed — their forcings are structurally present but
+  semantically absent, matching the "intentionally partial" policy in §6
+- sync / cross / stochastic adapters still leave `StageOutcome::forcings`
+  empty
 
 Readers should therefore treat empty stage-based forcing tables as “not yet
 populated”, not as proof that no forcings occurred.
@@ -226,11 +233,16 @@ populated”, not as proof that no forcings occurred.
 As of this tree:
 
 - `edge_flow.spawned` is the primary populated lifecycle field
-- `fanout_roots.live_descendants` is intended to track live subtree size
-
-If continuation paths evolve, this section should be updated to state whether
-resume operations are represented as self-edges, omitted from edge-flow, or
-counted some other way.
+- `fanout_roots.live_descendants` tracks live subtree size: incremented
+  by every emitted child, every `Continuation::Split` child, and every
+  `Continuation::Resume` item; decremented on handler completion
+- `Continuation::Split` children each contribute one `spawned` count on
+  their (parent_stage, child_stage) edge
+- **Resume model (this tree's choice):** `Continuation::Resume` is
+  represented as an explicit self-edge on `(from_stage, from_stage)` and
+  counts one `spawned` per resumption (option 1 in §2). This model lets
+  resume volume surface in `edge_flow`; the coordinator's live-descendant
+  accounting treats each queued resume as live work.
 
 ## Part 3: `--wz=sync` legacy telemetry blocks
 

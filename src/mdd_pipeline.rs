@@ -28,6 +28,40 @@ use crate::SPECTRAL_FREQS;
 
 
 
+/// Produce a `(decision_level, PropKind as u8, count)` list for the
+/// forced literals attributable to `solver` since `baseline` was
+/// snapshotted. `baseline` is typically `solver.propagations_by_kind_level().to_vec()`
+/// captured before the stage ran its solve loop.
+///
+/// For freshly-constructed solvers whose entire lifetime is within
+/// one stage call, pass an empty baseline (`&[]`) so the full
+/// `prop_by_kind_level` snapshot is reported as this call's
+/// attribution — matches the spec's "cause == this stage's own
+/// action" rule (`docs/TELEMETRY.md` §4 attribution rule) because
+/// the fresh solver has no prior history.
+pub(crate) fn forcing_delta_triples(
+    solver: &radical::Solver,
+    baseline: &[[u64; radical::PropKind::COUNT]],
+) -> Vec<(u16, u8, u32)> {
+    let after = solver.propagations_by_kind_level();
+    let mut out: Vec<(u16, u8, u32)> = Vec::new();
+    for (lvl, after_row) in after.iter().enumerate() {
+        let zeros = [0u64; radical::PropKind::COUNT];
+        let before_row = baseline.get(lvl).unwrap_or(&zeros);
+        for kind in 0..radical::PropKind::COUNT {
+            let d = after_row[kind].saturating_sub(before_row[kind]);
+            if d > 0 {
+                // `count` is a u32 on the wire. Cap at u32::MAX in
+                // the astronomically-unlikely event the solver
+                // forced > 4B literals at the same (level, kind);
+                // saturating keeps the ordering invariant.
+                out.push((lvl as u16, kind as u8, d.min(u32::MAX as u64) as u32));
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn compute_zw_autocorr(problem: Problem, z: &PackedSeq, w: &PackedSeq) -> Vec<i32> {
     let mut zw = vec![0i32; problem.n];
     for s in 1..problem.n {
@@ -532,6 +566,7 @@ pub(crate) fn process_solve_w(
     spectral_w: &SpectralFilter,
     fft_buf_w: &mut FftScratch,
     rng: &mut u64,
+    forcings_out: &mut Vec<(u16, u8, u32)>,
 ) -> Vec<PipelineWork> {
     let k = ctx.k;
     let m = ctx.problem.m();
@@ -659,6 +694,14 @@ pub(crate) fn process_solve_w(
         let w_p0 = w_solver.num_propagations();
         let w_l0 = w_solver.num_level0_vars();
         let w_nv = w_solver.num_vars();
+        // Baseline for forcing attribution. `w_solver` is reused
+        // across SolveW calls (cached in `w_bases`), so
+        // `prop_by_kind_level` already contains cumulative history
+        // from prior boundaries. The delta computed after the
+        // solve loop reflects only this stage call — matching the
+        // attribution rule in `docs/TELEMETRY.md` §4.
+        let w_plk0: Vec<[u64; radical::PropKind::COUNT]> =
+            w_solver.propagations_by_kind_level().to_vec();
 
         let max_w_per_boundary: usize = std::env::var("TURYN_MAX_W_PER_BND")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
@@ -725,6 +768,7 @@ pub(crate) fn process_solve_w(
         metrics.flow_w_propagations.fetch_add(w_propagations, AtomicOrdering::Relaxed);
         metrics.flow_w_root_forced.fetch_add(w_pre_forced, AtomicOrdering::Relaxed);
         metrics.flow_w_free_sum.fetch_add(w_free_vars, AtomicOrdering::Relaxed);
+        forcings_out.extend(forcing_delta_triples(&w_solver, &w_plk0));
 
         w_solver.spectral = None;
         w_solver.restore_checkpoint(w_cp);
@@ -762,6 +806,7 @@ pub(crate) fn process_solve_z(
     sat_config: &radical::SolverConfig,
     result_tx: &std::sync::mpsc::Sender<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
     rng: &mut u64,
+    forcings_out: &mut Vec<(u16, u8, u32)>,
 ) {
     let k = ctx.k;
     let n = ctx.problem.n;
@@ -1087,6 +1132,13 @@ pub(crate) fn process_solve_z(
     metrics.flow_z_propagations.fetch_add(z_propagations, AtomicOrdering::Relaxed);
     metrics.flow_z_root_forced.fetch_add(z_pre_forced, AtomicOrdering::Relaxed);
     metrics.flow_z_free_sum.fetch_add(z_free_vars, AtomicOrdering::Relaxed);
+    // `z_solver` is freshly built every call, so an empty baseline
+    // reports the full forcing trace as attribution for this
+    // SolveZ call. Inline XY-path solvers (SolveXyPerCandidate,
+    // try_candidate_via_mdd) do their own independent propagation
+    // inside this stage, but their forcings are not yet threaded
+    // through — only the outer Z-middle solver contributes today.
+    forcings_out.extend(forcing_delta_triples(&z_solver, &[]));
 
     // No cache-insert: the fresh-per-call policy above makes the
     // HashMap unused; keep the slot drained so future readers see
@@ -1119,6 +1171,7 @@ pub(crate) fn process_solve_wz(
     sat_config: &radical::SolverConfig,
     result_tx: &std::sync::mpsc::Sender<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
     rng: &mut u64,
+    forcings_out: &mut Vec<(u16, u8, u32)>,
 ) -> Option<(PipelineWork, f64)> {
     let k = ctx.k;
     let n = ctx.problem.n;
@@ -1632,6 +1685,11 @@ pub(crate) fn process_solve_wz(
     metrics.flow_z_propagations.fetch_add(wz_propagations, AtomicOrdering::Relaxed);
     metrics.flow_z_root_forced.fetch_add(wz_pre_forced, AtomicOrdering::Relaxed);
     metrics.flow_z_free_sum.fetch_add(wz_free_vars, AtomicOrdering::Relaxed);
+    // `solver` is the combined W+Z middle solver built fresh in
+    // this call; empty baseline gives full attribution. Inline
+    // per-(W,Z) XY solvers (`xy_solver`) are not yet threaded
+    // through — documented in `docs/TELEMETRY.md` Part 2.
+    forcings_out.extend(forcing_delta_triples(&solver, &[]));
 
     metrics.stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
 
