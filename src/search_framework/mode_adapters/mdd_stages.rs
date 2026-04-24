@@ -1189,6 +1189,76 @@ mod tests {
         assert!(snap.remaining_mass.0 >= 0.0);
     }
 
+    /// Live integration test for `WzMode::Together`. Round 4 wired
+    /// the SolveWZ stage's forcing rollups (middle solver + inline
+    /// XY solver), and the `mdd_live_run_populates_forcing_rollups`
+    /// test covers Apart mode (Boundary → SolveW → SolveZ). This
+    /// test exercises the alternate topology (Boundary → SolveWZ)
+    /// so a regression breaking SolveWZ forcings wiring doesn't
+    /// slip through on the basis of the Apart test alone.
+    #[test]
+    fn mdd_together_live_run_populates_forcing_rollups() {
+        use crate::config::{SearchConfig, WzMode};
+        use crate::enumerate::phase_a_tuples;
+        use crate::search_framework::engine::{EngineConfig, SearchEngine};
+        use crate::search_framework::events::SearchEvent;
+        use crate::search_framework::queue::GoldThenWork;
+        use crate::types::Problem;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let problem = Problem::new(6);
+        let tuples = phase_a_tuples(problem, None);
+        assert!(!tuples.is_empty());
+
+        let mut cfg = SearchConfig::default();
+        cfg.problem = problem;
+        cfg.wz_mode = Some(WzMode::Together);
+        cfg.wz_together = true; // routes Boundary stage to SolveWZ
+        cfg.mdd_k = 2;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (adapter, _rx) = MddStagesAdapter::build(
+            problem, tuples, &cfg, 2, false, "together", &cancel,
+        );
+        let mut engine = SearchEngine::<MddPayload>::new(
+            EngineConfig {
+                progress_interval: Duration::from_millis(20),
+                worker_count: 1,
+            },
+            Box::new(GoldThenWork::new(4)),
+        );
+
+        let mut final_snap = None;
+        engine.run(&adapter, |event| {
+            if let SearchEvent::Finished(p) = event {
+                final_snap = Some(p);
+            }
+        });
+        let snap = final_snap.expect("Finished event MUST be emitted");
+
+        // SolveWZ's combined middle solver populates forcings,
+        // so rollups MUST be non-empty.
+        assert!(!snap.forcings.stage_level.is_empty(),
+            "Together mode forcings.stage_level MUST be non-empty");
+        // Specifically, at least one key should be `mdd.solve_wz`
+        // (the Together-path stage).
+        let has_solve_wz = snap.forcings.stage_level.keys()
+            .any(|(stage, _)| *stage == "mdd.solve_wz");
+        assert!(has_solve_wz,
+            "Together mode forcings MUST include mdd.solve_wz key; got keys: {:?}",
+            snap.forcings.stage_level.keys().collect::<Vec<_>>());
+        // §4 consistency rule on the real data.
+        let sum_level: u64 = snap.forcings.stage_level.values().sum();
+        let sum_feature: u64 = snap.forcings.stage_feature.values().sum();
+        assert_eq!(sum_level, sum_feature,
+            "Together mode: stage_level ({}) and stage_feature ({}) totals MUST agree",
+            sum_level, sum_feature);
+        // TTC invariants on the live snapshot.
+        assert!(snap.covered_mass.0 <= snap.total_mass.0 + 1e-9);
+        assert!(snap.remaining_mass.0 >= 0.0);
+    }
+
     /// TTC §3 invariant 6 + §10 item 3 "covered mass is monotone"
     /// against a REAL MDD run. Prior monotone tests used synthetic
     /// adapters; this one drives the full MDD pipeline on n=6 with
