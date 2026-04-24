@@ -377,6 +377,13 @@ pub(crate) struct PipelineMetrics {
 
     // SolveW stage
     pub(crate) flow_w_unsat: Arc<std::sync::atomic::AtomicU64>,
+    /// W-search exited via conflict-budget timeout rather than
+    /// proving UNSAT. Distinguishes "no more W candidates exist"
+    /// (UNSAT) from "ran out of budget, might be more" (TIMEOUT).
+    /// Under TTC §4.1 only the UNSAT case strictly counts as
+    /// "no residual work remains"; the TIMEOUT case is why the
+    /// MDD adapter's quality label is `Hybrid` not `Direct`.
+    pub(crate) flow_w_timeout: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_w_solutions: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_w_spec_fail: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_w_spec_pass: Arc<std::sync::atomic::AtomicU64>,
@@ -402,6 +409,10 @@ pub(crate) struct PipelineMetrics {
 
     // SolveZ stage
     pub(crate) flow_z_unsat: Arc<std::sync::atomic::AtomicU64>,
+    /// Z-search exited via conflict-budget timeout. Same
+    /// UNSAT-vs-TIMEOUT distinction as `flow_w_timeout`; also
+    /// contributes to why MDD quality stays `Hybrid`.
+    pub(crate) flow_z_timeout: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_z_solutions: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_z_spec_fail: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_z_pair_fail: Arc<std::sync::atomic::AtomicU64>,
@@ -721,7 +732,26 @@ pub(crate) fn process_solve_w(
                 }).collect();
             w_solver.set_phase(&phases);
             if w_conflict_budget > 0 { w_solver.set_conflict_budget(w_conflict_budget); }
-            if w_solver.solve() != Some(true) { break; }
+            match w_solver.solve() {
+                Some(true) => {}
+                Some(false) => {
+                    // Genuinely UNSAT — no more W candidates
+                    // exist for this boundary. Safe closure.
+                    break;
+                }
+                None => {
+                    // Conflict budget exhausted. Residual W
+                    // candidates MAY exist; the boundary's
+                    // exact credit will be approximate (hence
+                    // `Hybrid` on `McddFractionMassModel`).
+                    // Spec §4.1: "A subproblem counts as exact
+                    // coverage only when no residual work remains"
+                    // — strictly violated here but permitted by
+                    // §5.1 / §6.3 Hybrid labeling.
+                    metrics.flow_w_timeout.fetch_add(1, AtomicOrdering::Relaxed);
+                    break;
+                }
+            }
             metrics.flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
 
             let w_mid = extract_vals(&w_solver, |i| ctx.w_mid_vars[i], ctx.middle_m);
@@ -982,9 +1012,23 @@ pub(crate) fn process_solve_z(
         z_solver.set_phase(&z_phases);
         if z_conflict_budget > 0 { z_solver.set_conflict_budget(z_conflict_budget); }
         let z_result = z_solver.solve();
-        if z_result != Some(true) {
-            if z_count == 0 { metrics.flow_z_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
-            break;
+        match z_result {
+            Some(true) => {}
+            Some(false) => {
+                // UNSAT — no more Z candidates exist. Clean
+                // boundary closure.
+                if z_count == 0 { metrics.flow_z_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
+                break;
+            }
+            None => {
+                // Z-search hit its conflict budget. Residual Z
+                // candidates MAY exist; boundary's exact credit
+                // will be approximate, consistent with Hybrid
+                // labeling. Tracked under `flow_z_timeout` for
+                // diagnostics.
+                metrics.flow_z_timeout.fetch_add(1, AtomicOrdering::Relaxed);
+                break;
+            }
         }
         z_count += 1;
         metrics.flow_z_solutions.fetch_add(1, AtomicOrdering::Relaxed);
@@ -2056,6 +2100,7 @@ pub(crate) fn new_pipeline_metrics() -> PipelineMetrics {
         stage_exit: (0..4).map(|_| z()).collect(),
         pending_boundaries: z(),
         flow_w_unsat: z(),
+        flow_w_timeout: z(),
         flow_w_solutions: z(),
         flow_w_spec_fail: z(),
         flow_w_spec_pass: z(),
@@ -2077,6 +2122,7 @@ pub(crate) fn new_pipeline_metrics() -> PipelineMetrics {
         flow_xy_root_forced: z(),
         flow_xy_free_sum: z(),
         flow_z_unsat: z(),
+        flow_z_timeout: z(),
         flow_z_solutions: z(),
         flow_z_spec_fail: z(),
         flow_z_pair_fail: z(),

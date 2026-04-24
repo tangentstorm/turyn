@@ -570,14 +570,27 @@ impl StageHandler<MddPayload> for SolveZStage {
 /// Fractional mass model for the staged MDD adapter.
 /// `total_mass = 1.0` (the whole search space). Coverage is
 /// polled from the adapter's `BoundaryProgress` and equals
-/// `completed_boundaries / seed_boundaries`: a boundary only
-/// counts as complete once every one of its descendants (SolveW,
-/// SolveWZ, SolveZ, or the inline XY walk) has returned, so the
-/// fraction is a real additive-over-disjoint coverage measure.
+/// `completed_boundaries / seed_boundaries`: a boundary counts
+/// as complete once every one of its descendants (SolveW,
+/// SolveWZ, SolveZ, or the inline XY walk) has returned.
+///
+/// Two sources of approximation that keep this labeled `Hybrid`:
+///
+/// 1. `covered_partial` is XY-timeout shortfall credit — a
+///    projected estimate of sub-cube elimination, not a direct
+///    measurement of search-space bytes removed.
+/// 2. `covered_exact` closes a boundary whenever its descendant
+///    search returns, even when that return was a SolveW or
+///    SolveZ conflict-budget timeout (tracked as
+///    `flow_w_timeout` / `flow_z_timeout`) rather than a clean
+///    UNSAT. Per TTC §4.1 that's strictly not "no residual work
+///    remains", but §5.1 / §6.3 permit this as an approximation
+///    as long as the label stays non-`Direct`.
+///
 /// No push-based `mass_delta` — relying on push would double-
 /// count when one boundary fans out to multiple SolveZs, and
 /// undercount when SolveW / SolveWZ prune a whole sub-tree
-/// without emitting (issues flagged in the PR review).
+/// without emitting.
 pub struct McddFractionMassModel {
     progress: Arc<BoundaryProgress>,
 }
@@ -590,12 +603,11 @@ impl SearchMassModel for McddFractionMassModel {
         MassValue(self.progress.partial_fraction())
     }
     fn quality(&self) -> CoverageQuality {
-        // `covered_exact` is a real additive-over-disjoint
-        // boundary fraction, but `covered_partial` is an
-        // approximation of XY-timeout shortfall credit (per
-        // `docs/TTC.md`). Mark as `Hybrid` because the published
-        // `covered = exact + partial` blends a direct fraction
-        // with a projected-shortfall estimate.
+        // Per the two approximation sources called out in the
+        // struct doc, the most conservative correct label per
+        // `docs/TTC.md` §6 is `Hybrid`: real additive boundary
+        // fractions blended with projected timeout-shortfall
+        // estimates and sub-tree-timeout approximations.
         CoverageQuality::Hybrid
     }
 }
