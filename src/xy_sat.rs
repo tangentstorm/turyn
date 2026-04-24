@@ -676,17 +676,6 @@ impl SatXYTemplate {
         Self::build_multi(problem, std::slice::from_ref(&tuple), sat_config)
     }
 
-    /// Like `build`, but with the XY product-law conjecture toggled
-    /// by `conj_xy_product` (see `add_xy_product_law`).
-    pub(crate) fn build_opts(
-        problem: Problem,
-        tuple: SumTuple,
-        sat_config: &radical::SolverConfig,
-        conj_xy_product: bool,
-    ) -> Option<Self> {
-        Self::build_multi_opts(problem, std::slice::from_ref(&tuple), sat_config, conj_xy_product)
-    }
-
     /// Multi-tuple template: `PbSetEq` on X and Y unions the ±|σ| counts
     /// across every tuple in `tuples`.  A single solver covers every
     /// unsigned (σ_X, σ_Y) pair in the list — the SAT picks a
@@ -1001,108 +990,12 @@ pub(crate) fn xy_cover_micro(result: Option<bool>, decisions: u64, free_vars: u6
 }
 
 
-/// Effective number of XY candidate solves completed, weighted for
-/// timeouts. Each fully-resolved (SAT or UNSAT) XY solve contributes
-/// 1.0; each timeout contributes its `cover_frac`. Used as the
-/// numerator in the cross-mode TTC formula and as the basis for the
-/// MDD-mode `effective_coverage_metric` shortfall calculation.
-pub(crate) fn effective_xy_done(
-    xy_sat: u64, xy_unsat: u64, xy_timeout: u64,
-    xy_timeout_cov_micro: u64,
-) -> f64 {
-    let normal_done = (xy_sat + xy_unsat) as f64;
-    let timeout_credit = xy_timeout_cov_micro as f64 / 1_000_000.0;
-    // Sanity: timeout_credit should always be ≤ xy_timeout, but clamp
-    // defensively in case a bogus solve over-credited.
-    normal_done + timeout_credit.min(xy_timeout as f64)
-}
 
 
-/// Cross-mode TTC denominator: estimated total XY candidate solves
-/// once enumeration completes. Extrapolates from tuple progress while
-/// the producer is still running; collapses to `xy_pushed` exactly
-/// once `cross_done` is true.
-pub(crate) fn cross_estimated_total_xy(
-    xy_pushed: u64, tuples_done: usize, tuples_total: usize, cross_done: bool,
-) -> f64 {
-    let xy_pushed = xy_pushed as f64;
-    if cross_done || tuples_done == 0 || tuples_total == 0 {
-        return xy_pushed;
-    }
-    // Extrapolation: assume remaining tuples produce XY candidates at
-    // the same average rate as the tuples seen so far. Crude but the
-    // best we can do without re-running the SpectralIndex enumeration.
-    xy_pushed * (tuples_total as f64) / (tuples_done as f64)
-}
 
 
-/// Effective number of boundaries covered, weighted by per-XY-solve
-/// coverage. Each fully-resolved boundary contributes 1.0; XY timeouts
-/// dock the boundary's contribution by `(1 - cover_frac) /
-/// xy_solves_per_boundary`. Derivation (without per-boundary state):
-///
-///   shortfall_per_xy_solve = (xy_timeout_count - sum_cover_frac_timeout)
-///                            / xy_total_solves
-///   eff = walked × (1 - shortfall_per_xy_solve)
-///
-/// Returns `walked` exactly when there are no timeouts (or no XY work
-/// yet), so the metric reduces to the prior path-rate-based TTC for
-/// healthy runs.
-pub(crate) fn effective_coverage_metric(
-    walked: u64,
-    xy_sat: u64, xy_unsat: u64, xy_timeout: u64,
-    xy_timeout_cov_micro: u64,
-) -> f64 {
-    let xy_total = xy_sat + xy_unsat + xy_timeout;
-    if xy_total == 0 || xy_timeout == 0 {
-        return walked as f64;
-    }
-    let xy_done_eff = effective_xy_done(xy_sat, xy_unsat, xy_timeout, xy_timeout_cov_micro);
-    // Per-XY shortfall as fraction of one XY solve, then scale to boundaries.
-    let shortfall_per_xy = (xy_total as f64 - xy_done_eff) / xy_total as f64;
-    walked as f64 * (1.0 - shortfall_per_xy).max(0.0)
-}
 
 
-/// Print the per-stage SAT pruning diagnostics block. Each tuple is
-/// (label, solves, decisions, propagations, root_forced, free_sum,
-///  optional_timeout_count, optional_timeout_cov_micro).
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
-pub(crate) fn print_stage_pruning_block(
-    w_row:  (&str, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, Option<&Arc<std::sync::atomic::AtomicU64>>, Option<&Arc<std::sync::atomic::AtomicU64>>),
-    z_row:  (&str, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, Option<&Arc<std::sync::atomic::AtomicU64>>, Option<&Arc<std::sync::atomic::AtomicU64>>),
-    xy_row: (&str, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, &Arc<std::sync::atomic::AtomicU64>, Option<&Arc<std::sync::atomic::AtomicU64>>, Option<&Arc<std::sync::atomic::AtomicU64>>),
-) {
-    println!("  SAT pruning per stage:");
-    println!("    stage    solves    pre-forced/free   dec/solve  prop/dec  timeout%(avg cov)");
-    for row in [w_row, z_row, xy_row] {
-        let (label, solves, decisions, propagations, root_forced, free_sum, timeout, timeout_cov) = row;
-        let n = solves.load(AtomicOrdering::Relaxed);
-        if n == 0 {
-            println!("    {:<6}  {:>7}  (no solves)", label, 0);
-            continue;
-        }
-        let dec    = decisions.load(AtomicOrdering::Relaxed);
-        let prop   = propagations.load(AtomicOrdering::Relaxed);
-        let forced = root_forced.load(AtomicOrdering::Relaxed);
-        let free   = free_sum.load(AtomicOrdering::Relaxed);
-        let avg_forced = forced as f64 / n as f64;
-        let avg_free   = free as f64 / n as f64;
-        let avg_dec    = dec as f64 / n as f64;
-        let avg_prop_per_dec = if dec > 0 { prop as f64 / dec as f64 } else { 0.0 };
-        let timeout_str = match (timeout, timeout_cov) {
-            (Some(to), Some(cov)) => {
-                let to_n = to.load(AtomicOrdering::Relaxed);
-                let to_pct = if n > 0 { to_n as f64 / n as f64 * 100.0 } else { 0.0 };
-                let avg_cov = if to_n > 0 { (cov.load(AtomicOrdering::Relaxed) as f64 / 1_000_000.0) / to_n as f64 } else { 1.0 };
-                format!("{:>5.1}%({:.2})", to_pct, avg_cov)
-            }
-            _ => "    n/a   ".to_string(),
-        };
-        println!("    {:<6}  {:>7}  {:>10.1}/{:<5.1}  {:>9.1}  {:>8.2}  {}",
-            label, n, avg_forced, avg_free, avg_dec, avg_prop_per_dec, timeout_str);
-    }
-}
 
 
 /// Per-(Z,W) prepared state for shared XY SAT solving. Built once per
@@ -1347,6 +1240,7 @@ pub(crate) fn try_candidate_via_mdd(
     nodes: &[[u32; 4]],
     pos_order: &[usize],
     conflict_limit: u64,
+    forcings_out: Option<&mut Vec<(u16, u8, u32)>>,
 ) -> (Option<(PackedSeq, PackedSeq)>, XyStats) {
     let n = problem.n;
     if !template.is_feasible(candidate) {
@@ -1396,6 +1290,16 @@ pub(crate) fn try_candidate_via_mdd(
     let propagations = solver.num_propagations().saturating_sub(p0);
     let cover_micro  = xy_cover_micro(result, decisions, free_vars);
     let stats = XyStats { decisions, propagations, vars_pre_forced, free_vars, cover_micro };
+
+    if let Some(sink) = forcings_out {
+        // Solver is freshly cloned from the template; an empty
+        // baseline attributes the full run of propagations to
+        // this stage call (the solver dies at the end of this
+        // function). Matches `docs/TELEMETRY.md` §4 attribution
+        // rule — the caller stage owns every forcing the solver
+        // did here.
+        sink.extend(crate::mdd_pipeline::forcing_delta_triples(&solver, &[]));
+    }
 
     let xy = match result {
         Some(true) => {

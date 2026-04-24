@@ -1,294 +1,336 @@
-# TTC (Time to Cover): implementation by solve path
+# TTC (Time to Cover): normative specification
 
-This note is the canonical map of how every active search path computes
-**TTC** today, and how to interpret it as one uniform metric.
+This document is the canonical specification for the **TTC** metric used by
+all search modes.
 
-## Uniform TTC contract
+It is intentionally normative. Statements using **MUST**, **MUST NOT**,
+**SHOULD**, and **MAY** define the required behavior of the implementation.
+Mode-specific implementation notes or examples belong elsewhere.
 
-Across all modes, the intended metric is:
+## 1. Core contract
 
-- `TTC = (total_search_mass - covered_search_mass) / coverage_rate`
-- `coverage_rate = covered_search_mass / elapsed`
+Every search mode MUST expose one uniform notion of progress:
 
-So equivalently:
+- `total_search_mass`
+- `covered_exact`
+- `covered_partial`
+- `covered_mass = covered_exact + covered_partial`
+- `coverage_rate = covered_mass / elapsed`
+- `remaining_mass = total_search_mass - covered_mass`
+- `TTC = remaining_mass / coverage_rate`
 
-- `TTC = elapsed * (total_search_mass - covered_search_mass) / covered_search_mass`
+Under the current universal contract:
 
-A mode is TTC-consistent if it defines:
+- `total_search_mass MUST equal 1.0`
+- all mass values MUST be fractions in `[0, 1]`
+- `covered_mass MUST be additive over disjoint subproblems`
 
-1. a denominator (`total_search_mass`) representing the full search space
-   that mode is responsible for,
-2. a numerator (`covered_search_mass`) that gives full credit to solved
-   subproblems and fractional credit to partially explored ones,
-3. a rate derived from that same numerator.
+This normalization is part of the public metric contract. An adapter's
+denominator is the full search space assigned to that adapter, normalized to
+`1.0`; any per-adapter weighting or scaling is an internal implementation
+detail.
 
-## Canonical metric set (keep this narrow)
+Equivalent form:
 
-To avoid metric sprawl, treat these as the **only primary metrics** for
-optimization decisions:
+- `TTC = elapsed * (total_search_mass - covered_mass) / covered_mass`
 
-1. **TTC (parallel)**
-   - Main success metric (`Time to cover` in pipeline modes,
-     `TTC_parallel`/direct parallel TTC in sync).
-2. **Effective coverage progress**
-   - `effective / total_mass` as reported in progress lines.
-3. **Timeout coverage quality**
-   - XY timeout rate + average timeout coverage credit (so TTC deltas are
-     not confused with changed timeout behavior).
-4. **Conjecture activity counters (only when enabled)**
-   - Currently just `--conj-zw-bound rejects`.
+If `coverage_rate <= 0`, TTC MUST be reported as unavailable rather than as
+an arbitrary sentinel.
 
-Everything else (per-stage solve counts, propagator-family splits,
-per-level tables) is **diagnostic-only** and should be consulted only
-when one of the four primary metrics moves unexpectedly.
+## 2. Required semantic meaning
 
-## Path-by-path implementation
+Each adapter MUST define:
 
-## 1) `--wz=cross`
+1. a denominator: the full search space that adapter is responsible for,
+2. an exact numerator: the fraction of that space fully discharged,
+3. a partial numerator: fractional credit from interrupted work,
+4. a rate derived from that same covered fraction.
+
+The denominator and numerator MUST refer to the same search space. An adapter
+MUST NOT compute its denominator in one unit and its numerator in another.
+
+Examples of forbidden behavior:
+
+- denominator = boundary count, numerator = solver decisions
+- denominator = unconstrained problem mass, numerator = conjecture-restricted
+  mass without explicit relabeling
+- denominator = logical subproblems, numerator = scheduler events
+
+## 3. Mass invariants
+
+All implementations MUST satisfy these invariants:
+
+1. `0 <= covered_exact <= total_search_mass`
+2. `0 <= covered_partial <= total_search_mass - covered_exact`
+3. `covered_mass = covered_exact + covered_partial`
+4. `0 <= covered_mass <= total_search_mass`
+5. `remaining_mass = max(total_search_mass - covered_mass, 0)`
+6. `covered_mass` MUST be monotone non-decreasing over time
+7. no completed subproblem may be credited more than once
+
+In particular:
+
+- exact credit and partial credit MUST be clamped so their sum never exceeds
+  `1.0`
+- if a residual subproblem is split or resumed, already-credited mass MUST NOT
+  be re-credited when the residual work later completes
+
+## 4. Exact vs partial coverage
+
+### 4.1 `covered_exact`
+
+`covered_exact` is the fraction of the search space that has been fully
+resolved. A subproblem counts as exact coverage only when no residual work
+remains for that subproblem.
+
+Exact coverage MUST be additive over disjoint subproblems.
+
+### 4.2 `covered_partial`
+
+`covered_partial` is fractional credit from interrupted work, such as a SAT
+timeout that still pruned part of a sub-cube before the budget was exhausted.
+
+Partial credit MUST obey these rules:
+
+1. it MUST be measured in the same fraction unit as `covered_exact`
+2. it MUST represent only the eliminated portion of the interrupted subproblem
+3. it MUST NOT include residual work that is re-queued, split, or resumed
+4. it MUST be added exactly once per interrupted attempt
+5. it MUST remain attributable even when one stage bundles many internal
+   sub-attempts, per the bundled-stage rule in Section 5.3
+
+If a stage internally executes multiple timeout-capable child solves, the
+adapter MUST aggregate the partial credit from all of them before returning or
+publishing a progress snapshot. It is not acceptable to credit only one
+variant of a logically-equivalent path.
+
+## 5. Split / resume semantics
+
+The framework supports handlers that return residual work through splitting or
+resumption. TTC accounting MUST follow the logical search mass, not queue
+mechanics.
+
+### 5.1 Split
+
+When a handler splits a residual subproblem into child items:
+
+- the parent MAY credit exact mass already eliminated
+- the parent MAY credit partial mass already eliminated
+- the residual children MUST represent only the uncredited remainder
+- the sum of child residual mass plus credited parent mass MUST equal the
+  parent's incoming mass
+
+If the adapter cannot compute that equality exactly because it uses an
+approximate weighting model, the approximation MUST still preserve the
+monotonicity and non-double-counting rules above, and the adapter MUST label
+the published TTC as `Hybrid` or `Projected`, not `Direct`.
+
+### 5.2 Resume
+
+When a handler resumes the same logical subproblem later:
+
+- progress already credited before the resume MUST persist
+- resumed work MUST NOT be treated as a fresh full-mass subproblem
+- completion of the resumed item MUST credit only the remaining uncovered mass
+
+### 5.3 Bundled stages
+
+If one stage bundles multiple internal solves, the implementation MUST still
+behave as though each internal solve contributed to the same global coverage
+ledger. The stage boundary MUST NOT cause partial credit to disappear.
+
+## 6. Quality labels
+
+Every published TTC value MUST carry a quality label:
+
+- `Direct`
+- `Projected`
+- `Hybrid`
+
+Conservatism order is:
+
+- `Direct` = strongest claim
+- `Hybrid` = intermediate claim
+- `Projected` = weakest claim
+
+"Most conservative correct label" means the adapter MUST choose the weakest
+label that is still true.
+
+### 6.1 `Direct`
+
+Use `Direct` only when published coverage is a real additive fraction of the
+ search space.
+
+### 6.2 `Projected`
+
+Use `Projected` when the published coverage is estimate-only. The estimate MAY
+be useful operationally, but consumers MUST treat mode-specific telemetry as
+authoritative.
+
+### 6.3 `Hybrid`
+
+Use `Hybrid` when the published value combines:
+
+- a direct exact fraction, and
+- an estimated or approximate partial fraction
+
+Adapters MUST choose the most conservative correct label. If there is doubt,
+they SHOULD prefer `Hybrid` or `Projected` over `Direct`.
+
+## 7. Per-mode specification
+
+This section defines the required meaning for each active mode.
+
+## 7.1 `--wz=cross`
 
 ### Work unit
-- XY candidate SAT solves.
 
-### Denominator (`total_search_mass`)
-- `cross_estimated_total_xy(...)` in `xy_sat.rs`:
-  - while tuple generation is still running: extrapolated total
-    `xy_pushed * tuples_total / tuples_done`
-  - once done: exact `xy_pushed`.
+- tuple shells
 
-### Covered mass (`covered_search_mass`)
-- `effective_xy_done(...)` in `xy_sat.rs`:
-  - SAT + UNSAT each count as `1.0`
-  - timeout counts as `xy_cover_micro / 1_000_000`.
+### Denominator
 
-### Timeout fractional coverage
-- `xy_cover_micro(...)` in `xy_sat.rs`:
-  - SAT/UNSAT => `1_000_000`
-  - timeout => `log2(decisions + 1) / free_vars`, clamped `[0,1]`.
+- the full tuple-shell search space assigned to the run
 
-### TTC report site
-- Progress snapshots and final summary in `mdd_pipeline.rs` (cross branch).
+### Exact coverage
 
-## 2) `--wz=apart` and `--wz=together`
+- fraction of tuple-shell mass fully processed
 
-These share the same TTC machinery in the MDD pipeline.
+### Partial coverage
+
+- if cross mode contains timeout-capable internal sub-solves that can report
+  eliminated search mass, it MUST surface that mass as `covered_partial`
+- if it does not surface such credit, the adapter MUST document that omission
+  and its quality label MUST remain non-`Direct`
+
+### Quality
+
+- `Hybrid` unless tuple shells are weighted by true search mass
+- cross MUST remain non-`Direct` until both tuple weighting and any timeout
+  partial-credit path are direct in the same search-mass unit
+
+Uniform tuple weighting is permitted as an approximation, but if used it MUST
+be labeled as approximate and MUST NOT be described as a direct XY-work
+fraction.
+
+## 7.2 `--wz=apart` and `--wz=together`
+
+These two modes MUST obey the same TTC contract, even if they route through
+different stage topologies.
 
 ### Work unit
-- MDD live ZW boundary paths ("walked boundaries"), with timeout
-  shortfall correction from downstream XY solves.
 
-### Denominator (`total_search_mass`)
-- `live_zw_paths = mdd.count_live_paths()` in `mdd_pipeline.rs`.
-- This is the MDD-pruned boundary space; if MDD construction or
-  constraints remove boundaries, denominator shrinks accordingly.
+- live boundary-rooted subproblems
 
-### Covered mass (`covered_search_mass`)
-- `effective_coverage_metric(...)` in `xy_sat.rs`:
-  - start from completed boundaries (`stage_exit[0]`)
-  - apply shortfall factor from XY timeout partial coverage.
+### Denominator
 
-### Timeout fractional coverage
-- Same `xy_cover_micro(...)` logic as cross mode.
+- the full seeded boundary mass for the run
 
-### TTC report site
-- Progress snapshots and final summary in `mdd_pipeline.rs`
-  (non-cross branch).
+### Exact coverage
 
-## 3) `--wz=sync`
+- a boundary contributes exact coverage only when its entire descendant search
+  has finished
 
-Sync mode currently prints two TTC-style estimates from walker telemetry.
+### Partial coverage
 
-### A) Projected TTC (`project_ttc`)
-- Uses per-level effective branching factors:
-  `b_eff(L) = children_by_level[L] / nodes_by_level[L]`.
-- Projects full tree size from the product of branching factors.
-- Converts to TTC by dividing projected nodes by observed node rate.
+- every timeout-capable XY attempt, regardless of which stage path triggered
+  it, MUST contribute its partial credit to the same boundary-mass ledger
+- this requirement applies equally to staged paths such as `SolveZ`, combined
+  paths such as `SolveWZ`, and any future bundled solver path
 
-### B) Direct TTC from coverage product
-- Computes per-level coverage `cov(L) = processed_children / children`.
-- Root coverage = `Π_L cov(L)`.
-- TTC estimate: `elapsed / root_coverage`.
+### Quality
 
-### TTC report sites
-- `project_ttc(...)` and per-level telemetry formatting in
-  `sync_walker.rs`.
+- `Hybrid` unless both base weights and timeout credits become direct
+  search-mass fractions
 
-## How search-space trimming affects TTC
+If boundary weights are uniform rather than true subtree mass, the adapter
+MUST describe that as an approximation.
 
-Under the uniform contract, **any mechanism that removes admissible
-search states should reduce denominator and/or increase covered fraction**:
+## 7.3 `--wz=sync`
 
-- MDD/static pruning reduces `live_zw_paths` (apart/together denominator).
-- Cross tuple/pair pruning reduces total XY candidates (cross denominator).
-- SAT root propagation and forced vars reduce `free_vars`, which raises
-  timeout coverage credit for a fixed decision budget.
-- Sync-level forcing/pruning lowers effective branching or increases level
-  coverage, reducing projected/direct TTC.
+### Work unit
 
-In short: if a change really trims search mass, TTC should improve even
-when wall-clock throughput is unchanged.
+- projected fraction of the sync walker's search tree
 
-## Contract gaps (what is still missing / non-uniform)
+### Denominator
 
-If we enforce the strict contract "TTC measures time to cover the full
-remaining search space for this problem instance", these are the current
-gaps:
+- the whole sync-run search space
 
-1. **`--wz=cross` uses an extrapolated denominator before producer done.**
-   - `cross_estimated_total_xy(...)` is a projection while tuples are still
-     being enumerated, so `total_search_mass` is not exact until
-     `cross_done=true`.
-   - This is useful online telemetry, but strictly it is an estimate of TTC,
-     not exact TTC.
+### Coverage
 
-2. **`--wz=apart|together` denominator is boundary-count only.**
-   - `live_zw_paths` counts surviving ZW boundaries, but does not weight each
-     boundary by the actual remaining XY subtree mass.
-   - If one optimization forces many XY vars early (shrinking subtree mass)
-     without changing boundary count, denominator does not drop accordingly.
+- the universal snapshot MAY publish a projected covered fraction derived from
+  the walker's own estimator
+- this fraction MUST be clearly labeled `Projected`
+- the published projected fraction MUST still satisfy the universal monotonicity
+  rule for `covered_mass`; if the underlying estimator can move backward as more
+  samples arrive, the published value MUST clamp to the monotone envelope rather
+  than decreasing
 
-3. **`effective_coverage_metric(...)` applies timeout shortfall globally.**
-   - It uses an aggregate timeout shortfall factor over all XY solves.
-   - That means coverage credit is approximate when timeout difficulty is
-     highly non-uniform across boundaries.
+### Authoritative telemetry
 
-4. **`--wz=sync` has two TTC estimators, not one canonical TTC.**
-   - `project_ttc` (branching projection) and direct `elapsed / Πcov` are
-     both estimates from partial traversal telemetry.
-   - Neither is currently wired into the same denominator/numerator interface
-     used by cross/apart/together final `Time to cover:` reporting.
+- mode-specific sync telemetry remains authoritative for analysis of sync runs
 
-5. **No common cross-mode mass unit yet.**
-   - Cross uses "effective XY solves", apart/together use "effective
-     boundaries", sync uses projected/covered nodes.
-   - Algebra is shared, but unit definitions differ, so TTC is most reliable
-     for within-mode comparisons.
+The universal snapshot for sync exists for dashboard continuity, not to replace
+the walker's direct diagnostics.
 
-## What currently *does* satisfy the contract
+## 8. Search-space trimming
 
-- Partial work from timeouts is credited (via `xy_cover_micro`) in cross and
-  MDD modes, so covered mass is not binary SAT/UNSAT only.
-- MDD/static pruning that removes full boundaries reduces denominator in
-  apart/together.
-- Sync pruning/forcing affects measured branching/coverage and therefore both
-  sync TTC estimators.
+Any optimization that truly removes admissible search states MUST improve TTC
+through at least one of these channels:
 
-## Tightening plan (to make TTC truly uniform)
+1. smaller denominator
+2. larger covered fraction at fixed elapsed time
+3. larger coverage rate
 
-1. Promote one explicit `SearchMass` interface in code:
-   - `total_mass(problem, mode)`
-   - `covered_mass(progress)`
-   - `ttc = (total - covered) / (covered / elapsed)`
-2. For apart/together, weight denominator by per-boundary XY mass estimate
-   (or exact count where available), not just boundary cardinality.
-3. For cross, label pre-`cross_done` output as `estimated TTC` explicitly,
-   and switch to exact TTC when enumeration completes.
-4. For sync, publish one canonical TTC field using the same interface
-   (keep projection/direct as diagnostics).
+Examples:
 
-## Practical notes on comparability
+- pruning before seeding reduces denominator mass
+- stronger propagation may increase timeout coverage credit
+- walker pruning may increase projected coverage growth
 
-- Cross TTC units are XY-candidate solves.
-- Apart/together TTC units are effective MDD boundaries.
-- Sync TTC units are projected/covered walker nodes.
+If a real pruning change improves neither denominator nor covered fraction nor
+rate, the implementation SHOULD be treated as suspect.
 
-All three obey the same algebra (`remaining_mass / mass_rate`) but use
-mode-specific mass definitions. For strict apples-to-apples comparison,
-compare TTC **within a mode** at fixed `n` and comparable limits.
+## 9. Conjecture-constrained runs
 
-## Recommended interpretation rule
+When any `--conj-*` flag removes search states, the run MUST be labeled as
+conjecture-constrained unless completeness of the restricted space is justified
+independently.
 
-When evaluating an optimization, always decompose the TTC delta into:
+Required reporting labels:
 
-1. denominator change (total search mass),
-2. covered-mass change (credit model, especially timeout coverage),
-3. rate change (covered mass per second).
-
-This ensures "forced-variable" or pruning optimizations receive TTC
-credit even when raw solves/sec is flat.
-
-
-## Search-conjecture options and TTC impact
-
-### Implementation status (April 20, 2026)
-
-The conjectural search flags are now implemented and wired through the
-CLI/parser:
-
-- `--conj-xy-product` / `--no-conj-xy-product`
-- `--conj-zw-bound` / `--no-conj-zw-bound`
-- `--conj-tuple` / `--no-conj-tuple`
-
-Current behavior by mode:
-
-- `--conj-xy-product`: applied where an XY SAT template is built
-  (`cross`, `apart`, `together`).
-- `--conj-zw-bound`: applied as an XY-stage prefilter on candidate
-  `(Z, W)` extensions (`cross`, `apart`, `together`), with explicit
-  reject counts in pipeline summary.
-- `--conj-tuple`: auto-picks one tuple (if `--test-tuple` is absent)
-  and restricts tuple enumeration to that single shell.
-- `--wz=sync`: currently ignores these conjecture toggles; sync TTC
-  remains governed by walker telemetry (`project_ttc` and direct
-  coverage-product TTC).
-
-### Quick TTC sanity check (`n=18`, `--wz=apart`, `--mdd-k=7`, `--sat-secs=8`)
-
-Single-sample runs (2 threads) showed:
-
-- baseline: `Time to cover ≈ 1.3m`
-- `--conj-xy-product`: `≈ 1.3m`
-- `--conj-zw-bound`: `≈ 1.4m` (`--conj-zw-bound rejects: 0` in sample)
-- `--conj-tuple`: `≈ 1.2m` with much larger reported progress
-  (`~10%` vs `<1%` baseline)
-- all three flags: `≈ 1.2m`
-
-Interpretation: in `apart/together`, TTC denominator is still
-`live_zw_paths`, so XY-only pruning mainly changes the rate term. Tuple
-restriction can make progress look much faster while denominator still
-references the unconstrained MDD boundary mass.
-
-### Flag-by-flag TTC expectations
-
-#### `--conj-tuple`
-
-Expected effect:
-- Strong cut in tuple-space work by restricting to one shell.
-- In current TTC instrumentation this can inflate apparent progress if
-  denominator is interpreted as unconstrained boundary mass.
-
-Contract note:
-- Treat this as **problem-restriction mode** unless you separately
-  account for symmetry/completeness recovery over omitted tuples.
-
-#### `--conj-xy-product`
-
-Expected effect:
-- Trims XY subspace via mirror-product equalities (`U_i = -U_{n+1-i}`),
-  typically reducing candidate solves and/or SAT work per boundary.
-
-Contract risk:
-- If conjecture fails on valid instances, TTC may improve by excluding
-  real solutions.
-
-#### `--conj-zw-bound`
-
-Expected effect:
-- Adds high-lag equality checks tied to `U`, pruning `(Z,W)` candidates
-  before expensive XY solve attempts.
-- Telemetry includes `--conj-zw-bound rejects` to expose whether the
-  rule is active at the sampled `n`/`k`.
-
-Contract risk:
-- Same as above: if incorrect, TTC becomes optimistic through invalid
-  pruning.
-
-### Reporting rule for conjecture runs
-
-When any `--conj-*` option is enabled, report TTC with a qualifier:
-
-- `TTC (conjecture-constrained)`
 - `TTC (unconstrained baseline)`
+- `TTC (conjecture-constrained)`
 
-Do not compare these as apples-to-apples unless completeness of the
-constrained run is justified (proof, or independent reconstruction of
-omitted search mass).
+The implementation MUST NOT present constrained and unconstrained TTC values as
+directly comparable without that qualifier.
+
+These qualifiers are output-label requirements for user-facing reports and logs;
+they are not additional fields on `ProgressSnapshot`.
+
+If a conjecture changes the actual problem being searched, the denominator for
+that run is the constrained search space for that run. Consumers comparing to
+baseline MUST do so with the qualifier, not by pretending the spaces are
+identical.
+
+## 10. Required tests and checks
+
+The implementation MUST include tests or assertions covering:
+
+1. disjoint exact fractions sum to `1.0`
+2. covered mass never exceeds `1.0`
+3. covered mass is monotone
+4. TTC is `None` when rate is zero
+5. split/resume paths do not double-count credited mass
+6. logically-equivalent timeout paths contribute partial credit uniformly
+7. mode quality labels match the actual estimator semantics
+
+## 11. Interpretation rule
+
+When evaluating an optimization, TTC deltas MUST be decomposed into:
+
+1. denominator change
+2. covered-mass change
+3. coverage-rate change
+
+This is the required interpretation rule for performance analysis. Raw solves
+per second or node throughput alone are not sufficient.

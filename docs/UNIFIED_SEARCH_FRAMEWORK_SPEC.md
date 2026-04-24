@@ -7,6 +7,22 @@ execution paths onto one shared scheduler/telemetry/TTC framework.
 
 Target date for first implementation slice: **April–May 2026**.
 
+**Progress (April 2026):**
+
+- Phases 0–3a landed: framework skeleton (`src/search_framework/`),
+  apart/together adapter (single-stage wrap), cross mode routing.
+- Universal-search-review pass landed: 2-D forcings registry in
+  radical (`prop_by_kind_level`), `ForcingDelta` + `Continuation`
+  on `StageOutcome`, `TtcQuality { Direct, Projected, Hybrid }`,
+  `ForcingRollups` wired through every `ProgressSnapshot`,
+  `engine.rs` rewritten as a coordinator + worker pool. See the
+  decisions in §13 entries 1–4 and the April 2026 commits on
+  `claude/universal-search-review-xBQEw`.
+- Open: split the apart/together adapter into four real stage
+  handlers, add cross/sync/stochastic adapter modules, delete the
+  legacy mode-specific dispatch in `main.rs`, drop the
+  `--engine=legacy` flag.
+
 ---
 
 ## 1) Problem statement
@@ -141,40 +157,64 @@ Additional policies can be introduced without changing worker code.
 
 ## 4) TTC contract (framework-wide)
 
-A single mass unit is required **per mode run** (not globally identical across
-all modes). The contract is unified by interface and accounting algebra.
+**One mass unit across all modes: search-space bits.** Mass is measured
+in `log2(|cube|)` — the log-size of the sub-cube the value represents.
+`total` is `log2` of the fully-free enumeration size for the current
+problem; `covered` is the sum of `log2(|sub-cube eliminated|)` over
+every stage handler call during the run. Throughput is
+bits-per-second; TTC is `remaining_bits / bits_per_sec`.
+
+This supersedes the earlier "one unit per mode run" policy (the old
+§4.3 that attached different denominators to each mode). Every mode
+now emits the same dimensionless unit, so cross-mode TTC comparison is
+meaningful without per-mode reinterpretation.
 
 ### 4.1 Required fields
 
-Each mode must define:
+Each mass model exposes:
 
-1. `mass_total`:
-   - exact when possible,
-   - otherwise estimated with confidence class.
-2. `mass_covered_exact`:
-   - fully resolved subproblems.
-3. `mass_covered_partial`:
-   - timeout/progressive credit, normalized to the same unit.
-4. `mass_remaining = mass_total - (mass_covered_exact + mass_covered_partial)`.
+1. `total_mass` — `MassValue` in bits. Exact where the problem
+   enumeration is enumerable, otherwise a bits-valued estimate with
+   a `TtcQuality` label.
+2. `covered_mass` — `MassValue` accumulated from `MassDelta` values
+   returned by stage handlers. Each handler credits the bits it
+   actually eliminated (forced literals, pruned boundaries, closed
+   sub-trees). Partial / progressive credit lives in the same unit
+   as full credit — the coverage-bits framing makes the distinction
+   unnecessary.
+3. `remaining_mass = total_mass - covered_mass`.
 
 ### 4.2 Quality labeling
 
-Engine emits:
+`TtcQuality { Direct, Projected, Hybrid }` travels with every
+`ProgressSnapshot`:
 
-- `ttc_exact` when total and coverage are exact,
-- `ttc_estimated` otherwise, with attribution:
-  - denominator estimate,
-  - partial-credit model,
-  - projection-based estimate.
+- `Direct` — TTC computed as `elapsed / cumulative_coverage` using
+  measured coverage bits. Trustworthy as long as the sampled
+  coverage rate is representative of the tail.
+- `Projected` — TTC computed from an explicit extrapolation (e.g.
+  branching-factor model in sync mode's Block 2). Used when
+  measured coverage is too small to trust the direct form.
+- `Hybrid` — blend; direct form with projected smoothing on the
+  remainder.
 
-### 4.3 Mode mappings (initial)
+### 4.3 Forcing-count registries (three 2-D rollups)
 
-- `cross`: mass unit = effective XY candidate solves.
-- `apart/together`: mass unit = weighted boundary mass (not raw boundary count;
-  use boundary × XY-mass estimate in v1.5).
-- `sync`: mass unit = walker-node mass under coverage product model.
-- `stochastic`: mass unit = sampled-trajectory coverage (estimate class only;
-  no exact TTC guarantee).
+Rather than one `[stage × level × feature]` cube, the framework
+publishes three 2-D tables, each owned by the layer that generates
+the data:
+
+- **`[feature, level]`** — owned by `radical`. Read directly from
+  `Solver::propagations_by_kind_level()` when the coordinator
+  builds a snapshot.
+- **`[stage, level]`** — owned by the coordinator. Fed by
+  `StageOutcome::forcings` deltas tagged with stage ID.
+- **`[stage, feature]`** — owned by the coordinator. Same source
+  stream as `[stage, level]`, rolled up along the other axis.
+
+This trades one off-axis cube for three cheap rollups. Any pair
+of rollups answers almost every diagnostic question in practice;
+the cube is not needed.
 
 ---
 
@@ -233,6 +273,34 @@ Engine runtime:
 - bounded in-flight items per stage,
 - starvation prevention (age-based boost),
 - cancellation token checked at stage boundaries.
+
+### 6.1.1 Deferral contract (no timeouts)
+
+There is no "timed out" outcome in this framework. When a stage
+handler hits a budget (conflicts, wall-clock, heap), it returns:
+
+- a `MassDelta` crediting the sub-cube it actually covered, and
+- a `Continuation<T>` describing how the residual re-enters the
+  queue:
+  - `Continuation::Split(children)` — residual decomposed into
+    smaller `WorkItem`s (e.g. branch on one more variable); each
+    gets its own `priority` tag.
+  - `Continuation::Resume(item)` — same sub-cube, resumed from a
+    saved solver checkpoint carried in the item's payload. For
+    SolveW / SolveZ this piggybacks on radical's 7-usize
+    `save_checkpoint`/`restore_checkpoint` pair. `SolveXY`'s
+    per-candidate solver has no checkpoint API, so it must use
+    `Split` only.
+  - `Continuation::None` — handler finished the full sub-cube.
+
+The handler chooses which continuation variant to emit; the
+scheduler treats the residual as another competing item. Priority
+tags:
+
+- `priority >= 2` — "valuable" residual; pulled before ordinary work.
+- `priority == 1` — "maybe"; same lane as fresh items.
+- `priority == 0` — "junk"; pulled only when nothing else is
+  available.
 
 ### 6.2 Determinism controls
 
@@ -535,10 +603,29 @@ Deliverable: faithful TTC comparability improvements and clearer uncertainty.
 
 ## 13) Decision log (this proposal)
 
-1. Keep one mass unit per mode run, unified by algebra and metadata, rather than
-   forcing a single global physical unit prematurely.
-2. Migrate highest-overlap modes first (`apart/together`) to derisk.
-3. Treat scheduler policy as pluggable so DualQueue behavior is preserved while
-   enabling future alternatives.
-4. Preserve existing solver kernels and pruning semantics in initial refactor.
+1. **One universal mass unit — search-space bits (`log2(|cube|)`).**
+   Superseded the earlier "one unit per mode run" policy after the
+   April 2026 universal-search-review interview. Every mode now
+   emits the same dimensionless coverage-bits denominator, computed
+   from forced-literal deltas and cube eliminations. See §4.
+2. **Three 2-D forcing rollups, no cube.** Radical owns
+   `[feature, level]`; the coordinator owns `[stage, level]` and
+   `[stage, feature]`. The full `[stage, feature, level]` cube is
+   not needed for diagnostics. See §4.3.
+3. **Deferral replaces timeout.** Stage handlers never return a
+   "timed out" outcome; they return a `MassDelta` + `Continuation`
+   describing the residual, with a priority tag on each child.
+   See §6.1.1.
+4. **One central coordinator thread.** Workers self-fetch from a
+   shared scheduler (`Arc<(Mutex<Box<dyn SchedulerPolicy>>,
+   Condvar)>`) and send `WorkerReport`s over an `mpsc::channel`
+   to a single coordinator that owns mass, forcings rollups, and
+   progress emission. Worker count defaults to 1 to avoid
+   oversubscribing adapters whose handlers already parallelize
+   internally. See `src/search_framework/engine.rs`.
+5. Migrate highest-overlap modes first (`apart/together`) to derisk.
+6. Treat scheduler policy as pluggable so DualQueue behavior is
+   preserved while enabling future alternatives.
+7. Preserve existing solver kernels and pruning semantics in
+   initial refactor.
 

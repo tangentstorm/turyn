@@ -8,7 +8,6 @@ mod config;
 mod enumerate;
 mod legacy_search;
 mod mdd_pipeline;
-#[cfg(feature = "search-framework")]
 mod search_framework;
 mod spectrum;
 mod stochastic;
@@ -34,13 +33,11 @@ use crate::config::*;
 use crate::enumerate::*;
 use crate::legacy_search::*;
 use crate::mdd_pipeline::*;
-#[cfg(feature = "search-framework")]
 use crate::search_framework::engine::{EngineConfig, SearchEngine, SearchModeAdapter};
-#[cfg(feature = "search-framework")]
 use crate::search_framework::events::SearchEvent;
-#[cfg(feature = "search-framework")]
-use crate::search_framework::mode_adapters::apart_together::{MddTupleAdapter, TuplePayload};
-#[cfg(feature = "search-framework")]
+use crate::search_framework::mode_adapters::mdd_stages::{MddPayload, MddStagesAdapter};
+use crate::search_framework::mode_adapters::stochastic::{StochasticAdapter, StochasticPayload};
+use crate::search_framework::mode_adapters::sync::{SyncAdapter, SyncPayload};
 use crate::search_framework::queue::GoldThenWork;
 use crate::spectrum::*;
 use crate::stochastic::*;
@@ -231,15 +228,6 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
             cfg.sat_config.xor_propagation = true;
         } else if arg == "--no-xor" {
             cfg.sat_config.xor_propagation = false;
-        } else if let Some(v) = arg.strip_prefix("--engine=") {
-            cfg.engine = match v {
-                "legacy" => EngineKind::Legacy,
-                "new" => EngineKind::New,
-                _ => {
-                    eprintln!("error: --engine must be one of legacy|new (got '{}')", v);
-                    std::process::exit(1);
-                }
-            };
         } else if arg == "--phase-a" || arg == "--phase-b" {
             cfg.phase_only = Some(arg[2..].to_string());
         } else if let Some(v) = arg.strip_prefix("--tuple=") {
@@ -322,7 +310,44 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
     }
 }
 
-#[cfg(feature = "search-framework")]
+/// Qualifier appended to framework-mode TTC lines so the number is
+/// not mistaken between the unconstrained baseline and a
+/// conjecture-restricted run. `docs/TTC.md` §9 requires the exact
+/// labels `TTC (unconstrained baseline)` and
+/// `TTC (conjecture-constrained)` on every user-facing TTC report.
+fn conjecture_ttc_qualifier(cfg: &SearchConfig) -> &'static str {
+    if cfg.conj_xy_product || cfg.conj_zw_bound || cfg.conj_tuple {
+        " TTC (conjecture-constrained)"
+    } else {
+        " TTC (unconstrained baseline)"
+    }
+}
+
+/// Spawn a wall-clock watchdog that flips `cancel` once `sat_secs`
+/// seconds have passed. Caller is responsible for joining the
+/// returned handle *after* also flipping `cancel` (or dropping the
+/// engine) so the watchdog doesn't outlive the search. Returns
+/// `None` when `sat_secs == 0` (no limit).
+fn spawn_sat_secs_watchdog(
+    sat_secs: u64,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Option<std::thread::JoinHandle<()>> {
+    if sat_secs == 0 {
+        return None;
+    }
+    let deadline = std::time::Duration::from_secs(sat_secs);
+    Some(std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return; // already cancelled by drain/solution
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }))
+}
+
 fn run_framework_mdd_mode(
     problem: Problem,
     tuples: Vec<SumTuple>,
@@ -330,38 +355,324 @@ fn run_framework_mdd_mode(
     verbose: bool,
     k: usize,
 ) {
-    let mode_name = match cfg.effective_wz_mode() {
+    let mode_name: &'static str = match cfg.effective_wz_mode() {
         WzMode::Cross => "cross",
         WzMode::Apart => "apart",
         WzMode::Together => "together",
         WzMode::Sync => "sync",
     };
-    let adapter = MddTupleAdapter {
-        problem,
-        tuples: std::sync::Arc::new(tuples),
-        cfg: std::sync::Arc::new(cfg.clone()),
-        k,
-        verbose,
-        mode_name,
-    };
-    let mut engine =
-        SearchEngine::<TuplePayload>::new(EngineConfig::default(), Box::new(GoldThenWork::new(32)));
-    engine.run(&adapter, |event| match event {
+    // Clock starts here — *before* `MddStagesAdapter::build`, which
+    // loads the MDD file and enumerates every live boundary
+    // (~18M entries at n=26 k=7). Both the `--sat-secs` watchdog
+    // and the engine's `elapsed` reporting need to cover that
+    // setup; pass `start` into `engine.run_since` below.
+    let start = std::time::Instant::now();
+    // Construct the engine up front so we can pull its live cancel
+    // flag *before* the adapter does any expensive setup.
+    let mut engine = SearchEngine::<MddPayload>::new(
+        EngineConfig::default(),
+        Box::new(GoldThenWork::new(32)),
+    );
+    let engine_cancel = engine.cancel_flag();
+    let watchdog_handle =
+        spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
+    let (adapter, result_rx) =
+        MddStagesAdapter::build(problem, tuples, cfg, k, verbose, mode_name, &engine_cancel);
+    let found_ctx = std::sync::Arc::clone(&adapter.ctx.found);
+    // Clone the progress handle so we can read
+    // `abandoned_count()` after the adapter is dropped below.
+    let progress_handle = std::sync::Arc::clone(&adapter.progress);
+
+    let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
+    // Drain-thread: polls the solution channel; on first hit sets
+    // the context's `found` flag *and* the engine's cancel flag so
+    // in-flight handlers exit fast and the coordinator stops
+    // dispatching.
+    let drain_handle = std::thread::spawn(move || {
+        let mut solutions = Vec::new();
+        while let Ok(sol) = result_rx.recv() {
+            found_ctx.store(true, std::sync::atomic::Ordering::Relaxed);
+            cancel_for_drain.store(true, std::sync::atomic::Ordering::Relaxed);
+            solutions.push(sol);
+        }
+        solutions
+    });
+
+    let ttc_tag = conjecture_ttc_qualifier(cfg);
+    engine.run_since(start, &adapter, move |event| match event {
         SearchEvent::Progress(p) => {
             if verbose {
                 eprintln!(
-                    "[framework:{}] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}",
-                    mode_name, p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc
+                    "[framework:{}] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}{}",
+                    mode_name, p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc, ttc_tag
                 );
             }
         }
         SearchEvent::Finished(p) => {
             println!(
-                "Framework search (--wz={}): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?}",
-                mode_name, p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc
+                "Framework search (--wz={}): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?} (quality={:?}){}",
+                mode_name, p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc, p.quality, ttc_tag
             );
         }
     });
+
+    // Engine has returned — make the watchdog exit if it's still
+    // sleeping, so we can join cleanly below.
+    engine_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = watchdog_handle {
+        let _ = h.join();
+    }
+
+    // Hold a clone of the metrics so per-stage counters are
+    // readable after `adapter` is dropped below.
+    let metrics = adapter.metrics.clone();
+    // Dropping the adapter drops its `result_tx`, which is the
+    // last sender (stage handlers cloned from it but they're gone
+    // now). The drain thread's `recv` returns Err and it exits.
+    drop(adapter);
+    let solutions = drain_handle.join().unwrap_or_default();
+    if !solutions.is_empty() {
+        println!(
+            "Framework search (--wz={}): found_solution=true ({} solution(s))",
+            mode_name,
+            solutions.len()
+        );
+    } else {
+        println!(
+            "Framework search (--wz={}): found_solution=false",
+            mode_name
+        );
+    }
+    // Per-stage pruning summary. Surfaces the counters the universal
+    // progress snapshot doesn't carry — where items actually die on
+    // the way to a solution. Matches the shape of the deleted
+    // pre-framework `print_stage_pruning_block` (PR review #7).
+    use std::sync::atomic::Ordering as Ord;
+    let stage_exit: Vec<u64> = metrics.stage_exit.iter().map(|c| c.load(Ord::Relaxed)).collect();
+    eprintln!(
+        "[framework:{}] stage_exit bnd/W/Z/XY = {}/{}/{}/{}",
+        mode_name,
+        stage_exit.first().copied().unwrap_or(0),
+        stage_exit.get(1).copied().unwrap_or(0),
+        stage_exit.get(2).copied().unwrap_or(0),
+        stage_exit.get(3).copied().unwrap_or(0),
+    );
+    // `timeout` counts are the approximation sources that keep the
+    // MDD mass model's quality label at `Hybrid` rather than
+    // `Direct` (per TTC §4.1 / §6.3): each W or Z conflict-budget
+    // timeout closes a boundary whose descendant search may still
+    // have residual work. Zero timeouts means the only source of
+    // approximation is XY-timeout shortfall credit.
+    eprintln!(
+        "[framework:{}] flow W: unsat={} timeout={} sol={} spec_fail={} spec_pass={} solves={}",
+        mode_name,
+        metrics.flow_w_unsat.load(Ord::Relaxed),
+        metrics.flow_w_timeout.load(Ord::Relaxed),
+        metrics.flow_w_solutions.load(Ord::Relaxed),
+        metrics.flow_w_spec_fail.load(Ord::Relaxed),
+        metrics.flow_w_spec_pass.load(Ord::Relaxed),
+        metrics.flow_w_solves.load(Ord::Relaxed),
+    );
+    eprintln!(
+        "[framework:{}] flow Z: unsat={} timeout={} sol={} pair_fail={} spec_fail={} solves={}",
+        mode_name,
+        metrics.flow_z_unsat.load(Ord::Relaxed),
+        metrics.flow_z_timeout.load(Ord::Relaxed),
+        metrics.flow_z_solutions.load(Ord::Relaxed),
+        metrics.flow_z_pair_fail.load(Ord::Relaxed),
+        metrics.flow_z_spec_fail.load(Ord::Relaxed),
+        metrics.flow_z_solves.load(Ord::Relaxed),
+    );
+    eprintln!(
+        "[framework:{}] flow XY: sat={} unsat={} timeout={} solves={} zw_bound_rej={} ext_pruned={}",
+        mode_name,
+        metrics.flow_xy_sat.load(Ord::Relaxed),
+        metrics.flow_xy_unsat.load(Ord::Relaxed),
+        metrics.flow_xy_timeout.load(Ord::Relaxed),
+        metrics.flow_xy_solves.load(Ord::Relaxed),
+        metrics.flow_xy_zw_bound_rej.load(Ord::Relaxed),
+        metrics.extensions_pruned.load(Ord::Relaxed),
+    );
+    // Count of boundaries closed with the abandoned taint (SAT
+    // timeout cut off W/Z enumeration). Non-zero is the exact
+    // reason covered_exact could plateau below 1.0 on a run that
+    // drained its work queue — those boundaries contribute only
+    // to covered_partial, never to covered_exact. TTC §4.1 / §9
+    // Hybrid-label approximation made visible.
+    let abandoned = progress_handle.abandoned_count();
+    eprintln!(
+        "[framework:{}] boundaries: abandoned={} (SAT-timeout-closed, retained partial only)",
+        mode_name, abandoned,
+    );
+    let _ = engine_cancel; // keep the Arc alive until the end
+}
+
+fn run_framework_stochastic_mode(
+    problem: Problem,
+    test_tuple: Option<SumTuple>,
+    cfg: &SearchConfig,
+    verbose: bool,
+) {
+    let start = std::time::Instant::now();
+    let time_limit = if cfg.stochastic_seconds > 0 {
+        cfg.stochastic_seconds
+    } else {
+        10
+    };
+    let (adapter, found) = StochasticAdapter::build(problem, test_tuple, verbose, time_limit);
+    let mut engine = SearchEngine::<StochasticPayload>::new(
+        EngineConfig::default(),
+        Box::new(GoldThenWork::new(32)),
+    );
+    let stoch_ttc_tag = conjecture_ttc_qualifier(cfg);
+    engine.run_since(start, &adapter, move |event| match event {
+        SearchEvent::Progress(p) => {
+            if verbose {
+                eprintln!(
+                    "[framework:stochastic] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?} (estimate-only){}",
+                    p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc, stoch_ttc_tag
+                );
+            }
+        }
+        SearchEvent::Finished(p) => {
+            println!(
+                "Framework search (--stochastic): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?} (quality={:?}){}",
+                p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc, p.quality,
+                conjecture_ttc_qualifier(cfg)
+            );
+        }
+    });
+    println!(
+        "Framework search (--stochastic): found_solution={}",
+        found.load(std::sync::atomic::Ordering::Relaxed)
+    );
+}
+
+fn run_framework_cross_mode(
+    problem: Problem,
+    tuples: Vec<SumTuple>,
+    cfg: &SearchConfig,
+    verbose: bool,
+    k: usize,
+) {
+    use crate::search_framework::mode_adapters::cross::{CrossAdapter, CrossPayload};
+    // Clock starts before adapter build so Finished `elapsed`
+    // includes the setup phase the `--sat-secs` watchdog covers.
+    let start = std::time::Instant::now();
+    let (adapter, result_rx) = CrossAdapter::build(problem, tuples, cfg.clone(), verbose, k);
+    let mut engine = SearchEngine::<CrossPayload>::new(
+        EngineConfig::default(),
+        Box::new(GoldThenWork::new(32)),
+    );
+    let engine_cancel = engine.cancel_flag();
+    let found_flag = std::sync::Arc::clone(&adapter.found);
+    let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
+    let drain = std::thread::spawn(move || {
+        let mut solutions = Vec::new();
+        while let Ok(sol) = result_rx.recv() {
+            found_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            cancel_for_drain.store(true, std::sync::atomic::Ordering::Relaxed);
+            solutions.push(sol);
+        }
+        solutions
+    });
+    let watchdog_handle =
+        spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
+    let ttc_tag = conjecture_ttc_qualifier(cfg);
+    engine.run_since(start, &adapter, move |event| match event {
+        SearchEvent::Progress(p) => {
+            if verbose {
+                eprintln!(
+                    "[framework:cross] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}{}",
+                    p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc, ttc_tag
+                );
+            }
+        }
+        SearchEvent::Finished(p) => {
+            println!(
+                "Framework search (--wz=cross): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?} (quality={:?}){}",
+                p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc, p.quality, ttc_tag
+            );
+        }
+    });
+    // Engine returned — release the watchdog so we can join.
+    engine_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = watchdog_handle {
+        let _ = h.join();
+    }
+    drop(adapter);
+    let solutions = drain.join().unwrap_or_default();
+    println!(
+        "Framework search (--wz=cross): found_solution={} ({} solution(s))",
+        !solutions.is_empty(),
+        solutions.len()
+    );
+}
+
+fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) {
+    // Sync walker's setup is cheap (no MDD load, no boundary
+    // enumeration) but we still clock from here so Finished
+    // `elapsed` is comparable across modes.
+    let start = std::time::Instant::now();
+    let mut engine = SearchEngine::<SyncPayload>::new(
+        EngineConfig::default(),
+        Box::new(GoldThenWork::new(32)),
+    );
+    let engine_cancel = engine.cancel_flag();
+    // Forward the same cancel flag into the walker so its internal
+    // parallel DFS (which runs inside a single StageHandler call)
+    // respects `--sat-secs` / drain cancellation alongside the
+    // universal `StageContext::is_cancelled` path.
+    let sync_cfg = crate::sync_walker::SyncConfig {
+        sat_secs: cfg.sat_secs,
+        sat_config: cfg.sat_config.clone(),
+        conflict_limit: cfg.conflict_limit,
+        random_seed: None,
+        cancel: Some(std::sync::Arc::clone(&engine_cancel)),
+        exchange: None,
+        projected_fraction_ppm: None,
+        live_sink: None,
+    };
+    let (adapter, result_rx) = SyncAdapter::build(problem, sync_cfg, verbose);
+    let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
+    let drain_handle = std::thread::spawn(move || {
+        let mut solutions = Vec::new();
+        while let Ok(sol) = result_rx.recv() {
+            cancel_for_drain.store(true, std::sync::atomic::Ordering::Relaxed);
+            solutions.push(sol);
+        }
+        solutions
+    });
+    let watchdog_handle =
+        spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
+    let ttc_tag = conjecture_ttc_qualifier(cfg);
+    engine.run_since(start, &adapter, move |event| match event {
+        SearchEvent::Progress(p) => {
+            if verbose {
+                eprintln!(
+                    "[framework:sync] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}{}",
+                    p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc, ttc_tag
+                );
+            }
+        }
+        SearchEvent::Finished(p) => {
+            println!(
+                "Framework search (--wz=sync): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?} (quality={:?}){}",
+                p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc, p.quality, ttc_tag
+            );
+        }
+    });
+    engine_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = watchdog_handle {
+        let _ = h.join();
+    }
+    drop(adapter);
+    let solutions = drain_handle.join().unwrap_or_default();
+    println!(
+        "Framework search (--wz=sync): found_solution={} ({} solution(s))",
+        !solutions.is_empty(),
+        solutions.len()
+    );
 }
 
 fn parse_args() -> (CliVerb, SearchConfig) {
@@ -545,25 +856,6 @@ fn pick_fewest_candidate_tuple(p: Problem) -> Option<SumTuple> {
 fn parse_seq(s: &str) -> PackedSeq {
     let vals: Vec<i8> = s.chars().map(|c| if c == '+' { 1 } else { -1 }).collect();
     PackedSeq::from_values(&vals)
-}
-
-fn run_info() -> String {
-    let hostname = std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let git_hash = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    format!("host={}, commit={}", hostname, git_hash)
 }
 
 fn list_known_solutions(n_filter: Option<usize>) {
@@ -1029,6 +1321,7 @@ fn main() {
                     &spectral_w,
                     &mut stats,
                     &AtomicBool::new(false),
+                    &AtomicBool::new(false),
                 );
                 println!(
                     "{} {} {} {}: z={}/{} w={}/{} pairs={} ({:.3?})",
@@ -1071,18 +1364,13 @@ fn main() {
     if cfg.benchmark_repeats > 0 {
         run_benchmark(&cfg);
     } else if cfg.stochastic {
-        let report = stochastic_search(
+        run_framework_stochastic_mode(
             cfg.problem,
-            cfg.test_tuple.as_ref(),
+            cfg.test_tuple.clone(),
+            &cfg,
             true,
-            cfg.stochastic_seconds,
         );
-        println!(
-            "Stochastic search: found_solution={}, elapsed={:.3?}\n  {}",
-            report.found_solution,
-            report.elapsed,
-            run_info()
-        );
+        return;
     } else {
         // All three --wz modes funnel through the same unified runner.
         // The runner's monitor thread either enumerates Z × W pairs
@@ -1118,25 +1406,13 @@ fn main() {
                 });
             }
         }
-        #[cfg(feature = "search-framework")]
-        if cfg.engine == EngineKind::New && matches!(mode, WzMode::Cross | WzMode::Apart | WzMode::Together) {
-            run_framework_mdd_mode(cfg.problem, tuples, &cfg, true, mdd_k);
-            return;
+        match mode {
+            WzMode::Cross => run_framework_cross_mode(cfg.problem, tuples, &cfg, true, mdd_k),
+            WzMode::Apart | WzMode::Together => {
+                run_framework_mdd_mode(cfg.problem, tuples, &cfg, true, mdd_k)
+            }
+            WzMode::Sync => run_framework_sync_mode(cfg.problem, &cfg, true),
         }
-        let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, true, mdd_k);
-        let label = match mode {
-            WzMode::Cross => "cross",
-            WzMode::Together => "together",
-            WzMode::Apart => "apart",
-            WzMode::Sync => "sync",
-        };
-        println!(
-            "Unified search (--wz={}): found_solution={}, elapsed={:.3?}\n  {}",
-            label,
-            report.found_solution,
-            report.elapsed,
-            run_info()
-        );
     }
 }
 
@@ -1222,7 +1498,6 @@ mod tests {
             conj_xy_product: false,
             conj_zw_bound: false,
             conj_tuple: false,
-            engine: EngineKind::Legacy,
         };
         let tuples = phase_a_tuples(cfg.problem, None);
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, false, cfg.mdd_k);

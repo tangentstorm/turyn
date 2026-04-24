@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use rustfft::num_complex::Complex;
 
+use turyn::mdd_bfs;
 use turyn::mdd_reorder;
 use turyn::mdd_zw_first;
 use turyn::sat_z_middle;
@@ -25,20 +26,41 @@ use crate::xy_sat::*;
 use crate::SPECTRAL_FREQS;
 
 
-/// A fully-specified `(Z, W)` candidate ready for the XY SAT stage.
-/// Wrapped in `SolveXYWork` and pushed onto the unified runner's gold
-/// queue by the cross-mode producer.
-pub(crate) struct SatWorkItem {
-    pub(crate) tuple: SumTuple,
-    pub(crate) z: PackedSeq,
-    pub(crate) w: PackedSeq,
-    /// Pre-computed 2·N_Z(s) + 2·N_W(s) for s in 1..n.
-    pub(crate) zw_autocorr: Vec<i32>,
-    /// Maximum spectral pair power across the realfft frequency grid.
-    /// Lower = higher priority (best candidates get solved first).
-    pub(crate) priority: f64,
-}
 
+
+/// Produce a `(decision_level, PropKind as u8, count)` list for the
+/// forced literals attributable to `solver` since `baseline` was
+/// snapshotted. `baseline` is typically `solver.propagations_by_kind_level().to_vec()`
+/// captured before the stage ran its solve loop.
+///
+/// For freshly-constructed solvers whose entire lifetime is within
+/// one stage call, pass an empty baseline (`&[]`) so the full
+/// `prop_by_kind_level` snapshot is reported as this call's
+/// attribution — matches the spec's "cause == this stage's own
+/// action" rule (`docs/TELEMETRY.md` §4 attribution rule) because
+/// the fresh solver has no prior history.
+pub(crate) fn forcing_delta_triples(
+    solver: &radical::Solver,
+    baseline: &[[u64; radical::PropKind::COUNT]],
+) -> Vec<(u16, u8, u32)> {
+    let after = solver.propagations_by_kind_level();
+    let mut out: Vec<(u16, u8, u32)> = Vec::new();
+    for (lvl, after_row) in after.iter().enumerate() {
+        let zeros = [0u64; radical::PropKind::COUNT];
+        let before_row = baseline.get(lvl).unwrap_or(&zeros);
+        for kind in 0..radical::PropKind::COUNT {
+            let d = after_row[kind].saturating_sub(before_row[kind]);
+            if d > 0 {
+                // `count` is a u32 on the wire. Cap at u32::MAX in
+                // the astronomically-unlikely event the solver
+                // forced > 4B literals at the same (level, kind);
+                // saturating keeps the ordering invariant.
+                out.push((lvl as u16, kind as u8, d.min(u32::MAX as u64) as u32));
+            }
+        }
+    }
+    out
+}
 
 pub(crate) fn compute_zw_autocorr(problem: Problem, z: &PackedSeq, w: &PackedSeq) -> Vec<i32> {
     let mut zw = vec![0i32; problem.n];
@@ -186,35 +208,25 @@ pub(crate) fn load_best_mdd(max_k: usize, verbose: bool) -> Option<mdd_reorder::
 }
 
 
-/// Unified pipeline work item. Priority = stage (higher = closer to result).
+/// Items the five stage helpers (`process_boundary`,
+/// `process_solve_w`, `process_solve_wz`, `process_solve_z`,
+/// `process_solve_xy`) emit as follow-up work. The framework
+/// `MddStagesAdapter` wraps these into its own `MddPayload` and
+/// pushes them back onto `SearchEngine`'s scheduler.
+///
+/// The Boundary / SolveXY / Shutdown variants the legacy worker
+/// loop used were trimmed with the legacy removal: nothing
+/// constructs them anymore. The adapter delivers Boundary items
+/// via its `MddPayload::Boundary` seed; SolveXY items are pushed
+/// by `process_solve_z` only via the `MddPayload::SolveXY`
+/// wrapper, not via `PipelineWork::SolveXY`.
 pub(crate) enum PipelineWork {
-    /// Stage 0: Check boundary feasibility + extension filter → emit SolveW.
-    Boundary(BoundaryWork),
-    /// Stage 1: SAT-solve W given boundary + tuple. Enumerate W with blocking clauses.
+    /// Stage 1: SAT-solve W given boundary + tuple.
     SolveW(SolveWWork),
     /// Stage 1 (alt): SAT-solve W+Z simultaneously in one call.
     SolveWZ(SolveWZWork),
-    /// Stage 2: SAT-solve Z given boundary + W. Enumerate Z with blocking clauses.
+    /// Stage 2: SAT-solve Z given boundary + W.
     SolveZ(SolveZWork),
-    /// Stage 3: run the XY SAT fast path for a fully-specified (Z, W)
-    /// candidate. Cross mode's producer pushes these directly after
-    /// Phase B enumeration + spectral pair filtering.
-    SolveXY(SolveXYWork),
-    Shutdown,
-}
-
-
-impl PipelineWork {
-    pub(crate) fn stage(&self) -> u8 {
-        match self {
-            PipelineWork::Boundary(_) => 0,
-            PipelineWork::SolveW(_) => 1,
-            PipelineWork::SolveWZ(_) => 1,
-            PipelineWork::SolveZ(_) => 2,
-            PipelineWork::SolveXY(_) => 3,
-            PipelineWork::Shutdown => 255,
-        }
-    }
 }
 
 
@@ -284,56 +296,6 @@ pub(crate) struct SolveZWork {
 }
 
 
-pub(crate) struct SolveXYWork {
-    pub(crate) item: SatWorkItem,
-}
-
-
-/// Navigate the MDD to a specific (z_bits, w_bits) boundary, returning
-/// the XY sub-root anchored at that boundary.  Returns `None` if the
-/// boundary does not exist in the MDD (pruned away during gen).
-pub(crate) fn mdd_navigate_to_outfix(
-    root: u32, zw_depth: usize, pos_order: &[usize], nodes: &[[u32; 4]],
-    z_bits: u32, w_bits: u32,
-) -> Option<u32> {
-    let mut nid = root;
-    for level in 0..zw_depth {
-        if nid == mdd_reorder::DEAD { return None; }
-        let pos = pos_order[level];
-        let z_bit = (z_bits >> pos) & 1;
-        let w_bit = (w_bits >> pos) & 1;
-        let branch = (z_bit | (w_bit << 1)) as usize;
-        if nid != mdd_reorder::LEAF {
-            nid = nodes[nid as usize][branch];
-            if nid == mdd_reorder::DEAD { return None; }
-        }
-    }
-    Some(nid)
-}
-
-
-/// Navigate the MDD along a deterministic path to reach one boundary.
-/// Returns (z_bits, w_bits, xy_root) or None if the path hits DEAD.
-pub(crate) fn mdd_navigate_path(
-    root: u32, zw_depth: usize, path: u64,
-    pos_order: &[usize], nodes: &[[u32; 4]],
-) -> Option<(u32, u32, u32)> {
-    let mut nid = root;
-    let mut z_acc = 0u32;
-    let mut w_acc = 0u32;
-    for level in 0..zw_depth {
-        if nid == mdd_reorder::DEAD { return None; }
-        let branch = ((path >> (2 * level)) & 3) as usize;
-        let pos = pos_order[level];
-        z_acc |= ((branch & 1) as u32) << pos;
-        w_acc |= (((branch >> 1) & 1) as u32) << pos;
-        if nid != mdd_reorder::LEAF {
-            nid = nodes[nid as usize][branch];
-            if nid == mdd_reorder::DEAD { return None; }
-        }
-    }
-    Some((z_acc, w_acc, nid))
-}
 
 
 /// Read-only context shared across all workers (via Arc). Populated
@@ -357,9 +319,6 @@ pub(crate) struct PhaseBContext {
     pub(crate) pair_bound: f64,
     pub(crate) theta: usize,
     pub(crate) mdd_extend: usize,
-    /// Use the combined SolveWZ stage instead of the default SolveW →
-    /// SolveZ two-stage pipeline. Plumbed from cfg.wz_together.
-    pub(crate) wz_together: bool,
     /// Optional XY product-law conjecture (`U_i = -U_{n+1-i}` for
     /// 2 <= i <= n-1, with U_i = x_i*y_i). Plumbed from
     /// cfg.conj_xy_product; only consulted by stages that build an
@@ -397,113 +356,1587 @@ pub(crate) struct PhaseBContext {
 
 
 
-/// MDD pipeline search: unified priority queue with stages MDD→W→Z→XY.
-/// All workers are identical — they grab the highest-stage item from the queue.
-/// Later stages (closer to producing a result) always get processed first.
-pub(crate) fn run_mdd_sat_search(
+/// Metric atomics shared across workers in the MDD pipeline. Also
+/// passed as a bundle into the per-stage handler helpers
+/// (`process_boundary` and friends) so that both the legacy worker
+/// loop in `run_mdd_sat_search` and the framework `StageHandler`
+/// adapters update the same counters. Each field is an `Arc` so it
+/// can be cheaply cloned into each worker thread. `Clone` on
+/// `PipelineMetrics` clones only the Arcs, so every handler
+/// instance keeps pointing at the same underlying counters.
+#[derive(Clone)]
+pub(crate) struct PipelineMetrics {
+    // Shared
+    pub(crate) flow_bnd_sum_fail: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-stage enter counters, indexed 0..4 (Boundary/SolveW/SolveZ/SolveXY).
+    pub(crate) stage_enter: Vec<Arc<std::sync::atomic::AtomicU64>>,
+    pub(crate) stage_exit: Vec<Arc<std::sync::atomic::AtomicU64>>,
+    /// Tracks how many Boundary items are pending in the queue or
+    /// mid-processing; decremented when the Boundary stage starts.
+    pub(crate) pending_boundaries: Arc<std::sync::atomic::AtomicU64>,
+
+    // SolveW stage
+    pub(crate) flow_w_unsat: Arc<std::sync::atomic::AtomicU64>,
+    /// W-search exited via conflict-budget timeout rather than
+    /// proving UNSAT. Distinguishes "no more W candidates exist"
+    /// (UNSAT) from "ran out of budget, might be more" (TIMEOUT).
+    /// Under TTC §4.1 only the UNSAT case strictly counts as
+    /// "no residual work remains"; the TIMEOUT case is why the
+    /// MDD adapter's quality label is `Hybrid` not `Direct`.
+    pub(crate) flow_w_timeout: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_solutions: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_spec_fail: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_spec_pass: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_solves: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_decisions: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_propagations: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_root_forced: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_w_free_sum: Arc<std::sync::atomic::AtomicU64>,
+
+    // SolveXY / cross-mode XY stage
+    pub(crate) items_completed: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_z_prep_fail: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_xy_zw_bound_rej: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_xy_sat: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_xy_unsat: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_xy_timeout: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_xy_timeout_cov_micro: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_xy_solves: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_xy_decisions: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_xy_propagations: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_xy_root_forced: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_xy_free_sum: Arc<std::sync::atomic::AtomicU64>,
+
+    // SolveZ stage
+    pub(crate) flow_z_unsat: Arc<std::sync::atomic::AtomicU64>,
+    /// Z-search exited via conflict-budget timeout. Same
+    /// UNSAT-vs-TIMEOUT distinction as `flow_w_timeout`; also
+    /// contributes to why MDD quality stays `Hybrid`.
+    pub(crate) flow_z_timeout: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_z_solutions: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_z_spec_fail: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_z_pair_fail: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_z_solves: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_z_decisions: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_z_propagations: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_z_root_forced: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_z_free_sum: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) extensions_pruned: Arc<std::sync::atomic::AtomicU64>,
+
+    // SolveWZ combined stage
+    pub(crate) flow_wz_empty_v: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_wz_rule_viol: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_wz_sat_calls: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_wz_first_unsat: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_wz_solutions: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_wz_exhausted: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) flow_wz_budget_hit: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Per-worker scratch state for the SolveZ stage. Kept as a bundle
+/// so `process_solve_z` takes one `&mut ZStageScratch` instead of
+/// six individual mutable references.
+pub(crate) struct ZStageScratch {
+    pub(crate) z_bases: HashMap<i32, radical::Solver>,
+    pub(crate) z_prep: sat_z_middle::ZBoundaryPrep,
+    pub(crate) z_prep_z_bits: Option<u32>,
+    pub(crate) z_re_boundary: Vec<f64>,
+    pub(crate) z_im_boundary: Vec<f64>,
+    pub(crate) z_spectrum_buf: Vec<f64>,
+    pub(crate) ext_cache: HashMap<u128, bool>,
+}
+
+/// Boundary (stage 0) handler body, callable from both the legacy
+/// worker loop (`run_mdd_sat_search`) and the framework
+/// `BoundaryStage` adapter. Returns the 0-or-1 follow-up
+/// `PipelineWork` items the boundary expands into (either a
+/// `SolveWZ` under `use_wz_mode=true` or a `SolveW`).
+///
+/// Side effects:
+/// - decrements `metrics.pending_boundaries` on entry,
+/// - increments `metrics.flow_bnd_sum_fail` for each dropped tuple,
+/// - increments `metrics.stage_enter[1]` once if any tuple survives,
+/// - increments `metrics.stage_exit[0]` on return (whether or not
+///   anything was emitted).
+pub(crate) fn process_boundary(
+    bnd: BoundaryWork,
+    ctx: &PhaseBContext,
+    metrics: &PipelineMetrics,
+    use_wz_mode: bool,
+) -> Vec<PipelineWork> {
+    let trace_bnd = bnd.z_bits == 43 && bnd.w_bits == 47;
+    if trace_bnd {
+        eprintln!(
+            "TRACE: found target boundary z=43 w=47 xy_root={}",
+            bnd.xy_root
+        );
+    }
+    // Boundary dequeued — the walker is free to push another.
+    metrics
+        .pending_boundaries
+        .fetch_sub(1, AtomicOrdering::Relaxed);
+
+    let z_bnd_sum = 2 * (bnd.z_bits.count_ones() as i32) - ctx.max_bnd_sum;
+    let w_bnd_sum = 2 * (bnd.w_bits.count_ones() as i32) - ctx.max_bnd_sum;
+
+    let mut candidate_tuples: Vec<SumTuple> = Vec::with_capacity(ctx.tuples.len());
+    for &tuple in &ctx.tuples {
+        // Both ±|σ_W|, ±|σ_Z| allowed — feasible if AT LEAST ONE sign
+        // of each is in range and parity.
+        let z_feas = [tuple.z.abs(), -tuple.z.abs()].iter().any(|&s| {
+            crate::spectrum::sigma_full_to_cnt(s, z_bnd_sum, ctx.middle_n).is_some()
+        });
+        let w_feas = [tuple.w.abs(), -tuple.w.abs()].iter().any(|&s| {
+            crate::spectrum::sigma_full_to_cnt(s, w_bnd_sum, ctx.middle_m).is_some()
+        });
+        if !z_feas || !w_feas {
+            metrics
+                .flow_bnd_sum_fail
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            continue;
+        }
+        // MDD-guided fail-fast on XY sub-tree compatibility.
+        if !crate::xy_sat::any_valid_xy(
+            bnd.xy_root,
+            0,
+            ctx.xy_zw_depth,
+            0,
+            0,
+            &ctx.xy_pos_order,
+            &ctx.mdd.nodes,
+            ctx.max_bnd_sum,
+            ctx.middle_n as i32,
+            tuple,
+        ) {
+            metrics
+                .flow_bnd_sum_fail
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            continue;
+        }
+        candidate_tuples.push(tuple);
+    }
+    if candidate_tuples.is_empty() {
+        metrics.stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
+        return Vec::new();
+    }
+    // Use the first candidate as the representative for legacy fields
+    // (z_mid_sum, w_mid_sum, tuple).
+    let rep = candidate_tuples[0];
+    metrics.stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
+    let work = if use_wz_mode {
+        PipelineWork::SolveWZ(SolveWZWork {
+            tuple: rep,
+            z_bits: bnd.z_bits,
+            w_bits: bnd.w_bits,
+            xy_root: bnd.xy_root,
+            candidate_tuples,
+            attempt: 0,
+            prior_blocks: Vec::new(),
+        })
+    } else {
+        PipelineWork::SolveW(SolveWWork {
+            tuple: rep,
+            z_bits: bnd.z_bits,
+            w_bits: bnd.w_bits,
+            xy_root: bnd.xy_root,
+            candidate_tuples,
+        })
+    };
+    if trace_bnd {
+        eprintln!("TRACE: emitting ONE SolveW for canonical TT(18) boundary");
+    }
+    metrics.stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
+    vec![work]
+}
+
+/// SolveW (stage 1) handler body, callable from both the legacy
+/// worker loop (`run_mdd_sat_search`) and the framework
+/// `SolveWStage` adapter. Returns the `SolveZ` follow-up items
+/// produced by enumerating W middles that pass the spectral filter.
+///
+/// Per-worker scratch is passed in as `&mut`: `spectral_w` and
+/// `fft_buf_w` back the FFT spectral check, and `rng` is the
+/// worker's xorshift state (also advanced here so the branching
+/// phase decisions differ across retries). The `_w_bases` slot is
+/// retained for API/storage compatibility with the legacy layout
+/// but is no longer read or written — see the fresh-per-call
+/// comment at the SAT-branch solver construction for why.
+///
+/// Side effects on `metrics`:
+/// - `flow_w_solutions` +1 per solver hit,
+/// - `flow_w_spec_fail` / `flow_w_spec_pass` +1 per FFT verdict,
+/// - `flow_w_unsat` +1 if no W passed at all AND the exit was
+///   clean (not via conflict-budget timeout); timeout exits are
+///   exclusively counted in `flow_w_timeout`,
+/// - `flow_w_timeout` +1 per SAT conflict-budget timeout exit,
+/// - `flow_w_solves`, `flow_w_decisions`, `flow_w_propagations`,
+///   `flow_w_root_forced`, `flow_w_free_sum` aggregated over the
+///   SAT path,
+/// - `stage_enter[2]` +1 per emitted SolveZ,
+/// - `stage_exit[1]` +1 on return.
+pub(crate) fn process_solve_w(
+    sw: SolveWWork,
+    ctx: &PhaseBContext,
+    metrics: &PipelineMetrics,
+    _w_bases: &mut HashMap<i32, radical::Solver>,
+    spectral_w: &SpectralFilter,
+    fft_buf_w: &mut FftScratch,
+    rng: &mut u64,
+    forcings_out: &mut Vec<(u16, u8, u32)>,
+    // Set to true if the SAT W-enumeration exited via conflict-
+    // budget timeout (residual W candidates MAY exist). The caller
+    // marks the boundary abandoned on true so it's never
+    // exact-credited (TTC §4.1).
+    timed_out: &mut bool,
+) -> Vec<PipelineWork> {
+    let k = ctx.k;
+    let m = ctx.problem.m();
+    let trace_w = sw.z_bits == 43 && sw.w_bits == 47 && sw.tuple.z == 8 && sw.tuple.w == 1;
+    if trace_w {
+        eprintln!("TRACE: SolveW for target boundary, |σ_W|={}", sw.tuple.w);
+    }
+    let (w_prefix, w_suffix) = expand_boundary_bits(sw.w_bits, k);
+    let mut w_boundary = vec![0i8; m];
+    w_boundary[..k].copy_from_slice(&w_prefix);
+    w_boundary[m - k..].copy_from_slice(&w_suffix);
+
+    // BDKR rule (v) boundary pre-filter. Skip this SolveW if the W
+    // boundary already fails rule (v). Legacy `continue` skipped
+    // the stage_exit[1] bump; preserved here for exact parity.
+    let rule_v_state = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
+    if rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary {
+        return Vec::new();
+    }
+
+    // Compute V_w = union over `sw.candidate_tuples` of
+    // {cnt(+|σ_W|), cnt(-|σ_W|)}. One SAT call per boundary finds
+    // any W middle landing on any valid σ_W — the decoded count
+    // then narrows the tuple list for SolveZ.
+    let w_bnd_sum_local: i32 = w_boundary.iter().map(|&v| v as i32).sum();
+    let w_counts: Vec<u32> = {
+        let mut cs: Vec<u32> = Vec::new();
+        for t in &sw.candidate_tuples {
+            let abs_w = t.w.abs();
+            let signs: &[i32] = if abs_w == 0 { &[0] } else { &[1, -1] };
+            for &sg in signs {
+                if let Some(c) = crate::spectrum::sigma_full_to_cnt(sg * abs_w, w_bnd_sum_local, ctx.middle_m) {
+                    if !cs.contains(&c) {
+                        cs.push(c);
+                    }
+                }
+            }
+        }
+        cs.sort_unstable();
+        cs
+    };
+    if w_counts.is_empty() {
+        metrics.stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
+        return Vec::new();
+    }
+
+    // For small middle: brute-force W enumeration (proven to find
+    // solutions). For large middle: SAT-based W generation.
+    let mut w_found_any = false;
+    let mut trace_w_total = 0u64;
+    let mut trace_w_pass = 0u64;
+    let mut out_batch: Vec<PipelineWork> = Vec::new();
+    if ctx.middle_m <= 20 {
+        let mut spec_buf: Vec<f64> = Vec::new();
+        for &cnt in &w_counts {
+            let mid_sum_iter = 2 * cnt as i32 - ctx.middle_m as i32;
+            crate::enumerate::generate_sequences_permuted(ctx.middle_m, mid_sum_iter, false, false, 200_000, |w_mid| {
+                if ctx.found.load(AtomicOrdering::Relaxed) { return false; }
+                if !ctx.outfix_w_mid_pins.is_empty() {
+                    let pin_ok = ctx.outfix_w_mid_pins.iter()
+                        .all(|&(mid, val)| mid >= ctx.middle_m || w_mid[mid] == val);
+                    if !pin_ok { return true; }
+                }
+                let mut w_vals = w_boundary.clone();
+                w_vals[k..k + ctx.middle_m].copy_from_slice(w_mid);
+                metrics.flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
+                if trace_w { trace_w_total += 1; }
+                if sat_z_middle::check_w_boundary_rule_v(m, m, &w_vals)
+                    == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
+                {
+                    return true;
+                }
+                if crate::spectrum::spectrum_into_if_ok(&w_vals, spectral_w, ctx.individual_bound, fft_buf_w, &mut spec_buf) {
+                    if trace_w { trace_w_pass += 1; }
+                    metrics.flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
+                    w_found_any = true;
+                    let sigma_w_full: i32 = w_vals.iter().map(|&v| v as i32).sum();
+                    let narrowed: Vec<SumTuple> = sw.candidate_tuples.iter()
+                        .copied()
+                        .filter(|t| t.w.abs() == sigma_w_full.abs())
+                        .collect();
+                    if narrowed.is_empty() { return true; }
+                    metrics.stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
+                    let rep = narrowed[0];
+                    out_batch.push(PipelineWork::SolveZ(SolveZWork {
+                        tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
+                        w_vals, w_spectrum: spec_buf.clone(), xy_root: sw.xy_root,
+                        candidate_tuples: narrowed,
+                    }));
+                } else {
+                    metrics.flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                true
+            });
+        }
+    } else {
+        // SAT-based W generation. Always build a fresh solver per
+        // call — the earlier `w_bases` cache keyed everything on
+        // `0i32`, which meant boundary A's cached solver (with a
+        // `PbSetEq` constraint encoding A's `w_counts`) was reused
+        // for boundary B whose `w_counts` may differ. B's search
+        // would then be constrained by A's counts and miss
+        // solutions. Mirrors the same fresh-per-call policy
+        // `process_solve_z` adopted after the same class of bug.
+        // TTC §4.1 / §2: the denominator and numerator must refer
+        // to the same search space — a stale cached solver
+        // changes the effective search space silently.
+        let mut w_solver = ctx.w_tmpl.build_base_solver_pb_set(ctx.middle_m, &w_counts);
+        let w_cp = w_solver.save_checkpoint();
+        sat_z_middle::fill_w_solver(&mut w_solver, &ctx.w_tmpl, m, &w_boundary);
+        if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
+            let mut nv = (w_solver.num_vars() + 1) as i32;
+            sat_z_middle::add_rule_v_middle_clauses(
+                &mut w_solver, m, k, &w_boundary,
+                |pf| (pf - k + 1) as i32,
+                &mut nv,
+            );
+        }
+        if let Some(ref wtab) = ctx.w_spectral_tables {
+            w_solver.spectral = Some(radical::SpectralConstraint::from_tables(
+                wtab, &w_boundary, ctx.individual_bound,
+            ));
+        }
+
+        for &(mid, val) in &ctx.outfix_w_mid_pins {
+            if mid < ctx.middle_m {
+                let lit = (mid + 1) as i32;
+                w_solver.add_clause([if val > 0 { lit } else { -lit }]);
+            }
+        }
+
+        let w_d0 = w_solver.num_decisions();
+        let w_p0 = w_solver.num_propagations();
+        let w_l0 = w_solver.num_level0_vars();
+        let w_nv = w_solver.num_vars();
+        // Baseline for forcing attribution. `w_solver` is now
+        // freshly built per call (the prior `w_bases` cache was
+        // unsafe across boundaries — see the comment at
+        // construction), so an empty baseline would be equivalent.
+        // Keep the snapshot to preserve semantics if the solver is
+        // ever built with pre-loaded blocks from a prior attempt.
+        let w_plk0: Vec<[u64; radical::PropKind::COUNT]> =
+            w_solver.propagations_by_kind_level().to_vec();
+
+        let max_w_per_boundary: usize = std::env::var("TURYN_MAX_W_PER_BND")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+        let w_conflict_budget: u64 = std::env::var("TURYN_W_CONFL")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(5000);
+        let mut w_iter_count: usize = 0;
+        loop {
+            if ctx.found.load(AtomicOrdering::Relaxed) { break; }
+            if w_iter_count >= max_w_per_boundary { break; }
+            w_iter_count += 1;
+            let phases: Vec<bool> = (0..ctx.middle_m)
+                .map(|_| {
+                    *rng ^= *rng << 13;
+                    *rng ^= *rng >> 7;
+                    *rng ^= *rng << 17;
+                    *rng & 1 == 1
+                }).collect();
+            w_solver.set_phase(&phases);
+            if w_conflict_budget > 0 { w_solver.set_conflict_budget(w_conflict_budget); }
+            match w_solver.solve() {
+                Some(true) => {}
+                Some(false) => {
+                    // Genuinely UNSAT — no more W candidates
+                    // exist for this boundary. Safe closure.
+                    break;
+                }
+                None => {
+                    // Conflict budget exhausted. Residual W
+                    // candidates MAY exist. Per TTC §4.1 the
+                    // boundary MUST NOT be exact-credited — the
+                    // caller reads `*timed_out` and routes the
+                    // boundary through `mark_abandoned` so it
+                    // retains its accumulated partial credit but
+                    // never bumps exact.
+                    metrics.flow_w_timeout.fetch_add(1, AtomicOrdering::Relaxed);
+                    *timed_out = true;
+                    break;
+                }
+            }
+            metrics.flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
+
+            let w_mid = extract_vals(&w_solver, |i| ctx.w_mid_vars[i], ctx.middle_m);
+            let mut w_vals = w_boundary.clone();
+            w_vals[k..k + ctx.middle_m].copy_from_slice(&w_mid);
+
+            let w_block: Vec<i32> = ctx.w_mid_vars.iter().map(|&v| {
+                if w_solver.value(v) == Some(true) { -v } else { v }
+            }).collect();
+            w_solver.reset();
+            w_solver.add_clause(w_block);
+
+            let w_spectrum = match crate::spectrum::spectrum_if_ok(&w_vals, spectral_w, ctx.individual_bound, fft_buf_w) {
+                Some(s) => s,
+                None => {
+                    metrics.flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                    continue;
+                }
+            };
+            metrics.flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
+            w_found_any = true;
+
+            let sigma_w_full: i32 = w_vals.iter().map(|&v| v as i32).sum();
+            let narrowed: Vec<SumTuple> = sw.candidate_tuples.iter()
+                .copied()
+                .filter(|t| t.w.abs() == sigma_w_full.abs())
+                .collect();
+            if narrowed.is_empty() { continue; }
+            metrics.stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
+            let rep = narrowed[0];
+            out_batch.push(PipelineWork::SolveZ(SolveZWork {
+                tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
+                w_vals, w_spectrum, xy_root: sw.xy_root,
+                candidate_tuples: narrowed,
+            }));
+        }
+
+        let w_decisions = w_solver.num_decisions().saturating_sub(w_d0);
+        let w_propagations = w_solver.num_propagations().saturating_sub(w_p0);
+        let w_pre_forced = w_l0 as u64;
+        let w_free_vars = w_nv.saturating_sub(w_l0) as u64;
+        metrics.flow_w_solves.fetch_add(1, AtomicOrdering::Relaxed);
+        metrics.flow_w_decisions.fetch_add(w_decisions, AtomicOrdering::Relaxed);
+        metrics.flow_w_propagations.fetch_add(w_propagations, AtomicOrdering::Relaxed);
+        metrics.flow_w_root_forced.fetch_add(w_pre_forced, AtomicOrdering::Relaxed);
+        metrics.flow_w_free_sum.fetch_add(w_free_vars, AtomicOrdering::Relaxed);
+        forcings_out.extend(forcing_delta_triples(&w_solver, &w_plk0));
+
+        // Fresh-per-call policy: `w_solver` is dropped at scope
+        // exit (end of this `else` block). `w_cp` was taken above
+        // to keep the legacy checkpoint/restore flow available if
+        // caching is ever re-enabled; today it simply dies with
+        // the solver.
+        let _w_cp = w_cp;
+        w_solver.spectral = None;
+    }
+    // Only attribute `flow_w_unsat` to runs where the W enumeration
+    // terminated cleanly without finding any candidate. If we
+    // exited via conflict-budget timeout (`*timed_out`), bumping
+    // this counter would double-attribute the same exit as both
+    // "unsat" and "timeout" in the diagnostic summary — the
+    // boundary is genuinely incomplete, not proven empty.
+    if !w_found_any && !*timed_out {
+        metrics.flow_w_unsat.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    if trace_w {
+        eprintln!("TRACE: SolveW done: {} W middles checked, {} passed spectral",
+            trace_w_total, trace_w_pass);
+    }
+    metrics.stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
+    out_batch
+}
+
+
+/// SolveZ (stage 2) handler body. Enumerates Z middles under the
+/// spectral pair bound and the BDKR rule (iv) filter, then drives
+/// the shared XY fast path for each surviving `(Z, W)` pair —
+/// either via `try_candidate_via_mdd` (when `ctx.xy_mdd_mode`) or
+/// the per-leaf `walk_xy_sub_mdd` loop with `SolveXyPerCandidate`.
+///
+/// Per-worker scratch is bundled in `ZStageScratch`. Cross-stage
+/// scratch (`template_cache`, `warm`) and IO (`result_tx`,
+/// `sat_config`, `rng`) are passed separately since they're shared
+/// with SolveXY.
+pub(crate) fn process_solve_z(
+    sz: SolveZWork,
+    ctx: &PhaseBContext,
+    metrics: &PipelineMetrics,
+    scratch: &mut ZStageScratch,
+    spectral_z: &SpectralFilter,
+    fft_buf_z: &mut FftScratch,
+    template_cache: &mut HashMap<Vec<(i32, i32, i32, i32)>, SatXYTemplate>,
+    warm: &mut WarmStartState,
+    sat_config: &radical::SolverConfig,
+    result_tx: &std::sync::mpsc::Sender<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+    rng: &mut u64,
+    forcings_out: &mut Vec<(u16, u8, u32)>,
+    // Per-call accumulator for XY-timeout `cover_micro` values.
+    // A local u64 rather than snapshot-diff on the global
+    // `flow_xy_timeout_cov_micro` atomic, which double-attributes
+    // XY timeouts across concurrent handlers under
+    // `worker_count > 1`.
+    cov_micro_out: &mut u64,
+    // Set to true if the SAT Z-enumeration exited via
+    // conflict-budget timeout (residual Z candidates MAY exist).
+    // Caller marks the boundary abandoned on true.
+    timed_out: &mut bool,
+) {
+    let k = ctx.k;
+    let n = ctx.problem.n;
+    let m = ctx.problem.m();
+    let trace_z = sz.z_bits == 43 && sz.w_bits == 47 && sz.tuple.z == 8;
+
+    let mut z_boundary = vec![0i8; n];
+    for i in 0..k {
+        z_boundary[i] = if (sz.z_bits >> i) & 1 == 1 { 1 } else { -1 };
+        z_boundary[n - k + i] = if (sz.z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+    }
+
+    let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
+    if rule_iv_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary {
+        return;
+    }
+
+    let z_bnd_sum_local: i32 = z_boundary.iter().map(|&v| v as i32).sum();
+    let z_counts: Vec<u32> = {
+        let mut cs: Vec<u32> = Vec::new();
+        for t in &sz.candidate_tuples {
+            let abs_z = t.z.abs();
+            let signs: &[i32] = if abs_z == 0 { &[0] } else { &[1, -1] };
+            for &sg in signs {
+                if let Some(c) = crate::spectrum::sigma_full_to_cnt(sg * abs_z, z_bnd_sum_local, ctx.middle_n) {
+                    if !cs.contains(&c) { cs.push(c); }
+                }
+            }
+        }
+        cs.sort_unstable();
+        cs
+    };
+    if z_counts.is_empty() {
+        metrics.stage_exit[2].fetch_add(1, AtomicOrdering::Relaxed);
+        return;
+    }
+
+    // Always build a fresh z_solver per call. The earlier
+    // `scratch.z_bases` cache (keyed by a constant `0i32`) reused a
+    // solver across calls via `save_checkpoint`/`restore_checkpoint`
+    // — but that reuse silently produced spurious UNSATs at small
+    // middle_n (e.g. n=4 middle_n=2), making the canonical TT(n)
+    // unreachable in the framework path. `build_base_solver_quad_pb_pb_set`
+    // is cheap; rebuilding each call trades a tiny per-call cost for
+    // correctness.
+    let mut z_solver = ctx.z_tmpl.build_base_solver_quad_pb_pb_set(ctx.middle_n, &z_counts);
+    let z_cp = z_solver.save_checkpoint();
+    if scratch.z_prep_z_bits != Some(sz.z_bits) {
+        scratch.z_prep.rebuild(&ctx.z_tmpl, ctx.middle_n, &z_boundary);
+        if let Some(ref ztab) = ctx.z_spectral_tables {
+            let nf = ztab.num_freqs;
+            scratch.z_re_boundary.iter_mut().for_each(|v| *v = 0.0);
+            scratch.z_im_boundary.iter_mut().for_each(|v| *v = 0.0);
+            for pos in 0..n {
+                if pos >= k && pos < n - k { continue; }
+                let val = z_boundary[pos] as f64;
+                let base = pos * nf;
+                for fi in 0..nf {
+                    scratch.z_re_boundary[fi] += val * ztab.pos_cos[base + fi];
+                    scratch.z_im_boundary[fi] += val * ztab.pos_sin[base + fi];
+                }
+            }
+        }
+        scratch.z_prep_z_bits = Some(sz.z_bits);
+    }
+    if let Some(ref ztab) = ctx.z_spectral_tables {
+        let num_freqs = ztab.num_freqs;
+        let middle_len = ztab.middle_len;
+        let mut z_spec = radical::SpectralConstraint {
+            num_seq_vars: middle_len,
+            cos_table: std::sync::Arc::clone(&ztab.cos_table),
+            sin_table: std::sync::Arc::clone(&ztab.sin_table),
+            num_freqs,
+            re: scratch.z_re_boundary.clone(),
+            im: scratch.z_im_boundary.clone(),
+            re_boundary: scratch.z_re_boundary.clone(),
+            im_boundary: scratch.z_im_boundary.clone(),
+            bound: ctx.pair_bound,
+            per_freq_bound: None,
+            max_reduction: ztab.max_reduction_total.clone(),
+            amplitudes: std::sync::Arc::clone(&ztab.amplitudes),
+            assigned: vec![false; middle_len],
+            values: vec![0i8; middle_len],
+            seq2: None,
+        };
+        let nf = z_spec.num_freqs;
+        let mut w_re = vec![0.0f64; nf];
+        let mut w_im = vec![0.0f64; nf];
+        for (j, &wv) in sz.w_vals.iter().enumerate() {
+            let base = j * nf;
+            let cos_slice = &ztab.pos_cos[base..base + nf];
+            let sin_slice = &ztab.pos_sin[base..base + nf];
+            if wv > 0 {
+                for fi in 0..nf {
+                    w_re[fi] += cos_slice[fi];
+                    w_im[fi] += sin_slice[fi];
+                }
+            } else {
+                for fi in 0..nf {
+                    w_re[fi] -= cos_slice[fi];
+                    w_im[fi] -= sin_slice[fi];
+                }
+            }
+        }
+        let mut pfb = vec![ctx.pair_bound; nf];
+        for fi in 0..nf {
+            pfb[fi] = (ctx.pair_bound - w_re[fi]*w_re[fi] - w_im[fi]*w_im[fi]).max(0.0);
+        }
+        z_spec.per_freq_bound = Some(pfb);
+        z_solver.spectral = Some(z_spec);
+    }
+
+    sat_z_middle::fill_z_solver_quad_pb(&mut z_solver, &ctx.z_tmpl, n, m, ctx.middle_n, &scratch.z_prep, &sz.w_vals);
+    if rule_iv_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
+        let mut nv = (z_solver.num_vars() + 1) as i32;
+        sat_z_middle::add_rule_iv_middle_clauses(
+            &mut z_solver, n, k,
+            |jf| (jf - k + 1) as i32,
+            &mut nv,
+        );
+    }
+    for &(mid, val) in &ctx.outfix_z_mid_pins {
+        if mid < ctx.middle_n {
+            let lit = ctx.z_mid_vars[mid];
+            z_solver.add_clause([if val > 0 { lit } else { -lit }]);
+        }
+    }
+    if z_solver.spectral.is_some() {
+        let nsv = z_solver.spectral.as_ref().unwrap().num_seq_vars;
+        let mut pending: Vec<(usize, i8)> = Vec::new();
+        for vi in 0..nsv {
+            let lit = ctx.z_mid_vars[vi];
+            if let Some(b) = z_solver.value(lit) {
+                let sp = z_solver.spectral.as_ref().unwrap();
+                if !sp.assigned[vi] {
+                    pending.push((vi, if b { 1 } else { -1 }));
+                }
+            }
+        }
+        if let Some(ref mut sp) = z_solver.spectral {
+            for (vi, val) in pending {
+                sp.assign(vi, val);
+            }
+        }
+    }
+
+    let w_seq = PackedSeq::from_values(&sz.w_vals);
+
+    let z_d0 = z_solver.num_decisions();
+    let z_p0 = z_solver.num_propagations();
+    let z_l0 = z_solver.num_level0_vars();
+    let z_nv = z_solver.num_vars();
+
+    let mut z_count = 0usize;
+    let z_conflict_budget: u64 = std::env::var("TURYN_Z_CONFL")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(5000);
+    loop {
+        if ctx.found.load(AtomicOrdering::Relaxed) { break; }
+        if z_count >= ctx.max_z { break; }
+        let z_phases: Vec<bool> = (0..ctx.middle_n)
+            .map(|_| {
+                *rng ^= *rng << 13;
+                *rng ^= *rng >> 7;
+                *rng ^= *rng << 17;
+                *rng & 1 == 1
+            }).collect();
+        z_solver.set_phase(&z_phases);
+        if z_conflict_budget > 0 { z_solver.set_conflict_budget(z_conflict_budget); }
+        let z_result = z_solver.solve();
+        match z_result {
+            Some(true) => {}
+            Some(false) => {
+                // UNSAT — no more Z candidates exist. Clean
+                // boundary closure.
+                if z_count == 0 { metrics.flow_z_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
+                break;
+            }
+            None => {
+                // Z-search hit its conflict budget. Residual Z
+                // candidates MAY exist. Per TTC §4.1 the caller
+                // marks the boundary abandoned so it retains its
+                // accumulated partial credit but never bumps
+                // exact.
+                metrics.flow_z_timeout.fetch_add(1, AtomicOrdering::Relaxed);
+                *timed_out = true;
+                break;
+            }
+        }
+        z_count += 1;
+        metrics.flow_z_solutions.fetch_add(1, AtomicOrdering::Relaxed);
+
+        let z_mid = extract_vals(&z_solver, |i| ctx.z_mid_vars[i], ctx.middle_n);
+
+        let mut z_vals = Vec::with_capacity(n);
+        z_vals.extend_from_slice(&z_boundary[..k]);
+        z_vals.extend_from_slice(&z_mid);
+        z_vals.extend_from_slice(&z_boundary[n-k..]);
+
+        if z_count < ctx.max_z {
+            let z_block: Vec<i32> = ctx.z_mid_vars.iter().map(|&v| {
+                if z_solver.value(v) == Some(true) { -v } else { v }
+            }).collect();
+            z_solver.reset();
+            z_solver.add_clause(z_block);
+        }
+
+        crate::spectrum::compute_spectrum_into(&z_vals, spectral_z, fft_buf_z, &mut scratch.z_spectrum_buf);
+
+        if ctx.middle_n <= 20 {
+            if !crate::spectrum::spectral_pair_ok(&scratch.z_spectrum_buf, &sz.w_spectrum, ctx.pair_bound) {
+                metrics.flow_z_pair_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                if trace_z {
+                    eprintln!("TRACE:   Z solution #{} FAILED pair check", z_count);
+                }
+                continue;
+            }
+        }
+        if trace_z { eprintln!("TRACE:   Z solution #{} REACHED XY!", z_count); }
+
+        let z_seq = PackedSeq::from_values(&z_vals);
+        let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
+
+        let mut tuple_key: Vec<(i32, i32, i32, i32)> = sz.candidate_tuples.iter()
+            .map(|t| (t.x, t.y, t.z, t.w)).collect();
+        tuple_key.sort_unstable();
+        let template = template_cache.entry(tuple_key).or_insert_with(||
+            SatXYTemplate::build_multi_opts(ctx.problem, &sz.candidate_tuples, sat_config, ctx.conj_xy_product).unwrap()
+        );
+        let candidate = CandidateZW { zw_autocorr };
+        if ctx.xy_mdd_mode {
+            let conflict_limit = if n > 30 { 5000 } else { 0 };
+            let (xy_res, stats) = try_candidate_via_mdd(
+                ctx.problem, &candidate, template, k,
+                sz.xy_root, &ctx.mdd.nodes, &ctx.xy_pos_order,
+                conflict_limit,
+                // Accumulate the fresh XY-MDD solver's forcing
+                // triples into the stage's sink so the MDD
+                // adapter's `StageOutcome::forcings` covers the
+                // inline XY work, not just the outer z_solver.
+                Some(forcings_out),
+            );
+            metrics.stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
+            metrics.items_completed.fetch_add(1, AtomicOrdering::Relaxed);
+            metrics.stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
+            metrics.flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
+            metrics.flow_xy_decisions.fetch_add(stats.decisions, AtomicOrdering::Relaxed);
+            metrics.flow_xy_propagations.fetch_add(stats.propagations, AtomicOrdering::Relaxed);
+            metrics.flow_xy_root_forced.fetch_add(stats.vars_pre_forced, AtomicOrdering::Relaxed);
+            metrics.flow_xy_free_sum.fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
+            match xy_res {
+                Some((x, y)) => {
+                    metrics.flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed);
+                    if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
+                        ctx.found.store(true, AtomicOrdering::Relaxed);
+                        let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
+                    }
+                }
+                None => {
+                    metrics.flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
+        } else if let Some(mut state) = SolveXyPerCandidate::new(
+            ctx.problem, &candidate, template, k,
+        ) {
+            if n > 30 { state.solver.set_conflict_limit(5000); }
+            if warm.inject_phase {
+                if let Some(ref ph) = warm.phase { state.solver.set_phase(ph); }
+            }
+
+            // Snapshot the XY solver BEFORE the walk so only the
+            // walk's contributions (many `try_candidate` calls,
+            // each propagating on top of the previous trail) are
+            // attributed. The solver already did some level-0
+            // propagation at construction; those are part of the
+            // stage's own setup work, so including them is OK,
+            // but taking the snapshot now keeps it to the walk
+            // proper — same contract as the outer z_solver.
+            let xy_plk0: Vec<[u64; radical::PropKind::COUNT]> =
+                state.solver.propagations_by_kind_level().to_vec();
+            walk_xy_sub_mdd(
+                sz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
+                &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
+                ctx.middle_n as i32, &sz.candidate_tuples,
+                &mut |x_bits, y_bits| {
+                    if ctx.found.load(AtomicOrdering::Relaxed) { return; }
+                    if let Some((fx, fy)) = ctx.outfix_xy {
+                        if x_bits != fx || y_bits != fy { return; }
+                    }
+                    if ctx.conj_zw_bound
+                        && !check_conj_zw_bound(n, k, x_bits, y_bits, &z_seq, &w_seq)
+                    {
+                        metrics.flow_xy_zw_bound_rej.fetch_add(1, AtomicOrdering::Relaxed);
+                        return;
+                    }
+                    if ctx.mdd_extend > 0 {
+                        let cache_key = (sz.z_bits as u128) | ((sz.w_bits as u128) << 32)
+                                      | ((x_bits as u128) << 64) | ((y_bits as u128) << 96);
+                        let ext_ok = *scratch.ext_cache.entry(cache_key).or_insert_with(||
+                            mdd_zw_first::has_extension(
+                                k, k + ctx.mdd_extend,
+                                sz.z_bits, sz.w_bits, x_bits, y_bits,
+                            )
+                        );
+                        if !ext_ok {
+                            metrics.extensions_pruned.fetch_add(1, AtomicOrdering::Relaxed);
+                            return;
+                        }
+                    }
+                    metrics.stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
+                    let (result, stats) = state.try_candidate(x_bits, y_bits);
+                    metrics.items_completed.fetch_add(1, AtomicOrdering::Relaxed);
+                    metrics.stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
+                    match &result {
+                        XyTryResult::Sat(_, _) => { metrics.flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed); }
+                        XyTryResult::Unsat | XyTryResult::Pruned => { metrics.flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
+                        XyTryResult::Timeout => {
+                            metrics.flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed);
+                            metrics.flow_xy_timeout_cov_micro.fetch_add(stats.cover_micro, AtomicOrdering::Relaxed);
+                            *cov_micro_out = cov_micro_out.saturating_add(stats.cover_micro);
+                        }
+                    };
+                    if !matches!(result, XyTryResult::Pruned) {
+                        metrics.flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
+                        metrics.flow_xy_decisions.fetch_add(stats.decisions, AtomicOrdering::Relaxed);
+                        metrics.flow_xy_propagations.fetch_add(stats.propagations, AtomicOrdering::Relaxed);
+                        metrics.flow_xy_root_forced.fetch_add(stats.vars_pre_forced, AtomicOrdering::Relaxed);
+                        metrics.flow_xy_free_sum.fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
+                    }
+                    if let XyTryResult::Sat(x, y) = result {
+                        if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
+                            ctx.found.store(true, AtomicOrdering::Relaxed);
+                            let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
+                        }
+                    }
+                },
+            );
+            // Drain the XY solver's propagation delta into the
+            // stage's forcing sink so `StageOutcome::forcings`
+            // reflects the actual inline XY work, not just the
+            // outer z_solver. See `docs/TELEMETRY.md` §4
+            // attribution rule.
+            forcings_out.extend(forcing_delta_triples(&state.solver, &xy_plk0));
+            warm.phase = Some(state.solver.get_phase());
+        } else {
+            metrics.flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+    }
+    if trace_z {
+        let z_sf = metrics.flow_z_spec_fail.load(AtomicOrdering::Relaxed);
+        let z_pf = metrics.flow_z_pair_fail.load(AtomicOrdering::Relaxed);
+        eprintln!("TRACE: SolveZ done for target: {} Z found (global z_spec_fail={}, z_pair_fail={})", z_count, z_sf, z_pf);
+    }
+
+    let z_decisions    = z_solver.num_decisions().saturating_sub(z_d0);
+    let z_propagations = z_solver.num_propagations().saturating_sub(z_p0);
+    let z_pre_forced   = z_l0 as u64;
+    let z_free_vars    = z_nv.saturating_sub(z_l0) as u64;
+    metrics.flow_z_solves.fetch_add(1, AtomicOrdering::Relaxed);
+    metrics.flow_z_decisions.fetch_add(z_decisions, AtomicOrdering::Relaxed);
+    metrics.flow_z_propagations.fetch_add(z_propagations, AtomicOrdering::Relaxed);
+    metrics.flow_z_root_forced.fetch_add(z_pre_forced, AtomicOrdering::Relaxed);
+    metrics.flow_z_free_sum.fetch_add(z_free_vars, AtomicOrdering::Relaxed);
+    // `z_solver` is freshly built every call, so an empty baseline
+    // reports the full forcing trace as attribution for this
+    // SolveZ call. Inline XY-path solvers (SolveXyPerCandidate,
+    // try_candidate_via_mdd) do their own independent propagation
+    // inside this stage, but their forcings are not yet threaded
+    // through — only the outer Z-middle solver contributes today.
+    forcings_out.extend(forcing_delta_triples(&z_solver, &[]));
+
+    // No cache-insert: the fresh-per-call policy above makes the
+    // HashMap unused; keep the slot drained so future readers see
+    // it isn't populated. The restore_checkpoint + spectral=None
+    // are harmless but redundant now.
+    let _ = z_cp;
+    z_solver.spectral = None;
+    let _ = &mut scratch.z_bases;
+    metrics.stage_exit[2].fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+/// SolveWZ (combined W+Z stage) handler body. Solves the coupled
+/// W+Z middle SAT with per-lag Turyn-identity range constraints
+/// plus a two-sequence spectral constraint, enumerates `(W, Z)`
+/// pairs, and drives the XY fast path per pair via the shared
+/// `walk_xy_sub_mdd`. Carries learnt blocking clauses across
+/// re-queued attempts so deferred boundaries never re-enumerate
+/// `(W, Z)` orbits already tried.
+///
+/// Returns the residual `SolveWZ` re-queue (with its bumped
+/// attempt and an accumulated priority penalty) when the attempt
+/// hit the conflict budget or `max_z` before proving UNSAT. The
+/// caller is responsible for routing that back onto the queue via
+/// `push_with_priority`.
+pub(crate) fn process_solve_wz(
+    swz: SolveWZWork,
+    ctx: &PhaseBContext,
+    metrics: &PipelineMetrics,
+    template_cache: &mut HashMap<Vec<(i32, i32, i32, i32)>, SatXYTemplate>,
+    sat_config: &radical::SolverConfig,
+    result_tx: &std::sync::mpsc::Sender<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+    rng: &mut u64,
+    forcings_out: &mut Vec<(u16, u8, u32)>,
+    // Per-call cov_micro accumulator; see `process_solve_z`.
+    cov_micro_out: &mut u64,
+) -> Option<(PipelineWork, f64)> {
+    let k = ctx.k;
+    let n = ctx.problem.n;
+    let m = ctx.problem.m();
+    let mut deferred: Option<(PipelineWork, f64)> = None;
+    // Combined W+Z SAT: solve for both middles simultaneously.
+    // W vars: 1..middle_m, Z vars: middle_m+1..middle_m+middle_n
+    let mut solver = radical::Solver::new();
+    let w_var = |i: usize| -> i32 { (i + 1) as i32 };
+    let z_var = |i: usize| -> i32 { (ctx.middle_m + i + 1) as i32 };
+    let total_vars = ctx.middle_m + ctx.middle_n;
+
+    // Expand boundaries (needed to build V_w and V_z).
+    let (w_prefix, w_suffix) = expand_boundary_bits(swz.w_bits, k);
+    let mut w_boundary = vec![0i8; m];
+    w_boundary[..k].copy_from_slice(&w_prefix);
+    w_boundary[m-k..].copy_from_slice(&w_suffix);
+    let mut z_boundary = vec![0i8; n];
+    for i in 0..k {
+        z_boundary[i] = if (swz.z_bits >> i) & 1 == 1 { 1 } else { -1 };
+        z_boundary[n-k+i] = if (swz.z_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
+    }
+
+    // Sum constraints via PbSetEq: union of ±|σ_W| (resp. ±|σ_Z|)
+    // counts across all `candidate_tuples`.
+    let w_bnd_sum_local: i32 = w_boundary.iter().map(|&v| v as i32).sum();
+    let z_bnd_sum_local: i32 = z_boundary.iter().map(|&v| v as i32).sum();
+    let mut w_counts: Vec<u32> = Vec::new();
+    let mut z_counts: Vec<u32> = Vec::new();
+    for t in &swz.candidate_tuples {
+        let abs_w = t.w.abs();
+        for &sg in if abs_w == 0 { &[0i32] as &[i32] } else { &[1, -1] } {
+            if let Some(c) = sigma_full_to_cnt(sg * abs_w, w_bnd_sum_local, ctx.middle_m) {
+                if !w_counts.contains(&c) { w_counts.push(c); }
+            }
+        }
+        let abs_z = t.z.abs();
+        for &sg in if abs_z == 0 { &[0i32] as &[i32] } else { &[1, -1] } {
+            if let Some(c) = sigma_full_to_cnt(sg * abs_z, z_bnd_sum_local, ctx.middle_n) {
+                if !z_counts.contains(&c) { z_counts.push(c); }
+            }
+        }
+    }
+    w_counts.sort_unstable();
+    z_counts.sort_unstable();
+    if w_counts.is_empty() || z_counts.is_empty() {
+        metrics.flow_wz_empty_v.fetch_add(1, AtomicOrdering::Relaxed);
+        metrics.stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
+        return None;
+    }
+    let w_lits: Vec<i32> = (0..ctx.middle_m).map(|i| w_var(i)).collect();
+    let z_lits: Vec<i32> = (0..ctx.middle_n).map(|i| z_var(i)).collect();
+    solver.add_pb_set_eq(&w_lits, &w_counts);
+    solver.add_pb_set_eq(&z_lits, &z_counts);
+
+    // BDKR rules (iv)/(v) boundary pre-filter.
+    let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
+    let rule_v_state  = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
+    if rule_iv_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
+       || rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
+    {
+        metrics.flow_wz_rule_viol.fetch_add(1, AtomicOrdering::Relaxed);
+        metrics.stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
+        return None;
+    }
+    // Rule (iv) / (v) middle clauses in the combined
+    // SolveWZ solver.  The separate helpers take a
+    // full-seq-pos → SAT-var closure; here the W
+    // middle occupies vars 1..middle_m and the Z
+    // middle occupies middle_m+1..middle_m+middle_n.
+    let total_existing_vars = total_vars;
+    let mut nv_combined = (total_existing_vars + 1) as i32;
+    if rule_iv_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
+        sat_z_middle::add_rule_iv_middle_clauses(
+            &mut solver, n, k,
+            |jf| z_var(jf - k),
+            &mut nv_combined,
+        );
+    }
+    if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
+        sat_z_middle::add_rule_v_middle_clauses(
+            &mut solver, m, k, &w_boundary,
+            |pf| w_var(pf - k),
+            &mut nv_combined,
+        );
+    }
+
+    // Combined per-lag autocorrelation: for each lag s,
+    //   N_Z(s) + N_W(s) ∈ [-(n-s), n-s]  (Turyn identity coupling)
+    //
+    // Expressed as a quadratic PB range on the combined W+Z
+    // agree terms.  Each "pair agrees" is encoded as a quad
+    // term x AND y (with coeff 1) — bnd×mid terms use a
+    // pinned true_var so that `lit_a AND true_var = lit_a`;
+    // mid×mid terms add TWO quad terms `(a,b)` and `(-a,-b)`
+    // (matching the XNOR definition `a==b ⇔ ab ∨ ¬a¬b`).
+    //
+    // This replaces the older encoding that built an
+    // explicit auxiliary var per mid×mid pair via
+    // `encode_xnor_agree` + `add_pb_atleast`.  Using
+    // `add_quad_pb_range` directly matches the encoding in
+    // SolveZ's `fill_z_solver_quad_pb` — the quad_pb
+    // propagator prunes much earlier than the XNOR-aux
+    // formulation, cutting conflicts-per-solve roughly by
+    // half at n=26 k=5.
+    {
+        // Pin a "true" helper variable for the bnd×mid
+        // terms' second literal.  Allocated as the very
+        // next var after the existing W/Z middles and the
+        // rules (iv)/(v) aux vars (counted in nv_combined).
+        let true_var = nv_combined;
+        solver.add_clause([true_var]);
+
+        for s in 1..n {
+            let max_nzw = (n - s) as i32;
+            let nw_pairs = if s < m { (m - s) as i32 } else { 0 };
+            let nz_pairs = (n - s) as i32;
+            let total_pairs = nw_pairs + nz_pairs;
+            let combined_lo = ((total_pairs - max_nzw) / 2).max(0) as u32;
+            let combined_hi = ((total_pairs + max_nzw) / 2).min(total_pairs) as u32;
+
+            let mut agree_const = 0u32;
+            let mut lits_a: Vec<i32> = Vec::new();
+            let mut lits_b: Vec<i32> = Vec::new();
+            // W pairs
+            if s < m {
+                let w_lag = &ctx.w_tmpl.lags[s - 1];
+                for &(i, j) in &w_lag.bnd_bnd {
+                    if w_boundary[i] == w_boundary[j] { agree_const += 1; }
+                }
+                for &(bnd_pos, mid_idx) in &w_lag.bnd_mid {
+                    let lit = if w_boundary[bnd_pos] == 1 { w_var(mid_idx) } else { -w_var(mid_idx) };
+                    lits_a.push(lit);
+                    lits_b.push(true_var);
+                }
+                for &(i, j) in &w_lag.mid_mid {
+                    // agree(a,b) = (a AND b) OR (-a AND -b)
+                    lits_a.push( w_var(i)); lits_b.push( w_var(j));
+                    lits_a.push(-w_var(i)); lits_b.push(-w_var(j));
+                }
+            }
+            // Z pairs
+            if s < n {
+                let z_lag = &ctx.z_tmpl.lags[s - 1];
+                for &(i, j) in &z_lag.bnd_bnd {
+                    if z_boundary[i] == z_boundary[j] { agree_const += 1; }
+                }
+                for &(bnd_pos, mid_idx) in &z_lag.bnd_mid {
+                    let lit = if z_boundary[bnd_pos] == 1 { z_var(mid_idx) } else { -z_var(mid_idx) };
+                    lits_a.push(lit);
+                    lits_b.push(true_var);
+                }
+                for &(i, j) in &z_lag.mid_mid {
+                    lits_a.push( z_var(i)); lits_b.push( z_var(j));
+                    lits_a.push(-z_var(i)); lits_b.push(-z_var(j));
+                }
+            }
+
+            let max_variable = lits_a.len() as u32;
+            let adj_lo = combined_lo.saturating_sub(agree_const);
+            let adj_hi = combined_hi.saturating_sub(agree_const);
+            if adj_lo > max_variable { solver.add_clause(std::iter::empty::<i32>()); break; }
+            if adj_lo == 0 && adj_hi >= max_variable { continue; }
+            if lits_a.is_empty() {
+                // No variable-dependent terms; agree_const
+                // alone must already satisfy the range
+                // (checked by the adj_lo/adj_hi guards above).
+                continue;
+            }
+            let coeffs: Vec<u32> = vec![1; lits_a.len()];
+            solver.add_quad_pb_range(&lits_a, &lits_b, &coeffs, adj_lo, adj_hi);
+        }
+    }
+
+    // Combined WZ spectral: 2|W(ω)|² + 2|Z(ω)|² ≤ pair_bound.
+    // Uses two-sequence SpectralConstraint with separate DFT tracking.
+    {
+        let nf = SPECTRAL_FREQS;
+        let total_mid = ctx.middle_m + ctx.middle_n;
+        let mut cos_table = vec![0.0f32; total_mid * nf];
+        let mut sin_table = vec![0.0f32; total_mid * nf];
+        let mut amplitudes = vec![0.0f32; total_mid * nf];
+        let mut re1_bnd = vec![0.0f64; nf]; // W boundary DFT
+        let mut im1_bnd = vec![0.0f64; nf];
+        let mut re2_bnd = vec![0.0f64; nf]; // Z boundary DFT
+        let mut im2_bnd = vec![0.0f64; nf];
+        let mut mr1 = vec![0.0f64; nf]; // max reduction seq1 (W)
+        let mut mr2 = vec![0.0f64; nf]; // max reduction seq2 (Z)
+
+        for fi in 0..nf {
+            let omega = (fi as f64 + 1.0) / (nf as f64 + 1.0) * std::f64::consts::PI;
+            for pos in 0..m {
+                if pos >= k && pos < m - k { continue; }
+                let val = w_boundary[pos] as f64;
+                re1_bnd[fi] += val * (omega * pos as f64).cos();
+                im1_bnd[fi] += val * (omega * pos as f64).sin();
+            }
+            for pos in 0..n {
+                if pos >= k && pos < n - k { continue; }
+                let val = z_boundary[pos] as f64;
+                re2_bnd[fi] += val * (omega * pos as f64).cos();
+                im2_bnd[fi] += val * (omega * pos as f64).sin();
+            }
+            for vi in 0..ctx.middle_m {
+                let pos = k + vi;
+                let c = (omega * pos as f64).cos() as f32;
+                let s = (omega * pos as f64).sin() as f32;
+                cos_table[vi * nf + fi] = c;
+                sin_table[vi * nf + fi] = s;
+                let amp = (c * c + s * s).sqrt();
+                amplitudes[vi * nf + fi] = amp;
+                mr1[fi] += amp as f64;
+            }
+            for vi in 0..ctx.middle_n {
+                let pos = k + vi;
+                let c = (omega * pos as f64).cos() as f32;
+                let s = (omega * pos as f64).sin() as f32;
+                let idx = (ctx.middle_m + vi) * nf + fi;
+                cos_table[idx] = c;
+                sin_table[idx] = s;
+                let amp = (c * c + s * s).sqrt();
+                amplitudes[idx] = amp;
+                mr2[fi] += amp as f64;
+            }
+        }
+        // Dummy combined re/im (not used in seq2 mode conflict check)
+        let re_dummy = vec![0.0f64; nf];
+        let im_dummy = vec![0.0f64; nf];
+        solver.spectral = Some(radical::SpectralConstraint {
+            num_seq_vars: total_mid,
+            cos_table: std::sync::Arc::new(cos_table),
+            sin_table: std::sync::Arc::new(sin_table),
+            num_freqs: nf,
+            re: re_dummy.clone(), im: im_dummy.clone(),
+            re_boundary: re_dummy.clone(), im_boundary: im_dummy,
+            bound: ctx.problem.target_energy() as f64, // 6n-2: full energy budget for 2|W|²+2|Z|²+|X|²+|Y|²
+            per_freq_bound: None,
+            max_reduction: vec![0.0; nf],
+            amplitudes: std::sync::Arc::new(amplitudes),
+            assigned: vec![false; total_mid],
+            values: vec![0i8; total_mid],
+            seq2: Some(radical::Seq2Config {
+                seq2_start: ctx.middle_m,
+                weight1: 2.0, weight2: 2.0,
+                individual_bound: ctx.individual_bound,
+                re1: re1_bnd.clone(), im1: im1_bnd.clone(),
+                re1_boundary: re1_bnd, im1_boundary: im1_bnd,
+                max_reduction1: mr1,
+                re2: re2_bnd.clone(), im2: im2_bnd.clone(),
+                re2_boundary: re2_bnd, im2_boundary: im2_bnd,
+                max_reduction2: mr2,
+            }),
+        });
+    }
+
+    // Snapshot search stats for the combined SAT enumeration.
+    // Combined WZ does the work of both the W and Z stages, so
+    // we credit its decisions/propagations to BOTH stage
+    // counters — each stage's "per-solve average" stays
+    // interpretable, at the cost of a small overcount in the
+    // grand total.
+    // --outfix middle pins: force Z/W middle positions to
+    // the canonical values via unit clauses.  Let the SAT
+    // decide the remaining middle bits.
+    for &(mid, val) in &ctx.outfix_z_mid_pins {
+        if mid < ctx.middle_n {
+            let lit = if val > 0 { z_var(mid) } else { -z_var(mid) };
+            solver.add_clause([lit]);
+        }
+    }
+    for &(mid, val) in &ctx.outfix_w_mid_pins {
+        if mid < ctx.middle_m {
+            let lit = if val > 0 { w_var(mid) } else { -w_var(mid) };
+            solver.add_clause([lit]);
+        }
+    }
+
+    // Inject blocking clauses accumulated from earlier
+    // attempts on this boundary.  Each block rules out
+    // one previously-enumerated (W, Z) middle; they use
+    // stable W/Z middle var IDs (1..=total_vars) so
+    // they remain valid in this freshly-built solver.
+    // Persisting these across re-queues is what makes
+    // the search eventually reach SAT's Some(false)
+    // rather than redundantly re-enumerating the same
+    // (W, Z) orbits with different phase RNG each
+    // attempt.
+    for block in &swz.prior_blocks {
+        solver.add_clause(block.iter().copied());
+    }
+
+    let wz_d0 = solver.num_decisions();
+    let wz_p0 = solver.num_propagations();
+    let wz_l0 = solver.num_level0_vars();
+    let wz_nv = solver.num_vars();
+
+    // Enumerate WZ solutions.
+    //
+    // Re-queue strategy: rather than burning a large
+    // conflict budget on one boundary (which monopolises
+    // a worker and slows space coverage), use a modest
+    // budget per attempt and push the item back into the
+    // queue when the budget is exhausted.  Exponential
+    // backoff: attempt 0 gets 5k conflicts, attempt 1
+    // gets 10k, etc., capped at 50k.  Re-queued items
+    // sit at priority −1 (below fresh boundaries and
+    // first-attempt SolveWZ), so the MDD is covered
+    // once before we retry hard boundaries.
+    let mut wz_count = 0usize;
+    // Per-attempt conflict budget doubles each retry so
+    // hard boundaries eventually get enough SAT effort to
+    // reach a decisive result (UNSAT or SAT).  Cap at 1M
+    // per attempt to bound memory; re-queue beyond that
+    // still happens (see below) so we defer but never
+    // cancel.
+    let conflict_budget: u64 = (5_000u64 << swz.attempt.min(7)).min(1_000_000);
+    solver.set_conflict_limit(conflict_budget);
+    // Tracks whether the enumeration was cut off with
+    // more WZ solutions possibly remaining (None from
+    // solve() = conflict limit, or hit max_z cap),
+    // vs. fully exhausted (Some(false) = UNSAT proved).
+    let mut more_possible = false;
+    // New blocking clauses produced in THIS attempt.
+    // If the attempt is deferred via re-queue, these
+    // plus the prior_blocks get passed forward so the
+    // next attempt skips already-found (W, Z) pairs.
+    let mut new_blocks: Vec<Vec<i32>> = Vec::new();
+    loop {
+        if ctx.found.load(AtomicOrdering::Relaxed) { break; }
+        if wz_count >= ctx.max_z {
+            more_possible = true;
+            break;
+        }
+        // Random phases for both W and Z.  Mix the
+        // attempt number into the RNG so re-queued
+        // items explore a different region of the
+        // phase space than their first attempt.
+        let mut attempt_rng = *rng ^ (swz.attempt as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        let phases: Vec<bool> = (0..total_vars)
+            .map(|_| {
+                attempt_rng ^= attempt_rng << 13;
+                attempt_rng ^= attempt_rng >> 7;
+                attempt_rng ^= attempt_rng << 17;
+                attempt_rng & 1 == 1
+            }).collect();
+        *rng = attempt_rng;
+        solver.set_phase(&phases);
+        metrics.flow_wz_sat_calls.fetch_add(1, AtomicOrdering::Relaxed);
+        let sat_res = solver.solve();
+        if sat_res == None {
+            // Conflict limit hit — more solutions may exist.
+            more_possible = true;
+            metrics.flow_wz_budget_hit.fetch_add(1, AtomicOrdering::Relaxed);
+            // Don't bump flow_wz_first_unsat here: the field name
+            // means "first iteration reported UNSAT", and a
+            // conflict-budget timeout is not UNSAT. Mirrors the
+            // round-28 fix for the analogous flow_w_unsat /
+            // flow_w_timeout mutual exclusion.
+            break;
+        }
+        if sat_res == Some(false) {
+            // Fully enumerated: every assignment has been
+            // blocked.  No point re-queuing.
+            metrics.flow_wz_exhausted.fetch_add(1, AtomicOrdering::Relaxed);
+            if wz_count == 0 {
+                metrics.flow_wz_first_unsat.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            break;
+        }
+        wz_count += 1;
+        metrics.flow_wz_solutions.fetch_add(1, AtomicOrdering::Relaxed);
+
+        // Extract W middle
+        let w_mid: Vec<i8> = (0..ctx.middle_m).map(|i| {
+            if solver.value(w_var(i)).unwrap() { 1 } else { -1 }
+        }).collect();
+        let mut w_vals = w_boundary.clone();
+        w_vals[k..k+ctx.middle_m].copy_from_slice(&w_mid);
+
+        // Extract Z middle
+        let z_mid: Vec<i8> = (0..ctx.middle_n).map(|i| {
+            if solver.value(z_var(i)).unwrap() { 1 } else { -1 }
+        }).collect();
+        let mut z_vals = Vec::with_capacity(n);
+        z_vals.extend_from_slice(&z_boundary[..k]);
+        z_vals.extend_from_slice(&z_mid);
+        z_vals.extend_from_slice(&z_boundary[n-k..]);
+
+        // Block this (W,Z) pair.  Also stash the clause
+        // in new_blocks so it survives re-queue: the
+        // next attempt's fresh solver will re-add it
+        // together with swz.prior_blocks.
+        let block: Vec<i32> = (0..total_vars as i32 + 1).skip(1).map(|v| {
+            if solver.value(v) == Some(true) { -v } else { v }
+        }).collect();
+        solver.reset();
+        solver.add_clause(block.iter().copied());
+        new_blocks.push(block);
+
+        // Got a valid (W,Z) pair — proceed to XY
+        metrics.flow_z_solutions.fetch_add(1, AtomicOrdering::Relaxed);
+        let z_seq = PackedSeq::from_values(&z_vals);
+        let w_seq = PackedSeq::from_values(&w_vals);
+        let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
+
+        // Multi-tuple XY template: the SolveWZ boundary is
+        // compatible with *all* candidate_tuples.  Use
+        // build_multi so the XY SAT's V_x/V_y cover every
+        // compatible |σ_X|/|σ_Y| across those tuples, and
+        // narrow post-hoc by the W+Z sums we just decoded
+        // (via zw_autocorr → lag PB ranges) and by the
+        // candidate magnitudes.
+        let mut tuple_key: Vec<(i32, i32, i32, i32)> = swz.candidate_tuples.iter()
+            .map(|t| (t.x, t.y, t.z, t.w)).collect();
+        tuple_key.sort_unstable();
+        let template = template_cache.entry(tuple_key).or_insert_with(||
+            SatXYTemplate::build_multi_opts(ctx.problem, &swz.candidate_tuples, &sat_config, ctx.conj_xy_product).unwrap()
+        );
+        let candidate = CandidateZW { zw_autocorr };
+        if let Some(mut xy_solver) = template.prepare_candidate_solver(&candidate) {
+            if n > 30 { xy_solver.set_conflict_limit(5000); }
+            // Snapshot before the walk so only the per-(W,Z) SAT
+            // work is attributed. `prepare_candidate_solver`
+            // clones the template and injects candidate-specific
+            // constraints; the resulting solver's prop counters
+            // start at the cloned base, so snapshotting-then-diff
+            // is needed to isolate this call's work.
+            let xy_plk0: Vec<[u64; radical::PropKind::COUNT]> =
+                xy_solver.propagations_by_kind_level().to_vec();
+            walk_xy_sub_mdd(
+                swz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
+                &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
+                ctx.middle_n as i32, &swz.candidate_tuples,
+                &mut |x_bits, y_bits| {
+                    if ctx.found.load(AtomicOrdering::Relaxed) { return; }
+                    if let Some((fx, fy)) = ctx.outfix_xy {
+                        if x_bits != fx || y_bits != fy { return; }
+                    }
+                    if ctx.conj_zw_bound
+                        && !check_conj_zw_bound(n, k, x_bits, y_bits, &z_seq, &w_seq)
+                    {
+                        metrics.flow_xy_zw_bound_rej.fetch_add(1, AtomicOrdering::Relaxed);
+                        return;
+                    }
+                    metrics.stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
+                    let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+                    let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+                    let mut assumptions = Vec::with_capacity(4 * k + ctx.outfix_x_mid_pins.len() + ctx.outfix_y_mid_pins.len());
+                    for i in 0..k {
+                        assumptions.push(if (x_bits >> i) & 1 == 1 { x_var(i) } else { -x_var(i) });
+                        assumptions.push(if (x_bits >> (k + i)) & 1 == 1 { x_var(n - k + i) } else { -x_var(n - k + i) });
+                        assumptions.push(if (y_bits >> i) & 1 == 1 { y_var(i) } else { -y_var(i) });
+                        assumptions.push(if (y_bits >> (k + i)) & 1 == 1 { y_var(n - k + i) } else { -y_var(n - k + i) });
+                    }
+                    // --outfix middle pins for X/Y: force middle positions too.
+                    for &(mid, val) in &ctx.outfix_x_mid_pins {
+                        if mid < ctx.middle_n {
+                            let lit = if val > 0 { x_var(k + mid) } else { -x_var(k + mid) };
+                            assumptions.push(lit);
+                        }
+                    }
+                    for &(mid, val) in &ctx.outfix_y_mid_pins {
+                        if mid < ctx.middle_n {
+                            let lit = if val > 0 { y_var(k + mid) } else { -y_var(k + mid) };
+                            assumptions.push(lit);
+                        }
+                    }
+                    // Snapshot search stats around the SAT call.
+                    let xy_d0 = xy_solver.num_decisions();
+                    let xy_p0 = xy_solver.num_propagations();
+                    let xy_l0 = xy_solver.num_level0_vars();
+                    let xy_nv = xy_solver.num_vars();
+                    let result = xy_solver.solve_with_assumptions(&assumptions);
+                    metrics.items_completed.fetch_add(1, AtomicOrdering::Relaxed);
+                    metrics.stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
+
+                    let xy_decisions    = xy_solver.num_decisions().saturating_sub(xy_d0);
+                    let xy_propagations = xy_solver.num_propagations().saturating_sub(xy_p0);
+                    let xy_pre_forced   = xy_l0 as u64;
+                    let xy_free_vars    = xy_nv.saturating_sub(xy_l0) as u64;
+                    metrics.flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
+                    metrics.flow_xy_decisions.fetch_add(xy_decisions, AtomicOrdering::Relaxed);
+                    metrics.flow_xy_propagations.fetch_add(xy_propagations, AtomicOrdering::Relaxed);
+                    metrics.flow_xy_root_forced.fetch_add(xy_pre_forced, AtomicOrdering::Relaxed);
+                    metrics.flow_xy_free_sum.fetch_add(xy_free_vars, AtomicOrdering::Relaxed);
+
+                    match result {
+                        Some(true) => metrics.flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed),
+                        Some(false) => metrics.flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed),
+                        None => {
+                            let cover = xy_cover_micro(result, xy_decisions, xy_free_vars);
+                            metrics.flow_xy_timeout_cov_micro.fetch_add(cover, AtomicOrdering::Relaxed);
+                            *cov_micro_out = cov_micro_out.saturating_add(cover);
+                            metrics.flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed)
+                        }
+                    };
+                    if result == Some(true) {
+                        let (x, y) = template.extract_xy(&xy_solver);
+                        if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
+                            ctx.found.store(true, AtomicOrdering::Relaxed);
+                            let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
+                        }
+                    }
+                },
+            );
+            // Drain the XY solver's propagation delta into the
+            // stage's forcing sink so `StageOutcome::forcings`
+            // reflects the actual inline XY work alongside the
+            // outer combined solver.
+            forcings_out.extend(forcing_delta_triples(&xy_solver, &xy_plk0));
+        }
+    }
+
+    // Aggregate combined-WZ stats into both W and Z stage
+    // counters (see comment at snapshot site above).
+    let wz_decisions    = solver.num_decisions().saturating_sub(wz_d0);
+    let wz_propagations = solver.num_propagations().saturating_sub(wz_p0);
+    let wz_pre_forced   = wz_l0 as u64;
+    let wz_free_vars    = wz_nv.saturating_sub(wz_l0) as u64;
+    metrics.flow_w_solves.fetch_add(1, AtomicOrdering::Relaxed);
+    metrics.flow_w_decisions.fetch_add(wz_decisions, AtomicOrdering::Relaxed);
+    metrics.flow_w_propagations.fetch_add(wz_propagations, AtomicOrdering::Relaxed);
+    metrics.flow_w_root_forced.fetch_add(wz_pre_forced, AtomicOrdering::Relaxed);
+    metrics.flow_w_free_sum.fetch_add(wz_free_vars, AtomicOrdering::Relaxed);
+    metrics.flow_z_solves.fetch_add(1, AtomicOrdering::Relaxed);
+    metrics.flow_z_decisions.fetch_add(wz_decisions, AtomicOrdering::Relaxed);
+    metrics.flow_z_propagations.fetch_add(wz_propagations, AtomicOrdering::Relaxed);
+    metrics.flow_z_root_forced.fetch_add(wz_pre_forced, AtomicOrdering::Relaxed);
+    metrics.flow_z_free_sum.fetch_add(wz_free_vars, AtomicOrdering::Relaxed);
+    // `solver` is the combined W+Z middle solver built fresh in
+    // this call; empty baseline gives full attribution. Inline
+    // per-(W,Z) XY solvers (`xy_solver`) are drained into the same
+    // sink inside the walk loop above, so `forcings_out` now
+    // covers both the outer middle solver and every per-pair XY
+    // solve.
+    forcings_out.extend(forcing_delta_triples(&solver, &[]));
+
+    metrics.stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
+
+    // Re-queue: if the enumeration was cut short (conflict
+    // limit hit, or max_z cap reached) and we haven't
+    // found a TT, push this item back with attempt+1 at
+    // a lower priority.  NO CAP on attempts — we defer
+    // hard boundaries to lower priority slots but never
+    // abandon them.  The per-attempt budget doubles each
+    // retry (see conflict_budget above) so every boundary
+    // eventually gets enough effort for SAT/UNSAT.
+    if more_possible
+        && !ctx.found.load(AtomicOrdering::Relaxed)
+    {
+        // Priority: re-queued SolveWZ items must sit
+        // BELOW stage 0 (fresh MDD boundaries, priority
+        // 0.0) so fresh boundaries are always preferred
+        // over retries.  Without this, re-queued items
+        // at attempt=0's priority 0.9 starve the walker:
+        // we'd cycle 18 boundaries forever instead of
+        // covering the whole space.
+        //
+        // Each retry drops priority by 0.001 so retries
+        // within themselves are FIFO by fewest attempts
+        // (gentler retries get priority over harder
+        // ones).  This implements "defer but never
+        // cancel": we walk every fresh boundary first,
+        // then work through retries in order of
+        // accumulated budget.
+        let priority = -0.001 * (swz.attempt + 1) as f64;
+        metrics.stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
+        // Carry prior blocks forward, appending the ones
+        // produced this attempt.  Without this, the next
+        // attempt would rebuild a fresh solver that
+        // doesn't know which (W, Z) pairs have already
+        // been tried, and would redundantly re-enumerate
+        // the same orbits with different phase RNG.
+        let mut carried_blocks = swz.prior_blocks;
+        carried_blocks.extend(new_blocks);
+        deferred = Some((PipelineWork::SolveWZ(SolveWZWork {
+                tuple: swz.tuple,
+                z_bits: swz.z_bits,
+                w_bits: swz.w_bits,
+                xy_root: swz.xy_root,
+                candidate_tuples: swz.candidate_tuples.clone(),
+                attempt: swz.attempt + 1,
+                prior_blocks: carried_blocks,
+            }), priority));
+    }
+    deferred
+}
+
+/// Build a `PhaseBContext` populated from the given problem / tuple
+/// list / search config. Duplicates the setup block at the top of
+/// `run_mdd_sat_search` so the framework `MddStagesAdapter` can own
+/// an identical context without invoking the legacy worker loop.
+///
+/// Panics / exits if no usable MDD file is available (matches
+/// `run_mdd_sat_search`'s exit behavior).
+pub(crate) fn build_phase_b_context(
     problem: Problem,
     tuples: &[SumTuple],
     cfg: &SearchConfig,
     verbose: bool,
     k: usize,
-) -> SearchReport {
+) -> Arc<PhaseBContext> {
     let n = problem.n;
     let m = problem.m();
-
-    // --wz=sync: no pre-built MDD, no tuple enumeration. Walker runs the
-    // full bouncing boundary DFS against a persistent SAT solver.
-    if cfg.effective_wz_mode() == WzMode::Sync {
-        let sync_cfg = crate::sync_walker::SyncConfig {
-            sat_secs: cfg.sat_secs,
-            sat_config: cfg.sat_config.clone(),
-            conflict_limit: cfg.conflict_limit,
-            random_seed: None,
-            cancel: None,
-            exchange: None,
-        };
-        let _ = tuples;  // unused by sync
-        let (found, stats, elapsed) = crate::sync_walker::search_sync(problem, &sync_cfg, verbose);
-        if verbose {
-            eprintln!(
-                "\n--wz=sync: nodes={} memo_hits={} cap_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?}",
-                stats.nodes_visited, stats.memo_hits,
-                stats.capacity_rejects, stats.rule_rejects, stats.sat_unsat, stats.leaves_reached, stats.max_level_reached, elapsed,
-            );
-        }
-        if let Some((x, y, z, w)) = found.as_ref() {
-            if verbose {
-                println!("\nFOUND! x={} y={} z={} w={}",
-                    colored_pm(x), colored_pm(y), colored_pm(z), colored_pm(w));
-            }
-        }
-        return SearchReport {
-            stats: SearchStats::default(),
-            elapsed,
-            found_solution: found.is_some(),
-        };
-    }
-
     let try_k = k.min((n - 1) / 2);
     let mdd = match load_best_mdd(try_k, verbose) {
         Some(m) => {
             if m.k != try_k {
-                eprintln!("error: requested --mdd-k={} but only mdd-{}.bin found (k={})", k, m.k, m.k);
-                eprintln!("Generate the exact MDD: target/release/gen_mdd {}", try_k);
+                eprintln!(
+                    "error: requested --mdd-k={} but only mdd-{}.bin found (k={})",
+                    k, m.k, m.k
+                );
+                eprintln!(
+                    "Generate the exact MDD: target/release/gen_mdd {}",
+                    try_k
+                );
                 std::process::exit(1);
             }
             Arc::new(m)
         }
         None => {
-            eprintln!("No MDD file found (tried mdd-1.bin through mdd-{}.bin)", try_k);
-            eprintln!("Generate one with: cargo build --release --bin gen_mdd && target/release/gen_mdd {}", k);
-            std::process::exit(1);
+            // No `mdd-<k>.bin` available — build one in memory via
+            // `mdd_bfs::build_bfs_mdd`. Fast for small k; identical
+            // structure to what `target/release/gen_mdd` writes. Prevents
+            // the PR-review-flagged regression where `--wz=cross`
+            // aborted on small n whenever the repo lacked a precomputed
+            // MDD file. For larger `k` (n ≥ 26 territory) the user
+            // should still precompute for performance, but it's no
+            // longer a hard requirement.
+            if verbose {
+                eprintln!(
+                    "No mdd-{}.bin file; building in-memory MDD via BFS (one-shot)...",
+                    try_k
+                );
+            }
+            Arc::new(mdd_bfs::build_bfs_mdd(try_k))
         }
     };
     let k = mdd.k;
     assert!(2 * k <= n, "k={} too large for n={}: need 2k <= n", k, n);
     assert!(2 * k <= m, "k={} too large for m={}: need 2k <= m", k, m);
-
     let middle_n = n - 2 * k;
     let middle_m = m - 2 * k;
     let max_bnd_sum = (2 * k) as i32;
     let zw_depth = 2 * k;
     let full_pos_order: Vec<usize> = {
         let mut v = Vec::with_capacity(2 * k);
-        for t in 0..k { v.push(t); v.push(2 * k - 1 - t); }
+        for t in 0..k {
+            v.push(t);
+            v.push(2 * k - 1 - t);
+        }
         v
     };
-
-    // Pull-based MDD feeding: monitor navigates paths on demand.
-    let total_paths: u64 = 4u64.pow(zw_depth as u32);
-    let lcg_mult: u64 = 0x5851F42D4C957F2D; // odd, full-period LCG for power-of-2
-    let lcg_mask: u64 = total_paths - 1;
-    let path_counter = std::sync::atomic::AtomicU64::new(0);
-
-    // Count live ZW paths for progress estimation
-    let live_zw_paths = {
-        let mut memo = std::collections::HashMap::new();
-        fn count_zw(nid: u32, level: usize, depth: usize, nodes: &[[u32; 4]],
-                    memo: &mut std::collections::HashMap<u32, f64>) -> f64 {
-            if nid == mdd_reorder::DEAD as u32 { return 0.0; }
-            if nid == mdd_reorder::LEAF { return 4.0f64.powi((depth - level) as i32); }
-            if level >= depth { return 1.0; }
-            if let Some(&c) = memo.get(&nid) { return c; }
-            let mut s = 0.0;
-            for b in 0..4 { s += count_zw(nodes[nid as usize][b], level + 1, depth, nodes, memo); }
-            memo.insert(nid, s);
-            s
-        }
-        count_zw(mdd.root, 0, zw_depth, &mdd.nodes, &mut memo)
-    };
-    if verbose {
-        eprintln!("  {:.0} live ZW paths of {} total ({:.4}% live)",
-            live_zw_paths, total_paths, live_zw_paths / total_paths as f64 * 100.0);
-    }
-
-    // Shared read-only context for all workers
-    let ctx = Arc::new(PhaseBContext {
+    Arc::new(PhaseBContext {
         mdd: Arc::clone(&mdd),
-        xy_pos_order: full_pos_order.clone(),
+        xy_pos_order: full_pos_order,
         tuples: tuples.to_vec(),
         w_tmpl: sat_z_middle::LagTemplate::new(m, k),
         z_tmpl: sat_z_middle::LagTemplate::new(n, k),
@@ -514,29 +1947,11 @@ pub(crate) fn run_mdd_sat_search(
         middle_n,
         middle_m,
         max_bnd_sum,
-        // Cap Z enumeration per SolveZ item. The post-hoc FFT pair check
-        // rejects >99.99% of Z solutions at small k; trying more than a
-        // handful per item wastes SAT time without improving coverage.
-        // Measured sweep at n=26 k=3 (boundaries walked in 20s):
-        //   max_z=1:  14   max_z=10: 15   max_z=100: 11   max_z=200000: 9
-        // A small cap lets workers move on to fresh (z_boundary, W) pairs
-        // faster, which matters more than exhaustively enumerating Z for
-        // one pair.
-        // The cap used to be 1: old PbEq-based SolveZ happened to pick
-        // a Z whose (Z, W) pair passed the external spectral filter by
-        // luck of decision ordering.  Under PbSetEq the decision order
-        // changes and 1 Z per pair isn't reliable — the in-SAT and
-        // external spectral filters are on different frequency grids
-        // by design, so the SAT may legitimately pick a Z that passes
-        // its own in-SAT spectral but fails the external pair check.
-        // Enumerate up to 16 Zs per (Z boundary, W middle) to recover.
-        // User can still override via `--max-z`.
         max_z: cfg.max_z.min(16),
         individual_bound: problem.spectral_bound(),
         pair_bound: cfg.max_spectral.unwrap_or(problem.spectral_bound()),
         theta: cfg.theta_samples,
         mdd_extend: cfg.mdd_extend,
-        wz_together: cfg.wz_together,
         conj_xy_product: cfg.conj_xy_product,
         conj_zw_bound: cfg.conj_zw_bound,
         xy_mdd_mode: std::env::var("XY_MDD").ok().as_deref() == Some("1"),
@@ -544,2286 +1959,344 @@ pub(crate) fn run_mdd_sat_search(
         z_mid_vars: (0..middle_n).map(|i| (i + 1) as i32).collect(),
         z_spectral_tables: if middle_n >= 8 {
             Some(radical::SpectralTables::new(n, k, SPECTRAL_FREQS))
-        } else { None },
+        } else {
+            None
+        },
         w_spectral_tables: if middle_m >= 8 {
             Some(radical::SpectralTables::new(m, k, SPECTRAL_FREQS))
-        } else { None },
+        } else {
+            None
+        },
         found: Arc::new(AtomicBool::new(false)),
         outfix_xy: cfg.test_outfix.as_ref().and_then(|o| o.xy_bits),
-        outfix_z_mid_pins: cfg.test_outfix.as_ref().map(|o| o.z_middle_pins.clone()).unwrap_or_default(),
-        outfix_w_mid_pins: cfg.test_outfix.as_ref().map(|o| o.w_middle_pins.clone()).unwrap_or_default(),
-        outfix_x_mid_pins: cfg.test_outfix.as_ref().map(|o| o.x_middle_pins.clone()).unwrap_or_default(),
-        outfix_y_mid_pins: cfg.test_outfix.as_ref().map(|o| o.y_middle_pins.clone()).unwrap_or_default(),
-    });
+        outfix_z_mid_pins: cfg
+            .test_outfix
+            .as_ref()
+            .map(|o| o.z_middle_pins.clone())
+            .unwrap_or_default(),
+        outfix_w_mid_pins: cfg
+            .test_outfix
+            .as_ref()
+            .map(|o| o.w_middle_pins.clone())
+            .unwrap_or_default(),
+        outfix_x_mid_pins: cfg
+            .test_outfix
+            .as_ref()
+            .map(|o| o.x_middle_pins.clone())
+            .unwrap_or_default(),
+        outfix_y_mid_pins: cfg
+            .test_outfix
+            .as_ref()
+            .map(|o| o.y_middle_pins.clone())
+            .unwrap_or_default(),
+    })
+}
 
-    let run_start = Instant::now();
-    let workers = std::env::var("TURYN_THREADS")
-        .ok().and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism()
-            .map(|n| n.get()).unwrap_or(1).max(1));
-    let sat_secs = cfg.sat_secs;
-
-    if verbose {
-        eprintln!("TT({}): MDD pipeline k={}, {} workers, 4^{}={:.0e} paths",
-            n, k, workers, zw_depth, total_paths as f64);
-        if cfg.conj_xy_product {
-            eprintln!("  --conj-xy-product: enforcing U_i = -U_{{n+1-i}} on XY canonical reps (XY product-law conjecture)");
-        }
-        if cfg.conj_zw_bound {
-            eprintln!("  --conj-zw-bound: enforcing |N_Z(s)+N_W(s)| = ((n-s)+N_U(s))/2 for s in {{n-1,n-2,n-3}}");
-        }
-        if cfg.test_tuple.is_some() && cfg.conj_tuple {
-            eprintln!("  --conj-tuple: restricted search to auto-selected tuple");
+/// Navigate the MDD to a specific `(z_bits, w_bits)` boundary, returning
+/// the XY sub-root anchored at that boundary. Returns `None` if the
+/// boundary is not live (pruned away during MDD gen).
+///
+/// Used by the framework `MddStagesAdapter` to seed a single
+/// `BoundaryWork` when `--outfix` pins the boundary explicitly —
+/// avoids enumerating hundreds of millions of boundaries at large
+/// `k` just to find the one the caller wants.
+pub(crate) fn mdd_navigate_to_outfix(
+    root: u32, zw_depth: usize, pos_order: &[usize], nodes: &[[u32; 4]],
+    z_bits: u32, w_bits: u32,
+) -> Option<u32> {
+    let mut nid = root;
+    for level in 0..zw_depth {
+        if nid == mdd_reorder::DEAD { return None; }
+        let pos = pos_order[level];
+        let z_bit = (z_bits >> pos) & 1;
+        let w_bit = (w_bits >> pos) & 1;
+        let branch = (z_bit | (w_bit << 1)) as usize;
+        if nid != mdd_reorder::LEAF {
+            nid = nodes[nid as usize][branch];
+            if nid == mdd_reorder::DEAD { return None; }
         }
     }
+    Some(nid)
+}
 
-    // Shared priority queue: workers push and pop. Higher stage = higher priority.
-    use std::collections::BinaryHeap;
-    // Two-queue system:
-    // - work: stages 0-2 (Boundary, SolveW, SolveZ) — higher stage first
-    // - gold: stage 3 (SolveXY) — lower spectral power first (best candidates)
-    // Workers check gold first; if empty, take from work to generate more gold.
-    struct PqEntry { priority: f64, work: PipelineWork }
-    impl PartialEq for PqEntry { fn eq(&self, o: &Self) -> bool { self.priority == o.priority } }
-    impl Eq for PqEntry {}
-    impl PartialOrd for PqEntry { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-    impl Ord for PqEntry {
-        fn cmp(&self, o: &Self) -> Ordering {
-            self.priority.partial_cmp(&o.priority).unwrap_or(Ordering::Equal)
+/// Enumerate every live boundary path through the first `zw_depth`
+/// levels of the MDD, returning a `BoundaryWork` per path. Used by
+/// the framework `MddStagesAdapter` to seed its queue upfront; the
+/// legacy worker loop instead pulls boundaries on demand via its
+/// monitor's LCG path walker.
+///
+/// A path is "live" iff none of its nodes are `mdd_reorder::DEAD`
+/// — i.e. it terminates at some non-DEAD XY-sub-tree root.
+pub(crate) fn enumerate_live_boundaries(
+    ctx: &PhaseBContext,
+    cancelled: &AtomicBool,
+) -> Vec<BoundaryWork> {
+    let mdd = &*ctx.mdd;
+    let zw_depth = ctx.zw_depth;
+    let xy_pos_order = &ctx.xy_pos_order;
+    let mut out: Vec<BoundaryWork> = Vec::new();
+
+    fn walk(
+        nid: u32,
+        level: usize,
+        z_bits: u32,
+        w_bits: u32,
+        depth: usize,
+        order: &[usize],
+        nodes: &[[u32; 4]],
+        out: &mut Vec<BoundaryWork>,
+        cancelled: &AtomicBool,
+    ) {
+        // Poll the shared cancel flag once per visited node. At
+        // n=26 k=7 this walk visits ~18M nodes; the watchdog set
+        // by `--sat-secs` flips this flag and we bail with a
+        // partial boundary list. The adapter treats that as a
+        // legitimate (if incomplete) seed set so the framework
+        // can still print honest telemetry.
+        if cancelled.load(AtomicOrdering::Relaxed) {
+            return;
         }
-    }
-
-    struct DualQueue {
-        work: std::sync::Mutex<BinaryHeap<PqEntry>>,  // stages 0-2
-        gold: std::sync::Mutex<BinaryHeap<PqEntry>>,  // stage 3, ranked by quality
-        condvar: std::sync::Condvar,
-        pair_bound: f64,
-        best_quality: std::sync::atomic::AtomicU64,    // f64 bits of best quality seen
-    }
-    impl DualQueue {
-        /// Push a non-XY work item with an explicit priority (e.g. for
-        /// re-queued SolveWZ items that should sit below fresh work).
-        fn push_with_priority(&self, item: PipelineWork, priority: f64) {
-            self.work.lock().unwrap().push(PqEntry { priority, work: item });
-            self.condvar.notify_one();
+        if nid == mdd_reorder::DEAD {
+            return;
         }
-
-        fn push(&self, item: PipelineWork) {
-            match &item {
-                PipelineWork::SolveXY(xy) => {
-                    // Gold queue: lower spectral power = higher priority (inverted)
-                    let quality = (1.0 - xy.item.priority / self.pair_bound.max(1.0)).max(0.0);
-                    // Track best quality seen
-                    let prev = f64::from_bits(self.best_quality.load(AtomicOrdering::Relaxed));
-                    if quality > prev {
-                        self.best_quality.store(quality.to_bits(), AtomicOrdering::Relaxed);
-                    }
-                    self.gold.lock().unwrap().push(PqEntry { priority: quality, work: item });
-                }
-                _ => {
-                    let priority = item.stage() as f64;
-                    self.work.lock().unwrap().push(PqEntry { priority, work: item });
-                }
-            }
-            self.condvar.notify_one();
+        if level == depth {
+            out.push(BoundaryWork {
+                z_bits,
+                w_bits,
+                xy_root: nid,
+            });
+            return;
         }
-        fn pop_blocking(&self, found: &AtomicBool, rng: &mut u64) -> Option<PipelineWork> {
-            loop {
-                if found.load(AtomicOrdering::Relaxed) { return None; }
-                // Check gold queue: accept based on quality (weighted coinflip).
-                // Top item has priority = quality (0.0 = bad, 1.0 = excellent).
-                // Accept with probability = quality^2 (strongly favor the best).
-                // If rejected, do work-queue stuff to generate more gold.
-                {
-                    let mut gq = self.gold.lock().unwrap();
-                    if let Some(_top) = gq.peek() {
-                        // Always accept if gold queue is well-stocked (>=100 items).
-                        // If <100 items, 50/50 between processing and generating more.
-                        let well_stocked = gq.len() >= 100;
-                        let accept = well_stocked || {
-                            *rng ^= *rng << 13; *rng ^= *rng >> 7; *rng ^= *rng << 17;
-                            *rng & 1 == 0
-                        };
-                        if accept {
-                            return Some(gq.pop().unwrap().work);
-                        }
-                    }
-                }
-                // Work queue (generate more gold candidates)
-                if let Some(e) = self.work.lock().unwrap().pop() { return Some(e.work); }
-                // Both empty or gold not accepted — wait briefly
-                let guard = self.work.lock().unwrap();
-                let (_guard, _) = self.condvar.wait_timeout(guard, std::time::Duration::from_millis(50)).unwrap();
-            }
-        }
-        fn push_batch(&self, items: Vec<PipelineWork>) {
-            if items.is_empty() { return; }
-            // Separate gold (XY) vs work items
-            let mut gold_items = Vec::new();
-            let mut work_items = Vec::new();
-            for item in items {
-                match &item {
-                    PipelineWork::SolveXY(xy) => {
-                        let quality = (1.0 - xy.item.priority / self.pair_bound.max(1.0)).max(0.0);
-                        let prev = f64::from_bits(self.best_quality.load(AtomicOrdering::Relaxed));
-                        if quality > prev {
-                            self.best_quality.store(quality.to_bits(), AtomicOrdering::Relaxed);
-                        }
-                        gold_items.push(PqEntry { priority: quality, work: item });
-                    }
-                    _ => {
-                        let priority = item.stage() as f64;
-                        work_items.push(PqEntry { priority, work: item });
-                    }
-                }
-            }
-            if !gold_items.is_empty() {
-                let mut gq = self.gold.lock().unwrap();
-                for e in gold_items { gq.push(e); }
-            }
-            if !work_items.is_empty() {
-                let mut wq = self.work.lock().unwrap();
-                for e in work_items { wq.push(e); }
-            }
-            self.condvar.notify_all();
-        }
-        fn gold_len(&self) -> usize { self.gold.lock().unwrap().len() }
-        fn work_len(&self) -> usize { self.work.lock().unwrap().len() }
-    }
-
-    let work_queue = Arc::new(DualQueue {
-        work: std::sync::Mutex::new(BinaryHeap::new()),
-        gold: std::sync::Mutex::new(BinaryHeap::new()),
-        condvar: std::sync::Condvar::new(),
-        pair_bound: ctx.pair_bound,
-        best_quality: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
-    });
-    let (result_tx, result_rx) =
-        std::sync::mpsc::channel::<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>();
-
-    // Shared counters
-    let items_completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let boundaries_walked = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let extensions_pruned = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    // SolveXY items currently being processed by a worker (not sub-candidate walks).
-    // Used by cross mode to detect completion: when the producer has
-    // enumerated every tuple and this counter is zero with both queues
-    // empty, the pipeline is drained.
-    let xy_item_in_flight = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    // Pipeline flow counters for Sankey visualization
-    let flow_bnd_sum_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));      // boundaries failing sum feasibility
-    let flow_w_unsat = Arc::new(std::sync::atomic::AtomicU64::new(0));            // W SAT: no solutions found
-    let flow_w_solutions = Arc::new(std::sync::atomic::AtomicU64::new(0));        // W solutions found (pre-spectral)
-    let flow_w_spec_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));        // W solutions failing spectral
-    let flow_w_spec_pass = Arc::new(std::sync::atomic::AtomicU64::new(0));        // W solutions passing spectral → SolveZ
-    let flow_z_unsat = Arc::new(std::sync::atomic::AtomicU64::new(0));            // Z SAT: no solutions found
-    let flow_z_solutions = Arc::new(std::sync::atomic::AtomicU64::new(0));        // Z solutions found (pre-spectral)
-    let flow_z_spec_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));        // Z solutions failing individual spectral
-    let flow_z_pair_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));        // Z solutions failing pair check
-    let flow_z_prep_fail = Arc::new(std::sync::atomic::AtomicU64::new(0));        // Z solutions failing prepare_candidate (infeasible/GJ)
-    let flow_xy_ext_pruned = Arc::new(std::sync::atomic::AtomicU64::new(0));      // XY candidates pruned by extension
-    let flow_xy_zw_bound_rej = Arc::new(std::sync::atomic::AtomicU64::new(0));    // XY candidates pruned by --conj-zw-bound pre-filter
-    let flow_xy_sat = Arc::new(std::sync::atomic::AtomicU64::new(0));             // XY SAT result = SAT
-    let flow_xy_unsat = Arc::new(std::sync::atomic::AtomicU64::new(0));           // XY SAT result = UNSAT (proved)
-    let flow_xy_timeout = Arc::new(std::sync::atomic::AtomicU64::new(0));         // XY SAT result = None (conflict limit)
-    // Per-stage SAT search stats: aggregate decisions/propagations/forced/free over all solves.
-    // Incremented by workers via diffing radical::Solver counters before/after each solve.
-    let flow_w_solves = Arc::new(std::sync::atomic::AtomicU64::new(0));           // count of W SAT solves
-    let flow_w_decisions = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let flow_w_propagations = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let flow_w_root_forced = Arc::new(std::sync::atomic::AtomicU64::new(0));      // sum of vars newly forced at level 0
-    let flow_w_free_sum = Arc::new(std::sync::atomic::AtomicU64::new(0));         // sum of "free vars after forcing"
-    let flow_z_solves = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let flow_z_decisions = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let flow_z_propagations = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let flow_z_root_forced = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let flow_z_free_sum = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let flow_xy_solves = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let flow_xy_decisions = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let flow_xy_propagations = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let flow_xy_root_forced = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let flow_xy_free_sum = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    // Sum of `cover_frac × 1_000_000` across XY timeout solves only.
-    // Used to derive effective coverage from aggregate counters in the TTC
-    // formula: a timeout that explored fraction f contributes f instead of 1.0
-    // to the boundary's coverage. (W and Z solves don't time out today, so
-    // partial-credit machinery applies only to XY.)
-    let flow_xy_timeout_cov_micro = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    // SolveWZ-specific flow counters: diagnose where combined WZ items are lost.
-    let flow_wz_empty_v = Arc::new(std::sync::atomic::AtomicU64::new(0));           // V_w or V_z was empty
-    let flow_wz_rule_viol = Arc::new(std::sync::atomic::AtomicU64::new(0));         // rule (iv)/(v) violated at boundary
-    let flow_wz_sat_calls = Arc::new(std::sync::atomic::AtomicU64::new(0));         // number of solver.solve() calls
-    let flow_wz_first_unsat = Arc::new(std::sync::atomic::AtomicU64::new(0));       // first solve returned UNSAT (no (W,Z) at all)
-    let flow_wz_solutions = Arc::new(std::sync::atomic::AtomicU64::new(0));         // WZ pairs produced (total, across enum)
-    let flow_wz_exhausted = Arc::new(std::sync::atomic::AtomicU64::new(0));         // SolveWZ attempts that ran to SAT-UNSAT (not budget-hit)
-    let flow_wz_budget_hit = Arc::new(std::sync::atomic::AtomicU64::new(0));        // SolveWZ attempts whose solve() returned None (conflict-limit)
-    // Per-stage enter/exit counters: depth = enter - exit.
-    let stage_enter: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
-    let stage_exit: [Arc<std::sync::atomic::AtomicU64>; 4] = std::array::from_fn(|_| Arc::new(std::sync::atomic::AtomicU64::new(0)));
-    // Count of Boundary items pending in the work queue OR being processed
-    // by a worker (not yet converted to SolveW/SolveWZ).  Used by the MDD
-    // walker to throttle the push rate — without this it'd either flood
-    // the queue upfront (memory) or (worse) stall when the queue fills
-    // with deferred re-queued SolveWZ items at negative priority, never
-    // making room for fresh boundaries.
-    let pending_boundaries = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-    let sat_config = cfg.sat_config.clone();
-    // SAT config: use defaults (EMA restarts/vivification/chrono BT tested and regressed)
-
-    // No seed — monitor feeds MDD boundaries inline on demand.
-
-    // Spawn workers — all identical, they grab highest-stage item
-    let mut handles = Vec::new();
-    for tid in 0..workers {
-        let ctx = Arc::clone(&ctx);
-        let wq = Arc::clone(&work_queue);
-        let result_tx = result_tx.clone();
-        let items_completed = Arc::clone(&items_completed);
-        let _boundaries_walked = Arc::clone(&boundaries_walked);
-        let extensions_pruned = Arc::clone(&extensions_pruned);
-        let xy_item_in_flight = Arc::clone(&xy_item_in_flight);
-        let flow_bnd_sum_fail = Arc::clone(&flow_bnd_sum_fail);
-        let flow_w_unsat = Arc::clone(&flow_w_unsat);
-        let flow_w_solutions = Arc::clone(&flow_w_solutions);
-        let flow_w_spec_fail = Arc::clone(&flow_w_spec_fail);
-        let flow_w_spec_pass = Arc::clone(&flow_w_spec_pass);
-        let flow_z_unsat = Arc::clone(&flow_z_unsat);
-        let flow_z_solutions = Arc::clone(&flow_z_solutions);
-        let flow_z_spec_fail = Arc::clone(&flow_z_spec_fail);
-        let flow_z_pair_fail = Arc::clone(&flow_z_pair_fail);
-        let flow_z_prep_fail = Arc::clone(&flow_z_prep_fail);
-        let _flow_xy_ext_pruned = Arc::clone(&flow_xy_ext_pruned);
-        let flow_xy_zw_bound_rej = Arc::clone(&flow_xy_zw_bound_rej);
-        let flow_xy_sat = Arc::clone(&flow_xy_sat);
-        let flow_xy_unsat = Arc::clone(&flow_xy_unsat);
-        let flow_xy_timeout = Arc::clone(&flow_xy_timeout);
-        let flow_w_solves = Arc::clone(&flow_w_solves);
-        let flow_w_decisions = Arc::clone(&flow_w_decisions);
-        let flow_w_propagations = Arc::clone(&flow_w_propagations);
-        let flow_w_root_forced = Arc::clone(&flow_w_root_forced);
-        let flow_w_free_sum = Arc::clone(&flow_w_free_sum);
-        let flow_z_solves = Arc::clone(&flow_z_solves);
-        let flow_z_decisions = Arc::clone(&flow_z_decisions);
-        let flow_z_propagations = Arc::clone(&flow_z_propagations);
-        let flow_z_root_forced = Arc::clone(&flow_z_root_forced);
-        let flow_z_free_sum = Arc::clone(&flow_z_free_sum);
-        let flow_xy_solves = Arc::clone(&flow_xy_solves);
-        let flow_xy_decisions = Arc::clone(&flow_xy_decisions);
-        let flow_xy_propagations = Arc::clone(&flow_xy_propagations);
-        let flow_xy_root_forced = Arc::clone(&flow_xy_root_forced);
-        let flow_xy_free_sum = Arc::clone(&flow_xy_free_sum);
-        let flow_xy_timeout_cov_micro = Arc::clone(&flow_xy_timeout_cov_micro);
-        let flow_wz_empty_v = Arc::clone(&flow_wz_empty_v);
-        let flow_wz_rule_viol = Arc::clone(&flow_wz_rule_viol);
-        let flow_wz_sat_calls = Arc::clone(&flow_wz_sat_calls);
-        let flow_wz_first_unsat = Arc::clone(&flow_wz_first_unsat);
-        let flow_wz_solutions = Arc::clone(&flow_wz_solutions);
-        let flow_wz_exhausted = Arc::clone(&flow_wz_exhausted);
-        let flow_wz_budget_hit = Arc::clone(&flow_wz_budget_hit);
-        let stage_enter: Vec<_> = stage_enter.iter().map(Arc::clone).collect();
-        let stage_exit: Vec<_> = stage_exit.iter().map(Arc::clone).collect();
-        let pending_boundaries = Arc::clone(&pending_boundaries);
-        let sat_config = sat_config.clone();
-
-        handles.push(std::thread::spawn(move || {
-            // Keyed by the sorted tuple list (each entry = signed tuple);
-            // templates differ only in their `V_x`/`V_y` PbSetEq values,
-            // which are derived from this list.
-            let mut template_cache: HashMap<Vec<(i32, i32, i32, i32)>, SatXYTemplate> = HashMap::new();
-            let mut warm = WarmStartState { phase: None, inject_phase: true };
-            let mut w_bases: HashMap<i32, radical::Solver> = HashMap::new();
-            let mut z_bases: HashMap<i32, radical::Solver> = HashMap::new();
-            let mut ext_cache: HashMap<u128, bool> = HashMap::new();
-            let spectral_w = SpectralFilter::new(ctx.problem.m(), ctx.theta);
-            let spectral_z = SpectralFilter::new(ctx.problem.n, ctx.theta);
-            let mut fft_buf_w = FftScratch::new(&spectral_w);
-            let mut fft_buf_z = FftScratch::new(&spectral_z);
-            // Reusable spectrum output buffer for the post-hoc Z pair check.
-            // Avoids allocating a fresh Vec<f64> per Z solution.
-            let mut z_spectrum_buf: Vec<f64> = Vec::new();
-            // Single-slot cache for the z_boundary-dependent fill prep.
-            // SolveZ items that share z_bits (all items from the same SolveW
-            // batch) reuse this precomputed per-lag data: agree_const + the
-            // lits_a/lits_b/coeffs templates. On a cache miss we rebuild in
-            // place — reusing the per-lag Vec allocations so a miss is not
-            // more expensive than the old per-item fill path.
-            let mut z_prep = sat_z_middle::ZBoundaryPrep::with_template(&ctx.z_tmpl);
-            let mut z_prep_z_bits: Option<u32> = None;
-            // Also cache the z_boundary DFT at the SAT frequency grid
-            // alongside the prep. Recomputing it per SolveZ item loops over
-            // (2k boundary positions × num_freqs) — not huge, but it's also
-            // not changing across the SolveW's batch. The cache key is the
-            // same z_bits used for `z_prep`.
-            let nf_z = ctx.z_spectral_tables.as_ref().map(|t| t.num_freqs).unwrap_or(0);
-            let mut z_re_boundary: Vec<f64> = vec![0.0; nf_z];
-            let mut z_im_boundary: Vec<f64> = vec![0.0; nf_z];
-            let mut rng: u64 = 0x517cc1b727220a95 ^ (tid as u64 * 0x9e3779b97f4a7c15);
-            macro_rules! next_rng { () => {{ rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng }} }
-            let k = ctx.k;
-            let n = ctx.problem.n;
-            let m = ctx.problem.m();
-            let use_wz_mode = ctx.wz_together;
-
-            loop {
-                let Some(work) = wq.pop_blocking(&ctx.found, &mut rng) else { break; };
-                if ctx.found.load(AtomicOrdering::Relaxed) { break; }
-                if matches!(work, PipelineWork::Shutdown) { break; }
-
-                match work {
-                    PipelineWork::Boundary(bnd) => {
-                        // TRACE: check if this is the known solution's boundary
-                        let trace_bnd = bnd.z_bits == 43 && bnd.w_bits == 47;
-                        if trace_bnd { eprintln!("TRACE: found target boundary z=43 w=47 xy_root={}", bnd.xy_root); }
-                        // Boundary dequeued — the walker is free to push another.
-                        pending_boundaries.fetch_sub(1, AtomicOrdering::Relaxed);
-                        // Check sum feasibility for each tuple, emit SolveW items
-                        let z_bnd_sum = 2 * (bnd.z_bits.count_ones() as i32) - ctx.max_bnd_sum;
-                        let w_bnd_sum = 2 * (bnd.w_bits.count_ones() as i32) - ctx.max_bnd_sum;
-                        // Collect all tuples this boundary is compatible with
-                        // (at least one sign of σ_W, σ_Z in range + right parity,
-                        // and the XY sub-MDD has a matching leaf).  Emit ONE
-                        // SolveW (or SolveWZ) carrying the whole candidate
-                        // list — the stage builds V_w as the union of
-                        // ±|σ_W|-counts over candidate tuples and lets the
-                        // SAT pick any of them.  Downstream stages narrow
-                        // the list by the decoded σ.
-                        let mut candidate_tuples: Vec<SumTuple> = Vec::with_capacity(ctx.tuples.len());
-                        for &tuple in &ctx.tuples {
-                            // Both ±|σ_W|, ±|σ_Z| allowed — feasible if AT
-                            // LEAST ONE sign of each is in range and parity.
-                            let z_feas = [tuple.z.abs(), -tuple.z.abs()].iter().any(|&s| {
-                                sigma_full_to_cnt(s, z_bnd_sum, ctx.middle_n).is_some()
-                            });
-                            let w_feas = [tuple.w.abs(), -tuple.w.abs()].iter().any(|&s| {
-                                sigma_full_to_cnt(s, w_bnd_sum, ctx.middle_m).is_some()
-                            });
-                            if !z_feas || !w_feas {
-                                flow_bnd_sum_fail.fetch_add(1, AtomicOrdering::Relaxed); continue;
-                            }
-                            // MDD-guided fail-fast on XY sub-tree compatibility.
-                            if !any_valid_xy(
-                                bnd.xy_root, 0, ctx.xy_zw_depth, 0, 0,
-                                &ctx.xy_pos_order, &ctx.mdd.nodes,
-                                ctx.max_bnd_sum, ctx.middle_n as i32, tuple,
-                            ) {
-                                flow_bnd_sum_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                                continue;
-                            }
-                            candidate_tuples.push(tuple);
-                        }
-                        if candidate_tuples.is_empty() {
-                            stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
-                            continue;
-                        }
-                        // Use the first candidate as the representative for
-                        // legacy fields (z_mid_sum, w_mid_sum, tuple).
-                        let rep = candidate_tuples[0];
-                        stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
-                        let work = if use_wz_mode {
-                            PipelineWork::SolveWZ(SolveWZWork {
-                                tuple: rep, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
-                                xy_root: bnd.xy_root,
-                                candidate_tuples,
-                                attempt: 0,
-                                prior_blocks: Vec::new(),
-                            })
-                        } else {
-                            PipelineWork::SolveW(SolveWWork {
-                                tuple: rep, z_bits: bnd.z_bits, w_bits: bnd.w_bits,
-                                xy_root: bnd.xy_root,
-                                candidate_tuples,
-                            })
-                        };
-                        if trace_bnd { eprintln!("TRACE: emitting ONE SolveW for canonical TT(18) boundary"); }
-                        wq.push_batch(vec![work]);
-                        stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-
-                    PipelineWork::SolveW(sw) => {
-                        let trace_w = sw.z_bits == 43 && sw.w_bits == 47 && sw.tuple.z == 8 && sw.tuple.w == 1;
-                        if trace_w { eprintln!("TRACE: SolveW for target boundary, |σ_W|={}", sw.tuple.w); }
-                        let (w_prefix, w_suffix) = expand_boundary_bits(sw.w_bits, k);
-                        let mut w_boundary = vec![0i8; m];
-                        w_boundary[..k].copy_from_slice(&w_prefix);
-                        w_boundary[m-k..].copy_from_slice(&w_suffix);
-
-                        // BDKR rule (v) boundary pre-filter.  Skip this
-                        // SolveW if the W boundary already fails rule (v).
-                        let rule_v_state = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
-                        if rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary {
-                            continue;
-                        }
-
-                        // Compute V_w = union over `sw.candidate_tuples` of
-                        // {cnt(+|σ_W|), cnt(-|σ_W|)}.  One SAT call per
-                        // boundary finds any W middle landing on any valid
-                        // σ_W — the decoded count then narrows the tuple
-                        // list for SolveZ.
-                        let w_bnd_sum_local: i32 = w_boundary.iter().map(|&v| v as i32).sum();
-                        let w_counts: Vec<u32> = {
-                            let mut cs: Vec<u32> = Vec::new();
-                            for t in &sw.candidate_tuples {
-                                let abs_w = t.w.abs();
-                                let signs: &[i32] = if abs_w == 0 { &[0] } else { &[1, -1] };
-                                for &sg in signs {
-                                    if let Some(c) = sigma_full_to_cnt(sg * abs_w, w_bnd_sum_local, ctx.middle_m) {
-                                        if !cs.contains(&c) { cs.push(c); }
-                                    }
-                                }
-                            }
-                            cs.sort_unstable();
-                            cs
-                        };
-                        if w_counts.is_empty() {
-                            stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
-                            continue;
-                        }
-
-                        // For small middle: brute-force W enumeration (proven to find solutions).
-                        // For large middle: SAT-based W generation (handles big search spaces).
-                        let mut w_found_any = false;
-                        let mut trace_w_total = 0u64;
-                        let mut trace_w_pass = 0u64;
-                        if ctx.middle_m <= 20 {
-                            // Collect all passing W candidates into a batch so we push
-                            // them to the queue with a single lock. This eliminates
-                            // per-W mutex contention when middle_m is small and many
-                            // W candidates pass the spectral filter.
-                            let mut batch: Vec<PipelineWork> = Vec::new();
-                            // Reusable spectrum buffer; we only materialize an
-                            // owned Vec at push time, so failed candidates (~85%)
-                            // never allocate a Vec<f64>.
-                            let mut spec_buf: Vec<f64> = Vec::new();
-                            // Iterate each count in V_w (one per feasible sign of σ_W).
-                            // generate_sequences_permuted takes a signed mid_sum
-                            // target — decode it from the count as 2·cnt − middle_m.
-                            for &cnt in &w_counts {
-                              let mid_sum_iter = 2 * cnt as i32 - ctx.middle_m as i32;
-                              generate_sequences_permuted(ctx.middle_m, mid_sum_iter, false, false, 200_000, |w_mid| {
-                                if ctx.found.load(AtomicOrdering::Relaxed) { return false; }
-                                // --outfix middle pins: skip W middles that
-                                // disagree with the user-specified pin.
-                                // Without this filter the outfix boundary is
-                                // honoured but the middle is free, so the
-                                // pipeline enumerates many W completions that
-                                // differ from the one the user wanted to test.
-                                if !ctx.outfix_w_mid_pins.is_empty() {
-                                    let pin_ok = ctx.outfix_w_mid_pins.iter()
-                                        .all(|&(mid, val)| mid >= ctx.middle_m || w_mid[mid] == val);
-                                    if !pin_ok { return true; }
-                                }
-                                let mut w_vals = w_boundary.clone();
-                                w_vals[k..k+ctx.middle_m].copy_from_slice(w_mid);
-                                flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
-                                if trace_w { trace_w_total += 1; }
-                                // BDKR rule (v): check the full W sequence.
-                                // `check_w_boundary_rule_v` works for any
-                                // prefix extent; using the full m here
-                                // catches violations in the middle too.
-                                if sat_z_middle::check_w_boundary_rule_v(m, m, &w_vals)
-                                    == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
-                                {
-                                    return true; // skip non-canonical w_mid
-                                }
-                                if spectrum_into_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w, &mut spec_buf) {
-                                    if trace_w { trace_w_pass += 1; }
-                                    flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
-                                    w_found_any = true;
-                                    // Decode σ_W and narrow the tuple list.
-                                    let sigma_w_full: i32 = w_vals.iter().map(|&v| v as i32).sum();
-                                    let narrowed: Vec<SumTuple> = sw.candidate_tuples.iter()
-                                        .copied()
-                                        .filter(|t| t.w.abs() == sigma_w_full.abs())
-                                        .collect();
-                                    if narrowed.is_empty() { return true; }
-                                    stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
-                                    let rep = narrowed[0];
-                                    batch.push(PipelineWork::SolveZ(SolveZWork {
-                                        tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
-                                        w_vals, w_spectrum: spec_buf.clone(), xy_root: sw.xy_root,
-                                        candidate_tuples: narrowed,
-                                    }));
-                                } else {
-                                    flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                                }
-                                true
-                              });
-                            } // end for &cnt
-                            if !batch.is_empty() {
-                                wq.push_batch(batch);
-                            }
-                        } else {
-                            // SAT-based W generation.  Build with a PbSetEq
-                            // so the SAT may pick any count in V_w (i.e.,
-                            // either sign of σ_W).  Cache key is 0 — we
-                            // don't reuse the solver across boundaries
-                            // because V_w depends on the boundary.
-                            let mut w_solver = w_bases.remove(&0i32).unwrap_or_else(||
-                                ctx.w_tmpl.build_base_solver_pb_set(ctx.middle_m, &w_counts)
-                            );
-                            let w_cp = w_solver.save_checkpoint();
-                            sat_z_middle::fill_w_solver(&mut w_solver, &ctx.w_tmpl, m, &w_boundary);
-                            // Rule (v) middle clauses when boundary left
-                            // the rule DeferredToMiddle.
-                            if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
-                                let mut nv = (w_solver.num_vars() + 1) as i32;
-                                sat_z_middle::add_rule_v_middle_clauses(
-                                    &mut w_solver, m, k, &w_boundary,
-                                    |pf| (pf - k + 1) as i32,
-                                    &mut nv,
-                                );
-                            }
-                            if let Some(ref wtab) = ctx.w_spectral_tables {
-                                w_solver.spectral = Some(radical::SpectralConstraint::from_tables(
-                                    wtab, &w_boundary, ctx.individual_bound,
-                                ));
-                            }
-
-                            // --outfix middle pins for W: force middle
-                            // positions to user-specified values.  Matches
-                            // the brute-force path above.
-                            for &(mid, val) in &ctx.outfix_w_mid_pins {
-                                if mid < ctx.middle_m {
-                                    let lit = (mid + 1) as i32;
-                                    w_solver.add_clause([if val > 0 { lit } else { -lit }]);
-                                }
-                            }
-
-                            // Snapshot solver search stats before the enumeration
-                            // loop. We diff against post-loop values to get this
-                            // boundary's contribution to the W-stage diagnostics
-                            // (decisions, propagations, level-0 forced, free vars).
-                            let w_d0 = w_solver.num_decisions();
-                            let w_p0 = w_solver.num_propagations();
-                            let w_l0 = w_solver.num_level0_vars();
-                            let w_nv = w_solver.num_vars();
-
-                            // Collect passing W candidates into a batch to reduce
-                            // queue lock contention, same as the brute-force path above.
-                            let mut batch: Vec<PipelineWork> = Vec::new();
-                            // N1: cap W enumeration per boundary.  At large
-                            // middle_m the SAT path can loop for thousands
-                            // of solutions per boundary (each with a long
-                            // UNSAT proof between finds), monopolising a
-                            // worker for seconds.  A small cap lets workers
-                            // move on to fresh boundaries — each capped
-                            // boundary still feeds the Z stage dozens of
-                            // (Z, W) pairs, which is plenty.  Matches the
-                            // spirit of `max_z.min(16)` at line 518.
-                            let max_w_per_boundary: usize = std::env::var("TURYN_MAX_W_PER_BND")
-                                .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
-                            // N2: per-call conflict budget so one pathological
-                            // solve() can't freeze a worker past sat_secs and
-                            // can't monopolise the attention past what's
-                            // useful.  5k matches the XY pattern for n > 30.
-                            let w_conflict_budget: u64 = std::env::var("TURYN_W_CONFL")
-                                .ok().and_then(|s| s.parse().ok()).unwrap_or(5000);
-                            let mut w_iter_count: usize = 0;
-                            loop {
-                                if ctx.found.load(AtomicOrdering::Relaxed) { break; }
-                                if w_iter_count >= max_w_per_boundary { break; }
-                                w_iter_count += 1;
-                                let phases: Vec<bool> = (0..ctx.middle_m)
-                                    .map(|_| next_rng!() & 1 == 1).collect();
-                                w_solver.set_phase(&phases);
-                                if w_conflict_budget > 0 { w_solver.set_conflict_budget(w_conflict_budget); }
-                                if w_solver.solve() != Some(true) { break; }
-                                flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
-
-                                let w_mid = extract_vals(&w_solver, |i| ctx.w_mid_vars[i], ctx.middle_m);
-                                let mut w_vals = w_boundary.clone();
-                                w_vals[k..k+ctx.middle_m].copy_from_slice(&w_mid);
-
-                                let w_block: Vec<i32> = ctx.w_mid_vars.iter().map(|&v| {
-                                    if w_solver.value(v) == Some(true) { -v } else { v }
-                                }).collect();
-                                w_solver.reset(); // backtrack before blocking clause
-                                w_solver.add_clause(w_block);
-
-                                let w_spectrum = match spectrum_if_ok(&w_vals, &spectral_w, ctx.individual_bound, &mut fft_buf_w) {
-                                    Some(s) => s,
-                                    None => {
-                                        flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                                        if std::env::var("TRACE_SPEC").is_ok() && flow_w_spec_fail.load(AtomicOrdering::Relaxed) <= 3 {
-                                            // Direct re-compute both: in-SAT-style DFT on the full W
-                                            // and external FFT, report peak |W|² at aligned ω.
-                                            let mut external = vec![0.0; 129];
-                                            compute_spectrum_into(&w_vals, &spectral_w, &mut fft_buf_w, &mut external);
-                                            use std::f64::consts::PI;
-                                            let mut insat = vec![0.0; 129];
-                                            for fi in 0..129 {
-                                                let om = fi as f64 * PI / 128.0;
-                                                let mut re = 0.0; let mut im = 0.0;
-                                                for (pos, &wv) in w_vals.iter().enumerate() {
-                                                    re += wv as f64 * (om * pos as f64).cos();
-                                                    im += wv as f64 * (om * pos as f64).sin();
-                                                }
-                                                insat[fi] = re*re + im*im;
-                                            }
-                                            let max_ext = external.iter().cloned().fold(0.0, f64::max);
-                                            let max_ins = insat.iter().cloned().fold(0.0, f64::max);
-                                            let ext_violating: Vec<usize> = (0..129).filter(|&i| external[i] > ctx.individual_bound).collect();
-                                            eprintln!("[TRACE_SPEC] W failed: {} chars, max_ext={:.4}, max_insat={:.4}, bound={:.1}",
-                                                w_vals.iter().map(|&v| if v>0 {'+'} else {'-'}).collect::<String>(),
-                                                max_ext, max_ins, ctx.individual_bound);
-                                            eprintln!("  external violates at bins: {:?}", ext_violating);
-                                            for &fi in ext_violating.iter().take(3) {
-                                                eprintln!("  bin {fi} (ω={:.4}π): external={:.4}, in-SAT-style={:.4}",
-                                                    fi as f64 / 128.0, external[fi], insat[fi]);
-                                            }
-                                        }
-                                        continue;
-                                    }
-                                };
-                                flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
-                                w_found_any = true;
-
-                                let sigma_w_full: i32 = w_vals.iter().map(|&v| v as i32).sum();
-                                let narrowed: Vec<SumTuple> = sw.candidate_tuples.iter()
-                                    .copied()
-                                    .filter(|t| t.w.abs() == sigma_w_full.abs())
-                                    .collect();
-                                if narrowed.is_empty() { continue; }
-                                stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
-                                let rep = narrowed[0];
-                                batch.push(PipelineWork::SolveZ(SolveZWork {
-                                    tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
-                                    w_vals, w_spectrum, xy_root: sw.xy_root,
-                                    candidate_tuples: narrowed,
-                                }));
-                            }
-                            if !batch.is_empty() {
-                                wq.push_batch(batch);
-                            }
-
-                            // Aggregate W-stage SAT search stats for this boundary.
-                            // Record level-0 forced count from the pre-solve snapshot
-                            // (constraint propagation pruning) — this is what gets
-                            // displayed as "vars forced before SAT runs".
-                            let w_decisions    = w_solver.num_decisions().saturating_sub(w_d0);
-                            let w_propagations = w_solver.num_propagations().saturating_sub(w_p0);
-                            let w_pre_forced   = w_l0 as u64;
-                            let w_free_vars    = w_nv.saturating_sub(w_l0) as u64;
-                            flow_w_solves.fetch_add(1, AtomicOrdering::Relaxed);
-                            flow_w_decisions.fetch_add(w_decisions, AtomicOrdering::Relaxed);
-                            flow_w_propagations.fetch_add(w_propagations, AtomicOrdering::Relaxed);
-                            flow_w_root_forced.fetch_add(w_pre_forced, AtomicOrdering::Relaxed);
-                            flow_w_free_sum.fetch_add(w_free_vars, AtomicOrdering::Relaxed);
-
-                            w_solver.spectral = None;
-                            w_solver.restore_checkpoint(w_cp);
-                            w_bases.insert(0i32, w_solver);
-                        }
-                        if !w_found_any { flow_w_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
-                        if trace_w { eprintln!("TRACE: SolveW done: {} W middles checked, {} passed spectral", trace_w_total, trace_w_pass); }
-                        stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-
-                    PipelineWork::SolveWZ(swz) => {
-                        // Combined W+Z SAT: solve for both middles simultaneously.
-                        // W vars: 1..middle_m, Z vars: middle_m+1..middle_m+middle_n
-                        let mut solver = radical::Solver::new();
-                        let w_var = |i: usize| -> i32 { (i + 1) as i32 };
-                        let z_var = |i: usize| -> i32 { (ctx.middle_m + i + 1) as i32 };
-                        let total_vars = ctx.middle_m + ctx.middle_n;
-
-                        // Expand boundaries (needed to build V_w and V_z).
-                        let (w_prefix, w_suffix) = expand_boundary_bits(swz.w_bits, k);
-                        let mut w_boundary = vec![0i8; m];
-                        w_boundary[..k].copy_from_slice(&w_prefix);
-                        w_boundary[m-k..].copy_from_slice(&w_suffix);
-                        let mut z_boundary = vec![0i8; n];
-                        for i in 0..k {
-                            z_boundary[i] = if (swz.z_bits >> i) & 1 == 1 { 1 } else { -1 };
-                            z_boundary[n-k+i] = if (swz.z_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
-                        }
-
-                        // Sum constraints via PbSetEq: union of ±|σ_W| (resp. ±|σ_Z|)
-                        // counts across all `candidate_tuples`.
-                        let w_bnd_sum_local: i32 = w_boundary.iter().map(|&v| v as i32).sum();
-                        let z_bnd_sum_local: i32 = z_boundary.iter().map(|&v| v as i32).sum();
-                        let mut w_counts: Vec<u32> = Vec::new();
-                        let mut z_counts: Vec<u32> = Vec::new();
-                        for t in &swz.candidate_tuples {
-                            let abs_w = t.w.abs();
-                            for &sg in if abs_w == 0 { &[0i32] as &[i32] } else { &[1, -1] } {
-                                if let Some(c) = sigma_full_to_cnt(sg * abs_w, w_bnd_sum_local, ctx.middle_m) {
-                                    if !w_counts.contains(&c) { w_counts.push(c); }
-                                }
-                            }
-                            let abs_z = t.z.abs();
-                            for &sg in if abs_z == 0 { &[0i32] as &[i32] } else { &[1, -1] } {
-                                if let Some(c) = sigma_full_to_cnt(sg * abs_z, z_bnd_sum_local, ctx.middle_n) {
-                                    if !z_counts.contains(&c) { z_counts.push(c); }
-                                }
-                            }
-                        }
-                        w_counts.sort_unstable();
-                        z_counts.sort_unstable();
-                        if w_counts.is_empty() || z_counts.is_empty() {
-                            flow_wz_empty_v.fetch_add(1, AtomicOrdering::Relaxed);
-                            stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
-                            continue;
-                        }
-                        let w_lits: Vec<i32> = (0..ctx.middle_m).map(|i| w_var(i)).collect();
-                        let z_lits: Vec<i32> = (0..ctx.middle_n).map(|i| z_var(i)).collect();
-                        solver.add_pb_set_eq(&w_lits, &w_counts);
-                        solver.add_pb_set_eq(&z_lits, &z_counts);
-
-                        // BDKR rules (iv)/(v) boundary pre-filter.
-                        let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
-                        let rule_v_state  = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
-                        if rule_iv_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
-                           || rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
-                        {
-                            flow_wz_rule_viol.fetch_add(1, AtomicOrdering::Relaxed);
-                            stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
-                            continue;
-                        }
-                        // Rule (iv) / (v) middle clauses in the combined
-                        // SolveWZ solver.  The separate helpers take a
-                        // full-seq-pos → SAT-var closure; here the W
-                        // middle occupies vars 1..middle_m and the Z
-                        // middle occupies middle_m+1..middle_m+middle_n.
-                        let total_existing_vars = total_vars;
-                        let mut nv_combined = (total_existing_vars + 1) as i32;
-                        if rule_iv_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
-                            sat_z_middle::add_rule_iv_middle_clauses(
-                                &mut solver, n, k,
-                                |jf| z_var(jf - k),
-                                &mut nv_combined,
-                            );
-                        }
-                        if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
-                            sat_z_middle::add_rule_v_middle_clauses(
-                                &mut solver, m, k, &w_boundary,
-                                |pf| w_var(pf - k),
-                                &mut nv_combined,
-                            );
-                        }
-
-                        // Combined per-lag autocorrelation: for each lag s,
-                        //   N_Z(s) + N_W(s) ∈ [-(n-s), n-s]  (Turyn identity coupling)
-                        //
-                        // Expressed as a quadratic PB range on the combined W+Z
-                        // agree terms.  Each "pair agrees" is encoded as a quad
-                        // term x AND y (with coeff 1) — bnd×mid terms use a
-                        // pinned true_var so that `lit_a AND true_var = lit_a`;
-                        // mid×mid terms add TWO quad terms `(a,b)` and `(-a,-b)`
-                        // (matching the XNOR definition `a==b ⇔ ab ∨ ¬a¬b`).
-                        //
-                        // This replaces the older encoding that built an
-                        // explicit auxiliary var per mid×mid pair via
-                        // `encode_xnor_agree` + `add_pb_atleast`.  Using
-                        // `add_quad_pb_range` directly matches the encoding in
-                        // SolveZ's `fill_z_solver_quad_pb` — the quad_pb
-                        // propagator prunes much earlier than the XNOR-aux
-                        // formulation, cutting conflicts-per-solve roughly by
-                        // half at n=26 k=5.
-                        {
-                            // Pin a "true" helper variable for the bnd×mid
-                            // terms' second literal.  Allocated as the very
-                            // next var after the existing W/Z middles and the
-                            // rules (iv)/(v) aux vars (counted in nv_combined).
-                            let true_var = nv_combined;
-                            solver.add_clause([true_var]);
-
-                            for s in 1..n {
-                                let max_nzw = (n - s) as i32;
-                                let nw_pairs = if s < m { (m - s) as i32 } else { 0 };
-                                let nz_pairs = (n - s) as i32;
-                                let total_pairs = nw_pairs + nz_pairs;
-                                let combined_lo = ((total_pairs - max_nzw) / 2).max(0) as u32;
-                                let combined_hi = ((total_pairs + max_nzw) / 2).min(total_pairs) as u32;
-
-                                let mut agree_const = 0u32;
-                                let mut lits_a: Vec<i32> = Vec::new();
-                                let mut lits_b: Vec<i32> = Vec::new();
-                                // W pairs
-                                if s < m {
-                                    let w_lag = &ctx.w_tmpl.lags[s - 1];
-                                    for &(i, j) in &w_lag.bnd_bnd {
-                                        if w_boundary[i] == w_boundary[j] { agree_const += 1; }
-                                    }
-                                    for &(bnd_pos, mid_idx) in &w_lag.bnd_mid {
-                                        let lit = if w_boundary[bnd_pos] == 1 { w_var(mid_idx) } else { -w_var(mid_idx) };
-                                        lits_a.push(lit);
-                                        lits_b.push(true_var);
-                                    }
-                                    for &(i, j) in &w_lag.mid_mid {
-                                        // agree(a,b) = (a AND b) OR (-a AND -b)
-                                        lits_a.push( w_var(i)); lits_b.push( w_var(j));
-                                        lits_a.push(-w_var(i)); lits_b.push(-w_var(j));
-                                    }
-                                }
-                                // Z pairs
-                                if s < n {
-                                    let z_lag = &ctx.z_tmpl.lags[s - 1];
-                                    for &(i, j) in &z_lag.bnd_bnd {
-                                        if z_boundary[i] == z_boundary[j] { agree_const += 1; }
-                                    }
-                                    for &(bnd_pos, mid_idx) in &z_lag.bnd_mid {
-                                        let lit = if z_boundary[bnd_pos] == 1 { z_var(mid_idx) } else { -z_var(mid_idx) };
-                                        lits_a.push(lit);
-                                        lits_b.push(true_var);
-                                    }
-                                    for &(i, j) in &z_lag.mid_mid {
-                                        lits_a.push( z_var(i)); lits_b.push( z_var(j));
-                                        lits_a.push(-z_var(i)); lits_b.push(-z_var(j));
-                                    }
-                                }
-
-                                let max_variable = lits_a.len() as u32;
-                                let adj_lo = combined_lo.saturating_sub(agree_const);
-                                let adj_hi = combined_hi.saturating_sub(agree_const);
-                                if adj_lo > max_variable { solver.add_clause(std::iter::empty::<i32>()); break; }
-                                if adj_lo == 0 && adj_hi >= max_variable { continue; }
-                                if lits_a.is_empty() {
-                                    // No variable-dependent terms; agree_const
-                                    // alone must already satisfy the range
-                                    // (checked by the adj_lo/adj_hi guards above).
-                                    continue;
-                                }
-                                let coeffs: Vec<u32> = vec![1; lits_a.len()];
-                                solver.add_quad_pb_range(&lits_a, &lits_b, &coeffs, adj_lo, adj_hi);
-                            }
-                        }
-
-                        // Combined WZ spectral: 2|W(ω)|² + 2|Z(ω)|² ≤ pair_bound.
-                        // Uses two-sequence SpectralConstraint with separate DFT tracking.
-                        {
-                            let nf = SPECTRAL_FREQS;
-                            let total_mid = ctx.middle_m + ctx.middle_n;
-                            let mut cos_table = vec![0.0f32; total_mid * nf];
-                            let mut sin_table = vec![0.0f32; total_mid * nf];
-                            let mut amplitudes = vec![0.0f32; total_mid * nf];
-                            let mut re1_bnd = vec![0.0f64; nf]; // W boundary DFT
-                            let mut im1_bnd = vec![0.0f64; nf];
-                            let mut re2_bnd = vec![0.0f64; nf]; // Z boundary DFT
-                            let mut im2_bnd = vec![0.0f64; nf];
-                            let mut mr1 = vec![0.0f64; nf]; // max reduction seq1 (W)
-                            let mut mr2 = vec![0.0f64; nf]; // max reduction seq2 (Z)
-
-                            for fi in 0..nf {
-                                let omega = (fi as f64 + 1.0) / (nf as f64 + 1.0) * std::f64::consts::PI;
-                                for pos in 0..m {
-                                    if pos >= k && pos < m - k { continue; }
-                                    let val = w_boundary[pos] as f64;
-                                    re1_bnd[fi] += val * (omega * pos as f64).cos();
-                                    im1_bnd[fi] += val * (omega * pos as f64).sin();
-                                }
-                                for pos in 0..n {
-                                    if pos >= k && pos < n - k { continue; }
-                                    let val = z_boundary[pos] as f64;
-                                    re2_bnd[fi] += val * (omega * pos as f64).cos();
-                                    im2_bnd[fi] += val * (omega * pos as f64).sin();
-                                }
-                                for vi in 0..ctx.middle_m {
-                                    let pos = k + vi;
-                                    let c = (omega * pos as f64).cos() as f32;
-                                    let s = (omega * pos as f64).sin() as f32;
-                                    cos_table[vi * nf + fi] = c;
-                                    sin_table[vi * nf + fi] = s;
-                                    let amp = (c * c + s * s).sqrt();
-                                    amplitudes[vi * nf + fi] = amp;
-                                    mr1[fi] += amp as f64;
-                                }
-                                for vi in 0..ctx.middle_n {
-                                    let pos = k + vi;
-                                    let c = (omega * pos as f64).cos() as f32;
-                                    let s = (omega * pos as f64).sin() as f32;
-                                    let idx = (ctx.middle_m + vi) * nf + fi;
-                                    cos_table[idx] = c;
-                                    sin_table[idx] = s;
-                                    let amp = (c * c + s * s).sqrt();
-                                    amplitudes[idx] = amp;
-                                    mr2[fi] += amp as f64;
-                                }
-                            }
-                            // Dummy combined re/im (not used in seq2 mode conflict check)
-                            let re_dummy = vec![0.0f64; nf];
-                            let im_dummy = vec![0.0f64; nf];
-                            solver.spectral = Some(radical::SpectralConstraint {
-                                num_seq_vars: total_mid,
-                                cos_table: std::sync::Arc::new(cos_table),
-                                sin_table: std::sync::Arc::new(sin_table),
-                                num_freqs: nf,
-                                re: re_dummy.clone(), im: im_dummy.clone(),
-                                re_boundary: re_dummy.clone(), im_boundary: im_dummy,
-                                bound: ctx.problem.target_energy() as f64, // 6n-2: full energy budget for 2|W|²+2|Z|²+|X|²+|Y|²
-                                per_freq_bound: None,
-                                max_reduction: vec![0.0; nf],
-                                amplitudes: std::sync::Arc::new(amplitudes),
-                                assigned: vec![false; total_mid],
-                                values: vec![0i8; total_mid],
-                                seq2: Some(radical::Seq2Config {
-                                    seq2_start: ctx.middle_m,
-                                    weight1: 2.0, weight2: 2.0,
-                                    individual_bound: ctx.individual_bound,
-                                    re1: re1_bnd.clone(), im1: im1_bnd.clone(),
-                                    re1_boundary: re1_bnd, im1_boundary: im1_bnd,
-                                    max_reduction1: mr1,
-                                    re2: re2_bnd.clone(), im2: im2_bnd.clone(),
-                                    re2_boundary: re2_bnd, im2_boundary: im2_bnd,
-                                    max_reduction2: mr2,
-                                }),
-                            });
-                        }
-
-                        // Snapshot search stats for the combined SAT enumeration.
-                        // Combined WZ does the work of both the W and Z stages, so
-                        // we credit its decisions/propagations to BOTH stage
-                        // counters — each stage's "per-solve average" stays
-                        // interpretable, at the cost of a small overcount in the
-                        // grand total.
-                        // --outfix middle pins: force Z/W middle positions to
-                        // the canonical values via unit clauses.  Let the SAT
-                        // decide the remaining middle bits.
-                        for &(mid, val) in &ctx.outfix_z_mid_pins {
-                            if mid < ctx.middle_n {
-                                let lit = if val > 0 { z_var(mid) } else { -z_var(mid) };
-                                solver.add_clause([lit]);
-                            }
-                        }
-                        for &(mid, val) in &ctx.outfix_w_mid_pins {
-                            if mid < ctx.middle_m {
-                                let lit = if val > 0 { w_var(mid) } else { -w_var(mid) };
-                                solver.add_clause([lit]);
-                            }
-                        }
-
-                        // Inject blocking clauses accumulated from earlier
-                        // attempts on this boundary.  Each block rules out
-                        // one previously-enumerated (W, Z) middle; they use
-                        // stable W/Z middle var IDs (1..=total_vars) so
-                        // they remain valid in this freshly-built solver.
-                        // Persisting these across re-queues is what makes
-                        // the search eventually reach SAT's Some(false)
-                        // rather than redundantly re-enumerating the same
-                        // (W, Z) orbits with different phase RNG each
-                        // attempt.
-                        for block in &swz.prior_blocks {
-                            solver.add_clause(block.iter().copied());
-                        }
-
-                        let wz_d0 = solver.num_decisions();
-                        let wz_p0 = solver.num_propagations();
-                        let wz_l0 = solver.num_level0_vars();
-                        let wz_nv = solver.num_vars();
-
-                        // Enumerate WZ solutions.
-                        //
-                        // Re-queue strategy: rather than burning a large
-                        // conflict budget on one boundary (which monopolises
-                        // a worker and slows space coverage), use a modest
-                        // budget per attempt and push the item back into the
-                        // queue when the budget is exhausted.  Exponential
-                        // backoff: attempt 0 gets 5k conflicts, attempt 1
-                        // gets 10k, etc., capped at 50k.  Re-queued items
-                        // sit at priority −1 (below fresh boundaries and
-                        // first-attempt SolveWZ), so the MDD is covered
-                        // once before we retry hard boundaries.
-                        let mut wz_count = 0usize;
-                        // Per-attempt conflict budget doubles each retry so
-                        // hard boundaries eventually get enough SAT effort to
-                        // reach a decisive result (UNSAT or SAT).  Cap at 1M
-                        // per attempt to bound memory; re-queue beyond that
-                        // still happens (see below) so we defer but never
-                        // cancel.
-                        let conflict_budget: u64 = (5_000u64 << swz.attempt.min(7)).min(1_000_000);
-                        solver.set_conflict_limit(conflict_budget);
-                        // Tracks whether the enumeration was cut off with
-                        // more WZ solutions possibly remaining (None from
-                        // solve() = conflict limit, or hit max_z cap),
-                        // vs. fully exhausted (Some(false) = UNSAT proved).
-                        let mut more_possible = false;
-                        // New blocking clauses produced in THIS attempt.
-                        // If the attempt is deferred via re-queue, these
-                        // plus the prior_blocks get passed forward so the
-                        // next attempt skips already-found (W, Z) pairs.
-                        let mut new_blocks: Vec<Vec<i32>> = Vec::new();
-                        loop {
-                            if ctx.found.load(AtomicOrdering::Relaxed) { break; }
-                            if wz_count >= ctx.max_z {
-                                more_possible = true;
-                                break;
-                            }
-                            // Random phases for both W and Z.  Mix the
-                            // attempt number into the RNG so re-queued
-                            // items explore a different region of the
-                            // phase space than their first attempt.
-                            let mut attempt_rng = rng ^ (swz.attempt as u64).wrapping_mul(0x9e3779b97f4a7c15);
-                            let phases: Vec<bool> = (0..total_vars)
-                                .map(|_| {
-                                    attempt_rng ^= attempt_rng << 13;
-                                    attempt_rng ^= attempt_rng >> 7;
-                                    attempt_rng ^= attempt_rng << 17;
-                                    attempt_rng & 1 == 1
-                                }).collect();
-                            rng = attempt_rng;
-                            solver.set_phase(&phases);
-                            flow_wz_sat_calls.fetch_add(1, AtomicOrdering::Relaxed);
-                            let sat_res = solver.solve();
-                            if sat_res == None {
-                                // Conflict limit hit — more solutions may exist.
-                                more_possible = true;
-                                flow_wz_budget_hit.fetch_add(1, AtomicOrdering::Relaxed);
-                                if wz_count == 0 {
-                                    flow_wz_first_unsat.fetch_add(1, AtomicOrdering::Relaxed);
-                                }
-                                break;
-                            }
-                            if sat_res == Some(false) {
-                                // Fully enumerated: every assignment has been
-                                // blocked.  No point re-queuing.
-                                flow_wz_exhausted.fetch_add(1, AtomicOrdering::Relaxed);
-                                if wz_count == 0 {
-                                    flow_wz_first_unsat.fetch_add(1, AtomicOrdering::Relaxed);
-                                }
-                                break;
-                            }
-                            wz_count += 1;
-                            flow_wz_solutions.fetch_add(1, AtomicOrdering::Relaxed);
-
-                            // Extract W middle
-                            let w_mid: Vec<i8> = (0..ctx.middle_m).map(|i| {
-                                if solver.value(w_var(i)).unwrap() { 1 } else { -1 }
-                            }).collect();
-                            let mut w_vals = w_boundary.clone();
-                            w_vals[k..k+ctx.middle_m].copy_from_slice(&w_mid);
-
-                            // Extract Z middle
-                            let z_mid: Vec<i8> = (0..ctx.middle_n).map(|i| {
-                                if solver.value(z_var(i)).unwrap() { 1 } else { -1 }
-                            }).collect();
-                            let mut z_vals = Vec::with_capacity(n);
-                            z_vals.extend_from_slice(&z_boundary[..k]);
-                            z_vals.extend_from_slice(&z_mid);
-                            z_vals.extend_from_slice(&z_boundary[n-k..]);
-
-                            // Block this (W,Z) pair.  Also stash the clause
-                            // in new_blocks so it survives re-queue: the
-                            // next attempt's fresh solver will re-add it
-                            // together with swz.prior_blocks.
-                            let block: Vec<i32> = (0..total_vars as i32 + 1).skip(1).map(|v| {
-                                if solver.value(v) == Some(true) { -v } else { v }
-                            }).collect();
-                            solver.reset();
-                            solver.add_clause(block.iter().copied());
-                            new_blocks.push(block);
-
-                            // Got a valid (W,Z) pair — proceed to XY
-                            flow_z_solutions.fetch_add(1, AtomicOrdering::Relaxed);
-                            let z_seq = PackedSeq::from_values(&z_vals);
-                            let w_seq = PackedSeq::from_values(&w_vals);
-                            let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
-
-                            // Multi-tuple XY template: the SolveWZ boundary is
-                            // compatible with *all* candidate_tuples.  Use
-                            // build_multi so the XY SAT's V_x/V_y cover every
-                            // compatible |σ_X|/|σ_Y| across those tuples, and
-                            // narrow post-hoc by the W+Z sums we just decoded
-                            // (via zw_autocorr → lag PB ranges) and by the
-                            // candidate magnitudes.
-                            let mut tuple_key: Vec<(i32, i32, i32, i32)> = swz.candidate_tuples.iter()
-                                .map(|t| (t.x, t.y, t.z, t.w)).collect();
-                            tuple_key.sort_unstable();
-                            let template = template_cache.entry(tuple_key).or_insert_with(||
-                                SatXYTemplate::build_multi_opts(problem, &swz.candidate_tuples, &sat_config, ctx.conj_xy_product).unwrap()
-                            );
-                            let candidate = CandidateZW { zw_autocorr };
-                            if let Some(mut xy_solver) = template.prepare_candidate_solver(&candidate) {
-                                if n > 30 { xy_solver.set_conflict_limit(5000); }
-                                walk_xy_sub_mdd(
-                                    swz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
-                                    &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
-                                    ctx.middle_n as i32, &swz.candidate_tuples,
-                                    &mut |x_bits, y_bits| {
-                                        if ctx.found.load(AtomicOrdering::Relaxed) { return; }
-                                        if let Some((fx, fy)) = ctx.outfix_xy {
-                                            if x_bits != fx || y_bits != fy { return; }
-                                        }
-                                        if ctx.conj_zw_bound
-                                            && !check_conj_zw_bound(n, k, x_bits, y_bits, &z_seq, &w_seq)
-                                        {
-                                            flow_xy_zw_bound_rej.fetch_add(1, AtomicOrdering::Relaxed);
-                                            return;
-                                        }
-                                        stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
-                                        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
-                                        let mut assumptions = Vec::with_capacity(4 * k + ctx.outfix_x_mid_pins.len() + ctx.outfix_y_mid_pins.len());
-                                        for i in 0..k {
-                                            assumptions.push(if (x_bits >> i) & 1 == 1 { x_var(i) } else { -x_var(i) });
-                                            assumptions.push(if (x_bits >> (k + i)) & 1 == 1 { x_var(n - k + i) } else { -x_var(n - k + i) });
-                                            assumptions.push(if (y_bits >> i) & 1 == 1 { y_var(i) } else { -y_var(i) });
-                                            assumptions.push(if (y_bits >> (k + i)) & 1 == 1 { y_var(n - k + i) } else { -y_var(n - k + i) });
-                                        }
-                                        // --outfix middle pins for X/Y: force middle positions too.
-                                        for &(mid, val) in &ctx.outfix_x_mid_pins {
-                                            if mid < ctx.middle_n {
-                                                let lit = if val > 0 { x_var(k + mid) } else { -x_var(k + mid) };
-                                                assumptions.push(lit);
-                                            }
-                                        }
-                                        for &(mid, val) in &ctx.outfix_y_mid_pins {
-                                            if mid < ctx.middle_n {
-                                                let lit = if val > 0 { y_var(k + mid) } else { -y_var(k + mid) };
-                                                assumptions.push(lit);
-                                            }
-                                        }
-                                        // Snapshot search stats around the SAT call.
-                                        let xy_d0 = xy_solver.num_decisions();
-                                        let xy_p0 = xy_solver.num_propagations();
-                                        let xy_l0 = xy_solver.num_level0_vars();
-                                        let xy_nv = xy_solver.num_vars();
-                                        let result = xy_solver.solve_with_assumptions(&assumptions);
-                                        items_completed.fetch_add(1, AtomicOrdering::Relaxed);
-                                        stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
-
-                                        let xy_decisions    = xy_solver.num_decisions().saturating_sub(xy_d0);
-                                        let xy_propagations = xy_solver.num_propagations().saturating_sub(xy_p0);
-                                        let xy_pre_forced   = xy_l0 as u64;
-                                        let xy_free_vars    = xy_nv.saturating_sub(xy_l0) as u64;
-                                        flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
-                                        flow_xy_decisions.fetch_add(xy_decisions, AtomicOrdering::Relaxed);
-                                        flow_xy_propagations.fetch_add(xy_propagations, AtomicOrdering::Relaxed);
-                                        flow_xy_root_forced.fetch_add(xy_pre_forced, AtomicOrdering::Relaxed);
-                                        flow_xy_free_sum.fetch_add(xy_free_vars, AtomicOrdering::Relaxed);
-
-                                        match result {
-                                            Some(true) => flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed),
-                                            Some(false) => flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed),
-                                            None => {
-                                                let cover = xy_cover_micro(result, xy_decisions, xy_free_vars);
-                                                flow_xy_timeout_cov_micro.fetch_add(cover, AtomicOrdering::Relaxed);
-                                                flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed)
-                                            }
-                                        };
-                                        if result == Some(true) {
-                                            let (x, y) = template.extract_xy(&xy_solver);
-                                            if verify_tt(problem, &x, &y, &z_seq, &w_seq) {
-                                                ctx.found.store(true, AtomicOrdering::Relaxed);
-                                                let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
-                                            }
-                                        }
-                                    },
-                                );
-                            }
-                        }
-
-                        // Aggregate combined-WZ stats into both W and Z stage
-                        // counters (see comment at snapshot site above).
-                        let wz_decisions    = solver.num_decisions().saturating_sub(wz_d0);
-                        let wz_propagations = solver.num_propagations().saturating_sub(wz_p0);
-                        let wz_pre_forced   = wz_l0 as u64;
-                        let wz_free_vars    = wz_nv.saturating_sub(wz_l0) as u64;
-                        flow_w_solves.fetch_add(1, AtomicOrdering::Relaxed);
-                        flow_w_decisions.fetch_add(wz_decisions, AtomicOrdering::Relaxed);
-                        flow_w_propagations.fetch_add(wz_propagations, AtomicOrdering::Relaxed);
-                        flow_w_root_forced.fetch_add(wz_pre_forced, AtomicOrdering::Relaxed);
-                        flow_w_free_sum.fetch_add(wz_free_vars, AtomicOrdering::Relaxed);
-                        flow_z_solves.fetch_add(1, AtomicOrdering::Relaxed);
-                        flow_z_decisions.fetch_add(wz_decisions, AtomicOrdering::Relaxed);
-                        flow_z_propagations.fetch_add(wz_propagations, AtomicOrdering::Relaxed);
-                        flow_z_root_forced.fetch_add(wz_pre_forced, AtomicOrdering::Relaxed);
-                        flow_z_free_sum.fetch_add(wz_free_vars, AtomicOrdering::Relaxed);
-
-                        stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
-
-                        // Re-queue: if the enumeration was cut short (conflict
-                        // limit hit, or max_z cap reached) and we haven't
-                        // found a TT, push this item back with attempt+1 at
-                        // a lower priority.  NO CAP on attempts — we defer
-                        // hard boundaries to lower priority slots but never
-                        // abandon them.  The per-attempt budget doubles each
-                        // retry (see conflict_budget above) so every boundary
-                        // eventually gets enough effort for SAT/UNSAT.
-                        if more_possible
-                            && !ctx.found.load(AtomicOrdering::Relaxed)
-                        {
-                            // Priority: re-queued SolveWZ items must sit
-                            // BELOW stage 0 (fresh MDD boundaries, priority
-                            // 0.0) so fresh boundaries are always preferred
-                            // over retries.  Without this, re-queued items
-                            // at attempt=0's priority 0.9 starve the walker:
-                            // we'd cycle 18 boundaries forever instead of
-                            // covering the whole space.
-                            //
-                            // Each retry drops priority by 0.001 so retries
-                            // within themselves are FIFO by fewest attempts
-                            // (gentler retries get priority over harder
-                            // ones).  This implements "defer but never
-                            // cancel": we walk every fresh boundary first,
-                            // then work through retries in order of
-                            // accumulated budget.
-                            let priority = -0.001 * (swz.attempt + 1) as f64;
-                            stage_enter[1].fetch_add(1, AtomicOrdering::Relaxed);
-                            // Carry prior blocks forward, appending the ones
-                            // produced this attempt.  Without this, the next
-                            // attempt would rebuild a fresh solver that
-                            // doesn't know which (W, Z) pairs have already
-                            // been tried, and would redundantly re-enumerate
-                            // the same orbits with different phase RNG.
-                            let mut carried_blocks = swz.prior_blocks;
-                            carried_blocks.extend(new_blocks);
-                            wq.push_with_priority(
-                                PipelineWork::SolveWZ(SolveWZWork {
-                                    tuple: swz.tuple,
-                                    z_bits: swz.z_bits,
-                                    w_bits: swz.w_bits,
-                                    xy_root: swz.xy_root,
-                                    candidate_tuples: swz.candidate_tuples.clone(),
-                                    attempt: swz.attempt + 1,
-                                    prior_blocks: carried_blocks,
-                                }),
-                                priority,
-                            );
-                        }
-                    }
-
-                    PipelineWork::SolveZ(sz) => {
-                        let trace_z = sz.z_bits == 43 && sz.w_bits == 47 && sz.tuple.z == 8;
-                        // SAT-solve for Z with spectral constraint, enumerate multiple Z
-                        let mut z_boundary = vec![0i8; n];
-                        for i in 0..k {
-                            z_boundary[i] = if (sz.z_bits >> i) & 1 == 1 { 1 } else { -1 };
-                            z_boundary[n - k + i] = if (sz.z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-                        }
-
-                        // BDKR rule (iv) boundary pre-filter.  If the
-                        // first palindromic pair falls inside the Z
-                        // boundary with the wrong sign, no middle Z
-                        // can fix it — skip building the SAT entirely.
-                        let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
-                        if rule_iv_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary {
-                            continue;
-                        }
-
-                        // Compute V_z = union of ±|σ_Z|-counts over the
-                        // tuples surviving the σ_W-narrowing in SolveW.
-                        let z_bnd_sum_local: i32 = z_boundary.iter().map(|&v| v as i32).sum();
-                        let z_counts: Vec<u32> = {
-                            let mut cs: Vec<u32> = Vec::new();
-                            for t in &sz.candidate_tuples {
-                                let abs_z = t.z.abs();
-                                let signs: &[i32] = if abs_z == 0 { &[0] } else { &[1, -1] };
-                                for &sg in signs {
-                                    if let Some(c) = sigma_full_to_cnt(sg * abs_z, z_bnd_sum_local, ctx.middle_n) {
-                                        if !cs.contains(&c) { cs.push(c); }
-                                    }
-                                }
-                            }
-                            cs.sort_unstable();
-                            cs
-                        };
-                        if z_counts.is_empty() {
-                            stage_exit[2].fetch_add(1, AtomicOrdering::Relaxed);
-                            continue;
-                        }
-
-                        let mut z_solver = z_bases.remove(&0i32).unwrap_or_else(||
-                            ctx.z_tmpl.build_base_solver_quad_pb_pb_set(ctx.middle_n, &z_counts)
-                        );
-                        let z_cp = z_solver.save_checkpoint();
-                        // Reuse z_boundary-dependent fill prep across SolveZ items
-                        // that share z_bits (every item from the same SolveW batch).
-                        if z_prep_z_bits != Some(sz.z_bits) {
-                            z_prep.rebuild(&ctx.z_tmpl, ctx.middle_n, &z_boundary);
-                            // Also refresh the cached z_boundary DFT at the
-                            // SAT frequency grid — boundary DFT depends only
-                            // on z_bits, so it can be reused across this
-                            // SolveW's batch of SolveZ items.
-                            if let Some(ref ztab) = ctx.z_spectral_tables {
-                                let nf = ztab.num_freqs;
-                                z_re_boundary.iter_mut().for_each(|v| *v = 0.0);
-                                z_im_boundary.iter_mut().for_each(|v| *v = 0.0);
-                                for pos in 0..n {
-                                    if pos >= k && pos < n - k { continue; }
-                                    let val = z_boundary[pos] as f64;
-                                    let base = pos * nf;
-                                    for fi in 0..nf {
-                                        z_re_boundary[fi] += val * ztab.pos_cos[base + fi];
-                                        z_im_boundary[fi] += val * ztab.pos_sin[base + fi];
-                                    }
-                                }
-                            }
-                            z_prep_z_bits = Some(sz.z_bits);
-                        }
-                        // Attach spectral BEFORE fill_z_solver_quad_pb so that
-                        // any level-0 middle-var assignments forced by quad_pb
-                        // propagation feed through the normal propagate path
-                        // (which calls spec.assign).  Setting spectral AFTER
-                        // fill was a long-standing bug: those level-0 assignments
-                        // bypassed spectral, leaving re/im incomplete and
-                        // causing the in-SAT check to pass Z's that the
-                        // external FFT pair filter correctly rejected.
-                        if let Some(ref ztab) = ctx.z_spectral_tables {
-                            // Build the SpectralConstraint manually, reusing
-                            // the cached z_boundary DFT instead of recomputing
-                            // it from scratch in from_tables.
-                            let num_freqs = ztab.num_freqs;
-                            let middle_len = ztab.middle_len;
-                            let mut z_spec = radical::SpectralConstraint {
-                                num_seq_vars: middle_len,
-                                cos_table: std::sync::Arc::clone(&ztab.cos_table),
-                                sin_table: std::sync::Arc::clone(&ztab.sin_table),
-                                num_freqs,
-                                re: z_re_boundary.clone(),
-                                im: z_im_boundary.clone(),
-                                re_boundary: z_re_boundary.clone(),
-                                im_boundary: z_im_boundary.clone(),
-                                bound: ctx.pair_bound,
-                                per_freq_bound: None,
-                                max_reduction: ztab.max_reduction_total.clone(),
-                                amplitudes: std::sync::Arc::clone(&ztab.amplitudes),
-                                assigned: vec![false; middle_len],
-                                values: vec![0i8; middle_len],
-                                seq2: None,
-                            };
-                            // Compute per-frequency W DFT using the precomputed
-                            // pos_cos/pos_sin tables from ztab. Loop order:
-                            // outer j (position in W), inner fi (frequency).
-                            // The pos tables are laid out as [j*nf + fi], so the
-                            // inner loop is sequential in memory (good cache).
-                            let nf = z_spec.num_freqs;
-                            let mut w_re = vec![0.0f64; nf];
-                            let mut w_im = vec![0.0f64; nf];
-                            // Inner loop is 25 × 167 fmadds per SolveZ item. Since
-                            // w_vals are ±1, replace the multiply with a conditional
-                            // add/sub. Lets the compiler emit one SIMD add/sub per
-                            // cache line rather than a vector multiply + add.
-                            for (j, &wv) in sz.w_vals.iter().enumerate() {
-                                let base = j * nf;
-                                let cos_slice = &ztab.pos_cos[base..base + nf];
-                                let sin_slice = &ztab.pos_sin[base..base + nf];
-                                if wv > 0 {
-                                    for fi in 0..nf {
-                                        w_re[fi] += cos_slice[fi];
-                                        w_im[fi] += sin_slice[fi];
-                                    }
-                                } else {
-                                    for fi in 0..nf {
-                                        w_re[fi] -= cos_slice[fi];
-                                        w_im[fi] -= sin_slice[fi];
-                                    }
-                                }
-                            }
-                            let mut pfb = vec![ctx.pair_bound; nf];
-                            for fi in 0..nf {
-                                pfb[fi] = (ctx.pair_bound - w_re[fi]*w_re[fi] - w_im[fi]*w_im[fi]).max(0.0);
-                            }
-                            z_spec.per_freq_bound = Some(pfb);
-                            z_solver.spectral = Some(z_spec);
-                        }
-
-                        sat_z_middle::fill_z_solver_quad_pb(&mut z_solver, &ctx.z_tmpl, n, m, ctx.middle_n, &z_prep, &sz.w_vals);
-                        // Rule (iv) middle clauses — only needed when
-                        // the boundary left the rule DeferredToMiddle.
-                        if rule_iv_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
-                            let mut nv = (z_solver.num_vars() + 1) as i32;
-                            sat_z_middle::add_rule_iv_middle_clauses(
-                                &mut z_solver, n, k,
-                                |jf| (jf - k + 1) as i32,
-                                &mut nv,
-                            );
-                        }
-                        // --outfix middle pins for Z: force middle positions
-                        // to user-specified values.  Without this the outfix
-                        // honours only the Z boundary and SolveZ enumerates
-                        // many different middles, most of which fail the
-                        // downstream pair check.
-                        for &(mid, val) in &ctx.outfix_z_mid_pins {
-                            if mid < ctx.middle_n {
-                                let lit = ctx.z_mid_vars[mid];
-                                z_solver.add_clause([if val > 0 { lit } else { -lit }]);
-                            }
-                        }
-                        // Retroactively feed middle vars that fill_z_solver
-                        // forced at level 0 into the spectral constraint.
-                        // `add_quad_pb_eq` / `add_pb_atleast` inside fill
-                        // enqueue lits via their own propagators, bypassing
-                        // main propagate() — so spectral never saw them.
-                        // The `!spec.assigned[v]` guard in propagate's
-                        // spectral block prevents double-counting when these
-                        // same vars later pass through the main loop.
-                        // Need to split borrow: read assignments from solver,
-                        // then mutate spectral.
-                        if z_solver.spectral.is_some() {
-                            let nsv = z_solver.spectral.as_ref().unwrap().num_seq_vars;
-                            let mut pending: Vec<(usize, i8)> = Vec::new();
-                            for vi in 0..nsv {
-                                let lit = ctx.z_mid_vars[vi];
-                                if let Some(b) = z_solver.value(lit) {
-                                    let sp = z_solver.spectral.as_ref().unwrap();
-                                    if !sp.assigned[vi] {
-                                        pending.push((vi, if b { 1 } else { -1 }));
-                                    }
-                                }
-                            }
-                            if let Some(ref mut sp) = z_solver.spectral {
-                                for (vi, val) in pending {
-                                    sp.assign(vi, val);
-                                }
-                            }
-                        }
-
-                        let w_seq = PackedSeq::from_values(&sz.w_vals);
-
-                        // Snapshot Z-stage SAT search stats. Diff against
-                        // post-loop values for this (Z,W) pair's contribution
-                        // to the Z-stage diagnostics.
-                        let z_d0 = z_solver.num_decisions();
-                        let z_p0 = z_solver.num_propagations();
-                        let z_l0 = z_solver.num_level0_vars();
-                        let z_nv = z_solver.num_vars();
-
-                        let mut z_count = 0usize;
-                        // N2: per-call Z SAT conflict budget, same rationale
-                        // as W SAT above.  Without this a single pathological
-                        // solve() can run past sat_secs and block shutdown.
-                        let z_conflict_budget: u64 = std::env::var("TURYN_Z_CONFL")
-                            .ok().and_then(|s| s.parse().ok()).unwrap_or(5000);
-                        loop {
-                            if ctx.found.load(AtomicOrdering::Relaxed) { break; }
-                            if z_count >= ctx.max_z { break; }
-                            let z_phases: Vec<bool> = (0..ctx.middle_n)
-                                .map(|_| next_rng!() & 1 == 1).collect();
-                            z_solver.set_phase(&z_phases);
-                            if z_conflict_budget > 0 { z_solver.set_conflict_budget(z_conflict_budget); }
-                            let z_result = z_solver.solve();
-                            if z_result != Some(true) {
-                                if z_count == 0 { flow_z_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
-                                break;
-                            }
-                            z_count += 1;
-                            flow_z_solutions.fetch_add(1, AtomicOrdering::Relaxed);
-
-                            let z_mid = extract_vals(&z_solver, |i| ctx.z_mid_vars[i], ctx.middle_n);
-
-                            // BEFORE reset: capture spectral state for diagnostics.
-                            let _spec_snap = if std::env::var("TRACE_SPEC").is_ok() {
-                                z_solver.spectral.as_ref().map(|sp| (sp.re.clone(), sp.im.clone(), sp.per_freq_bound.clone(), sp.values.clone(), sp.assigned.clone()))
-                            } else { None };
-
-                            let mut z_vals = Vec::with_capacity(n);
-                            z_vals.extend_from_slice(&z_boundary[..k]);
-                            z_vals.extend_from_slice(&z_mid);
-                            z_vals.extend_from_slice(&z_boundary[n-k..]);
-
-                            // Only add the blocking clause if we'll loop again.
-                            // With max_z=1 we exit the loop immediately after
-                            // this iteration, so building + adding the blocker
-                            // would be pure wasted work (the restore_checkpoint
-                            // below throws it away anyway).
-                            if z_count < ctx.max_z {
-                                let z_block: Vec<i32> = ctx.z_mid_vars.iter().map(|&v| {
-                                    if z_solver.value(v) == Some(true) { -v } else { v }
-                                }).collect();
-                                z_solver.reset(); // backtrack before adding blocking clause
-                                z_solver.add_clause(z_block);
-                            }
-
-                            // Individual spectral already enforced by solver (167 freqs).
-                            // Just compute spectrum for pair check, into a reusable
-                            // buffer (the spectrum is only consumed by the bool-valued
-                            // pair check below — no need to allocate a fresh Vec per
-                            // Z solution).
-                            compute_spectrum_into(&z_vals, &spectral_z, &mut fft_buf_z, &mut z_spectrum_buf);
-
-                            if ctx.middle_n <= 20 {
-                                if !spectral_pair_ok(&z_spectrum_buf, &sz.w_spectrum, ctx.pair_bound) {
-                                    flow_z_pair_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                                    if trace_z { eprintln!("TRACE:   Z solution #{} FAILED pair check", z_count); }
-                                    if std::env::var("TRACE_SPEC").is_ok()
-                                        && flow_z_pair_fail.load(AtomicOrdering::Relaxed) <= 1
-                                    {
-                                        // In-SAT's spectral state just before the SAT returned
-                                        // `sat` for this Z.  Compare to external.
-                                        let (insat_re, insat_im, insat_pfb, insat_values, insat_assigned): (Vec<f64>, Vec<f64>, Vec<f64>, Vec<i8>, Vec<bool>) =
-                                            if let Some((ref re, ref im, ref pfb, ref vals, ref asgn)) = _spec_snap {
-                                                (re.clone(), im.clone(),
-                                                 pfb.clone().unwrap_or_default(),
-                                                 vals.clone(), asgn.clone())
-                                            } else { (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()) };
-                                        let insat_mid_str: String = insat_values.iter()
-                                            .map(|&v| if v == 1 { '+' } else if v == -1 { '-' } else { '0' })
-                                            .collect();
-                                        let insat_assigned_count = insat_assigned.iter().filter(|&&b| b).count();
-                                        eprintln!(
-                                            "  SpectralConstraint's internal middle: {:?} ({}/{} assigned)",
-                                            insat_mid_str, insat_assigned_count, insat_values.len()
-                                        );
-                                        eprintln!(
-                                            "  Actual extracted z_mid:               {:?}",
-                                            z_mid.iter().map(|&v| if v>0 {'+'} else {'-'}).collect::<String>()
-                                        );
-                                        let fail_bins: Vec<usize> = (0..z_spectrum_buf.len())
-                                            .filter(|&i| z_spectrum_buf[i] + sz.w_spectrum[i] > ctx.pair_bound)
-                                            .collect();
-                                        eprintln!("[TRACE_SPEC] Z pair fail: z_mid={} bound={}",
-                                            z_mid.iter().map(|&v| if v>0 {'+'} else {'-'}).collect::<String>(),
-                                            ctx.pair_bound);
-                                        for &fi in fail_bins.iter().take(3) {
-                                            let insat_zmag2 = if fi < insat_re.len() {
-                                                insat_re[fi]*insat_re[fi] + insat_im[fi]*insat_im[fi]
-                                            } else { f64::NAN };
-                                            let pfb_fi = if fi < insat_pfb.len() { insat_pfb[fi] } else { f64::NAN };
-                                            eprintln!(
-                                                "  bin {fi} (ω={:.4}π): ext |Z|²={:.4} + |W|²={:.4} = {:.4} > bound={}; \
-                                                 in-SAT |Z|²={:.4} vs pfb[{fi}]={:.4}  → should have triggered conflict",
-                                                fi as f64 / 128.0,
-                                                z_spectrum_buf[fi], sz.w_spectrum[fi],
-                                                z_spectrum_buf[fi] + sz.w_spectrum[fi], ctx.pair_bound,
-                                                insat_zmag2, pfb_fi);
-                                        }
-                                    }
-                                    continue;
-                                }
-                            }
-                            if trace_z { eprintln!("TRACE:   Z solution #{} REACHED XY!", z_count); }
-
-                            let z_seq = PackedSeq::from_values(&z_vals);
-                            let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
-
-                            // Solve XY inline using solve_with_assumptions for each boundary.
-                            // This reuses the same solver across boundaries: learnt clauses
-                            // from one boundary transfer to the next, and no clone per boundary.
-                            // Cache key: the sorted list of candidate (σ_X, σ_Y, σ_Z, σ_W)
-                            // — same set of tuples ⇒ same XY template (rule clauses +
-                            // V_x/V_y are derived from the tuple list).
-                            let mut tuple_key: Vec<(i32, i32, i32, i32)> = sz.candidate_tuples.iter()
-                                .map(|t| (t.x, t.y, t.z, t.w)).collect();
-                            tuple_key.sort_unstable();
-                            let template = template_cache.entry(tuple_key).or_insert_with(||
-                                SatXYTemplate::build_multi_opts(problem, &sz.candidate_tuples, &sat_config, ctx.conj_xy_product).unwrap()
-                            );
-                            let candidate = CandidateZW { zw_autocorr };
-                            // Shared XY SAT fast path: clone the per-tuple
-                            // template, attach GJ/lag pre-filters and quad
-                            // PB term-state injection, then walk the XY
-                            // sub-MDD running `try_candidate` for each
-                            // surviving (x_bits, y_bits). The extension
-                            // pre-filter is interleaved inside the walk
-                            // callback.
-                            if ctx.xy_mdd_mode {
-                                // PROTOTYPE XY_MDD=1: one SAT call per (Z, W)
-                                // using the native MDD propagator. Replaces
-                                // the per-leaf walk_xy_sub_mdd fan-out for
-                                // this boundary. UNSAT here = every (x,y)
-                                // leaf in the sub-MDD is infeasible, which
-                                // is equivalent to the enumeration path
-                                // getting UNSAT (or Pruned) for every leaf.
-                                let conflict_limit = if n > 30 { 5000 } else { 0 };
-                                let (xy_res, stats) = try_candidate_via_mdd(
-                                    problem, &candidate, template, k,
-                                    sz.xy_root, &ctx.mdd.nodes, &ctx.xy_pos_order,
-                                    conflict_limit,
-                                );
-                                stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                items_completed.fetch_add(1, AtomicOrdering::Relaxed);
-                                stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
-                                flow_xy_decisions.fetch_add(stats.decisions, AtomicOrdering::Relaxed);
-                                flow_xy_propagations.fetch_add(stats.propagations, AtomicOrdering::Relaxed);
-                                flow_xy_root_forced.fetch_add(stats.vars_pre_forced, AtomicOrdering::Relaxed);
-                                flow_xy_free_sum.fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
-                                match xy_res {
-                                    Some((x, y)) => {
-                                        flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed);
-                                        if verify_tt(problem, &x, &y, &z_seq, &w_seq) {
-                                            ctx.found.store(true, AtomicOrdering::Relaxed);
-                                            let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
-                                        }
-                                    }
-                                    None => {
-                                        // Can't distinguish UNSAT from timeout
-                                        // without threading the raw result back;
-                                        // count as unsat for now (cover_micro
-                                        // = 1.0 for SAT/UNSAT, fractional for
-                                        // timeout — handled inside stats).
-                                        flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed);
-                                    }
-                                }
-                            } else if let Some(mut state) = SolveXyPerCandidate::new(
-                                problem, &candidate, template, k,
-                            ) {
-                                if n > 30 { state.solver.set_conflict_limit(5000); }
-                                if warm.inject_phase {
-                                    if let Some(ref ph) = warm.phase { state.solver.set_phase(ph); }
-                                }
-
-                                walk_xy_sub_mdd(
-                                    sz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
-                                    &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
-                                    ctx.middle_n as i32, &sz.candidate_tuples,
-                                    &mut |x_bits, y_bits| {
-                                        if ctx.found.load(AtomicOrdering::Relaxed) { return; }
-                                        // --outfix XY filter: skip everything except the
-                                        // pinned (x_bits, y_bits) when the flag is set.
-                                        if let Some((fx, fy)) = ctx.outfix_xy {
-                                            if x_bits != fx || y_bits != fy { return; }
-                                        }
-                                        if ctx.conj_zw_bound
-                                            && !check_conj_zw_bound(n, k, x_bits, y_bits, &z_seq, &w_seq)
-                                        {
-                                            flow_xy_zw_bound_rej.fetch_add(1, AtomicOrdering::Relaxed);
-                                            return;
-                                        }
-                                        // E1: Extension filter with cache.
-                                        if ctx.mdd_extend > 0 {
-                                            let cache_key = (sz.z_bits as u128) | ((sz.w_bits as u128) << 32)
-                                                          | ((x_bits as u128) << 64) | ((y_bits as u128) << 96);
-                                            let ext_ok = *ext_cache.entry(cache_key).or_insert_with(||
-                                                mdd_zw_first::has_extension(
-                                                    k, k + ctx.mdd_extend,
-                                                    sz.z_bits, sz.w_bits, x_bits, y_bits,
-                                                )
-                                            );
-                                            if !ext_ok {
-                                                extensions_pruned.fetch_add(1, AtomicOrdering::Relaxed);
-                                                return;
-                                            }
-                                        }
-                                        stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                        let (result, stats) = state.try_candidate(x_bits, y_bits);
-                                        items_completed.fetch_add(1, AtomicOrdering::Relaxed);
-                                        stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                        match &result {
-                                            XyTryResult::Sat(_, _) => { flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed); }
-                                            XyTryResult::Unsat | XyTryResult::Pruned => { flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
-                                            XyTryResult::Timeout => {
-                                                flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed);
-                                                flow_xy_timeout_cov_micro.fetch_add(stats.cover_micro, AtomicOrdering::Relaxed);
-                                            }
-                                        };
-                                        // Pruned candidates skip the SAT solver, so their stats are zero —
-                                        // don't pollute per-stage averages with an extra "0-decision" sample.
-                                        if !matches!(result, XyTryResult::Pruned) {
-                                            flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
-                                            flow_xy_decisions.fetch_add(stats.decisions, AtomicOrdering::Relaxed);
-                                            flow_xy_propagations.fetch_add(stats.propagations, AtomicOrdering::Relaxed);
-                                            flow_xy_root_forced.fetch_add(stats.vars_pre_forced, AtomicOrdering::Relaxed);
-                                            flow_xy_free_sum.fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
-                                        }
-                                        if let XyTryResult::Sat(x, y) = result {
-                                            if verify_tt(problem, &x, &y, &z_seq, &w_seq) {
-                                                ctx.found.store(true, AtomicOrdering::Relaxed);
-                                                let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
-                                            }
-                                        }
-                                    },
-                                );
-                                warm.phase = Some(state.solver.get_phase());
-                            } else {
-                                flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                            }
-                        }
-                        if trace_z {
-                            let z_sf = flow_z_spec_fail.load(AtomicOrdering::Relaxed);
-                            let z_pf = flow_z_pair_fail.load(AtomicOrdering::Relaxed);
-                            eprintln!("TRACE: SolveZ done for target: {} Z found (global z_spec_fail={}, z_pair_fail={})", z_count, z_sf, z_pf);
-                        }
-
-                        // Aggregate Z-stage SAT search stats for this (Z,W) pair.
-                        // Pre-solve level-0 count captures vars forced by constraint
-                        // setup (post fill_z_solver, pre solve()) — the meaningful
-                        // "constraint pruning" measurement for the Z stage.
-                        let z_decisions    = z_solver.num_decisions().saturating_sub(z_d0);
-                        let z_propagations = z_solver.num_propagations().saturating_sub(z_p0);
-                        let z_pre_forced   = z_l0 as u64;
-                        let z_free_vars    = z_nv.saturating_sub(z_l0) as u64;
-                        flow_z_solves.fetch_add(1, AtomicOrdering::Relaxed);
-                        flow_z_decisions.fetch_add(z_decisions, AtomicOrdering::Relaxed);
-                        flow_z_propagations.fetch_add(z_propagations, AtomicOrdering::Relaxed);
-                        flow_z_root_forced.fetch_add(z_pre_forced, AtomicOrdering::Relaxed);
-                        flow_z_free_sum.fetch_add(z_free_vars, AtomicOrdering::Relaxed);
-
-                        z_solver.spectral = None;
-                        z_solver.restore_checkpoint(z_cp);
-                        z_bases.insert(0i32, z_solver);
-                        stage_exit[2].fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-
-                    PipelineWork::SolveXY(xy) => {
-                        xy_item_in_flight.fetch_add(1, AtomicOrdering::Relaxed);
-                        // Cross-mode XY stage: (Z, W) pair already fully known.
-                        // Navigate the MDD to the xy_root for this (z_bits,
-                        // w_bits), build a SolveXyPerCandidate, then walk the
-                        // XY sub-MDD running the shared fast path.
-                        let item = xy.item;
-                        let z_seq = item.z.clone();
-                        let w_seq = item.w.clone();
-                        let candidate = CandidateZW { zw_autocorr: item.zw_autocorr.clone() };
-
-                        // Extract (z_bits, w_bits) from the boundary of each
-                        // sequence and navigate the ZW half of the MDD to the
-                        // xy_root node anchoring the XY sub-tree.
-                        let mut z_bits = 0u32;
-                        let mut w_bits = 0u32;
-                        for i in 0..k {
-                            if z_seq.get(i) == 1 { z_bits |= 1 << i; }
-                            if z_seq.get(n - k + i) == 1 { z_bits |= 1 << (k + i); }
-                            if w_seq.get(i) == 1 { w_bits |= 1 << i; }
-                            if w_seq.get(m - k + i) == 1 { w_bits |= 1 << (k + i); }
-                        }
-                        let mut nid = ctx.mdd.root;
-                        let mut live = true;
-                        for level in 0..ctx.zw_depth {
-                            if nid == mdd_reorder::DEAD { live = false; break; }
-                            let pos = ctx.xy_pos_order[level];
-                            let z_val = (z_bits >> pos) & 1;
-                            let w_val = (w_bits >> pos) & 1;
-                            let branch = (z_val | (w_val << 1)) as usize;
-                            if nid != mdd_reorder::LEAF {
-                                nid = ctx.mdd.nodes[nid as usize][branch];
-                            }
-                        }
-                        if !live || nid == mdd_reorder::DEAD {
-                            // Boundary not live in the MDD — no candidates.
-                            flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                            items_completed.fetch_add(1, AtomicOrdering::Relaxed);
-                            stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
-                            xy_item_in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
-                            continue;
-                        }
-                        let xy_root = nid;
-
-                        let tuple_key: Vec<(i32, i32, i32, i32)> = vec![(
-                            item.tuple.x, item.tuple.y, item.tuple.z, item.tuple.w)];
-                        let template = template_cache.entry(tuple_key).or_insert_with(||
-                            SatXYTemplate::build_opts(ctx.problem, item.tuple, &sat_config, ctx.conj_xy_product).unwrap()
-                        );
-
-                        if let Some(mut state) = SolveXyPerCandidate::new(
-                            ctx.problem, &candidate, template, k,
-                        ) {
-                            if n > 30 { state.solver.set_conflict_limit(5000); }
-                            if warm.inject_phase {
-                                if let Some(ref ph) = warm.phase { state.solver.set_phase(ph); }
-                            }
-
-                            walk_xy_sub_mdd(
-                                xy_root, 0, ctx.xy_zw_depth, 0, 0,
-                                &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
-                                ctx.middle_n as i32, std::slice::from_ref(&item.tuple),
-                                &mut |x_bits, y_bits| {
-                                    if ctx.found.load(AtomicOrdering::Relaxed) { return; }
-                                    if let Some((fx, fy)) = ctx.outfix_xy {
-                                        if x_bits != fx || y_bits != fy { return; }
-                                    }
-                                    if ctx.conj_zw_bound
-                                        && !check_conj_zw_bound(n, k, x_bits, y_bits, &z_seq, &w_seq)
-                                    {
-                                        flow_xy_zw_bound_rej.fetch_add(1, AtomicOrdering::Relaxed);
-                                        return;
-                                    }
-                                    stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                    let (result, stats) = state.try_candidate(x_bits, y_bits);
-                                    items_completed.fetch_add(1, AtomicOrdering::Relaxed);
-                                    stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
-                                    match &result {
-                                        XyTryResult::Sat(_, _) => { flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed); }
-                                        XyTryResult::Unsat | XyTryResult::Pruned => { flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
-                                        XyTryResult::Timeout => {
-                                            flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed);
-                                            flow_xy_timeout_cov_micro.fetch_add(stats.cover_micro, AtomicOrdering::Relaxed);
-                                        }
-                                    };
-                                    if !matches!(result, XyTryResult::Pruned) {
-                                        flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
-                                        flow_xy_decisions.fetch_add(stats.decisions, AtomicOrdering::Relaxed);
-                                        flow_xy_propagations.fetch_add(stats.propagations, AtomicOrdering::Relaxed);
-                                        flow_xy_root_forced.fetch_add(stats.vars_pre_forced, AtomicOrdering::Relaxed);
-                                        flow_xy_free_sum.fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
-                                    }
-                                    if let XyTryResult::Sat(x, y) = result {
-                                        if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
-                                            ctx.found.store(true, AtomicOrdering::Relaxed);
-                                            let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
-                                        }
-                                    }
-                                },
-                            );
-                            warm.phase = Some(state.solver.get_phase());
-                        } else {
-                            flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                        }
-                        xy_item_in_flight.fetch_sub(1, AtomicOrdering::Relaxed);
-                    }
-
-                    PipelineWork::Shutdown => break,
-                }
-            }
-        }));
-    }
-    drop(result_tx);
-
-    // Monitor loop: feed the queue on demand + check for solution/time limit.
-    //
-    // In cross mode, the monitor runs the hybrid Z × W enumeration
-    // directly and pushes SolveXY items as it finds surviving pairs.
-    // In apart/together modes, the monitor walks MDD paths and pushes
-    // Boundary items (the traditional MDD path).
-    let wz_mode = cfg.effective_wz_mode();
-    let queue_target = 200; // quality buffer: accumulate XY items for spectral sorting
-    let mut found_solution = false;
-    let mut last_progress = Instant::now();
-    let mut last_counts = [0u64; 4];
-    let mut rates = [0.0f64; 4];
-    let mut last_snap = Instant::now();
-
-    // Cross-mode enumeration state: built up lazily as tuples are
-    // processed. w_cache maps (tuple.w sum) → (w_candidates, SpectralIndex)
-    // so repeated tuples sharing the same w sum only build W once.
-    let mut cross_w_cache: HashMap<i32, (Vec<SeqWithSpectrum>, SpectralIndex)> = HashMap::new();
-    let mut cross_tuple_idx: usize = 0;
-    let cross_spectral_z = SpectralFilter::new(n, cfg.theta_samples);
-    let cross_spectral_w = SpectralFilter::new(n, cfg.theta_samples);
-    let mut cross_stats = SearchStats::default();
-    let mut cross_seen_zw: std::collections::HashSet<Vec<i32>> = std::collections::HashSet::new();
-    let mut cross_done = false;
-
-    loop {
-        // Feed the queue when depth is low.
-        let gold_depth = work_queue.gold_len();
-        let pending_bnd = pending_boundaries.load(AtomicOrdering::Relaxed) as usize;
-        if wz_mode == WzMode::Cross {
-            // Cross: process the next tuple and stream its (Z, W) pairs as
-            // SolveXY items. Apply backpressure via gold queue depth so we
-            // don't blow up memory on large n.
-            const CROSS_GOLD_CAP: usize = 4096;
-            if !cross_done && gold_depth < CROSS_GOLD_CAP && cross_tuple_idx < tuples.len() {
-                let tuple = tuples[cross_tuple_idx];
-                cross_tuple_idx += 1;
-
-                let b_start = Instant::now();
-                if !cross_w_cache.contains_key(&tuple.w) {
-                    let w_candidates = build_w_candidates(
-                        problem, tuple.w, cfg, &cross_spectral_w, &mut cross_stats, &ctx.found);
-                    let w_index = SpectralIndex::build(&w_candidates);
-                    cross_w_cache.insert(tuple.w, (w_candidates, w_index));
-                }
-                if !ctx.found.load(AtomicOrdering::Relaxed) {
-                    let (w_candidates, w_index) = cross_w_cache.get(&tuple.w).unwrap();
-                    let before = (
-                        cross_stats.z_generated,
-                        cross_stats.z_spectral_ok,
-                        cross_stats.candidate_pair_spectral_ok,
-                    );
-                    let mut pushed = 0usize;
-                    for_each_zw_pair(
-                        problem, tuple.z, w_candidates, w_index, cfg, &cross_spectral_z,
-                        &mut cross_stats, &ctx.found,
-                        |z_seq, w_seq, zw, z_spectrum, w_spectrum| {
-                            let max_power = spectral_pair_max_power(z_spectrum, w_spectrum);
-                            if cross_seen_zw.insert(zw.clone()) {
-                                let item = SatWorkItem {
-                                    tuple,
-                                    z: z_seq.clone(),
-                                    w: w_seq.clone(),
-                                    zw_autocorr: zw,
-                                    priority: max_power,
-                                };
-                                work_queue.push(PipelineWork::SolveXY(SolveXYWork { item }));
-                                pushed += 1;
-                            }
-                            true
-                        },
-                    );
-                    cross_stats.phase_b_nanos += b_start.elapsed().as_nanos() as u64;
-                    let z_gen = cross_stats.z_generated - before.0;
-                    let z_ok = cross_stats.z_spectral_ok - before.1;
-                    let pairs = cross_stats.candidate_pair_spectral_ok - before.2;
-                    if verbose {
-                        eprintln!("  tuple {}/{} (sums {} {} {} {}): z_gen={} z_ok={} w={} pairs={} pushed={}",
-                            cross_tuple_idx, tuples.len(), tuple.x, tuple.y, tuple.z, tuple.w,
-                            z_gen, z_ok, w_candidates.len(), pairs, pushed);
-                    }
-                }
-                if cross_tuple_idx >= tuples.len() {
-                    cross_done = true;
-                }
-            }
-        } else if pending_bnd < queue_target {
-            // Apart/Together: walk MDD paths and push Boundary items when
-            // the *pending boundary* count is low.  (We can't gate on the
-            // whole work_queue depth because deferred SolveWZ re-queues at
-            // negative priority pile up and would otherwise starve the
-            // walker of its queue budget, stranding the search on a handful
-            // of boundaries that just cycle through re-queue forever.)
-            if let Some(ref outfix) = cfg.test_outfix {
-                // --outfix: restrict the search to one specific boundary.
-                // Navigate directly to it (no MDD path walk), emit once,
-                // then exhaust the walker so the search terminates when
-                // the pipeline finishes this single boundary.
-                if path_counter.load(AtomicOrdering::Relaxed) == 0 {
-                    if let Some(xy_root) = mdd_navigate_to_outfix(
-                        mdd.root, zw_depth, &full_pos_order, &mdd.nodes,
-                        outfix.z_bits, outfix.w_bits,
-                    ) {
-                        boundaries_walked.fetch_add(1, AtomicOrdering::Relaxed);
-                        pending_boundaries.fetch_add(1, AtomicOrdering::Relaxed);
-                        work_queue.push(PipelineWork::Boundary(BoundaryWork {
-                            z_bits: outfix.z_bits, w_bits: outfix.w_bits, xy_root,
-                        }));
-                        eprintln!("--outfix: emitted one boundary (z_bits=0x{:x}, w_bits=0x{:x}, xy_root={})",
-                            outfix.z_bits, outfix.w_bits, xy_root);
-                    } else {
-                        eprintln!("--outfix: boundary (z_bits=0x{:x}, w_bits=0x{:x}) not present in the MDD (pruned during gen or rule pre-filter)",
-                            outfix.z_bits, outfix.w_bits);
-                    }
-                    // Mark the walker as fully exhausted: we've emitted
-                    // all we plan to.
-                    path_counter.store(total_paths, AtomicOrdering::Relaxed);
-                }
-            } else {
-                let batch = queue_target;
-                let mut fed = 0;
-                while fed < batch {
-                    let idx = path_counter.fetch_add(1, AtomicOrdering::Relaxed);
-                    if idx >= total_paths { break; } // exhausted all paths
-                    let path = idx.wrapping_mul(lcg_mult) & lcg_mask;
-                    let bnd = mdd_navigate_path(mdd.root, zw_depth, path, &full_pos_order, &mdd.nodes);
-                    if let Some((z_bits, w_bits, xy_root)) = bnd {
-                        boundaries_walked.fetch_add(1, AtomicOrdering::Relaxed);
-                        pending_boundaries.fetch_add(1, AtomicOrdering::Relaxed);
-                        work_queue.push(PipelineWork::Boundary(BoundaryWork { z_bits, w_bits, xy_root }));
-                        fed += 1;
-                    }
-                }
-            }
-        }
-
-        // Cross mode: the monitor IS the producer, so a long sleep
-        // directly delays enumeration. Use a much shorter pause so the
-        // next tuple is streamed promptly. MDD monitor's sleep stays
-        // at 10ms because it only feeds batches when the work queue
-        // drops below `queue_target`.
-        if wz_mode == WzMode::Cross {
-            std::thread::sleep(std::time::Duration::from_micros(500));
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        // Check for solution
-        match result_rx.try_recv() {
-            Ok(sol) => {
-                if verbose {
-                    print_solution(&format!("TT({}) SOLUTION", n), &sol.0, &sol.1, &sol.2, &sol.3);
-                }
-                found_solution = true;
-                ctx.found.store(true, AtomicOrdering::Relaxed);
-                break;
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        }
-
-        // Time limit
-        if sat_secs > 0 && run_start.elapsed().as_secs() >= sat_secs {
-            if verbose { eprintln!("  Time limit reached ({}s)", sat_secs); }
-            ctx.found.store(true, AtomicOrdering::Relaxed);
-            break;
-        }
-
-        // Cross-mode exhaustion: producer finished enumerating every
-        // tuple, the dual queue is empty, and no worker has a SolveXY
-        // item in flight. Signal `found` so workers unblock, then exit.
-        if wz_mode == WzMode::Cross && cross_done
-            && work_queue.work_len() == 0
-            && work_queue.gold_len() == 0
-            && xy_item_in_flight.load(AtomicOrdering::Relaxed) == 0
-        {
-            if verbose { eprintln!("  Cross enumeration exhausted, no solution found"); }
-            ctx.found.store(true, AtomicOrdering::Relaxed);
-            break;
-        }
-
-        // Throughput snapshots
-        if last_snap.elapsed().as_secs_f64() >= 2.0 {
-            let dt = last_snap.elapsed().as_secs_f64();
-            for i in 0..4 {
-                let cur = stage_exit[i].load(AtomicOrdering::Relaxed);
-                rates[i] = (cur - last_counts[i]) as f64 / dt;
-                last_counts[i] = cur;
-            }
-            last_snap = Instant::now();
-        }
-
-        // Progress display
-        if verbose && last_progress.elapsed().as_secs() >= 10 {
-            let elapsed = run_start.elapsed().as_secs_f64();
-            if wz_mode == WzMode::Cross {
-                // Cross mode: the MDD-centric depth bars are meaningless
-                // (the monitor doesn't walk paths and stages 0-2 stay at
-                // zero). Report producer progress instead: how many
-                // tuples have been enumerated, the gold queue depth, and
-                // the individual-XY-candidate throughput. TTC is
-                // extrapolated from tuple progress: estimate the total
-                // XY candidates as `pushed × tuples_total / tuples_done`.
-                let gold_depth = work_queue.gold_len();
-                let xy_pushed  = stage_enter[3].load(AtomicOrdering::Relaxed);
-                let xy_done_eff = effective_xy_done(
-                    flow_xy_sat.load(AtomicOrdering::Relaxed),
-                    flow_xy_unsat.load(AtomicOrdering::Relaxed),
-                    flow_xy_timeout.load(AtomicOrdering::Relaxed),
-                    flow_xy_timeout_cov_micro.load(AtomicOrdering::Relaxed),
+        if nid == mdd_reorder::LEAF {
+            // A LEAF reached before depth means the full (z,w)
+            // prefix is unconstrained at the remaining levels —
+            // enumerate all 4 branches.
+            let pos = order[level];
+            for b in 0..4u32 {
+                let z = b & 1;
+                let w = (b >> 1) & 1;
+                walk(
+                    mdd_reorder::LEAF,
+                    level + 1,
+                    z_bits | (z << pos),
+                    w_bits | (w << pos),
+                    depth,
+                    order,
+                    nodes,
+                    out,
+                    cancelled,
                 );
-                let est_total = cross_estimated_total_xy(
-                    xy_pushed, cross_tuple_idx, tuples.len(), cross_done,
-                );
-                let rate = if elapsed > 0.0 { xy_done_eff / elapsed } else { 0.0 };
-                let ttc = if rate > 0.0 { (est_total - xy_done_eff).max(0.0) / rate } else { f64::INFINITY };
-                let ttc_str = if ttc < 60.0 { format!("{:.0}s", ttc) }
-                             else if ttc < 3600.0 { format!("{:.0}m", ttc / 60.0) }
-                             else if ttc < 86400.0 { format!("{:.1}h", ttc / 3600.0) }
-                             else { format!("{:.0}d", ttc / 86400.0) };
-                let pct = if est_total > 0.0 { xy_done_eff / est_total * 100.0 } else { 0.0 };
-                eprintln!(
-                    "[{:>3.0}s] --wz=cross  tuples {}/{}  gold {}  XY {:.0}/{:.0} ({:.1}%)  {:.0}/s  cover:{}",
-                    elapsed, cross_tuple_idx, tuples.len(), gold_depth,
-                    xy_done_eff, est_total, pct, rate, ttc_str,
-                );
-            } else {
-                // MDD modes: boundary walker drives everything, so the
-                // depth bars and boundary-rate metric reflect real work.
-                let walked = stage_exit[0].load(AtomicOrdering::Relaxed);
-                // Per-stage queue depths
-                let mut depths = [0i64; 4];
-                for i in 0..4 {
-                    depths[i] = (stage_enter[i].load(AtomicOrdering::Relaxed) as i64
-                        - stage_exit[i].load(AtomicOrdering::Relaxed) as i64).max(0);
-                }
-                let fill_chars = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
-                let max_depth = depths.iter().cloned().max().unwrap_or(1).max(1) as f64;
-                let bar = |d: i64| -> char {
-                    let idx = ((d as f64 / max_depth) * 8.0).round() as usize;
-                    fill_chars[idx.min(8)]
-                };
-                let bnd_rate = if elapsed > 0.0 { walked as f64 / elapsed } else { 0.0 };
-                let pct_done = if live_zw_paths > 0.0 { walked as f64 / live_zw_paths * 100.0 } else { 0.0 };
-                // Effective coverage: each fully-resolved boundary counts as 1.0,
-                // each XY-timeout shaves off (1 - cover_frac) / xy_per_boundary.
-                // See `effective_coverage_metric` for the derivation.
-                let eff = effective_coverage_metric(
-                    walked,
-                    flow_xy_sat.load(AtomicOrdering::Relaxed),
-                    flow_xy_unsat.load(AtomicOrdering::Relaxed),
-                    flow_xy_timeout.load(AtomicOrdering::Relaxed),
-                    flow_xy_timeout_cov_micro.load(AtomicOrdering::Relaxed),
-                );
-                let cover_rate = if elapsed > 0.0 { eff / elapsed } else { 0.0 };
-                let ttc = if cover_rate > 0.0 { (live_zw_paths - eff).max(0.0) / cover_rate } else { f64::INFINITY };
-                let ttc_str = if ttc < 60.0 { format!("{:.0}s", ttc) }
-                             else if ttc < 3600.0 { format!("{:.0}m", ttc / 60.0) }
-                             else if ttc < 86400.0 { format!("{:.1}h", ttc / 3600.0) }
-                             else { format!("{:.0}d", ttc / 86400.0) };
-                eprintln!("[{:>3.0}s] {}{}{}{} {:>5.0}bnd/s  B:{:<4} W:{:<5} Z:{:<4} XY:{:<5}  {:.2}% cover:{}",
-                    elapsed,
-                    bar(depths[0]), bar(depths[1]), bar(depths[2]), bar(depths[3]),
-                    bnd_rate,
-                    depths[0], depths[1], depths[2], depths[3],
-                    pct_done, ttc_str);
             }
-            last_progress = Instant::now();
+            return;
         }
-    }
-
-    // Signal shutdown
-    for _ in 0..workers {
-        work_queue.push(PipelineWork::Shutdown);
-    }
-    work_queue.condvar.notify_all();
-    for h in handles {
-        let _ = h.join();
-    }
-
-    let elapsed = run_start.elapsed();
-    let done = items_completed.load(AtomicOrdering::Relaxed);
-    // TTC must be based on boundaries actually COMPLETED (stage 0 exit),
-    // not boundaries pushed to the queue. The old counter measured pushes,
-    // which inflates TTC when the monitor front-loads boundaries but workers
-    // can't drain them in the time window. stage_exit[0] is the true count
-    // of boundaries whose ZW->W->Z->XY work has finished.
-    let completed_bnd = stage_exit[0].load(AtomicOrdering::Relaxed);
-    let walked = completed_bnd;
-    let pushed = boundaries_walked.load(AtomicOrdering::Relaxed);
-
-    if verbose {
-        println!("\n--- MDD pipeline k={} ({} workers) ---", k, workers);
-        for (i, name) in ["MDD", "W", "Z", "XY"].iter().enumerate() {
-            println!("  Stage {} ({}): {:>10} items", i, name, stage_exit[i].load(AtomicOrdering::Relaxed));
-        }
-        let _z_done = stage_exit[2].load(AtomicOrdering::Relaxed);
-        let ext_pruned = extensions_pruned.load(AtomicOrdering::Relaxed);
-        println!("  XY solves:                {:>10}", done);
-        println!("  Extensions pruned:        {:>10}", ext_pruned);
-        if cfg.conj_zw_bound {
-            let zw_rej = flow_xy_zw_bound_rej.load(AtomicOrdering::Relaxed);
-            println!("  --conj-zw-bound rejects:  {:>10}", zw_rej);
-        }
-        println!("  Boundaries walked:        {:>10} (pushed: {})", walked, pushed);
-        // Coverage metrics
-        let secs = elapsed.as_secs_f64();
-        let xy_timeout_count = flow_xy_timeout.load(AtomicOrdering::Relaxed);
-        let xy_unsat_count = flow_xy_unsat.load(AtomicOrdering::Relaxed);
-        let xy_sat_count = flow_xy_sat.load(AtomicOrdering::Relaxed);
-        let xy_total_solves = xy_timeout_count + xy_unsat_count + xy_sat_count;
-        let timeout_frac = if xy_total_solves > 0 { xy_timeout_count as f64 / xy_total_solves as f64 } else { 0.0 };
-
-        // Search progress metric.
-        // The MDD at width k partitions the boundary space into 4^(4k) full paths
-        // (each fixing 8k bits across Z,W,X,Y). The MDD pre-eliminates dead paths
-        // during construction. We count live paths to compute remaining work.
-        let total_bits = 4 * n - 1;  // total sign degrees of freedom
-        let bnd_bits = 8 * k;        // bits fixed per full MDD path (all 4 seqs × 2k positions)
-        let subcube_bits = if total_bits > bnd_bits { total_bits - bnd_bits } else { 0 };
-        let live_paths = mdd.count_live_paths();
-        let total_paths = 4.0f64.powi(mdd.depth as i32);
-        let mdd_pruned_frac = 1.0 - live_paths / total_paths;
-        // Each live path is a subcube of 2^subcube_bits configs.
-        // MDD already eliminated (total - live) × 2^subcube_bits configs.
-        // Runtime resolves walked boundaries: each ZW boundary covers
-        // its full XY sub-tree, eliminating multiple full paths.
-        let _mdd_elim_log2 = if mdd_pruned_frac > 0.0 {
-            (total_paths - live_paths).log2() + subcube_bits as f64
-        } else { 0.0 };
-
-        // Headline metric: time to cover. Each fully-resolved boundary
-        // contributes 1.0 to `eff`; XY timeouts contribute fractionally
-        // based on how much of their sub-problem they actually explored.
-        // For a run with no XY timeouts, `eff == walked` exactly, so the
-        // formula reduces to the prior path-rate-based TTC.
-        let xy_timeout_cov_micro = flow_xy_timeout_cov_micro.load(AtomicOrdering::Relaxed);
-        // Pick the right denominator for this mode. Apart/Together walk
-        // MDD boundaries — total work = `live_zw_paths`, effective done =
-        // `walked × (1 - shortfall_per_xy)`. Cross enumerates (Z, W) pairs
-        // and pushes them straight to XY, so total work = total XY
-        // candidate solves (extrapolated from tuple progress while the
-        // producer is still running).
-        let (eff, total_label, total_value, rate_unit) = if wz_mode == WzMode::Cross {
-            let xy_pushed = stage_enter[3].load(AtomicOrdering::Relaxed);
-            let est_total = cross_estimated_total_xy(
-                xy_pushed, cross_tuple_idx, tuples.len(), cross_done,
+        let pos = order[level];
+        for b in 0..4u32 {
+            let child = nodes[nid as usize][b as usize];
+            if child == mdd_reorder::DEAD {
+                continue;
+            }
+            let z = b & 1;
+            let w = (b >> 1) & 1;
+            walk(
+                child,
+                level + 1,
+                z_bits | (z << pos),
+                w_bits | (w << pos),
+                depth,
+                order,
+                nodes,
+                out,
+                cancelled,
             );
-            let xy_done_eff = effective_xy_done(
-                xy_sat_count, xy_unsat_count, xy_timeout_count, xy_timeout_cov_micro,
-            );
-            (xy_done_eff, "XY candidates", est_total, "XY/s")
-        } else {
-            let eff = effective_coverage_metric(
-                walked, xy_sat_count, xy_unsat_count, xy_timeout_count, xy_timeout_cov_micro,
-            );
-            (eff, "live ZW paths", live_zw_paths, "eff bnd/s")
+        }
+    }
+
+    walk(
+        mdd.root,
+        0,
+        0,
+        0,
+        zw_depth,
+        xy_pos_order,
+        &mdd.nodes,
+        &mut out,
+        cancelled,
+    );
+    out
+}
+
+/// Bundle of freshly-constructed `PipelineMetrics` counters. Used
+/// by framework callers that run the staged adapter outside the
+/// legacy `run_mdd_sat_search` closure.
+pub(crate) fn new_pipeline_metrics() -> PipelineMetrics {
+    use std::sync::atomic::AtomicU64;
+    let z = || Arc::new(AtomicU64::new(0));
+    PipelineMetrics {
+        flow_bnd_sum_fail: z(),
+        stage_enter: (0..4).map(|_| z()).collect(),
+        stage_exit: (0..4).map(|_| z()).collect(),
+        pending_boundaries: z(),
+        flow_w_unsat: z(),
+        flow_w_timeout: z(),
+        flow_w_solutions: z(),
+        flow_w_spec_fail: z(),
+        flow_w_spec_pass: z(),
+        flow_w_solves: z(),
+        flow_w_decisions: z(),
+        flow_w_propagations: z(),
+        flow_w_root_forced: z(),
+        flow_w_free_sum: z(),
+        items_completed: z(),
+        flow_z_prep_fail: z(),
+        flow_xy_zw_bound_rej: z(),
+        flow_xy_sat: z(),
+        flow_xy_unsat: z(),
+        flow_xy_timeout: z(),
+        flow_xy_timeout_cov_micro: z(),
+        flow_xy_solves: z(),
+        flow_xy_decisions: z(),
+        flow_xy_propagations: z(),
+        flow_xy_root_forced: z(),
+        flow_xy_free_sum: z(),
+        flow_z_unsat: z(),
+        flow_z_timeout: z(),
+        flow_z_solutions: z(),
+        flow_z_spec_fail: z(),
+        flow_z_pair_fail: z(),
+        flow_z_solves: z(),
+        flow_z_decisions: z(),
+        flow_z_propagations: z(),
+        flow_z_root_forced: z(),
+        flow_z_free_sum: z(),
+        extensions_pruned: z(),
+        flow_wz_empty_v: z(),
+        flow_wz_rule_viol: z(),
+        flow_wz_sat_calls: z(),
+        flow_wz_first_unsat: z(),
+        flow_wz_solutions: z(),
+        flow_wz_exhausted: z(),
+        flow_wz_budget_hit: z(),
+    }
+}
+
+/// MDD pipeline search: unified priority queue with stages MDD→W→Z→XY.
+/// All workers are identical — they grab the highest-stage item from the queue.
+/// Later stages (closer to producing a result) always get processed first.
+/// Unified search dispatch.
+///
+/// All `--wz` modes route through the framework
+/// `search_framework::engine` + per-mode adapter. Kept with the
+/// legacy signature so existing benchmarks and correctness tests
+/// (the `hybrid_finds_ttN` suite in `src/main.rs`) don't need to
+/// rewrite their call sites.
+pub(crate) fn run_mdd_sat_search(
+    problem: Problem,
+    tuples: &[SumTuple],
+    cfg: &SearchConfig,
+    verbose: bool,
+    k: usize,
+) -> SearchReport {
+    use crate::search_framework::engine::{EngineConfig, SearchEngine};
+    use crate::search_framework::events::SearchEvent;
+    use crate::search_framework::mode_adapters::mdd_stages::{MddPayload, MddStagesAdapter};
+    use crate::search_framework::mode_adapters::sync::{SyncAdapter, SyncPayload};
+    use crate::search_framework::queue::GoldThenWork;
+
+    let start = std::time::Instant::now();
+
+    // --wz=sync: no MDD, no tuple enumeration. Framework wraps the
+    // walker as a single SyncWalkStage; inside it still spins up
+    // its own parallel DFS.
+    if cfg.effective_wz_mode() == WzMode::Sync {
+        let sync_cfg = crate::sync_walker::SyncConfig {
+            sat_secs: cfg.sat_secs,
+            sat_config: cfg.sat_config.clone(),
+            conflict_limit: cfg.conflict_limit,
+            random_seed: None,
+            cancel: None,
+            exchange: None,
+            projected_fraction_ppm: None,
+            live_sink: None,
         };
-        let cover_rate = if secs > 0.0 { eff / secs } else { 0.0 };
-        let ttc = if cover_rate > 0.0 { (total_value - eff).max(0.0) / cover_rate } else { f64::INFINITY };
-        let ttc_str = if ttc < 60.0 { format!("{:.0}s", ttc) }
-                     else if ttc < 3600.0 { format!("{:.1}m", ttc / 60.0) }
-                     else if ttc < 86400.0 { format!("{:.1}h", ttc / 3600.0) }
-                     else { format!("{:.1}d", ttc / 86400.0) };
-        println!("  Time to cover:            {} ({:.2} {}, {:.0} {})",
-            ttc_str, cover_rate, rate_unit, total_value, total_label);
-        let pct = if total_value > 0.0 { eff / total_value * 100.0 } else { 0.0 };
-        if wz_mode == WzMode::Cross {
-            println!("  Progress:                 {:.4}% ({:.1} effective of {:.0} estimated; cross_done={})",
-                pct, eff, total_value, cross_done);
-        } else {
-            println!("  Progress:                 {:.4}% ({:.1} effective of {:.0}, {} walked)",
-                pct, eff, total_value, walked);
-        }
-        println!("  XY timeout:               {:.1}%", timeout_frac * 100.0);
-        println!("  Wall-clock:               {:>10.3?}", elapsed);
-
-        // Per-stage SAT pruning diagnostics: averages over all SAT solves
-        // at each stage, derived from the per-stage flow_*_decisions etc.
-        // counters that workers update by diffing radical::Solver counters
-        // before/after each solve.
-        print_stage_pruning_block(
-            ("W", &flow_w_solves, &flow_w_decisions, &flow_w_propagations, &flow_w_root_forced, &flow_w_free_sum, None, None),
-            ("Z", &flow_z_solves, &flow_z_decisions, &flow_z_propagations, &flow_z_root_forced, &flow_z_free_sum, None, None),
-            ("XY", &flow_xy_solves, &flow_xy_decisions, &flow_xy_propagations, &flow_xy_root_forced, &flow_xy_free_sum, Some(&flow_xy_timeout), Some(&flow_xy_timeout_cov_micro)),
+        let _ = tuples;
+        let (adapter, result_rx) = SyncAdapter::build(problem, sync_cfg, verbose);
+        let mut engine = SearchEngine::<SyncPayload>::new(
+            EngineConfig::default(),
+            Box::new(GoldThenWork::new(32)),
         );
-
-        if !found_solution { println!("No solution found."); }
-
-        // Pipeline flow funnel
-        let f = |c: &Arc<std::sync::atomic::AtomicU64>| c.load(AtomicOrdering::Relaxed);
-        let w_emitted = stage_enter[1].load(AtomicOrdering::Relaxed);
-        let sum_fail = f(&flow_bnd_sum_fail);
-        let w_sols = f(&flow_w_solutions);
-        let w_sf = f(&flow_w_spec_fail);
-        let w_sp = f(&flow_w_spec_pass);
-        let z_sols = f(&flow_z_solutions);
-        let z_sf = f(&flow_z_spec_fail);
-        let z_pf = f(&flow_z_pair_fail);
-        let z_gj = f(&flow_z_prep_fail);
-        let z_xy = z_sols.saturating_sub(z_sf + z_pf + z_gj);
-        let xy_total = ext_pruned + f(&flow_xy_sat) + f(&flow_xy_unsat) + f(&flow_xy_timeout);
-        let xy_sat = f(&flow_xy_sat);
-        let xy_unsat = f(&flow_xy_unsat);
-        let xy_timeout = f(&flow_xy_timeout);
-        let pct = |num: u64, den: u64| if den > 0 { format!("{:.1}%", num as f64 / den as f64 * 100.0) } else { "—".into() };
-
-        println!("\n  --- Pipeline Flow ---");
-        println!("  Boundaries  {}", walked);
-        if sum_fail > 0 {
-            println!("    → Tuples    {}  (sum infeasible: {})", walked as u64 * ctx.tuples.len() as u64, sum_fail);
-        }
-        println!("    → SolveW    {}", w_emitted);
-        println!("      → W sols    {}", w_sols);
-        if w_sols > 0 {
-            println!("        ✗ {} W spectral fail ({})", w_sf, pct(w_sf, w_sols));
-        }
-        println!("        → {} pass → SolveZ", w_sp);
-        println!("          → {} Z solutions", z_sols);
-        if z_sols > 0 {
-            if z_sf > 0 { println!("            ✗ {} Z spectral fail ({})", z_sf, pct(z_sf, z_sols)); }
-            if z_pf > 0 { println!("            ✗ {} Z pair fail ({})", z_pf, pct(z_pf, z_sols)); }
-            if z_gj > 0 { println!("            ✗ {} Z prep/GJ fail", z_gj); }
-        }
-        println!("            → {} reach XY stage", z_xy);
-        if z_xy > 0 {
-            println!("              → {} XY candidates", xy_total);
-            if ext_pruned > 0 { println!("                ✗ {} extension pruned ({})", ext_pruned, pct(ext_pruned, xy_total)); }
-            println!("                → {} XY SAT solves", xy_sat + xy_unsat + xy_timeout);
-            println!("                  ✗ {} UNSAT proved ({})", xy_unsat, pct(xy_unsat, xy_unsat + xy_timeout + xy_sat));
-            if xy_timeout > 0 {
-                println!("                  ✗ {} TIMEOUT gave up ({})", xy_timeout, pct(xy_timeout, xy_unsat + xy_timeout + xy_sat));
+        let cancel_flag = engine.cancel_flag();
+        let drain = std::thread::spawn(move || {
+            let mut found = None;
+            while let Ok(sol) = result_rx.recv() {
+                // See comment in the MDD branch below for the
+                // cancel-on-first-solution rationale.
+                cancel_flag.store(true, AtomicOrdering::Relaxed);
+                found = Some(sol);
             }
-            if xy_sat > 0 {
-                println!("                  ✓ {} SAT!", xy_sat);
+            found
+        });
+        engine.run_since(start, &adapter, |_| {});
+        drop(adapter);
+        let found = drain.join().unwrap_or(None);
+        if verbose {
+            if let Some((x, y, z, w)) = found.as_ref() {
+                println!(
+                    "\nFOUND! x={} y={} z={} w={}",
+                    colored_pm(x), colored_pm(y), colored_pm(z), colored_pm(w)
+                );
             }
         }
-
-        // SolveWZ-specific diagnostics (only populated in --wz=together mode).
-        let wz_empty = flow_wz_empty_v.load(AtomicOrdering::Relaxed);
-        let wz_rule = flow_wz_rule_viol.load(AtomicOrdering::Relaxed);
-        let wz_calls = flow_wz_sat_calls.load(AtomicOrdering::Relaxed);
-        let wz_first_unsat = flow_wz_first_unsat.load(AtomicOrdering::Relaxed);
-        let wz_sols = flow_wz_solutions.load(AtomicOrdering::Relaxed);
-        let wz_exhausted = flow_wz_exhausted.load(AtomicOrdering::Relaxed);
-        let wz_budget = flow_wz_budget_hit.load(AtomicOrdering::Relaxed);
-        if wz_empty + wz_rule + wz_calls > 0 {
-            println!("\n  --- SolveWZ Flow (wz=together) ---");
-            println!("    V_w or V_z empty (early skip): {}", wz_empty);
-            println!("    Rule (iv)/(v) violated:         {}", wz_rule);
-            println!("    solver.solve() calls:           {}", wz_calls);
-            println!("      first-call UNSAT:             {} ({})", wz_first_unsat, pct(wz_first_unsat, wz_calls));
-            println!("      WZ solutions produced:        {}", wz_sols);
-            println!("      attempts exhausted (UNSAT):   {} ({})", wz_exhausted, pct(wz_exhausted, wz_calls));
-            println!("      attempts budget-hit (defer):  {} ({})", wz_budget, pct(wz_budget, wz_calls));
-            let wz_items = wz_empty + wz_rule + wz_first_unsat;
-            if wz_items > 0 {
-                let reach_sat = wz_calls.saturating_sub(wz_sols);
-                println!("    → {} reached first SAT call; {} returned 0 solutions", reach_sat, wz_first_unsat);
-            }
-        }
+        return SearchReport {
+            stats: SearchStats::default(),
+            elapsed: start.elapsed(),
+            found_solution: found.is_some(),
+        };
     }
 
-    let all_stats = SearchStats::default(); // TODO: aggregate from workers
-    SearchReport { stats: all_stats, elapsed, found_solution }
+    // MDD-backed modes (cross / apart / together): build staged
+    // adapter, run engine, drain solution channel.
+    let mode_name: &'static str = match cfg.effective_wz_mode() {
+        WzMode::Cross => "cross",
+        WzMode::Apart => "apart",
+        WzMode::Together => "together",
+        WzMode::Sync => unreachable!("sync branched above"),
+    };
+    let mut engine = SearchEngine::<MddPayload>::new(
+        EngineConfig::default(),
+        Box::new(GoldThenWork::new(32)),
+    );
+    let cancel_flag = engine.cancel_flag();
+    let (adapter, result_rx) =
+        MddStagesAdapter::build(problem, tuples.to_vec(), cfg, k, verbose, mode_name, &cancel_flag);
+    let found_ctx = Arc::clone(&adapter.ctx.found);
+    let drain = std::thread::spawn(move || {
+        let mut found = false;
+        while let Ok(_sol) = result_rx.recv() {
+            found_ctx.store(true, AtomicOrdering::Relaxed);
+            // Stop the engine on first solution — otherwise the
+            // coordinator drains the rest of the queue before
+            // `engine.run` returns, wasting work.
+            cancel_flag.store(true, AtomicOrdering::Relaxed);
+            found = true;
+        }
+        found
+    });
+    engine.run_since(start, &adapter, |event| {
+        if let SearchEvent::Progress(p) = event {
+            if verbose {
+                eprintln!(
+                    "[framework:{}] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}",
+                    mode_name, p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc
+                );
+            }
+        }
+    });
+    drop(adapter);
+    let found = drain.join().unwrap_or(false);
+    SearchReport {
+        stats: SearchStats::default(),
+        elapsed: start.elapsed(),
+        found_solution: found,
+    }
 }
 

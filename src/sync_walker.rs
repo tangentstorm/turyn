@@ -22,7 +22,7 @@
 #![allow(unused_imports)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use crate::types::{PackedSeq, Problem, SumTuple};
@@ -36,6 +36,19 @@ use crate::legacy_search::{SearchReport, SearchStats};
 /// unread index.
 pub(crate) struct ClauseExchange {
     pub clauses: std::sync::Mutex<Vec<Vec<i32>>>,
+}
+
+/// Minimal per-worker live stats — just the fields
+/// [`projected_fraction`] needs so the framework monitor can poll
+/// current traversal progress without waiting for the worker's
+/// final `stats_agg` merge. Every `LIVE_FLUSH_STRIDE` DFS node
+/// the worker snapshots its local counters into this sink; the
+/// monitor aggregates across workers and re-runs the projection.
+#[derive(Default)]
+pub(crate) struct LiveSyncStats {
+    pub nodes_visited: u64,
+    pub nodes_by_level: Vec<u64>,
+    pub children_by_level: Vec<u64>,
 }
 
 /// Config slice the walker needs. Pulled from `SearchConfig` at dispatch.
@@ -52,7 +65,26 @@ pub(crate) struct SyncConfig {
     pub cancel: Option<Arc<AtomicBool>>,
     /// Shared learnt-clause exchange. `None` for single-worker mode.
     pub exchange: Option<Arc<ClauseExchange>>,
+    /// Shared sink for the walker's latest projected fraction covered
+    /// (`elapsed / TTC_parallel`), stored as parts-per-million (so an
+    /// atomic integer roundtrip is lossless). Written by the walker
+    /// each progress tick; read by `SyncWalkMassModel::covered_mass`
+    /// so the universal `ProgressSnapshot` carries a non-zero
+    /// fraction for sync mode. `None` when no framework adapter is
+    /// attached.
+    pub projected_fraction_ppm: Option<Arc<AtomicU64>>,
+    /// Per-worker live-stats sink. Written by the DFS hot path
+    /// every `LIVE_FLUSH_STRIDE` nodes so the monitor thread can
+    /// read real mid-run progress, not just the worker's final
+    /// `stats_agg` merge.
+    pub live_sink: Option<Arc<std::sync::Mutex<LiveSyncStats>>>,
 }
+
+/// Flush the live sink every this many visited DFS nodes. 1024 is
+/// cheap enough that the extra `Mutex` lock doesn't show up in
+/// benchmarks, but frequent enough that a 30s run produces hundreds
+/// of snapshot points.
+pub(crate) const LIVE_FLUSH_STRIDE: u64 = 1024;
 
 /// Immutable context computed once per search.
 struct Ctx {
@@ -93,6 +125,10 @@ struct Ctx {
     /// workers).  Each worker publishes newly-learnt nogoods on
     /// propagate_only UNSAT and pulls peer clauses periodically.
     exchange: Option<Arc<ClauseExchange>>,
+    /// Live stats sink fed by the DFS hot path (see
+    /// [`LIVE_FLUSH_STRIDE`]). The monitor thread aggregates
+    /// across all worker sinks for mid-run progress.
+    live_sink: Option<Arc<std::sync::Mutex<LiveSyncStats>>>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -185,12 +221,14 @@ fn build_ctx_seeded(
     seed: u64,
     cancel: Option<Arc<AtomicBool>>,
     exchange: Option<Arc<ClauseExchange>>,
+    live_sink: Option<Arc<std::sync::Mutex<LiveSyncStats>>>,
     start: Instant,
 ) -> Ctx {
     let mut ctx = build_ctx(problem);
     ctx.seed = seed;
     ctx.cancel = cancel;
     ctx.exchange = exchange;
+    ctx.live_sink = live_sink;
     ctx.start = start;
     ctx
 }
@@ -299,6 +337,7 @@ fn build_ctx(problem: Problem) -> Ctx {
         seed: 0, cancel: None, start: Instant::now(),
         valid_tuples,
         exchange: None,
+        live_sink: None,
     }
 }
 
@@ -983,13 +1022,102 @@ fn search_sync_parallel(
         clauses: std::sync::Mutex::new(Vec::new()),
     });
 
+    // Worker liveness counter: the monitor thread exits when this
+    // drops to zero (every worker has returned), independent of
+    // the solution-found `cancel` path. Needed because workers
+    // time out without touching `cancel`, and we can't add a
+    // signal *after* `thread::scope` — scope joins its spawned
+    // threads (including the monitor) before returning.
+    let live_workers = Arc::new(std::sync::atomic::AtomicUsize::new(n_workers));
+    // Per-worker live-stats sink. The DFS hot path flushes into
+    // `live_sinks[worker_id]` every `LIVE_FLUSH_STRIDE` nodes; the
+    // monitor thread aggregates across all workers so
+    // `projected_fraction` sees real mid-run traversal, not just
+    // whatever workers have finished merging into `stats_agg`.
+    let live_sinks: Vec<Arc<std::sync::Mutex<LiveSyncStats>>> = (0..n_workers)
+        .map(|_| Arc::new(std::sync::Mutex::new(LiveSyncStats::default())))
+        .collect();
     thread::scope(|s| {
+        // Monitor thread: periodically aggregate the per-worker
+        // live sinks and feed the result through `projected_fraction`.
+        // Writes the result to `SyncConfig::projected_fraction_ppm`
+        // so the framework adapter's `SyncWalkMassModel::covered_mass`
+        // returns a non-zero fraction *during* the walk — matches
+        // the fixed-tick universal `ProgressSnapshot` schema in
+        // `docs/TELEMETRY.md`.
+        if let Some(sink) = cfg.projected_fraction_ppm.as_ref() {
+            let sink = Arc::clone(sink);
+            let cancel_monitor = Arc::clone(&cancel);
+            let live_workers_monitor = Arc::clone(&live_workers);
+            let live_sinks_monitor: Vec<_> =
+                live_sinks.iter().map(Arc::clone).collect();
+            let n = problem.n;
+            s.spawn(move || {
+                loop {
+                    if cancel_monitor.load(AtomicOrdering::Relaxed)
+                        || live_workers_monitor.load(AtomicOrdering::Relaxed) == 0
+                    {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    // Aggregate only the three fields
+                    // `projected_fraction` consumes, so the per-
+                    // worker flush stays cheap.
+                    let mut agg = SyncStats {
+                        nodes_visited: 0, memo_hits: 0,
+                        capacity_rejects: 0, rule_rejects: 0,
+                        tuple_rejects: 0, sat_unsat: 0,
+                        leaves_reached: 0, max_level_reached: 0,
+                        nodes_by_level: Vec::new(),
+                        children_by_level: Vec::new(),
+                        children_total: 0, internal_nodes: 0,
+                        time_to_first_leaf: None,
+                        nogood_len_sum: 0, full_nogood_len_sum: 0,
+                        peer_clauses_read: 0, peer_clauses_imported: 0,
+                        forced_by_level: Vec::new(),
+                        sub_cube_time_by_level: Vec::new(),
+                        children_processed_by_level: Vec::new(),
+                        prop_by_kind_total: [0; radical::PropKind::COUNT],
+                        forced_by_level_kind: Vec::new(),
+                    };
+                    for live in &live_sinks_monitor {
+                        let snap = live.lock().unwrap();
+                        agg.nodes_visited += snap.nodes_visited;
+                        if agg.nodes_by_level.len() < snap.nodes_by_level.len() {
+                            agg.nodes_by_level.resize(snap.nodes_by_level.len(), 0);
+                        }
+                        for (i, &c) in snap.nodes_by_level.iter().enumerate() {
+                            agg.nodes_by_level[i] += c;
+                        }
+                        if agg.children_by_level.len() < snap.children_by_level.len() {
+                            agg.children_by_level
+                                .resize(snap.children_by_level.len(), 0);
+                        }
+                        for (i, &c) in snap.children_by_level.iter().enumerate() {
+                            agg.children_by_level[i] += c;
+                        }
+                    }
+                    if let Some(f) = projected_fraction(
+                        &agg,
+                        n,
+                        start.elapsed().as_secs_f64(),
+                        n_workers,
+                    ) {
+                        sink.store((f * 1_000_000.0) as u64, AtomicOrdering::Relaxed);
+                    }
+                }
+            });
+        }
+
         for worker_id in 0..n_workers {
             let cfg = cfg.clone();
+            let live_workers = Arc::clone(&live_workers);
             let cancel = Arc::clone(&cancel);
             let result = Arc::clone(&result);
             let stats_agg = Arc::clone(&stats_agg);
             let exchange = Arc::clone(&exchange);
+            let live_sink = Arc::clone(&live_sinks[worker_id]);
+            let live_sink_for_flush = Arc::clone(&live_sink);
             s.spawn(move || {
                 // Worker 0: seed=0 → score-sorted best-first siblings.
                 // Worker k>0: seed=k → randomised ordering distinct
@@ -998,9 +1126,38 @@ fn search_sync_parallel(
                     random_seed: Some(worker_id as u64),
                     cancel: Some(Arc::clone(&cancel)),
                     exchange: Some(Arc::clone(&exchange)),
+                    live_sink: Some(live_sink),
                     ..cfg
                 };
                 let (sol, stats, _) = search_sync_serial(problem, &worker_cfg, false, start);
+                // Final flush into this worker's `live_sink` before
+                // merging into `stats_agg` and dropping
+                // `live_workers`. The in-loop flush runs every
+                // `LIVE_FLUSH_STRIDE` nodes, so a worker that
+                // exited at `k * LIVE_FLUSH_STRIDE + r` otherwise
+                // loses the trailing `r` nodes' worth of progress
+                // from the monitor's aggregate (and a worker that
+                // stopped at < stride would contribute 0 forever).
+                {
+                    let mut snap = live_sink_for_flush.lock().unwrap();
+                    snap.nodes_visited = stats.nodes_visited;
+                    if snap.nodes_by_level.len() < stats.nodes_by_level.len() {
+                        snap.nodes_by_level
+                            .resize(stats.nodes_by_level.len(), 0);
+                    }
+                    snap.nodes_by_level
+                        .iter_mut()
+                        .zip(stats.nodes_by_level.iter())
+                        .for_each(|(d, s)| *d = *s);
+                    if snap.children_by_level.len() < stats.children_by_level.len() {
+                        snap.children_by_level
+                            .resize(stats.children_by_level.len(), 0);
+                    }
+                    snap.children_by_level
+                        .iter_mut()
+                        .zip(stats.children_by_level.iter())
+                        .for_each(|(d, s)| *d = *s);
+                }
                 let mut agg = stats_agg.lock().unwrap();
                 agg.nodes_visited += stats.nodes_visited;
                 agg.memo_hits += stats.memo_hits;
@@ -1073,12 +1230,27 @@ fn search_sync_parallel(
                         cancel.store(true, AtomicOrdering::Release);
                     }
                 }
+                // Decrement liveness so the monitor can exit when
+                // the last worker returns — even without a
+                // solution to flip `cancel`.
+                live_workers.fetch_sub(1, AtomicOrdering::AcqRel);
             });
         }
     });
 
     let elapsed = start.elapsed();
     let stats = stats_agg.lock().unwrap().clone();
+    // Surface the walker's projected-fraction covered through the
+    // `SyncConfig::projected_fraction_ppm` hook so the framework
+    // adapter's `SyncWalkMassModel` sees a non-zero `covered_mass`
+    // at Finished time. Live mid-run updates are a follow-up — the
+    // walker has no natural progress tick today.
+    if let (Some(ref sink), Some(f)) = (
+        cfg.projected_fraction_ppm.as_ref(),
+        projected_fraction(&stats, problem.n, elapsed.as_secs_f64(), n_workers),
+    ) {
+        sink.store((f * 1_000_000.0) as u64, AtomicOrdering::Relaxed);
+    }
     let found = result.lock().unwrap().clone();
     if verbose {
         eprintln!(
@@ -1269,6 +1441,59 @@ fn format_per_level_telemetry(stats: &SyncStats) -> String {
 /// TTC_serial  = N_total / rate,   TTC_parallel = TTC_serial / n_workers
 /// where rate = nodes_visited / elapsed (aggregate across workers in
 /// parallel mode, so this is already a parallel rate).
+/// Compute the walker's projected-fraction covered — i.e.
+/// `elapsed / TTC_parallel` clamped to `[0, 1]`. Returns `None`
+/// when sample size is insufficient to produce a meaningful
+/// projection (same early-exit condition as `project_ttc`).
+///
+/// The returned value is what `SyncConfig::projected_fraction_ppm`
+/// stores (scaled by 1e6 for atomic-integer roundtrip).
+pub(crate) fn projected_fraction(
+    stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize,
+) -> Option<f64> {
+    const NOISY_THRESHOLD: u64 = 32;
+    let depth = n;
+    if elapsed_secs <= 0.0 || stats.nodes_visited == 0 {
+        return None;
+    }
+    struct Bee { b: f64, sampled: bool, noisy: bool }
+    let mut b_eff: Vec<Bee> = Vec::with_capacity(depth);
+    for l in 0..depth {
+        let parent = stats.nodes_by_level.get(l).copied().unwrap_or(0);
+        let child = stats.children_by_level.get(l).copied().unwrap_or(0);
+        if parent == 0 {
+            b_eff.push(Bee { b: 0.0, sampled: false, noisy: false });
+        } else {
+            b_eff.push(Bee {
+                b: child as f64 / parent as f64,
+                sampled: true,
+                noisy: parent < NOISY_THRESHOLD,
+            });
+        }
+    }
+    let mut clean_bs: Vec<f64> =
+        b_eff.iter().filter(|x| x.sampled && !x.noisy).map(|x| x.b).collect();
+    clean_bs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let fallback = if clean_bs.is_empty() { 1.0 } else { clean_bs[clean_bs.len() / 2] };
+    let mut projected_nodes = 1.0_f64;
+    let mut running_product = 1.0_f64;
+    for l in 0..depth {
+        let b = match b_eff.get(l) {
+            Some(Bee { b, sampled: true, .. }) => *b,
+            _ => fallback,
+        };
+        running_product *= b;
+        projected_nodes += running_product;
+        if !running_product.is_finite() { break; }
+    }
+    let rate = stats.nodes_visited as f64 / elapsed_secs;
+    if rate <= 0.0 || !projected_nodes.is_finite() { return None; }
+    let ttc_parallel = projected_nodes / rate;
+    let _ = n_workers;
+    if ttc_parallel <= 0.0 || !ttc_parallel.is_finite() { return None; }
+    Some((elapsed_secs / ttc_parallel).clamp(0.0, 1.0))
+}
+
 fn project_ttc(stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize) -> String {
     const NOISY_THRESHOLD: u64 = 32;
     let depth = n;  // bouncing-order depth = n for even n
@@ -1353,7 +1578,14 @@ fn search_sync_serial(
     start: Instant,
 ) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SyncStats, std::time::Duration) {
     let seed = cfg.random_seed.unwrap_or(0);
-    let ctx = build_ctx_seeded(problem, seed, cfg.cancel.clone(), cfg.exchange.clone(), start);
+    let ctx = build_ctx_seeded(
+        problem,
+        seed,
+        cfg.cancel.clone(),
+        cfg.exchange.clone(),
+        cfg.live_sink.clone(),
+        start,
+    );
     let mut solver = build_solver(problem, &cfg.sat_config);
     if cfg.conflict_limit > 0 {
         solver.set_conflict_limit(cfg.conflict_limit);
@@ -1467,6 +1699,35 @@ fn dfs_body(
     }
     if state.level as u64 > stats.max_level_reached {
         stats.max_level_reached = state.level as u64;
+    }
+
+    // Flush a snapshot of the three fields `projected_fraction`
+    // reads into the per-worker live sink every
+    // `LIVE_FLUSH_STRIDE` nodes. The `stride & (stride-1) == 0`
+    // mask is cheaper than `%` for the hot path. Uncontested
+    // `Mutex` locks cost ~20ns on x86_64, so the flush is
+    // effectively free.
+    if stats.nodes_visited & (LIVE_FLUSH_STRIDE - 1) == 0 {
+        if let Some(live) = &ctx.live_sink {
+            let mut snap = live.lock().unwrap();
+            snap.nodes_visited = stats.nodes_visited;
+            if snap.nodes_by_level.len() < stats.nodes_by_level.len() {
+                snap.nodes_by_level
+                    .resize(stats.nodes_by_level.len(), 0);
+            }
+            snap.nodes_by_level
+                .iter_mut()
+                .zip(stats.nodes_by_level.iter())
+                .for_each(|(d, s)| *d = *s);
+            if snap.children_by_level.len() < stats.children_by_level.len() {
+                snap.children_by_level
+                    .resize(stats.children_by_level.len(), 0);
+            }
+            snap.children_by_level
+                .iter_mut()
+                .zip(stats.children_by_level.iter())
+                .for_each(|(d, s)| *d = *s);
+        }
     }
 
     // Cumulative count of walker-var propagations at this frame's

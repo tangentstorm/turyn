@@ -246,17 +246,6 @@ pub(crate) fn spectral_pair_ok(z_spectrum: &[f64], w_spectrum: &[f64], bound: f6
 }
 
 
-/// Max combined spectral power across all frequencies.
-pub(crate) fn spectral_pair_max_power(z_spectrum: &[f64], w_spectrum: &[f64]) -> f64 {
-    let mut max_power = 0.0f64;
-    for i in 0..z_spectrum.len() {
-        let combined = z_spectrum[i] + w_spectrum[i];
-        if combined > max_power { max_power = combined; }
-    }
-    max_power
-}
-
-
 /// Index for fast spectral pair lookups.
 /// For each frequency, stores W candidate indices sorted by power at that frequency.
 /// Given a Z spectrum, we find the tightest frequency (highest Z power), then binary

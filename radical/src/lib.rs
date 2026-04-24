@@ -782,10 +782,13 @@ pub struct Solver {
     // Search stats (plain u64 — Solver is per-thread; aggregation at caller)
     decisions: u64,
     propagations: u64,
-    /// Per-propagator forced-variable counters, indexed by `PropKind`.
-    /// `propagations` is the sum of these. Lets callers attribute work
-    /// to clause BCP / PB / quad PB / XOR / spectral / MDD / PB-set-eq.
-    prop_by_kind: [u64; PropKind::COUNT],
+    /// Per-propagator forced-variable counters, indexed by
+    /// `[decision_level][PropKind]`. `propagations` is the sum of all
+    /// cells. Indexable up to the current `decision_level()`; grown on
+    /// every `new_decision_level()` and carries level 0 from `new()`.
+    /// Accumulates across backtracks — counts are "total propagations
+    /// that ever happened at level L by kind K" over the solver's lifetime.
+    prop_by_kind_level: Vec<[u64; PropKind::COUNT]>,
 
     // propagate_only stats
     last_nogood_len: usize,
@@ -887,7 +890,7 @@ impl Solver {
             luby_index: 0,
             decisions: 0,
             propagations: 0,
-            prop_by_kind: [0; PropKind::COUNT],
+            prop_by_kind_level: vec![[0; PropKind::COUNT]],
             last_nogood_len: 0,
             last_full_nogood_len: 0,
             last_learnt_clause: None,
@@ -2190,9 +2193,19 @@ impl Solver {
     /// quad PB, XOR, MDD, spectral). Excludes branching decisions.
     pub fn num_propagations(&self) -> u64 { self.propagations }
     /// Per-propagator forced-variable counts (sums to `num_propagations`).
-    /// Index with `kind as usize`; `PropKind::ALL` enumerates all kinds.
+    /// Summed across all decision levels; for the 2-D breakdown see
+    /// `propagations_by_kind_level`.
     pub fn propagations_by_kind(&self, kind: PropKind) -> u64 {
-        self.prop_by_kind[kind as usize]
+        let k = kind as usize;
+        self.prop_by_kind_level.iter().map(|row| row[k]).sum()
+    }
+    /// Per-`[decision_level][PropKind]` forced-variable counts.
+    /// `result[L][K]` is the total number of times propagator `K` forced
+    /// a literal while the solver was at decision level `L`. Reading
+    /// this and summing column-wise yields the same values as
+    /// `propagations_by_kind`. Sum of all cells equals `num_propagations`.
+    pub fn propagations_by_kind_level(&self) -> &[[u64; PropKind::COUNT]] {
+        &self.prop_by_kind_level
     }
     /// Number of variables currently assigned at decision level 0 (the
     /// "forced prefix"). Diff before/after a solve to see how many vars
@@ -3175,6 +3188,7 @@ impl Solver {
 
     fn new_decision_level(&mut self) {
         self.trail_lim.push(self.trail.len());
+        self.prop_by_kind_level.push([0; PropKind::COUNT]);
     }
 
     #[inline(always)]
@@ -3197,7 +3211,8 @@ impl Solver {
         self.trail.push(TrailEntry { lit, level: self.decision_level(), reason });
         if let Some(kind) = reason.prop_kind() {
             self.propagations += 1;
-            self.prop_by_kind[kind as usize] += 1;
+            let lvl = self.decision_level() as usize;
+            self.prop_by_kind_level[lvl][kind as usize] += 1;
         }
     }
 

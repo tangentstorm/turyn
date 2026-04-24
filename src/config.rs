@@ -31,14 +31,18 @@ use crate::xy_sat::*;
 /// with LSB = leftmost position.
 #[derive(Clone, Debug)]
 pub(crate) struct OutfixSpec {
-    /// MDD-boundary Z bits (packed as in `expand_boundary_bits`): bits
-    /// 0..k-1 = prefix Z[0..k], bits k..2k-1 = suffix Z[n-k..n].
-    pub(crate) z_bits: u32,
-    /// Same for W.
-    pub(crate) w_bits: u32,
-    /// Optional XY pinning (same encoding as z_bits/w_bits).  When set,
-    /// the XY search is restricted to this single (x_bits, y_bits).
+    /// Optional XY pinning — packed bits: bits 0..k-1 = prefix
+    /// X[0..k], bits k..2k-1 = suffix X[n-k..n] (and same for Y).
+    /// When set, the XY search is restricted to this single
+    /// (x_bits, y_bits).
     pub(crate) xy_bits: Option<(u32, u32)>,
+    /// ZW boundary bits: same packed encoding (bits 0..k-1 = prefix,
+    /// bits k..2k-1 = suffix).  Always populated by `parse_outfix`.
+    /// The framework adapter uses these to seed a single boundary
+    /// (via `mdd_navigate_to_outfix`) instead of enumerating every
+    /// live boundary — which is mandatory at k≥9 where there are
+    /// hundreds of millions of boundaries.
+    pub(crate) zw_bits: (u32, u32),
     /// Middle-position pins for Z: `(middle_idx, value)` where
     /// `middle_idx ∈ 0..middle_n` indexes `Z[k+middle_idx]` and `value`
     /// is ±1.  Forces the corresponding SAT var in SolveWZ.
@@ -242,9 +246,8 @@ pub(crate) fn parse_outfix(s: &str, n: usize, k: usize) -> Result<OutfixSpec, St
     }
 
     Ok(OutfixSpec {
-        z_bits,
-        w_bits,
         xy_bits: Some((x_bits, y_bits)),
+        zw_bits: (z_bits, w_bits),
         z_middle_pins,
         w_middle_pins,
         x_middle_pins,
@@ -326,10 +329,6 @@ pub(crate) struct SearchConfig {
     /// is a no-op. Enabled via `--conj-tuple` (see
     /// conjectures/positive-tuple.md).
     pub(crate) conj_tuple: bool,
-    /// Hidden migration toggle for the unified search framework.
-    /// `legacy` keeps the existing direct pipeline; `new` routes selected
-    /// modes through `search_framework::engine`.
-    pub(crate) engine: EngineKind,
 }
 
 /// Which (Z, W) candidate producer feeds the shared XY SAT stage.
@@ -357,12 +356,6 @@ pub(crate) enum WzMode {
     /// solver absorbs full BDKR (i)–(vi) + Turyn identity as per-lag
     /// quad PB; learned clauses persist across the walk. See `sync_walker`.
     Sync,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EngineKind {
-    Legacy,
-    New,
 }
 
 impl Default for SearchConfig {
@@ -393,7 +386,6 @@ impl Default for SearchConfig {
             conj_xy_product: false,
             conj_zw_bound: false,
             conj_tuple: false,
-            engine: EngineKind::Legacy,
         }
     }
 }
@@ -498,9 +490,6 @@ impl SearchConfig {
         }
         if let Some(d) = self.dump_dimacs.as_ref() {
             parts.push(format!("--dump-dimacs={d}"));
-        }
-        if self.engine == EngineKind::New {
-            parts.push("--engine=new".into());
         }
         let threads = std::env::var("TURYN_THREADS")
             .ok()
