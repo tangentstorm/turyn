@@ -15,6 +15,7 @@ use turyn::mdd_reorder;
 use turyn::mdd_zw_first;
 use turyn::sat_z_middle;
 
+use crate::SPECTRAL_FREQS;
 use crate::config::*;
 use crate::enumerate::*;
 use crate::mdd_pipeline::*;
@@ -22,8 +23,6 @@ use crate::spectrum::*;
 use crate::stochastic::*;
 use crate::types::*;
 use crate::xy_sat::*;
-use crate::SPECTRAL_FREQS;
-
 
 #[derive(Default, Clone, Debug)]
 pub(crate) struct SearchStats {
@@ -36,7 +35,6 @@ pub(crate) struct SearchStats {
     pub(crate) xy_nodes: usize,
     pub(crate) phase_b_nanos: u64,
 }
-
 
 impl SearchStats {
     pub(crate) fn merge_from(&mut self, other: &SearchStats) {
@@ -51,7 +49,6 @@ impl SearchStats {
     }
 }
 
-
 /// Per-worker warm-start state for phase transfer between SAT solves.
 /// Each worker captures the last solver's phase vector and injects it
 /// into the next clone-and-solve cycle — a cheap way to preserve value
@@ -60,7 +57,6 @@ pub(crate) struct WarmStartState {
     pub(crate) phase: Option<Vec<bool>>,
     pub(crate) inject_phase: bool,
 }
-
 
 #[derive(Clone, Debug)]
 pub(crate) struct SearchReport {
@@ -71,7 +67,6 @@ pub(crate) struct SearchReport {
 
 // ==================== Unified SAT work-item types ====================
 
-
 pub(crate) fn run_benchmark(cfg: &SearchConfig) {
     if cfg.stochastic {
         run_stochastic_benchmark(cfg);
@@ -79,7 +74,6 @@ pub(crate) fn run_benchmark(cfg: &SearchConfig) {
         run_hybrid_benchmark(cfg);
     }
 }
-
 
 pub(crate) fn run_hybrid_benchmark(cfg: &SearchConfig) {
     let repeats = cfg.benchmark_repeats.max(1);
@@ -100,12 +94,18 @@ pub(crate) fn run_hybrid_benchmark(cfg: &SearchConfig) {
     elapsed_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
     let median = elapsed_ms[elapsed_ms.len() / 2];
     let mean = elapsed_ms.iter().sum::<f64>() / elapsed_ms.len() as f64;
-    println!("benchmark,summary,mean_ms={:.3},median_ms={:.3},repeats={}", mean, median, repeats);
+    println!(
+        "benchmark,summary,mean_ms={:.3},median_ms={:.3},repeats={}",
+        mean, median, repeats
+    );
 }
 
-
 pub(crate) fn run_stochastic_benchmark(cfg: &SearchConfig) {
-    let secs = if cfg.stochastic_seconds > 0 { cfg.stochastic_seconds } else { 10 };
+    let secs = if cfg.stochastic_seconds > 0 {
+        cfg.stochastic_seconds
+    } else {
+        10
+    };
     let repeats = cfg.benchmark_repeats.max(1);
     // Warmup
     let warmup = stochastic_search(cfg.problem, cfg.test_tuple.as_ref(), false, secs);
@@ -141,7 +141,6 @@ pub(crate) fn run_stochastic_benchmark(cfg: &SearchConfig) {
     );
 }
 
-
 /// Thin wrapper around the unified runner with `wz_mode = Cross`. Kept
 /// for tests and benchmarks that were written before the unification;
 /// new code should call `run_mdd_sat_search` directly.
@@ -150,9 +149,21 @@ pub(crate) fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchRepo
     let mut tuples = phase_a_tuples(problem, cfg.test_tuple.as_ref());
     // Heuristic tuple ordering depends on problem size.
     if problem.n >= 26 {
-        tuples.sort_by_key(|t| ((t.x - t.y).abs(), t.z.abs() + t.w.abs(), t.x.abs() + t.y.abs()));
+        tuples.sort_by_key(|t| {
+            (
+                (t.x - t.y).abs(),
+                t.z.abs() + t.w.abs(),
+                t.x.abs() + t.y.abs(),
+            )
+        });
     } else {
-        tuples.sort_by_key(|t| (t.z.abs() + t.w.abs(), (t.x - t.y).abs(), t.x.abs() + t.y.abs()));
+        tuples.sort_by_key(|t| {
+            (
+                t.z.abs() + t.w.abs(),
+                (t.x - t.y).abs(),
+                t.x.abs() + t.y.abs(),
+            )
+        });
     }
 
     let mut cfg = cfg.clone();
@@ -165,4 +176,3 @@ pub(crate) fn run_hybrid_search(cfg: &SearchConfig, verbose: bool) -> SearchRepo
     let mdd_k = cfg.mdd_k.min((problem.n - 1) / 2).min(problem.m() / 2);
     run_mdd_sat_search(problem, &tuples, &cfg, verbose, mdd_k)
 }
-

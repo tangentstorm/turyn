@@ -16,6 +16,7 @@ use turyn::mdd_reorder;
 use turyn::mdd_zw_first;
 use turyn::sat_z_middle;
 
+use crate::SPECTRAL_FREQS;
 use crate::config::*;
 use crate::enumerate::*;
 use crate::legacy_search::*;
@@ -23,10 +24,6 @@ use crate::spectrum::*;
 use crate::stochastic::*;
 use crate::types::*;
 use crate::xy_sat::*;
-use crate::SPECTRAL_FREQS;
-
-
-
 
 /// Produce a `(decision_level, PropKind as u8, count)` list for the
 /// forced literals attributable to `solver` since `baseline` was
@@ -66,12 +63,15 @@ pub(crate) fn compute_zw_autocorr(problem: Problem, z: &PackedSeq, w: &PackedSeq
     let mut zw = vec![0i32; problem.n];
     for s in 1..problem.n {
         let nz = z.autocorrelation(s);
-        let nw = if s < problem.m() { w.autocorrelation(s) } else { 0 };
+        let nw = if s < problem.m() {
+            w.autocorrelation(s)
+        } else {
+            0
+        };
         zw[s] = 2 * nz + 2 * nw;
     }
     zw
 }
-
 
 /// `--conj-zw-bound` filter: at lag `s = n - diff` for `diff in 1..=3`
 /// (only while `k >= diff`), check the tightness conjecture
@@ -89,21 +89,24 @@ pub(crate) fn compute_zw_autocorr(problem: Problem, z: &PackedSeq, w: &PackedSeq
 /// the aggressive `s ∈ {n-4, n-5}` regime (not yet wired).  Filter is
 /// retained for correctness and for future aggressive-lag extensions.
 pub(crate) fn check_conj_zw_bound(
-    n: usize, k: usize,
-    x_bits: u32, y_bits: u32,
-    z_seq: &PackedSeq, w_seq: &PackedSeq,
+    n: usize,
+    k: usize,
+    x_bits: u32,
+    y_bits: u32,
+    z_seq: &PackedSeq,
+    w_seq: &PackedSeq,
 ) -> bool {
     let m = n - 1;
     let boundary_val = |bits: u32, pos: usize| -> i32 {
         let bit_idx = if pos < k { pos } else { k + (pos - (n - k)) };
         if (bits >> bit_idx) & 1 == 1 { 1 } else { -1 }
     };
-    let u_at = |pos: usize| -> i32 {
-        boundary_val(x_bits, pos) * boundary_val(y_bits, pos)
-    };
+    let u_at = |pos: usize| -> i32 { boundary_val(x_bits, pos) * boundary_val(y_bits, pos) };
 
     for diff in 1..=3usize {
-        if k < diff { break; }
+        if k < diff {
+            break;
+        }
         let s = n - diff;
         let nz = z_seq.autocorrelation(s);
         let nw = if s < m { w_seq.autocorrelation(s) } else { 0 };
@@ -130,18 +133,23 @@ pub(crate) fn check_conj_zw_bound(
     true
 }
 
-
 /// Generic 4-way MDD walker. Walks from `nid` at `level` down to `depth`,
 /// accumulating two bit-packed values (a_acc, b_acc) for branches (low bit, high bit).
 /// Calls `emit(a_acc, b_acc, terminal_nid)` at terminal depth.
 /// When a LEAF sentinel is reached before depth, enumerates all remaining branches.
 pub(crate) fn walk_mdd_4way(
-    nid: u32, level: usize, depth: usize,
-    a_acc: u32, b_acc: u32,
-    pos_order: &[usize], nodes: &[[u32; 4]],
+    nid: u32,
+    level: usize,
+    depth: usize,
+    a_acc: u32,
+    b_acc: u32,
+    pos_order: &[usize],
+    nodes: &[[u32; 4]],
     emit: &mut impl FnMut(u32, u32, u32),
 ) {
-    if nid == mdd_reorder::DEAD { return; }
+    if nid == mdd_reorder::DEAD {
+        return;
+    }
     if level == depth {
         emit(a_acc, b_acc, nid);
         return;
@@ -153,19 +161,29 @@ pub(crate) fn walk_mdd_4way(
     let pos = pos_order[level];
     for branch in 0u32..4 {
         let child = nodes[nid as usize][branch as usize];
-        if child == mdd_reorder::DEAD { continue; }
+        if child == mdd_reorder::DEAD {
+            continue;
+        }
         let a_val = (branch >> 0) & 1;
         let b_val = (branch >> 1) & 1;
-        walk_mdd_4way(child, level + 1, depth,
-            a_acc | (a_val << pos), b_acc | (b_val << pos),
-            pos_order, nodes, emit);
+        walk_mdd_4way(
+            child,
+            level + 1,
+            depth,
+            a_acc | (a_val << pos),
+            b_acc | (b_val << pos),
+            pos_order,
+            nodes,
+            emit,
+        );
     }
 }
 
-
 pub(crate) fn walk_mdd_4way_leaf(
-    level: usize, depth: usize,
-    a_acc: u32, b_acc: u32,
+    level: usize,
+    depth: usize,
+    a_acc: u32,
+    b_acc: u32,
     pos_order: &[usize],
     emit: &mut impl FnMut(u32, u32, u32),
 ) {
@@ -177,12 +195,16 @@ pub(crate) fn walk_mdd_4way_leaf(
     for branch in 0u32..4 {
         let a_val = (branch >> 0) & 1;
         let b_val = (branch >> 1) & 1;
-        walk_mdd_4way_leaf(level + 1, depth,
-            a_acc | (a_val << pos), b_acc | (b_val << pos),
-            pos_order, emit);
+        walk_mdd_4way_leaf(
+            level + 1,
+            depth,
+            a_acc | (a_val << pos),
+            b_acc | (b_val << pos),
+            pos_order,
+            emit,
+        );
     }
 }
-
 
 /// Try to load the best available MDD file, scanning from max_k down to 1.
 pub(crate) fn load_best_mdd(max_k: usize, verbose: bool) -> Option<mdd_reorder::Mdd4> {
@@ -197,16 +219,22 @@ pub(crate) fn load_best_mdd(max_k: usize, verbose: bool) -> Option<mdd_reorder::
                 // "0.00001% live" (typical for k=7 n=26) from "literally zero".
                 // The "100% pruned" framing rounds away the only interesting
                 // digits at this scale.
-                eprintln!("Loaded MDD from {} (k={}, {} nodes, {:.1} MB, {:.2e} live / {:.2e} total paths, {:.2e} live fraction)",
-                    path, m.k, m.nodes.len(), m.nodes.len() as f64 * 16.0 / 1_048_576.0,
-                    live, total, live_frac);
+                eprintln!(
+                    "Loaded MDD from {} (k={}, {} nodes, {:.1} MB, {:.2e} live / {:.2e} total paths, {:.2e} live fraction)",
+                    path,
+                    m.k,
+                    m.nodes.len(),
+                    m.nodes.len() as f64 * 16.0 / 1_048_576.0,
+                    live,
+                    total,
+                    live_frac
+                );
             }
             return Some(m);
         }
     }
     None
 }
-
 
 /// Items the five stage helpers (`process_boundary`,
 /// `process_solve_w`, `process_solve_wz`, `process_solve_z`,
@@ -229,13 +257,11 @@ pub(crate) enum PipelineWork {
     SolveZ(SolveZWork),
 }
 
-
 pub(crate) struct BoundaryWork {
     pub(crate) z_bits: u32,
     pub(crate) w_bits: u32,
     pub(crate) xy_root: u32,
 }
-
 
 pub(crate) struct SolveWZWork {
     /// Representative tuple (for trace / cache keys).  The real candidate
@@ -266,7 +292,6 @@ pub(crate) struct SolveWZWork {
     pub(crate) prior_blocks: Vec<Vec<i32>>,
 }
 
-
 pub(crate) struct SolveWWork {
     /// Representative tuple (for trace/cache keys).  Under the multi-tuple
     /// pipeline the *real* surviving tuple set is `candidate_tuples`.
@@ -281,7 +306,6 @@ pub(crate) struct SolveWWork {
     pub(crate) candidate_tuples: Vec<SumTuple>,
 }
 
-
 pub(crate) struct SolveZWork {
     pub(crate) tuple: SumTuple,
     pub(crate) z_bits: u32,
@@ -295,22 +319,19 @@ pub(crate) struct SolveZWork {
     pub(crate) candidate_tuples: Vec<SumTuple>,
 }
 
-
-
-
 /// Read-only context shared across all workers (via Arc). Populated
 /// once in `run_mdd_sat_search` before spawning workers and read-only
 /// thereafter.
 pub(crate) struct PhaseBContext {
     pub(crate) mdd: Arc<mdd_reorder::Mdd4>,
-    pub(crate) xy_pos_order: Vec<usize>,  // full pos_order for XY sub-MDD walk
+    pub(crate) xy_pos_order: Vec<usize>, // full pos_order for XY sub-MDD walk
     pub(crate) tuples: Vec<SumTuple>,
     pub(crate) w_tmpl: sat_z_middle::LagTemplate,
     pub(crate) z_tmpl: sat_z_middle::LagTemplate,
     pub(crate) problem: Problem,
     pub(crate) k: usize,
-    pub(crate) zw_depth: usize,         // full 2*k — matches the MDD's ZW half depth
-    pub(crate) xy_zw_depth: usize,      // full 2*k for XY sub-MDD walk
+    pub(crate) zw_depth: usize, // full 2*k — matches the MDD's ZW half depth
+    pub(crate) xy_zw_depth: usize, // full 2*k for XY sub-MDD walk
     pub(crate) middle_n: usize,
     pub(crate) middle_m: usize,
     pub(crate) max_bnd_sum: i32,
@@ -353,8 +374,6 @@ pub(crate) struct PhaseBContext {
     pub(crate) outfix_x_mid_pins: Vec<(usize, i8)>,
     pub(crate) outfix_y_mid_pins: Vec<(usize, i8)>,
 }
-
-
 
 /// Metric atomics shared across workers in the MDD pipeline. Also
 /// passed as a bundle into the per-stage handler helpers
@@ -483,12 +502,12 @@ pub(crate) fn process_boundary(
     for &tuple in &ctx.tuples {
         // Both ±|σ_W|, ±|σ_Z| allowed — feasible if AT LEAST ONE sign
         // of each is in range and parity.
-        let z_feas = [tuple.z.abs(), -tuple.z.abs()].iter().any(|&s| {
-            crate::spectrum::sigma_full_to_cnt(s, z_bnd_sum, ctx.middle_n).is_some()
-        });
-        let w_feas = [tuple.w.abs(), -tuple.w.abs()].iter().any(|&s| {
-            crate::spectrum::sigma_full_to_cnt(s, w_bnd_sum, ctx.middle_m).is_some()
-        });
+        let z_feas = [tuple.z.abs(), -tuple.z.abs()]
+            .iter()
+            .any(|&s| crate::spectrum::sigma_full_to_cnt(s, z_bnd_sum, ctx.middle_n).is_some());
+        let w_feas = [tuple.w.abs(), -tuple.w.abs()]
+            .iter()
+            .any(|&s| crate::spectrum::sigma_full_to_cnt(s, w_bnd_sum, ctx.middle_m).is_some());
         if !z_feas || !w_feas {
             metrics
                 .flow_bnd_sum_fail
@@ -619,7 +638,9 @@ pub(crate) fn process_solve_w(
             let abs_w = t.w.abs();
             let signs: &[i32] = if abs_w == 0 { &[0] } else { &[1, -1] };
             for &sg in signs {
-                if let Some(c) = crate::spectrum::sigma_full_to_cnt(sg * abs_w, w_bnd_sum_local, ctx.middle_m) {
+                if let Some(c) =
+                    crate::spectrum::sigma_full_to_cnt(sg * abs_w, w_bnd_sum_local, ctx.middle_m)
+                {
                     if !cs.contains(&c) {
                         cs.push(c);
                     }
@@ -644,44 +665,81 @@ pub(crate) fn process_solve_w(
         let mut spec_buf: Vec<f64> = Vec::new();
         for &cnt in &w_counts {
             let mid_sum_iter = 2 * cnt as i32 - ctx.middle_m as i32;
-            crate::enumerate::generate_sequences_permuted(ctx.middle_m, mid_sum_iter, false, false, 200_000, |w_mid| {
-                if ctx.found.load(AtomicOrdering::Relaxed) { return false; }
-                if !ctx.outfix_w_mid_pins.is_empty() {
-                    let pin_ok = ctx.outfix_w_mid_pins.iter()
-                        .all(|&(mid, val)| mid >= ctx.middle_m || w_mid[mid] == val);
-                    if !pin_ok { return true; }
-                }
-                let mut w_vals = w_boundary.clone();
-                w_vals[k..k + ctx.middle_m].copy_from_slice(w_mid);
-                metrics.flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
-                if trace_w { trace_w_total += 1; }
-                if sat_z_middle::check_w_boundary_rule_v(m, m, &w_vals)
-                    == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
-                {
-                    return true;
-                }
-                if crate::spectrum::spectrum_into_if_ok(&w_vals, spectral_w, ctx.individual_bound, fft_buf_w, &mut spec_buf) {
-                    if trace_w { trace_w_pass += 1; }
-                    metrics.flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
-                    w_found_any = true;
-                    let sigma_w_full: i32 = w_vals.iter().map(|&v| v as i32).sum();
-                    let narrowed: Vec<SumTuple> = sw.candidate_tuples.iter()
-                        .copied()
-                        .filter(|t| t.w.abs() == sigma_w_full.abs())
-                        .collect();
-                    if narrowed.is_empty() { return true; }
-                    metrics.stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
-                    let rep = narrowed[0];
-                    out_batch.push(PipelineWork::SolveZ(SolveZWork {
-                        tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
-                        w_vals, w_spectrum: spec_buf.clone(), xy_root: sw.xy_root,
-                        candidate_tuples: narrowed,
-                    }));
-                } else {
-                    metrics.flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
-                }
-                true
-            });
+            crate::enumerate::generate_sequences_permuted(
+                ctx.middle_m,
+                mid_sum_iter,
+                false,
+                false,
+                200_000,
+                |w_mid| {
+                    if ctx.found.load(AtomicOrdering::Relaxed) {
+                        return false;
+                    }
+                    if !ctx.outfix_w_mid_pins.is_empty() {
+                        let pin_ok = ctx
+                            .outfix_w_mid_pins
+                            .iter()
+                            .all(|&(mid, val)| mid >= ctx.middle_m || w_mid[mid] == val);
+                        if !pin_ok {
+                            return true;
+                        }
+                    }
+                    let mut w_vals = w_boundary.clone();
+                    w_vals[k..k + ctx.middle_m].copy_from_slice(w_mid);
+                    metrics
+                        .flow_w_solutions
+                        .fetch_add(1, AtomicOrdering::Relaxed);
+                    if trace_w {
+                        trace_w_total += 1;
+                    }
+                    if sat_z_middle::check_w_boundary_rule_v(m, m, &w_vals)
+                        == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
+                    {
+                        return true;
+                    }
+                    if crate::spectrum::spectrum_into_if_ok(
+                        &w_vals,
+                        spectral_w,
+                        ctx.individual_bound,
+                        fft_buf_w,
+                        &mut spec_buf,
+                    ) {
+                        if trace_w {
+                            trace_w_pass += 1;
+                        }
+                        metrics
+                            .flow_w_spec_pass
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                        w_found_any = true;
+                        let sigma_w_full: i32 = w_vals.iter().map(|&v| v as i32).sum();
+                        let narrowed: Vec<SumTuple> = sw
+                            .candidate_tuples
+                            .iter()
+                            .copied()
+                            .filter(|t| t.w.abs() == sigma_w_full.abs())
+                            .collect();
+                        if narrowed.is_empty() {
+                            return true;
+                        }
+                        metrics.stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
+                        let rep = narrowed[0];
+                        out_batch.push(PipelineWork::SolveZ(SolveZWork {
+                            tuple: rep,
+                            z_bits: sw.z_bits,
+                            w_bits: sw.w_bits,
+                            w_vals,
+                            w_spectrum: spec_buf.clone(),
+                            xy_root: sw.xy_root,
+                            candidate_tuples: narrowed,
+                        }));
+                    } else {
+                        metrics
+                            .flow_w_spec_fail
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    true
+                },
+            );
         }
     } else {
         // SAT-based W generation. Always build a fresh solver per
@@ -701,14 +759,19 @@ pub(crate) fn process_solve_w(
         if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
             let mut nv = (w_solver.num_vars() + 1) as i32;
             sat_z_middle::add_rule_v_middle_clauses(
-                &mut w_solver, m, k, &w_boundary,
+                &mut w_solver,
+                m,
+                k,
+                &w_boundary,
                 |pf| (pf - k + 1) as i32,
                 &mut nv,
             );
         }
         if let Some(ref wtab) = ctx.w_spectral_tables {
             w_solver.spectral = Some(radical::SpectralConstraint::from_tables(
-                wtab, &w_boundary, ctx.individual_bound,
+                wtab,
+                &w_boundary,
+                ctx.individual_bound,
             ));
         }
 
@@ -733,13 +796,21 @@ pub(crate) fn process_solve_w(
             w_solver.propagations_by_kind_level().to_vec();
 
         let max_w_per_boundary: usize = std::env::var("TURYN_MAX_W_PER_BND")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(128);
         let w_conflict_budget: u64 = std::env::var("TURYN_W_CONFL")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(5000);
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5000);
         let mut w_iter_count: usize = 0;
         loop {
-            if ctx.found.load(AtomicOrdering::Relaxed) { break; }
-            if w_iter_count >= max_w_per_boundary { break; }
+            if ctx.found.load(AtomicOrdering::Relaxed) {
+                break;
+            }
+            if w_iter_count >= max_w_per_boundary {
+                break;
+            }
             w_iter_count += 1;
             let phases: Vec<bool> = (0..ctx.middle_m)
                 .map(|_| {
@@ -747,9 +818,12 @@ pub(crate) fn process_solve_w(
                     *rng ^= *rng >> 7;
                     *rng ^= *rng << 17;
                     *rng & 1 == 1
-                }).collect();
+                })
+                .collect();
             w_solver.set_phase(&phases);
-            if w_conflict_budget > 0 { w_solver.set_conflict_budget(w_conflict_budget); }
+            if w_conflict_budget > 0 {
+                w_solver.set_conflict_budget(w_conflict_budget);
+            }
             match w_solver.solve() {
                 Some(true) => {}
                 Some(false) => {
@@ -770,39 +844,66 @@ pub(crate) fn process_solve_w(
                     break;
                 }
             }
-            metrics.flow_w_solutions.fetch_add(1, AtomicOrdering::Relaxed);
+            metrics
+                .flow_w_solutions
+                .fetch_add(1, AtomicOrdering::Relaxed);
 
             let w_mid = extract_vals(&w_solver, |i| ctx.w_mid_vars[i], ctx.middle_m);
             let mut w_vals = w_boundary.clone();
             w_vals[k..k + ctx.middle_m].copy_from_slice(&w_mid);
 
-            let w_block: Vec<i32> = ctx.w_mid_vars.iter().map(|&v| {
-                if w_solver.value(v) == Some(true) { -v } else { v }
-            }).collect();
+            let w_block: Vec<i32> = ctx
+                .w_mid_vars
+                .iter()
+                .map(|&v| {
+                    if w_solver.value(v) == Some(true) {
+                        -v
+                    } else {
+                        v
+                    }
+                })
+                .collect();
             w_solver.reset();
             w_solver.add_clause(w_block);
 
-            let w_spectrum = match crate::spectrum::spectrum_if_ok(&w_vals, spectral_w, ctx.individual_bound, fft_buf_w) {
+            let w_spectrum = match crate::spectrum::spectrum_if_ok(
+                &w_vals,
+                spectral_w,
+                ctx.individual_bound,
+                fft_buf_w,
+            ) {
                 Some(s) => s,
                 None => {
-                    metrics.flow_w_spec_fail.fetch_add(1, AtomicOrdering::Relaxed);
+                    metrics
+                        .flow_w_spec_fail
+                        .fetch_add(1, AtomicOrdering::Relaxed);
                     continue;
                 }
             };
-            metrics.flow_w_spec_pass.fetch_add(1, AtomicOrdering::Relaxed);
+            metrics
+                .flow_w_spec_pass
+                .fetch_add(1, AtomicOrdering::Relaxed);
             w_found_any = true;
 
             let sigma_w_full: i32 = w_vals.iter().map(|&v| v as i32).sum();
-            let narrowed: Vec<SumTuple> = sw.candidate_tuples.iter()
+            let narrowed: Vec<SumTuple> = sw
+                .candidate_tuples
+                .iter()
                 .copied()
                 .filter(|t| t.w.abs() == sigma_w_full.abs())
                 .collect();
-            if narrowed.is_empty() { continue; }
+            if narrowed.is_empty() {
+                continue;
+            }
             metrics.stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
             let rep = narrowed[0];
             out_batch.push(PipelineWork::SolveZ(SolveZWork {
-                tuple: rep, z_bits: sw.z_bits, w_bits: sw.w_bits,
-                w_vals, w_spectrum, xy_root: sw.xy_root,
+                tuple: rep,
+                z_bits: sw.z_bits,
+                w_bits: sw.w_bits,
+                w_vals,
+                w_spectrum,
+                xy_root: sw.xy_root,
                 candidate_tuples: narrowed,
             }));
         }
@@ -812,10 +913,18 @@ pub(crate) fn process_solve_w(
         let w_pre_forced = w_l0 as u64;
         let w_free_vars = w_nv.saturating_sub(w_l0) as u64;
         metrics.flow_w_solves.fetch_add(1, AtomicOrdering::Relaxed);
-        metrics.flow_w_decisions.fetch_add(w_decisions, AtomicOrdering::Relaxed);
-        metrics.flow_w_propagations.fetch_add(w_propagations, AtomicOrdering::Relaxed);
-        metrics.flow_w_root_forced.fetch_add(w_pre_forced, AtomicOrdering::Relaxed);
-        metrics.flow_w_free_sum.fetch_add(w_free_vars, AtomicOrdering::Relaxed);
+        metrics
+            .flow_w_decisions
+            .fetch_add(w_decisions, AtomicOrdering::Relaxed);
+        metrics
+            .flow_w_propagations
+            .fetch_add(w_propagations, AtomicOrdering::Relaxed);
+        metrics
+            .flow_w_root_forced
+            .fetch_add(w_pre_forced, AtomicOrdering::Relaxed);
+        metrics
+            .flow_w_free_sum
+            .fetch_add(w_free_vars, AtomicOrdering::Relaxed);
         forcings_out.extend(forcing_delta_triples(&w_solver, &w_plk0));
 
         // Fresh-per-call policy: `w_solver` is dropped at scope
@@ -836,13 +945,14 @@ pub(crate) fn process_solve_w(
         metrics.flow_w_unsat.fetch_add(1, AtomicOrdering::Relaxed);
     }
     if trace_w {
-        eprintln!("TRACE: SolveW done: {} W middles checked, {} passed spectral",
-            trace_w_total, trace_w_pass);
+        eprintln!(
+            "TRACE: SolveW done: {} W middles checked, {} passed spectral",
+            trace_w_total, trace_w_pass
+        );
     }
     metrics.stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
     out_batch
 }
-
 
 /// SolveZ (stage 2) handler body. Enumerates Z middles under the
 /// spectral pair bound and the BDKR rule (iv) filter, then drives
@@ -886,7 +996,11 @@ pub(crate) fn process_solve_z(
     let mut z_boundary = vec![0i8; n];
     for i in 0..k {
         z_boundary[i] = if (sz.z_bits >> i) & 1 == 1 { 1 } else { -1 };
-        z_boundary[n - k + i] = if (sz.z_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+        z_boundary[n - k + i] = if (sz.z_bits >> (k + i)) & 1 == 1 {
+            1
+        } else {
+            -1
+        };
     }
 
     let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
@@ -901,8 +1015,12 @@ pub(crate) fn process_solve_z(
             let abs_z = t.z.abs();
             let signs: &[i32] = if abs_z == 0 { &[0] } else { &[1, -1] };
             for &sg in signs {
-                if let Some(c) = crate::spectrum::sigma_full_to_cnt(sg * abs_z, z_bnd_sum_local, ctx.middle_n) {
-                    if !cs.contains(&c) { cs.push(c); }
+                if let Some(c) =
+                    crate::spectrum::sigma_full_to_cnt(sg * abs_z, z_bnd_sum_local, ctx.middle_n)
+                {
+                    if !cs.contains(&c) {
+                        cs.push(c);
+                    }
                 }
             }
         }
@@ -922,16 +1040,22 @@ pub(crate) fn process_solve_z(
     // unreachable in the framework path. `build_base_solver_quad_pb_pb_set`
     // is cheap; rebuilding each call trades a tiny per-call cost for
     // correctness.
-    let mut z_solver = ctx.z_tmpl.build_base_solver_quad_pb_pb_set(ctx.middle_n, &z_counts);
+    let mut z_solver = ctx
+        .z_tmpl
+        .build_base_solver_quad_pb_pb_set(ctx.middle_n, &z_counts);
     let z_cp = z_solver.save_checkpoint();
     if scratch.z_prep_z_bits != Some(sz.z_bits) {
-        scratch.z_prep.rebuild(&ctx.z_tmpl, ctx.middle_n, &z_boundary);
+        scratch
+            .z_prep
+            .rebuild(&ctx.z_tmpl, ctx.middle_n, &z_boundary);
         if let Some(ref ztab) = ctx.z_spectral_tables {
             let nf = ztab.num_freqs;
             scratch.z_re_boundary.iter_mut().for_each(|v| *v = 0.0);
             scratch.z_im_boundary.iter_mut().for_each(|v| *v = 0.0);
             for pos in 0..n {
-                if pos >= k && pos < n - k { continue; }
+                if pos >= k && pos < n - k {
+                    continue;
+                }
                 let val = z_boundary[pos] as f64;
                 let base = pos * nf;
                 for fi in 0..nf {
@@ -983,17 +1107,27 @@ pub(crate) fn process_solve_z(
         }
         let mut pfb = vec![ctx.pair_bound; nf];
         for fi in 0..nf {
-            pfb[fi] = (ctx.pair_bound - w_re[fi]*w_re[fi] - w_im[fi]*w_im[fi]).max(0.0);
+            pfb[fi] = (ctx.pair_bound - w_re[fi] * w_re[fi] - w_im[fi] * w_im[fi]).max(0.0);
         }
         z_spec.per_freq_bound = Some(pfb);
         z_solver.spectral = Some(z_spec);
     }
 
-    sat_z_middle::fill_z_solver_quad_pb(&mut z_solver, &ctx.z_tmpl, n, m, ctx.middle_n, &scratch.z_prep, &sz.w_vals);
+    sat_z_middle::fill_z_solver_quad_pb(
+        &mut z_solver,
+        &ctx.z_tmpl,
+        n,
+        m,
+        ctx.middle_n,
+        &scratch.z_prep,
+        &sz.w_vals,
+    );
     if rule_iv_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
         let mut nv = (z_solver.num_vars() + 1) as i32;
         sat_z_middle::add_rule_iv_middle_clauses(
-            &mut z_solver, n, k,
+            &mut z_solver,
+            n,
+            k,
             |jf| (jf - k + 1) as i32,
             &mut nv,
         );
@@ -1032,26 +1166,37 @@ pub(crate) fn process_solve_z(
 
     let mut z_count = 0usize;
     let z_conflict_budget: u64 = std::env::var("TURYN_Z_CONFL")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(5000);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000);
     loop {
-        if ctx.found.load(AtomicOrdering::Relaxed) { break; }
-        if z_count >= ctx.max_z { break; }
+        if ctx.found.load(AtomicOrdering::Relaxed) {
+            break;
+        }
+        if z_count >= ctx.max_z {
+            break;
+        }
         let z_phases: Vec<bool> = (0..ctx.middle_n)
             .map(|_| {
                 *rng ^= *rng << 13;
                 *rng ^= *rng >> 7;
                 *rng ^= *rng << 17;
                 *rng & 1 == 1
-            }).collect();
+            })
+            .collect();
         z_solver.set_phase(&z_phases);
-        if z_conflict_budget > 0 { z_solver.set_conflict_budget(z_conflict_budget); }
+        if z_conflict_budget > 0 {
+            z_solver.set_conflict_budget(z_conflict_budget);
+        }
         let z_result = z_solver.solve();
         match z_result {
             Some(true) => {}
             Some(false) => {
                 // UNSAT — no more Z candidates exist. Clean
                 // boundary closure.
-                if z_count == 0 { metrics.flow_z_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
+                if z_count == 0 {
+                    metrics.flow_z_unsat.fetch_add(1, AtomicOrdering::Relaxed);
+                }
                 break;
             }
             None => {
@@ -1066,51 +1211,88 @@ pub(crate) fn process_solve_z(
             }
         }
         z_count += 1;
-        metrics.flow_z_solutions.fetch_add(1, AtomicOrdering::Relaxed);
+        metrics
+            .flow_z_solutions
+            .fetch_add(1, AtomicOrdering::Relaxed);
 
         let z_mid = extract_vals(&z_solver, |i| ctx.z_mid_vars[i], ctx.middle_n);
 
         let mut z_vals = Vec::with_capacity(n);
         z_vals.extend_from_slice(&z_boundary[..k]);
         z_vals.extend_from_slice(&z_mid);
-        z_vals.extend_from_slice(&z_boundary[n-k..]);
+        z_vals.extend_from_slice(&z_boundary[n - k..]);
 
         if z_count < ctx.max_z {
-            let z_block: Vec<i32> = ctx.z_mid_vars.iter().map(|&v| {
-                if z_solver.value(v) == Some(true) { -v } else { v }
-            }).collect();
+            let z_block: Vec<i32> = ctx
+                .z_mid_vars
+                .iter()
+                .map(|&v| {
+                    if z_solver.value(v) == Some(true) {
+                        -v
+                    } else {
+                        v
+                    }
+                })
+                .collect();
             z_solver.reset();
             z_solver.add_clause(z_block);
         }
 
-        crate::spectrum::compute_spectrum_into(&z_vals, spectral_z, fft_buf_z, &mut scratch.z_spectrum_buf);
+        crate::spectrum::compute_spectrum_into(
+            &z_vals,
+            spectral_z,
+            fft_buf_z,
+            &mut scratch.z_spectrum_buf,
+        );
 
         if ctx.middle_n <= 20 {
-            if !crate::spectrum::spectral_pair_ok(&scratch.z_spectrum_buf, &sz.w_spectrum, ctx.pair_bound) {
-                metrics.flow_z_pair_fail.fetch_add(1, AtomicOrdering::Relaxed);
+            if !crate::spectrum::spectral_pair_ok(
+                &scratch.z_spectrum_buf,
+                &sz.w_spectrum,
+                ctx.pair_bound,
+            ) {
+                metrics
+                    .flow_z_pair_fail
+                    .fetch_add(1, AtomicOrdering::Relaxed);
                 if trace_z {
                     eprintln!("TRACE:   Z solution #{} FAILED pair check", z_count);
                 }
                 continue;
             }
         }
-        if trace_z { eprintln!("TRACE:   Z solution #{} REACHED XY!", z_count); }
+        if trace_z {
+            eprintln!("TRACE:   Z solution #{} REACHED XY!", z_count);
+        }
 
         let z_seq = PackedSeq::from_values(&z_vals);
         let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
 
-        let mut tuple_key: Vec<(i32, i32, i32, i32)> = sz.candidate_tuples.iter()
-            .map(|t| (t.x, t.y, t.z, t.w)).collect();
+        let mut tuple_key: Vec<(i32, i32, i32, i32)> = sz
+            .candidate_tuples
+            .iter()
+            .map(|t| (t.x, t.y, t.z, t.w))
+            .collect();
         tuple_key.sort_unstable();
-        let template = template_cache.entry(tuple_key).or_insert_with(||
-            SatXYTemplate::build_multi_opts(ctx.problem, &sz.candidate_tuples, sat_config, ctx.conj_xy_product).unwrap()
-        );
+        let template = template_cache.entry(tuple_key).or_insert_with(|| {
+            SatXYTemplate::build_multi_opts(
+                ctx.problem,
+                &sz.candidate_tuples,
+                sat_config,
+                ctx.conj_xy_product,
+            )
+            .unwrap()
+        });
         let candidate = CandidateZW { zw_autocorr };
         if ctx.xy_mdd_mode {
             let conflict_limit = if n > 30 { 5000 } else { 0 };
             let (xy_res, stats) = try_candidate_via_mdd(
-                ctx.problem, &candidate, template, k,
-                sz.xy_root, &ctx.mdd.nodes, &ctx.xy_pos_order,
+                ctx.problem,
+                &candidate,
+                template,
+                k,
+                sz.xy_root,
+                &ctx.mdd.nodes,
+                &ctx.xy_pos_order,
                 conflict_limit,
                 // Accumulate the fresh XY-MDD solver's forcing
                 // triples into the stage's sink so the MDD
@@ -1119,13 +1301,23 @@ pub(crate) fn process_solve_z(
                 Some(forcings_out),
             );
             metrics.stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
-            metrics.items_completed.fetch_add(1, AtomicOrdering::Relaxed);
+            metrics
+                .items_completed
+                .fetch_add(1, AtomicOrdering::Relaxed);
             metrics.stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
             metrics.flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
-            metrics.flow_xy_decisions.fetch_add(stats.decisions, AtomicOrdering::Relaxed);
-            metrics.flow_xy_propagations.fetch_add(stats.propagations, AtomicOrdering::Relaxed);
-            metrics.flow_xy_root_forced.fetch_add(stats.vars_pre_forced, AtomicOrdering::Relaxed);
-            metrics.flow_xy_free_sum.fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
+            metrics
+                .flow_xy_decisions
+                .fetch_add(stats.decisions, AtomicOrdering::Relaxed);
+            metrics
+                .flow_xy_propagations
+                .fetch_add(stats.propagations, AtomicOrdering::Relaxed);
+            metrics
+                .flow_xy_root_forced
+                .fetch_add(stats.vars_pre_forced, AtomicOrdering::Relaxed);
+            metrics
+                .flow_xy_free_sum
+                .fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
             match xy_res {
                 Some((x, y)) => {
                     metrics.flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1138,12 +1330,16 @@ pub(crate) fn process_solve_z(
                     metrics.flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed);
                 }
             }
-        } else if let Some(mut state) = SolveXyPerCandidate::new(
-            ctx.problem, &candidate, template, k,
-        ) {
-            if n > 30 { state.solver.set_conflict_limit(5000); }
+        } else if let Some(mut state) =
+            SolveXyPerCandidate::new(ctx.problem, &candidate, template, k)
+        {
+            if n > 30 {
+                state.solver.set_conflict_limit(5000);
+            }
             if warm.inject_phase {
-                if let Some(ref ph) = warm.phase { state.solver.set_phase(ph); }
+                if let Some(ref ph) = warm.phase {
+                    state.solver.set_phase(ph);
+                }
             }
 
             // Snapshot the XY solver BEFORE the walk so only the
@@ -1157,53 +1353,92 @@ pub(crate) fn process_solve_z(
             let xy_plk0: Vec<[u64; radical::PropKind::COUNT]> =
                 state.solver.propagations_by_kind_level().to_vec();
             walk_xy_sub_mdd(
-                sz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
-                &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
-                ctx.middle_n as i32, &sz.candidate_tuples,
+                sz.xy_root,
+                0,
+                ctx.xy_zw_depth,
+                0,
+                0,
+                &ctx.xy_pos_order,
+                &ctx.mdd.nodes,
+                ctx.max_bnd_sum,
+                ctx.middle_n as i32,
+                &sz.candidate_tuples,
                 &mut |x_bits, y_bits| {
-                    if ctx.found.load(AtomicOrdering::Relaxed) { return; }
+                    if ctx.found.load(AtomicOrdering::Relaxed) {
+                        return;
+                    }
                     if let Some((fx, fy)) = ctx.outfix_xy {
-                        if x_bits != fx || y_bits != fy { return; }
+                        if x_bits != fx || y_bits != fy {
+                            return;
+                        }
                     }
                     if ctx.conj_zw_bound
                         && !check_conj_zw_bound(n, k, x_bits, y_bits, &z_seq, &w_seq)
                     {
-                        metrics.flow_xy_zw_bound_rej.fetch_add(1, AtomicOrdering::Relaxed);
+                        metrics
+                            .flow_xy_zw_bound_rej
+                            .fetch_add(1, AtomicOrdering::Relaxed);
                         return;
                     }
                     if ctx.mdd_extend > 0 {
-                        let cache_key = (sz.z_bits as u128) | ((sz.w_bits as u128) << 32)
-                                      | ((x_bits as u128) << 64) | ((y_bits as u128) << 96);
-                        let ext_ok = *scratch.ext_cache.entry(cache_key).or_insert_with(||
+                        let cache_key = (sz.z_bits as u128)
+                            | ((sz.w_bits as u128) << 32)
+                            | ((x_bits as u128) << 64)
+                            | ((y_bits as u128) << 96);
+                        let ext_ok = *scratch.ext_cache.entry(cache_key).or_insert_with(|| {
                             mdd_zw_first::has_extension(
-                                k, k + ctx.mdd_extend,
-                                sz.z_bits, sz.w_bits, x_bits, y_bits,
+                                k,
+                                k + ctx.mdd_extend,
+                                sz.z_bits,
+                                sz.w_bits,
+                                x_bits,
+                                y_bits,
                             )
-                        );
+                        });
                         if !ext_ok {
-                            metrics.extensions_pruned.fetch_add(1, AtomicOrdering::Relaxed);
+                            metrics
+                                .extensions_pruned
+                                .fetch_add(1, AtomicOrdering::Relaxed);
                             return;
                         }
                     }
                     metrics.stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
                     let (result, stats) = state.try_candidate(x_bits, y_bits);
-                    metrics.items_completed.fetch_add(1, AtomicOrdering::Relaxed);
+                    metrics
+                        .items_completed
+                        .fetch_add(1, AtomicOrdering::Relaxed);
                     metrics.stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
                     match &result {
-                        XyTryResult::Sat(_, _) => { metrics.flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed); }
-                        XyTryResult::Unsat | XyTryResult::Pruned => { metrics.flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
+                        XyTryResult::Sat(_, _) => {
+                            metrics.flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        XyTryResult::Unsat | XyTryResult::Pruned => {
+                            metrics.flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
                         XyTryResult::Timeout => {
-                            metrics.flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed);
-                            metrics.flow_xy_timeout_cov_micro.fetch_add(stats.cover_micro, AtomicOrdering::Relaxed);
+                            metrics
+                                .flow_xy_timeout
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                            metrics
+                                .flow_xy_timeout_cov_micro
+                                .fetch_add(stats.cover_micro, AtomicOrdering::Relaxed);
                             *cov_micro_out = cov_micro_out.saturating_add(stats.cover_micro);
                         }
                     };
                     if !matches!(result, XyTryResult::Pruned) {
                         metrics.flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
-                        metrics.flow_xy_decisions.fetch_add(stats.decisions, AtomicOrdering::Relaxed);
-                        metrics.flow_xy_propagations.fetch_add(stats.propagations, AtomicOrdering::Relaxed);
-                        metrics.flow_xy_root_forced.fetch_add(stats.vars_pre_forced, AtomicOrdering::Relaxed);
-                        metrics.flow_xy_free_sum.fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
+                        metrics
+                            .flow_xy_decisions
+                            .fetch_add(stats.decisions, AtomicOrdering::Relaxed);
+                        metrics
+                            .flow_xy_propagations
+                            .fetch_add(stats.propagations, AtomicOrdering::Relaxed);
+                        metrics
+                            .flow_xy_root_forced
+                            .fetch_add(stats.vars_pre_forced, AtomicOrdering::Relaxed);
+                        metrics
+                            .flow_xy_free_sum
+                            .fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
                     }
                     if let XyTryResult::Sat(x, y) = result {
                         if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
@@ -1221,24 +1456,37 @@ pub(crate) fn process_solve_z(
             forcings_out.extend(forcing_delta_triples(&state.solver, &xy_plk0));
             warm.phase = Some(state.solver.get_phase());
         } else {
-            metrics.flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
+            metrics
+                .flow_z_prep_fail
+                .fetch_add(1, AtomicOrdering::Relaxed);
         }
     }
     if trace_z {
         let z_sf = metrics.flow_z_spec_fail.load(AtomicOrdering::Relaxed);
         let z_pf = metrics.flow_z_pair_fail.load(AtomicOrdering::Relaxed);
-        eprintln!("TRACE: SolveZ done for target: {} Z found (global z_spec_fail={}, z_pair_fail={})", z_count, z_sf, z_pf);
+        eprintln!(
+            "TRACE: SolveZ done for target: {} Z found (global z_spec_fail={}, z_pair_fail={})",
+            z_count, z_sf, z_pf
+        );
     }
 
-    let z_decisions    = z_solver.num_decisions().saturating_sub(z_d0);
+    let z_decisions = z_solver.num_decisions().saturating_sub(z_d0);
     let z_propagations = z_solver.num_propagations().saturating_sub(z_p0);
-    let z_pre_forced   = z_l0 as u64;
-    let z_free_vars    = z_nv.saturating_sub(z_l0) as u64;
+    let z_pre_forced = z_l0 as u64;
+    let z_free_vars = z_nv.saturating_sub(z_l0) as u64;
     metrics.flow_z_solves.fetch_add(1, AtomicOrdering::Relaxed);
-    metrics.flow_z_decisions.fetch_add(z_decisions, AtomicOrdering::Relaxed);
-    metrics.flow_z_propagations.fetch_add(z_propagations, AtomicOrdering::Relaxed);
-    metrics.flow_z_root_forced.fetch_add(z_pre_forced, AtomicOrdering::Relaxed);
-    metrics.flow_z_free_sum.fetch_add(z_free_vars, AtomicOrdering::Relaxed);
+    metrics
+        .flow_z_decisions
+        .fetch_add(z_decisions, AtomicOrdering::Relaxed);
+    metrics
+        .flow_z_propagations
+        .fetch_add(z_propagations, AtomicOrdering::Relaxed);
+    metrics
+        .flow_z_root_forced
+        .fetch_add(z_pre_forced, AtomicOrdering::Relaxed);
+    metrics
+        .flow_z_free_sum
+        .fetch_add(z_free_vars, AtomicOrdering::Relaxed);
     // `z_solver` is freshly built every call, so an empty baseline
     // reports the full forcing trace as attribution for this
     // SolveZ call. Inline XY-path solvers (SolveXyPerCandidate,
@@ -1297,11 +1545,15 @@ pub(crate) fn process_solve_wz(
     let (w_prefix, w_suffix) = expand_boundary_bits(swz.w_bits, k);
     let mut w_boundary = vec![0i8; m];
     w_boundary[..k].copy_from_slice(&w_prefix);
-    w_boundary[m-k..].copy_from_slice(&w_suffix);
+    w_boundary[m - k..].copy_from_slice(&w_suffix);
     let mut z_boundary = vec![0i8; n];
     for i in 0..k {
         z_boundary[i] = if (swz.z_bits >> i) & 1 == 1 { 1 } else { -1 };
-        z_boundary[n-k+i] = if (swz.z_bits >> (k+i)) & 1 == 1 { 1 } else { -1 };
+        z_boundary[n - k + i] = if (swz.z_bits >> (k + i)) & 1 == 1 {
+            1
+        } else {
+            -1
+        };
     }
 
     // Sum constraints via PbSetEq: union of ±|σ_W| (resp. ±|σ_Z|)
@@ -1312,22 +1564,36 @@ pub(crate) fn process_solve_wz(
     let mut z_counts: Vec<u32> = Vec::new();
     for t in &swz.candidate_tuples {
         let abs_w = t.w.abs();
-        for &sg in if abs_w == 0 { &[0i32] as &[i32] } else { &[1, -1] } {
+        for &sg in if abs_w == 0 {
+            &[0i32] as &[i32]
+        } else {
+            &[1, -1]
+        } {
             if let Some(c) = sigma_full_to_cnt(sg * abs_w, w_bnd_sum_local, ctx.middle_m) {
-                if !w_counts.contains(&c) { w_counts.push(c); }
+                if !w_counts.contains(&c) {
+                    w_counts.push(c);
+                }
             }
         }
         let abs_z = t.z.abs();
-        for &sg in if abs_z == 0 { &[0i32] as &[i32] } else { &[1, -1] } {
+        for &sg in if abs_z == 0 {
+            &[0i32] as &[i32]
+        } else {
+            &[1, -1]
+        } {
             if let Some(c) = sigma_full_to_cnt(sg * abs_z, z_bnd_sum_local, ctx.middle_n) {
-                if !z_counts.contains(&c) { z_counts.push(c); }
+                if !z_counts.contains(&c) {
+                    z_counts.push(c);
+                }
             }
         }
     }
     w_counts.sort_unstable();
     z_counts.sort_unstable();
     if w_counts.is_empty() || z_counts.is_empty() {
-        metrics.flow_wz_empty_v.fetch_add(1, AtomicOrdering::Relaxed);
+        metrics
+            .flow_wz_empty_v
+            .fetch_add(1, AtomicOrdering::Relaxed);
         metrics.stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
         return None;
     }
@@ -1338,11 +1604,13 @@ pub(crate) fn process_solve_wz(
 
     // BDKR rules (iv)/(v) boundary pre-filter.
     let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
-    let rule_v_state  = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
+    let rule_v_state = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
     if rule_iv_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
-       || rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
+        || rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary
     {
-        metrics.flow_wz_rule_viol.fetch_add(1, AtomicOrdering::Relaxed);
+        metrics
+            .flow_wz_rule_viol
+            .fetch_add(1, AtomicOrdering::Relaxed);
         metrics.stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
         return None;
     }
@@ -1355,14 +1623,19 @@ pub(crate) fn process_solve_wz(
     let mut nv_combined = (total_existing_vars + 1) as i32;
     if rule_iv_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
         sat_z_middle::add_rule_iv_middle_clauses(
-            &mut solver, n, k,
+            &mut solver,
+            n,
+            k,
             |jf| z_var(jf - k),
             &mut nv_combined,
         );
     }
     if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
         sat_z_middle::add_rule_v_middle_clauses(
-            &mut solver, m, k, &w_boundary,
+            &mut solver,
+            m,
+            k,
+            &w_boundary,
             |pf| w_var(pf - k),
             &mut nv_combined,
         );
@@ -1409,41 +1682,62 @@ pub(crate) fn process_solve_wz(
             if s < m {
                 let w_lag = &ctx.w_tmpl.lags[s - 1];
                 for &(i, j) in &w_lag.bnd_bnd {
-                    if w_boundary[i] == w_boundary[j] { agree_const += 1; }
+                    if w_boundary[i] == w_boundary[j] {
+                        agree_const += 1;
+                    }
                 }
                 for &(bnd_pos, mid_idx) in &w_lag.bnd_mid {
-                    let lit = if w_boundary[bnd_pos] == 1 { w_var(mid_idx) } else { -w_var(mid_idx) };
+                    let lit = if w_boundary[bnd_pos] == 1 {
+                        w_var(mid_idx)
+                    } else {
+                        -w_var(mid_idx)
+                    };
                     lits_a.push(lit);
                     lits_b.push(true_var);
                 }
                 for &(i, j) in &w_lag.mid_mid {
                     // agree(a,b) = (a AND b) OR (-a AND -b)
-                    lits_a.push( w_var(i)); lits_b.push( w_var(j));
-                    lits_a.push(-w_var(i)); lits_b.push(-w_var(j));
+                    lits_a.push(w_var(i));
+                    lits_b.push(w_var(j));
+                    lits_a.push(-w_var(i));
+                    lits_b.push(-w_var(j));
                 }
             }
             // Z pairs
             if s < n {
                 let z_lag = &ctx.z_tmpl.lags[s - 1];
                 for &(i, j) in &z_lag.bnd_bnd {
-                    if z_boundary[i] == z_boundary[j] { agree_const += 1; }
+                    if z_boundary[i] == z_boundary[j] {
+                        agree_const += 1;
+                    }
                 }
                 for &(bnd_pos, mid_idx) in &z_lag.bnd_mid {
-                    let lit = if z_boundary[bnd_pos] == 1 { z_var(mid_idx) } else { -z_var(mid_idx) };
+                    let lit = if z_boundary[bnd_pos] == 1 {
+                        z_var(mid_idx)
+                    } else {
+                        -z_var(mid_idx)
+                    };
                     lits_a.push(lit);
                     lits_b.push(true_var);
                 }
                 for &(i, j) in &z_lag.mid_mid {
-                    lits_a.push( z_var(i)); lits_b.push( z_var(j));
-                    lits_a.push(-z_var(i)); lits_b.push(-z_var(j));
+                    lits_a.push(z_var(i));
+                    lits_b.push(z_var(j));
+                    lits_a.push(-z_var(i));
+                    lits_b.push(-z_var(j));
                 }
             }
 
             let max_variable = lits_a.len() as u32;
             let adj_lo = combined_lo.saturating_sub(agree_const);
             let adj_hi = combined_hi.saturating_sub(agree_const);
-            if adj_lo > max_variable { solver.add_clause(std::iter::empty::<i32>()); break; }
-            if adj_lo == 0 && adj_hi >= max_variable { continue; }
+            if adj_lo > max_variable {
+                solver.add_clause(std::iter::empty::<i32>());
+                break;
+            }
+            if adj_lo == 0 && adj_hi >= max_variable {
+                continue;
+            }
             if lits_a.is_empty() {
                 // No variable-dependent terms; agree_const
                 // alone must already satisfy the range
@@ -1473,13 +1767,17 @@ pub(crate) fn process_solve_wz(
         for fi in 0..nf {
             let omega = (fi as f64 + 1.0) / (nf as f64 + 1.0) * std::f64::consts::PI;
             for pos in 0..m {
-                if pos >= k && pos < m - k { continue; }
+                if pos >= k && pos < m - k {
+                    continue;
+                }
                 let val = w_boundary[pos] as f64;
                 re1_bnd[fi] += val * (omega * pos as f64).cos();
                 im1_bnd[fi] += val * (omega * pos as f64).sin();
             }
             for pos in 0..n {
-                if pos >= k && pos < n - k { continue; }
+                if pos >= k && pos < n - k {
+                    continue;
+                }
                 let val = z_boundary[pos] as f64;
                 re2_bnd[fi] += val * (omega * pos as f64).cos();
                 im2_bnd[fi] += val * (omega * pos as f64).sin();
@@ -1514,8 +1812,10 @@ pub(crate) fn process_solve_wz(
             cos_table: std::sync::Arc::new(cos_table),
             sin_table: std::sync::Arc::new(sin_table),
             num_freqs: nf,
-            re: re_dummy.clone(), im: im_dummy.clone(),
-            re_boundary: re_dummy.clone(), im_boundary: im_dummy,
+            re: re_dummy.clone(),
+            im: im_dummy.clone(),
+            re_boundary: re_dummy.clone(),
+            im_boundary: im_dummy,
             bound: ctx.problem.target_energy() as f64, // 6n-2: full energy budget for 2|W|²+2|Z|²+|X|²+|Y|²
             per_freq_bound: None,
             max_reduction: vec![0.0; nf],
@@ -1524,13 +1824,18 @@ pub(crate) fn process_solve_wz(
             values: vec![0i8; total_mid],
             seq2: Some(radical::Seq2Config {
                 seq2_start: ctx.middle_m,
-                weight1: 2.0, weight2: 2.0,
+                weight1: 2.0,
+                weight2: 2.0,
                 individual_bound: ctx.individual_bound,
-                re1: re1_bnd.clone(), im1: im1_bnd.clone(),
-                re1_boundary: re1_bnd, im1_boundary: im1_bnd,
+                re1: re1_bnd.clone(),
+                im1: im1_bnd.clone(),
+                re1_boundary: re1_bnd,
+                im1_boundary: im1_bnd,
                 max_reduction1: mr1,
-                re2: re2_bnd.clone(), im2: im2_bnd.clone(),
-                re2_boundary: re2_bnd, im2_boundary: im2_bnd,
+                re2: re2_bnd.clone(),
+                im2: im2_bnd.clone(),
+                re2_boundary: re2_bnd,
+                im2_boundary: im2_bnd,
                 max_reduction2: mr2,
             }),
         });
@@ -1609,7 +1914,9 @@ pub(crate) fn process_solve_wz(
     // next attempt skips already-found (W, Z) pairs.
     let mut new_blocks: Vec<Vec<i32>> = Vec::new();
     loop {
-        if ctx.found.load(AtomicOrdering::Relaxed) { break; }
+        if ctx.found.load(AtomicOrdering::Relaxed) {
+            break;
+        }
         if wz_count >= ctx.max_z {
             more_possible = true;
             break;
@@ -1625,15 +1932,20 @@ pub(crate) fn process_solve_wz(
                 attempt_rng ^= attempt_rng >> 7;
                 attempt_rng ^= attempt_rng << 17;
                 attempt_rng & 1 == 1
-            }).collect();
+            })
+            .collect();
         *rng = attempt_rng;
         solver.set_phase(&phases);
-        metrics.flow_wz_sat_calls.fetch_add(1, AtomicOrdering::Relaxed);
+        metrics
+            .flow_wz_sat_calls
+            .fetch_add(1, AtomicOrdering::Relaxed);
         let sat_res = solver.solve();
         if sat_res == None {
             // Conflict limit hit — more solutions may exist.
             more_possible = true;
-            metrics.flow_wz_budget_hit.fetch_add(1, AtomicOrdering::Relaxed);
+            metrics
+                .flow_wz_budget_hit
+                .fetch_add(1, AtomicOrdering::Relaxed);
             // Don't bump flow_wz_first_unsat here: the field name
             // means "first iteration reported UNSAT", and a
             // conflict-budget timeout is not UNSAT. Mirrors the
@@ -1644,44 +1956,65 @@ pub(crate) fn process_solve_wz(
         if sat_res == Some(false) {
             // Fully enumerated: every assignment has been
             // blocked.  No point re-queuing.
-            metrics.flow_wz_exhausted.fetch_add(1, AtomicOrdering::Relaxed);
+            metrics
+                .flow_wz_exhausted
+                .fetch_add(1, AtomicOrdering::Relaxed);
             if wz_count == 0 {
-                metrics.flow_wz_first_unsat.fetch_add(1, AtomicOrdering::Relaxed);
+                metrics
+                    .flow_wz_first_unsat
+                    .fetch_add(1, AtomicOrdering::Relaxed);
             }
             break;
         }
         wz_count += 1;
-        metrics.flow_wz_solutions.fetch_add(1, AtomicOrdering::Relaxed);
+        metrics
+            .flow_wz_solutions
+            .fetch_add(1, AtomicOrdering::Relaxed);
 
         // Extract W middle
-        let w_mid: Vec<i8> = (0..ctx.middle_m).map(|i| {
-            if solver.value(w_var(i)).unwrap() { 1 } else { -1 }
-        }).collect();
+        let w_mid: Vec<i8> = (0..ctx.middle_m)
+            .map(|i| {
+                if solver.value(w_var(i)).unwrap() {
+                    1
+                } else {
+                    -1
+                }
+            })
+            .collect();
         let mut w_vals = w_boundary.clone();
-        w_vals[k..k+ctx.middle_m].copy_from_slice(&w_mid);
+        w_vals[k..k + ctx.middle_m].copy_from_slice(&w_mid);
 
         // Extract Z middle
-        let z_mid: Vec<i8> = (0..ctx.middle_n).map(|i| {
-            if solver.value(z_var(i)).unwrap() { 1 } else { -1 }
-        }).collect();
+        let z_mid: Vec<i8> = (0..ctx.middle_n)
+            .map(|i| {
+                if solver.value(z_var(i)).unwrap() {
+                    1
+                } else {
+                    -1
+                }
+            })
+            .collect();
         let mut z_vals = Vec::with_capacity(n);
         z_vals.extend_from_slice(&z_boundary[..k]);
         z_vals.extend_from_slice(&z_mid);
-        z_vals.extend_from_slice(&z_boundary[n-k..]);
+        z_vals.extend_from_slice(&z_boundary[n - k..]);
 
         // Block this (W,Z) pair.  Also stash the clause
         // in new_blocks so it survives re-queue: the
         // next attempt's fresh solver will re-add it
         // together with swz.prior_blocks.
-        let block: Vec<i32> = (0..total_vars as i32 + 1).skip(1).map(|v| {
-            if solver.value(v) == Some(true) { -v } else { v }
-        }).collect();
+        let block: Vec<i32> = (0..total_vars as i32 + 1)
+            .skip(1)
+            .map(|v| if solver.value(v) == Some(true) { -v } else { v })
+            .collect();
         solver.reset();
         solver.add_clause(block.iter().copied());
         new_blocks.push(block);
 
         // Got a valid (W,Z) pair — proceed to XY
-        metrics.flow_z_solutions.fetch_add(1, AtomicOrdering::Relaxed);
+        metrics
+            .flow_z_solutions
+            .fetch_add(1, AtomicOrdering::Relaxed);
         let z_seq = PackedSeq::from_values(&z_vals);
         let w_seq = PackedSeq::from_values(&w_vals);
         let zw_autocorr = compute_zw_autocorr(ctx.problem, &z_seq, &w_seq);
@@ -1693,15 +2026,26 @@ pub(crate) fn process_solve_wz(
         // narrow post-hoc by the W+Z sums we just decoded
         // (via zw_autocorr → lag PB ranges) and by the
         // candidate magnitudes.
-        let mut tuple_key: Vec<(i32, i32, i32, i32)> = swz.candidate_tuples.iter()
-            .map(|t| (t.x, t.y, t.z, t.w)).collect();
+        let mut tuple_key: Vec<(i32, i32, i32, i32)> = swz
+            .candidate_tuples
+            .iter()
+            .map(|t| (t.x, t.y, t.z, t.w))
+            .collect();
         tuple_key.sort_unstable();
-        let template = template_cache.entry(tuple_key).or_insert_with(||
-            SatXYTemplate::build_multi_opts(ctx.problem, &swz.candidate_tuples, &sat_config, ctx.conj_xy_product).unwrap()
-        );
+        let template = template_cache.entry(tuple_key).or_insert_with(|| {
+            SatXYTemplate::build_multi_opts(
+                ctx.problem,
+                &swz.candidate_tuples,
+                &sat_config,
+                ctx.conj_xy_product,
+            )
+            .unwrap()
+        });
         let candidate = CandidateZW { zw_autocorr };
         if let Some(mut xy_solver) = template.prepare_candidate_solver(&candidate) {
-            if n > 30 { xy_solver.set_conflict_limit(5000); }
+            if n > 30 {
+                xy_solver.set_conflict_limit(5000);
+            }
             // Snapshot before the walk so only the per-(W,Z) SAT
             // work is attributed. `prepare_candidate_solver`
             // clones the template and injects candidate-specific
@@ -1711,40 +2055,79 @@ pub(crate) fn process_solve_wz(
             let xy_plk0: Vec<[u64; radical::PropKind::COUNT]> =
                 xy_solver.propagations_by_kind_level().to_vec();
             walk_xy_sub_mdd(
-                swz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
-                &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
-                ctx.middle_n as i32, &swz.candidate_tuples,
+                swz.xy_root,
+                0,
+                ctx.xy_zw_depth,
+                0,
+                0,
+                &ctx.xy_pos_order,
+                &ctx.mdd.nodes,
+                ctx.max_bnd_sum,
+                ctx.middle_n as i32,
+                &swz.candidate_tuples,
                 &mut |x_bits, y_bits| {
-                    if ctx.found.load(AtomicOrdering::Relaxed) { return; }
+                    if ctx.found.load(AtomicOrdering::Relaxed) {
+                        return;
+                    }
                     if let Some((fx, fy)) = ctx.outfix_xy {
-                        if x_bits != fx || y_bits != fy { return; }
+                        if x_bits != fx || y_bits != fy {
+                            return;
+                        }
                     }
                     if ctx.conj_zw_bound
                         && !check_conj_zw_bound(n, k, x_bits, y_bits, &z_seq, &w_seq)
                     {
-                        metrics.flow_xy_zw_bound_rej.fetch_add(1, AtomicOrdering::Relaxed);
+                        metrics
+                            .flow_xy_zw_bound_rej
+                            .fetch_add(1, AtomicOrdering::Relaxed);
                         return;
                     }
                     metrics.stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
                     let x_var = |i: usize| -> i32 { (i + 1) as i32 };
                     let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
-                    let mut assumptions = Vec::with_capacity(4 * k + ctx.outfix_x_mid_pins.len() + ctx.outfix_y_mid_pins.len());
+                    let mut assumptions = Vec::with_capacity(
+                        4 * k + ctx.outfix_x_mid_pins.len() + ctx.outfix_y_mid_pins.len(),
+                    );
                     for i in 0..k {
-                        assumptions.push(if (x_bits >> i) & 1 == 1 { x_var(i) } else { -x_var(i) });
-                        assumptions.push(if (x_bits >> (k + i)) & 1 == 1 { x_var(n - k + i) } else { -x_var(n - k + i) });
-                        assumptions.push(if (y_bits >> i) & 1 == 1 { y_var(i) } else { -y_var(i) });
-                        assumptions.push(if (y_bits >> (k + i)) & 1 == 1 { y_var(n - k + i) } else { -y_var(n - k + i) });
+                        assumptions.push(if (x_bits >> i) & 1 == 1 {
+                            x_var(i)
+                        } else {
+                            -x_var(i)
+                        });
+                        assumptions.push(if (x_bits >> (k + i)) & 1 == 1 {
+                            x_var(n - k + i)
+                        } else {
+                            -x_var(n - k + i)
+                        });
+                        assumptions.push(if (y_bits >> i) & 1 == 1 {
+                            y_var(i)
+                        } else {
+                            -y_var(i)
+                        });
+                        assumptions.push(if (y_bits >> (k + i)) & 1 == 1 {
+                            y_var(n - k + i)
+                        } else {
+                            -y_var(n - k + i)
+                        });
                     }
                     // --outfix middle pins for X/Y: force middle positions too.
                     for &(mid, val) in &ctx.outfix_x_mid_pins {
                         if mid < ctx.middle_n {
-                            let lit = if val > 0 { x_var(k + mid) } else { -x_var(k + mid) };
+                            let lit = if val > 0 {
+                                x_var(k + mid)
+                            } else {
+                                -x_var(k + mid)
+                            };
                             assumptions.push(lit);
                         }
                     }
                     for &(mid, val) in &ctx.outfix_y_mid_pins {
                         if mid < ctx.middle_n {
-                            let lit = if val > 0 { y_var(k + mid) } else { -y_var(k + mid) };
+                            let lit = if val > 0 {
+                                y_var(k + mid)
+                            } else {
+                                -y_var(k + mid)
+                            };
                             assumptions.push(lit);
                         }
                     }
@@ -1754,27 +2137,41 @@ pub(crate) fn process_solve_wz(
                     let xy_l0 = xy_solver.num_level0_vars();
                     let xy_nv = xy_solver.num_vars();
                     let result = xy_solver.solve_with_assumptions(&assumptions);
-                    metrics.items_completed.fetch_add(1, AtomicOrdering::Relaxed);
+                    metrics
+                        .items_completed
+                        .fetch_add(1, AtomicOrdering::Relaxed);
                     metrics.stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
 
-                    let xy_decisions    = xy_solver.num_decisions().saturating_sub(xy_d0);
+                    let xy_decisions = xy_solver.num_decisions().saturating_sub(xy_d0);
                     let xy_propagations = xy_solver.num_propagations().saturating_sub(xy_p0);
-                    let xy_pre_forced   = xy_l0 as u64;
-                    let xy_free_vars    = xy_nv.saturating_sub(xy_l0) as u64;
+                    let xy_pre_forced = xy_l0 as u64;
+                    let xy_free_vars = xy_nv.saturating_sub(xy_l0) as u64;
                     metrics.flow_xy_solves.fetch_add(1, AtomicOrdering::Relaxed);
-                    metrics.flow_xy_decisions.fetch_add(xy_decisions, AtomicOrdering::Relaxed);
-                    metrics.flow_xy_propagations.fetch_add(xy_propagations, AtomicOrdering::Relaxed);
-                    metrics.flow_xy_root_forced.fetch_add(xy_pre_forced, AtomicOrdering::Relaxed);
-                    metrics.flow_xy_free_sum.fetch_add(xy_free_vars, AtomicOrdering::Relaxed);
+                    metrics
+                        .flow_xy_decisions
+                        .fetch_add(xy_decisions, AtomicOrdering::Relaxed);
+                    metrics
+                        .flow_xy_propagations
+                        .fetch_add(xy_propagations, AtomicOrdering::Relaxed);
+                    metrics
+                        .flow_xy_root_forced
+                        .fetch_add(xy_pre_forced, AtomicOrdering::Relaxed);
+                    metrics
+                        .flow_xy_free_sum
+                        .fetch_add(xy_free_vars, AtomicOrdering::Relaxed);
 
                     match result {
                         Some(true) => metrics.flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed),
                         Some(false) => metrics.flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed),
                         None => {
                             let cover = xy_cover_micro(result, xy_decisions, xy_free_vars);
-                            metrics.flow_xy_timeout_cov_micro.fetch_add(cover, AtomicOrdering::Relaxed);
+                            metrics
+                                .flow_xy_timeout_cov_micro
+                                .fetch_add(cover, AtomicOrdering::Relaxed);
                             *cov_micro_out = cov_micro_out.saturating_add(cover);
-                            metrics.flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed)
+                            metrics
+                                .flow_xy_timeout
+                                .fetch_add(1, AtomicOrdering::Relaxed)
                         }
                     };
                     if result == Some(true) {
@@ -1796,20 +2193,36 @@ pub(crate) fn process_solve_wz(
 
     // Aggregate combined-WZ stats into both W and Z stage
     // counters (see comment at snapshot site above).
-    let wz_decisions    = solver.num_decisions().saturating_sub(wz_d0);
+    let wz_decisions = solver.num_decisions().saturating_sub(wz_d0);
     let wz_propagations = solver.num_propagations().saturating_sub(wz_p0);
-    let wz_pre_forced   = wz_l0 as u64;
-    let wz_free_vars    = wz_nv.saturating_sub(wz_l0) as u64;
+    let wz_pre_forced = wz_l0 as u64;
+    let wz_free_vars = wz_nv.saturating_sub(wz_l0) as u64;
     metrics.flow_w_solves.fetch_add(1, AtomicOrdering::Relaxed);
-    metrics.flow_w_decisions.fetch_add(wz_decisions, AtomicOrdering::Relaxed);
-    metrics.flow_w_propagations.fetch_add(wz_propagations, AtomicOrdering::Relaxed);
-    metrics.flow_w_root_forced.fetch_add(wz_pre_forced, AtomicOrdering::Relaxed);
-    metrics.flow_w_free_sum.fetch_add(wz_free_vars, AtomicOrdering::Relaxed);
+    metrics
+        .flow_w_decisions
+        .fetch_add(wz_decisions, AtomicOrdering::Relaxed);
+    metrics
+        .flow_w_propagations
+        .fetch_add(wz_propagations, AtomicOrdering::Relaxed);
+    metrics
+        .flow_w_root_forced
+        .fetch_add(wz_pre_forced, AtomicOrdering::Relaxed);
+    metrics
+        .flow_w_free_sum
+        .fetch_add(wz_free_vars, AtomicOrdering::Relaxed);
     metrics.flow_z_solves.fetch_add(1, AtomicOrdering::Relaxed);
-    metrics.flow_z_decisions.fetch_add(wz_decisions, AtomicOrdering::Relaxed);
-    metrics.flow_z_propagations.fetch_add(wz_propagations, AtomicOrdering::Relaxed);
-    metrics.flow_z_root_forced.fetch_add(wz_pre_forced, AtomicOrdering::Relaxed);
-    metrics.flow_z_free_sum.fetch_add(wz_free_vars, AtomicOrdering::Relaxed);
+    metrics
+        .flow_z_decisions
+        .fetch_add(wz_decisions, AtomicOrdering::Relaxed);
+    metrics
+        .flow_z_propagations
+        .fetch_add(wz_propagations, AtomicOrdering::Relaxed);
+    metrics
+        .flow_z_root_forced
+        .fetch_add(wz_pre_forced, AtomicOrdering::Relaxed);
+    metrics
+        .flow_z_free_sum
+        .fetch_add(wz_free_vars, AtomicOrdering::Relaxed);
     // `solver` is the combined W+Z middle solver built fresh in
     // this call; empty baseline gives full attribution. Inline
     // per-(W,Z) XY solvers (`xy_solver`) are drained into the same
@@ -1828,9 +2241,7 @@ pub(crate) fn process_solve_wz(
     // abandon them.  The per-attempt budget doubles each
     // retry (see conflict_budget above) so every boundary
     // eventually gets enough effort for SAT/UNSAT.
-    if more_possible
-        && !ctx.found.load(AtomicOrdering::Relaxed)
-    {
+    if more_possible && !ctx.found.load(AtomicOrdering::Relaxed) {
         // Priority: re-queued SolveWZ items must sit
         // BELOW stage 0 (fresh MDD boundaries, priority
         // 0.0) so fresh boundaries are always preferred
@@ -1856,7 +2267,8 @@ pub(crate) fn process_solve_wz(
         // the same orbits with different phase RNG.
         let mut carried_blocks = swz.prior_blocks;
         carried_blocks.extend(new_blocks);
-        deferred = Some((PipelineWork::SolveWZ(SolveWZWork {
+        deferred = Some((
+            PipelineWork::SolveWZ(SolveWZWork {
                 tuple: swz.tuple,
                 z_bits: swz.z_bits,
                 w_bits: swz.w_bits,
@@ -1864,7 +2276,9 @@ pub(crate) fn process_solve_wz(
                 candidate_tuples: swz.candidate_tuples.clone(),
                 attempt: swz.attempt + 1,
                 prior_blocks: carried_blocks,
-            }), priority));
+            }),
+            priority,
+        ));
     }
     deferred
 }
@@ -1893,10 +2307,7 @@ pub(crate) fn build_phase_b_context(
                     "error: requested --mdd-k={} but only mdd-{}.bin found (k={})",
                     k, m.k, m.k
                 );
-                eprintln!(
-                    "Generate the exact MDD: target/release/gen_mdd {}",
-                    try_k
-                );
+                eprintln!("Generate the exact MDD: target/release/gen_mdd {}", try_k);
                 std::process::exit(1);
             }
             Arc::new(m)
@@ -2001,19 +2412,27 @@ pub(crate) fn build_phase_b_context(
 /// avoids enumerating hundreds of millions of boundaries at large
 /// `k` just to find the one the caller wants.
 pub(crate) fn mdd_navigate_to_outfix(
-    root: u32, zw_depth: usize, pos_order: &[usize], nodes: &[[u32; 4]],
-    z_bits: u32, w_bits: u32,
+    root: u32,
+    zw_depth: usize,
+    pos_order: &[usize],
+    nodes: &[[u32; 4]],
+    z_bits: u32,
+    w_bits: u32,
 ) -> Option<u32> {
     let mut nid = root;
     for level in 0..zw_depth {
-        if nid == mdd_reorder::DEAD { return None; }
+        if nid == mdd_reorder::DEAD {
+            return None;
+        }
         let pos = pos_order[level];
         let z_bit = (z_bits >> pos) & 1;
         let w_bit = (w_bits >> pos) & 1;
         let branch = (z_bit | (w_bit << 1)) as usize;
         if nid != mdd_reorder::LEAF {
             nid = nodes[nid as usize][branch];
-            if nid == mdd_reorder::DEAD { return None; }
+            if nid == mdd_reorder::DEAD {
+                return None;
+            }
         }
     }
     Some(nid)
@@ -2242,7 +2661,10 @@ pub(crate) fn run_mdd_sat_search(
             if let Some((x, y, z, w)) = found.as_ref() {
                 println!(
                     "\nFOUND! x={} y={} z={} w={}",
-                    colored_pm(x), colored_pm(y), colored_pm(z), colored_pm(w)
+                    colored_pm(x),
+                    colored_pm(y),
+                    colored_pm(z),
+                    colored_pm(w)
                 );
             }
         }
@@ -2261,13 +2683,18 @@ pub(crate) fn run_mdd_sat_search(
         WzMode::Together => "together",
         WzMode::Sync => unreachable!("sync branched above"),
     };
-    let mut engine = SearchEngine::<MddPayload>::new(
-        EngineConfig::default(),
-        Box::new(GoldThenWork::new(32)),
-    );
+    let mut engine =
+        SearchEngine::<MddPayload>::new(EngineConfig::default(), Box::new(GoldThenWork::new(32)));
     let cancel_flag = engine.cancel_flag();
-    let (adapter, result_rx) =
-        MddStagesAdapter::build(problem, tuples.to_vec(), cfg, k, verbose, mode_name, &cancel_flag);
+    let (adapter, result_rx) = MddStagesAdapter::build(
+        problem,
+        tuples.to_vec(),
+        cfg,
+        k,
+        verbose,
+        mode_name,
+        &cancel_flag,
+    );
     let found_ctx = Arc::clone(&adapter.ctx.found);
     let drain = std::thread::spawn(move || {
         let mut found = false;
@@ -2299,4 +2726,3 @@ pub(crate) fn run_mdd_sat_search(
         found_solution: found,
     }
 }
-

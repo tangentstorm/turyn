@@ -1,5 +1,5 @@
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crate::search_framework::mass::MassDelta;
 
@@ -75,7 +75,10 @@ impl ForcingDelta {
 
     /// Total forced literals across all (level, feature) pairs.
     pub fn total(&self) -> u64 {
-        self.by_level_feature.iter().map(|(_, _, c)| *c as u64).sum()
+        self.by_level_feature
+            .iter()
+            .map(|(_, _, c)| *c as u64)
+            .sum()
     }
 }
 
@@ -157,8 +160,7 @@ impl StageContext<'_> {
     /// Snapshot of the live cancel flag. Safe to call in a tight loop
     /// — one relaxed atomic load.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled
-            .load(std::sync::atomic::Ordering::Relaxed)
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

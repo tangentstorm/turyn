@@ -1,3 +1,7 @@
+use crate::mdd_reorder::Mdd4;
+use crate::mdd_zw_first::{
+    DEAD, LEAF, StateKey, compute_active_tracking, make_zw_delta, pack_active, pack_sums,
+};
 /// BFS-by-level MDD builder.
 ///
 /// Two passes:
@@ -8,14 +12,7 @@
 ///
 /// Memory: O(max_states_per_level * 24 bytes) for state keys.
 /// Disk: O(total_states * 24 bytes) for level files.
-
 use rustc_hash::FxHashMap as HashMap;
-use crate::mdd_reorder::Mdd4;
-use crate::mdd_zw_first::{
-    DEAD, LEAF, StateKey,
-    pack_sums, pack_active, make_zw_delta,
-    compute_active_tracking,
-};
 
 fn unpack_sums(packed: u128, k: usize) -> Vec<i8> {
     (0..k).map(|i| ((packed >> (i * 8)) & 0xFF) as i8).collect()
@@ -102,10 +99,13 @@ impl BfsCtx {
         // Raw events (before index resolution)
         let mut raw_events: Vec<Vec<(usize, usize, usize, bool)>> =
             (0..zw_depth).map(|_| Vec::new()).collect();
-        let mut lag_check_at_level: Vec<Vec<usize>> =
-            (0..=zw_depth).map(|_| Vec::new()).collect();
+        let mut lag_check_at_level: Vec<Vec<usize>> = (0..=zw_depth).map(|_| Vec::new()).collect();
 
-        for (li, (zp, wp)) in z_pairs_per_lag.iter().zip(w_pairs_per_lag.iter()).enumerate() {
+        for (li, (zp, wp)) in z_pairs_per_lag
+            .iter()
+            .zip(w_pairs_per_lag.iter())
+            .enumerate()
+        {
             let mut complete = 0;
             for &(a, b) in zp {
                 let c = pos_to_level[a].max(pos_to_level[b]);
@@ -121,7 +121,11 @@ impl BfsCtx {
         }
 
         let mut max_remaining: Vec<Vec<i32>> = vec![vec![0i32; k]; zw_depth + 1];
-        for (li, (zp, wp)) in z_pairs_per_lag.iter().zip(w_pairs_per_lag.iter()).enumerate() {
+        for (li, (zp, wp)) in z_pairs_per_lag
+            .iter()
+            .zip(w_pairs_per_lag.iter())
+            .enumerate()
+        {
             for &(a, b) in zp {
                 let c = pos_to_level[a].max(pos_to_level[b]);
                 for lv in 0..=c {
@@ -136,20 +140,27 @@ impl BfsCtx {
             }
         }
 
-        let pairs: Vec<Vec<(usize, usize)>> = raw_events.iter()
-            .map(|evs| evs.iter().map(|&(_, a, b, _)| (a, b)).collect()).collect();
+        let pairs: Vec<Vec<(usize, usize)>> = raw_events
+            .iter()
+            .map(|evs| evs.iter().map(|&(_, a, b, _)| (a, b)).collect())
+            .collect();
         let (active_at_level, active_indices) =
             compute_active_tracking(zw_depth, 2 * k, &pos_order, &pairs);
 
         // Pre-resolve events with delta tables
-        let events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>> =
-            raw_events.iter().enumerate().map(|(level, evs)| {
-                evs.iter().map(|&(li, pos_a, pos_b, is_z)| {
-                    let idx_a = active_indices[level][pos_a];
-                    let idx_b = active_indices[level][pos_b];
-                    (li, idx_a, idx_b, make_zw_delta(is_z))
-                }).collect()
-            }).collect();
+        let events_at_level: Vec<Vec<(usize, usize, usize, [i8; 16])>> = raw_events
+            .iter()
+            .enumerate()
+            .map(|(level, evs)| {
+                evs.iter()
+                    .map(|&(li, pos_a, pos_b, is_z)| {
+                        let idx_a = active_indices[level][pos_a];
+                        let idx_b = active_indices[level][pos_b];
+                        (li, idx_a, idx_b, make_zw_delta(is_z))
+                    })
+                    .collect()
+            })
+            .collect();
 
         BfsCtx {
             k,
@@ -173,7 +184,12 @@ impl BfsCtx {
 
     /// Expand a state at `level`, calling `callback(branch, child_key)` for each valid child.
     #[inline]
-    fn expand_state_cb<F: FnMut(u32, StateKey)>(&self, key: StateKey, level: usize, mut callback: F) {
+    fn expand_state_cb<F: FnMut(u32, StateKey)>(
+        &self,
+        key: StateKey,
+        level: usize,
+        mut callback: F,
+    ) {
         let pos = self.pos_order[level];
         let active = &self.active_at_level[level];
         let n_active = active.len();
@@ -310,7 +326,10 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
     let _ = std::fs::create_dir_all(&tmp_dir);
 
     // ===== Pass 1: BFS top-down, enumerate states + store children =====
-    eprintln!("BFS Pass 1: enumerating ZW states (k={}, depth={})...", k, zw_depth);
+    eprintln!(
+        "BFS Pass 1: enumerating ZW states (k={}, depth={})...",
+        k, zw_depth
+    );
 
     let init_key: StateKey = (pack_sums(&vec![0i8; k]), 0u64);
     let mut current_keys: Vec<StateKey> = vec![init_key];
@@ -354,14 +373,25 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
                     all_child_keys = chunk_children;
                 } else {
                     // Merge two sorted deduped arrays
-                    let mut merged = Vec::with_capacity(all_child_keys.len() + chunk_children.len());
+                    let mut merged =
+                        Vec::with_capacity(all_child_keys.len() + chunk_children.len());
                     let mut i = 0;
                     let mut j = 0;
                     while i < all_child_keys.len() && j < chunk_children.len() {
                         match all_child_keys[i].cmp(&chunk_children[j]) {
-                            std::cmp::Ordering::Less => { merged.push(all_child_keys[i]); i += 1; }
-                            std::cmp::Ordering::Greater => { merged.push(chunk_children[j]); j += 1; }
-                            std::cmp::Ordering::Equal => { merged.push(all_child_keys[i]); i += 1; j += 1; }
+                            std::cmp::Ordering::Less => {
+                                merged.push(all_child_keys[i]);
+                                i += 1;
+                            }
+                            std::cmp::Ordering::Greater => {
+                                merged.push(chunk_children[j]);
+                                j += 1;
+                            }
+                            std::cmp::Ordering::Equal => {
+                                merged.push(all_child_keys[i]);
+                                i += 1;
+                                j += 1;
+                            }
                         }
                     }
                     merged.extend_from_slice(&all_child_keys[i..]);
@@ -414,16 +444,26 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
         write_children(&path, &parent_children).expect("Failed to write children");
 
         let count = next_keys.len();
-        eprint!("\r  Level {}/{}: {} → {} states ({:.1?})   ",
-            level + 1, zw_depth, n_parents, count, start.elapsed());
+        eprint!(
+            "\r  Level {}/{}: {} → {} states ({:.1?})   ",
+            level + 1,
+            zw_depth,
+            n_parents,
+            count,
+            start.elapsed()
+        );
         level_key_counts.push(count);
         current_keys = next_keys;
     }
 
     let max_states = level_key_counts.iter().max().copied().unwrap_or(0);
     let total_states: usize = level_key_counts.iter().sum();
-    eprintln!("\n  Pass 1 done in {:.1?}: max {}, total {} states",
-        start.elapsed(), max_states, total_states);
+    eprintln!(
+        "\n  Pass 1 done in {:.1?}: max {}, total {} states",
+        start.elapsed(),
+        max_states,
+        total_states
+    );
 
     // ===== Build XY sub-MDDs for distinct boundary zw_sums =====
     let zw_only = std::env::var("MDD_ZW_ONLY").is_ok();
@@ -434,7 +474,10 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
 
     let boundary_nids: Vec<u32> = if zw_only {
         // ZW-only: all valid boundary states → LEAF
-        eprintln!("ZW-only mode: {} boundary states → LEAF", current_keys.len());
+        eprintln!(
+            "ZW-only mode: {} boundary states → LEAF",
+            current_keys.len()
+        );
         let mut nids = Vec::with_capacity(current_keys.len());
         for &(sums_packed, _) in &current_keys {
             let sums = unpack_sums(sums_packed, k);
@@ -442,14 +485,23 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
             for li in 0..k {
                 let zw_val = sums[li] as i32;
                 let max_xy = ctx.xy_max_abs[li];
-                if zw_val.abs() > max_xy { ok = false; break; }
-                if (zw_val + max_xy) % 2 != 0 { ok = false; break; }
+                if zw_val.abs() > max_xy {
+                    ok = false;
+                    break;
+                }
+                if (zw_val + max_xy) % 2 != 0 {
+                    ok = false;
+                    break;
+                }
             }
             nids.push(if ok { LEAF } else { DEAD });
         }
         nids
     } else {
-        eprintln!("Building XY sub-MDDs for {} boundary states...", current_keys.len());
+        eprintln!(
+            "Building XY sub-MDDs for {} boundary states...",
+            current_keys.len()
+        );
         let xy_start = std::time::Instant::now();
 
         let mut xy_cache: HashMap<u128, u32> = HashMap::default();
@@ -461,23 +513,41 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
             }
             set.into_keys().collect()
         };
-        eprintln!("  {} distinct zw_sums from {} boundary states", distinct_sums.len(), current_keys.len());
+        eprintln!(
+            "  {} distinct zw_sums from {} boundary states",
+            distinct_sums.len(),
+            current_keys.len()
+        );
 
         for (i, &sums_packed) in distinct_sums.iter().enumerate() {
             if i % 100000 == 0 && i > 0 {
-                eprint!("\r  XY build {}/{} ({:.1?})   ", i, distinct_sums.len(), xy_start.elapsed());
+                eprint!(
+                    "\r  XY build {}/{} ({:.1?})   ",
+                    i,
+                    distinct_sums.len(),
+                    xy_start.elapsed()
+                );
             }
             let zw_sums = unpack_sums(sums_packed, k);
             let root = build_xy_dfs(
-                &zw_sums, k, zw_depth,
-                &ctx.pos_order, &ctx.active_at_level, &ctx.active_indices,
+                &zw_sums,
+                k,
+                zw_depth,
+                &ctx.pos_order,
+                &ctx.active_at_level,
+                &ctx.active_indices,
                 &ctx.xy_max_abs,
-                &mut nodes, &mut unique,
+                &mut nodes,
+                &mut unique,
             );
             xy_cache.insert(sums_packed, root);
         }
-        eprintln!("\r  XY builds done: {} sub-MDDs in {:.1?}, {} total nodes",
-            distinct_sums.len(), xy_start.elapsed(), nodes.len());
+        eprintln!(
+            "\r  XY builds done: {} sub-MDDs in {:.1?}, {} total nodes",
+            distinct_sums.len(),
+            xy_start.elapsed(),
+            nodes.len()
+        );
 
         // Map boundary states to XY root node IDs
         let mut nids = Vec::with_capacity(current_keys.len());
@@ -529,15 +599,30 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
             level_nids.push(node_id);
         }
 
-        eprint!("\r  Level {}/{}: {} states → {} nodes total ({:.1?})   ",
-            level, zw_depth, parent_children.len(), nodes.len(), pass2_start.elapsed());
+        eprint!(
+            "\r  Level {}/{}: {} states → {} nodes total ({:.1?})   ",
+            level,
+            zw_depth,
+            parent_children.len(),
+            nodes.len(),
+            pass2_start.elapsed()
+        );
         child_nids = level_nids;
     }
     eprintln!();
 
-    let root = if child_nids.is_empty() { DEAD } else { child_nids[0] };
-    eprintln!("BFS MDD k={}: {} nodes, {:.1} MB, total {:.1?}",
-        k, nodes.len(), nodes.len() as f64 * 16.0 / 1_048_576.0, start.elapsed());
+    let root = if child_nids.is_empty() {
+        DEAD
+    } else {
+        child_nids[0]
+    };
+    eprintln!(
+        "BFS MDD k={}: {} nodes, {:.1} MB, total {:.1?}",
+        k,
+        nodes.len(),
+        nodes.len() as f64 * 16.0 / 1_048_576.0,
+        start.elapsed()
+    );
 
     // Cleanup
     let _ = std::fs::remove_dir(&tmp_dir);
@@ -566,8 +651,7 @@ fn build_xy_dfs(
     // Precompute XY events (same structure as ZW but for x,y pairs)
     let mut xy_events_at_level: Vec<Vec<(usize, usize, usize)>> =
         (0..xy_depth).map(|_| Vec::new()).collect();
-    let mut xy_lag_check_at_level: Vec<Vec<usize>> =
-        (0..=xy_depth).map(|_| Vec::new()).collect();
+    let mut xy_lag_check_at_level: Vec<Vec<usize>> = (0..=xy_depth).map(|_| Vec::new()).collect();
     let mut xy_max_remaining: Vec<Vec<i32>> = vec![vec![0i32; k]; xy_depth + 1];
 
     let mut pos_to_level: Vec<usize> = vec![0; 2 * k];
@@ -590,7 +674,8 @@ fn build_xy_dfs(
     }
 
     type XyStateKey = (u128, u64);
-    let mut memo: Vec<HashMap<XyStateKey, u32>> = (0..=xy_depth).map(|_| HashMap::default()).collect();
+    let mut memo: Vec<HashMap<XyStateKey, u32>> =
+        (0..=xy_depth).map(|_| HashMap::default()).collect();
 
     fn build_xy_rec(
         level: usize,
@@ -740,10 +825,20 @@ fn build_xy_dfs(
 
     let mut sums = vec![0i8; k];
     build_xy_rec(
-        0, &mut sums, &[],
-        zw_sums, k, xy_depth,
-        pos_order, active_at_level, active_indices,
-        &xy_events_at_level, &xy_lag_check_at_level, &xy_max_remaining,
-        nodes, unique, &mut memo,
+        0,
+        &mut sums,
+        &[],
+        zw_sums,
+        k,
+        xy_depth,
+        pos_order,
+        active_at_level,
+        active_indices,
+        &xy_events_at_level,
+        &xy_lag_check_at_level,
+        &xy_max_remaining,
+        nodes,
+        unique,
+        &mut memo,
     )
 }

@@ -369,10 +369,8 @@ fn run_framework_mdd_mode(
     let start = std::time::Instant::now();
     // Construct the engine up front so we can pull its live cancel
     // flag *before* the adapter does any expensive setup.
-    let mut engine = SearchEngine::<MddPayload>::new(
-        EngineConfig::default(),
-        Box::new(GoldThenWork::new(32)),
-    );
+    let mut engine =
+        SearchEngine::<MddPayload>::new(EngineConfig::default(), Box::new(GoldThenWork::new(32)));
     let engine_cancel = engine.cancel_flag();
     let watchdog_handle =
         spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
@@ -448,7 +446,11 @@ fn run_framework_mdd_mode(
     // the way to a solution. Matches the shape of the deleted
     // pre-framework `print_stage_pruning_block` (PR review #7).
     use std::sync::atomic::Ordering as Ord;
-    let stage_exit: Vec<u64> = metrics.stage_exit.iter().map(|c| c.load(Ord::Relaxed)).collect();
+    let stage_exit: Vec<u64> = metrics
+        .stage_exit
+        .iter()
+        .map(|c| c.load(Ord::Relaxed))
+        .collect();
     eprintln!(
         "[framework:{}] stage_exit bnd/W/Z/XY = {}/{}/{}/{}",
         mode_name,
@@ -560,10 +562,8 @@ fn run_framework_cross_mode(
     // includes the setup phase the `--sat-secs` watchdog covers.
     let start = std::time::Instant::now();
     let (adapter, result_rx) = CrossAdapter::build(problem, tuples, cfg.clone(), verbose, k);
-    let mut engine = SearchEngine::<CrossPayload>::new(
-        EngineConfig::default(),
-        Box::new(GoldThenWork::new(32)),
-    );
+    let mut engine =
+        SearchEngine::<CrossPayload>::new(EngineConfig::default(), Box::new(GoldThenWork::new(32)));
     let engine_cancel = engine.cancel_flag();
     let found_flag = std::sync::Arc::clone(&adapter.found);
     let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
@@ -614,10 +614,8 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
     // enumeration) but we still clock from here so Finished
     // `elapsed` is comparable across modes.
     let start = std::time::Instant::now();
-    let mut engine = SearchEngine::<SyncPayload>::new(
-        EngineConfig::default(),
-        Box::new(GoldThenWork::new(32)),
-    );
+    let mut engine =
+        SearchEngine::<SyncPayload>::new(EngineConfig::default(), Box::new(GoldThenWork::new(32)));
     let engine_cancel = engine.cancel_flag();
     // Forward the same cancel flag into the walker so its internal
     // parallel DFS (which runs inside a single StageHandler call)
@@ -1364,12 +1362,7 @@ fn main() {
     if cfg.benchmark_repeats > 0 {
         run_benchmark(&cfg);
     } else if cfg.stochastic {
-        run_framework_stochastic_mode(
-            cfg.problem,
-            cfg.test_tuple.clone(),
-            &cfg,
-            true,
-        );
+        run_framework_stochastic_mode(cfg.problem, cfg.test_tuple.clone(), &cfg, true);
         return;
     } else {
         // All three --wz modes funnel through the same unified runner.

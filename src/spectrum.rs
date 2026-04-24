@@ -15,6 +15,7 @@ use turyn::mdd_reorder;
 use turyn::mdd_zw_first;
 use turyn::sat_z_middle;
 
+use crate::SPECTRAL_FREQS;
 use crate::config::*;
 use crate::enumerate::*;
 use crate::legacy_search::*;
@@ -22,8 +23,6 @@ use crate::mdd_pipeline::*;
 use crate::stochastic::*;
 use crate::types::*;
 use crate::xy_sat::*;
-use crate::SPECTRAL_FREQS;
-
 
 #[derive(Clone, Debug)]
 pub(crate) struct SeqWithSpectrum {
@@ -32,7 +31,6 @@ pub(crate) struct SeqWithSpectrum {
 }
 
 // BoundarySignature removed: bucketing provided no benefit (see commit history).
-
 
 #[derive(Clone)]
 pub(crate) struct SpectralFilter {
@@ -43,7 +41,6 @@ pub(crate) struct SpectralFilter {
     pub(crate) rfft: Arc<dyn realfft::RealToComplex<f64>>,
 }
 
-
 impl fmt::Debug for SpectralFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SpectralFilter")
@@ -51,7 +48,6 @@ impl fmt::Debug for SpectralFilter {
             .finish()
     }
 }
-
 
 impl SpectralFilter {
     pub(crate) fn new(seq_len: usize, theta_samples: usize) -> Self {
@@ -66,8 +62,6 @@ impl SpectralFilter {
     }
 }
 
-
-
 /// Convert a signed full-sequence sum to the SAT cardinality count over a
 /// middle slice with a fixed boundary contribution.  Returns `None` if the
 /// resulting mid_sum is out of range or has the wrong parity.
@@ -77,12 +71,15 @@ impl SpectralFilter {
 #[inline]
 pub(crate) fn sigma_full_to_cnt(sigma_full: i32, sigma_bnd: i32, l_mid: usize) -> Option<u32> {
     let mid_sum = sigma_full - sigma_bnd;
-    if mid_sum.unsigned_abs() as usize > l_mid { return None; }
+    if mid_sum.unsigned_abs() as usize > l_mid {
+        return None;
+    }
     let shifted = mid_sum + l_mid as i32;
-    if shifted & 1 != 0 { return None; }
+    if shifted & 1 != 0 {
+        return None;
+    }
     Some((shifted / 2) as u32)
 }
-
 
 /// Build the sorted-deduped set V of valid middle-count SAT targets for a
 /// sequence, across a list of **unsigned** tuples.  Every tuple contributes
@@ -103,7 +100,8 @@ pub(crate) fn valid_mid_counts<F>(
     sigma_bnd: i32,
     l_mid: usize,
 ) -> (Vec<u32>, Vec<(u32, usize, i32)>)
-where F: Fn(&SumTuple) -> i32,
+where
+    F: Fn(&SumTuple) -> i32,
 {
     let mut entries: Vec<(u32, usize, i32)> = Vec::new();
     for (ti, t) in tuples.iter().enumerate() {
@@ -123,7 +121,6 @@ where F: Fn(&SumTuple) -> i32,
     (counts, entries)
 }
 
-
 /// Given the solved middle bits and the boundary contribution, return the
 /// signed full-sequence sum σ_full.
 #[inline]
@@ -132,7 +129,6 @@ pub(crate) fn decode_sigma_full(mid_bits: &[i8], sigma_bnd: i32) -> i32 {
     let mid_sum: i32 = mid_bits.iter().map(|&b| b as i32).sum();
     sigma_bnd + mid_sum
 }
-
 
 /// Scratch buffers for realfft-based spectrum computation. Each worker
 /// keeps one of these for Z and one for W. Reusing the buffers avoids
@@ -144,7 +140,6 @@ pub(crate) struct FftScratch {
     pub(crate) output: Vec<Complex<f64>>,
 }
 
-
 impl FftScratch {
     pub(crate) fn new(filter: &SpectralFilter) -> Self {
         Self {
@@ -153,7 +148,6 @@ impl FftScratch {
         }
     }
 }
-
 
 #[inline]
 pub(crate) fn fill_real_input(values: &[i8], input: &mut Vec<f64>, fft_size: usize) {
@@ -168,7 +162,6 @@ pub(crate) fn fill_real_input(values: &[i8], input: &mut Vec<f64>, fft_size: usi
     }
 }
 
-
 /// Write the spectrum into `out` (reusable buffer) instead of allocating.
 pub(crate) fn compute_spectrum_into(
     values: &[i8],
@@ -178,14 +171,16 @@ pub(crate) fn compute_spectrum_into(
 ) {
     let m = filter.fft_size;
     fill_real_input(values, &mut scratch.input, m);
-    filter.rfft.process(&mut scratch.input, &mut scratch.output).unwrap();
+    filter
+        .rfft
+        .process(&mut scratch.input, &mut scratch.output)
+        .unwrap();
     out.clear();
     out.reserve(scratch.output.len());
     for c in &scratch.output {
         out.push(c.norm_sqr());
     }
 }
-
 
 pub(crate) fn spectrum_if_ok(
     values: &[i8],
@@ -195,7 +190,10 @@ pub(crate) fn spectrum_if_ok(
 ) -> Option<Vec<f64>> {
     let m = filter.fft_size;
     fill_real_input(values, &mut scratch.input, m);
-    filter.rfft.process(&mut scratch.input, &mut scratch.output).unwrap();
+    filter
+        .rfft
+        .process(&mut scratch.input, &mut scratch.output)
+        .unwrap();
     let mut spectrum = Vec::with_capacity(scratch.output.len());
     for c in &scratch.output {
         let p = c.norm_sqr();
@@ -206,7 +204,6 @@ pub(crate) fn spectrum_if_ok(
     }
     Some(spectrum)
 }
-
 
 /// Like `spectrum_if_ok` but writes into a reusable buffer and returns a
 /// bool. The buffer is cleared and sized to `half = fft_size/2 + 1` on
@@ -222,7 +219,10 @@ pub(crate) fn spectrum_into_if_ok(
 ) -> bool {
     let m = filter.fft_size;
     fill_real_input(values, &mut scratch.input, m);
-    filter.rfft.process(&mut scratch.input, &mut scratch.output).unwrap();
+    filter
+        .rfft
+        .process(&mut scratch.input, &mut scratch.output)
+        .unwrap();
     out.clear();
     out.reserve(scratch.output.len());
     for c in &scratch.output {
@@ -235,7 +235,6 @@ pub(crate) fn spectrum_into_if_ok(
     true
 }
 
-
 pub(crate) fn spectral_pair_ok(z_spectrum: &[f64], w_spectrum: &[f64], bound: f64) -> bool {
     for i in 0..z_spectrum.len() {
         if z_spectrum[i] + w_spectrum[i] > bound {
@@ -244,7 +243,6 @@ pub(crate) fn spectral_pair_ok(z_spectrum: &[f64], w_spectrum: &[f64], bound: f6
     }
     true
 }
-
 
 /// Index for fast spectral pair lookups.
 /// For each frequency, stores W candidate indices sorted by power at that frequency.
@@ -255,16 +253,19 @@ pub(crate) struct SpectralIndex {
     pub(crate) sorted_by_freq: Vec<Vec<(f64, usize)>>,
 }
 
-
 impl SpectralIndex {
     pub(crate) fn build(w_candidates: &[SeqWithSpectrum]) -> Self {
         if w_candidates.is_empty() {
-            return Self { sorted_by_freq: Vec::new() };
+            return Self {
+                sorted_by_freq: Vec::new(),
+            };
         }
         let num_freqs = w_candidates[0].spectrum.len();
         let mut sorted_by_freq = Vec::with_capacity(num_freqs);
         for f in 0..num_freqs {
-            let mut entries: Vec<(f64, usize)> = w_candidates.iter().enumerate()
+            let mut entries: Vec<(f64, usize)> = w_candidates
+                .iter()
+                .enumerate()
                 .map(|(i, w)| (w.spectrum[f], i))
                 .collect();
             entries.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -276,9 +277,17 @@ impl SpectralIndex {
     /// Find W candidates that pass budget constraints at the top-4 tightest frequencies.
     /// Uses binary search on the tightest, then filters by frequencies 2-4.
     /// Results are written into `out` (cleared first) as W indices.
-    pub(crate) fn candidates_for(&self, z_spectrum: &[f64], pair_bound: f64, w_candidates: &[SeqWithSpectrum], out: &mut Vec<usize>) {
+    pub(crate) fn candidates_for(
+        &self,
+        z_spectrum: &[f64],
+        pair_bound: f64,
+        w_candidates: &[SeqWithSpectrum],
+        out: &mut Vec<usize>,
+    ) {
         out.clear();
-        if self.sorted_by_freq.is_empty() { return; }
+        if self.sorted_by_freq.is_empty() {
+            return;
+        }
         // Find top-4 tightest frequencies (highest Z power = least budget for W)
         let mut top: [(f64, usize); 4] = [(f64::MIN, 0); 4];
         for (f, &zp) in z_spectrum.iter().enumerate() {
@@ -313,4 +322,3 @@ impl SpectralIndex {
         }
     }
 }
-

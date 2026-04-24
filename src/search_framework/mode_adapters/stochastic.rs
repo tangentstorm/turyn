@@ -45,8 +45,7 @@ impl StageHandler<StochasticPayload> for StochasticStage {
             self.time_limit_secs,
         );
         if report.found_solution {
-            self.found
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.found.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         // Stochastic search is non-exhaustive by construction;
         // crediting `covered=1.0` on return would falsely hit the

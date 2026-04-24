@@ -15,6 +15,7 @@ use turyn::mdd_reorder;
 use turyn::mdd_zw_first;
 use turyn::sat_z_middle;
 
+use crate::SPECTRAL_FREQS;
 use crate::config::*;
 use crate::legacy_search::*;
 use crate::mdd_pipeline::*;
@@ -22,8 +23,6 @@ use crate::spectrum::*;
 use crate::stochastic::*;
 use crate::types::*;
 use crate::xy_sat::*;
-use crate::SPECTRAL_FREQS;
-
 
 /// A (Z, W) candidate reduced to everything the XY SAT stage actually
 /// reads — the aperiodic autocorrelation sum `2·N_Z(s) + 2·N_W(s)` for
@@ -34,7 +33,6 @@ use crate::SPECTRAL_FREQS;
 pub(crate) struct CandidateZW {
     pub(crate) zw_autocorr: Vec<i32>,
 }
-
 
 pub(crate) fn enumerate_sum_tuples(problem: Problem) -> Vec<SumTuple> {
     let mut out = Vec::new();
@@ -65,21 +63,22 @@ pub(crate) fn enumerate_sum_tuples(problem: Problem) -> Vec<SumTuple> {
     out
 }
 
-
 pub(crate) fn normalized_tuples(raw: &[SumTuple]) -> Vec<SumTuple> {
     let mut seen = HashMap::new();
     for t in raw {
         let key = t.norm_key();
         // Store canonical form: all positive, x <= y
         seen.entry(key).or_insert(SumTuple {
-            x: key.0, y: key.1, z: key.2, w: key.3,
+            x: key.0,
+            y: key.1,
+            z: key.2,
+            w: key.3,
         });
     }
     let mut items: Vec<_> = seen.into_values().collect();
     items.sort_by_key(|t| t.norm_key());
     items
 }
-
 
 /// Unified Phase A: enumerate sum-tuples with normalization, dedup, parity filter, and --tuple filter.
 /// Returns canonical forms: all positive, x <= y.
@@ -101,8 +100,6 @@ pub(crate) fn phase_a_tuples(problem: Problem, test_tuple: Option<&SumTuple>) ->
     tuples
 }
 
-
-
 #[allow(dead_code)]
 pub(crate) fn generate_sequences_with_sum(
     len: usize,
@@ -118,7 +115,6 @@ pub(crate) fn generate_sequences_with_sum(
     });
     out
 }
-
 
 /// Generate ±1 sequences of given length and sum, calling `visit` for each.
 /// `visit` returns `true` to continue, `false` to stop early.
@@ -219,7 +215,9 @@ pub(crate) fn generate_sequences_with_sum_visit<F: FnMut(&[i8]) -> bool>(
             );
         }
 
-        if *stopped { return; }
+        if *stopped {
+            return;
+        }
 
         curr[i] = -1;
         let max_neg = curr_sum - 1 + forced_plus + free_remaining;
@@ -256,7 +254,6 @@ pub(crate) fn generate_sequences_with_sum_visit<F: FnMut(&[i8]) -> bool>(
     );
 }
 
-
 /// Print search space statistics for a set of tuples.
 /// For each tuple, shows k!n (J notation for binomial) for each sequence —
 /// the number of {+1,-1} strings of the given length with the given sum.
@@ -275,21 +272,38 @@ pub(crate) fn print_search_space(problem: Problem, tuples: &[SumTuple]) {
         let cw = binom(m, kw);
         let prod = cx as f64 * cy as f64 * cz as f64 * cw as f64;
         grand_total += prod;
-        eprintln!("  {:>2} {:>2} {:>2} {:>2}   X:{}!{}={:.3e}  Y:{}!{}={:.3e}  Z:{}!{}={:.3e}  W:{}!{}={:.3e}  total {:.3e}",
-            t.x, t.y, t.z, t.w,
-            kx, n, cx as f64,
-            ky, n, cy as f64,
-            kz, n, cz as f64,
-            kw, m, cw as f64,
-            prod);
+        eprintln!(
+            "  {:>2} {:>2} {:>2} {:>2}   X:{}!{}={:.3e}  Y:{}!{}={:.3e}  Z:{}!{}={:.3e}  W:{}!{}={:.3e}  total {:.3e}",
+            t.x,
+            t.y,
+            t.z,
+            t.w,
+            kx,
+            n,
+            cx as f64,
+            ky,
+            n,
+            cy as f64,
+            kz,
+            n,
+            cz as f64,
+            kw,
+            m,
+            cw as f64,
+            prod
+        );
     }
-    eprintln!("  Brute-force search space (all tuples): {:.3e}", grand_total);
+    eprintln!(
+        "  Brute-force search space (all tuples): {:.3e}",
+        grand_total
+    );
 }
-
 
 /// Compute binomial coefficient C(n, k) as u128 (enough for n ≤ 60).
 pub(crate) fn binom(n: usize, k: usize) -> u128 {
-    if k > n { return 0; }
+    if k > n {
+        return 0;
+    }
     let k = k.min(n - k);
     let mut result = 1u128;
     for i in 0..k {
@@ -298,13 +312,14 @@ pub(crate) fn binom(n: usize, k: usize) -> u128 {
     result
 }
 
-
 /// Unrank: given index `rank` in [0, C(f, r)), produce the rank-th combination
 /// of choosing r positions from f slots (in colex order).
 /// Writes +1/-1 into `out[start..start+f]`.
 pub(crate) fn unrank_combination(rank: u128, f: usize, r: usize, out: &mut [i8], start: usize) {
     // Set all to -1, then place r ones
-    for i in 0..f { out[start + i] = -1; }
+    for i in 0..f {
+        out[start + i] = -1;
+    }
     let mut remaining_rank = rank;
     let mut remaining_choose = r;
     let mut pos = f;
@@ -318,7 +333,6 @@ pub(crate) fn unrank_combination(rank: u128, f: usize, r: usize, out: &mut [i8],
         }
     }
 }
-
 
 /// Generate ±1 sequences with a given sum in permuted (pseudo-random) order.
 /// Uses an LCG bijection over [0, C(f, r)) to visit every sequence exactly once
@@ -340,17 +354,25 @@ pub(crate) fn generate_sequences_permuted<F: FnMut(&[i8]) -> bool>(
     let free_target = target_sum - fixed_sum; // sum needed from free positions
     // free positions have values in {-1, +1}, sum = 2*ones - f
     // so ones = (free_target + f) / 2
-    if (free_target + f as i32) % 2 != 0 { return; }
+    if (free_target + f as i32) % 2 != 0 {
+        return;
+    }
     let r_signed = (free_target + f as i32) / 2;
-    if r_signed < 0 || r_signed > f as i32 { return; }
+    if r_signed < 0 || r_signed > f as i32 {
+        return;
+    }
     let r = r_signed as usize; // number of +1s among free positions
 
     let total = binom(f, r);
     let n_visit = (limit as u128).min(total);
 
     let mut curr = vec![1i8; len];
-    if root_one { curr[0] = 1; }
-    if tail_one { curr[len - 1] = 1; }
+    if root_one {
+        curr[0] = 1;
+    }
+    if tail_one {
+        curr[len - 1] = 1;
+    }
 
     // If the full space fits within the limit, DFS is faster (no unranking overhead).
     if total <= limit as u128 {
@@ -363,10 +385,14 @@ pub(crate) fn generate_sequences_permuted<F: FnMut(&[i8]) -> bool>(
     let m = total;
     let a = {
         let mut candidate = 6364136223846793005u128 % m;
-        if candidate == 0 { candidate = 1; }
+        if candidate == 0 {
+            candidate = 1;
+        }
         while gcd128(candidate, m) != 1 {
             candidate = (candidate + 1) % m;
-            if candidate == 0 { candidate = 1; }
+            if candidate == 0 {
+                candidate = 1;
+            }
         }
         candidate
     };
@@ -375,16 +401,20 @@ pub(crate) fn generate_sequences_permuted<F: FnMut(&[i8]) -> bool>(
     for i in 0..n_visit {
         let rank = (a * i + c) % m;
         unrank_combination(rank, f, r, &mut curr, free_start);
-        if !visit(&curr) { return; }
+        if !visit(&curr) {
+            return;
+        }
     }
 }
 
-
 pub(crate) fn gcd128(mut a: u128, mut b: u128) -> u128 {
-    while b != 0 { let t = b; b = a % b; a = t; }
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
     a
 }
-
 
 /// Generate all spectrally-valid W sequences for a given sum.
 /// W is the shorter sequence (length n-1) so we materialize it; Z is streamed.
@@ -409,9 +439,7 @@ pub(crate) fn build_w_candidates(
             return false;
         }
         stats.w_generated += 1;
-        if let Some(spectrum) =
-            spectrum_if_ok(values, spectral_w, individual_bound, &mut fft_buf)
-        {
+        if let Some(spectrum) = spectrum_if_ok(values, spectral_w, individual_bound, &mut fft_buf) {
             stats.w_spectral_ok += 1;
             w_candidates.push(SeqWithSpectrum {
                 spectrum,
@@ -422,7 +450,6 @@ pub(crate) fn build_w_candidates(
     });
     w_candidates
 }
-
 
 /// Streaming Z×W pairing with spectral index for fast candidate lookup.
 /// For each spectrally-valid Z, uses the index to find W candidates that pass
@@ -449,23 +476,28 @@ pub(crate) fn for_each_zw_pair(
             return false;
         }
         stats.z_generated += 1;
-        let Some(z_spectrum) =
-            spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf) else { return true; };
+        let Some(z_spectrum) = spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf)
+        else {
+            return true;
+        };
         stats.z_spectral_ok += 1;
         let z_seq = PackedSeq::from_values(values);
         w_index.candidates_for(&z_spectrum, pair_bound, w_candidates, &mut idx_buf);
         for &wi in &idx_buf {
             let w = &w_candidates[wi];
             stats.candidate_pair_attempts += 1;
-            if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) { continue; }
+            if !spectral_pair_ok(&z_spectrum, &w.spectrum, pair_bound) {
+                continue;
+            }
             stats.candidate_pair_spectral_ok += 1;
             let zw = compute_zw_autocorr(problem, &z_seq, &w.seq);
-            if !emit(&z_seq, &w.seq, zw, &z_spectrum, &w.spectrum) { return false; }
+            if !emit(&z_seq, &w.seq, zw, &z_spectrum, &w.spectrum) {
+                return false;
+            }
         }
         true
     });
 }
-
 
 pub(crate) fn stream_zw_candidates(
     problem: Problem,
@@ -480,7 +512,15 @@ pub(crate) fn stream_zw_candidates(
 ) -> Vec<CandidateZW> {
     let mut out = Vec::new();
     for_each_zw_pair(
-        problem, z_sum, w_candidates, w_index, cfg, spectral_z, stats, found, cancelled,
+        problem,
+        z_sum,
+        w_candidates,
+        w_index,
+        cfg,
+        spectral_z,
+        stats,
+        found,
+        cancelled,
         |_z_seq, _w_seq, zw, _, _| {
             out.push(CandidateZW { zw_autocorr: zw });
             true
@@ -488,7 +528,6 @@ pub(crate) fn stream_zw_candidates(
     );
     out
 }
-
 
 pub(crate) fn build_zw_candidates(
     problem: Problem,
@@ -518,4 +557,3 @@ pub(crate) fn build_zw_candidates(
         cancelled,
     )
 }
-

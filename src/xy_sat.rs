@@ -15,6 +15,7 @@ use turyn::mdd_reorder;
 use turyn::mdd_zw_first;
 use turyn::sat_z_middle;
 
+use crate::SPECTRAL_FREQS;
 use crate::config::*;
 use crate::enumerate::*;
 use crate::legacy_search::*;
@@ -22,8 +23,6 @@ use crate::mdd_pipeline::*;
 use crate::spectrum::*;
 use crate::stochastic::*;
 use crate::types::*;
-use crate::SPECTRAL_FREQS;
-
 
 /// Pre-built SAT template for X/Y solving. Contains the structural clauses
 /// (XNOR, totalizer trees, sum constraints) that are shared across all Z/W pairs
@@ -35,14 +34,12 @@ pub(crate) struct SatXYTemplate {
     pub(crate) n: usize,
 }
 
-
 #[cfg(feature = "cadical")]
 pub(crate) struct SatXYTemplate {
     pub(crate) solver: cadical::Solver,
     pub(crate) lag_pairs: Vec<LagPairs>,
     pub(crate) n: usize,
 }
-
 
 /// Per-candidate GJ elimination: given specific agree targets for each lag,
 /// determine which primary variable pairs must be equal/opposite, and
@@ -58,10 +55,12 @@ pub(crate) struct Gf2Row {
     pub(crate) constant: bool,  // right-hand side
 }
 
-
 impl Gf2Row {
     pub(crate) fn new(num_vars: usize) -> Self {
-        Self { vars: vec![false; num_vars], constant: false }
+        Self {
+            vars: vec![false; num_vars],
+            constant: false,
+        }
     }
     pub(crate) fn xor_with(&mut self, other: &Gf2Row) {
         for i in 0..self.vars.len() {
@@ -79,19 +78,22 @@ impl Gf2Row {
     }
 }
 
-
 /// Compute the XY agree target for a given lag `s`:
 /// target_raw = 2*(n-s) - zw_autocorr[s], target = target_raw/2.
 /// Returns None if the target is infeasible (negative or wrong parity).
 pub(crate) fn xy_agree_target(n: usize, s: usize, zw_autocorr: &[i32]) -> Option<usize> {
     let target_raw = 2 * (n - s) as i32 - zw_autocorr[s];
-    if target_raw < 0 || target_raw % 2 != 0 { return None; }
+    if target_raw < 0 || target_raw % 2 != 0 {
+        return None;
+    }
     Some((target_raw / 2) as usize)
 }
 
-
 /// Returns None if a contradiction is detected (UNSAT), otherwise equalities.
-pub(crate) fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Option<Vec<(i32, i32, bool)>> {
+pub(crate) fn gj_candidate_equalities(
+    n: usize,
+    candidate: &CandidateZW,
+) -> Option<Vec<(i32, i32, bool)>> {
     let num_vars = 2 * n;
     // Union-find with negation tracking (XOR-union-find)
     let mut parent: Vec<usize> = (0..num_vars).collect();
@@ -117,8 +119,14 @@ pub(crate) fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Opti
     }
 
     // Returns false if a contradiction is detected
-    fn union(parent: &mut [usize], rank: &mut [u8], neg: &mut [bool],
-             a: usize, b: usize, a_neg_b: bool) -> bool {
+    fn union(
+        parent: &mut [usize],
+        rank: &mut [u8],
+        neg: &mut [bool],
+        a: usize,
+        b: usize,
+        a_neg_b: bool,
+    ) -> bool {
         let (ra, na) = find(parent, neg, a);
         let (rb, nb) = find(parent, neg, b);
         if ra == rb {
@@ -143,7 +151,9 @@ pub(crate) fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Opti
     // Process lags where ALL or NO pairs agree.
     // Also process lags where X and Y halves have separate extreme targets.
     for s in 1..n {
-        let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { continue; };
+        let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else {
+            continue;
+        };
         let x_pairs = n - s;
         let y_pairs = n - s;
         let max_pairs = x_pairs + y_pairs;
@@ -151,18 +161,26 @@ pub(crate) fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Opti
         if target == max_pairs {
             // ALL pairs agree
             for i in 0..x_pairs {
-                if !union(&mut parent, &mut rank, &mut neg, i, i + s, false) { return None; }
+                if !union(&mut parent, &mut rank, &mut neg, i, i + s, false) {
+                    return None;
+                }
             }
             for i in 0..y_pairs {
-                if !union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, false) { return None; }
+                if !union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, false) {
+                    return None;
+                }
             }
         } else if target == 0 {
             // NO pairs agree
             for i in 0..x_pairs {
-                if !union(&mut parent, &mut rank, &mut neg, i, i + s, true) { return None; }
+                if !union(&mut parent, &mut rank, &mut neg, i, i + s, true) {
+                    return None;
+                }
             }
             for i in 0..y_pairs {
-                if !union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, true) { return None; }
+                if !union(&mut parent, &mut rank, &mut neg, n + i, n + i + s, true) {
+                    return None;
+                }
             }
         }
     }
@@ -184,7 +202,9 @@ pub(crate) fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Opti
     {
         let mut rows: Vec<Gf2Row> = Vec::new();
         for s in 1..n {
-            let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { continue; };
+            let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else {
+                continue;
+            };
             let k = 2 * (n - s); // total pairs (X + Y)
 
             // Build GF(2) equation: for each pair (i, i+s), x_i and x_{i+s} each
@@ -192,13 +212,13 @@ pub(crate) fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Opti
             let mut row = Gf2Row::new(num_vars);
             // X pairs
             for i in 0..(n - s) {
-                row.vars[i] ^= true;       // x_i
-                row.vars[i + s] ^= true;   // x_{i+s}
+                row.vars[i] ^= true; // x_i
+                row.vars[i + s] ^= true; // x_{i+s}
             }
             // Y pairs
             for i in 0..(n - s) {
-                row.vars[n + i] ^= true;       // y_i
-                row.vars[n + i + s] ^= true;   // y_{i+s}
+                row.vars[n + i] ^= true; // y_i
+                row.vars[n + i + s] ^= true; // y_{i+s}
             }
             row.constant = ((target + k) % 2) == 1;
             // Skip trivial rows (all zeros)
@@ -235,12 +255,19 @@ pub(crate) fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Opti
         // A row with exactly 1 variable: that variable = constant
         // A row with exactly 2 variables: they are equal (or negated)
         for row in &rows {
-            let set_vars: Vec<usize> = row.vars.iter().enumerate()
-                .filter(|&(_, &v)| v).map(|(i, _)| i).collect();
+            let set_vars: Vec<usize> = row
+                .vars
+                .iter()
+                .enumerate()
+                .filter(|&(_, &v)| v)
+                .map(|(i, _)| i)
+                .collect();
             match set_vars.len() {
                 0 => {
                     // All-zero row: if constant is 1, contradiction (UNSAT)
-                    if row.constant { return None; }
+                    if row.constant {
+                        return None;
+                    }
                 }
                 1 => {
                     // Forced variable: x_v = constant (in GF(2)).
@@ -277,7 +304,6 @@ pub(crate) fn gj_candidate_equalities(n: usize, candidate: &CandidateZW) -> Opti
     Some(equalities)
 }
 
-
 /// Pair data for quadratic PB constraints per lag: (lits_a, lits_b) for each lag.
 /// agree(x_i, x_{i+s}) = x_i*x_{i+s} + ¬x_i*¬x_{i+s}, so each lag has
 /// 4*(n-s) product terms (both-true + both-false for X pairs and Y pairs).
@@ -286,27 +312,24 @@ pub(crate) struct LagPairs {
     pub(crate) lits_b: Vec<i32>,
 }
 
-
 /// Encode `aux ↔ (a == b)` (XNOR / agree indicator). Only referenced
 /// from the regression test that pins down all four input combinations;
 /// the production code path inlines the same four clauses where it
 /// builds quadratic-PB lag constraints.
 #[cfg(test)]
 pub(crate) fn encode_xnor_agree(solver: &mut impl SatSolver, aux: i32, a: i32, b: i32) {
-    solver.add_clause([-aux, -a,  b]);
-    solver.add_clause([-aux,  a, -b]);
-    solver.add_clause([ aux,  a,  b]);
-    solver.add_clause([ aux, -a, -b]);
+    solver.add_clause([-aux, -a, b]);
+    solver.add_clause([-aux, a, -b]);
+    solver.add_clause([aux, a, b]);
+    solver.add_clause([aux, -a, -b]);
 }
-
 
 pub(crate) fn encode_xor_def(solver: &mut impl SatSolver, d: i32, a: i32, b: i32) {
-    solver.add_clause([-d,  a,  b]);
+    solver.add_clause([-d, a, b]);
     solver.add_clause([-d, -a, -b]);
-    solver.add_clause([ d,  a, -b]);
-    solver.add_clause([ d, -a,  b]);
+    solver.add_clause([d, a, -b]);
+    solver.add_clause([d, -a, b]);
 }
-
 
 /// Allocate fresh aux vars and emit BDKR "first-violation" palindromic-
 /// break clauses (rules ii, iii, iv).
@@ -327,10 +350,17 @@ pub(crate) fn add_palindromic_break<F, S>(
     equality: bool,
     start_j: usize,
     next_var: &mut i32,
-) where F: Fn(usize) -> i32, S: SatSolver {
-    if seq_len < 2 { return; }
+) where
+    F: Fn(usize) -> i32,
+    S: SatSolver,
+{
+    if seq_len < 2 {
+        return;
+    }
     let last_j = (seq_len - 2) / 2;
-    if start_j > last_j { return; }
+    if start_j > last_j {
+        return;
+    }
     let n_aux = last_j - start_j + 1;
     let base = *next_var;
     *next_var += n_aux as i32;
@@ -345,14 +375,21 @@ pub(crate) fn add_palindromic_break<F, S>(
     for i in start_j..=last_j {
         let mut clause: Vec<i32> = Vec::with_capacity(i - start_j + 2);
         for j in start_j..i {
-            if equality { clause.push(-diff(j)); } else { clause.push(diff(j)); }
+            if equality {
+                clause.push(-diff(j));
+            } else {
+                clause.push(diff(j));
+            }
         }
-        if equality { clause.push(diff(i)); } else { clause.push(-diff(i)); }
+        if equality {
+            clause.push(diff(i));
+        } else {
+            clause.push(-diff(i));
+        }
         clause.push(seq_var(i));
         solver.add_clause(clause);
     }
 }
-
 
 /// BDKR rule (v) — alternation-break for W.  Defines `v_k` aux vars via
 ///    v_k ↔ d[k] XOR d[m-1-k] XOR d[m-1]
@@ -366,8 +403,13 @@ pub(crate) fn add_alternation_break<F, S>(
     seq_len: usize,
     seq_var: F,
     next_var: &mut i32,
-) where F: Fn(usize) -> i32, S: SatSolver {
-    if seq_len < 3 { return; }
+) where
+    F: Fn(usize) -> i32,
+    S: SatSolver,
+{
+    if seq_len < 3 {
+        return;
+    }
     let last_k = (seq_len - 2) / 2;
     let tail = seq_var(seq_len - 1);
     // Allocate v_k aux vars and an inner aux u_k for the two-step XOR.
@@ -388,13 +430,14 @@ pub(crate) fn add_alternation_break<F, S>(
     // ⇒ d[i] = +1.  CNF clause: (∨_{j<i} ¬v_j) ∨ v_i ∨ d[i].
     for i in 0..=last_k {
         let mut clause: Vec<i32> = Vec::with_capacity(i + 2);
-        for j in 0..i { clause.push(-v(j)); }
+        for j in 0..i {
+            clause.push(-v(j));
+        }
         clause.push(v(i));
         clause.push(seq_var(i));
         solver.add_clause(clause);
     }
 }
-
 
 /// BDKR rule (vi) — conditional X↔Y swap break (requires n > 2).
 ///
@@ -404,24 +447,25 @@ pub(crate) fn add_alternation_break<F, S>(
 /// In 0-indexed vars: `a[2]→x_var(1)`, `a[n-1]→x_var(n-2)` (and same
 /// for b).  Encoded as five binary/ternary clauses; see
 /// docs/CANONICAL.md.
-pub(crate) fn add_swap_break<F, G, S>(
-    solver: &mut S,
-    x_var: F,
-    y_var: G,
-    n: usize,
-) where F: Fn(usize) -> i32, G: Fn(usize) -> i32, S: SatSolver {
-    if n <= 2 { return; }
+pub(crate) fn add_swap_break<F, G, S>(solver: &mut S, x_var: F, y_var: G, n: usize)
+where
+    F: Fn(usize) -> i32,
+    G: Fn(usize) -> i32,
+    S: SatSolver,
+{
+    if n <= 2 {
+        return;
+    }
     let x1 = x_var(1);
     let y1 = y_var(1);
     let x_last = x_var(n - 2);
     let y_last = y_var(n - 2);
-    solver.add_clause([x1, -y1]);              // forbid (x[1]=-1 ∧ y[1]=+1)
-    solver.add_clause([x1,  x_last]);          // NOT case 2  ⇒  x[n-2] = +1  (i)
-    solver.add_clause([-y1, x_last]);          //                             (ii)
-    solver.add_clause([x1, -y_last]);          // NOT case 2  ⇒  y[n-2] = -1  (i)
-    solver.add_clause([-y1, -y_last]);         //                             (ii)
+    solver.add_clause([x1, -y1]); // forbid (x[1]=-1 ∧ y[1]=+1)
+    solver.add_clause([x1, x_last]); // NOT case 2  ⇒  x[n-2] = +1  (i)
+    solver.add_clause([-y1, x_last]); //                             (ii)
+    solver.add_clause([x1, -y_last]); // NOT case 2  ⇒  y[n-2] = -1  (i)
+    solver.add_clause([-y1, -y_last]); //                             (ii)
 }
-
 
 /// XY product-law conjecture (`--conj-xy-product`): enforce
 /// `U_i = -U_{n+1-i}` for every 2 <= i <= n-1, where
@@ -440,16 +484,20 @@ pub(crate) fn add_swap_break<F, G, S>(
 /// Self-paired indices (`j == n-1-j`, only possible for odd `n`) force
 /// `U_i * U_i = -1` which is infeasible; in that case we emit a trivial
 /// empty clause and the solver returns UNSAT.
-pub(crate) fn add_xy_product_law<F, G, S>(
-    solver: &mut S,
-    x_var: F,
-    y_var: G,
-    n: usize,
-) where F: Fn(usize) -> i32, G: Fn(usize) -> i32, S: SatSolver {
-    if n < 2 { return; }
+pub(crate) fn add_xy_product_law<F, G, S>(solver: &mut S, x_var: F, y_var: G, n: usize)
+where
+    F: Fn(usize) -> i32,
+    G: Fn(usize) -> i32,
+    S: SatSolver,
+{
+    if n < 2 {
+        return;
+    }
     for j in 1..=((n - 1) / 2) {
         let k = n - 1 - j;
-        if j > k { break; }
+        if j > k {
+            break;
+        }
         if j == k {
             // Infeasible: (x_j*y_j)^2 = +1 ≠ -1. Make it obviously UNSAT.
             solver.add_clause([]);
@@ -461,17 +509,16 @@ pub(crate) fn add_xy_product_law<F, G, S>(
         let d = y_var(k);
         // Forbid every even-parity assignment of (a,b,c,d):
         //   0 true, all four 2-true combos, 4 true.
-        solver.add_clause([ a,  b,  c,  d]);  // rule out (F,F,F,F)
-        solver.add_clause([-a, -b, -c, -d]);  // rule out (T,T,T,T)
-        solver.add_clause([-a, -b,  c,  d]);  // rule out (T,T,F,F)
-        solver.add_clause([-a,  b, -c,  d]);  // rule out (T,F,T,F)
-        solver.add_clause([-a,  b,  c, -d]);  // rule out (T,F,F,T)
-        solver.add_clause([ a, -b, -c,  d]);  // rule out (F,T,T,F)
-        solver.add_clause([ a, -b,  c, -d]);  // rule out (F,T,F,T)
-        solver.add_clause([ a,  b, -c, -d]);  // rule out (F,F,T,T)
+        solver.add_clause([a, b, c, d]); // rule out (F,F,F,F)
+        solver.add_clause([-a, -b, -c, -d]); // rule out (T,T,T,T)
+        solver.add_clause([-a, -b, c, d]); // rule out (T,T,F,F)
+        solver.add_clause([-a, b, -c, d]); // rule out (T,F,T,F)
+        solver.add_clause([-a, b, c, -d]); // rule out (T,F,F,T)
+        solver.add_clause([a, -b, -c, d]); // rule out (F,T,T,F)
+        solver.add_clause([a, -b, c, -d]); // rule out (F,T,F,T)
+        solver.add_clause([a, b, -c, -d]); // rule out (F,F,T,T)
     }
 }
-
 
 /// Build SAT XY template with PB constraints for sum constraints
 /// and quadratic PB agree pairs per lag. No XNOR auxiliary variables.
@@ -488,7 +535,6 @@ pub(crate) fn build_sat_xy_clauses_multi(
 ) -> Option<(Vec<LagPairs>, usize)> {
     build_sat_xy_clauses_multi_opts(problem, tuples, solver, false)
 }
-
 
 /// Like `build_sat_xy_clauses_multi`, but optionally appends the
 /// XY product-law conjecture (`U_i = -U_{n+1-i}` pairwise) on top of
@@ -531,18 +577,32 @@ pub(crate) fn build_sat_xy_clauses_multi_opts(
     for t in tuples {
         let abs_x = t.x.abs();
         let abs_y = t.y.abs();
-        for &sx in if abs_x == 0 { &[0i32] as &[i32] } else { &[1, -1] } {
+        for &sx in if abs_x == 0 {
+            &[0i32] as &[i32]
+        } else {
+            &[1, -1]
+        } {
             if let Some(c) = sigma_full_to_cnt(sx * abs_x, 0, n) {
-                if !x_values.contains(&c) { x_values.push(c); }
+                if !x_values.contains(&c) {
+                    x_values.push(c);
+                }
             }
         }
-        for &sy in if abs_y == 0 { &[0i32] as &[i32] } else { &[1, -1] } {
+        for &sy in if abs_y == 0 {
+            &[0i32] as &[i32]
+        } else {
+            &[1, -1]
+        } {
             if let Some(c) = sigma_full_to_cnt(sy * abs_y, 0, n) {
-                if !y_values.contains(&c) { y_values.push(c); }
+                if !y_values.contains(&c) {
+                    y_values.push(c);
+                }
             }
         }
     }
-    if x_values.is_empty() || y_values.is_empty() { return None; }
+    if x_values.is_empty() || y_values.is_empty() {
+        return None;
+    }
     x_values.sort_unstable();
     y_values.sort_unstable();
     solver.add_pb_set_eq(&x_lits, &x_values);
@@ -552,14 +612,16 @@ pub(crate) fn build_sat_xy_clauses_multi_opts(
     build_xy_lag_pairs(n)
 }
 
-
 /// Extracted lag-pair construction used by both the single-tuple and
 /// multi-tuple XY template builders.
 pub(crate) fn build_xy_lag_pairs(n: usize) -> Option<(Vec<LagPairs>, usize)> {
     let x_var = |i: usize| -> i32 { (i + 1) as i32 };
     let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
     let mut lag_pairs = Vec::with_capacity(n);
-    lag_pairs.push(LagPairs { lits_a: Vec::new(), lits_b: Vec::new() });
+    lag_pairs.push(LagPairs {
+        lits_a: Vec::new(),
+        lits_b: Vec::new(),
+    });
     for s in 1..n {
         let mut lits_a = Vec::with_capacity(4 * (n - s));
         let mut lits_b = Vec::with_capacity(4 * (n - s));
@@ -580,7 +642,6 @@ pub(crate) fn build_xy_lag_pairs(n: usize) -> Option<(Vec<LagPairs>, usize)> {
     Some((lag_pairs, n))
 }
 
-
 #[allow(dead_code)] // kept as a convenience wrapper (single-tuple = 1-element slice)
 pub(crate) fn build_sat_xy_clauses(
     problem: Problem,
@@ -590,7 +651,6 @@ pub(crate) fn build_sat_xy_clauses(
     // Single-tuple path = multi-tuple path with a one-element slice.
     build_sat_xy_clauses_multi(problem, std::slice::from_ref(&tuple), solver)
 }
-
 
 /// Trait abstracting over radical::Solver and cadical::Solver.
 #[allow(dead_code)]
@@ -605,7 +665,6 @@ pub(crate) trait SatSolver {
     fn reset(&mut self);
     fn set_conflict_limit(&mut self, limit: u64);
 }
-
 
 impl SatSolver for radical::Solver {
     fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I) {
@@ -638,7 +697,6 @@ impl SatSolver for radical::Solver {
     }
 }
 
-
 #[cfg(feature = "cadical")]
 impl SatSolver for cadical::Solver {
     fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I) {
@@ -670,9 +728,12 @@ impl SatSolver for cadical::Solver {
     }
 }
 
-
 impl SatXYTemplate {
-    pub(crate) fn build(problem: Problem, tuple: SumTuple, sat_config: &radical::SolverConfig) -> Option<Self> {
+    pub(crate) fn build(
+        problem: Problem,
+        tuple: SumTuple,
+        sat_config: &radical::SolverConfig,
+    ) -> Option<Self> {
         Self::build_multi(problem, std::slice::from_ref(&tuple), sat_config)
     }
 
@@ -680,7 +741,11 @@ impl SatXYTemplate {
     /// across every tuple in `tuples`.  A single solver covers every
     /// unsigned (σ_X, σ_Y) pair in the list — the SAT picks a
     /// rule-(i)..(vi)-consistent sign combination at solve time.
-    pub(crate) fn build_multi(problem: Problem, tuples: &[SumTuple], sat_config: &radical::SolverConfig) -> Option<Self> {
+    pub(crate) fn build_multi(
+        problem: Problem,
+        tuples: &[SumTuple],
+        sat_config: &radical::SolverConfig,
+    ) -> Option<Self> {
         Self::build_multi_opts(problem, tuples, sat_config, false)
     }
 
@@ -693,23 +758,36 @@ impl SatXYTemplate {
         conj_xy_product: bool,
     ) -> Option<Self> {
         #[cfg(not(feature = "cadical"))]
-        let mut solver: radical::Solver = { let mut s = radical::Solver::new(); s.config = sat_config.clone(); s };
+        let mut solver: radical::Solver = {
+            let mut s = radical::Solver::new();
+            s.config = sat_config.clone();
+            s
+        };
         #[cfg(feature = "cadical")]
         let mut solver: cadical::Solver = Default::default();
 
-        let (lag_pairs, n) = build_sat_xy_clauses_multi_opts(problem, tuples, &mut solver, conj_xy_product)?;
+        let (lag_pairs, n) =
+            build_sat_xy_clauses_multi_opts(problem, tuples, &mut solver, conj_xy_product)?;
         #[cfg(not(feature = "cadical"))]
         solver.reserve_for_search(200);
-        Some(Self { solver, lag_pairs, n })
+        Some(Self {
+            solver,
+            lag_pairs,
+            n,
+        })
     }
 
     /// Quick feasibility check: are the cardinality targets in range?
     pub(crate) fn is_feasible(&self, candidate: &CandidateZW) -> bool {
         let n = self.n;
         for s in 1..n {
-            let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { return false; };
+            let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else {
+                return false;
+            };
             let max_pairs = 2 * (n - s);
-            if target > max_pairs { return false; }
+            if target > max_pairs {
+                return false;
+            }
         }
         true
     }
@@ -717,10 +795,17 @@ impl SatXYTemplate {
     /// Clone the template solver and add per-candidate constraints:
     /// GJ equalities, quad PB per lag, and XOR parity constraints.
     /// Returns None if infeasible or GJ detects a contradiction.
-    pub(crate) fn prepare_candidate_solver(&self, candidate: &CandidateZW) -> Option<radical::Solver> {
-        if !self.is_feasible(candidate) { return None; }
+    pub(crate) fn prepare_candidate_solver(
+        &self,
+        candidate: &CandidateZW,
+    ) -> Option<radical::Solver> {
+        if !self.is_feasible(candidate) {
+            return None;
+        }
         let n = self.n;
-        let Some(equalities) = gj_candidate_equalities(n, candidate) else { return None; };
+        let Some(equalities) = gj_candidate_equalities(n, candidate) else {
+            return None;
+        };
 
         let mut solver = self.solver.clone();
         for &(a, b, equal) in &equalities {
@@ -744,7 +829,9 @@ impl SatXYTemplate {
         // GF(2) XOR constraints: parity of agree count at each lag.
         if solver.config.xor_propagation && n >= 8 {
             for s in 1..n {
-                let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else { continue; };
+                let Some(target) = xy_agree_target(n, s, &candidate.zw_autocorr) else {
+                    continue;
+                };
                 let k = 2 * (n - s);
                 let parity = ((target + k) % 2) == 1;
                 let mut in_xor = vec![false; 2 * n];
@@ -756,7 +843,9 @@ impl SatXYTemplate {
                     in_xor[n + i] ^= true;
                     in_xor[n + i + s] ^= true;
                 }
-                let vars: Vec<i32> = in_xor.iter().enumerate()
+                let vars: Vec<i32> = in_xor
+                    .iter()
+                    .enumerate()
                     .filter(|&(_, &v)| v)
                     .map(|(i, _)| (i + 1) as i32)
                     .collect();
@@ -790,7 +879,6 @@ impl SatXYTemplate {
     }
 }
 
-
 /// BDKR rule (ii)/(iii)/(vi) pre-filter applied to the packed XY
 /// boundary bits.  Bits 0..k-1 hold sub-MDD prefix positions (= seq
 /// positions 0..k-1); bits k..2k-1 hold the suffix (= seq positions
@@ -804,7 +892,9 @@ pub(crate) fn xy_boundary_passes_rules(x_bits: u32, y_bits: u32, n: usize, k: us
         let bit_j = (x_bits >> j) & 1;
         let bit_mirror = (x_bits >> (2 * k - 1 - j)) & 1;
         if bit_j != bit_mirror {
-            if bit_j == 0 { return false; }
+            if bit_j == 0 {
+                return false;
+            }
             break;
         }
     }
@@ -813,7 +903,9 @@ pub(crate) fn xy_boundary_passes_rules(x_bits: u32, y_bits: u32, n: usize, k: us
         let bit_j = (y_bits >> j) & 1;
         let bit_mirror = (y_bits >> (2 * k - 1 - j)) & 1;
         if bit_j != bit_mirror {
-            if bit_j == 0 { return false; }
+            if bit_j == 0 {
+                return false;
+            }
             break;
         }
     }
@@ -826,23 +918,32 @@ pub(crate) fn xy_boundary_passes_rules(x_bits: u32, y_bits: u32, n: usize, k: us
         let x_nm2 = (x_bits >> bit_nm2) & 1;
         let y_nm2 = (y_bits >> bit_nm2) & 1;
         if x1 != y1 {
-            if x1 == 0 { return false; } // forbid x[1]=-1 ∧ y[1]=+1
+            if x1 == 0 {
+                return false;
+            } // forbid x[1]=-1 ∧ y[1]=+1
         } else {
             // "a[2] = b[2]" branch of rule (vi): a[n-1]=+1 ∧ b[n-1]=-1.
-            if x_nm2 == 0 || y_nm2 == 1 { return false; }
+            if x_nm2 == 0 || y_nm2 == 1 {
+                return false;
+            }
         }
     }
     true
 }
 
-
 /// Walk the XY bottom half of the reordered MDD, emitting (x_bits, y_bits)
 /// that pass sum compatibility with the given tuple.
 pub(crate) fn walk_xy_sub_mdd<F: FnMut(u32, u32)>(
-    nid: u32, level: usize, xy_depth: usize,
-    x_acc: u32, y_acc: u32,
-    pos_order: &[usize], nodes: &[[u32; 4]],
-    max_bnd_sum: i32, middle_n: i32, tuples: &[SumTuple],
+    nid: u32,
+    level: usize,
+    xy_depth: usize,
+    x_acc: u32,
+    y_acc: u32,
+    pos_order: &[usize],
+    nodes: &[[u32; 4]],
+    max_bnd_sum: i32,
+    middle_n: i32,
+    tuples: &[SumTuple],
     callback: &mut F,
 ) {
     let n_full = middle_n as usize + 2 * xy_depth / 2;
@@ -851,10 +952,16 @@ pub(crate) fn walk_xy_sub_mdd<F: FnMut(u32, u32)>(
     // one admits this boundary, we pass it to the SAT.  Using a single
     // representative tuple would spuriously reject (x_bits, y_bits)
     // pairs valid for another tuple in the set (e.g., a T4-swap image).
-    let feasible = |val: i32, middle_n: i32| -> bool {
-        val.abs() <= middle_n && (val + middle_n) % 2 == 0
-    };
-    walk_mdd_4way(nid, level, xy_depth, x_acc, y_acc, pos_order, nodes,
+    let feasible =
+        |val: i32, middle_n: i32| -> bool { val.abs() <= middle_n && (val + middle_n) % 2 == 0 };
+    walk_mdd_4way(
+        nid,
+        level,
+        xy_depth,
+        x_acc,
+        y_acc,
+        pos_order,
+        nodes,
         &mut |x_bits, y_bits, _nid| {
             let x_bnd_sum = 2 * (x_bits.count_ones() as i32) - max_bnd_sum;
             let y_bnd_sum = 2 * (y_bits.count_ones() as i32) - max_bnd_sum;
@@ -865,34 +972,47 @@ pub(crate) fn walk_xy_sub_mdd<F: FnMut(u32, u32)>(
                 let y_abs = t.y.abs();
                 let x_signs: &[i32] = if x_abs == 0 { &[0] } else { &[1, -1] };
                 let y_signs: &[i32] = if y_abs == 0 { &[0] } else { &[1, -1] };
-                x_signs.iter().any(|&sx| feasible(sx * x_abs - x_bnd_sum, middle_n))
-                    && y_signs.iter().any(|&sy| feasible(sy * y_abs - y_bnd_sum, middle_n))
+                x_signs
+                    .iter()
+                    .any(|&sx| feasible(sx * x_abs - x_bnd_sum, middle_n))
+                    && y_signs
+                        .iter()
+                        .any(|&sy| feasible(sy * y_abs - y_bnd_sum, middle_n))
             });
-            if !ok { return; }
+            if !ok {
+                return;
+            }
             // BDKR rules (ii)/(iii)/(vi) pre-filter on the boundary
             // bits.  The XY SAT still enforces the full rule including
             // middle positions; this catches the boundary-only part
             // cheaply so we skip the SAT call setup entirely.
-            if !xy_boundary_passes_rules(x_bits, y_bits, n_full, k_full) { return; }
+            if !xy_boundary_passes_rules(x_bits, y_bits, n_full, k_full) {
+                return;
+            }
             callback(x_bits, y_bits);
-        });
+        },
+    );
 }
-
 
 /// Return true iff the XY sub-MDD rooted at `xy_root` has at least one
 /// (x_bits, y_bits) leaf compatible with the tuple's sum constraints.
 /// Early-exits on the first valid candidate. Used to fail-fast SolveZ
 /// items whose boundary can't possibly produce a valid XY completion.
 pub(crate) fn any_valid_xy(
-    nid: u32, level: usize, xy_depth: usize,
-    x_acc: u32, y_acc: u32,
-    pos_order: &[usize], nodes: &[[u32; 4]],
-    max_bnd_sum: i32, middle_n: i32, tuple: SumTuple,
+    nid: u32,
+    level: usize,
+    xy_depth: usize,
+    x_acc: u32,
+    y_acc: u32,
+    pos_order: &[usize],
+    nodes: &[[u32; 4]],
+    max_bnd_sum: i32,
+    middle_n: i32,
+    tuple: SumTuple,
 ) -> bool {
     // Magnitude-based feasibility (tries both σ signs, matching walk_xy_sub_mdd).
-    let feasible = |val: i32, middle_n: i32| -> bool {
-        val.abs() <= middle_n && (val + middle_n) % 2 == 0
-    };
+    let feasible =
+        |val: i32, middle_n: i32| -> bool { val.abs() <= middle_n && (val + middle_n) % 2 == 0 };
     let check_leaf = |x_acc: u32, y_acc: u32| -> bool {
         let x_bnd_sum = 2 * (x_acc.count_ones() as i32) - max_bnd_sum;
         let y_bnd_sum = 2 * (y_acc.count_ones() as i32) - max_bnd_sum;
@@ -900,10 +1020,16 @@ pub(crate) fn any_valid_xy(
         let y_abs = tuple.y.abs();
         let x_signs: &[i32] = if x_abs == 0 { &[0] } else { &[1, -1] };
         let y_signs: &[i32] = if y_abs == 0 { &[0] } else { &[1, -1] };
-        x_signs.iter().any(|&sx| feasible(sx * x_abs - x_bnd_sum, middle_n))
-            && y_signs.iter().any(|&sy| feasible(sy * y_abs - y_bnd_sum, middle_n))
+        x_signs
+            .iter()
+            .any(|&sx| feasible(sx * x_abs - x_bnd_sum, middle_n))
+            && y_signs
+                .iter()
+                .any(|&sy| feasible(sy * y_abs - y_bnd_sum, middle_n))
     };
-    if nid == mdd_reorder::DEAD { return false; }
+    if nid == mdd_reorder::DEAD {
+        return false;
+    }
     if level == xy_depth {
         return check_leaf(x_acc, y_acc);
     }
@@ -913,24 +1039,42 @@ pub(crate) fn any_valid_xy(
     let pos = pos_order[level];
     for branch in 0u32..4 {
         let child = nodes[nid as usize][branch as usize];
-        if child == mdd_reorder::DEAD { continue; }
+        if child == mdd_reorder::DEAD {
+            continue;
+        }
         let a_val = (branch >> 0) & 1;
         let b_val = (branch >> 1) & 1;
         if any_valid_xy(
-            child, level + 1, xy_depth,
-            x_acc | (a_val << pos), y_acc | (b_val << pos),
-            pos_order, nodes, max_bnd_sum, middle_n, tuple,
-        ) { return true; }
+            child,
+            level + 1,
+            xy_depth,
+            x_acc | (a_val << pos),
+            y_acc | (b_val << pos),
+            pos_order,
+            nodes,
+            max_bnd_sum,
+            middle_n,
+            tuple,
+        ) {
+            return true;
+        }
     }
     false
 }
 
-
-
-
-pub(crate) struct LagFilter { s: usize, pairs: Vec<(u32, u32)>, max_unknown: i32, num_bnd_pairs: i32 }
-pub(crate) struct TermBndInfo { var_a: usize, var_b: usize, neg_a: bool, neg_b: bool, both_bnd: bool }
-
+pub(crate) struct LagFilter {
+    s: usize,
+    pairs: Vec<(u32, u32)>,
+    max_unknown: i32,
+    num_bnd_pairs: i32,
+}
+pub(crate) struct TermBndInfo {
+    var_a: usize,
+    var_b: usize,
+    neg_a: bool,
+    neg_b: bool,
+    both_bnd: bool,
+}
 
 /// Outcome of `SolveXyPerCandidate::try_candidate` for a single
 /// `(x_bits, y_bits)` XY boundary.
@@ -945,7 +1089,6 @@ pub(crate) enum XyTryResult {
     /// SAT hit its conflict limit without deciding.
     Timeout,
 }
-
 
 /// Per-solve search stats captured around `try_candidate`'s SAT call.
 /// Zero when the candidate was pruned before invoking SAT.
@@ -973,7 +1116,6 @@ pub(crate) struct XyStats {
     pub(crate) cover_micro: u64,
 }
 
-
 /// Compute the cover fraction (× 1_000_000) for a single SAT result.
 /// SAT/UNSAT mean the sub-problem is fully accounted for; on timeout,
 /// estimate the explored fraction from decisions vs. tree height.
@@ -988,15 +1130,6 @@ pub(crate) fn xy_cover_micro(result: Option<bool>, decisions: u64, free_vars: u6
         }
     }
 }
-
-
-
-
-
-
-
-
-
 
 /// Per-(Z,W) prepared state for shared XY SAT solving. Built once per
 /// candidate via `SolveXyPerCandidate::new`, consulted via `try_candidate`
@@ -1019,7 +1152,6 @@ pub(crate) struct SolveXyPerCandidate {
     pub(crate) configs_tested: usize,
 }
 
-
 impl SolveXyPerCandidate {
     /// Build the per-candidate state. Returns `None` if the (Z,W)
     /// candidate is infeasible or GJ detects a contradiction up front.
@@ -1030,15 +1162,22 @@ impl SolveXyPerCandidate {
         k: usize,
     ) -> Option<Self> {
         let n = problem.n;
-        if !template.is_feasible(candidate) { return None; }
+        if !template.is_feasible(candidate) {
+            return None;
+        }
         let equalities = gj_candidate_equalities(n, candidate)?;
 
         // Clone the template solver once per (Z,W) pair and add the
         // per-pair constraints (GJ equalities + full per-lag quad PB).
         let mut solver = template.solver.clone();
         for &(a, b, equal) in &equalities {
-            if equal { solver.add_clause([-a, b]); solver.add_clause([a, -b]); }
-            else { solver.add_clause([-a, -b]); solver.add_clause([a, b]); }
+            if equal {
+                solver.add_clause([-a, b]);
+                solver.add_clause([a, -b]);
+            } else {
+                solver.add_clause([-a, -b]);
+                solver.add_clause([a, b]);
+            }
         }
         for s in 1..n {
             let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
@@ -1057,17 +1196,30 @@ impl SolveXyPerCandidate {
             let mut infos = Vec::with_capacity(nt);
             for ti in 0..nt {
                 let (va, vb, na, nb) = solver.quad_pb_term_info(qi, ti);
-                let pa = va % n; let pb = vb % n;
-                infos.push(TermBndInfo { var_a: va, var_b: vb, neg_a: na, neg_b: nb, both_bnd: is_bnd(pa) && is_bnd(pb) });
+                let pa = va % n;
+                let pb = vb % n;
+                infos.push(TermBndInfo {
+                    var_a: va,
+                    var_b: vb,
+                    neg_a: na,
+                    neg_b: nb,
+                    both_bnd: is_bnd(pa) && is_bnd(pb),
+                });
             }
             qpb_term_info.push(infos);
         }
 
         // Partial-lag autocorrelation filter (cheap bitwise pre-filter).
         let pos_to_bit = |pos: usize| -> u32 {
-            if pos < k { pos as u32 } else { (k + pos - (n - k)) as u32 }
+            if pos < k {
+                pos as u32
+            } else {
+                (k + pos - (n - k)) as u32
+            }
         };
-        let targets: Vec<i32> = (0..n).map(|s| if s == 0 { 0 } else { -candidate.zw_autocorr[s] }).collect();
+        let targets: Vec<i32> = (0..n)
+            .map(|s| if s == 0 { 0 } else { -candidate.zw_autocorr[s] })
+            .collect();
         let mut lag_filters: Vec<LagFilter> = Vec::new();
         for s in 1..n {
             let mut pairs = Vec::new();
@@ -1075,10 +1227,17 @@ impl SolveXyPerCandidate {
             for i in 0..n - s {
                 if is_bnd(i) && is_bnd(i + s) {
                     pairs.push((pos_to_bit(i), pos_to_bit(i + s)));
-                } else { unk += 2; }
+                } else {
+                    unk += 2;
+                }
             }
             if !pairs.is_empty() && unk > 0 {
-                lag_filters.push(LagFilter { s, pairs: pairs.clone(), max_unknown: unk, num_bnd_pairs: 2 * pairs.len() as i32 });
+                lag_filters.push(LagFilter {
+                    s,
+                    pairs: pairs.clone(),
+                    max_unknown: unk,
+                    num_bnd_pairs: 2 * pairs.len() as i32,
+                });
             }
         }
         lag_filters.sort_by_key(|f| f.max_unknown);
@@ -1087,8 +1246,15 @@ impl SolveXyPerCandidate {
         let term_state_buf = vec![0u8; max_terms];
 
         Some(Self {
-            n, k, solver, equalities, qpb_term_info, lag_filters, targets,
-            term_state_buf, configs_tested: 0,
+            n,
+            k,
+            solver,
+            equalities,
+            qpb_term_info,
+            lag_filters,
+            targets,
+            term_state_buf,
+            configs_tested: 0,
         })
     }
 
@@ -1101,7 +1267,11 @@ impl SolveXyPerCandidate {
         let k = self.k;
         let is_bnd = |pos: usize| -> bool { pos < k || pos >= n - k };
         let pos_to_bit = |pos: usize| -> u32 {
-            if pos < k { pos as u32 } else { (k + pos - (n - k)) as u32 }
+            if pos < k {
+                pos as u32
+            } else {
+                (k + pos - (n - k)) as u32
+            }
         };
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
@@ -1110,12 +1280,25 @@ impl SolveXyPerCandidate {
         for &(a, b, equal) in &self.equalities {
             let va = (a.unsigned_abs() as usize) - 1;
             let vb = (b.unsigned_abs() as usize) - 1;
-            let pa = va % n; let pb = vb % n;
-            if !is_bnd(pa) || !is_bnd(pb) { continue; }
-            let ba = if va < n { (x_bits >> pos_to_bit(pa)) & 1 } else { (y_bits >> pos_to_bit(pa)) & 1 };
-            let bb = if vb < n { (x_bits >> pos_to_bit(pb)) & 1 } else { (y_bits >> pos_to_bit(pb)) & 1 };
+            let pa = va % n;
+            let pb = vb % n;
+            if !is_bnd(pa) || !is_bnd(pb) {
+                continue;
+            }
+            let ba = if va < n {
+                (x_bits >> pos_to_bit(pa)) & 1
+            } else {
+                (y_bits >> pos_to_bit(pa)) & 1
+            };
+            let bb = if vb < n {
+                (x_bits >> pos_to_bit(pb)) & 1
+            } else {
+                (y_bits >> pos_to_bit(pb)) & 1
+            };
             let need_xor = (a < 0) as u32 ^ (b < 0) as u32 ^ (!equal) as u32;
-            if (ba ^ bb) != need_xor { return (XyTryResult::Pruned, XyStats::default()); }
+            if (ba ^ bb) != need_xor {
+                return (XyTryResult::Pruned, XyStats::default());
+            }
         }
         // Partial-lag autocorrelation pre-filter.
         for lf in &self.lag_filters {
@@ -1125,23 +1308,35 @@ impl SolveXyPerCandidate {
                 disagree += ((y_bits >> bi) ^ (y_bits >> bj)) & 1;
             }
             let kn = lf.num_bnd_pairs - 2 * disagree as i32;
-            if (self.targets[lf.s] - kn).abs() > lf.max_unknown { return (XyTryResult::Pruned, XyStats::default()); }
+            if (self.targets[lf.s] - kn).abs() > lf.max_unknown {
+                return (XyTryResult::Pruned, XyStats::default());
+            }
         }
 
         // Expand boundary bits and inject quad PB term states.
-        let mut xv = [0i8; 64]; let mut yv = [0i8; 64];
+        let mut xv = [0i8; 64];
+        let mut yv = [0i8; 64];
         let (xp, xs) = expand_boundary_bits(x_bits, k);
         let (yp, ys) = expand_boundary_bits(y_bits, k);
-        xv[..k].copy_from_slice(&xp); xv[n-k..n].copy_from_slice(&xs);
-        yv[..k].copy_from_slice(&yp); yv[n-k..n].copy_from_slice(&ys);
+        xv[..k].copy_from_slice(&xp);
+        xv[n - k..n].copy_from_slice(&xs);
+        yv[..k].copy_from_slice(&yp);
+        yv[n - k..n].copy_from_slice(&ys);
         let mut bnd_vals = [0i8; 128];
-        for i in 0..k { bnd_vals[i] = xv[i]; bnd_vals[n-k+i] = xv[n-k+i]; }
-        for i in 0..k { bnd_vals[n+i] = yv[i]; bnd_vals[n+n-k+i] = yv[n-k+i]; }
+        for i in 0..k {
+            bnd_vals[i] = xv[i];
+            bnd_vals[n - k + i] = xv[n - k + i];
+        }
+        for i in 0..k {
+            bnd_vals[n + i] = yv[i];
+            bnd_vals[n + n - k + i] = yv[n - k + i];
+        }
 
         let num_qpb = self.qpb_term_info.len();
         for qi in 0..num_qpb {
             let infos = &self.qpb_term_info[qi];
-            let mut st = 0i32; let mut sm = 0i32;
+            let mut st = 0i32;
+            let mut sm = 0i32;
             for (ti, info) in infos.iter().enumerate() {
                 if info.both_bnd {
                     let a_val = bnd_vals[info.var_a];
@@ -1149,21 +1344,25 @@ impl SolveXyPerCandidate {
                     let a_true = (a_val == 1 && !info.neg_a) || (a_val == -1 && info.neg_a);
                     let b_true = (b_val == 1 && !info.neg_b) || (b_val == -1 && info.neg_b);
                     if a_true && b_true {
-                        self.term_state_buf[ti] = 2; st += 1;
+                        self.term_state_buf[ti] = 2;
+                        st += 1;
                     } else {
                         let a_false = (a_val == 1 && info.neg_a) || (a_val == -1 && !info.neg_a);
                         let b_false = (b_val == 1 && info.neg_b) || (b_val == -1 && !info.neg_b);
                         if a_false || b_false {
                             self.term_state_buf[ti] = 0;
                         } else {
-                            self.term_state_buf[ti] = 1; sm += 1;
+                            self.term_state_buf[ti] = 1;
+                            sm += 1;
                         }
                     }
                 } else {
-                    self.term_state_buf[ti] = 1; sm += 1;
+                    self.term_state_buf[ti] = 1;
+                    sm += 1;
                 }
             }
-            self.solver.reset_quad_pb_state(qi, &self.term_state_buf[..infos.len()], st, sm);
+            self.solver
+                .reset_quad_pb_state(qi, &self.term_state_buf[..infos.len()], st, sm);
         }
 
         // Assumptions for boundary variables.
@@ -1173,7 +1372,7 @@ impl SolveXyPerCandidate {
             assumptions.push(if yv[i] == 1 { y_var(i) } else { -y_var(i) });
         }
         for i in 0..k {
-            let p = n-k+i;
+            let p = n - k + i;
             assumptions.push(if xv[p] == 1 { x_var(p) } else { -x_var(p) });
             assumptions.push(if yv[p] == 1 { y_var(p) } else { -y_var(p) });
         }
@@ -1189,10 +1388,16 @@ impl SolveXyPerCandidate {
         let result = self.solver.solve_with_assumptions(&assumptions);
 
         let stats = {
-            let decisions    = self.solver.num_decisions().saturating_sub(d0);
+            let decisions = self.solver.num_decisions().saturating_sub(d0);
             let propagations = self.solver.num_propagations().saturating_sub(p0);
-            let cover_micro  = xy_cover_micro(result, decisions, free_vars);
-            XyStats { decisions, propagations, vars_pre_forced, free_vars, cover_micro }
+            let cover_micro = xy_cover_micro(result, decisions, free_vars);
+            XyStats {
+                decisions,
+                propagations,
+                vars_pre_forced,
+                free_vars,
+                cover_micro,
+            }
         };
 
         let outcome = match result {
@@ -1219,7 +1424,6 @@ impl SolveXyPerCandidate {
         (outcome, stats)
     }
 }
-
 
 /// **Prototype (XY_MDD=1)**: solve the XY sub-tree for a given (Z, W)
 /// candidate as ONE SAT call using the native MDD propagator, instead
@@ -1253,8 +1457,13 @@ pub(crate) fn try_candidate_via_mdd(
     // Same template clone as SolveXyPerCandidate::new.
     let mut solver = template.solver.clone();
     for &(a, b, equal) in &equalities {
-        if equal { solver.add_clause([-a, b]); solver.add_clause([a, -b]); }
-        else { solver.add_clause([-a, -b]); solver.add_clause([a, b]); }
+        if equal {
+            solver.add_clause([-a, b]);
+            solver.add_clause([a, -b]);
+        } else {
+            solver.add_clause([-a, -b]);
+            solver.add_clause([a, b]);
+        }
     }
     for s in 1..n {
         let target = xy_agree_target(n, s, &candidate.zw_autocorr).unwrap();
@@ -1283,13 +1492,21 @@ pub(crate) fn try_candidate_via_mdd(
     let vars_pre_forced = solver.num_level0_vars() as u64;
     let free_vars = (solver.num_vars() as u64).saturating_sub(vars_pre_forced);
 
-    if conflict_limit > 0 { solver.set_conflict_limit(conflict_limit); }
+    if conflict_limit > 0 {
+        solver.set_conflict_limit(conflict_limit);
+    }
     let result = solver.solve_with_assumptions(&[]);
 
-    let decisions    = solver.num_decisions().saturating_sub(d0);
+    let decisions = solver.num_decisions().saturating_sub(d0);
     let propagations = solver.num_propagations().saturating_sub(p0);
-    let cover_micro  = xy_cover_micro(result, decisions, free_vars);
-    let stats = XyStats { decisions, propagations, vars_pre_forced, free_vars, cover_micro };
+    let cover_micro = xy_cover_micro(result, decisions, free_vars);
+    let stats = XyStats {
+        decisions,
+        propagations,
+        vars_pre_forced,
+        free_vars,
+        cover_micro,
+    };
 
     if let Some(sink) = forcings_out {
         // Solver is freshly cloned from the template; an empty
@@ -1311,4 +1528,3 @@ pub(crate) fn try_candidate_via_mdd(
     };
     (xy, stats)
 }
-

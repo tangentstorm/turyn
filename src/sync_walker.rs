@@ -25,9 +25,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::Instant;
 
-use crate::types::{PackedSeq, Problem, SumTuple};
 use crate::enumerate::enumerate_sum_tuples;
 use crate::legacy_search::{SearchReport, SearchStats};
+use crate::types::{PackedSeq, Problem, SumTuple};
 
 /// Shared clause exchange between parallel workers.  Each worker
 /// appends its newly-learnt nogood and periodically pulls unread
@@ -169,10 +169,10 @@ struct State {
 }
 
 // Rule-fired bits.
-const RULE_II: u8  = 1 << 0;
+const RULE_II: u8 = 1 << 0;
 const RULE_III: u8 = 1 << 1;
-const RULE_IV: u8  = 1 << 2;
-const RULE_V: u8   = 1 << 3;
+const RULE_IV: u8 = 1 << 2;
+const RULE_V: u8 = 1 << 3;
 
 impl State {
     fn new(n: usize) -> Self {
@@ -202,8 +202,8 @@ impl State {
 
 fn kind_coeff(kind: u8) -> i16 {
     match kind {
-        0 | 1 => 1,  // X, Y
-        2 | 3 => 2,  // Z, W
+        0 | 1 => 1, // X, Y
+        2 | 3 => 2, // Z, W
         _ => unreachable!(),
     }
 }
@@ -267,7 +267,11 @@ fn build_ctx(problem: Problem) -> Ctx {
                 let close = la.max(lb);
                 if close < depth {
                     closure_events[close].push(PairEvent {
-                        lag: s, kind, pos_a: a, pos_b: b, abs_coeff: coeff,
+                        lag: s,
+                        kind,
+                        pos_a: a,
+                        pos_b: b,
+                        abs_coeff: coeff,
                     });
                 }
                 // Contributes to max_remaining at all levels where at
@@ -289,7 +293,11 @@ fn build_ctx(problem: Problem) -> Ctx {
             let close = la.max(lb);
             if close < depth {
                 closure_events[close].push(PairEvent {
-                    lag: s, kind, pos_a: a, pos_b: b, abs_coeff: coeff,
+                    lag: s,
+                    kind,
+                    pos_a: a,
+                    pos_b: b,
+                    abs_coeff: coeff,
                 });
             }
             let end_lvl = close.min(depth);
@@ -312,8 +320,7 @@ fn build_ctx(problem: Problem) -> Ctx {
     for events in closure_events.iter_mut() {
         events.sort_by_key(|e| e.kind);
     }
-    let mut closure_events_kind_ranges: Vec<[(u32, u32); 4]> =
-        Vec::with_capacity(depth);
+    let mut closure_events_kind_ranges: Vec<[(u32, u32); 4]> = Vec::with_capacity(depth);
     for events in &closure_events {
         let mut ranges = [(0u32, 0u32); 4];
         let mut start = 0usize;
@@ -331,10 +338,16 @@ fn build_ctx(problem: Problem) -> Ctx {
     }
 
     Ctx {
-        n, m, depth,
+        n,
+        m,
+        depth,
         pos_order,
-        closure_events, closure_events_kind_ranges, max_remaining,
-        seed: 0, cancel: None, start: Instant::now(),
+        closure_events,
+        closure_events_kind_ranges,
+        max_remaining,
+        seed: 0,
+        cancel: None,
+        start: Instant::now(),
         valid_tuples,
         exchange: None,
         live_sink: None,
@@ -382,11 +395,11 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
         let b1 = y_var(1);
         let aam = x_var(n - 2);
         let bbm = y_var(n - 2);
-        solver.add_clause([a1, -b1]);       // forbid A[1]=-1 AND B[1]=+1
-        solver.add_clause([a1, aam]);       // A[1]=-1 → A[n-2]=+1
-        solver.add_clause([-b1, aam]);      // B[1]=+1 → A[n-2]=+1
-        solver.add_clause([a1, -bbm]);      // A[1]=-1 → B[n-2]=-1
-        solver.add_clause([-b1, -bbm]);     // B[1]=+1 → B[n-2]=-1
+        solver.add_clause([a1, -b1]); // forbid A[1]=-1 AND B[1]=+1
+        solver.add_clause([a1, aam]); // A[1]=-1 → A[n-2]=+1
+        solver.add_clause([-b1, aam]); // B[1]=+1 → A[n-2]=+1
+        solver.add_clause([a1, -bbm]); // A[1]=-1 → B[n-2]=-1
+        solver.add_clause([-b1, -bbm]); // B[1]=+1 → B[n-2]=-1
     }
 
     // Phase-A sum constraints: each sequence's sum must land in the
@@ -398,7 +411,8 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     // after harvest_forced).
     let tuples = enumerate_sum_tuples(problem);
     let sum_set = |seq_len: usize, pick: fn(&SumTuple) -> i32| -> Vec<u32> {
-        let mut vs: Vec<u32> = tuples.iter()
+        let mut vs: Vec<u32> = tuples
+            .iter()
             .filter_map(|t| {
                 let s = pick(t);
                 let count_plus = s + seq_len as i32;
@@ -421,10 +435,18 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     let y_vals = sum_set(n, |t| t.y);
     let z_vals = sum_set(n, |t| t.z);
     let w_vals = sum_set(m, |t| t.w);
-    if !x_vals.is_empty() { solver.add_pb_set_eq(&x_lits, &x_vals); }
-    if !y_vals.is_empty() { solver.add_pb_set_eq(&y_lits, &y_vals); }
-    if !z_vals.is_empty() { solver.add_pb_set_eq(&z_lits, &z_vals); }
-    if !w_vals.is_empty() { solver.add_pb_set_eq(&w_lits, &w_vals); }
+    if !x_vals.is_empty() {
+        solver.add_pb_set_eq(&x_lits, &x_vals);
+    }
+    if !y_vals.is_empty() {
+        solver.add_pb_set_eq(&y_lits, &y_vals);
+    }
+    if !z_vals.is_empty() {
+        solver.add_pb_set_eq(&z_lits, &z_vals);
+    }
+    if !w_vals.is_empty() {
+        solver.add_pb_set_eq(&w_lits, &w_vals);
+    }
 
     // BDKR Canonical2..5 via Tseitin eq / prod chains.
     let mut next_aux: i32 = (3 * n + m + 1) as i32;
@@ -441,10 +463,13 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     let mut eq_a: Vec<Option<i32>> = vec![None; n];
     for j in 1..n {
         let mirror = n - 1 - j;
-        if mirror <= j { break; }
+        if mirror <= j {
+            break;
+        }
         let a = x_var(j);
         let b = x_var(mirror);
-        let y = next_aux; next_aux += 1;
+        let y = next_aux;
+        next_aux += 1;
         solver.add_clause([-y, -a, b]);
         solver.add_clause([-y, a, -b]);
         solver.add_clause([y, a, b]);
@@ -454,10 +479,18 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     }
     for i in 1..n {
         let mirror = n - 1 - i;
-        if mirror <= i { break; }
+        if mirror <= i {
+            break;
+        }
         let mut clause: Vec<i32> = Vec::with_capacity(i + 1);
-        for j in 1..i { if let Some(y) = eq_a[j] { clause.push(-y); } }
-        if let Some(y) = eq_a[i] { clause.push(y); }
+        for j in 1..i {
+            if let Some(y) = eq_a[j] {
+                clause.push(-y);
+            }
+        }
+        if let Some(y) = eq_a[i] {
+            clause.push(y);
+        }
         clause.push(x_var(i));
         solver.add_clause(clause);
     }
@@ -466,10 +499,13 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     let mut eq_b: Vec<Option<i32>> = vec![None; n];
     for j in 1..n {
         let mirror = n - 1 - j;
-        if mirror <= j { break; }
+        if mirror <= j {
+            break;
+        }
         let a = y_var(j);
         let b = y_var(mirror);
-        let y = next_aux; next_aux += 1;
+        let y = next_aux;
+        next_aux += 1;
         solver.add_clause([-y, -a, b]);
         solver.add_clause([-y, a, -b]);
         solver.add_clause([y, a, b]);
@@ -479,10 +515,18 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     }
     for i in 1..n {
         let mirror = n - 1 - i;
-        if mirror <= i { break; }
+        if mirror <= i {
+            break;
+        }
         let mut clause: Vec<i32> = Vec::with_capacity(i + 1);
-        for j in 1..i { if let Some(y) = eq_b[j] { clause.push(-y); } }
-        if let Some(y) = eq_b[i] { clause.push(y); }
+        for j in 1..i {
+            if let Some(y) = eq_b[j] {
+                clause.push(-y);
+            }
+        }
+        if let Some(y) = eq_b[i] {
+            clause.push(y);
+        }
         clause.push(y_var(i));
         solver.add_clause(clause);
     }
@@ -491,10 +535,13 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     let mut eq_c: Vec<Option<i32>> = vec![None; n];
     for j in 1..n {
         let mirror = n - 1 - j;
-        if mirror <= j { break; }
+        if mirror <= j {
+            break;
+        }
         let a = z_var(j);
         let b = z_var(mirror);
-        let y = next_aux; next_aux += 1;
+        let y = next_aux;
+        next_aux += 1;
         solver.add_clause([-y, -a, b]);
         solver.add_clause([-y, a, -b]);
         solver.add_clause([y, a, b]);
@@ -504,10 +551,18 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     }
     for i in 1..n {
         let mirror = n - 1 - i;
-        if mirror <= i { break; }
+        if mirror <= i {
+            break;
+        }
         let mut clause: Vec<i32> = Vec::with_capacity(i + 1);
-        for j in 1..i { if let Some(y) = eq_c[j] { clause.push(y); } }
-        if let Some(y) = eq_c[i] { clause.push(-y); }
+        for j in 1..i {
+            if let Some(y) = eq_c[j] {
+                clause.push(y);
+            }
+        }
+        if let Some(y) = eq_c[i] {
+            clause.push(-y);
+        }
         clause.push(z_var(i));
         solver.add_clause(clause);
     }
@@ -518,11 +573,14 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     let mut prod_d: Vec<Option<i32>> = vec![None; mlen];
     for j in 1..mlen {
         let mirror = mlen - 1 - j;
-        if mirror <= j { break; }
+        if mirror <= j {
+            break;
+        }
         let a = w_var(j);
         let b = w_var(mirror);
         let c = d_last;
-        let y = next_aux; next_aux += 1;
+        let y = next_aux;
+        next_aux += 1;
         solver.add_clause([-y, a, b, -c]);
         solver.add_clause([-y, a, -b, c]);
         solver.add_clause([-y, -a, b, c]);
@@ -541,10 +599,18 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     // clause for j<i, NEGATIVE for j=i.
     for i in 1..mlen {
         let mirror = mlen - 1 - i;
-        if mirror <= i { break; }
+        if mirror <= i {
+            break;
+        }
         let mut clause: Vec<i32> = Vec::with_capacity(i + 1);
-        for j in 1..i { if let Some(y) = prod_d[j] { clause.push(y); } }
-        if let Some(y) = prod_d[i] { clause.push(-y); }
+        for j in 1..i {
+            if let Some(y) = prod_d[j] {
+                clause.push(y);
+            }
+        }
+        if let Some(y) = prod_d[i] {
+            clause.push(-y);
+        }
         clause.push(w_var(i));
         solver.add_clause(clause);
     }
@@ -556,17 +622,33 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
         let mut lits_b: Vec<i32> = Vec::new();
         let mut coeffs: Vec<u32> = Vec::new();
         for i in 0..(n - s) {
-            lits_a.push(x_var(i)); lits_b.push(x_var(i + s)); coeffs.push(1);
-            lits_a.push(-x_var(i)); lits_b.push(-x_var(i + s)); coeffs.push(1);
-            lits_a.push(y_var(i)); lits_b.push(y_var(i + s)); coeffs.push(1);
-            lits_a.push(-y_var(i)); lits_b.push(-y_var(i + s)); coeffs.push(1);
-            lits_a.push(z_var(i)); lits_b.push(z_var(i + s)); coeffs.push(2);
-            lits_a.push(-z_var(i)); lits_b.push(-z_var(i + s)); coeffs.push(2);
+            lits_a.push(x_var(i));
+            lits_b.push(x_var(i + s));
+            coeffs.push(1);
+            lits_a.push(-x_var(i));
+            lits_b.push(-x_var(i + s));
+            coeffs.push(1);
+            lits_a.push(y_var(i));
+            lits_b.push(y_var(i + s));
+            coeffs.push(1);
+            lits_a.push(-y_var(i));
+            lits_b.push(-y_var(i + s));
+            coeffs.push(1);
+            lits_a.push(z_var(i));
+            lits_b.push(z_var(i + s));
+            coeffs.push(2);
+            lits_a.push(-z_var(i));
+            lits_b.push(-z_var(i + s));
+            coeffs.push(2);
         }
         if s < m {
             for i in 0..(m - s) {
-                lits_a.push(w_var(i)); lits_b.push(w_var(i + s)); coeffs.push(2);
-                lits_a.push(-w_var(i)); lits_b.push(-w_var(i + s)); coeffs.push(2);
+                lits_a.push(w_var(i));
+                lits_b.push(w_var(i + s));
+                coeffs.push(2);
+                lits_a.push(-w_var(i));
+                lits_b.push(-w_var(i + s));
+                coeffs.push(2);
             }
         }
         let target = if s < m {
@@ -587,7 +669,7 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
     // BVE preprocessing — eliminate Tseitin aux vars where possible,
     // but protect walker vars (1..=4n) since they're used as
     // assumption literals in push_assume_frame.
-    let protected: Vec<usize> = (0..4 * n).collect();  // 0-based var idx
+    let protected: Vec<usize> = (0..4 * n).collect(); // 0-based var idx
     let _bve_eliminated = solver.preprocess_bve_with_protection(&protected);
 
     // Compact the clause arena after preprocessing. BVE / SCC leave
@@ -616,10 +698,10 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
 
 fn var_for(kind: u8, pos: usize, n: usize) -> i32 {
     match kind {
-        0 => (pos + 1) as i32,              // X
-        1 => (n + pos + 1) as i32,          // Y
-        2 => (2 * n + pos + 1) as i32,      // Z
-        3 => (3 * n + pos + 1) as i32,      // W
+        0 => (pos + 1) as i32,         // X
+        1 => (n + pos + 1) as i32,     // Y
+        2 => (2 * n + pos + 1) as i32, // Z
+        3 => (3 * n + pos + 1) as i32, // W
         _ => unreachable!(),
     }
 }
@@ -636,7 +718,9 @@ fn harvest_forced(solver: &radical::Solver, state: &mut State, ctx: &Ctx) -> usi
     for kind in 0u8..4 {
         let xy_len = kind_xy_len(kind, ctx.n, ctx.m);
         for pos in 0..xy_len {
-            if state.bit(kind, pos) != 0 { continue; }
+            if state.bit(kind, pos) != 0 {
+                continue;
+            }
             let var = var_for(kind, pos, ctx.n);
             if let Some(b) = solver.value(var) {
                 state.set_bit(kind, pos, if b { 1 } else { -1 });
@@ -660,26 +744,28 @@ fn harvest_forced(solver: &radical::Solver, state: &mut State, ctx: &Ctx) -> usi
 /// endpoints set in `state.bits`. The "max-level" endpoint is
 /// `pos_order[level]` (just placed by us), and the "earlier" endpoint
 /// is at some level < `level` (placed by an ancestor or harvested).
-fn apply_sum_delta_at(
-    state: &mut State,
-    ctx: &Ctx,
-    level: usize,
-    newly_placed: &[bool; 4],
-) {
-    if level >= ctx.depth { return; }
+fn apply_sum_delta_at(state: &mut State, ctx: &Ctx, level: usize, newly_placed: &[bool; 4]) {
+    if level >= ctx.depth {
+        return;
+    }
     let events = &ctx.closure_events[level];
     let ranges = &ctx.closure_events_kind_ranges[level];
     for k in 0u8..4 {
-        if !newly_placed[k as usize] { continue; }
+        if !newly_placed[k as usize] {
+            continue;
+        }
         let (start, end) = ranges[k as usize];
         // Slice over the contiguous run for this kind.
-        for ev in &events[start as usize .. end as usize] {
+        for ev in &events[start as usize..end as usize] {
             let a_sign = state.bit(ev.kind, ev.pos_a);
             let b_sign = state.bit(ev.kind, ev.pos_b);
             debug_assert!(
                 a_sign != 0 && b_sign != 0,
                 "apply_sum_delta_at: unset endpoint at level={} kind={} pos_a={} pos_b={}",
-                level, ev.kind, ev.pos_a, ev.pos_b,
+                level,
+                ev.kind,
+                ev.pos_a,
+                ev.pos_b,
             );
             let a = if a_sign == 1 { 1i16 } else { -1 };
             let b = if b_sign == 1 { 1i16 } else { -1 };
@@ -743,11 +829,15 @@ fn check_rules(state: &State, ctx: &Ctx, level: usize) -> Result<u8, ()> {
             3 => ev.pos_a + ev.pos_b == m - 1,
             _ => false,
         };
-        if !is_palindromic { continue; }
+        if !is_palindromic {
+            continue;
+        }
 
         let sa = state.bit(ev.kind, ev.pos_a);
         let sb = state.bit(ev.kind, ev.pos_b);
-        if sa == 0 || sb == 0 { continue; }
+        if sa == 0 || sb == 0 {
+            continue;
+        }
         let sa_sign: i8 = if sa == 1 { 1 } else { -1 };
         let sb_sign: i8 = if sb == 1 { 1 } else { -1 };
         // By symmetry pos_a < pos_b (bouncing order pins low first).
@@ -755,32 +845,46 @@ fn check_rules(state: &State, ctx: &Ctx, level: usize) -> Result<u8, ()> {
         let early_bit = sa_sign;
 
         match ev.kind {
-            0 => {  // X: rule (ii)
+            0 => {
+                // X: rule (ii)
                 if rs & RULE_II == 0 && sa_sign != sb_sign {
-                    if early_bit != 1 { return Err(()); }
+                    if early_bit != 1 {
+                        return Err(());
+                    }
                     rs |= RULE_II;
                 }
             }
-            1 => {  // Y: rule (iii)
+            1 => {
+                // Y: rule (iii)
                 if rs & RULE_III == 0 && sa_sign != sb_sign {
-                    if early_bit != 1 { return Err(()); }
+                    if early_bit != 1 {
+                        return Err(());
+                    }
                     rs |= RULE_III;
                 }
             }
-            2 => {  // Z: rule (iv) — note equality polarity
+            2 => {
+                // Z: rule (iv) — note equality polarity
                 if rs & RULE_IV == 0 && sa_sign == sb_sign {
-                    if early_bit != 1 { return Err(()); }
+                    if early_bit != 1 {
+                        return Err(());
+                    }
                     rs |= RULE_IV;
                 }
             }
-            3 => {  // W: rule (v), needs W[m-1]
+            3 => {
+                // W: rule (v), needs W[m-1]
                 let w_last = state.bit(3, m - 1);
-                if w_last == 0 { continue; }
+                if w_last == 0 {
+                    continue;
+                }
                 let w_last_sign: i8 = if w_last == 1 { 1 } else { -1 };
                 // premise: W[j] * W[m-1-j] * W[m-1] == -1
                 let product = sa_sign * sb_sign * w_last_sign;
                 if rs & RULE_V == 0 && product == -1 {
-                    if early_bit != 1 { return Err(()); }
+                    if early_bit != 1 {
+                        return Err(());
+                    }
                     rs |= RULE_V;
                 }
             }
@@ -800,13 +904,21 @@ fn compute_sigma(state: &State, ctx: &Ctx) -> (i32, i32, i32, i32, usize, usize,
         let xy_len = kind_xy_len(kind, ctx.n, ctx.m);
         for pos in 0..xy_len {
             match state.bit(kind, pos) {
-                1 => { sigma[kind as usize] += 1; free[kind as usize] -= 1; }
-                2 => { sigma[kind as usize] -= 1; free[kind as usize] -= 1; }
+                1 => {
+                    sigma[kind as usize] += 1;
+                    free[kind as usize] -= 1;
+                }
+                2 => {
+                    sigma[kind as usize] -= 1;
+                    free[kind as usize] -= 1;
+                }
                 _ => {}
             }
         }
     }
-    (sigma[0], sigma[1], sigma[2], sigma[3], free[0], free[1], free[2], free[3])
+    (
+        sigma[0], sigma[1], sigma[2], sigma[3], free[0], free[1], free[2], free[3],
+    )
 }
 
 /// Can any valid Phase-A tuple be reached from the current partial sums?
@@ -827,23 +939,43 @@ fn tuple_reachable(state: &State, ctx: &Ctx) -> bool {
 #[inline]
 fn tuple_reachable_args(
     ctx: &Ctx,
-    sx: i32, sy: i32, sz: i32, sw: i32,
-    fx: usize, fy: usize, fz: usize, fw: usize,
+    sx: i32,
+    sy: i32,
+    sz: i32,
+    sw: i32,
+    fx: usize,
+    fy: usize,
+    fz: usize,
+    fw: usize,
 ) -> bool {
-    let dx_max = fx as i32; let px = fx & 1;
-    let dy_max = fy as i32; let py = fy & 1;
-    let dz_max = fz as i32; let pz = fz & 1;
-    let dw_max = fw as i32; let pw = fw & 1;
+    let dx_max = fx as i32;
+    let px = fx & 1;
+    let dy_max = fy as i32;
+    let py = fy & 1;
+    let dz_max = fz as i32;
+    let pz = fz & 1;
+    let dw_max = fw as i32;
+    let pw = fw & 1;
     for t in &ctx.valid_tuples {
         let dx = (t.x - sx).abs();
         let dy = (t.y - sy).abs();
         let dz = (t.z - sz).abs();
         let dw = (t.w - sw).abs();
-        if dx > dx_max || dy > dy_max || dz > dz_max || dw > dw_max { continue; }
-        if (dx as usize & 1) != px { continue; }
-        if (dy as usize & 1) != py { continue; }
-        if (dz as usize & 1) != pz { continue; }
-        if (dw as usize & 1) != pw { continue; }
+        if dx > dx_max || dy > dy_max || dz > dz_max || dw > dw_max {
+            continue;
+        }
+        if (dx as usize & 1) != px {
+            continue;
+        }
+        if (dy as usize & 1) != py {
+            continue;
+        }
+        if (dz as usize & 1) != pz {
+            continue;
+        }
+        if (dw as usize & 1) != pw {
+            continue;
+        }
         return true;
     }
     false
@@ -966,7 +1098,11 @@ pub(crate) fn search_sync(
     problem: Problem,
     cfg: &SyncConfig,
     verbose: bool,
-) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SyncStats, std::time::Duration) {
+) -> (
+    Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+    SyncStats,
+    std::time::Duration,
+) {
     let start = Instant::now();
     // Always parallel: one worker per available CPU. Worker 0 runs
     // best-first (score-sorted) siblings; workers 1.. each get a
@@ -979,12 +1115,18 @@ pub(crate) fn search_sync(
     // Respect `TURYN_THREADS` (and `RAYON_NUM_THREADS`) so users can
     // pin the parallelism for bench reproducibility — matches the MDD
     // pipeline's behaviour documented in CLAUDE.md.
-    let n_workers = std::env::var("TURYN_THREADS").ok()
+    let n_workers = std::env::var("TURYN_THREADS")
+        .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .or_else(|| std::env::var("RAYON_NUM_THREADS").ok()
-            .and_then(|v| v.parse::<usize>().ok()))
+        .or_else(|| {
+            std::env::var("RAYON_NUM_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+        })
         .unwrap_or_else(|| {
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
         })
         .max(1);
     search_sync_parallel(problem, cfg, verbose, n_workers, start)
@@ -996,7 +1138,11 @@ fn search_sync_parallel(
     verbose: bool,
     n_workers: usize,
     start: Instant,
-) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SyncStats, std::time::Duration) {
+) -> (
+    Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+    SyncStats,
+    std::time::Duration,
+) {
     use std::sync::Mutex;
     use std::thread;
 
@@ -1004,14 +1150,23 @@ fn search_sync_parallel(
     let result: Arc<Mutex<Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>>> =
         Arc::new(Mutex::new(None));
     let stats_agg: Arc<Mutex<SyncStats>> = Arc::new(Mutex::new(SyncStats {
-        nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-        rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
+        nodes_visited: 0,
+        memo_hits: 0,
+        capacity_rejects: 0,
+        rule_rejects: 0,
+        tuple_rejects: 0,
+        sat_unsat: 0,
+        leaves_reached: 0,
         max_level_reached: 0,
-        nodes_by_level: Vec::new(), children_by_level: Vec::new(),
-        children_total: 0, internal_nodes: 0,
+        nodes_by_level: Vec::new(),
+        children_by_level: Vec::new(),
+        children_total: 0,
+        internal_nodes: 0,
         time_to_first_leaf: None,
-        nogood_len_sum: 0, full_nogood_len_sum: 0,
-        peer_clauses_read: 0, peer_clauses_imported: 0,
+        nogood_len_sum: 0,
+        full_nogood_len_sum: 0,
+        peer_clauses_read: 0,
+        peer_clauses_imported: 0,
         forced_by_level: Vec::new(),
         sub_cube_time_by_level: Vec::new(),
         children_processed_by_level: Vec::new(),
@@ -1049,8 +1204,7 @@ fn search_sync_parallel(
             let sink = Arc::clone(sink);
             let cancel_monitor = Arc::clone(&cancel);
             let live_workers_monitor = Arc::clone(&live_workers);
-            let live_sinks_monitor: Vec<_> =
-                live_sinks.iter().map(Arc::clone).collect();
+            let live_sinks_monitor: Vec<_> = live_sinks.iter().map(Arc::clone).collect();
             let n = problem.n;
             s.spawn(move || {
                 loop {
@@ -1064,16 +1218,23 @@ fn search_sync_parallel(
                     // `projected_fraction` consumes, so the per-
                     // worker flush stays cheap.
                     let mut agg = SyncStats {
-                        nodes_visited: 0, memo_hits: 0,
-                        capacity_rejects: 0, rule_rejects: 0,
-                        tuple_rejects: 0, sat_unsat: 0,
-                        leaves_reached: 0, max_level_reached: 0,
+                        nodes_visited: 0,
+                        memo_hits: 0,
+                        capacity_rejects: 0,
+                        rule_rejects: 0,
+                        tuple_rejects: 0,
+                        sat_unsat: 0,
+                        leaves_reached: 0,
+                        max_level_reached: 0,
                         nodes_by_level: Vec::new(),
                         children_by_level: Vec::new(),
-                        children_total: 0, internal_nodes: 0,
+                        children_total: 0,
+                        internal_nodes: 0,
                         time_to_first_leaf: None,
-                        nogood_len_sum: 0, full_nogood_len_sum: 0,
-                        peer_clauses_read: 0, peer_clauses_imported: 0,
+                        nogood_len_sum: 0,
+                        full_nogood_len_sum: 0,
+                        peer_clauses_read: 0,
+                        peer_clauses_imported: 0,
                         forced_by_level: Vec::new(),
                         sub_cube_time_by_level: Vec::new(),
                         children_processed_by_level: Vec::new(),
@@ -1097,12 +1258,9 @@ fn search_sync_parallel(
                             agg.children_by_level[i] += c;
                         }
                     }
-                    if let Some(f) = projected_fraction(
-                        &agg,
-                        n,
-                        start.elapsed().as_secs_f64(),
-                        n_workers,
-                    ) {
+                    if let Some(f) =
+                        projected_fraction(&agg, n, start.elapsed().as_secs_f64(), n_workers)
+                    {
                         sink.store((f * 1_000_000.0) as u64, AtomicOrdering::Relaxed);
                     }
                 }
@@ -1142,8 +1300,7 @@ fn search_sync_parallel(
                     let mut snap = live_sink_for_flush.lock().unwrap();
                     snap.nodes_visited = stats.nodes_visited;
                     if snap.nodes_by_level.len() < stats.nodes_by_level.len() {
-                        snap.nodes_by_level
-                            .resize(stats.nodes_by_level.len(), 0);
+                        snap.nodes_by_level.resize(stats.nodes_by_level.len(), 0);
                     }
                     snap.nodes_by_level
                         .iter_mut()
@@ -1185,7 +1342,8 @@ fn search_sync_parallel(
                     agg.nodes_by_level[i] += c;
                 }
                 if agg.children_by_level.len() < stats.children_by_level.len() {
-                    agg.children_by_level.resize(stats.children_by_level.len(), 0);
+                    agg.children_by_level
+                        .resize(stats.children_by_level.len(), 0);
                 }
                 for (i, &c) in stats.children_by_level.iter().enumerate() {
                     agg.children_by_level[i] += c;
@@ -1197,13 +1355,15 @@ fn search_sync_parallel(
                     agg.forced_by_level[i] += c;
                 }
                 if agg.sub_cube_time_by_level.len() < stats.sub_cube_time_by_level.len() {
-                    agg.sub_cube_time_by_level.resize(stats.sub_cube_time_by_level.len(), 0.0);
+                    agg.sub_cube_time_by_level
+                        .resize(stats.sub_cube_time_by_level.len(), 0.0);
                 }
                 for (i, &t) in stats.sub_cube_time_by_level.iter().enumerate() {
                     agg.sub_cube_time_by_level[i] += t;
                 }
                 if agg.children_processed_by_level.len() < stats.children_processed_by_level.len() {
-                    agg.children_processed_by_level.resize(stats.children_processed_by_level.len(), 0);
+                    agg.children_processed_by_level
+                        .resize(stats.children_processed_by_level.len(), 0);
                 }
                 for (i, &c) in stats.children_processed_by_level.iter().enumerate() {
                     agg.children_processed_by_level[i] += c;
@@ -1255,20 +1415,40 @@ fn search_sync_parallel(
     if verbose {
         eprintln!(
             "sync_walker(parallel x{}): nodes={} cap_rejects={} tuple_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?} time_to_first_leaf={} avg_nogood={:.1}/{:.1} ({:.2}x shrink) peer_imports={}",
-            n_workers, stats.nodes_visited, stats.capacity_rejects, stats.tuple_rejects, stats.rule_rejects, stats.sat_unsat, stats.leaves_reached, stats.max_level_reached, elapsed,
-            stats.time_to_first_leaf.map(|t| format!("{:.3}s", t)).unwrap_or_else(|| "(never)".into()),
-            if stats.sat_unsat > 0 { stats.nogood_len_sum as f64 / stats.sat_unsat as f64 } else { 0.0 },
-            if stats.sat_unsat > 0 { stats.full_nogood_len_sum as f64 / stats.sat_unsat as f64 } else { 0.0 },
-            if stats.nogood_len_sum > 0 { stats.full_nogood_len_sum as f64 / stats.nogood_len_sum as f64 } else { 1.0 },
+            n_workers,
+            stats.nodes_visited,
+            stats.capacity_rejects,
+            stats.tuple_rejects,
+            stats.rule_rejects,
+            stats.sat_unsat,
+            stats.leaves_reached,
+            stats.max_level_reached,
+            elapsed,
+            stats
+                .time_to_first_leaf
+                .map(|t| format!("{:.3}s", t))
+                .unwrap_or_else(|| "(never)".into()),
+            if stats.sat_unsat > 0 {
+                stats.nogood_len_sum as f64 / stats.sat_unsat as f64
+            } else {
+                0.0
+            },
+            if stats.sat_unsat > 0 {
+                stats.full_nogood_len_sum as f64 / stats.sat_unsat as f64
+            } else {
+                0.0
+            },
+            if stats.nogood_len_sum > 0 {
+                stats.full_nogood_len_sum as f64 / stats.nogood_len_sum as f64
+            } else {
+                1.0
+            },
             stats.peer_clauses_imported,
         );
         let ttc = project_ttc(&stats, problem.n, elapsed.as_secs_f64(), n_workers);
         eprintln!("{}", ttc);
-        let per_level = format_per_level_telemetry_with_ttc(
-            &stats,
-            elapsed.as_secs_f64(),
-            n_workers,
-        );
+        let per_level =
+            format_per_level_telemetry_with_ttc(&stats, elapsed.as_secs_f64(), n_workers);
         eprintln!("{}", per_level);
     }
     (found, stats, elapsed)
@@ -1286,14 +1466,25 @@ fn search_sync_parallel(
 ///   (includes descendants). Divided by nodes gives avg sub-cube time.
 /// - `implied_pruned_2^…`: log2 estimate of how many walker sub-cubes
 ///   at the DEEPEST level were eliminated by SAT work at level L.
-fn format_per_level_telemetry_with_ttc(stats: &SyncStats, elapsed_secs: f64, n_workers: usize) -> String {
+fn format_per_level_telemetry_with_ttc(
+    stats: &SyncStats,
+    elapsed_secs: f64,
+    n_workers: usize,
+) -> String {
     let base = format_per_level_telemetry(stats);
     // Compute coverage product over levels with generated candidates.
     let mut coverage_product: f64 = 1.0;
-    let levels = stats.nodes_by_level.len().max(stats.children_by_level.len());
+    let levels = stats
+        .nodes_by_level
+        .len()
+        .max(stats.children_by_level.len());
     for l in 0..levels {
         let children = stats.children_by_level.get(l).copied().unwrap_or(0);
-        let processed = stats.children_processed_by_level.get(l).copied().unwrap_or(0);
+        let processed = stats
+            .children_processed_by_level
+            .get(l)
+            .copied()
+            .unwrap_or(0);
         if children > 0 {
             coverage_product *= processed as f64 / children as f64;
         }
@@ -1318,19 +1509,32 @@ fn format_per_level_telemetry_with_ttc(stats: &SyncStats, elapsed_secs: f64, n_w
 /// Answer to "which level is quadpb hottest at, and where does clause
 /// BCP take over?"
 fn format_per_level_kind_table(stats: &SyncStats) -> String {
-    if stats.forced_by_level_kind.is_empty() { return String::new(); }
+    if stats.forced_by_level_kind.is_empty() {
+        return String::new();
+    }
     let active_kinds: Vec<radical::PropKind> = radical::PropKind::ALL
         .iter()
         .copied()
-        .filter(|k| stats.forced_by_level_kind.iter().any(|row| row[*k as usize] > 0))
+        .filter(|k| {
+            stats
+                .forced_by_level_kind
+                .iter()
+                .any(|row| row[*k as usize] > 0)
+        })
         .collect();
-    if active_kinds.is_empty() { return String::new(); }
+    if active_kinds.is_empty() {
+        return String::new();
+    }
     let mut out = String::from("Per-level forcings by feature: lvl");
-    for k in &active_kinds { out.push_str(&format!(" | {:>10}", k.label())); }
+    for k in &active_kinds {
+        out.push_str(&format!(" | {:>10}", k.label()));
+    }
     out.push('\n');
     for (l, row) in stats.forced_by_level_kind.iter().enumerate() {
         let row_total: u64 = active_kinds.iter().map(|k| row[*k as usize]).sum();
-        if row_total == 0 { continue; }
+        if row_total == 0 {
+            continue;
+        }
         out.push_str(&format!("Per-level forcings by feature: {:3}", l));
         for k in &active_kinds {
             out.push_str(&format!(" | {:>10}", row[*k as usize]));
@@ -1347,21 +1551,32 @@ fn format_per_level_kind_table(stats: &SyncStats) -> String {
 /// doing most of the propagation; "spect=45%" means spectral is hot.
 fn format_prop_by_kind_summary(stats: &SyncStats) -> String {
     let total: u64 = stats.prop_by_kind_total.iter().sum();
-    if total == 0 { return String::new(); }
+    if total == 0 {
+        return String::new();
+    }
     let mut parts: Vec<String> = Vec::with_capacity(radical::PropKind::COUNT);
     for kind in radical::PropKind::ALL {
         let c = stats.prop_by_kind_total[kind as usize];
-        if c == 0 { continue; }
+        if c == 0 {
+            continue;
+        }
         let pct = c as f64 / total as f64 * 100.0;
         parts.push(format!("{}={} ({:.1}%)", kind.label(), c, pct));
     }
-    format!("Per-feature forcings (total {}): {}\n", total, parts.join("  "))
+    format!(
+        "Per-feature forcings (total {}): {}\n",
+        total,
+        parts.join("  ")
+    )
 }
 
 fn format_per_level_telemetry(stats: &SyncStats) -> String {
-    let mut out = String::from("Per-level: lvl |   nodes |  children | proc'd | cov% |   forced | f/node |   time(s) |  t/node\n");
+    let mut out = String::from(
+        "Per-level: lvl |   nodes |  children | proc'd | cov% |   forced | f/node |   time(s) |  t/node\n",
+    );
     let levels = stats
-        .nodes_by_level.len()
+        .nodes_by_level
+        .len()
         .max(stats.forced_by_level.len())
         .max(stats.sub_cube_time_by_level.len());
     let mut total_forced: u64 = 0;
@@ -1373,16 +1588,32 @@ fn format_per_level_telemetry(stats: &SyncStats) -> String {
     for l in 0..levels {
         let nodes = stats.nodes_by_level.get(l).copied().unwrap_or(0);
         let children = stats.children_by_level.get(l).copied().unwrap_or(0);
-        let processed = stats.children_processed_by_level.get(l).copied().unwrap_or(0);
+        let processed = stats
+            .children_processed_by_level
+            .get(l)
+            .copied()
+            .unwrap_or(0);
         let forced = stats.forced_by_level.get(l).copied().unwrap_or(0);
         let tsec = stats.sub_cube_time_by_level.get(l).copied().unwrap_or(0.0);
         total_forced += forced;
         total_time += tsec;
-        if nodes == 0 && forced == 0 && tsec == 0.0 { continue; }
-        let fpn = if nodes > 0 { forced as f64 / nodes as f64 } else { 0.0 };
+        if nodes == 0 && forced == 0 && tsec == 0.0 {
+            continue;
+        }
+        let fpn = if nodes > 0 {
+            forced as f64 / nodes as f64
+        } else {
+            0.0
+        };
         let tpn = if nodes > 0 { tsec / nodes as f64 } else { 0.0 };
-        let cov = if children > 0 { processed as f64 / children as f64 } else { 1.0 };
-        if children > 0 { coverage_product *= cov; }
+        let cov = if children > 0 {
+            processed as f64 / children as f64
+        } else {
+            1.0
+        };
+        if children > 0 {
+            coverage_product *= cov;
+        }
         out.push_str(&format!(
             "Per-level: {:>3} | {:>7} | {:>9} | {:>6} | {:>4.1} | {:>8} | {:>6.2} | {:>9.3} | {:>7.6}\n",
             l, nodes, children, processed, cov * 100.0, forced, fpn, tsec, tpn,
@@ -1400,7 +1631,9 @@ fn format_per_level_telemetry(stats: &SyncStats) -> String {
     let sat_calls = stats.sat_unsat + stats.nodes_visited.saturating_sub(stats.leaves_reached);
     let avg_forced_per_call = if sat_calls > 0 {
         total_forced as f64 / sat_calls as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
     // Per-level time columns are INCLUSIVE of descendants, so summing
     // across levels double-counts. We suppress the "total" to avoid
     // that confusion; the level-0 column already shows total aggregate
@@ -1449,20 +1682,31 @@ fn format_per_level_telemetry(stats: &SyncStats) -> String {
 /// The returned value is what `SyncConfig::projected_fraction_ppm`
 /// stores (scaled by 1e6 for atomic-integer roundtrip).
 pub(crate) fn projected_fraction(
-    stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize,
+    stats: &SyncStats,
+    n: usize,
+    elapsed_secs: f64,
+    n_workers: usize,
 ) -> Option<f64> {
     const NOISY_THRESHOLD: u64 = 32;
     let depth = n;
     if elapsed_secs <= 0.0 || stats.nodes_visited == 0 {
         return None;
     }
-    struct Bee { b: f64, sampled: bool, noisy: bool }
+    struct Bee {
+        b: f64,
+        sampled: bool,
+        noisy: bool,
+    }
     let mut b_eff: Vec<Bee> = Vec::with_capacity(depth);
     for l in 0..depth {
         let parent = stats.nodes_by_level.get(l).copied().unwrap_or(0);
         let child = stats.children_by_level.get(l).copied().unwrap_or(0);
         if parent == 0 {
-            b_eff.push(Bee { b: 0.0, sampled: false, noisy: false });
+            b_eff.push(Bee {
+                b: 0.0,
+                sampled: false,
+                noisy: false,
+            });
         } else {
             b_eff.push(Bee {
                 b: child as f64 / parent as f64,
@@ -1471,32 +1715,47 @@ pub(crate) fn projected_fraction(
             });
         }
     }
-    let mut clean_bs: Vec<f64> =
-        b_eff.iter().filter(|x| x.sampled && !x.noisy).map(|x| x.b).collect();
+    let mut clean_bs: Vec<f64> = b_eff
+        .iter()
+        .filter(|x| x.sampled && !x.noisy)
+        .map(|x| x.b)
+        .collect();
     clean_bs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let fallback = if clean_bs.is_empty() { 1.0 } else { clean_bs[clean_bs.len() / 2] };
+    let fallback = if clean_bs.is_empty() {
+        1.0
+    } else {
+        clean_bs[clean_bs.len() / 2]
+    };
     let mut projected_nodes = 1.0_f64;
     let mut running_product = 1.0_f64;
     for l in 0..depth {
         let b = match b_eff.get(l) {
-            Some(Bee { b, sampled: true, .. }) => *b,
+            Some(Bee {
+                b, sampled: true, ..
+            }) => *b,
             _ => fallback,
         };
         running_product *= b;
         projected_nodes += running_product;
-        if !running_product.is_finite() { break; }
+        if !running_product.is_finite() {
+            break;
+        }
     }
     let rate = stats.nodes_visited as f64 / elapsed_secs;
-    if rate <= 0.0 || !projected_nodes.is_finite() { return None; }
+    if rate <= 0.0 || !projected_nodes.is_finite() {
+        return None;
+    }
     let ttc_parallel = projected_nodes / rate;
     let _ = n_workers;
-    if ttc_parallel <= 0.0 || !ttc_parallel.is_finite() { return None; }
+    if ttc_parallel <= 0.0 || !ttc_parallel.is_finite() {
+        return None;
+    }
     Some((elapsed_secs / ttc_parallel).clamp(0.0, 1.0))
 }
 
 fn project_ttc(stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize) -> String {
     const NOISY_THRESHOLD: u64 = 32;
-    let depth = n;  // bouncing-order depth = n for even n
+    let depth = n; // bouncing-order depth = n for even n
     if elapsed_secs <= 0.0 || stats.nodes_visited == 0 {
         return "TTC projection: insufficient data".to_string();
     }
@@ -1506,13 +1765,21 @@ fn project_ttc(stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize)
     // but still USED in the projection (early levels have near-zero
     // variance because every worker sees the same root-level
     // branching — 1 sample is effectively exact there).
-    struct Bee { b: f64, sampled: bool, noisy: bool }
+    struct Bee {
+        b: f64,
+        sampled: bool,
+        noisy: bool,
+    }
     let mut b_eff: Vec<Bee> = Vec::with_capacity(depth);
     for l in 0..depth {
         let parent = stats.nodes_by_level.get(l).copied().unwrap_or(0);
         let child = stats.children_by_level.get(l).copied().unwrap_or(0);
         if parent == 0 {
-            b_eff.push(Bee { b: 0.0, sampled: false, noisy: false });
+            b_eff.push(Bee {
+                b: 0.0,
+                sampled: false,
+                noisy: false,
+            });
         } else {
             b_eff.push(Bee {
                 b: child as f64 / parent as f64,
@@ -1523,8 +1790,11 @@ fn project_ttc(stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize)
     }
     // Fallback for un-SAMPLED levels (no data at all): median of
     // well-sampled levels (noisy excluded). Median resists outliers.
-    let mut clean_bs: Vec<f64> =
-        b_eff.iter().filter(|x| x.sampled && !x.noisy).map(|x| x.b).collect();
+    let mut clean_bs: Vec<f64> = b_eff
+        .iter()
+        .filter(|x| x.sampled && !x.noisy)
+        .map(|x| x.b)
+        .collect();
     clean_bs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let fallback = if clean_bs.is_empty() {
         1.0
@@ -1544,12 +1814,16 @@ fn project_ttc(stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize)
     let mut running_product = 1.0_f64;
     for l in 0..depth {
         let b = match b_eff.get(l) {
-            Some(Bee { b, sampled: true, .. }) => *b,
+            Some(Bee {
+                b, sampled: true, ..
+            }) => *b,
             _ => fallback,
         };
         running_product *= b;
         projected_nodes += running_product;
-        if !running_product.is_finite() { break; }
+        if !running_product.is_finite() {
+            break;
+        }
     }
     let rate = stats.nodes_visited as f64 / elapsed_secs;
     let ttc_parallel = projected_nodes / rate;
@@ -1561,13 +1835,27 @@ fn project_ttc(stats: &SyncStats, n: usize, elapsed_secs: f64, n_workers: usize)
          TTC projection: clean geo mean = {:.3}, projected nodes to cover = {:.3e}\n\
          TTC projection: rate = {:.0} nodes/s ({} workers, aggregate),\n\
          TTC projection: TTC_parallel ≈ {:.1}s, TTC_serial ≈ {:.1}s",
-        b_eff.iter()
-            .map(|x| if !x.sampled { "-".into() }
-                     else if x.noisy { format!("{:.2}?", x.b) }
-                     else { format!("{:.2}", x.b) })
-            .collect::<Vec<_>>().join(", "),
-        clean_bs.len(), noisy_count, unsampled, fallback,
-        geo_mean, projected_nodes, rate, n_workers, ttc_parallel, ttc_serial,
+        b_eff
+            .iter()
+            .map(|x| if !x.sampled {
+                "-".into()
+            } else if x.noisy {
+                format!("{:.2}?", x.b)
+            } else {
+                format!("{:.2}", x.b)
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        clean_bs.len(),
+        noisy_count,
+        unsampled,
+        fallback,
+        geo_mean,
+        projected_nodes,
+        rate,
+        n_workers,
+        ttc_parallel,
+        ttc_serial,
     )
 }
 
@@ -1576,7 +1864,11 @@ fn search_sync_serial(
     cfg: &SyncConfig,
     verbose: bool,
     start: Instant,
-) -> (Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>, SyncStats, std::time::Duration) {
+) -> (
+    Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+    SyncStats,
+    std::time::Duration,
+) {
     let seed = cfg.random_seed.unwrap_or(0);
     let ctx = build_ctx_seeded(
         problem,
@@ -1596,20 +1888,34 @@ fn search_sync_serial(
     // so this is O(n) instead of a full SAT solve.
     if solver.propagate_only(&[]) != Some(true) {
         eprintln!("sync_walker: base solver UNSAT — canonical constraints inconsistent");
-        return (None, SyncStats {
-            nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-            rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0, max_level_reached: 0,
-            nodes_by_level: Vec::new(), children_by_level: Vec::new(),
-            children_total: 0, internal_nodes: 0,
-            time_to_first_leaf: None,
-        nogood_len_sum: 0, full_nogood_len_sum: 0,
-        peer_clauses_read: 0, peer_clauses_imported: 0,
-        forced_by_level: Vec::new(),
-        sub_cube_time_by_level: Vec::new(),
-        children_processed_by_level: Vec::new(),
-        prop_by_kind_total: [0; radical::PropKind::COUNT],
-        forced_by_level_kind: Vec::new(),
-        }, start.elapsed());
+        return (
+            None,
+            SyncStats {
+                nodes_visited: 0,
+                memo_hits: 0,
+                capacity_rejects: 0,
+                rule_rejects: 0,
+                tuple_rejects: 0,
+                sat_unsat: 0,
+                leaves_reached: 0,
+                max_level_reached: 0,
+                nodes_by_level: Vec::new(),
+                children_by_level: Vec::new(),
+                children_total: 0,
+                internal_nodes: 0,
+                time_to_first_leaf: None,
+                nogood_len_sum: 0,
+                full_nogood_len_sum: 0,
+                peer_clauses_read: 0,
+                peer_clauses_imported: 0,
+                forced_by_level: Vec::new(),
+                sub_cube_time_by_level: Vec::new(),
+                children_processed_by_level: Vec::new(),
+                prop_by_kind_total: [0; radical::PropKind::COUNT],
+                forced_by_level_kind: Vec::new(),
+            },
+            start.elapsed(),
+        );
     }
 
     let mut state = State::new(ctx.n);
@@ -1622,15 +1928,23 @@ fn search_sync_serial(
     harvest_forced(&solver, &mut state, &ctx);
 
     let mut stats = SyncStats {
-        nodes_visited: 0, memo_hits: 0, capacity_rejects: 0,
-        rule_rejects: 0, tuple_rejects: 0, sat_unsat: 0, leaves_reached: 0,
+        nodes_visited: 0,
+        memo_hits: 0,
+        capacity_rejects: 0,
+        rule_rejects: 0,
+        tuple_rejects: 0,
+        sat_unsat: 0,
+        leaves_reached: 0,
         max_level_reached: 0,
         nodes_by_level: vec![0; ctx.depth + 1],
         children_by_level: vec![0; ctx.depth + 1],
-        children_total: 0, internal_nodes: 0,
+        children_total: 0,
+        internal_nodes: 0,
         time_to_first_leaf: None,
-        nogood_len_sum: 0, full_nogood_len_sum: 0,
-        peer_clauses_read: 0, peer_clauses_imported: 0,
+        nogood_len_sum: 0,
+        full_nogood_len_sum: 0,
+        peer_clauses_read: 0,
+        peer_clauses_imported: 0,
         forced_by_level: vec![0; ctx.depth + 1],
         sub_cube_time_by_level: vec![0.0; ctx.depth + 1],
         children_processed_by_level: vec![0; ctx.depth + 1],
@@ -1640,16 +1954,32 @@ fn search_sync_serial(
 
     let deadline = if cfg.sat_secs > 0 {
         Some(start + std::time::Duration::from_secs(cfg.sat_secs))
-    } else { None };
+    } else {
+        None
+    };
 
     let mut found: Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)> = None;
-    dfs(&mut solver, &mut state, &ctx, &mut stats, deadline, &mut found);
+    dfs(
+        &mut solver,
+        &mut state,
+        &ctx,
+        &mut stats,
+        deadline,
+        &mut found,
+    );
 
     let elapsed = start.elapsed();
     if verbose {
         eprintln!(
             "sync_walker: nodes={} memo_hits={} cap_rejects={} rule_rejects={} sat_unsat={} leaves={} max_lvl={} elapsed={:?}",
-            stats.nodes_visited, stats.memo_hits, stats.capacity_rejects, stats.rule_rejects, stats.sat_unsat, stats.leaves_reached, stats.max_level_reached, elapsed,
+            stats.nodes_visited,
+            stats.memo_hits,
+            stats.capacity_rejects,
+            stats.rule_rejects,
+            stats.sat_unsat,
+            stats.leaves_reached,
+            stats.max_level_reached,
+            elapsed,
         );
     }
     (found, stats, elapsed)
@@ -1686,12 +2016,18 @@ fn dfs_body(
     deadline: Option<Instant>,
     found: &mut Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
 ) -> bool {
-    if found.is_some() { return true; }
+    if found.is_some() {
+        return true;
+    }
     if let Some(d) = deadline {
-        if Instant::now() >= d { return false; }
+        if Instant::now() >= d {
+            return false;
+        }
     }
     if let Some(c) = &ctx.cancel {
-        if c.load(AtomicOrdering::Acquire) { return false; }
+        if c.load(AtomicOrdering::Acquire) {
+            return false;
+        }
     }
     stats.nodes_visited += 1;
     if state.level < stats.nodes_by_level.len() {
@@ -1712,8 +2048,7 @@ fn dfs_body(
             let mut snap = live.lock().unwrap();
             snap.nodes_visited = stats.nodes_visited;
             if snap.nodes_by_level.len() < stats.nodes_by_level.len() {
-                snap.nodes_by_level
-                    .resize(stats.nodes_by_level.len(), 0);
+                snap.nodes_by_level.resize(stats.nodes_by_level.len(), 0);
             }
             snap.nodes_by_level
                 .iter_mut()
@@ -1825,7 +2160,9 @@ fn dfs_body(
     let spec_parent_sums = state.sums.clone();
 
     for choice in 0u8..16 {
-        if !has_w && (choice & 1) != 0 { continue; }  // W bit must be 0 (ignored)
+        if !has_w && (choice & 1) != 0 {
+            continue;
+        } // W bit must be 0 (ignored)
         let bx = if (choice >> 3) & 1 == 0 { 1i8 } else { -1 };
         let by = if (choice >> 2) & 1 == 0 { 1i8 } else { -1 };
         let bz = if (choice >> 1) & 1 == 0 { 1i8 } else { -1 };
@@ -1839,11 +2176,16 @@ fn dfs_body(
 
         for (kind, sign) in [(0u8, bx), (1, by), (2, bz), (3, bw)] {
             let xy_len = kind_xy_len(kind, ctx.n, ctx.m);
-            if pos >= xy_len { continue; }
+            if pos >= xy_len {
+                continue;
+            }
             let existing = state.bit(kind, pos);
             if existing != 0 {
                 let existing_sign = if existing == 1 { 1i8 } else { -1 };
-                if existing_sign != sign { consistent = false; break; }
+                if existing_sign != sign {
+                    consistent = false;
+                    break;
+                }
                 // Already forced; don't add to assumptions.
                 continue;
             }
@@ -1853,7 +2195,9 @@ fn dfs_body(
             new_assums[num_new as usize] = if sign > 0 { var } else { -var };
             num_new += 1;
         }
-        if !consistent { continue; }
+        if !consistent {
+            continue;
+        }
 
         // Speculatively update sums for pairs closing at this level
         // using the placed bits. We don't call the solver yet — capacity
@@ -1964,11 +2308,17 @@ fn dfs_body(
         use std::hash::Hasher;
         let mut h = rustc_hash::FxHasher::default();
         h.write_u64(ctx.seed);
-        for &lit in &state.assumptions { h.write_i32(lit); }
+        for &lit in &state.assumptions {
+            h.write_i32(lit);
+        }
         let s = h.finish();
-        let mut rng = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut rng = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         for i in (1..candidates.len()).rev() {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let j = (rng >> 32) as usize % (i + 1);
             candidates.swap(i, j);
         }
@@ -2003,12 +2353,21 @@ fn dfs_body(
     let mut result_override: Option<bool> = None;
 
     for cand in candidates {
-        if found.is_some() { result_override = Some(true); break; }
+        if found.is_some() {
+            result_override = Some(true);
+            break;
+        }
         if let Some(d) = deadline {
-            if Instant::now() >= d { result_override = Some(false); break; }
+            if Instant::now() >= d {
+                result_override = Some(false);
+                break;
+            }
         }
         if let Some(c) = &ctx.cancel {
-            if c.load(AtomicOrdering::Acquire) { result_override = Some(false); break; }
+            if c.load(AtomicOrdering::Acquire) {
+                result_override = Some(false);
+                break;
+            }
         }
 
         // Restore state.bits to the parent snapshot before each sibling.
@@ -2031,7 +2390,9 @@ fn dfs_body(
             let (ki, pi, si) = cand.placed_signs[k];
             state.set_bit(ki, pi, si);
         }
-        state.assumptions.extend_from_slice(&cand.new_assums[..cand.num_new_assums as usize]);
+        state
+            .assumptions
+            .extend_from_slice(&cand.new_assums[..cand.num_new_assums as usize]);
         let sib_saved_level = state.level;
         state.level += 1;
         state.rule_state = cand.rule_state;
@@ -2064,10 +2425,9 @@ fn dfs_body(
         let new_lits = &cand.new_assums[..cand.num_new_assums as usize];
         let sat = solver.push_assume_frame(new_lits);
         if state.level >= stats.forced_by_level_kind.len() {
-            stats.forced_by_level_kind.resize(
-                state.level + 1,
-                [0; radical::PropKind::COUNT],
-            );
+            stats
+                .forced_by_level_kind
+                .resize(state.level + 1, [0; radical::PropKind::COUNT]);
         }
         for kind in radical::PropKind::ALL {
             let post = solver.propagations_by_kind(kind);
@@ -2111,8 +2471,8 @@ fn dfs_body(
             // may now be set (via rule propagation into the
             // middle). Use the tighter dynamic capacity check
             // which accounts for pairs already fully determined.
-            let found_solution = !capacity_violated(state, ctx)
-                && dfs(solver, state, ctx, stats, deadline, found);
+            let found_solution =
+                !capacity_violated(state, ctx) && dfs(solver, state, ctx, stats, deadline, found);
             // Pop this sibling's frame before moving to the next
             // sibling. Must be paired with the Some(true) push above.
             solver.pop_assume_frame();
@@ -2156,7 +2516,7 @@ fn dfs_body(
         stats.children_processed_by_level.resize(entry_level + 1, 0);
     }
     stats.children_processed_by_level[entry_level] += processed_count;
-    let _ = total_candidates;  // silence unused if only for debugging
+    let _ = total_candidates; // silence unused if only for debugging
 
     // Final rollback to leave state as caller expected.
     state.bits.copy_from_slice(&saved_all_bits);
@@ -2166,7 +2526,9 @@ fn dfs_body(
     // Restore state.level if the loop broke with state.level bumped.
     state.level = entry_level;
 
-    if let Some(v) = result_override { return v; }
+    if let Some(v) = result_override {
+        return v;
+    }
     false
 }
 
@@ -2181,12 +2543,28 @@ fn extract_solution(
     let mut z_vals = vec![0i8; n];
     let mut w_vals = vec![0i8; m];
     for i in 0..n {
-        x_vals[i] = if solver.value((i + 1) as i32).unwrap_or(true) { 1 } else { -1 };
-        y_vals[i] = if solver.value((n + i + 1) as i32).unwrap_or(true) { 1 } else { -1 };
-        z_vals[i] = if solver.value((2 * n + i + 1) as i32).unwrap_or(true) { 1 } else { -1 };
+        x_vals[i] = if solver.value((i + 1) as i32).unwrap_or(true) {
+            1
+        } else {
+            -1
+        };
+        y_vals[i] = if solver.value((n + i + 1) as i32).unwrap_or(true) {
+            1
+        } else {
+            -1
+        };
+        z_vals[i] = if solver.value((2 * n + i + 1) as i32).unwrap_or(true) {
+            1
+        } else {
+            -1
+        };
     }
     for i in 0..m {
-        w_vals[i] = if solver.value((3 * n + i + 1) as i32).unwrap_or(true) { 1 } else { -1 };
+        w_vals[i] = if solver.value((3 * n + i + 1) as i32).unwrap_or(true) {
+            1
+        } else {
+            -1
+        };
     }
     (
         PackedSeq::from_values(&x_vals),
@@ -2218,12 +2596,24 @@ mod tests {
         let z_var = |i: usize| -> i32 { (2 * n + i + 1) as i32 };
         let w_var = |i: usize| -> i32 { (3 * n + i + 1) as i32 };
         let mut assums: Vec<i32> = Vec::new();
-        for (i, &v) in x.iter().enumerate() { assums.push(if v > 0 { x_var(i) } else { -x_var(i) }); }
-        for (i, &v) in y.iter().enumerate() { assums.push(if v > 0 { y_var(i) } else { -y_var(i) }); }
-        for (i, &v) in z.iter().enumerate() { assums.push(if v > 0 { z_var(i) } else { -z_var(i) }); }
-        for (i, &v) in w.iter().enumerate() { assums.push(if v > 0 { w_var(i) } else { -w_var(i) }); }
+        for (i, &v) in x.iter().enumerate() {
+            assums.push(if v > 0 { x_var(i) } else { -x_var(i) });
+        }
+        for (i, &v) in y.iter().enumerate() {
+            assums.push(if v > 0 { y_var(i) } else { -y_var(i) });
+        }
+        for (i, &v) in z.iter().enumerate() {
+            assums.push(if v > 0 { z_var(i) } else { -z_var(i) });
+        }
+        for (i, &v) in w.iter().enumerate() {
+            assums.push(if v > 0 { w_var(i) } else { -w_var(i) });
+        }
         let result = solver.propagate_only(&assums);
-        assert_eq!(result, Some(true), "canonical TT(6) rejected by propagate_only");
+        assert_eq!(
+            result,
+            Some(true),
+            "canonical TT(6) rejected by propagate_only"
+        );
     }
 
     #[test]
@@ -2234,8 +2624,13 @@ mod tests {
         assert_eq!(solver.propagate_only(&[]), Some(true));
         // Just the first two position placements of the canonical solution.
         // Should still be satisfiable (many completions exist).
-        let x0 = 1; let y0 = 7; let z0 = 13; let w0 = 19; // vars for position 0
-        let x5 = 6; let y5 = 12; let z5 = 18; // vars for position 5 (no W[5])
+        let x0 = 1;
+        let y0 = 7;
+        let z0 = 13;
+        let w0 = 19; // vars for position 0
+        let x5 = 6;
+        let y5 = 12;
+        let z5 = 18; // vars for position 5 (no W[5])
         let assums = vec![x0, y0, z0, w0, x5, y5, -z5]; // Z[5]=-1, others +1
         let result = solver.propagate_only(&assums);
         assert_eq!(result, Some(true), "partial boundary rejected");
@@ -2262,7 +2657,11 @@ mod tests {
         for prefix_len in 0..=n {
             let mut assums: Vec<i32> = Vec::new();
             for level in 0..prefix_len {
-                let pos = if level % 2 == 0 { level / 2 } else { n - 1 - level / 2 };
+                let pos = if level % 2 == 0 {
+                    level / 2
+                } else {
+                    n - 1 - level / 2
+                };
                 assums.push(if x[pos] > 0 { x_var(pos) } else { -x_var(pos) });
                 assums.push(if y[pos] > 0 { y_var(pos) } else { -y_var(pos) });
                 assums.push(if z[pos] > 0 { z_var(pos) } else { -z_var(pos) });
@@ -2277,8 +2676,10 @@ mod tests {
             let mut full_solver = build_solver(problem, &sat_cfg);
             let full_result = full_solver.solve_with_assumptions(&assums);
             if prop_result != Some(true) && full_result == Some(true) {
-                panic!("prefix_len={}: propagate_only={:?} but full SAT says {:?} — propagate_only rejected a valid partial!",
-                    prefix_len, prop_result, full_result);
+                panic!(
+                    "prefix_len={}: propagate_only={:?} but full SAT says {:?} — propagate_only rejected a valid partial!",
+                    prefix_len, prop_result, full_result
+                );
             }
         }
     }
@@ -2295,7 +2696,8 @@ mod tests {
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
         let z_var = |i: usize| -> i32 { (2 * n + i + 1) as i32 };
         let w_var = |i: usize| -> i32 { (3 * n + i + 1) as i32 };
-        let parse = |s: &str| -> Vec<i8> { s.chars().map(|c| if c == '+' { 1i8 } else { -1 }).collect() };
+        let parse =
+            |s: &str| -> Vec<i8> { s.chars().map(|c| if c == '+' { 1i8 } else { -1 }).collect() };
         let x = parse("++-+++++++++-+--++");
         let y = parse("++----++-+---+-+-+");
         let z = parse("++-+++----+-+-++--");
@@ -2303,7 +2705,10 @@ mod tests {
 
         // Bouncing order
         let mut pos_order = Vec::with_capacity(n);
-        for j in 0..n/2 { pos_order.push(j); pos_order.push(n - 1 - j); }
+        for j in 0..n / 2 {
+            pos_order.push(j);
+            pos_order.push(n - 1 - j);
+        }
 
         for prefix_len in 0..=pos_order.len() {
             let sat_cfg = radical::SolverConfig::default();
@@ -2315,11 +2720,17 @@ mod tests {
                 assums.push(if x[pos] > 0 { x_var(pos) } else { -x_var(pos) });
                 assums.push(if y[pos] > 0 { y_var(pos) } else { -y_var(pos) });
                 assums.push(if z[pos] > 0 { z_var(pos) } else { -z_var(pos) });
-                if pos < m { assums.push(if w[pos] > 0 { w_var(pos) } else { -w_var(pos) }); }
+                if pos < m {
+                    assums.push(if w[pos] > 0 { w_var(pos) } else { -w_var(pos) });
+                }
             }
             let result = solver.propagate_only(&assums);
-            assert_eq!(result, Some(true),
-                "canonical TT(18) rejected at walker prefix_len={}", prefix_len);
+            assert_eq!(
+                result,
+                Some(true),
+                "canonical TT(18) rejected at walker prefix_len={}",
+                prefix_len
+            );
         }
     }
 
@@ -2333,7 +2744,8 @@ mod tests {
         let z_var = |i: usize| -> i32 { (2 * n + i + 1) as i32 };
         let w_var = |i: usize| -> i32 { (3 * n + i + 1) as i32 };
 
-        let parse = |s: &str| -> Vec<i8> { s.chars().map(|c| if c == '+' { 1i8 } else { -1 }).collect() };
+        let parse =
+            |s: &str| -> Vec<i8> { s.chars().map(|c| if c == '+' { 1i8 } else { -1 }).collect() };
         let x = parse("++-+++++++++-+--++");
         let y = parse("++----++-+---+-+-+");
         let z = parse("++-+++----+-+-++--");
@@ -2343,11 +2755,23 @@ mod tests {
         let mut solver = build_solver(problem, &sat_cfg);
         solver.propagate_only(&[]);
         let mut assums: Vec<i32> = Vec::new();
-        for (i, &v) in x.iter().enumerate() { assums.push(if v > 0 { x_var(i) } else { -x_var(i) }); }
-        for (i, &v) in y.iter().enumerate() { assums.push(if v > 0 { y_var(i) } else { -y_var(i) }); }
-        for (i, &v) in z.iter().enumerate() { assums.push(if v > 0 { z_var(i) } else { -z_var(i) }); }
-        for (i, &v) in w.iter().enumerate() { assums.push(if v > 0 { w_var(i) } else { -w_var(i) }); }
+        for (i, &v) in x.iter().enumerate() {
+            assums.push(if v > 0 { x_var(i) } else { -x_var(i) });
+        }
+        for (i, &v) in y.iter().enumerate() {
+            assums.push(if v > 0 { y_var(i) } else { -y_var(i) });
+        }
+        for (i, &v) in z.iter().enumerate() {
+            assums.push(if v > 0 { z_var(i) } else { -z_var(i) });
+        }
+        for (i, &v) in w.iter().enumerate() {
+            assums.push(if v > 0 { w_var(i) } else { -w_var(i) });
+        }
         let result = solver.propagate_only(&assums);
-        assert_eq!(result, Some(true), "canonical TT(18) rejected by propagate_only");
+        assert_eq!(
+            result,
+            Some(true),
+            "canonical TT(18) rejected by propagate_only"
+        );
     }
 }

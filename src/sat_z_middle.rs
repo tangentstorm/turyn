@@ -61,7 +61,13 @@ impl LagTemplate {
             }
 
             let aux_base = (middle_len + 1 + s * seq_len) as i32;
-            lags.push(LagInfo { bnd_bnd, bnd_mid, mid_mid, aux_base, num_pairs });
+            lags.push(LagInfo {
+                bnd_bnd,
+                bnd_mid,
+                mid_mid,
+                aux_base,
+                num_pairs,
+            });
         }
 
         LagTemplate { lags }
@@ -79,7 +85,12 @@ impl LagTemplate {
         self.build_base_solver_inner(middle_len, mid_sum, true)
     }
 
-    fn build_base_solver_inner(&self, middle_len: usize, mid_sum: i32, use_quad_pb: bool) -> radical::Solver {
+    fn build_base_solver_inner(
+        &self,
+        middle_len: usize,
+        mid_sum: i32,
+        use_quad_pb: bool,
+    ) -> radical::Solver {
         let mut solver = radical::Solver::new();
         let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
 
@@ -121,7 +132,11 @@ impl LagTemplate {
     /// `PbSetEq` over multiple valid counts.  Used by the multi-σ W middle
     /// SAT — the SAT may then pick either sign of σ_W (or any σ_W compatible
     /// with the `valid_counts` set).
-    pub fn build_base_solver_pb_set(&self, middle_len: usize, valid_counts: &[u32]) -> radical::Solver {
+    pub fn build_base_solver_pb_set(
+        &self,
+        middle_len: usize,
+        valid_counts: &[u32],
+    ) -> radical::Solver {
         let mut solver = radical::Solver::new();
         let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
         let lits: Vec<i32> = (0..middle_len).map(mid_var).collect();
@@ -144,7 +159,11 @@ impl LagTemplate {
 
     /// Like `build_base_solver_quad_pb` but with a `PbSetEq` middle-sum
     /// constraint.  Used by the multi-σ Z middle SAT.
-    pub fn build_base_solver_quad_pb_pb_set(&self, middle_len: usize, valid_counts: &[u32]) -> radical::Solver {
+    pub fn build_base_solver_quad_pb_pb_set(
+        &self,
+        middle_len: usize,
+        valid_counts: &[u32],
+    ) -> radical::Solver {
         let mut solver = radical::Solver::new();
         let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
         let lits: Vec<i32> = (0..middle_len).map(mid_var).collect();
@@ -173,8 +192,12 @@ pub fn fill_z_solver(
 
         // Compute N_W(s)
         let nw_s: i32 = if s < m {
-            (0..m - s).map(|i| w_vals[i] as i32 * w_vals[i + s] as i32).sum()
-        } else { 0 };
+            (0..m - s)
+                .map(|i| w_vals[i] as i32 * w_vals[i + s] as i32)
+                .sum()
+        } else {
+            0
+        };
 
         let max_nz = (n - s) as i32;
         let lo = (-max_nz).max(-max_nz - nw_s);
@@ -225,7 +248,9 @@ pub fn fill_z_solver(
         }
 
         // Skip trivially satisfied constraints
-        if adj_lo == 0 && adj_hi >= max_variable { continue; }
+        if adj_lo == 0 && adj_hi >= max_variable {
+            continue;
+        }
 
         if lag.mid_mid.is_empty() {
             // Linear only
@@ -306,7 +331,9 @@ impl ZBoundaryPrep {
         for (s_idx, lag) in tmpl.lags.iter().enumerate() {
             let mut agc: u32 = 0;
             for &(i, j) in &lag.bnd_bnd {
-                if z_boundary[i] == z_boundary[j] { agc += 1; }
+                if z_boundary[i] == z_boundary[j] {
+                    agc += 1;
+                }
             }
             self.agree_const[s_idx] = agc;
 
@@ -318,7 +345,11 @@ impl ZBoundaryPrep {
             c.clear();
 
             for &(bnd_pos, mid_idx) in &lag.bnd_mid {
-                let lit = if z_boundary[bnd_pos] == 1 { mid_var(mid_idx) } else { -mid_var(mid_idx) };
+                let lit = if z_boundary[bnd_pos] == 1 {
+                    mid_var(mid_idx)
+                } else {
+                    -mid_var(mid_idx)
+                };
                 la.push(lit);
                 lb.push(true_var);
             }
@@ -363,8 +394,12 @@ pub fn fill_z_solver_quad_pb(
         let s = s_idx + 1;
 
         let nw_s: i32 = if s < m {
-            (0..m - s).map(|i| w_vals[i] as i32 * w_vals[i + s] as i32).sum()
-        } else { 0 };
+            (0..m - s)
+                .map(|i| w_vals[i] as i32 * w_vals[i + s] as i32)
+                .sum()
+        } else {
+            0
+        };
 
         let max_nz = (n - s) as i32;
         let lo = (-max_nz).max(-max_nz - nw_s);
@@ -397,7 +432,9 @@ pub fn fill_z_solver_quad_pb(
             continue;
         }
 
-        if adj_lo == 0 && adj_hi >= max_variable { continue; }
+        if adj_lo == 0 && adj_hi >= max_variable {
+            continue;
+        }
 
         solver.add_quad_pb_range(
             &prep.lits_a[s_idx],
@@ -424,7 +461,9 @@ pub fn fill_w_solver(
 
         let mut agree_const: u32 = 0;
         for &(i, j) in &lag.bnd_bnd {
-            if boundary[i] == boundary[j] { agree_const += 1; }
+            if boundary[i] == boundary[j] {
+                agree_const += 1;
+            }
         }
 
         let mut agree_lits: Vec<i32> = Vec::with_capacity(lag.bnd_mid.len());
@@ -440,7 +479,9 @@ pub fn fill_w_solver(
         let adj_lo = agree_lo.saturating_sub(agree_const);
         let adj_hi = agree_hi - agree_const;
 
-        if adj_lo == 0 && adj_hi >= max_variable { continue; }
+        if adj_lo == 0 && adj_hi >= max_variable {
+            continue;
+        }
 
         if agree_lits.is_empty() && lag.mid_mid.is_empty() {
             if agree_const < agree_lo || agree_const > agree_hi {
@@ -494,10 +535,10 @@ pub fn fill_w_solver(
 pub fn fill_w_spectral(
     solver: &mut radical::Solver,
     tmpl: &LagTemplate,
-    seq_len: usize,       // m (W length)
+    seq_len: usize, // m (W length)
     boundary: &[i8],
-    spectral_bound: f64,  // (6n-2)/2
-    num_freqs: usize,     // how many frequency constraints to add
+    spectral_bound: f64, // (6n-2)/2
+    num_freqs: usize,    // how many frequency constraints to add
 ) {
     let mid_var = |i: usize| -> i32 { (i + 1) as i32 };
     let m = seq_len;
@@ -517,8 +558,8 @@ pub fn fill_w_spectral(
         // Sample frequencies evenly in (0, 0.5) — avoid ω=0 (trivially loose)
         let omega = (fi as f64 + 1.0) / (num_freqs as f64 + 1.0) * 0.5;
 
-        let mut const_weighted = 0.0f64;  // Σ agree_const(s) * cos(s,ω)
-        let mut baseline = 0.0f64;        // Σ num_pairs(s) * cos(s,ω)
+        let mut const_weighted = 0.0f64; // Σ agree_const(s) * cos(s,ω)
+        let mut baseline = 0.0f64; // Σ num_pairs(s) * cos(s,ω)
 
         // Collect (literal, float_weight) pairs for variable agree terms
         let mut lit_weights: Vec<(i32, f64)> = Vec::new();
@@ -532,13 +573,19 @@ pub fn fill_w_spectral(
             // bnd×bnd constant contribution
             let mut agree_const = 0u32;
             for &(i, j) in &lag.bnd_bnd {
-                if boundary[i] == boundary[j] { agree_const += 1; }
+                if boundary[i] == boundary[j] {
+                    agree_const += 1;
+                }
             }
             const_weighted += agree_const as f64 * cos_val;
 
             // bnd×mid variable terms
             for &(bnd_pos, mid_idx) in &lag.bnd_mid {
-                let lit = if boundary[bnd_pos] == 1 { mid_var(mid_idx) } else { -mid_var(mid_idx) };
+                let lit = if boundary[bnd_pos] == 1 {
+                    mid_var(mid_idx)
+                } else {
+                    -mid_var(mid_idx)
+                };
                 lit_weights.push((lit, cos_val));
             }
 
@@ -548,7 +595,9 @@ pub fn fill_w_spectral(
             }
         }
 
-        if lit_weights.is_empty() { continue; }
+        if lit_weights.is_empty() {
+            continue;
+        }
 
         // Threshold for variable part:
         // Σ variable_agree * cos ≤ ((B-m)/2 + baseline) / 2 - const_weighted
@@ -564,10 +613,12 @@ pub fn fill_w_spectral(
 
         for &(lit, w) in &lit_weights {
             let scaled_w = (w * SCALE).round();
-            if scaled_w.abs() < 1.0 { continue; } // skip near-zero weights
+            if scaled_w.abs() < 1.0 {
+                continue;
+            } // skip near-zero weights
 
             if scaled_w > 0.0 {
-                pb_lits.push(-lit);  // negate: count when x_i=0
+                pb_lits.push(-lit); // negate: count when x_i=0
                 pb_coeffs.push(scaled_w as u32);
                 sum_positive += scaled_w;
             } else {
@@ -577,7 +628,9 @@ pub fn fill_w_spectral(
         }
 
         let bound = sum_positive - threshold * SCALE;
-        if bound <= 0.0 { continue; } // trivially satisfied
+        if bound <= 0.0 {
+            continue;
+        } // trivially satisfied
         let bound = bound.ceil() as u32;
 
         if !pb_lits.is_empty() {
@@ -628,7 +681,9 @@ pub fn check_z_boundary_rule_iv(n: usize, k: usize, z_boundary: &[i8]) -> Bounda
 /// d[m-1] is in the suffix boundary so its sign is known; the first-
 /// violation at a boundary pair k < K is thus fully determined.
 pub fn check_w_boundary_rule_v(m: usize, k: usize, w_boundary: &[i8]) -> BoundaryRuleState {
-    if m < 3 { return BoundaryRuleState::DeferredToMiddle; }
+    if m < 3 {
+        return BoundaryRuleState::DeferredToMiddle;
+    }
     let last_p = (m - 2) / 2;
     let tail = w_boundary[m - 1];
     let bnd_end = k.min(last_p + 1);
@@ -664,7 +719,9 @@ pub fn add_rule_iv_middle_clauses(
     next_var: &mut i32,
 ) {
     let last_j = (n - 2) / 2;
-    if k > last_j { return; }
+    if k > last_j {
+        return;
+    }
     let mid_start = k;
     let mid_end = last_j;
     let n_aux = mid_end - mid_start + 1;
@@ -674,14 +731,16 @@ pub fn add_rule_iv_middle_clauses(
     for j in mid_start..=mid_end {
         let a = mid_var(j);
         let b = mid_var(n - 1 - j);
-        solver.add_clause([-diff(j),  a,  b]);
+        solver.add_clause([-diff(j), a, b]);
         solver.add_clause([-diff(j), -a, -b]);
-        solver.add_clause([ diff(j),  a, -b]);
-        solver.add_clause([ diff(j), -a,  b]);
+        solver.add_clause([diff(j), a, -b]);
+        solver.add_clause([diff(j), -a, b]);
     }
     for i in mid_start..=mid_end {
         let mut clause: Vec<i32> = Vec::with_capacity(i - mid_start + 2);
-        for j in mid_start..i { clause.push(-diff(j)); }
+        for j in mid_start..i {
+            clause.push(-diff(j));
+        }
         clause.push(diff(i));
         clause.push(mid_var(i));
         solver.add_clause(clause);
@@ -704,9 +763,13 @@ pub fn add_rule_v_middle_clauses(
     mid_var: impl Fn(usize) -> i32,
     next_var: &mut i32,
 ) {
-    if m < 3 { return; }
+    if m < 3 {
+        return;
+    }
     let last_p = (m - 2) / 2;
-    if k > last_p { return; }
+    if k > last_p {
+        return;
+    }
     let mid_start = k;
     let mid_end = last_p;
     let n_aux = mid_end - mid_start + 1;
@@ -721,18 +784,18 @@ pub fn add_rule_v_middle_clauses(
         let a = mid_var(p);
         let b = mid_var(m - 1 - p);
         // u_p ↔ a XOR b
-        solver.add_clause([-u(p),  a,  b]);
+        solver.add_clause([-u(p), a, b]);
         solver.add_clause([-u(p), -a, -b]);
-        solver.add_clause([ u(p),  a, -b]);
-        solver.add_clause([ u(p), -a,  b]);
+        solver.add_clause([u(p), a, -b]);
+        solver.add_clause([u(p), -a, b]);
         // v_p ↔ u_p XOR tail.  tail is a constant ±1; when tail=+1,
         // v_p = u_p; when tail=-1, v_p = ¬u_p.
         if tail_sign == 1 {
-            solver.add_clause([-v(p),  u(p)]);
-            solver.add_clause([ v(p), -u(p)]);
+            solver.add_clause([-v(p), u(p)]);
+            solver.add_clause([v(p), -u(p)]);
         } else {
             solver.add_clause([-v(p), -u(p)]);
-            solver.add_clause([ v(p),  u(p)]);
+            solver.add_clause([v(p), u(p)]);
         }
     }
     // Rule (v): least i with inequality (w[i]·w[m-1-i] != tail) has
@@ -744,7 +807,9 @@ pub fn add_rule_v_middle_clauses(
     // watches INEQUALITY (v=TRUE).
     for i in mid_start..=mid_end {
         let mut clause: Vec<i32> = Vec::with_capacity(i - mid_start + 2);
-        for j in mid_start..i { clause.push(v(j)); }
+        for j in mid_start..i {
+            clause.push(v(j));
+        }
         clause.push(-v(i));
         clause.push(mid_var(i));
         solver.add_clause(clause);

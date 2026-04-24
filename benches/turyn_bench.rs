@@ -93,7 +93,9 @@ fn parse_ttc_seconds(line: &str) -> Option<f64> {
     let total_field = parts.next()?.trim();
     let rate: f64 = rate_field.split_whitespace().next()?.parse().ok()?;
     let total: f64 = total_field.split_whitespace().next()?.parse().ok()?;
-    if rate <= 0.0 { return None; }
+    if rate <= 0.0 {
+        return None;
+    }
     Some(total / rate)
 }
 
@@ -123,10 +125,18 @@ fn run_turyn(n: usize) -> TuryRun {
         .lines()
         .find(|l| l.contains("Time to cover:"))
         .map(|l| l.trim().to_string());
-    let ttc = ttc_line.as_deref().and_then(parse_ttc_seconds).map(Duration::from_secs_f64);
+    let ttc = ttc_line
+        .as_deref()
+        .and_then(parse_ttc_seconds)
+        .map(Duration::from_secs_f64);
     let found_solution = stdout.contains("found_solution=true");
 
-    TuryRun { wall, ttc, ttc_line, found_solution }
+    TuryRun {
+        wall,
+        ttc,
+        ttc_line,
+        found_solution,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,35 +155,55 @@ static TTC_SAMPLES: Mutex<BTreeMap<usize, TtcSeries>> = Mutex::new(BTreeMap::new
 fn record(n: usize, r: &TuryRun) {
     let label = format!("TT({n})");
     let line = r.ttc_line.as_deref().unwrap_or("(no Time-to-cover line)");
-    let solved = if r.found_solution { "solved" } else { "NO SOLUTION" };
+    let solved = if r.found_solution {
+        "solved"
+    } else {
+        "NO SOLUTION"
+    };
     eprintln!("[{label}] wall={:>10.3?} {solved} | {line}", r.wall);
     if let Some(ttc) = r.ttc {
         let mut map = TTC_SAMPLES.lock().unwrap();
         map.entry(n)
-            .or_insert_with(|| TtcSeries { label: label.clone(), samples: Vec::new() })
-            .samples.push(ttc);
+            .or_insert_with(|| TtcSeries {
+                label: label.clone(),
+                samples: Vec::new(),
+            })
+            .samples
+            .push(ttc);
     }
 }
 
 fn fmt_duration(d: Duration) -> String {
     let s = d.as_secs_f64();
-    if s < 60.0 { format!("{s:>6.2}s") }
-    else if s < 3600.0 { format!("{:>6.2}m", s / 60.0) }
-    else if s < 86400.0 { format!("{:>6.2}h", s / 3600.0) }
-    else { format!("{:>6.2}d", s / 86400.0) }
+    if s < 60.0 {
+        format!("{s:>6.2}s")
+    } else if s < 3600.0 {
+        format!("{:>6.2}m", s / 60.0)
+    } else if s < 86400.0 {
+        format!("{:>6.2}h", s / 3600.0)
+    } else {
+        format!("{:>6.2}d", s / 86400.0)
+    }
 }
 
 fn print_ttc_summary() {
     let samples = TTC_SAMPLES.lock().unwrap();
-    if samples.is_empty() { return; }
+    if samples.is_empty() {
+        return;
+    }
     eprintln!();
     eprintln!("Time to cover (cross-size comparable metric):");
-    eprintln!("  {:<10} {:>7}  {:>7}  {:>7}  {:>7}  samples", "bench", "min", "median", "max", "mean");
+    eprintln!(
+        "  {:<10} {:>7}  {:>7}  {:>7}  {:>7}  samples",
+        "bench", "min", "median", "max", "mean"
+    );
     for series in samples.values() {
         let mut v = series.samples.clone();
         v.sort();
         let n = v.len();
-        if n == 0 { continue; }
+        if n == 0 {
+            continue;
+        }
         let min = v[0];
         let max = v[n - 1];
         let median = v[n / 2];
@@ -216,11 +246,7 @@ fn tt(bencher: divan::Bencher, n: usize) {
 // TT(26): current frontier. Single sample, 24-hour budget, may not find
 // a solution. Run with: `cargo bench --bench turyn_bench -- tt26`.
 // ---------------------------------------------------------------------------
-#[divan::bench(
-    sample_count = 1,
-    sample_size = 1,
-    max_time = 86_400,
-)]
+#[divan::bench(sample_count = 1, sample_size = 1, max_time = 86_400)]
 fn tt26(bencher: divan::Bencher) {
     bencher.bench_local(|| {
         let r = run_turyn(26);

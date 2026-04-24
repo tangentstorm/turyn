@@ -95,11 +95,7 @@ impl<T: Send + 'static> SearchEngine<T> {
         Arc::clone(&self.cancelled)
     }
 
-    pub fn run(
-        &mut self,
-        adapter: &dyn SearchModeAdapter<T>,
-        on_event: impl FnMut(SearchEvent),
-    ) {
+    pub fn run(&mut self, adapter: &dyn SearchModeAdapter<T>, on_event: impl FnMut(SearchEvent)) {
         self.run_since(Instant::now(), adapter, on_event)
     }
 
@@ -176,8 +172,7 @@ impl<T: Send + 'static> SearchEngine<T> {
             let (lock, _) = &*scheduler;
             let mut guard = lock.lock().unwrap();
             for (i, seed) in adapter.init().seed_items.into_iter().enumerate() {
-                if i & (SEED_CANCEL_POLL_STRIDE - 1) == 0
-                    && self.cancelled.load(Ordering::Relaxed)
+                if i & (SEED_CANCEL_POLL_STRIDE - 1) == 0 && self.cancelled.load(Ordering::Relaxed)
                 {
                     break;
                 }
@@ -231,7 +226,9 @@ impl<T: Send + 'static> SearchEngine<T> {
                                 guard = cvar.wait(guard).unwrap();
                             }
                         };
-                        let Some(item) = next else { return; };
+                        let Some(item) = next else {
+                            return;
+                        };
                         let stage_id: StageId = item.stage_id;
                         let Some(handler) = stages.get(stage_id) else {
                             // Unknown stage — credit nothing, move on.
@@ -350,9 +347,12 @@ impl<T: Send + 'static> SearchEngine<T> {
         if !self.cancelled.load(Ordering::Relaxed) {
             let total_spawned: u64 = edge_flow.values().map(|c| c.spawned).sum();
             debug_assert_eq!(
-                handled_count, seed_count + total_spawned,
+                handled_count,
+                seed_count + total_spawned,
                 "TELEMETRY §7.5 at Finished (uncancelled): handled ({}) MUST equal seeds ({}) + spawned ({})",
-                handled_count, seed_count, total_spawned,
+                handled_count,
+                seed_count,
+                total_spawned,
             );
         }
         on_event(SearchEvent::Finished(build_snapshot(
@@ -551,7 +551,8 @@ fn build_snapshot(
     debug_assert!(
         covered.0 <= mass.total.0 + 1e-9,
         "TELEMETRY §7.1: covered_mass={} MUST be <= total_mass={}",
-        covered.0, mass.total.0,
+        covered.0,
+        mass.total.0,
     );
     debug_assert!(
         remaining.0 + 1e-9 >= 0.0,
@@ -566,10 +567,15 @@ fn build_snapshot(
     // runaway `saturating_add` producing a telemetry value that
     // can no longer shrink back.
     debug_assert!(
-        fanout_roots.values().all(|c| c.live_descendants < u64::MAX / 2),
+        fanout_roots
+            .values()
+            .all(|c| c.live_descendants < u64::MAX / 2),
         "TELEMETRY §3: fanout_roots.live_descendants has saturated near u64::MAX ({} entries > half-range); \
          a handler is emitting children without corresponding completions",
-        fanout_roots.values().filter(|c| c.live_descendants >= u64::MAX / 2).count(),
+        fanout_roots
+            .values()
+            .filter(|c| c.live_descendants >= u64::MAX / 2)
+            .count(),
     );
     let sum_level: u64 = forcings.stage_level.values().sum();
     let sum_feature: u64 = forcings.stage_feature.values().sum();
@@ -596,7 +602,9 @@ fn build_snapshot(
         handled_count <= seed_count + total_spawned,
         "TELEMETRY §7.5: handled_count ({}) MUST NOT exceed seeds ({}) + spawned ({}); \
          this would mean some handler call was attributed to no seed AND no edge",
-        handled_count, seed_count, total_spawned,
+        handled_count,
+        seed_count,
+        total_spawned,
     );
     ProgressSnapshot {
         elapsed,
@@ -617,9 +625,7 @@ mod tests {
     use super::*;
     use crate::search_framework::mass::{CoverageQuality, MassDelta};
     use crate::search_framework::queue::GoldThenWork;
-    use crate::search_framework::stage::{
-        Continuation, ForcingDelta, StageOutcome, WorkItemMeta,
-    };
+    use crate::search_framework::stage::{Continuation, ForcingDelta, StageOutcome, WorkItemMeta};
     use std::sync::atomic::AtomicU64;
 
     #[derive(Default)]
@@ -636,11 +642,7 @@ mod tests {
         fn id(&self) -> StageId {
             "counter"
         }
-        fn handle(
-            &self,
-            item: WorkItem<u64>,
-            _ctx: &StageContext<'_>,
-        ) -> StageOutcome<u64> {
+        fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
             self.counter.fetch_add(1, Ordering::Relaxed);
             let mut out = StageOutcome::default();
             out.mass_delta = MassDelta {
@@ -693,7 +695,9 @@ mod tests {
             // `total_mass` is defaulted to `MassValue::ONE` per
             // the spec. `total` is retained only as a marker for
             // test legibility; the trait impl never reads it.
-            Self { total: MassValue::ONE }
+            Self {
+                total: MassValue::ONE,
+            }
         }
     }
 
@@ -735,7 +739,9 @@ mod tests {
             // Per TTC §1, `total_mass` must be 1.0; the former
             // `seeds * 3.0` value predated the fraction-based
             // contract.
-            Box::new(CounterMass { total: MassValue::ONE })
+            Box::new(CounterMass {
+                total: MassValue::ONE,
+            })
         }
     }
 
@@ -787,7 +793,9 @@ mod tests {
         counter: Arc<AtomicU64>,
     }
     impl StageHandler<u64> for SplitStage {
-        fn id(&self) -> StageId { "split" }
+        fn id(&self) -> StageId {
+            "split"
+        }
         fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
             self.counter.fetch_add(1, Ordering::Relaxed);
             let mut out = StageOutcome::default();
@@ -813,9 +821,14 @@ mod tests {
         }
     }
 
-    struct SplitAdapter { counter: Arc<AtomicU64>, depth: u64 }
+    struct SplitAdapter {
+        counter: Arc<AtomicU64>,
+        depth: u64,
+    }
     impl SearchModeAdapter<u64> for SplitAdapter {
-        fn name(&self) -> &'static str { "split" }
+        fn name(&self) -> &'static str {
+            "split"
+        }
         fn init(&self) -> AdapterInit<u64> {
             AdapterInit {
                 seed_items: vec![WorkItem {
@@ -837,14 +850,19 @@ mod tests {
         }
         fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<u64>>> {
             let mut m: BTreeMap<StageId, Box<dyn StageHandler<u64>>> = BTreeMap::new();
-            m.insert("split", Box::new(SplitStage {
-                depth: self.depth,
-                counter: Arc::clone(&self.counter),
-            }));
+            m.insert(
+                "split",
+                Box::new(SplitStage {
+                    depth: self.depth,
+                    counter: Arc::clone(&self.counter),
+                }),
+            );
             m
         }
         fn mass_model(&self) -> Box<dyn SearchMassModel> {
-            Box::new(CounterMass { total: MassValue::ONE })
+            Box::new(CounterMass {
+                total: MassValue::ONE,
+            })
         }
     }
 
@@ -856,7 +874,9 @@ mod tests {
         counter: Arc<AtomicU64>,
     }
     impl StageHandler<u64> for ResumeStage {
-        fn id(&self) -> StageId { "resume" }
+        fn id(&self) -> StageId {
+            "resume"
+        }
         fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
             self.counter.fetch_add(1, Ordering::Relaxed);
             let mut out = StageOutcome::default();
@@ -881,9 +901,14 @@ mod tests {
         }
     }
 
-    struct ResumeAdapter { counter: Arc<AtomicU64>, resumes: u64 }
+    struct ResumeAdapter {
+        counter: Arc<AtomicU64>,
+        resumes: u64,
+    }
     impl SearchModeAdapter<u64> for ResumeAdapter {
-        fn name(&self) -> &'static str { "resume" }
+        fn name(&self) -> &'static str {
+            "resume"
+        }
         fn init(&self) -> AdapterInit<u64> {
             AdapterInit {
                 seed_items: vec![WorkItem {
@@ -905,20 +930,23 @@ mod tests {
         }
         fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<u64>>> {
             let mut m: BTreeMap<StageId, Box<dyn StageHandler<u64>>> = BTreeMap::new();
-            m.insert("resume", Box::new(ResumeStage {
-                resumes: self.resumes,
-                counter: Arc::clone(&self.counter),
-            }));
+            m.insert(
+                "resume",
+                Box::new(ResumeStage {
+                    resumes: self.resumes,
+                    counter: Arc::clone(&self.counter),
+                }),
+            );
             m
         }
         fn mass_model(&self) -> Box<dyn SearchMassModel> {
-            Box::new(CounterMass { total: MassValue::ONE })
+            Box::new(CounterMass {
+                total: MassValue::ONE,
+            })
         }
     }
 
-    fn final_snapshot<T: Send + 'static>(
-        adapter: &dyn SearchModeAdapter<T>,
-    ) -> ProgressSnapshot {
+    fn final_snapshot<T: Send + 'static>(adapter: &dyn SearchModeAdapter<T>) -> ProgressSnapshot {
         let cfg = EngineConfig {
             progress_interval: Duration::from_millis(50),
             worker_count: 1,
@@ -941,7 +969,10 @@ mod tests {
         // between `split -> split` per docs/TELEMETRY.md §2; the
         // seed subtree fully drains so `live_descendants` ends at 0.
         let counter = Arc::new(AtomicU64::new(0));
-        let adapter = SplitAdapter { counter: Arc::clone(&counter), depth: 2 };
+        let adapter = SplitAdapter {
+            counter: Arc::clone(&counter),
+            depth: 2,
+        };
         let p = final_snapshot::<u64>(&adapter);
         assert_eq!(counter.load(Ordering::Relaxed), 7);
         // 3 split parents × 2 children each = 6 spawned edges.
@@ -950,9 +981,19 @@ mod tests {
             .get(&("split".to_string(), "split".to_string()))
             .map(|c| c.spawned)
             .unwrap_or(0);
-        assert_eq!(spawned, 6, "Continuation::Split children MUST contribute to edge_flow.spawned");
-        let live = p.fanout_roots.get(&42).map(|c| c.live_descendants).unwrap_or(0);
-        assert_eq!(live, 0, "subtree fully drained — live_descendants must decay to 0");
+        assert_eq!(
+            spawned, 6,
+            "Continuation::Split children MUST contribute to edge_flow.spawned"
+        );
+        let live = p
+            .fanout_roots
+            .get(&42)
+            .map(|c| c.live_descendants)
+            .unwrap_or(0);
+        assert_eq!(
+            live, 0,
+            "subtree fully drained — live_descendants must decay to 0"
+        );
     }
 
     #[test]
@@ -963,7 +1004,10 @@ mod tests {
         // One seed, 3 resumes ⇒ 4 handle() calls, 3 resume edges
         // on (resume -> resume).
         let counter = Arc::new(AtomicU64::new(0));
-        let adapter = ResumeAdapter { counter: Arc::clone(&counter), resumes: 3 };
+        let adapter = ResumeAdapter {
+            counter: Arc::clone(&counter),
+            resumes: 3,
+        };
         let p = final_snapshot::<u64>(&adapter);
         assert_eq!(counter.load(Ordering::Relaxed), 4);
         let spawned = p
@@ -971,9 +1015,19 @@ mod tests {
             .get(&("resume".to_string(), "resume".to_string()))
             .map(|c| c.spawned)
             .unwrap_or(0);
-        assert_eq!(spawned, 3, "Continuation::Resume MUST count as one self-edge per resumption under the engine's declared model");
-        let live = p.fanout_roots.get(&7).map(|c| c.live_descendants).unwrap_or(0);
-        assert_eq!(live, 0, "resume chain must terminate at zero live descendants");
+        assert_eq!(
+            spawned, 3,
+            "Continuation::Resume MUST count as one self-edge per resumption under the engine's declared model"
+        );
+        let live = p
+            .fanout_roots
+            .get(&7)
+            .map(|c| c.live_descendants)
+            .unwrap_or(0);
+        assert_eq!(
+            live, 0,
+            "resume chain must terminate at zero live descendants"
+        );
     }
 
     #[test]
@@ -989,8 +1043,10 @@ mod tests {
         // populated from the same forcing events, their totals MUST
         // be equal. CounterStage emits each event exactly once per
         // (level, feature) pair, so this equality is invariant.
-        assert_eq!(total_level, total_feature,
-            "TELEMETRY.md §4 consistency rule: stage_level and stage_feature MUST sum to the same total when populated from the same events");
+        assert_eq!(
+            total_level, total_feature,
+            "TELEMETRY.md §4 consistency rule: stage_level and stage_feature MUST sum to the same total when populated from the same events"
+        );
         let lvl0_clause = forcings
             .stage_level
             .get(&("counter", 0))
@@ -1019,7 +1075,9 @@ mod tests {
             counter: Arc<AtomicU64>,
         }
         impl StageHandler<u64> for SplitCreditStage {
-            fn id(&self) -> StageId { "split_credit" }
+            fn id(&self) -> StageId {
+                "split_credit"
+            }
             fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
                 self.counter.fetch_add(1, Ordering::Relaxed);
                 let mut out = StageOutcome::default();
@@ -1060,9 +1118,13 @@ mod tests {
             }
         }
 
-        struct SplitCreditAdapter { counter: Arc<AtomicU64> }
+        struct SplitCreditAdapter {
+            counter: Arc<AtomicU64>,
+        }
         impl SearchModeAdapter<u64> for SplitCreditAdapter {
-            fn name(&self) -> &'static str { "split_credit" }
+            fn name(&self) -> &'static str {
+                "split_credit"
+            }
             fn init(&self) -> AdapterInit<u64> {
                 AdapterInit {
                     seed_items: vec![WorkItem {
@@ -1084,18 +1146,25 @@ mod tests {
             }
             fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<u64>>> {
                 let mut m: BTreeMap<StageId, Box<dyn StageHandler<u64>>> = BTreeMap::new();
-                m.insert("split_credit", Box::new(SplitCreditStage {
-                    counter: Arc::clone(&self.counter),
-                }));
+                m.insert(
+                    "split_credit",
+                    Box::new(SplitCreditStage {
+                        counter: Arc::clone(&self.counter),
+                    }),
+                );
                 m
             }
             fn mass_model(&self) -> Box<dyn SearchMassModel> {
-                Box::new(CounterMass { total: MassValue::ONE })
+                Box::new(CounterMass {
+                    total: MassValue::ONE,
+                })
             }
         }
 
         let counter = Arc::new(AtomicU64::new(0));
-        let adapter = SplitCreditAdapter { counter: Arc::clone(&counter) };
+        let adapter = SplitCreditAdapter {
+            counter: Arc::clone(&counter),
+        };
         let p = final_snapshot::<u64>(&adapter);
         // Three handle() calls: parent + 2 children.
         assert_eq!(counter.load(Ordering::Relaxed), 3);
@@ -1103,10 +1172,15 @@ mod tests {
         // Expected: 0.3 + 0.2 + 0.2 = 0.7. Any double-count would
         // push this above 0.7 (or trip the 1.0 clamp and still be
         // wrong).
-        assert!((covered - 0.7).abs() < 1e-9,
-            "split credit must be additive, not double-counted: got {}", covered);
-        assert!(covered <= p.total_mass.0 + 1e-12,
-            "covered_mass MUST stay ≤ total per TTC §3");
+        assert!(
+            (covered - 0.7).abs() < 1e-9,
+            "split credit must be additive, not double-counted: got {}",
+            covered
+        );
+        assert!(
+            covered <= p.total_mass.0 + 1e-12,
+            "covered_mass MUST stay ≤ total per TTC §3"
+        );
     }
 
     /// TTC §1: `total_search_mass MUST equal 1.0` for every live
@@ -1115,7 +1189,14 @@ mod tests {
     /// default.
     #[test]
     fn all_test_adapters_total_mass_is_one() {
-        assert_eq!(CounterMass { total: MassValue::ONE }.total_mass().0, 1.0);
+        assert_eq!(
+            CounterMass {
+                total: MassValue::ONE
+            }
+            .total_mass()
+            .0,
+            1.0
+        );
     }
 
     /// TTC §5.2 Resume semantics: progress already credited before
@@ -1134,7 +1215,9 @@ mod tests {
             phase: Arc<A64>,
         }
         impl StageHandler<u64> for ResumeCreditStage {
-            fn id(&self) -> StageId { "resume_credit" }
+            fn id(&self) -> StageId {
+                "resume_credit"
+            }
             fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
                 let ph = self.phase.fetch_add(1, Ordering::Relaxed);
                 let mut out = StageOutcome::default();
@@ -1181,9 +1264,13 @@ mod tests {
             }
         }
 
-        struct ResumeCreditAdapter { phase: Arc<A64> }
+        struct ResumeCreditAdapter {
+            phase: Arc<A64>,
+        }
         impl SearchModeAdapter<u64> for ResumeCreditAdapter {
-            fn name(&self) -> &'static str { "resume_credit" }
+            fn name(&self) -> &'static str {
+                "resume_credit"
+            }
             fn init(&self) -> AdapterInit<u64> {
                 AdapterInit {
                     seed_items: vec![WorkItem {
@@ -1205,26 +1292,40 @@ mod tests {
             }
             fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<u64>>> {
                 let mut m: BTreeMap<StageId, Box<dyn StageHandler<u64>>> = BTreeMap::new();
-                m.insert("resume_credit", Box::new(ResumeCreditStage {
-                    phase: Arc::clone(&self.phase),
-                }));
+                m.insert(
+                    "resume_credit",
+                    Box::new(ResumeCreditStage {
+                        phase: Arc::clone(&self.phase),
+                    }),
+                );
                 m
             }
             fn mass_model(&self) -> Box<dyn SearchMassModel> {
-                Box::new(CounterMass { total: MassValue::ONE })
+                Box::new(CounterMass {
+                    total: MassValue::ONE,
+                })
             }
         }
 
         let phase = Arc::new(A64::new(0));
-        let adapter = ResumeCreditAdapter { phase: Arc::clone(&phase) };
+        let adapter = ResumeCreditAdapter {
+            phase: Arc::clone(&phase),
+        };
         let p = final_snapshot::<u64>(&adapter);
-        assert_eq!(phase.load(Ordering::Relaxed), 2,
-            "resume should produce exactly 2 handle() calls");
-        assert!((p.covered_mass.0 - 0.5).abs() < 1e-9,
+        assert_eq!(
+            phase.load(Ordering::Relaxed),
+            2,
+            "resume should produce exactly 2 handle() calls"
+        );
+        assert!(
+            (p.covered_mass.0 - 0.5).abs() < 1e-9,
             "Resume MUST persist prior 0.3 credit and add only 0.2: total covered = 0.5, got {}",
-            p.covered_mass.0);
-        assert!(p.covered_mass.0 <= p.total_mass.0 + 1e-12,
-            "covered MUST stay ≤ total per TTC §3");
+            p.covered_mass.0
+        );
+        assert!(
+            p.covered_mass.0 <= p.total_mass.0 + 1e-12,
+            "covered MUST stay ≤ total per TTC §3"
+        );
     }
 
     /// TTC §3 invariant 6 + §7.3 monotone envelope: a
@@ -1268,7 +1369,9 @@ mod tests {
             calls: Arc<A64>,
         }
         impl StageHandler<u64> for FluctuatingStage {
-            fn id(&self) -> StageId { "fluctuating" }
+            fn id(&self) -> StageId {
+                "fluctuating"
+            }
             fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
                 let idx = self.calls.fetch_add(1, Ordering::Relaxed) as usize;
                 if let Some(&v) = self.schedule.get(idx) {
@@ -1305,7 +1408,9 @@ mod tests {
             calls: Arc<A64>,
         }
         impl SearchModeAdapter<u64> for FluctuatingAdapter {
-            fn name(&self) -> &'static str { "fluctuating" }
+            fn name(&self) -> &'static str {
+                "fluctuating"
+            }
             fn init(&self) -> AdapterInit<u64> {
                 AdapterInit {
                     seed_items: vec![WorkItem {
@@ -1327,15 +1432,20 @@ mod tests {
             }
             fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<u64>>> {
                 let mut m: BTreeMap<StageId, Box<dyn StageHandler<u64>>> = BTreeMap::new();
-                m.insert("fluctuating", Box::new(FluctuatingStage {
-                    ppm: Arc::clone(&self.ppm),
-                    schedule: Arc::clone(&self.schedule),
-                    calls: Arc::clone(&self.calls),
-                }));
+                m.insert(
+                    "fluctuating",
+                    Box::new(FluctuatingStage {
+                        ppm: Arc::clone(&self.ppm),
+                        schedule: Arc::clone(&self.schedule),
+                        calls: Arc::clone(&self.calls),
+                    }),
+                );
                 m
             }
             fn mass_model(&self) -> Box<dyn SearchMassModel> {
-                Box::new(FluctuatingMass { ppm: Arc::clone(&self.ppm) })
+                Box::new(FluctuatingMass {
+                    ppm: Arc::clone(&self.ppm),
+                })
             }
         }
 
@@ -1343,10 +1453,8 @@ mod tests {
         // 70%, drops to 40%, lands at 80%. The engine snapshot
         // stream MUST stay monotone across ticks regardless.
         let schedule = Arc::new(vec![
-            500_000,
-            300_000,  // drop — engine MUST ignore this downward move
-            700_000,
-            400_000,  // drop — engine MUST still hold 700_000 high-water
+            500_000, 300_000, // drop — engine MUST ignore this downward move
+            700_000, 400_000, // drop — engine MUST still hold 700_000 high-water
             800_000,
         ]);
         let ppm = Arc::new(A64::new(0));
@@ -1380,7 +1488,10 @@ mod tests {
         });
 
         let observed = observed.lock().unwrap();
-        assert!(!observed.is_empty(), "engine MUST emit at least one snapshot");
+        assert!(
+            !observed.is_empty(),
+            "engine MUST emit at least one snapshot"
+        );
         // Final value MUST reflect the highest ever observed ppm
         // (which is 800_000 = 0.8).
         let final_covered = observed.last().unwrap().0;
@@ -1394,7 +1505,8 @@ mod tests {
             assert!(
                 w[1].0 + 1e-9 >= w[0].0,
                 "covered_mass MUST be monotone non-decreasing: {} -> {} violates §3.6 / §7.3",
-                w[0].0, w[1].0,
+                w[0].0,
+                w[1].0,
             );
         }
     }
@@ -1455,7 +1567,9 @@ mod tests {
             counter: Arc<A64>,
         }
         impl StageHandler<u64> for DeferCreditStage {
-            fn id(&self) -> StageId { "defer_credit" }
+            fn id(&self) -> StageId {
+                "defer_credit"
+            }
             fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
                 self.counter.fetch_add(1, Ordering::Relaxed);
                 let mut out = StageOutcome::default();
@@ -1498,9 +1612,13 @@ mod tests {
             }
         }
 
-        struct DeferCreditAdapter { counter: Arc<A64> }
+        struct DeferCreditAdapter {
+            counter: Arc<A64>,
+        }
         impl SearchModeAdapter<u64> for DeferCreditAdapter {
-            fn name(&self) -> &'static str { "defer_credit" }
+            fn name(&self) -> &'static str {
+                "defer_credit"
+            }
             fn init(&self) -> AdapterInit<u64> {
                 AdapterInit {
                     seed_items: vec![WorkItem {
@@ -1522,18 +1640,25 @@ mod tests {
             }
             fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<u64>>> {
                 let mut m: BTreeMap<StageId, Box<dyn StageHandler<u64>>> = BTreeMap::new();
-                m.insert("defer_credit", Box::new(DeferCreditStage {
-                    counter: Arc::clone(&self.counter),
-                }));
+                m.insert(
+                    "defer_credit",
+                    Box::new(DeferCreditStage {
+                        counter: Arc::clone(&self.counter),
+                    }),
+                );
                 m
             }
             fn mass_model(&self) -> Box<dyn SearchMassModel> {
-                Box::new(CounterMass { total: MassValue::ONE })
+                Box::new(CounterMass {
+                    total: MassValue::ONE,
+                })
             }
         }
 
         let counter = Arc::new(A64::new(0));
-        let adapter = DeferCreditAdapter { counter: Arc::clone(&counter) };
+        let adapter = DeferCreditAdapter {
+            counter: Arc::clone(&counter),
+        };
         let p = final_snapshot::<u64>(&adapter);
         assert_eq!(counter.load(Ordering::Relaxed), 2);
         // Final: covered = 0.4 (parent) + 0.6 (residual child) = 1.0.
@@ -1541,13 +1666,22 @@ mod tests {
         // covered, we'd see covered > 1.0 (clamped, but the test
         // construction makes the miscount visible via the
         // live_descendants dump).
-        assert!((p.covered_mass.0 - 1.0).abs() < 1e-9,
+        assert!(
+            (p.covered_mass.0 - 1.0).abs() < 1e-9,
             "credit + residual-completion MUST equal parent incoming mass; got {}",
-            p.covered_mass.0);
+            p.covered_mass.0
+        );
         // At end, all work completed: live_descendants = 0.
-        let live = p.fanout_roots.get(&99).map(|c| c.live_descendants).unwrap_or(0);
-        assert_eq!(live, 0,
-            "live_descendants MUST drain to 0 once residual completes; got {}", live);
+        let live = p
+            .fanout_roots
+            .get(&99)
+            .map(|c| c.live_descendants)
+            .unwrap_or(0);
+        assert_eq!(
+            live, 0,
+            "live_descendants MUST drain to 0 once residual completes; got {}",
+            live
+        );
     }
 
     /// TTC §3 invariants + §7.3 monotone envelope: the coordinator's
@@ -1601,11 +1735,16 @@ mod tests {
         *model.exact.lock().unwrap() = 0.8;
         *model.partial.lock().unwrap() = 0.0;
         poll_mass(&model, &mut mass, &mut high_total);
-        assert!(mass.covered().0 <= 1.0 + 1e-12,
+        assert!(
+            mass.covered().0 <= 1.0 + 1e-12,
             "covered MUST stay ≤ total; got exact={} partial={}",
-            mass.covered_exact.0, mass.covered_partial.0);
-        assert!(mass.covered_exact.0 >= 0.8,
-            "covered_exact is monotone non-decreasing");
+            mass.covered_exact.0,
+            mass.covered_partial.0
+        );
+        assert!(
+            mass.covered_exact.0 >= 0.8,
+            "covered_exact is monotone non-decreasing"
+        );
         // Tick 4: exact advances further. Partial stays ≤ residual.
         *model.exact.lock().unwrap() = 1.0;
         poll_mass(&model, &mut mass, &mut high_total);
@@ -1631,9 +1770,15 @@ mod tests {
             p: std::sync::Mutex<f64>,
         }
         impl SearchMassModel for SrcModel {
-            fn covered_mass(&self) -> MassValue { MassValue(*self.e.lock().unwrap()) }
-            fn covered_partial_mass(&self) -> MassValue { MassValue(*self.p.lock().unwrap()) }
-            fn quality(&self) -> CoverageQuality { CoverageQuality::Hybrid }
+            fn covered_mass(&self) -> MassValue {
+                MassValue(*self.e.lock().unwrap())
+            }
+            fn covered_partial_mass(&self) -> MassValue {
+                MassValue(*self.p.lock().unwrap())
+            }
+            fn quality(&self) -> CoverageQuality {
+                CoverageQuality::Hybrid
+            }
         }
 
         let model = SrcModel {
@@ -1658,8 +1803,11 @@ mod tests {
             mass.covered().0,
         );
         assert!((mass.covered_exact.0 - 0.1).abs() < 1e-9);
-        assert!((mass.covered_partial.0 - 0.0).abs() < 1e-9,
-            "partial MUST drop with source when subsumed; got {}", mass.covered_partial.0);
+        assert!(
+            (mass.covered_partial.0 - 0.0).abs() < 1e-9,
+            "partial MUST drop with source when subsumed; got {}",
+            mass.covered_partial.0
+        );
     }
 
     /// TELEMETRY §7.5 "edge-flow semantics for split/resume are
@@ -1679,9 +1827,13 @@ mod tests {
         /// payload: emit a child, split into two children, or
         /// resume itself. After each action, payload increments;
         /// at payload=10 the handler stops.
-        struct MixedStage { calls: Arc<A64> }
+        struct MixedStage {
+            calls: Arc<A64>,
+        }
         impl StageHandler<u64> for MixedStage {
-            fn id(&self) -> StageId { "mixed" }
+            fn id(&self) -> StageId {
+                "mixed"
+            }
             fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 let mut out = StageOutcome::default();
@@ -1737,60 +1889,74 @@ mod tests {
         }
 
         const SEEDS: u64 = 3;
-        struct MixedAdapter { calls: Arc<A64> }
+        struct MixedAdapter {
+            calls: Arc<A64>,
+        }
         impl SearchModeAdapter<u64> for MixedAdapter {
-            fn name(&self) -> &'static str { "mixed" }
+            fn name(&self) -> &'static str {
+                "mixed"
+            }
             fn init(&self) -> AdapterInit<u64> {
-                let seed_items = (0..SEEDS).map(|i| WorkItem {
-                    stage_id: "mixed",
-                    priority: 0,
-                    cost_hint: 1,
-                    replay_key: i,
-                    mass_hint: None,
-                    meta: WorkItemMeta {
-                        item_id: i + 1,
-                        parent_item_id: None,
-                        fanout_root_id: i + 1,
-                        depth_from_root: 0,
-                        spawn_seq: 0,
-                    },
-                    payload: 0,
-                }).collect();
+                let seed_items = (0..SEEDS)
+                    .map(|i| WorkItem {
+                        stage_id: "mixed",
+                        priority: 0,
+                        cost_hint: 1,
+                        replay_key: i,
+                        mass_hint: None,
+                        meta: WorkItemMeta {
+                            item_id: i + 1,
+                            parent_item_id: None,
+                            fanout_root_id: i + 1,
+                            depth_from_root: 0,
+                            spawn_seq: 0,
+                        },
+                        payload: 0,
+                    })
+                    .collect();
                 AdapterInit { seed_items }
             }
             fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<u64>>> {
                 let mut m: BTreeMap<StageId, Box<dyn StageHandler<u64>>> = BTreeMap::new();
-                m.insert("mixed", Box::new(MixedStage {
-                    calls: Arc::clone(&self.calls),
-                }));
+                m.insert(
+                    "mixed",
+                    Box::new(MixedStage {
+                        calls: Arc::clone(&self.calls),
+                    }),
+                );
                 m
             }
             fn mass_model(&self) -> Box<dyn SearchMassModel> {
-                Box::new(CounterMass { total: MassValue::ONE })
+                Box::new(CounterMass {
+                    total: MassValue::ONE,
+                })
             }
         }
 
         let calls = Arc::new(A64::new(0));
-        let adapter = MixedAdapter { calls: Arc::clone(&calls) };
+        let adapter = MixedAdapter {
+            calls: Arc::clone(&calls),
+        };
         let p = final_snapshot::<u64>(&adapter);
         let total_calls = calls.load(Ordering::Relaxed);
-        let total_spawned: u64 = p
-            .edge_flow
-            .values()
-            .map(|c| c.spawned)
-            .sum();
+        let total_spawned: u64 = p.edge_flow.values().map(|c| c.spawned).sum();
         // Book-balance: every handle() call was either a seed or
         // spawned on some edge.
         assert_eq!(
             total_spawned + SEEDS,
             total_calls,
             "TELEMETRY §7.5 edge-flow conservation: spawned({}) + seeds({}) MUST equal calls({})",
-            total_spawned, SEEDS, total_calls,
+            total_spawned,
+            SEEDS,
+            total_calls,
         );
         // And the engine drained to zero live descendants.
         for (root, c) in &p.fanout_roots {
-            assert_eq!(c.live_descendants, 0,
-                "root {} leaked live_descendants={}", root, c.live_descendants);
+            assert_eq!(
+                c.live_descendants, 0,
+                "root {} leaked live_descendants={}",
+                root, c.live_descendants
+            );
         }
     }
 
@@ -1803,16 +1969,27 @@ mod tests {
     fn forcing_rollups_consistency_equality_invariant() {
         let mut rollups = ForcingRollups::default();
         let deltas = [
-            ForcingDelta { by_level_feature: vec![(0, 0, 3), (1, 2, 5), (3, 4, 7)] },
-            ForcingDelta { by_level_feature: vec![(0, 4, 1), (2, 0, 9)] },
+            ForcingDelta {
+                by_level_feature: vec![(0, 0, 3), (1, 2, 5), (3, 4, 7)],
+            },
+            ForcingDelta {
+                by_level_feature: vec![(0, 4, 1), (2, 0, 9)],
+            },
         ];
         for d in &deltas {
             rollups.apply("stageA", d);
         }
-        rollups.apply("stageB", &ForcingDelta { by_level_feature: vec![(0, 0, 11)] });
+        rollups.apply(
+            "stageB",
+            &ForcingDelta {
+                by_level_feature: vec![(0, 0, 11)],
+            },
+        );
         let sum_level: u64 = rollups.stage_level.values().sum();
         let sum_feature: u64 = rollups.stage_feature.values().sum();
-        assert_eq!(sum_level, sum_feature,
-            "forcing axes MUST sum to the same total per TELEMETRY.md §4 consistency rule");
+        assert_eq!(
+            sum_level, sum_feature,
+            "forcing axes MUST sum to the same total per TELEMETRY.md §4 consistency rule"
+        );
     }
 }

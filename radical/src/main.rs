@@ -26,8 +26,11 @@ fn main() {
             "--xor-propagation" => config.xor_propagation = true,
             "--no-xor" => config.xor_propagation = false,
             s if s.starts_with("--conflict-limit=") => {
-                conflict_limit = s.strip_prefix("--conflict-limit=")
-                    .unwrap().parse().unwrap_or(0);
+                conflict_limit = s
+                    .strip_prefix("--conflict-limit=")
+                    .unwrap()
+                    .parse()
+                    .unwrap_or(0);
             }
             s if !s.starts_with('-') => {
                 path = Some(s.to_string());
@@ -57,10 +60,19 @@ fn main() {
         solver.set_conflict_limit(conflict_limit);
     }
     let parse_elapsed = start.elapsed();
-    eprintln!("Parsed: {} vars, {} clauses in {:.3?}", solver.num_vars(), solver.num_clauses(), parse_elapsed);
-    eprintln!("Config: xor={}, ema={}, probing={}, rephasing={}",
-        solver.config.xor_propagation, solver.config.ema_restarts,
-        solver.config.probing, solver.config.rephasing);
+    eprintln!(
+        "Parsed: {} vars, {} clauses in {:.3?}",
+        solver.num_vars(),
+        solver.num_clauses(),
+        parse_elapsed
+    );
+    eprintln!(
+        "Config: xor={}, ema={}, probing={}, rephasing={}",
+        solver.config.xor_propagation,
+        solver.config.ema_restarts,
+        solver.config.probing,
+        solver.config.rephasing
+    );
 
     let solve_start = Instant::now();
     let result = solver.solve();
@@ -84,7 +96,11 @@ fn main() {
             println!("s UNKNOWN");
         }
     }
-    eprintln!("Solved in {:.3?}, {} conflicts", solve_elapsed, solver.num_conflicts());
+    eprintln!(
+        "Solved in {:.3?}, {} conflicts",
+        solve_elapsed,
+        solver.num_conflicts()
+    );
     process::exit(match result {
         Some(true) => 10,
         Some(false) => 20,

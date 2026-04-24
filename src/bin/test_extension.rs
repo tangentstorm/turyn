@@ -8,8 +8,7 @@
 /// 4. Call build_extension(base_k, target_k, ...) for a sample of base boundaries
 /// 5. Walk the extension MDD to count valid extensions
 /// 6. Cross-check: count how many target_k boundaries have this base prefix
-
-use turyn::mdd_zw_first::{self, ZwFirstMdd, DEAD, LEAF};
+use turyn::mdd_zw_first::{self, DEAD, LEAF, ZwFirstMdd};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -17,7 +16,10 @@ fn main() {
     let target_k: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
 
     assert!(target_k > base_k, "target_k must be > base_k");
-    eprintln!("Testing build_extension: base_k={} → target_k={}", base_k, target_k);
+    eprintln!(
+        "Testing build_extension: base_k={} → target_k={}",
+        base_k, target_k
+    );
 
     // Build full MDD at base_k to get boundary configs
     eprintln!("Building base MDD (k={})...", base_k);
@@ -43,7 +45,11 @@ fn main() {
             target_configs.push((z_bits, w_bits, x_bits, y_bits));
         });
     });
-    eprintln!("  {} target configs at k={}", target_configs.len(), target_k);
+    eprintln!(
+        "  {} target configs at k={}",
+        target_configs.len(),
+        target_k
+    );
 
     // For a sample of base configs, test build_extension
     let sample_size = base_configs.len().min(100);
@@ -52,7 +58,9 @@ fn main() {
     let mut failed = 0;
 
     for (i, &(z, w, x, y)) in base_configs.iter().enumerate() {
-        if i >= sample_size { break; }
+        if i >= sample_size {
+            break;
+        }
         tested += 1;
 
         // Count target configs that match the base boundary.
@@ -62,25 +70,44 @@ fn main() {
         // (Old long covers actual positions n-base_k..n-1, which in target encoding
         //  start at target_k+extra.)
         let extra = target_k - base_k;
-        let expected_count = target_configs.iter().filter(|&&(tz, tw, tx, ty)| {
-            // Check prefix: positions 0..base_k-1
-            for p in 0..base_k {
-                if ((tz >> p) & 1) != ((z >> p) & 1) { return false; }
-                if ((tw >> p) & 1) != ((w >> p) & 1) { return false; }
-                if ((tx >> p) & 1) != ((x >> p) & 1) { return false; }
-                if ((ty >> p) & 1) != ((y >> p) & 1) { return false; }
-            }
-            // Check suffix: base pos base_k+m → target pos target_k+extra+m
-            for m in 0..base_k {
-                let base_pos = base_k + m;
-                let target_pos = target_k + extra + m;
-                if ((tz >> target_pos) & 1) != ((z >> base_pos) & 1) { return false; }
-                if ((tw >> target_pos) & 1) != ((w >> base_pos) & 1) { return false; }
-                if ((tx >> target_pos) & 1) != ((x >> base_pos) & 1) { return false; }
-                if ((ty >> target_pos) & 1) != ((y >> base_pos) & 1) { return false; }
-            }
-            true
-        }).count();
+        let expected_count = target_configs
+            .iter()
+            .filter(|&&(tz, tw, tx, ty)| {
+                // Check prefix: positions 0..base_k-1
+                for p in 0..base_k {
+                    if ((tz >> p) & 1) != ((z >> p) & 1) {
+                        return false;
+                    }
+                    if ((tw >> p) & 1) != ((w >> p) & 1) {
+                        return false;
+                    }
+                    if ((tx >> p) & 1) != ((x >> p) & 1) {
+                        return false;
+                    }
+                    if ((ty >> p) & 1) != ((y >> p) & 1) {
+                        return false;
+                    }
+                }
+                // Check suffix: base pos base_k+m → target pos target_k+extra+m
+                for m in 0..base_k {
+                    let base_pos = base_k + m;
+                    let target_pos = target_k + extra + m;
+                    if ((tz >> target_pos) & 1) != ((z >> base_pos) & 1) {
+                        return false;
+                    }
+                    if ((tw >> target_pos) & 1) != ((w >> base_pos) & 1) {
+                        return false;
+                    }
+                    if ((tx >> target_pos) & 1) != ((x >> base_pos) & 1) {
+                        return false;
+                    }
+                    if ((ty >> target_pos) & 1) != ((y >> base_pos) & 1) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .count();
 
         // Build extension MDD
         let (ext_nodes, ext_root) = mdd_zw_first::build_extension(base_k, target_k, z, w, x, y);
@@ -93,10 +120,19 @@ fn main() {
             passed += 1;
         } else {
             failed += 1;
-            eprintln!("  MISMATCH config #{}: z={:0w$b} w={:0w$b} x={:0w$b} y={:0w$b}",
-                i, z, w, x, y, w = 2 * base_k);
-            eprintln!("    extension says {} paths, brute force says {}",
-                ext_count, expected_count);
+            eprintln!(
+                "  MISMATCH config #{}: z={:0w$b} w={:0w$b} x={:0w$b} y={:0w$b}",
+                i,
+                z,
+                w,
+                x,
+                y,
+                w = 2 * base_k
+            );
+            eprintln!(
+                "    extension says {} paths, brute force says {}",
+                ext_count, expected_count
+            );
             if failed >= 10 {
                 eprintln!("  (stopping after 10 failures)");
                 break;
@@ -104,13 +140,22 @@ fn main() {
         }
 
         if tested % 10 == 0 {
-            eprint!("\r  Tested {}/{} ({} passed, {} failed)   ", tested, sample_size, passed, failed);
+            eprint!(
+                "\r  Tested {}/{} ({} passed, {} failed)   ",
+                tested, sample_size, passed, failed
+            );
         }
     }
 
-    eprintln!("\nResults: {} tested, {} passed, {} failed", tested, passed, failed);
+    eprintln!(
+        "\nResults: {} tested, {} passed, {} failed",
+        tested, passed, failed
+    );
     if failed == 0 {
-        eprintln!("ALL TESTS PASSED for base_k={} → target_k={}", base_k, target_k);
+        eprintln!(
+            "ALL TESTS PASSED for base_k={} → target_k={}",
+            base_k, target_k
+        );
     } else {
         eprintln!("FAILURES DETECTED");
         std::process::exit(1);
@@ -118,11 +163,14 @@ fn main() {
 }
 
 fn count_paths(nid: u32, level: usize, depth: usize, nodes: &[[u32; 4]]) -> u128 {
-    if nid == DEAD { return 0; }
+    if nid == DEAD {
+        return 0;
+    }
     if nid == LEAF {
         return 4u128.pow((depth - level) as u32);
     }
-    nodes[nid as usize].iter()
+    nodes[nid as usize]
+        .iter()
         .map(|&child| count_paths(child, level + 1, depth, nodes))
         .sum()
 }

@@ -101,7 +101,10 @@ fn main() -> Result<(), String> {
         }
         let coverage = load_realized_tuples(&path, n)?;
         let tuple_space = enumerate_tuple_space(n);
-        let missing: Vec<_> = tuple_space.difference(&coverage.realized).copied().collect();
+        let missing: Vec<_> = tuple_space
+            .difference(&coverage.realized)
+            .copied()
+            .collect();
         let missing_with_t3: Vec<_> = tuple_space
             .difference(&coverage.realized_with_t3)
             .copied()
@@ -126,15 +129,18 @@ fn main() -> Result<(), String> {
         if opts.list_t3 {
             println!(
                 "  realized_with_t3={}",
-                format_tuple_list(&coverage.realized_with_t3.iter().copied().collect::<Vec<_>>())
+                format_tuple_list(
+                    &coverage
+                        .realized_with_t3
+                        .iter()
+                        .copied()
+                        .collect::<Vec<_>>()
+                )
             );
         }
         if opts.list_missing {
             println!("  missing_tuples={}", format_tuple_list(&missing));
-            println!(
-                "  missing_with_t3={}",
-                format_tuple_list(&missing_with_t3)
-            );
+            println!("  missing_with_t3={}", format_tuple_list(&missing_with_t3));
         }
         println!();
     }
@@ -188,8 +194,12 @@ fn parse_args() -> Result<Options, String> {
 }
 
 fn print_help() {
-    println!("Usage: cargo run --release --bin tuple_coverage -- [--data-dir PATH] [--max-n N] [--no-missing] [--list-t3]");
-    println!("Compares the full signed tuple shell against tuples realized by canonical representatives.");
+    println!(
+        "Usage: cargo run --release --bin tuple_coverage -- [--data-dir PATH] [--max-n N] [--no-missing] [--list-t3]"
+    );
+    println!(
+        "Compares the full signed tuple shell against tuples realized by canonical representatives."
+    );
 }
 
 struct Coverage {
@@ -206,10 +216,10 @@ fn load_realized_tuples(path: &Path, n: usize) -> Result<Coverage, String> {
         if line.is_empty() {
             continue;
         }
-        let sol = decode_line(n, line)
-            .map_err(|e| format!("{}:{}: {e}", path.display(), line_no + 1))?;
-        let canonical = canonicalize(&sol)
-            .map_err(|e| format!("{}:{}: {e}", path.display(), line_no + 1))?;
+        let sol =
+            decode_line(n, line).map_err(|e| format!("{}:{}: {e}", path.display(), line_no + 1))?;
+        let canonical =
+            canonicalize(&sol).map_err(|e| format!("{}:{}: {e}", path.display(), line_no + 1))?;
         let tuple = canonical.tuple_sums();
         realized.insert(tuple);
         realized_with_t3.insert(tuple);
@@ -224,9 +234,9 @@ fn load_realized_tuples(path: &Path, n: usize) -> Result<Coverage, String> {
 fn enumerate_tuple_space(n: usize) -> BTreeSet<(i32, i32, i32, i32)> {
     let target = (6 * n as i32) - 2;
     let mut out = BTreeSet::new();
-    for sx in (-((n as i32))..=(n as i32)).step_by(2) {
-        for sy in (-((n as i32))..=(n as i32)).step_by(2) {
-            for sz in (-((n as i32))..=(n as i32)).step_by(2) {
+    for sx in (-(n as i32)..=(n as i32)).step_by(2) {
+        for sy in (-(n as i32)..=(n as i32)).step_by(2) {
+            for sz in (-(n as i32)..=(n as i32)).step_by(2) {
                 let rem = target - sx * sx - sy * sy - 2 * sz * sz;
                 if rem < 0 || rem % 2 != 0 {
                     continue;

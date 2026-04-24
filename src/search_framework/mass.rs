@@ -207,9 +207,16 @@ mod tests {
         let ttc = snap.ttc(elapsed).expect("rate > 0 MUST produce a TTC");
         // elapsed * (1 - 0.25) / 0.25 = 10 * 3 = 30 seconds.
         let expected = Duration::from_secs_f64(30.0);
-        let delta = if ttc > expected { ttc - expected } else { expected - ttc };
-        assert!(delta < Duration::from_millis(1),
-            "TTC MUST equal elapsed * (total - covered) / covered ≈ 30s; got {:?}", ttc);
+        let delta = if ttc > expected {
+            ttc - expected
+        } else {
+            expected - ttc
+        };
+        assert!(
+            delta < Duration::from_millis(1),
+            "TTC MUST equal elapsed * (total - covered) / covered ≈ 30s; got {:?}",
+            ttc
+        );
     }
 
     #[test]

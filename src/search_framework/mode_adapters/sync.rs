@@ -17,15 +17,15 @@
 //! authoritative for mid-run progress.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::search_framework::engine::{AdapterInit, SearchModeAdapter};
 use crate::search_framework::mass::{CoverageQuality, MassValue, SearchMassModel};
 use crate::search_framework::stage::{
     StageContext, StageHandler, StageId, StageOutcome, WorkItem, WorkItemMeta,
 };
-use crate::sync_walker::{search_sync, SyncConfig};
+use crate::sync_walker::{SyncConfig, search_sync};
 use crate::types::{PackedSeq, Problem};
 
 pub const STAGE_SYNC_WALK: StageId = "sync.walk";
@@ -71,11 +71,7 @@ impl StageHandler<SyncPayload> for SyncWalkStage {
         for (level, row) in stats.forced_by_level_kind.iter().enumerate() {
             for (kind, &count) in row.iter().enumerate() {
                 if count > 0 {
-                    triples.push((
-                        level as u16,
-                        kind as u8,
-                        count.min(u32::MAX as u64) as u32,
-                    ));
+                    triples.push((level as u16, kind as u8, count.min(u32::MAX as u64) as u32));
                 }
             }
         }
@@ -199,7 +195,10 @@ mod tests {
         let model = SyncWalkMassModel {
             projected_fraction_ppm: Arc::new(AtomicU64::new(0)),
         };
-        assert_eq!(model.quality(), CoverageQuality::Projected,
-            "sync fraction is an estimator output; quality MUST be Projected per TTC §7.3");
+        assert_eq!(
+            model.quality(),
+            CoverageQuality::Projected,
+            "sync fraction is an estimator output; quality MUST be Projected per TTC §7.3"
+        );
     }
 }

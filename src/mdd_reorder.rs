@@ -5,7 +5,6 @@
 ///
 /// Result: depth 4k, first 2k levels branch on (z,w), last 2k on (x,y).
 /// Each ZW path arrives at a node that roots the XY sub-MDD.
-
 use rustc_hash::FxHashMap as HashMap;
 use std::io::Write;
 
@@ -27,14 +26,25 @@ impl Mdd4 {
         self.count_paths_from(self.root, 0, &mut cache)
     }
 
-    fn count_paths_from(&self, nid: u32, level: usize, cache: &mut std::collections::HashMap<u32, f64>) -> f64 {
-        if nid == DEAD { return 0.0; }
+    fn count_paths_from(
+        &self,
+        nid: u32,
+        level: usize,
+        cache: &mut std::collections::HashMap<u32, f64>,
+    ) -> f64 {
+        if nid == DEAD {
+            return 0.0;
+        }
         if nid == LEAF {
             let remaining = self.depth.saturating_sub(level);
             return 4.0f64.powi(remaining as i32);
         }
-        if level >= self.depth { return 1.0; }
-        if let Some(&c) = cache.get(&nid) { return c; }
+        if level >= self.depth {
+            return 1.0;
+        }
+        if let Some(&c) = cache.get(&nid) {
+            return c;
+        }
         let mut count = 0.0f64;
         for b in 0..4 {
             count += self.count_paths_from(self.nodes[nid as usize][b], level + 1, cache);
@@ -50,10 +60,7 @@ impl Mdd4 {
         f.write_all(&self.root.to_le_bytes())?;
         f.write_all(&(self.nodes.len() as u32).to_le_bytes())?;
         let bytes = unsafe {
-            std::slice::from_raw_parts(
-                self.nodes.as_ptr() as *const u8,
-                self.nodes.len() * 16,
-            )
+            std::slice::from_raw_parts(self.nodes.as_ptr() as *const u8, self.nodes.len() * 16)
         };
         f.write_all(bytes)?;
         f.flush()?;
@@ -63,13 +70,19 @@ impl Mdd4 {
     /// Load from binary file.
     pub fn load(path: &str) -> Option<Self> {
         let data = std::fs::read(path).ok()?;
-        if data.len() < 16 { return None; }
-        if &data[0..4] != b"MDD4" { return None; }
+        if data.len() < 16 {
+            return None;
+        }
+        if &data[0..4] != b"MDD4" {
+            return None;
+        }
         let k = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
         let root = u32::from_le_bytes(data[8..12].try_into().ok()?);
         let node_count = u32::from_le_bytes(data[12..16].try_into().ok()?) as usize;
         let expected = 16 + node_count * 16;
-        if data.len() < expected { return None; }
+        if data.len() < expected {
+            return None;
+        }
         let mut nodes = vec![[0u32; 4]; node_count];
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -78,7 +91,12 @@ impl Mdd4 {
                 node_count * 16,
             );
         }
-        Some(Mdd4 { nodes, root, k, depth: 4 * k })
+        Some(Mdd4 {
+            nodes,
+            root,
+            k,
+            depth: 4 * k,
+        })
     }
 }
 
@@ -89,11 +107,17 @@ impl Mdd4 {
         level: u16,
         children: [u32; 4],
     ) -> u32 {
-        if children.iter().all(|&c| c == DEAD) { return DEAD; }
+        if children.iter().all(|&c| c == DEAD) {
+            return DEAD;
+        }
         let first = children[0];
-        if children.iter().all(|&c| c == first) { return first; }
+        if children.iter().all(|&c| c == first) {
+            return first;
+        }
         let key = (level, children);
-        if let Some(&nid) = unique.get(&key) { return nid; }
+        if let Some(&nid) = unique.get(&key) {
+            return nid;
+        }
         let nid = nodes.len() as u32;
         nodes.push(children);
         unique.insert(key, nid);
@@ -105,11 +129,7 @@ impl Mdd4 {
 /// At each original level, create two 4-way levels:
 ///   - First: branch on (z,w) = bits 2-3 of sign_col
 ///   - Second: branch on (x,y) = bits 0-1 of sign_col
-pub fn split_16_to_4(
-    nodes_16: &[[u32; 16]],
-    root_16: u32,
-    depth_16: usize,
-) -> Mdd4 {
+pub fn split_16_to_4(nodes_16: &[[u32; 16]], root_16: u32, depth_16: usize) -> Mdd4 {
     let depth_4 = depth_16 * 2;
     let mut nodes_4: Vec<[u32; 4]> = Vec::new();
     nodes_4.push([DEAD; 4]); // node 0 = DEAD
@@ -125,9 +145,15 @@ pub fn split_16_to_4(
         unique: &mut HashMap<(u16, [u32; 4]), u32>,
         memo: &mut HashMap<u32, u32>,
     ) -> u32 {
-        if nid_16 == DEAD { return DEAD; }
-        if nid_16 == LEAF { return LEAF; }
-        if let Some(&cached) = memo.get(&nid_16) { return cached; }
+        if nid_16 == DEAD {
+            return DEAD;
+        }
+        if nid_16 == LEAF {
+            return LEAF;
+        }
+        if let Some(&cached) = memo.get(&nid_16) {
+            return cached;
+        }
 
         let level_4_zw = (level_16 * 2) as u16;
         let level_4_xy = level_4_zw + 1;
@@ -142,8 +168,13 @@ pub fn split_16_to_4(
                 let sign_col = xy | zw_bits;
                 let child_16 = ch16[sign_col as usize];
                 xy_children[xy as usize] = convert(
-                    child_16, level_16 + 1, depth_16,
-                    nodes_16, nodes_4, unique, memo,
+                    child_16,
+                    level_16 + 1,
+                    depth_16,
+                    nodes_16,
+                    nodes_4,
+                    unique,
+                    memo,
                 );
             }
             zw_children[zw as usize] = Mdd4::make_node(nodes_4, unique, level_4_xy, xy_children);
@@ -153,8 +184,21 @@ pub fn split_16_to_4(
         result
     }
 
-    let root = convert(root_16, 0, depth_16, nodes_16, &mut nodes_4, &mut unique, &mut memo);
-    Mdd4 { nodes: nodes_4, root, k: depth_16 / 2, depth: depth_4 }
+    let root = convert(
+        root_16,
+        0,
+        depth_16,
+        nodes_16,
+        &mut nodes_4,
+        &mut unique,
+        &mut memo,
+    );
+    Mdd4 {
+        nodes: nodes_4,
+        root,
+        k: depth_16 / 2,
+        depth: depth_4,
+    }
 }
 
 /// Swap two adjacent levels in a 4-way MDD (in-place).
@@ -166,13 +210,20 @@ fn swap_adjacent_inplace(mdd: &mut Mdd4, level: u16) {
     {
         let mut visited = vec![false; mdd.nodes.len()];
         fn collect(
-            nid: u32, current: u16, target: u16,
-            nodes: &[[u32; 4]], visited: &mut [bool],
+            nid: u32,
+            current: u16,
+            target: u16,
+            nodes: &[[u32; 4]],
+            visited: &mut [bool],
             result: &mut Vec<u32>,
         ) {
-            if nid == DEAD || nid == LEAF { return; }
+            if nid == DEAD || nid == LEAF {
+                return;
+            }
             let idx = nid as usize;
-            if visited[idx] { return; }
+            if visited[idx] {
+                return;
+            }
             visited[idx] = true;
             if current == target {
                 result.push(nid);
@@ -200,9 +251,13 @@ fn swap_adjacent_inplace(mdd: &mut Mdd4, level: u16) {
         // Read grandchildren D[i][j]
         let mut d = [[DEAD; 4]; 4];
         for i in 0..4 {
-            d[i] = if ch[i] == DEAD { [DEAD; 4] }
-                   else if ch[i] == LEAF { [LEAF; 4] }
-                   else { mdd.nodes[ch[i] as usize] };
+            d[i] = if ch[i] == DEAD {
+                [DEAD; 4]
+            } else if ch[i] == LEAF {
+                [LEAF; 4]
+            } else {
+                mdd.nodes[ch[i] as usize]
+            };
         }
 
         // Transpose: new_ch[j] has children [D[0][j], D[1][j], D[2][j], D[3][j]]
@@ -235,13 +290,13 @@ fn swap_adjacent_inplace(mdd: &mut Mdd4, level: u16) {
 
 /// Reorder a 16-way interleaved MDD so z,w decisions come first.
 /// Returns a 4-way MDD with depth 4k: first 2k levels = (z,w), last 2k = (x,y).
-pub fn reorder_zw_first(
-    nodes_16: &[[u32; 16]],
-    root_16: u32,
-    k: usize,
-) -> Mdd4 {
+pub fn reorder_zw_first(nodes_16: &[[u32; 16]], root_16: u32, k: usize) -> Mdd4 {
     let depth_16 = 2 * k;
-    eprintln!("Splitting 16-way → 4-way ({} → {} levels)...", depth_16, depth_16 * 2);
+    eprintln!(
+        "Splitting 16-way → 4-way ({} → {} levels)...",
+        depth_16,
+        depth_16 * 2
+    );
     let mut mdd4 = split_16_to_4(nodes_16, root_16, depth_16);
     eprintln!("  Split: {} nodes", mdd4.nodes.len());
 
@@ -286,7 +341,7 @@ pub fn reorder_zw_first(
     // Each pair of levels covers one boundary position.
     let mut labels: Vec<bool> = Vec::with_capacity(total_levels);
     for _ in 0..depth_16 {
-        labels.push(true);  // zw level
+        labels.push(true); // zw level
         labels.push(false); // xy level
     }
 
@@ -297,9 +352,15 @@ pub fn reorder_zw_first(
         loop {
             let mut any = false;
             for i in 0..tmp.len() - 1 {
-                if !tmp[i] && tmp[i + 1] { tmp.swap(i, i + 1); count += 1; any = true; }
+                if !tmp[i] && tmp[i + 1] {
+                    tmp.swap(i, i + 1);
+                    count += 1;
+                    any = true;
+                }
             }
-            if !any { break; }
+            if !any {
+                break;
+            }
         }
         count
     };
@@ -317,8 +378,13 @@ pub fn reorder_zw_first(
                 swaps_done += 1;
                 swapped = true;
                 if total_swaps_needed >= 10 {
-                    eprint!("\r  Reorder: swap {}/{}, {} nodes, {:.1?}   ",
-                        swaps_done, total_swaps_needed, mdd4.nodes.len(), reorder_start.elapsed());
+                    eprint!(
+                        "\r  Reorder: swap {}/{}, {} nodes, {:.1?}   ",
+                        swaps_done,
+                        total_swaps_needed,
+                        mdd4.nodes.len(),
+                        reorder_start.elapsed()
+                    );
                 }
             }
         }
@@ -327,16 +393,33 @@ pub fn reorder_zw_first(
         if mdd4.nodes.len() > gc_threshold {
             let before = mdd4.nodes.len();
             gc_mdd(&mut mdd4);
-            eprintln!("\r  Reorder pass {}: {} swaps, GC {} → {} nodes, {:.1?}",
-                pass, swaps_done, before, mdd4.nodes.len(), reorder_start.elapsed());
+            eprintln!(
+                "\r  Reorder pass {}: {} swaps, GC {} → {} nodes, {:.1?}",
+                pass,
+                swaps_done,
+                before,
+                mdd4.nodes.len(),
+                reorder_start.elapsed()
+            );
         } else {
-            eprintln!("\r  Reorder pass {}: {} swaps total, {} nodes, {:.1?}",
-                pass, swaps_done, mdd4.nodes.len(), reorder_start.elapsed());
+            eprintln!(
+                "\r  Reorder pass {}: {} swaps total, {} nodes, {:.1?}",
+                pass,
+                swaps_done,
+                mdd4.nodes.len(),
+                reorder_start.elapsed()
+            );
         }
-        if !swapped { break; }
+        if !swapped {
+            break;
+        }
     }
 
-    eprintln!("  Reorder complete: {} swaps, {} nodes (before final GC)", swaps_done, mdd4.nodes.len());
+    eprintln!(
+        "  Reorder complete: {} swaps, {} nodes (before final GC)",
+        swaps_done,
+        mdd4.nodes.len()
+    );
 
     // Final garbage-collect
     gc_mdd(&mut mdd4);
@@ -351,9 +434,13 @@ fn gc_mdd(mdd: &mut Mdd4) {
     let mut reachable = vec![false; n];
     // Mark reachable nodes via DFS from root
     fn mark(nid: u32, nodes: &[[u32; 4]], reachable: &mut [bool]) {
-        if nid == DEAD || nid == LEAF { return; }
+        if nid == DEAD || nid == LEAF {
+            return;
+        }
         let idx = nid as usize;
-        if reachable[idx] { return; }
+        if reachable[idx] {
+            return;
+        }
         reachable[idx] = true;
         for &ch in &nodes[idx] {
             mark(ch, nodes, reachable);
@@ -379,7 +466,10 @@ fn gc_mdd(mdd: &mut Mdd4) {
             }
         }
     }
-    mdd.root = if mdd.root == DEAD || mdd.root == LEAF { mdd.root }
-               else { old_to_new[mdd.root as usize] };
+    mdd.root = if mdd.root == DEAD || mdd.root == LEAF {
+        mdd.root
+    } else {
+        old_to_new[mdd.root as usize]
+    };
     mdd.nodes = new_nodes;
 }

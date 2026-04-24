@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 /// Test that build_xy_for_boundary produces correct results by comparing
 /// against the full ZW-first MDD builder.
 ///
@@ -6,9 +7,7 @@
 /// 2. Call build_xy_for_boundary(k, &zw_sums)
 /// 3. Count XY paths from both the full MDD and standalone builder
 /// 4. Verify they match
-
-use turyn::mdd_zw_first::{self, ZwFirstMdd, DEAD, LEAF};
-use std::collections::HashMap;
+use turyn::mdd_zw_first::{self, DEAD, LEAF, ZwFirstMdd};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -61,7 +60,12 @@ fn main() {
             }
             zw_sums[j] = sum as i8;
         }
-        boundaries.push(BoundaryInfo { z_bits, w_bits, xy_root, zw_sums });
+        boundaries.push(BoundaryInfo {
+            z_bits,
+            w_bits,
+            xy_root,
+            zw_sums,
+        });
     });
 
     eprintln!("Step 2: Found {} ZW boundaries", boundaries.len());
@@ -105,10 +109,16 @@ fn main() {
         } else {
             failed += 1;
             let b = &boundaries[first_idx];
-            eprintln!("  MISMATCH at zw_sums={:?}: full={} standalone={}",
-                zw_sums, full_count, standalone_count);
-            eprintln!("    z={:0width$b} w={:0width$b}",
-                b.z_bits, b.w_bits, width = 2 * k);
+            eprintln!(
+                "  MISMATCH at zw_sums={:?}: full={} standalone={}",
+                zw_sums, full_count, standalone_count
+            );
+            eprintln!(
+                "    z={:0width$b} w={:0width$b}",
+                b.z_bits,
+                b.w_bits,
+                width = 2 * k
+            );
             if failed >= 10 {
                 eprintln!("  (stopping after 10 failures)");
                 break;
@@ -116,12 +126,20 @@ fn main() {
         }
 
         if tested % 1000 == 0 {
-            eprint!("\r  Tested {}/{} sums ({} passed, {} failed)   ",
-                tested, sums_groups.len(), passed, failed);
+            eprint!(
+                "\r  Tested {}/{} sums ({} passed, {} failed)   ",
+                tested,
+                sums_groups.len(),
+                passed,
+                failed
+            );
         }
     }
 
-    eprintln!("\nResults: {} tested, {} passed, {} failed", tested, passed, failed);
+    eprintln!(
+        "\nResults: {} tested, {} passed, {} failed",
+        tested, passed, failed
+    );
     if failed == 0 {
         eprintln!("ALL TESTS PASSED for k={}", k);
     } else {
@@ -131,11 +149,14 @@ fn main() {
 }
 
 fn count_paths(nid: u32, level: usize, depth: usize, nodes: &[[u32; 4]]) -> u128 {
-    if nid == DEAD { return 0; }
+    if nid == DEAD {
+        return 0;
+    }
     if nid == LEAF {
         return 4u128.pow((depth - level) as u32);
     }
-    nodes[nid as usize].iter()
+    nodes[nid as usize]
+        .iter()
         .map(|&child| count_paths(child, level + 1, depth, nodes))
         .sum()
 }

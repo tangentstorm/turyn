@@ -43,7 +43,7 @@ enum LBool {
 /// Clause metadata (literals stored in flat `clause_lits` array).
 #[derive(Clone, Copy, Debug)]
 struct ClauseMeta {
-    start: u32,  // index into clause_lits
+    start: u32, // index into clause_lits
     len: u16,
     learnt: bool,
     lbd: u8,
@@ -104,10 +104,10 @@ struct PbSetEqConstraint {
 /// running XOR of assigned values.
 #[derive(Clone, Debug)]
 struct XorConstraint {
-    vars: Vec<usize>,     // 0-based variable indices
-    parity: bool,         // RHS: XOR of all vars must equal this
-    num_unknown: u32,     // count of currently-unassigned vars
-    assigned_xor: bool,   // XOR of assigned variable values (true = 1)
+    vars: Vec<usize>,   // 0-based variable indices
+    parity: bool,       // RHS: XOR of all vars must equal this
+    num_unknown: u32,   // count of currently-unassigned vars
+    assigned_xor: bool, // XOR of assigned variable values (true = 1)
 }
 
 /// MDD constraint: encodes a multi-valued decision diagram over boundary variable pairs.
@@ -181,16 +181,11 @@ static QPB_STATE_TABLE: [u8; 36] = [
     0, 1, 0, 1,
     // aa=True(1), ab=Undef(0): MAYBE if ma, DEAD if !ma
     //   tv=(T,*)→ma=1→M, tv=(F,*)→ma=0→D
-    1, 1, 0, 0,
-    // aa=True(1), ab=True(1): TRUE if ma&&mb, else DEAD
-    2, 0, 0, 0,
-    // aa=True(1), ab=False(2)
-    0, 2, 0, 0,
-    // aa=False(2), ab=Undef(0)
-    0, 0, 1, 1,
-    // aa=False(2), ab=True(1)
-    0, 0, 2, 0,
-    // aa=False(2), ab=False(2)
+    1, 1, 0, 0, // aa=True(1), ab=True(1): TRUE if ma&&mb, else DEAD
+    2, 0, 0, 0, // aa=True(1), ab=False(2)
+    0, 2, 0, 0, // aa=False(2), ab=Undef(0)
+    0, 0, 1, 1, // aa=False(2), ab=True(1)
+    0, 0, 2, 0, // aa=False(2), ab=False(2)
     0, 0, 0, 2,
 ];
 
@@ -199,37 +194,58 @@ struct QuadPbTerm {
     lit_a: Lit,
     lit_b: Lit,
     coeff: u16,
-    var_a: u16,     // cached var_of(lit_a) as u16
-    var_b: u16,     // cached var_of(lit_b) as u16
-    state: u8,      // 0=DEAD, 1=MAYBE, 2=TRUE
-    tv_offset: u8,  // precomputed: (if lit_a < 0 { 2 } else { 0 }) + (if lit_b < 0 { 1 } else { 0 })
+    var_a: u16,    // cached var_of(lit_a) as u16
+    var_b: u16,    // cached var_of(lit_b) as u16
+    state: u8,     // 0=DEAD, 1=MAYBE, 2=TRUE
+    tv_offset: u8, // precomputed: (if lit_a < 0 { 2 } else { 0 }) + (if lit_b < 0 { 1 } else { 0 })
 }
 
 impl QuadPbTerm {
     #[inline(always)]
-    fn var_a(&self) -> usize { self.var_a as usize }
+    fn var_a(&self) -> usize {
+        self.var_a as usize
+    }
     #[inline(always)]
-    fn var_b(&self) -> usize { self.var_b as usize }
+    fn var_b(&self) -> usize {
+        self.var_b as usize
+    }
     #[inline(always)]
-    fn true_val_a(&self) -> LBool { if self.lit_a > 0 { LBool::True } else { LBool::False } }
+    fn true_val_a(&self) -> LBool {
+        if self.lit_a > 0 {
+            LBool::True
+        } else {
+            LBool::False
+        }
+    }
     #[inline(always)]
-    fn true_val_b(&self) -> LBool { if self.lit_b > 0 { LBool::True } else { LBool::False } }
+    fn true_val_b(&self) -> LBool {
+        if self.lit_b > 0 {
+            LBool::True
+        } else {
+            LBool::False
+        }
+    }
     #[inline(always)]
-    fn neg_a(&self) -> bool { self.lit_a < 0 }
+    fn neg_a(&self) -> bool {
+        self.lit_a < 0
+    }
     #[inline(always)]
-    fn neg_b(&self) -> bool { self.lit_b < 0 }
+    fn neg_b(&self) -> bool {
+        self.lit_b < 0
+    }
     /// Compute state from two LBool assignments using branchless table lookup.
     #[inline(always)]
     fn compute_state(&self, aa: LBool, ab: LBool) -> u8 {
-        QPB_STATE_TABLE[(aa as u8 as usize) * 12 + (ab as u8 as usize) * 4 + self.tv_offset as usize]
+        QPB_STATE_TABLE
+            [(aa as u8 as usize) * 12 + (ab as u8 as usize) * 4 + self.tv_offset as usize]
     }
 }
 
 #[derive(Clone, Debug)]
 struct QuadPbConstraint {
-    terms: Vec<QuadPbTerm>,  // single Vec instead of 10 separate ones
+    terms: Vec<QuadPbTerm>, // single Vec instead of 10 separate ones
     target: u32,
-    target_hi: u32,         // for range constraints; equals target for equality
+    target_hi: u32, // for range constraints; equals target for equality
     num_terms: u32,
     /// Branchless counter array indexed by state: sums[0]=dead(unused), sums[1]=maybe, sums[2]=true.
     /// Replaces separate sum_true/sum_maybe fields for branch-free updates.
@@ -269,8 +285,13 @@ pub enum PropKind {
 impl PropKind {
     pub const COUNT: usize = 7;
     pub const ALL: [PropKind; Self::COUNT] = [
-        PropKind::Clause, PropKind::Pb, PropKind::QuadPb, PropKind::Xor,
-        PropKind::Spectral, PropKind::Mdd, PropKind::PbSetEq,
+        PropKind::Clause,
+        PropKind::Pb,
+        PropKind::QuadPb,
+        PropKind::Xor,
+        PropKind::Spectral,
+        PropKind::Mdd,
+        PropKind::PbSetEq,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -386,7 +407,7 @@ pub struct SpectralTables {
     pub cos_table: std::sync::Arc<Vec<f32>>,
     pub sin_table: std::sync::Arc<Vec<f32>>,
     pub amplitudes: std::sync::Arc<Vec<f32>>,
-    pub max_reduction_total: Vec<f64>,  // sum of all amplitudes per freq
+    pub max_reduction_total: Vec<f64>, // sum of all amplitudes per freq
     pub num_freqs: usize,
     pub middle_len: usize,
     pub seq_len: usize,
@@ -449,8 +470,13 @@ impl SpectralTables {
             sin_table: std::sync::Arc::new(sin_table),
             amplitudes: std::sync::Arc::new(amplitudes),
             max_reduction_total,
-            num_freqs, middle_len, seq_len, k,
-            omega: omega_vec, pos_cos, pos_sin,
+            num_freqs,
+            middle_len,
+            seq_len,
+            k,
+            omega: omega_vec,
+            pos_cos,
+            pos_sin,
         }
     }
 }
@@ -462,13 +488,7 @@ impl SpectralConstraint {
     /// `boundary`: full sequence with boundary positions filled, middle = 0
     /// `bound`: spectral power bound (|DFT(ω)|² ≤ bound)
     /// `num_freqs`: number of frequency samples
-    pub fn new(
-        seq_len: usize,
-        k: usize,
-        boundary: &[i8],
-        bound: f64,
-        num_freqs: usize,
-    ) -> Self {
+    pub fn new(seq_len: usize, k: usize, boundary: &[i8], bound: f64, num_freqs: usize) -> Self {
         let tables = SpectralTables::new(seq_len, k, num_freqs);
         Self::from_tables(&tables, boundary, bound)
     }
@@ -484,7 +504,9 @@ impl SpectralConstraint {
         let mut re_boundary = vec![0.0f64; num_freqs];
         let mut im_boundary = vec![0.0f64; num_freqs];
         for pos in 0..seq_len {
-            if pos >= k && pos < seq_len - k { continue; }
+            if pos >= k && pos < seq_len - k {
+                continue;
+            }
             let val = boundary[pos] as f64;
             for fi in 0..num_freqs {
                 re_boundary[fi] += val * tables.pos_cos[pos * num_freqs + fi];
@@ -516,22 +538,31 @@ impl SpectralConstraint {
         self.re.copy_from_slice(&self.re_boundary);
         self.im.copy_from_slice(&self.im_boundary);
         // Recompute max_reduction from all vars being unassigned
-        for fi in 0..self.num_freqs { self.max_reduction[fi] = 0.0; }
+        for fi in 0..self.num_freqs {
+            self.max_reduction[fi] = 0.0;
+        }
         for vi in 0..self.num_seq_vars {
             let base = vi * self.num_freqs;
             for fi in 0..self.num_freqs {
                 self.max_reduction[fi] += self.amplitudes[base + fi] as f64;
             }
         }
-        for v in &mut self.assigned { *v = false; }
-        for v in &mut self.values { *v = 0; }
+        for v in &mut self.assigned {
+            *v = false;
+        }
+        for v in &mut self.values {
+            *v = 0;
+        }
         if let Some(ref mut s2) = self.seq2 {
             s2.re1.copy_from_slice(&s2.re1_boundary);
             s2.im1.copy_from_slice(&s2.im1_boundary);
             s2.re2.copy_from_slice(&s2.re2_boundary);
             s2.im2.copy_from_slice(&s2.im2_boundary);
             // Recompute max_reduction from amplitudes
-            for fi in 0..self.num_freqs { s2.max_reduction1[fi] = 0.0; s2.max_reduction2[fi] = 0.0; }
+            for fi in 0..self.num_freqs {
+                s2.max_reduction1[fi] = 0.0;
+                s2.max_reduction2[fi] = 0.0;
+            }
             for vi in 0..s2.seq2_start {
                 for fi in 0..self.num_freqs {
                     s2.max_reduction1[fi] += self.amplitudes[vi * self.num_freqs + fi] as f64;
@@ -630,9 +661,13 @@ impl SpectralConstraint {
                 let min1 = (mag1 - s2.max_reduction1[fi]).max(0.0);
                 let min2 = (mag2 - s2.max_reduction2[fi]).max(0.0);
                 // Individual W bound
-                if min1 > ib_sqrt { return Some(fi); }
+                if min1 > ib_sqrt {
+                    return Some(fi);
+                }
                 // Individual Z bound
-                if min2 > ib_sqrt { return Some(fi); }
+                if min2 > ib_sqrt {
+                    return Some(fi);
+                }
                 // Combined pair bound
                 if s2.weight1 * min1 * min1 + s2.weight2 * min2 * min2 > self.bound {
                     return Some(fi);
@@ -646,7 +681,9 @@ impl SpectralConstraint {
                     Some(ref pfb) => pfb[fi],
                     None => self.bound,
                 };
-                if b <= 0.0 { return Some(fi); }
+                if b <= 0.0 {
+                    return Some(fi);
+                }
                 let mag = (self.re[fi] * self.re[fi] + self.im[fi] * self.im[fi]).sqrt();
                 if mag - self.max_reduction[fi] > b.sqrt() {
                     return Some(fi);
@@ -709,20 +746,20 @@ pub struct Solver {
     pub config: SolverConfig,
     // Variable state
     num_vars: usize,
-    assigns: Vec<LBool>,    // indexed by var (0-based)
-    level: Vec<u32>,         // decision level of each var
-    reason: Vec<Reason>,     // reason for assignment
-    trail_pos: Vec<usize>,   // trail position when variable was assigned (for lazy explanation filtering)
-    phase: Vec<bool>,        // phase saving: last polarity of each var
+    assigns: Vec<LBool>,   // indexed by var (0-based)
+    level: Vec<u32>,       // decision level of each var
+    reason: Vec<Reason>,   // reason for assignment
+    trail_pos: Vec<usize>, // trail position when variable was assigned (for lazy explanation filtering)
+    phase: Vec<bool>,      // phase saving: last polarity of each var
 
     // Trail
     trail: Vec<TrailEntry>,
-    trail_lim: Vec<usize>,  // trail index at start of each decision level
+    trail_lim: Vec<usize>, // trail index at start of each decision level
 
     // Clause database (flat storage for cheap cloning)
     clause_meta: Vec<ClauseMeta>,
     clause_lits: Vec<Lit>,         // flat array of all clause literals
-    watches: Vec<Vec<(u32, Lit)>>,  // watches[lit_index] = (clause_index, blocker_literal)
+    watches: Vec<Vec<(u32, Lit)>>, // watches[lit_index] = (clause_index, blocker_literal)
     /// R2: Dedicated binary-clause fast-path index. When literal `l`
     /// becomes true, every `(other, ci)` in `bin_watches[lit_index(l)]`
     /// is a binary clause (-l ∨ other) that now forces `other` or
@@ -735,32 +772,32 @@ pub struct Solver {
     activity: Vec<f64>,
     var_inc: f64,
     var_decay: f64,
-    heap: Vec<usize>,        // max-heap of variable indices, ordered by activity
-    heap_pos: Vec<usize>,    // heap_pos[v] = position of var v in heap (usize::MAX if not in heap)
+    heap: Vec<usize>,     // max-heap of variable indices, ordered by activity
+    heap_pos: Vec<usize>, // heap_pos[v] = position of var v in heap (usize::MAX if not in heap)
 
     // Pseudo-boolean constraints
     pb_constraints: Vec<PbConstraint>,
-    pb_watches: Vec<Vec<u32>>,  // pb_watches[lit_index] = list of PB constraint indices
+    pb_watches: Vec<Vec<u32>>, // pb_watches[lit_index] = list of PB constraint indices
 
     // Quadratic PB constraints
     quad_pb_constraints: Vec<QuadPbConstraint>,
-    quad_pb_var_watches: Vec<Vec<u32>>,       // quad_pb_var_watches[var] = list of constraint indices
-    quad_pb_var_terms: Vec<Vec<(u32, u16, bool)>>,  // (constraint_idx, term_idx, is_var_a)
+    quad_pb_var_watches: Vec<Vec<u32>>, // quad_pb_var_watches[var] = list of constraint indices
+    quad_pb_var_terms: Vec<Vec<(u32, u16, bool)>>, // (constraint_idx, term_idx, is_var_a)
     // Reusable scratch buffer for quad PB explanation building (on-demand during analysis)
     quad_pb_seen_buf: Vec<bool>,
 
     // Reusable scratch buffers for conflict analysis (avoids per-conflict heap allocations)
-    analyze_seen: Vec<bool>,           // seen[] in analyze()
-    analyze_reason_buf: Vec<Lit>,      // reusable for quad PB explanation in analyze
-    analyze_reason_buf2: Vec<Lit>,     // reusable for quad PB explanation in lit_removable
-    minimize_stack: Vec<usize>,        // stack for lit_removable()
-    minimize_visited: Vec<bool>,       // visited[] for lit_removable()
-    minimize_levels: Vec<bool>,        // levels_in_learnt for minimize_learnt()
-    lbd_seen: Vec<bool>,              // reusable buffer for compute_lbd (avoids per-conflict alloc)
+    analyze_seen: Vec<bool>,       // seen[] in analyze()
+    analyze_reason_buf: Vec<Lit>,  // reusable for quad PB explanation in analyze
+    analyze_reason_buf2: Vec<Lit>, // reusable for quad PB explanation in lit_removable
+    minimize_stack: Vec<usize>,    // stack for lit_removable()
+    minimize_visited: Vec<bool>,   // visited[] for lit_removable()
+    minimize_levels: Vec<bool>,    // levels_in_learnt for minimize_learnt()
+    lbd_seen: Vec<bool>,           // reusable buffer for compute_lbd (avoids per-conflict alloc)
 
     // XOR (GF(2)) constraints
     xor_constraints: Vec<XorConstraint>,
-    xor_var_watches: Vec<Vec<u32>>,  // xor_var_watches[var] = list of XOR constraint indices
+    xor_var_watches: Vec<Vec<u32>>, // xor_var_watches[var] = list of XOR constraint indices
 
     // "Sum is in a set" constraints: #{i : lit_i true} ∈ V (sorted non-negative set).
     // Propagation: binary-search V for the alive subset under current (cnt_lo, cnt_hi);
@@ -798,11 +835,11 @@ pub struct Solver {
     last_learnt_clause: Option<Vec<Lit>>,
 
     // Restart (EMA) — glucose-style adaptive restarts
-    ema_lbd_fast: f64,   // fast EMA of recent LBD (α ≈ 1/32)
-    ema_lbd_slow: f64,   // slow EMA of global LBD (α ≈ 1/4096)
+    ema_lbd_fast: f64,      // fast EMA of recent LBD (α ≈ 1/32)
+    ema_lbd_slow: f64,      // slow EMA of global LBD (α ≈ 1/4096)
     ema_restart_block: u64, // conflicts since last restart (for blocking)
-    ema_trail_fast: f64, // fast EMA of trail size (for blocking)
-    ema_trail_slow: f64, // slow EMA of trail size
+    ema_trail_fast: f64,    // fast EMA of trail size (for blocking)
+    ema_trail_slow: f64,    // slow EMA of trail size
 
     // Rephasing state
     rephase_conflicts: u64, // next conflict count to trigger rephase
@@ -810,7 +847,7 @@ pub struct Solver {
     best_phase_set: bool,   // whether best_phase has been populated
 
     // Limits
-    conflict_limit: u64,  // 0 = no limit
+    conflict_limit: u64, // 0 = no limit
 
     // State
     pub ok: bool, // false if top-level conflict detected
@@ -938,7 +975,9 @@ impl Solver {
 
     /// Add a clause. Literals are signed integers (DIMACS convention).
     pub fn add_clause(&mut self, lits: impl IntoIterator<Item = i32>) {
-        if !self.ok { return; }
+        if !self.ok {
+            return;
+        }
         let lits: Vec<Lit> = lits.into_iter().collect();
 
         // Ensure all variables exist
@@ -948,20 +987,31 @@ impl Solver {
         }
 
         match lits.len() {
-            0 => { self.ok = false; }
+            0 => {
+                self.ok = false;
+            }
             1 => {
                 // Unit clause: enqueue immediately
                 let lit = lits[0];
                 let val = self.lit_value(lit);
                 match val {
                     LBool::True => {} // already satisfied
-                    LBool::False => { self.ok = false; } // contradiction
+                    LBool::False => {
+                        self.ok = false;
+                    } // contradiction
                     LBool::Undef => {
                         // Store as a clause so we have a reason index
                         let ci = self.clause_meta.len() as u32;
                         let start = self.clause_lits.len() as u32;
                         self.clause_lits.extend_from_slice(&lits);
-                        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false, used: 0 });
+                        self.clause_meta.push(ClauseMeta {
+                            start,
+                            len: lits.len() as u16,
+                            learnt: false,
+                            lbd: 0,
+                            deleted: false,
+                            used: 0,
+                        });
                         self.enqueue(lit, Reason::Clause(ci));
                         // Propagate immediately
                         if self.propagate().is_some() {
@@ -980,8 +1030,16 @@ impl Solver {
                 let mut i = 0;
                 for j in 0..lits.len() {
                     match self.lit_value(lits[j]) {
-                        LBool::True => { lits.swap(i, j); num_true += 1; i += 1; }
-                        LBool::Undef => { lits.swap(i, j); num_undef += 1; i += 1; }
+                        LBool::True => {
+                            lits.swap(i, j);
+                            num_true += 1;
+                            i += 1;
+                        }
+                        LBool::Undef => {
+                            lits.swap(i, j);
+                            num_undef += 1;
+                            i += 1;
+                        }
                         LBool::False => {}
                     }
                 }
@@ -995,7 +1053,14 @@ impl Solver {
                     let ci = self.clause_meta.len() as u32;
                     let start = self.clause_lits.len() as u32;
                     self.clause_lits.extend_from_slice(&lits);
-                    self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false, used: 0 });
+                    self.clause_meta.push(ClauseMeta {
+                        start,
+                        len: lits.len() as u16,
+                        learnt: false,
+                        lbd: 0,
+                        deleted: false,
+                        used: 0,
+                    });
                     self.enqueue(lits[0], Reason::Clause(ci));
                     if self.propagate().is_some() {
                         self.ok = false;
@@ -1017,7 +1082,14 @@ impl Solver {
                     self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
                 }
                 self.clause_lits.extend_from_slice(&lits);
-                self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: false, lbd: 0, deleted: false, used: 0 });
+                self.clause_meta.push(ClauseMeta {
+                    start,
+                    len: lits.len() as u16,
+                    learnt: false,
+                    lbd: 0,
+                    deleted: false,
+                    used: 0,
+                });
             }
         }
     }
@@ -1044,12 +1116,18 @@ impl Solver {
     ///   contradicted in the current state and will be re-derived if
     ///   needed).
     pub fn add_clause_deferred(&mut self, lits: &[Lit]) {
-        if !self.ok { return; }
-        if lits.len() < 2 { return; }
+        if !self.ok {
+            return;
+        }
+        if lits.len() < 2 {
+            return;
+        }
 
         // Ensure all variables exist.
         for &lit in lits {
-            if lit == 0 { return; }
+            if lit == 0 {
+                return;
+            }
             self.ensure_var(lit.unsigned_abs() as usize);
         }
 
@@ -1057,12 +1135,10 @@ impl Solver {
         // so the clause is satisfied (and never re-fires) when possible.
         let mut order: Vec<Lit> = lits.to_vec();
         // Sort by lit_value priority (True=2, Undef=1, False=0) descending.
-        order.sort_by_key(|&lit| {
-            match self.lit_value(lit) {
-                LBool::True => 0u8,
-                LBool::Undef => 1u8,
-                LBool::False => 2u8,
-            }
+        order.sort_by_key(|&lit| match self.lit_value(lit) {
+            LBool::True => 0u8,
+            LBool::Undef => 1u8,
+            LBool::False => 2u8,
         });
         // After sort, index 0 has the highest priority (true if any),
         // index 1 next.
@@ -1098,7 +1174,9 @@ impl Solver {
     /// Add a pseudo-boolean "at least" constraint: sum(coeffs[i] * lits[i]) >= bound.
     /// All coefficients must be positive. Literals use DIMACS convention.
     pub fn add_pb_atleast(&mut self, lits: &[i32], coeffs: &[u32], bound: u32) {
-        if !self.ok { return; }
+        if !self.ok {
+            return;
+        }
         assert_eq!(lits.len(), coeffs.len());
 
         // Ensure all variables exist
@@ -1147,7 +1225,9 @@ impl Solver {
     /// constraint propagates via binary search over V against the running
     /// `(cnt_lo, cnt_hi)` bounds (see `PbSetEqConstraint` for the rules).
     pub fn add_pb_set_eq(&mut self, lits: &[i32], values: &[u32]) {
-        if !self.ok { return; }
+        if !self.ok {
+            return;
+        }
         if values.is_empty() {
             self.ok = false;
             return;
@@ -1179,8 +1259,8 @@ impl Solver {
         self.pb_set_eq_constraints.push(PbSetEqConstraint {
             lits: lits.to_vec(),
             values: vals,
-            num_true: 0,    // scratch — recomputed by propagate_pb_set_eq
-            num_undef: 0,   // scratch — recomputed by propagate_pb_set_eq
+            num_true: 0,  // scratch — recomputed by propagate_pb_set_eq
+            num_undef: 0, // scratch — recomputed by propagate_pb_set_eq
         });
         if self.propagate_pb_set_eq(pi).is_some() {
             self.ok = false;
@@ -1271,7 +1351,9 @@ impl Solver {
         let n_lits = self.pb_set_eq_constraints[pi as usize].lits.len();
         for i in 0..n_lits {
             let lit = self.pb_set_eq_constraints[pi as usize].lits[i];
-            if self.lit_value(lit) != LBool::Undef { continue; }
+            if self.lit_value(lit) != LBool::Undef {
+                continue;
+            }
             let forced = if true_dir { lit } else { -lit };
             self.enqueue(forced, Reason::PbSetEq(pi));
         }
@@ -1281,13 +1363,19 @@ impl Solver {
     /// Add a quadratic PB equality: sum(coeffs[i] * lits_a[i] * lits_b[i]) = target.
     /// Each term is 1 iff both lits_a[i] and lits_b[i] are true (under their polarities).
     pub fn add_quad_pb_eq(&mut self, lits_a: &[i32], lits_b: &[i32], coeffs: &[u32], target: u32) {
-        if !self.ok { return; }
+        if !self.ok {
+            return;
+        }
         assert_eq!(lits_a.len(), lits_b.len());
         assert_eq!(lits_a.len(), coeffs.len());
 
         // Skip ensure_var when all variables are known to exist already
-        let max_var = lits_a.iter().chain(lits_b.iter())
-            .map(|&l| l.unsigned_abs() as usize).max().unwrap_or(0);
+        let max_var = lits_a
+            .iter()
+            .chain(lits_b.iter())
+            .map(|&l| l.unsigned_abs() as usize)
+            .max()
+            .unwrap_or(0);
         if max_var > self.num_vars {
             for &lit in lits_a.iter().chain(lits_b.iter()) {
                 self.ensure_var(lit.unsigned_abs() as usize);
@@ -1310,17 +1398,20 @@ impl Solver {
             self.quad_pb_var_terms[vb].push((qi, i as u16, false));
         }
 
-        let terms: Vec<QuadPbTerm> = (0..lits_a.len()).map(|i| {
-            QuadPbTerm {
-                lit_a: lits_a[i],
-                lit_b: lits_b[i],
-                coeff: coeffs[i] as u16,
-                var_a: var_of(lits_a[i]) as u16,
-                var_b: var_of(lits_b[i]) as u16,
-                state: 1, // MAYBE
-                tv_offset: (if lits_a[i] < 0 { 2u8 } else { 0 }) + (if lits_b[i] < 0 { 1 } else { 0 }),
-            }
-        }).collect();
+        let terms: Vec<QuadPbTerm> = (0..lits_a.len())
+            .map(|i| {
+                QuadPbTerm {
+                    lit_a: lits_a[i],
+                    lit_b: lits_b[i],
+                    coeff: coeffs[i] as u16,
+                    var_a: var_of(lits_a[i]) as u16,
+                    var_b: var_of(lits_b[i]) as u16,
+                    state: 1, // MAYBE
+                    tv_offset: (if lits_a[i] < 0 { 2u8 } else { 0 })
+                        + (if lits_b[i] < 0 { 1 } else { 0 }),
+                }
+            })
+            .collect();
         self.quad_pb_constraints.push(QuadPbConstraint {
             target,
             target_hi: target,
@@ -1339,8 +1430,17 @@ impl Solver {
 
     /// Add a quadratic PB range constraint: target_lo ≤ Σ(coeffs[i] * lits_a[i] * lits_b[i]) ≤ target_hi
     /// Same as add_quad_pb_eq but with a range instead of exact target.
-    pub fn add_quad_pb_range(&mut self, lits_a: &[i32], lits_b: &[i32], coeffs: &[u32], target_lo: u32, target_hi: u32) {
-        if !self.ok { return; }
+    pub fn add_quad_pb_range(
+        &mut self,
+        lits_a: &[i32],
+        lits_b: &[i32],
+        coeffs: &[u32],
+        target_lo: u32,
+        target_hi: u32,
+    ) {
+        if !self.ok {
+            return;
+        }
         if target_lo == target_hi {
             self.add_quad_pb_eq(lits_a, lits_b, coeffs, target_lo);
             return;
@@ -1350,8 +1450,12 @@ impl Solver {
 
         // Skip ensure_var when all variables are known to exist already
         // (common in checkpoint/restore path where base solver has all vars)
-        let max_var = lits_a.iter().chain(lits_b.iter())
-            .map(|&l| l.unsigned_abs() as usize).max().unwrap_or(0);
+        let max_var = lits_a
+            .iter()
+            .chain(lits_b.iter())
+            .map(|&l| l.unsigned_abs() as usize)
+            .max()
+            .unwrap_or(0);
         if max_var > self.num_vars {
             for &lit in lits_a.iter().chain(lits_b.iter()) {
                 self.ensure_var(lit.unsigned_abs() as usize);
@@ -1378,17 +1482,18 @@ impl Solver {
             self.quad_pb_var_terms[vb].push((qi, i as u16, false));
         }
 
-        let terms: Vec<QuadPbTerm> = (0..lits_a.len()).map(|i| {
-            QuadPbTerm {
+        let terms: Vec<QuadPbTerm> = (0..lits_a.len())
+            .map(|i| QuadPbTerm {
                 lit_a: lits_a[i],
                 lit_b: lits_b[i],
                 coeff: coeffs[i] as u16,
                 var_a: var_of(lits_a[i]) as u16,
                 var_b: var_of(lits_b[i]) as u16,
                 state: 1,
-                tv_offset: (if lits_a[i] < 0 { 2u8 } else { 0 }) + (if lits_b[i] < 0 { 1 } else { 0 }),
-            }
-        }).collect();
+                tv_offset: (if lits_a[i] < 0 { 2u8 } else { 0 })
+                    + (if lits_b[i] < 0 { 1 } else { 0 }),
+            })
+            .collect();
         self.quad_pb_constraints.push(QuadPbConstraint {
             target: target_lo,
             target_hi,
@@ -1408,7 +1513,9 @@ impl Solver {
     /// The constraint propagates during BCP: when exactly one variable remains
     /// unassigned, it is forced to satisfy the parity.
     pub fn add_xor(&mut self, vars_1based: &[i32], parity: bool) {
-        if !self.ok { return; }
+        if !self.ok {
+            return;
+        }
         let mut vars: Vec<usize> = Vec::with_capacity(vars_1based.len());
         for &v in vars_1based {
             let uv = v.unsigned_abs() as usize;
@@ -1419,7 +1526,9 @@ impl Solver {
         // Adjust parity for negated literals
         let mut p = parity;
         for &v in vars_1based {
-            if v < 0 { p = !p; }
+            if v < 0 {
+                p = !p;
+            }
         }
 
         let xi = self.xor_constraints.len() as u32;
@@ -1458,7 +1567,11 @@ impl Solver {
             for &v in &xc.vars {
                 if self.assigns[v] == LBool::Undef {
                     let need_true = xc.assigned_xor ^ xc.parity;
-                    let lit = if need_true { (v + 1) as Lit } else { -((v + 1) as Lit) };
+                    let lit = if need_true {
+                        (v + 1) as Lit
+                    } else {
+                        -((v + 1) as Lit)
+                    };
                     let val = need_true;
                     let xc = &mut self.xor_constraints[xi as usize];
                     xc.num_unknown = 0;
@@ -1486,11 +1599,21 @@ impl Solver {
         assert_eq!(level_y_vars_1based.len(), depth);
 
         // Ensure all variables exist
-        for &v in level_x_vars_1based { self.ensure_var(v.unsigned_abs() as usize); }
-        for &v in level_y_vars_1based { self.ensure_var(v.unsigned_abs() as usize); }
+        for &v in level_x_vars_1based {
+            self.ensure_var(v.unsigned_abs() as usize);
+        }
+        for &v in level_y_vars_1based {
+            self.ensure_var(v.unsigned_abs() as usize);
+        }
 
-        let lx: Vec<usize> = level_x_vars_1based.iter().map(|&v| v.unsigned_abs() as usize - 1).collect();
-        let ly: Vec<usize> = level_y_vars_1based.iter().map(|&v| v.unsigned_abs() as usize - 1).collect();
+        let lx: Vec<usize> = level_x_vars_1based
+            .iter()
+            .map(|&v| v.unsigned_abs() as usize - 1)
+            .collect();
+        let ly: Vec<usize> = level_y_vars_1based
+            .iter()
+            .map(|&v| v.unsigned_abs() as usize - 1)
+            .collect();
 
         let max_var = lx.iter().chain(ly.iter()).copied().max().unwrap_or(0);
         let mut var_to_level = vec![usize::MAX; max_var + 1];
@@ -1507,7 +1630,8 @@ impl Solver {
         let num_nodes = nodes.len();
         self.mdd = Some(MddConstraint {
             nodes: nodes.to_vec(),
-            root, depth,
+            root,
+            depth,
             level_x_var: lx,
             level_y_var: ly,
             var_to_level,
@@ -1531,13 +1655,25 @@ impl Solver {
             let mut stack = vec![mdd.root];
             let mut seen = std::collections::HashSet::new();
             while let Some(nid) = stack.pop() {
-                if nid == 0 || nid == u32::MAX { continue; }
-                if !seen.insert(nid) { continue; }
+                if nid == 0 || nid == u32::MAX {
+                    continue;
+                }
+                if !seen.insert(nid) {
+                    continue;
+                }
                 count += 1;
-                for &c in &mdd.nodes[nid as usize] { stack.push(c); }
+                for &c in &mdd.nodes[nid as usize] {
+                    stack.push(c);
+                }
             }
-            eprintln!("[MDD] root={} depth={} reachable_nodes={} x_vars={:?} y_vars={:?}",
-                mdd.root, mdd.depth, count, &mdd.level_x_var[..mdd.depth.min(4)], &mdd.level_y_var[..mdd.depth.min(4)]);
+            eprintln!(
+                "[MDD] root={} depth={} reachable_nodes={} x_vars={:?} y_vars={:?}",
+                mdd.root,
+                mdd.depth,
+                count,
+                &mdd.level_x_var[..mdd.depth.min(4)],
+                &mdd.level_y_var[..mdd.depth.min(4)]
+            );
         }
     }
 
@@ -1555,8 +1691,13 @@ impl Solver {
         const MDD_DEAD: u32 = 0;
         const MDD_LEAF: u32 = u32::MAX;
 
-        let mdd_ref = match self.mdd.as_ref() { Some(m) => m, None => return None };
-        if mdd_ref.root == MDD_DEAD { return Some(Reason::Mdd); }
+        let mdd_ref = match self.mdd.as_ref() {
+            Some(m) => m,
+            None => return None,
+        };
+        if mdd_ref.root == MDD_DEAD {
+            return Some(Reason::Mdd);
+        }
 
         // Read MDD fields via raw pointer to avoid borrow issues with self.assigns.
         let mdd_ptr = self.mdd.as_mut().unwrap() as *mut MddConstraint;
@@ -1584,7 +1725,9 @@ impl Solver {
             let mut next = std::mem::take(&mut mdd.scratch_next);
             next.clear();
             // scratch_seen_list contains previously-set indices; clear them.
-            for &idx in &mdd.scratch_seen_list { mdd.scratch_seen[idx as usize] = false; }
+            for &idx in &mdd.scratch_seen_list {
+                mdd.scratch_seen[idx as usize] = false;
+            }
             mdd.scratch_seen_list.clear();
 
             // Dedup helper implemented inline (closures fight the borrow checker
@@ -1598,7 +1741,9 @@ impl Solver {
                         // via a separate check — use a reserved high index in
                         // scratch_seen's last slot if needed. Simple path:
                         // scan only the small tail in rare LEAF runs.
-                        if !next.contains(&MDD_LEAF) { next.push(MDD_LEAF); }
+                        if !next.contains(&MDD_LEAF) {
+                            next.push(MDD_LEAF);
+                        }
                     } else {
                         let ci = c as usize;
                         if !mdd.scratch_seen[ci] {
@@ -1613,12 +1758,16 @@ impl Solver {
             let frontier: &Vec<u32> = &mdd.level_frontier[level];
 
             if x_asgn != LBool::Undef && y_asgn != LBool::Undef {
-                let branch = (x_asgn == LBool::True) as usize | (((y_asgn == LBool::True) as usize) << 1);
+                let branch =
+                    (x_asgn == LBool::True) as usize | (((y_asgn == LBool::True) as usize) << 1);
                 for &nid in frontier {
-                    if nid == MDD_LEAF { push_dedup!(MDD_LEAF); }
-                    else {
+                    if nid == MDD_LEAF {
+                        push_dedup!(MDD_LEAF);
+                    } else {
                         let c = nodes_ref[nid as usize][branch];
-                        if c != MDD_DEAD { push_dedup!(c); }
+                        if c != MDD_DEAD {
+                            push_dedup!(c);
+                        }
                     }
                 }
             } else if x_asgn != LBool::Undef {
@@ -1626,68 +1775,109 @@ impl Solver {
                 let b1 = b0 | 2;
                 let (mut y0_ok, mut y1_ok) = (false, false);
                 for &nid in frontier {
-                    if nid == MDD_LEAF { y0_ok = true; y1_ok = true; push_dedup!(MDD_LEAF); }
-                    else {
+                    if nid == MDD_LEAF {
+                        y0_ok = true;
+                        y1_ok = true;
+                        push_dedup!(MDD_LEAF);
+                    } else {
                         let (c0, c1) = (nodes_ref[nid as usize][b0], nodes_ref[nid as usize][b1]);
-                        if c0 != MDD_DEAD { y0_ok = true; push_dedup!(c0); }
-                        if c1 != MDD_DEAD { y1_ok = true; push_dedup!(c1); }
+                        if c0 != MDD_DEAD {
+                            y0_ok = true;
+                            push_dedup!(c0);
+                        }
+                        if c1 != MDD_DEAD {
+                            y1_ok = true;
+                            push_dedup!(c1);
+                        }
                     }
                 }
-                if !y0_ok && !y1_ok { conflict = true; }
-                else if !y0_ok && self.assigns[yv] == LBool::Undef {
-                    forced[num_forced] = (yv + 1) as Lit; num_forced += 1;
+                if !y0_ok && !y1_ok {
+                    conflict = true;
+                } else if !y0_ok && self.assigns[yv] == LBool::Undef {
+                    forced[num_forced] = (yv + 1) as Lit;
+                    num_forced += 1;
                 } else if !y1_ok && self.assigns[yv] == LBool::Undef {
-                    forced[num_forced] = -((yv + 1) as Lit); num_forced += 1;
+                    forced[num_forced] = -((yv + 1) as Lit);
+                    num_forced += 1;
                 }
             } else if y_asgn != LBool::Undef {
                 let b0 = ((y_asgn == LBool::True) as usize) << 1;
                 let b1 = b0 | 1;
                 let (mut x0_ok, mut x1_ok) = (false, false);
                 for &nid in frontier {
-                    if nid == MDD_LEAF { x0_ok = true; x1_ok = true; push_dedup!(MDD_LEAF); }
-                    else {
+                    if nid == MDD_LEAF {
+                        x0_ok = true;
+                        x1_ok = true;
+                        push_dedup!(MDD_LEAF);
+                    } else {
                         let (c0, c1) = (nodes_ref[nid as usize][b0], nodes_ref[nid as usize][b1]);
-                        if c0 != MDD_DEAD { x0_ok = true; push_dedup!(c0); }
-                        if c1 != MDD_DEAD { x1_ok = true; push_dedup!(c1); }
+                        if c0 != MDD_DEAD {
+                            x0_ok = true;
+                            push_dedup!(c0);
+                        }
+                        if c1 != MDD_DEAD {
+                            x1_ok = true;
+                            push_dedup!(c1);
+                        }
                     }
                 }
-                if !x0_ok && !x1_ok { conflict = true; }
-                else if !x0_ok && self.assigns[xv] == LBool::Undef {
-                    forced[num_forced] = (xv + 1) as Lit; num_forced += 1;
+                if !x0_ok && !x1_ok {
+                    conflict = true;
+                } else if !x0_ok && self.assigns[xv] == LBool::Undef {
+                    forced[num_forced] = (xv + 1) as Lit;
+                    num_forced += 1;
                 } else if !x1_ok && self.assigns[xv] == LBool::Undef {
-                    forced[num_forced] = -((xv + 1) as Lit); num_forced += 1;
+                    forced[num_forced] = -((xv + 1) as Lit);
+                    num_forced += 1;
                 }
             } else {
                 let (mut x0_ok, mut x1_ok, mut y0_ok, mut y1_ok) = (false, false, false, false);
                 for &nid in frontier {
                     if nid == MDD_LEAF {
-                        x0_ok = true; x1_ok = true; y0_ok = true; y1_ok = true;
+                        x0_ok = true;
+                        x1_ok = true;
+                        y0_ok = true;
+                        y1_ok = true;
                         push_dedup!(MDD_LEAF);
                     } else {
                         for b in 0..4usize {
                             let c = nodes_ref[nid as usize][b];
                             if c != MDD_DEAD {
-                                if b & 1 == 0 { x0_ok = true; } else { x1_ok = true; }
-                                if b & 2 == 0 { y0_ok = true; } else { y1_ok = true; }
+                                if b & 1 == 0 {
+                                    x0_ok = true;
+                                } else {
+                                    x1_ok = true;
+                                }
+                                if b & 2 == 0 {
+                                    y0_ok = true;
+                                } else {
+                                    y1_ok = true;
+                                }
                                 push_dedup!(c);
                             }
                         }
                     }
                 }
-                if !x0_ok && !x1_ok { conflict = true; }
-                else if !y0_ok && !y1_ok { conflict = true; }
-                else {
+                if !x0_ok && !x1_ok {
+                    conflict = true;
+                } else if !y0_ok && !y1_ok {
+                    conflict = true;
+                } else {
                     if !x0_ok && self.assigns[xv] == LBool::Undef {
-                        forced[num_forced] = (xv + 1) as Lit; num_forced += 1;
+                        forced[num_forced] = (xv + 1) as Lit;
+                        num_forced += 1;
                     }
                     if !x1_ok && self.assigns[xv] == LBool::Undef {
-                        forced[num_forced] = -((xv + 1) as Lit); num_forced += 1;
+                        forced[num_forced] = -((xv + 1) as Lit);
+                        num_forced += 1;
                     }
                     if !y0_ok && self.assigns[yv] == LBool::Undef {
-                        forced[num_forced] = (yv + 1) as Lit; num_forced += 1;
+                        forced[num_forced] = (yv + 1) as Lit;
+                        num_forced += 1;
                     }
                     if !y1_ok && self.assigns[yv] == LBool::Undef {
-                        forced[num_forced] = -((yv + 1) as Lit); num_forced += 1;
+                        forced[num_forced] = -((yv + 1) as Lit);
+                        num_forced += 1;
                     }
                 }
             }
@@ -1701,16 +1891,26 @@ impl Solver {
             // Return the (now-old) vec to scratch_next for reuse.
             mdd.scratch_next = next;
 
-            if conflict { break; }
-            if num_forced > 0 { break; } // let forced vars trigger re-propagation
+            if conflict {
+                break;
+            }
+            if num_forced > 0 {
+                break;
+            } // let forced vars trigger re-propagation
         }
-        if let Some(l) = last_computed_level { mdd.dirty_level = l; }
+        if let Some(l) = last_computed_level {
+            mdd.dirty_level = l;
+        }
 
-        if conflict { return Some(Reason::Mdd); }
+        if conflict {
+            return Some(Reason::Mdd);
+        }
 
         for i in 0..num_forced {
             let flit = forced[i];
-            if self.lit_value(flit) == LBool::False { return Some(Reason::Mdd); }
+            if self.lit_value(flit) == LBool::False {
+                return Some(Reason::Mdd);
+            }
             if self.lit_value(flit) == LBool::Undef {
                 self.enqueue(flit, Reason::Mdd);
             }
@@ -1728,7 +1928,9 @@ impl Solver {
     /// are asserted at decision level 1. After solving, the solver backtracks
     /// to level 0, so assumptions don't persist but learnt clauses do.
     pub fn solve_with_assumptions(&mut self, assumptions: &[Lit]) -> Option<bool> {
-        if !self.ok { return Some(false); }
+        if !self.ok {
+            return Some(false);
+        }
 
         // Backtrack to level 0 before each solve to support incremental solving
         // (e.g. adding blocking clauses between solves). The previous SAT result
@@ -1754,7 +1956,9 @@ impl Solver {
         // Failed literal probing (runs once before first solve)
         if self.config.probing && self.conflicts == 0 {
             self.probe();
-            if !self.ok { return Some(false); }
+            if !self.ok {
+                return Some(false);
+            }
         }
 
         let assumption_level: u32 = if assumptions.is_empty() { 0 } else { 1 };
@@ -1833,7 +2037,9 @@ impl Solver {
     /// - `Some(true)` + empty assumptions → solver at decision level 0.
     /// - `Some(false)` → solver at decision level 0.
     pub fn propagate_only(&mut self, assumptions: &[Lit]) -> Option<bool> {
-        if !self.ok { return Some(false); }
+        if !self.ok {
+            return Some(false);
+        }
 
         if self.decision_level() > 0 {
             self.backtrack(0);
@@ -1953,8 +2159,12 @@ impl Solver {
     /// `last_nogood_stats`, `take_last_learnt_clause` are updated on
     /// `Some(false)`.
     pub fn push_assume_frame(&mut self, lits: &[Lit]) -> Option<bool> {
-        if !self.ok { return Some(false); }
-        if lits.is_empty() { return Some(true); }
+        if !self.ok {
+            return Some(false);
+        }
+        if lits.is_empty() {
+            return Some(true);
+        }
 
         // Pre-size reusable buffers (mirrors propagate_only).
         if self.quad_pb_seen_buf.len() < self.num_vars {
@@ -2099,7 +2309,9 @@ impl Solver {
     }
 
     /// Number of variables.
-    pub fn num_vars(&self) -> usize { self.num_vars }
+    pub fn num_vars(&self) -> usize {
+        self.num_vars
+    }
 
     /// Number of currently-assigned variables (trail length). Includes
     /// level-0 forced units, decision-level-1 assumption lits, and all
@@ -2107,7 +2319,9 @@ impl Solver {
     /// `num_assigned() - trail0_size - assums.len()` = vars the solver
     /// forced via propagation, i.e. the "free" pruning power of the
     /// current assumption prefix.
-    pub fn num_assigned(&self) -> usize { self.trail.len() }
+    pub fn num_assigned(&self) -> usize {
+        self.trail.len()
+    }
 
     /// Number of assigned vars with var-id in `1..=max_var` (inclusive).
     /// Useful for "how many walker-space variables have been resolved"
@@ -2119,7 +2333,9 @@ impl Solver {
         let upper = max_var.min(self.num_vars);
         let mut n = 0usize;
         for v in 1..=upper {
-            if self.assigns[v] != LBool::Undef { n += 1; }
+            if self.assigns[v] != LBool::Undef {
+                n += 1;
+            }
         }
         n
     }
@@ -2129,7 +2345,9 @@ impl Solver {
     pub fn verify_quad_pb_state(&self) -> usize {
         let mut bad = 0;
         for (qi, qc) in self.quad_pb_constraints.iter().enumerate() {
-            if qc.stale { continue; } // stale will be recomputed
+            if qc.stale {
+                continue;
+            } // stale will be recomputed
             let mut expected_sums = [0i32, 0, 0];
             for ti in 0..qc.num_terms as usize {
                 let t = &qc.terms[ti];
@@ -2139,15 +2357,27 @@ impl Solver {
                 expected_sums[expected_state as usize] += t.coeff as i32;
                 if t.state != expected_state {
                     if bad == 0 {
-                        eprintln!("QUAD PB BUG: constraint {} term {} state={} expected={} (var_a={} val={:?}, var_b={} val={:?})",
-                            qi, ti, t.state, expected_state, t.var_a(), aa, t.var_b(), ab);
+                        eprintln!(
+                            "QUAD PB BUG: constraint {} term {} state={} expected={} (var_a={} val={:?}, var_b={} val={:?})",
+                            qi,
+                            ti,
+                            t.state,
+                            expected_state,
+                            t.var_a(),
+                            aa,
+                            t.var_b(),
+                            ab
+                        );
                     }
                     bad += 1;
                 }
             }
             if qc.sums != expected_sums {
                 if bad == 0 {
-                    eprintln!("QUAD PB BUG: constraint {} sums={:?} expected={:?}", qi, qc.sums, expected_sums);
+                    eprintln!(
+                        "QUAD PB BUG: constraint {} sums={:?} expected={:?}",
+                        qi, qc.sums, expected_sums
+                    );
                 }
                 bad += 1;
             }
@@ -2157,10 +2387,14 @@ impl Solver {
 
     /// Get all learnt clauses as Vec<Vec<Lit>> (for debugging).
     pub fn get_learnt_clauses(&self) -> Vec<Vec<Lit>> {
-        self.clause_meta.iter().filter(|cm| cm.learnt && !cm.deleted).map(|cm| {
-            let s = cm.start as usize;
-            self.clause_lits[s..s + cm.len as usize].to_vec()
-        }).collect()
+        self.clause_meta
+            .iter()
+            .filter(|cm| cm.learnt && !cm.deleted)
+            .map(|cm| {
+                let s = cm.start as usize;
+                self.clause_lits[s..s + cm.len as usize].to_vec()
+            })
+            .collect()
     }
 
     /// Force recompute of ALL quad PB constraints (public, for testing).
@@ -2178,20 +2412,30 @@ impl Solver {
     pub fn clause_length_histogram(&self) -> Vec<u32> {
         let mut hist: Vec<u32> = Vec::new();
         for m in &self.clause_meta {
-            if m.deleted { continue; }
+            if m.deleted {
+                continue;
+            }
             let l = m.len as usize;
-            if hist.len() <= l { hist.resize(l + 1, 0); }
+            if hist.len() <= l {
+                hist.resize(l + 1, 0);
+            }
             hist[l] += 1;
         }
         hist
     }
     /// Number of conflicts so far.
-    pub fn num_conflicts(&self) -> u64 { self.conflicts }
+    pub fn num_conflicts(&self) -> u64 {
+        self.conflicts
+    }
     /// Number of branching decisions made so far.
-    pub fn num_decisions(&self) -> u64 { self.decisions }
+    pub fn num_decisions(&self) -> u64 {
+        self.decisions
+    }
     /// Number of variable assignments forced by propagation (clause BCP, PB,
     /// quad PB, XOR, MDD, spectral). Excludes branching decisions.
-    pub fn num_propagations(&self) -> u64 { self.propagations }
+    pub fn num_propagations(&self) -> u64 {
+        self.propagations
+    }
     /// Per-propagator forced-variable counts (sums to `num_propagations`).
     /// Summed across all decision levels; for the 2-D breakdown see
     /// `propagations_by_kind_level`.
@@ -2220,7 +2464,9 @@ impl Solver {
         let num_clauses = self.clause_meta.iter().filter(|m| !m.deleted).count();
         writeln!(w, "p cnf {} {}", self.num_vars, num_clauses)?;
         for m in &self.clause_meta {
-            if m.deleted { continue; }
+            if m.deleted {
+                continue;
+            }
             let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
             for &lit in lits {
                 write!(w, "{} ", lit)?;
@@ -2233,23 +2479,37 @@ impl Solver {
     /// Set a conflict limit. Solve returns None if limit is reached.
     /// Set to 0 to disable.
     /// Returns true if the solver is in a consistent state (no top-level contradiction detected).
-    pub fn is_ok(&self) -> bool { self.ok }
+    pub fn is_ok(&self) -> bool {
+        self.ok
+    }
 
     /// Add multiple unit clauses and propagate once at the end.
     /// More efficient than calling add_clause() for each unit individually.
     pub fn add_unit_clauses_batch(&mut self, units: &[Lit]) {
-        if !self.ok { return; }
+        if !self.ok {
+            return;
+        }
         for &lit in units {
             self.ensure_var(lit.unsigned_abs() as usize);
             let val = self.lit_value(lit);
             match val {
                 LBool::True => {} // already satisfied
-                LBool::False => { self.ok = false; return; }
+                LBool::False => {
+                    self.ok = false;
+                    return;
+                }
                 LBool::Undef => {
                     let ci = self.clause_meta.len() as u32;
                     let start = self.clause_lits.len() as u32;
                     self.clause_lits.push(lit);
-                    self.clause_meta.push(ClauseMeta { start, len: 1, learnt: false, lbd: 0, deleted: false, used: 0 });
+                    self.clause_meta.push(ClauseMeta {
+                        start,
+                        len: 1,
+                        learnt: false,
+                        lbd: 0,
+                        deleted: false,
+                        used: 0,
+                    });
                     self.enqueue(lit, Reason::Clause(ci));
                 }
             }
@@ -2260,7 +2520,9 @@ impl Solver {
         }
     }
 
-    pub fn set_conflict_limit(&mut self, limit: u64) { self.conflict_limit = limit; }
+    pub fn set_conflict_limit(&mut self, limit: u64) {
+        self.conflict_limit = limit;
+    }
 
     /// Set a variable's VSIDS activity score. Higher = decided earlier.
     /// Variable is 1-based (DIMACS convention).
@@ -2279,7 +2541,9 @@ impl Solver {
                     self.heap_pos[self.heap[pos]] = pos;
                     self.heap_pos[self.heap[parent]] = parent;
                     pos = parent;
-                } else { break; }
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -2292,7 +2556,9 @@ impl Solver {
     /// Find equivalent literals via SCC on the binary implication graph.
     /// Returns number of equivalences found and applied.
     pub fn preprocess_scc_equivalences(&mut self) -> usize {
-        if !self.ok { return 0; }
+        if !self.ok {
+            return 0;
+        }
         // Propagate first
         if self.propagate().is_some() {
             self.ok = false;
@@ -2307,7 +2573,9 @@ impl Solver {
         let mut adj: Vec<Vec<usize>> = vec![Vec::new(); num_lits];
 
         for m in &self.clause_meta {
-            if m.deleted || m.len != 2 { continue; }
+            if m.deleted || m.len != 2 {
+                continue;
+            }
             let lits = &self.clause_lits[m.start as usize..(m.start as usize + 2)];
             let a = lits[0];
             let b = lits[1];
@@ -2337,7 +2605,9 @@ impl Solver {
         let mut call_stack: Vec<(usize, usize)> = Vec::new(); // (node, neighbor_idx)
 
         for start in 0..num_lits {
-            if index[start] != usize::MAX { continue; }
+            if index[start] != usize::MAX {
+                continue;
+            }
 
             call_stack.push((start, 0));
             index[start] = index_counter;
@@ -2370,7 +2640,9 @@ impl Solver {
                             let w = stack.pop().unwrap();
                             on_stack[w] = false;
                             scc_id[w] = scc;
-                            if w == node { break; }
+                            if w == node {
+                                break;
+                            }
                         }
                     }
                     let (popped_node, _) = call_stack.pop().unwrap();
@@ -2400,14 +2672,22 @@ impl Solver {
         let mut equivs = 0usize;
 
         for v in 0..n {
-            if self.assigns[v] != LBool::Undef { continue; }
+            if self.assigns[v] != LBool::Undef {
+                continue;
+            }
             let pos_v = 2 * v;
-            if scc_id[pos_v] == usize::MAX { continue; }
+            if scc_id[pos_v] == usize::MAX {
+                continue;
+            }
 
             for w in (v + 1)..n {
-                if self.assigns[w] != LBool::Undef { continue; }
+                if self.assigns[w] != LBool::Undef {
+                    continue;
+                }
                 let pos_w = 2 * w;
-                if scc_id[pos_w] == usize::MAX { continue; }
+                if scc_id[pos_w] == usize::MAX {
+                    continue;
+                }
 
                 if scc_id[pos_v] == scc_id[pos_w] {
                     // v ↔ w: substitute w with v
@@ -2421,11 +2701,15 @@ impl Solver {
             }
         }
 
-        if equivs == 0 { return 0; }
+        if equivs == 0 {
+            return 0;
+        }
 
         // Apply substitutions to all non-deleted clauses
         for m in &mut self.clause_meta {
-            if m.deleted { continue; }
+            if m.deleted {
+                continue;
+            }
             let start = m.start as usize;
             let len = m.len as usize;
             for i in start..start + len {
@@ -2455,7 +2739,9 @@ impl Solver {
 
     /// BVE with a set of protected variable indices (0-based) that won't be eliminated.
     pub fn preprocess_bve_with_protection(&mut self, protected: &[usize]) -> usize {
-        if !self.ok { return 0; }
+        if !self.ok {
+            return 0;
+        }
         // Propagate first to simplify
         if self.propagate().is_some() {
             self.ok = false;
@@ -2468,15 +2754,21 @@ impl Solver {
         // First pass: simplify clauses using level-0 assignments.
         // Remove satisfied clauses, remove false literals from remaining clauses.
         self.simplify_clauses_at_level0();
-        if !self.ok { return 0; }
+        if !self.ok {
+            return 0;
+        }
 
         // Mark protected and constrained variables
         let mut skip_var = vec![false; num_vars];
         for &v in protected {
-            if v < num_vars { skip_var[v] = true; }
+            if v < num_vars {
+                skip_var[v] = true;
+            }
         }
         for pbc in &self.pb_constraints {
-            for &lit in &pbc.lits { skip_var[var_of(lit)] = true; }
+            for &lit in &pbc.lits {
+                skip_var[var_of(lit)] = true;
+            }
         }
         for qpbc in &self.quad_pb_constraints {
             for t in &qpbc.terms {
@@ -2485,20 +2777,29 @@ impl Solver {
             }
         }
         for xc in &self.xor_constraints {
-            for &v in &xc.vars { skip_var[v] = true; }
+            for &v in &xc.vars {
+                skip_var[v] = true;
+            }
         }
 
         // Build and maintain occurrence lists
         let mut pos_occs: Vec<Vec<u32>> = vec![Vec::new(); num_vars];
         let mut neg_occs: Vec<Vec<u32>> = vec![Vec::new(); num_vars];
         for (ci, m) in self.clause_meta.iter().enumerate() {
-            if m.deleted { continue; }
+            if m.deleted {
+                continue;
+            }
             let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
             for &lit in lits {
                 let v = var_of(lit);
-                if self.assigns[v] != LBool::Undef { continue; }
-                if lit > 0 { pos_occs[v].push(ci as u32); }
-                else { neg_occs[v].push(ci as u32); }
+                if self.assigns[v] != LBool::Undef {
+                    continue;
+                }
+                if lit > 0 {
+                    pos_occs[v].push(ci as u32);
+                } else {
+                    neg_occs[v].push(ci as u32);
+                }
             }
         }
 
@@ -2506,25 +2807,33 @@ impl Solver {
         let mut candidates: Vec<(usize, usize)> = (0..num_vars)
             .filter(|&v| {
                 self.assigns[v] == LBool::Undef
-                && !skip_var[v]
-                && !pos_occs[v].is_empty()
-                && !neg_occs[v].is_empty()
+                    && !skip_var[v]
+                    && !pos_occs[v].is_empty()
+                    && !neg_occs[v].is_empty()
             })
             .map(|v| (pos_occs[v].len() * neg_occs[v].len(), v))
             .collect();
         candidates.sort_unstable();
 
         for &(product, v) in &candidates {
-            if product > 50 { break; } // limit resolvent explosion
+            if product > 50 {
+                break;
+            } // limit resolvent explosion
 
             // Filter to non-deleted clauses
-            let pos_valid: Vec<u32> = pos_occs[v].iter().copied()
+            let pos_valid: Vec<u32> = pos_occs[v]
+                .iter()
+                .copied()
                 .filter(|&ci| !self.clause_meta[ci as usize].deleted)
                 .collect();
-            let neg_valid: Vec<u32> = neg_occs[v].iter().copied()
+            let neg_valid: Vec<u32> = neg_occs[v]
+                .iter()
+                .copied()
                 .filter(|&ci| !self.clause_meta[ci as usize].deleted)
                 .collect();
-            if pos_valid.is_empty() || neg_valid.is_empty() { continue; }
+            if pos_valid.is_empty() || neg_valid.is_empty() {
+                continue;
+            }
 
             let original_count = pos_valid.len() + neg_valid.len();
             let var_lit_pos = (v + 1) as i32;
@@ -2538,19 +2847,29 @@ impl Solver {
 
             for &pci in &pos_valid {
                 let pm = &self.clause_meta[pci as usize];
-                let p_lits: Vec<Lit> = self.clause_lits[pm.start as usize..(pm.start as usize + pm.len as usize)].to_vec();
+                let p_lits: Vec<Lit> = self.clause_lits
+                    [pm.start as usize..(pm.start as usize + pm.len as usize)]
+                    .to_vec();
                 for &nci in &neg_valid {
                     let nm = &self.clause_meta[nci as usize];
-                    let n_lits = &self.clause_lits[nm.start as usize..(nm.start as usize + nm.len as usize)];
+                    let n_lits =
+                        &self.clause_lits[nm.start as usize..(nm.start as usize + nm.len as usize)];
 
                     // Build resolvent with O(1) membership testing
                     let mut resolvent: Vec<Lit> = Vec::new();
                     let mut tautology = false;
 
                     for &lit in &p_lits {
-                        if lit == var_lit_pos { continue; }
-                        if self.lit_value(lit) == LBool::False { continue; }
-                        if self.lit_value(lit) == LBool::True { tautology = true; break; }
+                        if lit == var_lit_pos {
+                            continue;
+                        }
+                        if self.lit_value(lit) == LBool::False {
+                            continue;
+                        }
+                        if self.lit_value(lit) == LBool::True {
+                            tautology = true;
+                            break;
+                        }
                         let li = lit_index(lit);
                         if !in_resolvent[li] {
                             in_resolvent[li] = true;
@@ -2559,11 +2878,21 @@ impl Solver {
                     }
                     if !tautology {
                         for &lit in n_lits {
-                            if lit == var_lit_neg { continue; }
-                            if self.lit_value(lit) == LBool::False { continue; }
-                            if self.lit_value(lit) == LBool::True { tautology = true; break; }
+                            if lit == var_lit_neg {
+                                continue;
+                            }
+                            if self.lit_value(lit) == LBool::False {
+                                continue;
+                            }
+                            if self.lit_value(lit) == LBool::True {
+                                tautology = true;
+                                break;
+                            }
                             // Check for complementary literal
-                            if in_resolvent[lit_index(-lit)] { tautology = true; break; }
+                            if in_resolvent[lit_index(-lit)] {
+                                tautology = true;
+                                break;
+                            }
                             let li = lit_index(lit);
                             if !in_resolvent[li] {
                                 in_resolvent[li] = true;
@@ -2573,9 +2902,13 @@ impl Solver {
                     }
 
                     // Clear the bitset for next iteration
-                    for &lit in &resolvent { in_resolvent[lit_index(lit)] = false; }
+                    for &lit in &resolvent {
+                        in_resolvent[lit_index(lit)] = false;
+                    }
 
-                    if tautology { continue; }
+                    if tautology {
+                        continue;
+                    }
 
                     resolvents.push(resolvent);
                     if resolvents.len() > original_count {
@@ -2583,10 +2916,14 @@ impl Solver {
                         break;
                     }
                 }
-                if too_many { break; }
+                if too_many {
+                    break;
+                }
             }
 
-            if too_many || resolvents.len() > original_count { continue; }
+            if too_many || resolvents.len() > original_count {
+                continue;
+            }
 
             // Elimination is beneficial: delete original clauses, add resolvents
             for &ci in &pos_valid {
@@ -2618,13 +2955,21 @@ impl Solver {
                     let start = self.clause_lits.len() as u32;
                     self.clause_lits.extend_from_slice(resolvent);
                     self.clause_meta.push(ClauseMeta {
-                        start, len: resolvent.len() as u16, learnt: false, lbd: 0, deleted: false, used: 0,
+                        start,
+                        len: resolvent.len() as u16,
+                        learnt: false,
+                        lbd: 0,
+                        deleted: false,
+                        used: 0,
                     });
                     // Add to occurrence lists for future iterations
                     for &lit in resolvent {
                         let w = var_of(lit);
-                        if lit > 0 { pos_occs[w].push(ci); }
-                        else { neg_occs[w].push(ci); }
+                        if lit > 0 {
+                            pos_occs[w].push(ci);
+                        } else {
+                            neg_occs[w].push(ci);
+                        }
                     }
                 }
             }
@@ -2640,10 +2985,16 @@ impl Solver {
     /// Rebuild all watch lists from the clause database.
     /// Clears existing watches and re-adds watches for all non-deleted clauses with >= 2 literals.
     fn rebuild_watches(&mut self) {
-        for wl in &mut self.watches { wl.clear(); }
-        for bw in &mut self.bin_watches { bw.clear(); }
+        for wl in &mut self.watches {
+            wl.clear();
+        }
+        for bw in &mut self.bin_watches {
+            bw.clear();
+        }
         for (ci, m) in self.clause_meta.iter().enumerate() {
-            if m.deleted || m.len < 2 { continue; }
+            if m.deleted || m.len < 2 {
+                continue;
+            }
             let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
             if m.len == 2 && self.config.bin_watch_fastpath {
                 self.bin_watches[lit_index(negate(lits[0]))].push((lits[1], ci as u32));
@@ -2659,14 +3010,18 @@ impl Solver {
     /// Removes satisfied clauses and false literals. Also rebuilds watch lists.
     /// Returns the number of clauses removed.
     pub fn simplify(&mut self) -> usize {
-        if !self.ok { return 0; }
+        if !self.ok {
+            return 0;
+        }
         if self.propagate().is_some() {
             self.ok = false;
             return 0;
         }
         let before = self.clause_meta.iter().filter(|m| !m.deleted).count();
         self.simplify_clauses_at_level0();
-        if !self.ok { return 0; }
+        if !self.ok {
+            return 0;
+        }
         let after = self.clause_meta.iter().filter(|m| !m.deleted).count();
         // Rebuild watch lists from scratch (since clauses were modified)
         self.rebuild_watches();
@@ -2676,7 +3031,9 @@ impl Solver {
     fn simplify_clauses_at_level0(&mut self) {
         for ci in 0..self.clause_meta.len() {
             let m = &self.clause_meta[ci];
-            if m.deleted { continue; }
+            if m.deleted {
+                continue;
+            }
             let start = m.start as usize;
             let len = m.len as usize;
 
@@ -2715,7 +3072,9 @@ impl Solver {
     pub fn extract_learnt_clauses(&self, max_lbd: u8) -> Vec<Vec<Lit>> {
         let mut result = Vec::new();
         for m in &self.clause_meta {
-            if m.deleted || !m.learnt || m.lbd > max_lbd { continue; }
+            if m.deleted || !m.learnt || m.lbd > max_lbd {
+                continue;
+            }
             let lits = &self.clause_lits[m.start as usize..(m.start as usize + m.len as usize)];
             result.push(lits.to_vec());
         }
@@ -2744,13 +3103,17 @@ impl Solver {
     /// Clauses are added as learnt with the given LBD.
     pub fn inject_clauses(&mut self, clauses: &[Vec<Lit>], lbd: u8) {
         for clause in clauses {
-            if clause.len() < 2 { continue; } // skip unit/empty
+            if clause.len() < 2 {
+                continue;
+            } // skip unit/empty
             // Check all variables are in range
             let valid = clause.iter().all(|&lit| {
                 let v = (lit.abs() - 1) as usize;
                 v < self.num_vars
             });
-            if !valid { continue; }
+            if !valid {
+                continue;
+            }
             let start = self.clause_lits.len() as u32;
             self.clause_lits.extend_from_slice(clause);
             let ci = self.clause_meta.len() as u32;
@@ -2778,7 +3141,13 @@ impl Solver {
 
     /// Reset a quad PB constraint's incremental state from precomputed values.
     /// Used for fast boundary config switching without backtracking.
-    pub fn reset_quad_pb_state(&mut self, qi: usize, term_state: &[u8], #[allow(unused)] sum_true: i32, sum_maybe: i32) {
+    pub fn reset_quad_pb_state(
+        &mut self,
+        qi: usize,
+        term_state: &[u8],
+        #[allow(unused)] sum_true: i32,
+        sum_maybe: i32,
+    ) {
         let qc = &mut self.quad_pb_constraints[qi];
         for (i, &s) in term_state.iter().enumerate() {
             qc.terms[i].state = s;
@@ -2788,10 +3157,14 @@ impl Solver {
     }
 
     /// Get the number of quad PB constraints.
-    pub fn num_quad_pb(&self) -> usize { self.quad_pb_constraints.len() }
+    pub fn num_quad_pb(&self) -> usize {
+        self.quad_pb_constraints.len()
+    }
 
     /// Get the number of terms in a quad PB constraint.
-    pub fn quad_pb_num_terms(&self, qi: usize) -> usize { self.quad_pb_constraints[qi].num_terms as usize }
+    pub fn quad_pb_num_terms(&self, qi: usize) -> usize {
+        self.quad_pb_constraints[qi].num_terms as usize
+    }
 
     /// Get quad PB term info for precomputation.
     pub fn quad_pb_term_info(&self, qi: usize, ti: usize) -> (usize, usize, bool, bool) {
@@ -2803,10 +3176,15 @@ impl Solver {
     /// After calling this, new clauses/PBs/quad PBs/XORs/PbSetEq can be added
     /// and later undone with `restore_checkpoint`. Cheap: just records 7 integers.
     pub fn save_checkpoint(&self) -> (usize, usize, usize, usize, usize, usize, usize) {
-        (self.clause_meta.len(), self.clause_lits.len(),
-         self.pb_constraints.len(), self.num_vars,
-         self.quad_pb_constraints.len(), self.xor_constraints.len(),
-         self.pb_set_eq_constraints.len())
+        (
+            self.clause_meta.len(),
+            self.clause_lits.len(),
+            self.pb_constraints.len(),
+            self.num_vars,
+            self.quad_pb_constraints.len(),
+            self.xor_constraints.len(),
+            self.pb_set_eq_constraints.len(),
+        )
     }
 
     /// Restore the solver to a previous checkpoint, removing all clauses/PBs/quad PBs/XORs/PbSetEq
@@ -2886,14 +3264,22 @@ impl Solver {
         self.backtrack(0);
         // Mark learnt clauses as deleted
         for cm in &mut self.clause_meta {
-            if cm.learnt { cm.deleted = true; }
+            if cm.learnt {
+                cm.deleted = true;
+            }
         }
         // Rebuild watch lists (only non-deleted clauses). R2: route
         // binaries into bin_watches when fastpath is enabled.
-        for wl in &mut self.watches { wl.clear(); }
-        for bw in &mut self.bin_watches { bw.clear(); }
+        for wl in &mut self.watches {
+            wl.clear();
+        }
+        for bw in &mut self.bin_watches {
+            bw.clear();
+        }
         for (ci, cm) in self.clause_meta.iter().enumerate() {
-            if cm.deleted || cm.len < 2 { continue; }
+            if cm.deleted || cm.len < 2 {
+                continue;
+            }
             let start = cm.start as usize;
             let l0 = self.clause_lits[start];
             let l1 = self.clause_lits[start + 1];
@@ -2927,7 +3313,9 @@ impl Solver {
     pub fn clear_learnt(&mut self) {
         self.backtrack(0);
         for m in &mut self.clause_meta {
-            if m.learnt { m.deleted = true; }
+            if m.learnt {
+                m.deleted = true;
+            }
         }
         for wl in &mut self.watches {
             wl.retain(|&(ci, _)| !self.clause_meta[ci as usize].deleted);
@@ -2954,7 +3342,9 @@ impl Solver {
         // Collect candidate clause indices (learnt, non-deleted, len >= 3, small LBD)
         let mut candidates: Vec<(u8, u32)> = Vec::new(); // (lbd, ci)
         for (ci, m) in self.clause_meta.iter().enumerate() {
-            if m.deleted || !m.learnt || m.len < 3 || m.lbd > 3 { continue; }
+            if m.deleted || !m.learnt || m.len < 3 || m.lbd > 3 {
+                continue;
+            }
             candidates.push((m.lbd, ci as u32));
         }
         candidates.sort_unstable(); // sort by LBD (best first)
@@ -2962,7 +3352,9 @@ impl Solver {
 
         for &(_, ci) in &candidates {
             let m = &self.clause_meta[ci as usize];
-            if m.deleted { continue; }
+            if m.deleted {
+                continue;
+            }
             let len = m.len as usize;
             let start = m.start as usize;
 
@@ -3033,16 +3425,24 @@ impl Solver {
                     let new_start = self.clause_lits.len() as u32;
                     let lbd = self.compute_lbd(&short_lits).min(new_len as u32) as u8;
                     if short_lits.len() == 2 && self.config.bin_watch_fastpath {
-                        self.bin_watches[lit_index(negate(short_lits[0]))].push((short_lits[1], new_ci));
-                        self.bin_watches[lit_index(negate(short_lits[1]))].push((short_lits[0], new_ci));
+                        self.bin_watches[lit_index(negate(short_lits[0]))]
+                            .push((short_lits[1], new_ci));
+                        self.bin_watches[lit_index(negate(short_lits[1]))]
+                            .push((short_lits[0], new_ci));
                     } else {
-                        self.watches[lit_index(negate(short_lits[0]))].push((new_ci, short_lits[1]));
-                        self.watches[lit_index(negate(short_lits[1]))].push((new_ci, short_lits[0]));
+                        self.watches[lit_index(negate(short_lits[0]))]
+                            .push((new_ci, short_lits[1]));
+                        self.watches[lit_index(negate(short_lits[1]))]
+                            .push((new_ci, short_lits[0]));
                     }
                     self.clause_lits.extend_from_slice(&short_lits);
                     self.clause_meta.push(ClauseMeta {
-                        start: new_start, len: short_lits.len() as u16,
-                        learnt: true, lbd, deleted: false, used: 0,
+                        start: new_start,
+                        len: short_lits.len() as u16,
+                        learnt: true,
+                        lbd,
+                        deleted: false,
+                        used: 0,
                     });
                 }
             }
@@ -3056,8 +3456,14 @@ impl Solver {
         // Make decisions for all unassigned variables in order
         let n = self.num_vars;
         for v in 0..n {
-            if self.assigns[v] != LBool::Undef { continue; }
-            let lit = if self.phase[v] { (v + 1) as i32 } else { -((v + 1) as i32) };
+            if self.assigns[v] != LBool::Undef {
+                continue;
+            }
+            let lit = if self.phase[v] {
+                (v + 1) as i32
+            } else {
+                -((v + 1) as i32)
+            };
             self.new_decision_level();
             self.enqueue(lit, Reason::Decision);
             if let Some(_conflict) = self.propagate() {
@@ -3090,9 +3496,13 @@ impl Solver {
                 // at the current decision level (before backtrack).
                 #[cfg(debug_assertions)]
                 for &lit in &learnt_clause {
-                    debug_assert!(self.lit_value(lit) == LBool::False,
+                    debug_assert!(
+                        self.lit_value(lit) == LBool::False,
                         "learnt clause lit {} should be false but is {:?} (level={})",
-                        lit, self.lit_value(lit), self.level[var_of(lit)]);
+                        lit,
+                        self.lit_value(lit),
+                        self.level[var_of(lit)]
+                    );
                 }
                 let bt_level = bt_level.max(base_level);
                 let cur_level = self.decision_level();
@@ -3126,8 +3536,8 @@ impl Solver {
                 let should_restart = if self.config.ema_restarts {
                     // Glucose-style: restart when recent LBD quality is worse than global,
                     // but block if trail is unusually long (making good progress).
-                    let lbd_trigger = self.conflicts > 100
-                        && self.ema_lbd_fast > 1.25 * self.ema_lbd_slow;
+                    let lbd_trigger =
+                        self.conflicts > 100 && self.ema_lbd_fast > 1.25 * self.ema_lbd_slow;
                     let blocked = self.ema_restart_block < 50
                         || self.ema_trail_fast > 1.4 * self.ema_trail_slow;
                     lbd_trigger && !blocked
@@ -3172,7 +3582,9 @@ impl Solver {
     /// Get the value of a variable after solving. Var is 1-based.
     pub fn value(&self, var: i32) -> Option<bool> {
         let v = var.unsigned_abs() as usize;
-        if v == 0 || v > self.num_vars { return None; }
+        if v == 0 || v > self.num_vars {
+            return None;
+        }
         match self.assigns[v - 1] {
             LBool::True => Some(var > 0),
             LBool::False => Some(var < 0),
@@ -3195,20 +3607,35 @@ impl Solver {
     fn lit_value(&self, lit: Lit) -> LBool {
         let v = var_of(lit);
         let a = self.assigns[v];
-        if a == LBool::Undef { return LBool::Undef; }
+        if a == LBool::Undef {
+            return LBool::Undef;
+        }
         // True XOR negative = flip if literal is negative
-        if (a == LBool::True) == (lit > 0) { LBool::True } else { LBool::False }
+        if (a == LBool::True) == (lit > 0) {
+            LBool::True
+        } else {
+            LBool::False
+        }
     }
 
     fn enqueue(&mut self, lit: Lit, reason: Reason) {
         let v = var_of(lit);
-        debug_assert!(self.assigns[v] == LBool::Undef,
-            "enqueue lit={} but var {} already assigned {:?}", lit, v, self.assigns[v]);
+        debug_assert!(
+            self.assigns[v] == LBool::Undef,
+            "enqueue lit={} but var {} already assigned {:?}",
+            lit,
+            v,
+            self.assigns[v]
+        );
         self.assigns[v] = if lit > 0 { LBool::True } else { LBool::False };
         self.trail_pos[v] = self.trail.len();
         self.level[v] = self.decision_level();
         self.reason[v] = reason;
-        self.trail.push(TrailEntry { lit, level: self.decision_level(), reason });
+        self.trail.push(TrailEntry {
+            lit,
+            level: self.decision_level(),
+            reason,
+        });
         if let Some(kind) = reason.prop_kind() {
             self.propagations += 1;
             let lvl = self.decision_level() as usize;
@@ -3268,7 +3695,9 @@ impl Solver {
                 for idx in 0..self.xor_var_watches[v].len() {
                     let xi = self.xor_var_watches[v][idx];
                     let xc = &mut self.xor_constraints[xi as usize];
-                    if xc.num_unknown == 0 { continue; } // already fully resolved (e.g. by add_xor)
+                    if xc.num_unknown == 0 {
+                        continue;
+                    } // already fully resolved (e.g. by add_xor)
                     xc.num_unknown -= 1;
                     xc.assigned_xor ^= val;
                     // Recount unknowns from scratch. The incremental num_unknown
@@ -3353,17 +3782,25 @@ impl Solver {
                         let num_sv = spec.num_seq_vars;
                         let mut cl: Vec<Lit> = Vec::with_capacity(num_sv);
                         for sv in 0..num_sv {
-                            if !spec.assigned[sv] { continue; }
+                            if !spec.assigned[sv] {
+                                continue;
+                            }
                             let sv_lit = (sv + 1) as Lit;
                             cl.push(if spec.values[sv] > 0 { -sv_lit } else { sv_lit });
                         }
                         let ci = self.clause_meta.len() as u32;
                         let cs = self.clause_lits.len();
                         let cn = cl.len();
-                        for &l in &cl { self.clause_lits.push(l); }
+                        for &l in &cl {
+                            self.clause_lits.push(l);
+                        }
                         self.clause_meta.push(ClauseMeta {
-                            start: cs as u32, len: cn as u16,
-                            learnt: true, deleted: false, lbd: cn.min(255) as u8, used: 0,
+                            start: cs as u32,
+                            len: cn as u16,
+                            learnt: true,
+                            deleted: false,
+                            lbd: cn.min(255) as u8,
+                            used: 0,
                         });
                         if cn == 2 && self.config.bin_watch_fastpath {
                             self.bin_watches[lit_index(cl[0])].push((cl[1], ci));
@@ -3387,8 +3824,12 @@ impl Solver {
                         let mut conflict = false;
 
                         for u in 0..num_sv {
-                            if spec.assigned[u] { continue; }
-                            if self.assigns[u] != LBool::Undef { continue; }
+                            if spec.assigned[u] {
+                                continue;
+                            }
+                            if self.assigns[u] != LBool::Undef {
+                                continue;
+                            }
                             let base = u * nf;
                             let mut pos_bad = false;
                             let mut neg_bad = false;
@@ -3400,25 +3841,35 @@ impl Solver {
                                 if !pos_bad {
                                     let re = spec.re[fi] + c;
                                     let im = spec.im[fi] + s;
-                                    if (re*re + im*im).sqrt() - remaining > sqrt_bound {
+                                    if (re * re + im * im).sqrt() - remaining > sqrt_bound {
                                         pos_bad = true;
                                     }
                                 }
                                 if !neg_bad {
                                     let re = spec.re[fi] - c;
                                     let im = spec.im[fi] - s;
-                                    if (re*re + im*im).sqrt() - remaining > sqrt_bound {
+                                    if (re * re + im * im).sqrt() - remaining > sqrt_bound {
                                         neg_bad = true;
                                     }
                                 }
-                                if pos_bad && neg_bad { break; }
+                                if pos_bad && neg_bad {
+                                    break;
+                                }
                             }
-                            if pos_bad && neg_bad { conflict = true; break; }
-                            if pos_bad { forced.push(-((u + 1) as Lit)); }
-                            else if neg_bad { forced.push((u + 1) as Lit); }
+                            if pos_bad && neg_bad {
+                                conflict = true;
+                                break;
+                            }
+                            if pos_bad {
+                                forced.push(-((u + 1) as Lit));
+                            } else if neg_bad {
+                                forced.push((u + 1) as Lit);
+                            }
                         }
 
-                        if conflict { return Some(Reason::Spectral); }
+                        if conflict {
+                            return Some(Reason::Spectral);
+                        }
                         for flit in forced {
                             if self.lit_value(flit) == LBool::Undef {
                                 self.enqueue(flit, Reason::Spectral);
@@ -3448,11 +3899,17 @@ impl Solver {
             let bin_len = self.bin_watches[watch_idx].len();
             for idx in 0..bin_len {
                 let (other, ci) = self.bin_watches[watch_idx][idx];
-                if self.clause_meta[ci as usize].deleted { continue; }
+                if self.clause_meta[ci as usize].deleted {
+                    continue;
+                }
                 match self.lit_value(other) {
                     LBool::True => {} // clause satisfied
-                    LBool::False => { return Some(ci); } // conflict
-                    LBool::Undef => { self.enqueue(other, Reason::Clause(ci)); }
+                    LBool::False => {
+                        return Some(ci);
+                    } // conflict
+                    LBool::Undef => {
+                        self.enqueue(other, Reason::Clause(ci));
+                    }
                 }
             }
         }
@@ -3552,7 +4009,9 @@ impl Solver {
             let a = self.assigns[v];
             if a == LBool::Undef {
                 slack += pb.coeffs[i] as i64;
-                if first_undef == n { first_undef = i; }
+                if first_undef == n {
+                    first_undef = i;
+                }
             } else if (a == LBool::True) == (pb.lits[i] > 0) {
                 // Literal is true → contributes to slack
                 slack += pb.coeffs[i] as i64;
@@ -3565,7 +4024,9 @@ impl Solver {
 
         // Propagate: any undef literal whose coefficient > slack must be true.
         // Early exit: if slack >= max_coeff, no propagation possible.
-        if slack > 0 { return None; } // all coefficients are 1, so slack>0 means no propagation
+        if slack > 0 {
+            return None;
+        } // all coefficients are 1, so slack>0 means no propagation
 
         // slack == 0: force all undef literals
         for i in first_undef..n {
@@ -3611,7 +4072,9 @@ impl Solver {
 
         let qc = &mut self.quad_pb_constraints[qi as usize];
         let old_state = qc.terms[ti].state;
-        if old_state == new_state { return; }
+        if old_state == new_state {
+            return;
+        }
 
         let c = qc.terms[ti].coeff as i32;
         // Branchless: decrement old bucket, increment new bucket.
@@ -3673,20 +4136,28 @@ impl Solver {
         let slack_up = sum_true + sum_maybe - target_lo;
         // slack_down: how many more can become TRUE before exceeding upper bound
         let slack_down = target_hi - sum_true;
-        if slack_up > 0 && slack_down > 0 { return None; }
+        if slack_up > 0 && slack_down > 0 {
+            return None;
+        }
 
         for i in 0..n {
             let t = &self.quad_pb_constraints[qi as usize].terms[i];
             // Fast path: DEAD and TRUE terms can never propagate
-            if t.state != 1 { continue; }
+            if t.state != 1 {
+                continue;
+            }
             let aa = self.assigns[t.var_a()];
             let ab = self.assigns[t.var_b()];
             let a_false = aa != LBool::Undef && aa != t.true_val_a();
             let b_false = ab != LBool::Undef && ab != t.true_val_b();
-            if a_false | b_false { continue; }
+            if a_false | b_false {
+                continue;
+            }
             let a_undef = aa == LBool::Undef;
             let b_undef = ab == LBool::Undef;
-            if !a_undef && !b_undef { continue; }
+            if !a_undef && !b_undef {
+                continue;
+            }
 
             let c = t.coeff as i64;
             let la = t.lit_a;
@@ -3695,10 +4166,16 @@ impl Solver {
             if c > slack_up {
                 propagated_lit = if !a_undef { lb } else { la };
             } else if c > slack_down && (!a_undef || !b_undef) {
-                if !a_undef && b_undef { propagated_lit = negate(lb); }
-                else if !b_undef && a_undef { propagated_lit = negate(la); }
-                else { continue; }
-            } else { continue; }
+                if !a_undef && b_undef {
+                    propagated_lit = negate(lb);
+                } else if !b_undef && a_undef {
+                    propagated_lit = negate(la);
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            }
 
             // Lazy explanation: encode is_upper in bit 31 of qi, defer building to analyze time.
             let is_upper = c > slack_down;
@@ -3726,8 +4203,16 @@ impl Solver {
         for t in terms {
             let va = t.var_a();
             let vb = t.var_b();
-            let aa = if self.assigns[va] != LBool::Undef && self.trail_pos[va] < pv_pos { self.assigns[va] } else { LBool::Undef };
-            let ab = if self.assigns[vb] != LBool::Undef && self.trail_pos[vb] < pv_pos { self.assigns[vb] } else { LBool::Undef };
+            let aa = if self.assigns[va] != LBool::Undef && self.trail_pos[va] < pv_pos {
+                self.assigns[va]
+            } else {
+                LBool::Undef
+            };
+            let ab = if self.assigns[vb] != LBool::Undef && self.trail_pos[vb] < pv_pos {
+                self.assigns[vb]
+            } else {
+                LBool::Undef
+            };
             let af = (aa == LBool::True && t.neg_a()) || (aa == LBool::False && !t.neg_a());
             let bf = (ab == LBool::True && t.neg_b()) || (ab == LBool::False && !t.neg_b());
 
@@ -3783,9 +4268,13 @@ impl Solver {
 
         while let Some(lit) = worklist.pop() {
             let v = var_of(lit);
-            if self.analyze_seen[v] { continue; }
+            if self.analyze_seen[v] {
+                continue;
+            }
             self.analyze_seen[v] = true;
-            if self.assigns[v] == LBool::Undef { continue; }
+            if self.assigns[v] == LBool::Undef {
+                continue;
+            }
             if self.level[v] == 0 {
                 // Root-level fact; not part of any nogood.
                 continue;
@@ -3820,8 +4309,17 @@ impl Solver {
     /// through (currently false; its negation is the propagated-true
     /// lit we need to exclude from the antecedent set).  Pass 0 for
     /// the initial conflict reason (no propagated lit to skip).
-    fn collect_reason_lits_into(&mut self, reason: Reason, propagated_false_lit: Lit, out: &mut Vec<Lit>) {
-        let skip_true_lit = if propagated_false_lit == 0 { 0 } else { -propagated_false_lit };
+    fn collect_reason_lits_into(
+        &mut self,
+        reason: Reason,
+        propagated_false_lit: Lit,
+        out: &mut Vec<Lit>,
+    ) {
+        let skip_true_lit = if propagated_false_lit == 0 {
+            0
+        } else {
+            -propagated_false_lit
+        };
         match reason {
             Reason::Clause(ci) => {
                 let m = self.clause_meta[ci as usize];
@@ -3829,7 +4327,9 @@ impl Solver {
                 let clen = m.len as usize;
                 for i in 0..clen {
                     let l = self.clause_lits[cstart + i];
-                    if l == skip_true_lit { continue; }
+                    if l == skip_true_lit {
+                        continue;
+                    }
                     if self.lit_value(l) == LBool::False {
                         out.push(l);
                     }
@@ -3840,7 +4340,9 @@ impl Solver {
                 let n_lits = pb.lits.len();
                 for i in 0..n_lits {
                     let l = self.pb_constraints[pbi as usize].lits[i];
-                    if l == skip_true_lit { continue; }
+                    if l == skip_true_lit {
+                        continue;
+                    }
                     if self.lit_value(l) == LBool::False {
                         out.push(l);
                     }
@@ -3941,7 +4443,14 @@ impl Solver {
                     let cstart = m.start as usize;
                     let clen = m.len as usize;
                     for idx in 0..clen {
-                        process_reason_lit!(self, self.clause_lits[cstart + idx], p, counter, learnt, bt_level);
+                        process_reason_lit!(
+                            self,
+                            self.clause_lits[cstart + idx],
+                            p,
+                            counter,
+                            learnt,
+                            bt_level
+                        );
                     }
                 }
                 Reason::Pb(pbi) => {
@@ -3950,14 +4459,25 @@ impl Solver {
                     let pb = &self.pb_constraints[pbi as usize];
                     for i in 0..pb.lits.len() {
                         let lit = pb.lits[i];
-                        if lit == negate(p) { continue; }
+                        if lit == negate(p) {
+                            continue;
+                        }
                         if self.lit_value(lit) == LBool::False {
                             self.analyze_reason_buf.push(lit);
                         }
                     }
-                    if p != 0 { self.analyze_reason_buf.push(p); }
+                    if p != 0 {
+                        self.analyze_reason_buf.push(p);
+                    }
                     for idx in 0..self.analyze_reason_buf.len() {
-                        process_reason_lit!(self, self.analyze_reason_buf[idx], p, counter, learnt, bt_level);
+                        process_reason_lit!(
+                            self,
+                            self.analyze_reason_buf[idx],
+                            p,
+                            counter,
+                            learnt,
+                            bt_level
+                        );
                     }
                 }
                 Reason::QuadPb(qi_encoded) => {
@@ -3973,11 +4493,19 @@ impl Solver {
                         let nt = self.quad_pb_constraints[qi].num_terms as usize;
                         for ti in 0..nt {
                             let t = &self.quad_pb_constraints[qi].terms[ti];
-                            let pairs: [(Lit, usize); 2] = [(t.lit_a, t.var_a()), (t.lit_b, t.var_b())];
+                            let pairs: [(Lit, usize); 2] =
+                                [(t.lit_a, t.var_a()), (t.lit_b, t.var_b())];
                             for &(lit, v) in &pairs {
-                                if !self.quad_pb_seen_buf[v] && self.assigns[v] != LBool::Undef && self.level[v] > 0 {
+                                if !self.quad_pb_seen_buf[v]
+                                    && self.assigns[v] != LBool::Undef
+                                    && self.level[v] > 0
+                                {
                                     self.quad_pb_seen_buf[v] = true;
-                                    buf.push(if self.lit_value(lit) == LBool::False { lit } else { negate(lit) });
+                                    buf.push(if self.lit_value(lit) == LBool::False {
+                                        lit
+                                    } else {
+                                        negate(lit)
+                                    });
                                 }
                             }
                         }
@@ -3998,17 +4526,31 @@ impl Solver {
                     let mut buf = std::mem::take(&mut self.analyze_reason_buf);
                     buf.clear();
                     let pv = if p != 0 { var_of(p) } else { usize::MAX };
-                    let pv_pos = if pv < self.num_vars { self.trail_pos[pv] } else { usize::MAX };
+                    let pv_pos = if pv < self.num_vars {
+                        self.trail_pos[pv]
+                    } else {
+                        usize::MAX
+                    };
                     let xc = &self.xor_constraints[xi as usize];
                     for &v in &xc.vars {
-                        if v == pv { continue; }
-                        if self.assigns[v] == LBool::Undef { continue; }
+                        if v == pv {
+                            continue;
+                        }
+                        if self.assigns[v] == LBool::Undef {
+                            continue;
+                        }
                         // For propagation reasons (p!=0): only include vars assigned
                         // before the propagated variable on the trail.
                         // For conflict reasons (p==0): include all assigned vars.
-                        if p != 0 && self.trail_pos[v] >= pv_pos { continue; }
+                        if p != 0 && self.trail_pos[v] >= pv_pos {
+                            continue;
+                        }
                         let lit_v = (v + 1) as Lit;
-                        let neg_lit = if self.assigns[v] == LBool::True { -lit_v } else { lit_v };
+                        let neg_lit = if self.assigns[v] == LBool::True {
+                            -lit_v
+                        } else {
+                            lit_v
+                        };
                         buf.push(neg_lit);
                     }
                     for idx in 0..buf.len() {
@@ -4024,14 +4566,24 @@ impl Solver {
                     let mut buf = std::mem::take(&mut self.analyze_reason_buf);
                     buf.clear();
                     let pv = if p != 0 { var_of(p) } else { usize::MAX };
-                    let pv_pos = if pv < self.num_vars { self.trail_pos[pv] } else { usize::MAX };
+                    let pv_pos = if pv < self.num_vars {
+                        self.trail_pos[pv]
+                    } else {
+                        usize::MAX
+                    };
                     let n_lits = self.pb_set_eq_constraints[pi as usize].lits.len();
                     for i in 0..n_lits {
                         let cl = self.pb_set_eq_constraints[pi as usize].lits[i];
                         let v = var_of(cl);
-                        if v == pv { continue; }
-                        if self.assigns[v] == LBool::Undef { continue; }
-                        if p != 0 && self.trail_pos[v] >= pv_pos { continue; }
+                        if v == pv {
+                            continue;
+                        }
+                        if self.assigns[v] == LBool::Undef {
+                            continue;
+                        }
+                        if p != 0 && self.trail_pos[v] >= pv_pos {
+                            continue;
+                        }
                         // Push the negation of the literal's current truth value.
                         let cur_true = self.lit_value(cl) == LBool::True;
                         let neg_lit = if cur_true { -cl } else { cl };
@@ -4056,12 +4608,18 @@ impl Solver {
                             }
                         }
                     }
-                    if p != 0 { buf.push(p); }
+                    if p != 0 {
+                        buf.push(p);
+                    }
                     for idx in 0..buf.len() {
                         let lit = buf[idx];
-                        if lit == p { continue; }
+                        if lit == p {
+                            continue;
+                        }
                         let v = var_of(lit);
-                        if self.analyze_seen[v] { continue; }
+                        if self.analyze_seen[v] {
+                            continue;
+                        }
                         self.analyze_seen[v] = true;
                         self.bump_activity(v);
                         if self.level[v] == self.decision_level() {
@@ -4082,24 +4640,36 @@ impl Solver {
                             for &v in &[mdd.level_x_var[level], mdd.level_y_var[level]] {
                                 if self.assigns[v] != LBool::Undef {
                                     let lit_v = (v + 1) as Lit;
-                                    buf.push(if self.assigns[v] == LBool::True { -lit_v } else { lit_v });
+                                    buf.push(if self.assigns[v] == LBool::True {
+                                        -lit_v
+                                    } else {
+                                        lit_v
+                                    });
                                 }
                             }
                         }
                     }
-                    if p != 0 { buf.push(p); }
+                    if p != 0 {
+                        buf.push(p);
+                    }
                     for idx in 0..buf.len() {
                         let lit = buf[idx];
-                        if lit == p { continue; }
+                        if lit == p {
+                            continue;
+                        }
                         let v = var_of(lit);
-                        if self.analyze_seen[v] { continue; }
+                        if self.analyze_seen[v] {
+                            continue;
+                        }
                         self.analyze_seen[v] = true;
                         self.bump_activity(v);
                         if self.level[v] == self.decision_level() {
                             counter += 1;
                         } else if self.level[v] > 0 {
                             learnt.push(negate(lit));
-                            if self.level[v] > bt_level { bt_level = self.level[v]; }
+                            if self.level[v] > bt_level {
+                                bt_level = self.level[v];
+                            }
                         }
                     }
                     self.analyze_reason_buf = buf;
@@ -4150,7 +4720,9 @@ impl Solver {
         self.minimize_levels.fill(false);
         for &lit in learnt.iter() {
             let lv = self.level[var_of(lit)] as usize;
-            if lv < dl { self.minimize_levels[lv] = true; }
+            if lv < dl {
+                self.minimize_levels[lv] = true;
+            }
         }
 
         let mut j = 1;
@@ -4158,8 +4730,16 @@ impl Solver {
             let lit = learnt[i];
             let v = var_of(lit);
             match self.reason[v] {
-                Reason::Clause(_) | Reason::Pb(_) | Reason::QuadPb(_) | Reason::Xor(_) | Reason::Spectral | Reason::Mdd | Reason::PbSetEq(_) => {
-                    if self.lit_removable(v) { continue; }
+                Reason::Clause(_)
+                | Reason::Pb(_)
+                | Reason::QuadPb(_)
+                | Reason::Xor(_)
+                | Reason::Spectral
+                | Reason::Mdd
+                | Reason::PbSetEq(_) => {
+                    if self.lit_removable(v) {
+                        continue;
+                    }
                 }
                 Reason::Decision => {}
             }
@@ -4186,8 +4766,12 @@ impl Solver {
                             $fail = true;
                         } else {
                             match $self.reason[u] {
-                                Reason::Decision => { $fail = true; }
-                                _ => { $self.minimize_stack.push(u); }
+                                Reason::Decision => {
+                                    $fail = true;
+                                }
+                                _ => {
+                                    $self.minimize_stack.push(u);
+                                }
                             }
                         }
                     }
@@ -4210,17 +4794,28 @@ impl Solver {
                     let cstart = m.start as usize;
                     let clen = m.len as usize;
                     for idx in 0..clen {
-                        check_minimize_var!(self, var_of(self.clause_lits[cstart + idx]), cur, fail);
-                        if fail { return false; }
+                        check_minimize_var!(
+                            self,
+                            var_of(self.clause_lits[cstart + idx]),
+                            cur,
+                            fail
+                        );
+                        if fail {
+                            return false;
+                        }
                     }
                 }
                 Reason::Pb(pbi) => {
                     let n = self.pb_constraints[pbi as usize].lits.len();
                     for i in 0..n {
                         let lit = self.pb_constraints[pbi as usize].lits[i];
-                        if self.lit_value(lit) != LBool::False { continue; }
+                        if self.lit_value(lit) != LBool::False {
+                            continue;
+                        }
                         check_minimize_var!(self, var_of(lit), cur, fail);
-                        if fail { return false; }
+                        if fail {
+                            return false;
+                        }
                     }
                 }
                 Reason::QuadPb(qi_encoded) => {
@@ -4228,18 +4823,26 @@ impl Solver {
                     self.compute_quad_pb_explanation_into(qi_encoded, cur, &mut buf2);
                     for idx in 0..buf2.len() {
                         check_minimize_var!(self, var_of(buf2[idx]), cur, fail);
-                        if fail { break; }
+                        if fail {
+                            break;
+                        }
                     }
                     self.analyze_reason_buf2 = buf2;
-                    if fail { return false; }
+                    if fail {
+                        return false;
+                    }
                 }
                 Reason::Xor(xi) => {
                     let xc = &self.xor_constraints[xi as usize];
                     for vi in 0..xc.vars.len() {
                         let u = xc.vars[vi];
-                        if self.assigns[u] == LBool::Undef { continue; }
+                        if self.assigns[u] == LBool::Undef {
+                            continue;
+                        }
                         check_minimize_var!(self, u, cur, fail);
-                        if fail { return false; }
+                        if fail {
+                            return false;
+                        }
                     }
                 }
                 Reason::PbSetEq(pi) => {
@@ -4247,25 +4850,41 @@ impl Solver {
                     for i in 0..n_lits {
                         let lit = self.pb_set_eq_constraints[pi as usize].lits[i];
                         let u = var_of(lit);
-                        if self.assigns[u] == LBool::Undef { continue; }
+                        if self.assigns[u] == LBool::Undef {
+                            continue;
+                        }
                         check_minimize_var!(self, u, cur, fail);
-                        if fail { return false; }
+                        if fail {
+                            return false;
+                        }
                     }
                 }
                 Reason::Spectral => {
                     // Spectral reason: all assigned sequence vars
                     if let Some(ref spec) = self.spectral {
                         for v in 0..spec.num_seq_vars {
-                            if !spec.assigned[v] { continue; }
-                            if v == cur || self.minimize_visited[v] { continue; }
+                            if !spec.assigned[v] {
+                                continue;
+                            }
+                            if v == cur || self.minimize_visited[v] {
+                                continue;
+                            }
                             self.minimize_visited[v] = true;
-                            if self.level[v] == 0 { continue; }
-                            if self.analyze_seen[v] { continue; }
+                            if self.level[v] == 0 {
+                                continue;
+                            }
+                            if self.analyze_seen[v] {
+                                continue;
+                            }
                             let lv = self.level[v] as usize;
-                            if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { return false; }
+                            if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] {
+                                return false;
+                            }
                             match self.reason[v] {
                                 Reason::Decision => return false,
-                                _ => { self.minimize_stack.push(v); }
+                                _ => {
+                                    self.minimize_stack.push(v);
+                                }
                             }
                         }
                     }
@@ -4274,16 +4893,28 @@ impl Solver {
                     if let Some(ref mdd) = self.mdd {
                         for level in 0..mdd.depth {
                             for &v in &[mdd.level_x_var[level], mdd.level_y_var[level]] {
-                                if self.assigns[v] == LBool::Undef { continue; }
-                                if v == cur || self.minimize_visited[v] { continue; }
+                                if self.assigns[v] == LBool::Undef {
+                                    continue;
+                                }
+                                if v == cur || self.minimize_visited[v] {
+                                    continue;
+                                }
                                 self.minimize_visited[v] = true;
-                                if self.level[v] == 0 { continue; }
-                                if self.analyze_seen[v] { continue; }
+                                if self.level[v] == 0 {
+                                    continue;
+                                }
+                                if self.analyze_seen[v] {
+                                    continue;
+                                }
                                 let lv = self.level[v] as usize;
-                                if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] { return false; }
+                                if lv >= self.minimize_levels.len() || !self.minimize_levels[lv] {
+                                    return false;
+                                }
                                 match self.reason[v] {
                                     Reason::Decision => return false,
-                                    _ => { self.minimize_stack.push(v); }
+                                    _ => {
+                                        self.minimize_stack.push(v);
+                                    }
                                 }
                             }
                         }
@@ -4297,7 +4928,9 @@ impl Solver {
 
     /// Backtrack to the given decision level.
     fn backtrack(&mut self, level: u32) {
-        if self.decision_level() <= level { return; }
+        if self.decision_level() <= level {
+            return;
+        }
 
         while self.trail.len() > self.trail_lim[level as usize] {
             let entry = self.trail.pop().unwrap();
@@ -4316,7 +4949,9 @@ impl Solver {
             if let Some(ref mut mdd) = self.mdd {
                 if v < mdd.var_to_level.len() && mdd.var_to_level[v] != usize::MAX {
                     let l = mdd.var_to_level[v];
-                    if l < mdd.dirty_level { mdd.dirty_level = l; }
+                    if l < mdd.dirty_level {
+                        mdd.dirty_level = l;
+                    }
                 }
             }
             // Mark quad PB constraints involving this variable as stale.
@@ -4361,7 +4996,9 @@ impl Solver {
             for qc in &mut self.quad_pb_constraints {
                 let total: i32 = qc.terms.iter().map(|t| t.coeff as i32).sum();
                 qc.sums = [0, total, 0];
-                for t in qc.terms.iter_mut() { t.state = 1; } // all MAYBE
+                for t in qc.terms.iter_mut() {
+                    t.state = 1;
+                } // all MAYBE
                 qc.stale = false;
             }
         }
@@ -4391,7 +5028,14 @@ impl Solver {
             self.watches[lit_index(negate(lits[1]))].push((ci, lits[0]));
         }
         self.clause_lits.extend_from_slice(&lits);
-        self.clause_meta.push(ClauseMeta { start, len: lits.len() as u16, learnt: true, lbd: lbd as u8, deleted: false, used: 0 });
+        self.clause_meta.push(ClauseMeta {
+            start,
+            len: lits.len() as u16,
+            learnt: true,
+            lbd: lbd as u8,
+            deleted: false,
+            used: 0,
+        });
 
         if enqueue_asserting {
             self.enqueue(lits[0], Reason::Clause(ci));
@@ -4470,15 +5114,23 @@ impl Solver {
 
     // ── Heap operations (max-heap by activity) ──
 
-    fn heap_parent(i: usize) -> usize { (i.wrapping_sub(1)) / 2 }
-    fn heap_left(i: usize) -> usize { 2 * i + 1 }
-    fn heap_right(i: usize) -> usize { 2 * i + 2 }
+    fn heap_parent(i: usize) -> usize {
+        (i.wrapping_sub(1)) / 2
+    }
+    fn heap_left(i: usize) -> usize {
+        2 * i + 1
+    }
+    fn heap_right(i: usize) -> usize {
+        2 * i + 2
+    }
 
     fn heap_sift_up(&mut self, mut i: usize) {
         let v = self.heap[i];
         while i > 0 {
             let p = Self::heap_parent(i);
-            if self.activity[self.heap[p]] >= self.activity[v] { break; }
+            if self.activity[self.heap[p]] >= self.activity[v] {
+                break;
+            }
             self.heap[i] = self.heap[p];
             self.heap_pos[self.heap[p]] = i;
             i = p;
@@ -4492,10 +5144,18 @@ impl Solver {
         let n = self.heap.len();
         loop {
             let l = Self::heap_left(i);
-            if l >= n { break; }
+            if l >= n {
+                break;
+            }
             let r = Self::heap_right(i);
-            let best = if r < n && self.activity[self.heap[r]] > self.activity[self.heap[l]] { r } else { l };
-            if self.activity[self.heap[best]] <= self.activity[v] { break; }
+            let best = if r < n && self.activity[self.heap[r]] > self.activity[self.heap[l]] {
+                r
+            } else {
+                l
+            };
+            if self.activity[self.heap[best]] <= self.activity[v] {
+                break;
+            }
             self.heap[i] = self.heap[best];
             self.heap_pos[self.heap[best]] = i;
             i = best;
@@ -4518,7 +5178,9 @@ impl Solver {
     }
 
     fn heap_insert(&mut self, v: usize) {
-        if self.heap_pos[v] < self.heap.len() { return; } // already in heap
+        if self.heap_pos[v] < self.heap.len() {
+            return;
+        } // already in heap
         let pos = self.heap.len();
         self.heap.push(v);
         self.heap_pos[v] = pos;
@@ -4543,11 +5205,19 @@ impl Solver {
     /// higher-quality retention helped. Kept the `used` counter in
     /// `ClauseMeta` as a tie-breaker for the sort.
     pub fn reduce_db(&mut self) {
-        let num_learnt: usize = self.clause_meta.iter()
-            .filter(|m| m.learnt && !m.deleted).count();
-        let num_original: usize = self.clause_meta.iter()
-            .filter(|m| !m.learnt && !m.deleted).count();
-        if num_learnt < num_original { return; }
+        let num_learnt: usize = self
+            .clause_meta
+            .iter()
+            .filter(|m| m.learnt && !m.deleted)
+            .count();
+        let num_original: usize = self
+            .clause_meta
+            .iter()
+            .filter(|m| !m.learnt && !m.deleted)
+            .count();
+        if num_learnt < num_original {
+            return;
+        }
 
         // Collect which clauses are currently reasons
         let mut is_reason = vec![false; self.clause_meta.len()];
@@ -4565,7 +5235,9 @@ impl Solver {
                 eligible.push((ci as u32, m.lbd, m.used));
             }
         }
-        if eligible.len() < 100 { return; }
+        if eligible.len() < 100 {
+            return;
+        }
 
         // Sort by (lbd desc, used asc) — evict worst-LBD first, ties broken
         // by least-used (so unused clauses go before used ones at the
@@ -4579,7 +5251,9 @@ impl Solver {
 
         // Decay `used` counters so "recently useful" wins across cycles.
         for m in &mut self.clause_meta {
-            if !m.deleted { m.used >>= 1; }
+            if !m.deleted {
+                m.used >>= 1;
+            }
         }
 
         // Clean watch lists. R2: also clean bin_watches. Binary
@@ -4605,7 +5279,9 @@ impl Solver {
     /// analysis path uses those references by position/iteration and
     /// would need their old indices for reason-chain walks.
     pub fn compact_arena(&mut self) -> usize {
-        if self.decision_level() != 0 { return 0; }
+        if self.decision_level() != 0 {
+            return 0;
+        }
         let old_n = self.clause_meta.len();
         // Protect any clause still referenced by a trail entry.
         // Preprocessing (BVE / SCC) can mark a clause deleted even
@@ -4630,7 +5306,9 @@ impl Solver {
         let mut new_meta: Vec<ClauseMeta> = Vec::with_capacity(old_n);
         let mut new_lits: Vec<Lit> = Vec::with_capacity(self.clause_lits.len());
         for (old_ci, m) in self.clause_meta.iter().enumerate() {
-            if m.deleted && !trail_referenced[old_ci] { continue; }
+            if m.deleted && !trail_referenced[old_ci] {
+                continue;
+            }
             let new_ci = new_meta.len() as u32;
             remap[old_ci] = new_ci as i32;
             let start = new_lits.len() as u32;
@@ -4641,7 +5319,9 @@ impl Solver {
             new_meta.push(nm);
         }
         let freed = old_n - new_meta.len();
-        if freed == 0 { return 0; }
+        if freed == 0 {
+            return 0;
+        }
         self.clause_meta = new_meta;
         self.clause_lits = new_lits;
 
@@ -4678,7 +5358,11 @@ impl Solver {
         for entry in &mut self.trail {
             if let Reason::Clause(ref mut ci) = entry.reason {
                 let new = remap[*ci as usize];
-                debug_assert!(new >= 0, "compact_arena: level-0 trail entry references deleted clause {}", ci);
+                debug_assert!(
+                    new >= 0,
+                    "compact_arena: level-0 trail entry references deleted clause {}",
+                    ci
+                );
                 if new >= 0 {
                     *ci = new as u32;
                 }
@@ -4697,7 +5381,11 @@ impl Solver {
             // Alternate: 50% best phase, 50% inverted
             let invert = (self.rephase_conflicts / 10000) % 2 == 1;
             for v in 0..self.num_vars {
-                self.phase[v] = if invert { !self.best_phase[v] } else { self.best_phase[v] };
+                self.phase[v] = if invert {
+                    !self.best_phase[v]
+                } else {
+                    self.best_phase[v]
+                };
             }
         }
         // else: keep current phases (no best known yet)
@@ -4706,17 +5394,24 @@ impl Solver {
     /// Failed literal probing: for each unassigned literal, assume it true and propagate.
     /// If conflict, the literal must be false — enqueue its negation at level 0.
     pub fn probe(&mut self) {
-        if self.num_vars == 0 { return; }
+        if self.num_vars == 0 {
+            return;
+        }
         self.backtrack(0);
         let nv = self.num_vars;
         let max_probes = nv.min(200); // limit to avoid excessive cost
         // Probe most active variables first
         let mut vars_by_activity: Vec<usize> = (0..nv).collect();
-        vars_by_activity.sort_by(|&a, &b|
-            self.activity[b].partial_cmp(&self.activity[a]).unwrap_or(std::cmp::Ordering::Equal));
+        vars_by_activity.sort_by(|&a, &b| {
+            self.activity[b]
+                .partial_cmp(&self.activity[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         for &v in vars_by_activity.iter().take(max_probes) {
-            if self.assigns[v] != LBool::Undef { continue; }
+            if self.assigns[v] != LBool::Undef {
+                continue;
+            }
             let lit = (v + 1) as Lit;
             // Try positive
             for sign in [lit, -lit] {
@@ -4752,9 +5447,15 @@ impl Solver {
     /// one-shot preprocessing step, not a per-conflict trigger.
     /// `max_var` = 0 means all variables.
     pub fn backbone_scan(&mut self, max_var: usize) -> usize {
-        if self.num_vars == 0 || !self.ok { return 0; }
+        if self.num_vars == 0 || !self.ok {
+            return 0;
+        }
         self.backtrack(0);
-        let limit = if max_var == 0 { self.num_vars } else { max_var.min(self.num_vars) };
+        let limit = if max_var == 0 {
+            self.num_vars
+        } else {
+            max_var.min(self.num_vars)
+        };
         // Pre-size reusable buffers.
         if self.quad_pb_seen_buf.len() < self.num_vars {
             self.quad_pb_seen_buf.resize(self.num_vars, false);
@@ -4767,8 +5468,12 @@ impl Solver {
         while progress {
             progress = false;
             for v in 0..limit {
-                if !self.ok { return installed; }
-                if self.assigns[v] != LBool::Undef { continue; }
+                if !self.ok {
+                    return installed;
+                }
+                if self.assigns[v] != LBool::Undef {
+                    continue;
+                }
                 let lit = (v + 1) as Lit;
                 // Try +lit first, then -lit.
                 let mut forced: Option<Lit> = None;
@@ -4853,8 +5558,14 @@ mod tests {
     fn build_xor_quad_pb_no_gj_n26_solver(enable_xor: bool) -> Solver {
         let n = 26usize;
         let m = 25usize;
-        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
-        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let z: Vec<i8> = "+++-+--++++++--++---+-+--+"
+            .chars()
+            .map(|c| if c == '+' { 1 } else { -1 })
+            .collect();
+        let w: Vec<i8> = "++++-+---+--+++--++++-+-+"
+            .chars()
+            .map(|c| if c == '+' { 1 } else { -1 })
+            .collect();
 
         let mut s = Solver::new();
         s.config.xor_propagation = enable_xor;
@@ -4870,22 +5581,30 @@ mod tests {
 
         let mut zw_ac = vec![0i32; n];
         for lag in 1..n {
-            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
-            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
-            zw_ac[lag] = 2*nz + 2*nw;
+            let nz: i32 = (0..n - lag).map(|i| z[i] as i32 * z[i + lag] as i32).sum();
+            let nw: i32 = if lag < m {
+                (0..m - lag).map(|i| w[i] as i32 * w[i + lag] as i32).sum()
+            } else {
+                0
+            };
+            zw_ac[lag] = 2 * nz + 2 * nw;
         }
 
         for lag in 1..n {
-            let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as u32;
+            let target = ((2 * (n - lag) as i32 - zw_ac[lag]) / 2) as u32;
             let mut la = Vec::new();
             let mut lb = Vec::new();
-            for i in 0..(n-lag) {
-                la.push(x_var(i)); lb.push(x_var(i+lag));
-                la.push(-x_var(i)); lb.push(-x_var(i+lag));
+            for i in 0..(n - lag) {
+                la.push(x_var(i));
+                lb.push(x_var(i + lag));
+                la.push(-x_var(i));
+                lb.push(-x_var(i + lag));
             }
-            for i in 0..(n-lag) {
-                la.push(y_var(i)); lb.push(y_var(i+lag));
-                la.push(-y_var(i)); lb.push(-y_var(i+lag));
+            for i in 0..(n - lag) {
+                la.push(y_var(i));
+                lb.push(y_var(i + lag));
+                la.push(-y_var(i));
+                lb.push(-y_var(i + lag));
             }
             let coeffs: Vec<u32> = vec![1; la.len()];
             s.add_quad_pb_eq(&la, &lb, &coeffs, target);
@@ -4893,19 +5612,21 @@ mod tests {
 
         if enable_xor {
             for lag in 1..n {
-                let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
-                let k = 2*(n-lag);
+                let target = ((2 * (n - lag) as i32 - zw_ac[lag]) / 2) as usize;
+                let k = 2 * (n - lag);
                 let parity = ((target + k) % 2) == 1;
-                let mut in_xor = vec![false; 2*n];
-                for i in 0..(n-lag) {
+                let mut in_xor = vec![false; 2 * n];
+                for i in 0..(n - lag) {
                     in_xor[i] ^= true;
-                    in_xor[i+lag] ^= true;
+                    in_xor[i + lag] ^= true;
                 }
-                for i in 0..(n-lag) {
-                    in_xor[n+i] ^= true;
-                    in_xor[n+i+lag] ^= true;
+                for i in 0..(n - lag) {
+                    in_xor[n + i] ^= true;
+                    in_xor[n + i + lag] ^= true;
                 }
-                let vars: Vec<i32> = in_xor.iter().enumerate()
+                let vars: Vec<i32> = in_xor
+                    .iter()
+                    .enumerate()
                     .filter(|&(_, &v)| v)
                     .map(|(i, _)| (i + 1) as i32)
                     .collect();
@@ -4988,7 +5709,11 @@ mod tests {
         assert_eq!(s.num_level0_vars(), 2);
         let d_before = s.num_decisions();
         assert_eq!(s.solve(), Some(true));
-        assert_eq!(s.num_decisions(), d_before, "no branching needed for pure unit propagation");
+        assert_eq!(
+            s.num_decisions(),
+            d_before,
+            "no branching needed for pure unit propagation"
+        );
     }
 
     #[test]
@@ -5001,8 +5726,10 @@ mod tests {
         let p_before = s.num_propagations();
         assert_eq!(s.solve_with_assumptions(&[1]), Some(true));
         // y is forced by propagation under the assumption.
-        assert!(s.num_propagations() > p_before,
-            "assumption [x] should force y via propagation");
+        assert!(
+            s.num_propagations() > p_before,
+            "assumption [x] should force y via propagation"
+        );
         // Level-0 stays at 0 — assumptions live at level 1.
         assert_eq!(s.num_level0_vars(), 0);
     }
@@ -5012,15 +5739,26 @@ mod tests {
         // 4-var instance where every assignment is feasible (no constraints).
         // The solver branches until all vars assigned. decisions <= num_vars.
         let mut s = Solver::new();
-        for v in 1..=4 { s.ensure_var(v); }
+        for v in 1..=4 {
+            s.ensure_var(v);
+        }
         assert_eq!(s.solve(), Some(true));
         let n = s.num_vars() as u64;
-        assert!(s.num_decisions() <= n,
-            "decisions={} exceeds num_vars={}", s.num_decisions(), n);
+        assert!(
+            s.num_decisions() <= n,
+            "decisions={} exceeds num_vars={}",
+            s.num_decisions(),
+            n
+        );
         // assignments accounted for: decisions + propagations + level-0 forced
         // should sum to at most the trail length (= num_vars when SAT).
         let total = s.num_decisions() + s.num_propagations();
-        assert!(total <= n, "decisions+propagations={} exceeds num_vars={}", total, n);
+        assert!(
+            total <= n,
+            "decisions+propagations={} exceeds num_vars={}",
+            total,
+            n
+        );
     }
 
     #[test]
@@ -5070,13 +5808,22 @@ mod tests {
         // Verify: each node has exactly one color, adjacent different
         for n in 0..3 {
             let colors: Vec<bool> = (0..3).map(|c| s.value(var(n, c)) == Some(true)).collect();
-            assert_eq!(colors.iter().filter(|&&c| c).count(), 1,
-                "node {} should have exactly one color", n);
+            assert_eq!(
+                colors.iter().filter(|&&c| c).count(),
+                1,
+                "node {} should have exactly one color",
+                n
+            );
         }
         for &(a, b) in &edges {
             for c in 0..3 {
-                assert!(!(s.value(var(a, c)) == Some(true) && s.value(var(b, c)) == Some(true)),
-                    "adjacent nodes {} and {} both have color {}", a, b, c);
+                assert!(
+                    !(s.value(var(a, c)) == Some(true) && s.value(var(b, c)) == Some(true)),
+                    "adjacent nodes {} and {} both have color {}",
+                    a,
+                    b,
+                    c
+                );
             }
         }
     }
@@ -5209,15 +5956,15 @@ mod tests {
         // At most 2: every triple of positives is forbidden
         // (this is the simplest exact-k encoding for small k)
         for a in 0..4 {
-            for b in (a+1)..4 {
-                for c in (b+1)..4 {
+            for b in (a + 1)..4 {
+                for c in (b + 1)..4 {
                     s.add_clause([-lits[a], -lits[b], -lits[c]]); // at most 2
                 }
             }
         }
         for a in 0..4 {
-            for b in (a+1)..4 {
-                for c in (b+1)..4 {
+            for b in (a + 1)..4 {
+                for c in (b + 1)..4 {
                     // at least 2 = ¬(at most 1) = not all triples of negations
                     s.add_clause([lits[a], lits[b], lits[c]]);
                 }
@@ -5262,8 +6009,8 @@ mod tests {
     #[test]
     fn assumptions_basic() {
         let mut s = Solver::new();
-        s.add_clause([1, 2]);       // x1 OR x2
-        s.add_clause([-1, -2]);     // at most one true
+        s.add_clause([1, 2]); // x1 OR x2
+        s.add_clause([-1, -2]); // at most one true
 
         // x1=true → x2=false
         assert_eq!(s.solve_with_assumptions(&[1]), Some(true));
@@ -5326,10 +6073,10 @@ mod tests {
         let n = 6; // Use small n=6 for minimal repro
 
         // Known TT(6): X=+++---, Y=++--+-, Z=+++-++, W=++-+-
-        let x_vals: Vec<i8> = vec![1,1,1,-1,-1,-1];
-        let y_vals: Vec<i8> = vec![1,1,-1,-1,1,-1];
-        let z_vals: Vec<i8> = vec![1,1,1,-1,1,1];
-        let w_vals: Vec<i8> = vec![1,1,-1,1,-1];
+        let x_vals: Vec<i8> = vec![1, 1, 1, -1, -1, -1];
+        let y_vals: Vec<i8> = vec![1, 1, -1, -1, 1, -1];
+        let z_vals: Vec<i8> = vec![1, 1, 1, -1, 1, 1];
+        let w_vals: Vec<i8> = vec![1, 1, -1, 1, -1];
 
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
@@ -5351,26 +6098,40 @@ mod tests {
         let m = n - 1;
         let mut zw_ac = vec![0i32; n];
         for lag in 1..n {
-            let nz: i32 = (0..n-lag).map(|i| z_vals[i] as i32 * z_vals[i+lag] as i32).sum();
-            let nw: i32 = if lag < m { (0..m-lag).map(|i| w_vals[i] as i32 * w_vals[i+lag] as i32).sum() } else { 0 };
-            zw_ac[lag] = 2*nz + 2*nw;
+            let nz: i32 = (0..n - lag)
+                .map(|i| z_vals[i] as i32 * z_vals[i + lag] as i32)
+                .sum();
+            let nw: i32 = if lag < m {
+                (0..m - lag)
+                    .map(|i| w_vals[i] as i32 * w_vals[i + lag] as i32)
+                    .sum()
+            } else {
+                0
+            };
+            zw_ac[lag] = 2 * nz + 2 * nw;
         }
 
         // Add quad PB agree constraints per lag
         for lag in 1..n {
-            let target_raw = 2*(n-lag) as i32 - zw_ac[lag];
-            if target_raw < 0 || target_raw % 2 != 0 { panic!("infeasible"); }
+            let target_raw = 2 * (n - lag) as i32 - zw_ac[lag];
+            if target_raw < 0 || target_raw % 2 != 0 {
+                panic!("infeasible");
+            }
             let target = (target_raw / 2) as u32;
 
             let mut la = Vec::new();
             let mut lb = Vec::new();
-            for i in 0..(n-lag) {
-                la.push(x_var(i)); lb.push(x_var(i+lag));
-                la.push(-x_var(i)); lb.push(-x_var(i+lag));
+            for i in 0..(n - lag) {
+                la.push(x_var(i));
+                lb.push(x_var(i + lag));
+                la.push(-x_var(i));
+                lb.push(-x_var(i + lag));
             }
-            for i in 0..(n-lag) {
-                la.push(y_var(i)); lb.push(y_var(i+lag));
-                la.push(-y_var(i)); lb.push(-y_var(i+lag));
+            for i in 0..(n - lag) {
+                la.push(y_var(i));
+                lb.push(y_var(i + lag));
+                la.push(-y_var(i));
+                lb.push(-y_var(i + lag));
             }
             let coeffs: Vec<u32> = vec![1; la.len()];
             s.add_quad_pb_eq(&la, &lb, &coeffs, target);
@@ -5378,20 +6139,22 @@ mod tests {
 
         // Add XOR parity constraints per lag (this is where the bug triggers)
         for lag in 1..n {
-            let target_raw = 2*(n-lag) as i32 - zw_ac[lag];
+            let target_raw = 2 * (n - lag) as i32 - zw_ac[lag];
             let target = (target_raw / 2) as usize;
-            let k = 2*(n-lag);
+            let k = 2 * (n - lag);
             let parity = ((target + k) % 2) == 1;
-            let mut in_xor = vec![false; 2*n];
-            for i in 0..(n-lag) {
+            let mut in_xor = vec![false; 2 * n];
+            for i in 0..(n - lag) {
                 in_xor[i] ^= true;
-                in_xor[i+lag] ^= true;
+                in_xor[i + lag] ^= true;
             }
-            for i in 0..(n-lag) {
-                in_xor[n+i] ^= true;
-                in_xor[n+i+lag] ^= true;
+            for i in 0..(n - lag) {
+                in_xor[n + i] ^= true;
+                in_xor[n + i + lag] ^= true;
             }
-            let vars: Vec<i32> = in_xor.iter().enumerate()
+            let vars: Vec<i32> = in_xor
+                .iter()
+                .enumerate()
                 .filter(|&(_, &v)| v)
                 .map(|(i, _)| (i + 1) as i32)
                 .collect();
@@ -5401,8 +6164,11 @@ mod tests {
         }
 
         let result = s.solve();
-        assert_eq!(result, Some(true),
-            "XOR+QuadPB encoding of known TT(6) should be SAT (XOR reason bug)");
+        assert_eq!(
+            result,
+            Some(true),
+            "XOR+QuadPB encoding of known TT(6) should be SAT (XOR reason bug)"
+        );
     }
 
     #[test]
@@ -5417,8 +6183,14 @@ mod tests {
         // Known TT(26) solution
         let z_str = "+++-+--++++++--++---+-+--+";
         let w_str = "++++-+---+--+++--++++-+-+";
-        let z: Vec<i8> = z_str.chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
-        let w: Vec<i8> = w_str.chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let z: Vec<i8> = z_str
+            .chars()
+            .map(|c| if c == '+' { 1 } else { -1 })
+            .collect();
+        let w: Vec<i8> = w_str
+            .chars()
+            .map(|c| if c == '+' { 1 } else { -1 })
+            .collect();
         assert_eq!(z.len(), n);
         assert_eq!(w.len(), m);
 
@@ -5444,26 +6216,34 @@ mod tests {
         // Compute zw_autocorr
         let mut zw_ac = vec![0i32; n];
         for lag in 1..n {
-            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
-            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
-            zw_ac[lag] = 2*nz + 2*nw;
+            let nz: i32 = (0..n - lag).map(|i| z[i] as i32 * z[i + lag] as i32).sum();
+            let nw: i32 = if lag < m {
+                (0..m - lag).map(|i| w[i] as i32 * w[i + lag] as i32).sum()
+            } else {
+                0
+            };
+            zw_ac[lag] = 2 * nz + 2 * nw;
         }
 
         // Quad PB agree constraints per lag
         for lag in 1..n {
-            let target_raw = 2*(n-lag) as i32 - zw_ac[lag];
+            let target_raw = 2 * (n - lag) as i32 - zw_ac[lag];
             assert!(target_raw >= 0 && target_raw % 2 == 0);
             let target = (target_raw / 2) as u32;
 
             let mut la = Vec::new();
             let mut lb = Vec::new();
-            for i in 0..(n-lag) {
-                la.push(x_var(i)); lb.push(x_var(i+lag));
-                la.push(-x_var(i)); lb.push(-x_var(i+lag));
+            for i in 0..(n - lag) {
+                la.push(x_var(i));
+                lb.push(x_var(i + lag));
+                la.push(-x_var(i));
+                lb.push(-x_var(i + lag));
             }
-            for i in 0..(n-lag) {
-                la.push(y_var(i)); lb.push(y_var(i+lag));
-                la.push(-y_var(i)); lb.push(-y_var(i+lag));
+            for i in 0..(n - lag) {
+                la.push(y_var(i));
+                lb.push(y_var(i + lag));
+                la.push(-y_var(i));
+                lb.push(-y_var(i + lag));
             }
             let coeffs: Vec<u32> = vec![1; la.len()];
             s.add_quad_pb_eq(&la, &lb, &coeffs, target);
@@ -5471,20 +6251,22 @@ mod tests {
 
         // XOR parity constraints per lag
         for lag in 1..n {
-            let target_raw = 2*(n-lag) as i32 - zw_ac[lag];
+            let target_raw = 2 * (n - lag) as i32 - zw_ac[lag];
             let target = (target_raw / 2) as usize;
-            let k = 2*(n-lag);
+            let k = 2 * (n - lag);
             let parity = ((target + k) % 2) == 1;
-            let mut in_xor = vec![false; 2*n];
-            for i in 0..(n-lag) {
+            let mut in_xor = vec![false; 2 * n];
+            for i in 0..(n - lag) {
                 in_xor[i] ^= true;
-                in_xor[i+lag] ^= true;
+                in_xor[i + lag] ^= true;
             }
-            for i in 0..(n-lag) {
-                in_xor[n+i] ^= true;
-                in_xor[n+i+lag] ^= true;
+            for i in 0..(n - lag) {
+                in_xor[n + i] ^= true;
+                in_xor[n + i + lag] ^= true;
             }
-            let vars: Vec<i32> = in_xor.iter().enumerate()
+            let vars: Vec<i32> = in_xor
+                .iter()
+                .enumerate()
                 .filter(|&(_, &v)| v)
                 .map(|(i, _)| (i + 1) as i32)
                 .collect();
@@ -5495,8 +6277,11 @@ mod tests {
 
         s.reserve_for_search(200);
         let result = s.solve();
-        assert_eq!(result, Some(true),
-            "XOR+QuadPB encoding of known TT(26) Z/W must be SAT");
+        assert_eq!(
+            result,
+            Some(true),
+            "XOR+QuadPB encoding of known TT(26) Z/W must be SAT"
+        );
     }
 
     #[test]
@@ -5505,17 +6290,27 @@ mod tests {
         use super::*;
         let n = 26usize;
         let m = 25usize;
-        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
-        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let z: Vec<i8> = "+++-+--++++++--++---+-+--+"
+            .chars()
+            .map(|c| if c == '+' { 1 } else { -1 })
+            .collect();
+        let w: Vec<i8> = "++++-+---+--+++--++++-+-+"
+            .chars()
+            .map(|c| if c == '+' { 1 } else { -1 })
+            .collect();
 
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
 
         let mut zw_ac = vec![0i32; n];
         for lag in 1..n {
-            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
-            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
-            zw_ac[lag] = 2*nz + 2*nw;
+            let nz: i32 = (0..n - lag).map(|i| z[i] as i32 * z[i + lag] as i32).sum();
+            let nw: i32 = if lag < m {
+                (0..m - lag).map(|i| w[i] as i32 * w[i + lag] as i32).sum()
+            } else {
+                0
+            };
+            zw_ac[lag] = 2 * nz + 2 * nw;
         }
 
         let mut s = Solver::new();
@@ -5530,16 +6325,20 @@ mod tests {
 
         // All quad PB
         for lag in 1..n {
-            let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as u32;
+            let target = ((2 * (n - lag) as i32 - zw_ac[lag]) / 2) as u32;
             let mut la = Vec::new();
             let mut lb = Vec::new();
-            for i in 0..(n-lag) {
-                la.push(x_var(i)); lb.push(x_var(i+lag));
-                la.push(-x_var(i)); lb.push(-x_var(i+lag));
+            for i in 0..(n - lag) {
+                la.push(x_var(i));
+                lb.push(x_var(i + lag));
+                la.push(-x_var(i));
+                lb.push(-x_var(i + lag));
             }
-            for i in 0..(n-lag) {
-                la.push(y_var(i)); lb.push(y_var(i+lag));
-                la.push(-y_var(i)); lb.push(-y_var(i+lag));
+            for i in 0..(n - lag) {
+                la.push(y_var(i));
+                lb.push(y_var(i + lag));
+                la.push(-y_var(i));
+                lb.push(-y_var(i + lag));
             }
             let coeffs: Vec<u32> = vec![1; la.len()];
             s.add_quad_pb_eq(&la, &lb, &coeffs, target);
@@ -5547,20 +6346,34 @@ mod tests {
 
         // XOR ONLY for lag 4
         let lag = 4;
-        let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
-        let k = 2*(n-lag);
+        let target = ((2 * (n - lag) as i32 - zw_ac[lag]) / 2) as usize;
+        let k = 2 * (n - lag);
         let parity = ((target + k) % 2) == 1;
-        let mut in_xor = vec![false; 2*n];
-        for i in 0..(n-lag) { in_xor[i] ^= true; in_xor[i+lag] ^= true; }
-        for i in 0..(n-lag) { in_xor[n+i] ^= true; in_xor[n+i+lag] ^= true; }
-        let vars: Vec<i32> = in_xor.iter().enumerate()
-            .filter(|&(_, &v)| v).map(|(i, _)| (i + 1) as i32).collect();
+        let mut in_xor = vec![false; 2 * n];
+        for i in 0..(n - lag) {
+            in_xor[i] ^= true;
+            in_xor[i + lag] ^= true;
+        }
+        for i in 0..(n - lag) {
+            in_xor[n + i] ^= true;
+            in_xor[n + i + lag] ^= true;
+        }
+        let vars: Vec<i32> = in_xor
+            .iter()
+            .enumerate()
+            .filter(|&(_, &v)| v)
+            .map(|(i, _)| (i + 1) as i32)
+            .collect();
         s.add_xor(&vars, parity);
 
         s.reserve_for_search(200);
         s.set_conflict_limit(50000);
         let result = s.solve();
-        assert_eq!(result, Some(true), "QuadPB + single lag-4 XOR should be SAT");
+        assert_eq!(
+            result,
+            Some(true),
+            "QuadPB + single lag-4 XOR should be SAT"
+        );
     }
 
     #[test]
@@ -5569,8 +6382,14 @@ mod tests {
         // If UNSAT: the constraints themselves are wrong (encoding bug).
         // If SAT: the constraints are correct and the search is wrong.
         let mut s = build_xor_quad_pb_no_gj_n26_solver(true);
-        let x: Vec<i8> = "++--+--+++++++-+-++--+-++-".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
-        let y: Vec<i8> = "+++-+-++++++-++-+---+-++--".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let x: Vec<i8> = "++--+--+++++++-+-++--+-++-"
+            .chars()
+            .map(|c| if c == '+' { 1 } else { -1 })
+            .collect();
+        let y: Vec<i8> = "+++-+-++++++-++-+---+-++--"
+            .chars()
+            .map(|c| if c == '+' { 1 } else { -1 })
+            .collect();
         let n = 26;
         let mut assumptions = Vec::new();
         for i in 0..n {
@@ -5582,8 +6401,11 @@ mod tests {
             assumptions.push(if y[i] == 1 { lit } else { -lit });
         }
         let result = s.solve_with_assumptions(&assumptions);
-        assert_eq!(result, Some(true),
-            "Forcing the known TT(26) solution should be SAT even with XOR+QuadPB");
+        assert_eq!(
+            result,
+            Some(true),
+            "Forcing the known TT(26) solution should be SAT even with XOR+QuadPB"
+        );
     }
 
     #[test]
@@ -5592,17 +6414,27 @@ mod tests {
         use super::*;
         let n = 26usize;
         let m = 25usize;
-        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
-        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let z: Vec<i8> = "+++-+--++++++--++---+-+--+"
+            .chars()
+            .map(|c| if c == '+' { 1 } else { -1 })
+            .collect();
+        let w: Vec<i8> = "++++-+---+--+++--++++-+-+"
+            .chars()
+            .map(|c| if c == '+' { 1 } else { -1 })
+            .collect();
 
         let x_var = |i: usize| -> i32 { (i + 1) as i32 };
         let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
 
         let mut zw_ac = vec![0i32; n];
         for lag in 1..n {
-            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
-            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
-            zw_ac[lag] = 2*nz + 2*nw;
+            let nz: i32 = (0..n - lag).map(|i| z[i] as i32 * z[i + lag] as i32).sum();
+            let nw: i32 = if lag < m {
+                (0..m - lag).map(|i| w[i] as i32 * w[i + lag] as i32).sum()
+            } else {
+                0
+            };
+            zw_ac[lag] = 2 * nz + 2 * nw;
         }
 
         for max_lag in 1..n {
@@ -5617,31 +6449,47 @@ mod tests {
             s.add_pb_eq(&y_lits, &ones_n, 16);
 
             for lag in 1..n {
-                let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as u32;
+                let target = ((2 * (n - lag) as i32 - zw_ac[lag]) / 2) as u32;
                 let mut la = Vec::new();
                 let mut lb = Vec::new();
-                for i in 0..(n-lag) {
-                    la.push(x_var(i)); lb.push(x_var(i+lag));
-                    la.push(-x_var(i)); lb.push(-x_var(i+lag));
+                for i in 0..(n - lag) {
+                    la.push(x_var(i));
+                    lb.push(x_var(i + lag));
+                    la.push(-x_var(i));
+                    lb.push(-x_var(i + lag));
                 }
-                for i in 0..(n-lag) {
-                    la.push(y_var(i)); lb.push(y_var(i+lag));
-                    la.push(-y_var(i)); lb.push(-y_var(i+lag));
+                for i in 0..(n - lag) {
+                    la.push(y_var(i));
+                    lb.push(y_var(i + lag));
+                    la.push(-y_var(i));
+                    lb.push(-y_var(i + lag));
                 }
                 let coeffs: Vec<u32> = vec![1; la.len()];
                 s.add_quad_pb_eq(&la, &lb, &coeffs, target);
             }
 
             for lag in 1..=max_lag {
-                let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
-                let k = 2*(n-lag);
+                let target = ((2 * (n - lag) as i32 - zw_ac[lag]) / 2) as usize;
+                let k = 2 * (n - lag);
                 let parity = ((target + k) % 2) == 1;
-                let mut in_xor = vec![false; 2*n];
-                for i in 0..(n-lag) { in_xor[i] ^= true; in_xor[i+lag] ^= true; }
-                for i in 0..(n-lag) { in_xor[n+i] ^= true; in_xor[n+i+lag] ^= true; }
-                let vars: Vec<i32> = in_xor.iter().enumerate()
-                    .filter(|&(_, &v)| v).map(|(i, _)| (i + 1) as i32).collect();
-                if !vars.is_empty() { s.add_xor(&vars, parity); }
+                let mut in_xor = vec![false; 2 * n];
+                for i in 0..(n - lag) {
+                    in_xor[i] ^= true;
+                    in_xor[i + lag] ^= true;
+                }
+                for i in 0..(n - lag) {
+                    in_xor[n + i] ^= true;
+                    in_xor[n + i + lag] ^= true;
+                }
+                let vars: Vec<i32> = in_xor
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &v)| v)
+                    .map(|(i, _)| (i + 1) as i32)
+                    .collect();
+                if !vars.is_empty() {
+                    s.add_xor(&vars, parity);
+                }
             }
 
             s.reserve_for_search(200);
@@ -5658,14 +6506,22 @@ mod tests {
     fn xor_quad_pb_no_gj_n26_oracle() {
         let mut s = build_xor_quad_pb_no_gj_n26_solver(true);
         let result = s.solve();
-        assert_eq!(result, Some(true), "XOR+QuadPB (no GJ) TT(26) should be SAT");
+        assert_eq!(
+            result,
+            Some(true),
+            "XOR+QuadPB (no GJ) TT(26) should be SAT"
+        );
     }
 
     #[test]
 
     fn xor_quad_pb_no_gj_n26_reference_branch_oracle() {
         let mut reference = build_xor_quad_pb_no_gj_n26_solver(false);
-        assert_eq!(reference.solve(), Some(true), "reference X/Y model should exist without XOR");
+        assert_eq!(
+            reference.solve(),
+            Some(true),
+            "reference X/Y model should exist without XOR"
+        );
 
         // Variable 51 is the first explicit branch in the failing run; use the
         // polarity from a real X/Y witness so this assumption stays SAT-consistent.
@@ -5673,8 +6529,11 @@ mod tests {
 
         let mut s = build_xor_quad_pb_no_gj_n26_solver(true);
         let result = s.solve_with_assumptions(&[branch_lit]);
-        assert_eq!(result, Some(true),
-            "XOR+QuadPB should stay SAT under a branch literal taken from a reference X/Y model");
+        assert_eq!(
+            result,
+            Some(true),
+            "XOR+QuadPB should stay SAT under a branch literal taken from a reference X/Y model"
+        );
     }
 
     #[test]
@@ -5684,8 +6543,14 @@ mod tests {
         use super::*;
         let n = 26usize;
         let m = 25usize;
-        let z: Vec<i8> = "+++-+--++++++--++---+-+--+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
-        let w: Vec<i8> = "++++-+---+--+++--++++-+-+".chars().map(|c| if c=='+' { 1 } else { -1 }).collect();
+        let z: Vec<i8> = "+++-+--++++++--++---+-+--+"
+            .chars()
+            .map(|c| if c == '+' { 1 } else { -1 })
+            .collect();
+        let w: Vec<i8> = "++++-+---+--+++--++++-+-+"
+            .chars()
+            .map(|c| if c == '+' { 1 } else { -1 })
+            .collect();
 
         let mut s = Solver::new();
         s.config.xor_propagation = true;
@@ -5701,26 +6566,38 @@ mod tests {
 
         let mut zw_ac = vec![0i32; n];
         for lag in 1..n {
-            let nz: i32 = (0..n-lag).map(|i| z[i] as i32 * z[i+lag] as i32).sum();
-            let nw: i32 = if lag < m { (0..m-lag).map(|i| w[i] as i32 * w[i+lag] as i32).sum() } else { 0 };
-            zw_ac[lag] = 2*nz + 2*nw;
+            let nz: i32 = (0..n - lag).map(|i| z[i] as i32 * z[i + lag] as i32).sum();
+            let nw: i32 = if lag < m {
+                (0..m - lag).map(|i| w[i] as i32 * w[i + lag] as i32).sum()
+            } else {
+                0
+            };
+            zw_ac[lag] = 2 * nz + 2 * nw;
         }
 
         // XOR parity constraints ONLY (no quad PB)
         for lag in 1..n {
-            let target = ((2*(n-lag) as i32 - zw_ac[lag]) / 2) as usize;
-            let k = 2*(n-lag);
+            let target = ((2 * (n - lag) as i32 - zw_ac[lag]) / 2) as usize;
+            let k = 2 * (n - lag);
             let parity = ((target + k) % 2) == 1;
-            let mut in_xor = vec![false; 2*n];
-            for i in 0..(n-lag) {
-                in_xor[i] ^= true; in_xor[i+lag] ^= true;
+            let mut in_xor = vec![false; 2 * n];
+            for i in 0..(n - lag) {
+                in_xor[i] ^= true;
+                in_xor[i + lag] ^= true;
             }
-            for i in 0..(n-lag) {
-                in_xor[n+i] ^= true; in_xor[n+i+lag] ^= true;
+            for i in 0..(n - lag) {
+                in_xor[n + i] ^= true;
+                in_xor[n + i + lag] ^= true;
             }
-            let vars: Vec<i32> = in_xor.iter().enumerate()
-                .filter(|&(_, &v)| v).map(|(i, _)| (i + 1) as i32).collect();
-            if !vars.is_empty() { s.add_xor(&vars, parity); }
+            let vars: Vec<i32> = in_xor
+                .iter()
+                .enumerate()
+                .filter(|&(_, &v)| v)
+                .map(|(i, _)| (i + 1) as i32)
+                .collect();
+            if !vars.is_empty() {
+                s.add_xor(&vars, parity);
+            }
         }
 
         s.reserve_for_search(200);
@@ -5745,7 +6622,13 @@ mod tests {
         for round in 0..10 {
             let assume_var = (round % 4) as i32 + 1;
             let result = s.solve_with_assumptions(&[assume_var]);
-            assert_eq!(result, Some(true), "round {} with assumption {} should be SAT", round, assume_var);
+            assert_eq!(
+                result,
+                Some(true),
+                "round {} with assumption {} should be SAT",
+                round,
+                assume_var
+            );
             s.reset();
         }
 
@@ -5898,39 +6781,56 @@ mod tests {
     fn pb_set_eq_plus_quad_pb_tt18_regression() {
         let n = 18usize;
         // Canonical TT(18).  X[i] = +1 if bit i is 1.
-        let x_vals: [i8; 18] = [ 1,  1, -1,  1,  1,  1,  1,  1,  1,  1,  1,  1, -1,  1, -1, -1,  1,  1];
-        let y_vals: [i8; 18] = [ 1,  1, -1, -1, -1, -1,  1,  1, -1,  1, -1, -1, -1,  1, -1,  1, -1,  1];
-        let z_vals: [i8; 18] = [ 1,  1, -1,  1,  1,  1, -1, -1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1];
-        let w_vals: [i8; 17] = [ 1,  1, -1, -1, -1, -1,  1, -1, -1,  1, -1, -1,  1,  1,  1, -1,  1];
+        let x_vals: [i8; 18] = [1, 1, -1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, 1, -1, -1, 1, 1];
+        let y_vals: [i8; 18] = [
+            1, 1, -1, -1, -1, -1, 1, 1, -1, 1, -1, -1, -1, 1, -1, 1, -1, 1,
+        ];
+        let z_vals: [i8; 18] = [
+            1, 1, -1, 1, 1, 1, -1, -1, -1, -1, 1, -1, 1, -1, 1, 1, -1, -1,
+        ];
+        let w_vals: [i8; 17] = [1, 1, -1, -1, -1, -1, 1, -1, -1, 1, -1, -1, 1, 1, 1, -1, 1];
 
         // zw_autocorr[s] = 2 * N_Z(s) + 2 * N_W(s), where N_A(s) = Σ A[i]*A[i+s]
         let mut zw_autocorr = vec![0i32; n];
         for s in 1..n {
             let mut nz = 0i32;
-            for i in 0..(n - s) { nz += (z_vals[i] as i32) * (z_vals[i + s] as i32); }
+            for i in 0..(n - s) {
+                nz += (z_vals[i] as i32) * (z_vals[i + s] as i32);
+            }
             let mut nw = 0i32;
             if s < 17 {
-                for i in 0..(17 - s) { nw += (w_vals[i] as i32) * (w_vals[i + s] as i32); }
+                for i in 0..(17 - s) {
+                    nw += (w_vals[i] as i32) * (w_vals[i + s] as i32);
+                }
             }
             zw_autocorr[s] = 2 * nz + 2 * nw;
         }
         // Verify Turyn identity for X, Y: N_X + N_Y + zw = 0 for s >= 1.
         for s in 1..n {
             let mut nx = 0i32;
-            for i in 0..(n - s) { nx += (x_vals[i] as i32) * (x_vals[i + s] as i32); }
+            for i in 0..(n - s) {
+                nx += (x_vals[i] as i32) * (x_vals[i + s] as i32);
+            }
             let mut ny = 0i32;
-            for i in 0..(n - s) { ny += (y_vals[i] as i32) * (y_vals[i + s] as i32); }
-            assert_eq!(nx + ny + zw_autocorr[s], 0,
+            for i in 0..(n - s) {
+                ny += (y_vals[i] as i32) * (y_vals[i + s] as i32);
+            }
+            assert_eq!(
+                nx + ny + zw_autocorr[s],
+                0,
                 "Turyn identity fails at s={s}: N_X={nx}, N_Y={ny}, zw_autocorr={}",
-                zw_autocorr[s]);
+                zw_autocorr[s]
+            );
         }
 
-        let x_var = |i: usize| -> i32 { (i + 1) as i32 };          // 1..=18
-        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };       // 19..=36
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 }; // 1..=18
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 }; // 19..=36
 
         let mut s = Solver::new();
         // Ensure all 36 vars exist.
-        for v in 1..=(2 * n) as i32 { s.add_clause([v, -v]); }
+        for v in 1..=(2 * n) as i32 {
+            s.add_clause([v, -v]);
+        }
 
         // PbSetEq on X: exactly 14 true.  Canonical σ_X = +10, so count = 14.
         let x_lits: Vec<i32> = (0..n).map(|i| x_var(i)).collect();
@@ -5947,12 +6847,16 @@ mod tests {
             let mut lits_a: Vec<i32> = Vec::with_capacity(4 * (n - lag));
             let mut lits_b: Vec<i32> = Vec::with_capacity(4 * (n - lag));
             for i in 0..(n - lag) {
-                lits_a.push(x_var(i)); lits_b.push(x_var(i + lag));
-                lits_a.push(-x_var(i)); lits_b.push(-x_var(i + lag));
+                lits_a.push(x_var(i));
+                lits_b.push(x_var(i + lag));
+                lits_a.push(-x_var(i));
+                lits_b.push(-x_var(i + lag));
             }
             for i in 0..(n - lag) {
-                lits_a.push(y_var(i)); lits_b.push(y_var(i + lag));
-                lits_a.push(-y_var(i)); lits_b.push(-y_var(i + lag));
+                lits_a.push(y_var(i));
+                lits_b.push(y_var(i + lag));
+                lits_a.push(-y_var(i));
+                lits_b.push(-y_var(i + lag));
             }
             let ones: Vec<u32> = vec![1; lits_a.len()];
             s.add_quad_pb_eq(&lits_a, &lits_b, &ones, target);
@@ -5962,14 +6866,25 @@ mod tests {
         let k = 5usize;
         for i in 0..k {
             s.add_clause([if x_vals[i] == 1 { x_var(i) } else { -x_var(i) }]);
-            s.add_clause([if x_vals[n - k + i] == 1 { x_var(n - k + i) } else { -x_var(n - k + i) }]);
+            s.add_clause([if x_vals[n - k + i] == 1 {
+                x_var(n - k + i)
+            } else {
+                -x_var(n - k + i)
+            }]);
             s.add_clause([if y_vals[i] == 1 { y_var(i) } else { -y_var(i) }]);
-            s.add_clause([if y_vals[n - k + i] == 1 { y_var(n - k + i) } else { -y_var(n - k + i) }]);
+            s.add_clause([if y_vals[n - k + i] == 1 {
+                y_var(n - k + i)
+            } else {
+                -y_var(n - k + i)
+            }]);
         }
 
         let result = s.solve();
-        assert_eq!(result, Some(true),
+        assert_eq!(
+            result,
+            Some(true),
             "PbSetEq + quad_pb + canonical boundary should be SAT — the canonical middle X, Y is a valid completion.  \
-             This is the n=18 turyn open-search regression manifesting as a pure radical-level test.");
+             This is the n=18 turyn open-search regression manifesting as a pure radical-level test."
+        );
     }
 }

@@ -1,6 +1,5 @@
 /// Analyze an MDD file: count ZW leaf nodes, unique XY roots, path counts.
 /// Usage: analyze_mdd [file]
-
 use std::collections::{HashMap, HashSet};
 
 fn main() {
@@ -19,19 +18,31 @@ fn main() {
         pos_order.push(2 * k - 1 - t);
     }
 
-    eprintln!("Loaded: k={}, {} nodes, depth={}, ZW depth={}",
-        k, mdd.nodes.len(), mdd.depth, zw_depth);
+    eprintln!(
+        "Loaded: k={}, {} nodes, depth={}, ZW depth={}",
+        k,
+        mdd.nodes.len(),
+        mdd.depth,
+        zw_depth
+    );
 
     // Collect all unique node IDs reachable at the ZW boundary (depth 2k).
     // These are the XY sub-MDD roots.
     let mut at_depth: HashSet<u32> = HashSet::new();
     fn collect_at_depth(
-        nid: u32, level: usize, target: usize,
-        nodes: &[[u32; 4]], visited: &mut HashSet<(u32, usize)>,
+        nid: u32,
+        level: usize,
+        target: usize,
+        nodes: &[[u32; 4]],
+        visited: &mut HashSet<(u32, usize)>,
         result: &mut HashSet<u32>,
     ) {
-        if nid == 0 || nid == u32::MAX { return; }
-        if !visited.insert((nid, level)) { return; }
+        if nid == 0 || nid == u32::MAX {
+            return;
+        }
+        if !visited.insert((nid, level)) {
+            return;
+        }
         if level == target {
             result.insert(nid);
             return;
@@ -41,21 +52,40 @@ fn main() {
         }
     }
     let mut visited = HashSet::new();
-    collect_at_depth(mdd.root, 0, zw_depth, &mdd.nodes, &mut visited, &mut at_depth);
+    collect_at_depth(
+        mdd.root,
+        0,
+        zw_depth,
+        &mdd.nodes,
+        &mut visited,
+        &mut at_depth,
+    );
 
     eprintln!("Unique XY root nodes at ZW boundary: {}", at_depth.len());
 
     // Count ZW paths (using memoized path counting)
     let mut path_memo: HashMap<u32, u128> = HashMap::new();
     fn count_zw_paths(
-        nid: u32, level: usize, zw_depth: usize,
-        nodes: &[[u32; 4]], memo: &mut HashMap<u32, u128>,
+        nid: u32,
+        level: usize,
+        zw_depth: usize,
+        nodes: &[[u32; 4]],
+        memo: &mut HashMap<u32, u128>,
     ) -> u128 {
-        if nid == 0 { return 0; }
-        if level == zw_depth { return 1; } // reached boundary
-        if nid == u32::MAX { return 1; } // LEAF
-        if let Some(&c) = memo.get(&nid) { return c; }
-        let total: u128 = nodes[nid as usize].iter()
+        if nid == 0 {
+            return 0;
+        }
+        if level == zw_depth {
+            return 1;
+        } // reached boundary
+        if nid == u32::MAX {
+            return 1;
+        } // LEAF
+        if let Some(&c) = memo.get(&nid) {
+            return c;
+        }
+        let total: u128 = nodes[nid as usize]
+            .iter()
             .map(|&child| count_zw_paths(child, level + 1, zw_depth, nodes, memo))
             .sum();
         memo.insert(nid, total);
@@ -69,11 +99,19 @@ fn main() {
     // Count XY paths per root (just a few examples)
     let mut xy_path_memo: HashMap<u32, u128> = HashMap::new();
     fn count_xy_paths(nid: u32, nodes: &[[u32; 4]], memo: &mut HashMap<u32, u128>) -> u128 {
-        if nid == 0 { return 0; }
-        if nid == u32::MAX { return 1; }
-        if let Some(&c) = memo.get(&nid) { return c; }
-        let total: u128 = nodes[nid as usize].iter()
-            .map(|&child| count_xy_paths(child, nodes, memo)).sum();
+        if nid == 0 {
+            return 0;
+        }
+        if nid == u32::MAX {
+            return 1;
+        }
+        if let Some(&c) = memo.get(&nid) {
+            return c;
+        }
+        let total: u128 = nodes[nid as usize]
+            .iter()
+            .map(|&child| count_xy_paths(child, nodes, memo))
+            .sum();
         memo.insert(nid, total);
         total
     }
@@ -103,8 +141,12 @@ fn main() {
     // State: (packed_zw_sums, z_prefix_bits, w_prefix_bits)
 
     fn walk_for_extension(
-        nid: u32, level: usize, zw_depth: usize, k: usize,
-        z_acc: u32, w_acc: u32,
+        nid: u32,
+        level: usize,
+        zw_depth: usize,
+        k: usize,
+        z_acc: u32,
+        w_acc: u32,
         sums: &mut Vec<i32>,
         pos_order: &[usize],
         nodes: &[[u32; 4]],
@@ -112,7 +154,9 @@ fn main() {
         zw_events_at_level: &Vec<Vec<(usize, usize, usize, bool)>>,
         states: &mut HashSet<(u128, u32, u32)>,
     ) {
-        if nid == 0 { return; }
+        if nid == 0 {
+            return;
+        }
         if level == zw_depth {
             // Pack sums
             let mut packed = 0u128;
@@ -126,12 +170,16 @@ fn main() {
             states.insert((packed, z_rel, w_rel));
             return;
         }
-        if nid == u32::MAX { return; }
+        if nid == u32::MAX {
+            return;
+        }
 
         let pos = pos_order[level];
         for branch in 0u32..4 {
             let child = nodes[nid as usize][branch as usize];
-            if child == 0 { continue; }
+            if child == 0 {
+                continue;
+            }
             let z_val = (branch >> 0) & 1;
             let w_val = (branch >> 1) & 1;
             let _z_sign: i32 = if z_val == 1 { 1 } else { -1 };
@@ -155,9 +203,17 @@ fn main() {
             }
 
             walk_for_extension(
-                child, level + 1, zw_depth, k,
-                z_acc | (z_val << pos), w_acc | (w_val << pos),
-                sums, pos_order, nodes, zw_events_at_level, states,
+                child,
+                level + 1,
+                zw_depth,
+                k,
+                z_acc | (z_val << pos),
+                w_acc | (w_val << pos),
+                sums,
+                pos_order,
+                nodes,
+                zw_events_at_level,
+                states,
             );
             *sums = sums_backup;
         }
@@ -173,14 +229,14 @@ fn main() {
         (0..zw_depth).map(|_| Vec::new()).collect();
     for j in 0..k {
         // Z pairs
-        for i in 0..k-j {
+        for i in 0..k - j {
             let (a, b) = (i, k + i + j);
             let complete = pos_to_level_map[a].max(pos_to_level_map[b]);
             zw_events_at_level[complete].push((j, a, b, true));
         }
         // W pairs
         if j < k - 1 {
-            for i in 0..k-j-1 {
+            for i in 0..k - j - 1 {
                 let (a, b) = (i, k + i + j + 1);
                 let complete = pos_to_level_map[a].max(pos_to_level_map[b]);
                 zw_events_at_level[complete].push((j, a, b, false));
@@ -190,13 +246,26 @@ fn main() {
 
     let mut sums = vec![0i32; k];
     walk_for_extension(
-        mdd.root, 0, zw_depth, k, 0, 0,
-        &mut sums, &pos_order, &mdd.nodes, &zw_events_at_level,
+        mdd.root,
+        0,
+        zw_depth,
+        k,
+        0,
+        0,
+        &mut sums,
+        &pos_order,
+        &mdd.nodes,
+        &zw_events_at_level,
         &mut extension_states,
     );
 
-    eprintln!("  Unique extension states (zw_sums, z_rel, w_rel): {}",
-        extension_states.len());
-    eprintln!("  Extension work: {} × 16 = {} constraint checks",
-        extension_states.len(), extension_states.len() * 16);
+    eprintln!(
+        "  Unique extension states (zw_sums, z_rel, w_rel): {}",
+        extension_states.len()
+    );
+    eprintln!(
+        "  Extension work: {} × 16 = {} constraint checks",
+        extension_states.len(),
+        extension_states.len() * 16
+    );
 }

@@ -15,6 +15,7 @@ use turyn::mdd_reorder;
 use turyn::mdd_zw_first;
 use turyn::sat_z_middle;
 
+use crate::SPECTRAL_FREQS;
 use crate::config::*;
 use crate::enumerate::*;
 use crate::legacy_search::*;
@@ -22,8 +23,6 @@ use crate::mdd_pipeline::*;
 use crate::spectrum::*;
 use crate::stochastic::*;
 use crate::xy_sat::*;
-use crate::SPECTRAL_FREQS;
-
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Problem {
@@ -53,7 +52,6 @@ impl Problem {
         (-max_abs..=max_abs).filter(|v| v.abs() % 2 == 1).collect()
     }
 }
-
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct PackedSeq {
@@ -153,7 +151,6 @@ impl PackedSeq {
         acc
     }
 
-
     #[allow(dead_code)]
     pub(crate) fn as_string(&self) -> String {
         (0..self.len)
@@ -162,27 +159,43 @@ impl PackedSeq {
     }
 }
 
-
 /// Extract a ±1 sequence from a SAT solver's assignment.
-pub(crate) fn extract_seq(solver: &radical::Solver, var_fn: impl Fn(usize) -> i32, len: usize) -> PackedSeq {
+pub(crate) fn extract_seq(
+    solver: &radical::Solver,
+    var_fn: impl Fn(usize) -> i32,
+    len: usize,
+) -> PackedSeq {
     PackedSeq::from_values(&extract_vals(solver, var_fn, len))
 }
 
-
 /// Extract ±1 values from a SAT solver's assignment.
-pub(crate) fn extract_vals(solver: &radical::Solver, var_fn: impl Fn(usize) -> i32, len: usize) -> Vec<i8> {
-    (0..len).map(|i| if solver.value(var_fn(i)) == Some(true) { 1 } else { -1 }).collect()
+pub(crate) fn extract_vals(
+    solver: &radical::Solver,
+    var_fn: impl Fn(usize) -> i32,
+    len: usize,
+) -> Vec<i8> {
+    (0..len)
+        .map(|i| {
+            if solver.value(var_fn(i)) == Some(true) {
+                1
+            } else {
+                -1
+            }
+        })
+        .collect()
 }
-
 
 /// Expand packed boundary bits into ±1 prefix and suffix arrays.
 /// Low k bits → prefix, next k bits → suffix.
 pub(crate) fn expand_boundary_bits(bits: u32, k: usize) -> (Vec<i8>, Vec<i8>) {
-    let prefix: Vec<i8> = (0..k).map(|i| if (bits >> i) & 1 == 1 { 1 } else { -1 }).collect();
-    let suffix: Vec<i8> = (0..k).map(|i| if (bits >> (k + i)) & 1 == 1 { 1 } else { -1 }).collect();
+    let prefix: Vec<i8> = (0..k)
+        .map(|i| if (bits >> i) & 1 == 1 { 1 } else { -1 })
+        .collect();
+    let suffix: Vec<i8> = (0..k)
+        .map(|i| if (bits >> (k + i)) & 1 == 1 { 1 } else { -1 })
+        .collect();
     (prefix, suffix)
 }
-
 
 /// Format a sequence as a colorized +/- string for terminal display.
 /// '+' gets black text on light gray background, '-' gets white text on dark gray.
@@ -199,14 +212,25 @@ pub(crate) fn colored_pm(seq: &PackedSeq) -> String {
     out
 }
 
-
-pub(crate) fn print_solution(label: &str, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &PackedSeq) {
+pub(crate) fn print_solution(
+    label: &str,
+    x: &PackedSeq,
+    y: &PackedSeq,
+    z: &PackedSeq,
+    w: &PackedSeq,
+) {
     use std::io::Write;
     let n = x.len().max(y.len()).max(z.len()).max(w.len());
     let mut buf = format!("\n{}\n", label);
     for (name, seq) in [("X", x), ("Y", y), ("Z", z), ("W", w)] {
         let pad = " ".repeat(n.saturating_sub(seq.len()));
-        buf.push_str(&format!("{} =: '{}'{}  NB. {}\n", name, colored_pm(seq), pad, seq.sum()));
+        buf.push_str(&format!(
+            "{} =: '{}'{}  NB. {}\n",
+            name,
+            colored_pm(seq),
+            pad,
+            seq.sum()
+        ));
     }
     buf.push('\n');
     let stdout = std::io::stdout();
@@ -249,7 +273,6 @@ impl SumTuple {
     pub(crate) fn norm_key(&self) -> (i32, i32, i32, i32) {
         (self.x.abs(), self.y.abs(), self.z.abs(), self.w.abs())
     }
-
 }
 
 impl fmt::Display for SumTuple {
@@ -262,8 +285,13 @@ impl fmt::Display for SumTuple {
     }
 }
 
-
-pub(crate) fn verify_tt(problem: Problem, x: &PackedSeq, y: &PackedSeq, z: &PackedSeq, w: &PackedSeq) -> bool {
+pub(crate) fn verify_tt(
+    problem: Problem,
+    x: &PackedSeq,
+    y: &PackedSeq,
+    z: &PackedSeq,
+    w: &PackedSeq,
+) -> bool {
     if x.len() != problem.n
         || y.len() != problem.n
         || z.len() != problem.n
@@ -287,5 +315,3 @@ pub(crate) fn verify_tt(problem: Problem, x: &PackedSeq, y: &PackedSeq, z: &Pack
     }
     true
 }
-
-

@@ -347,7 +347,10 @@ fn main() {
     } else if search.stop {
         eprintln!("\nStopped at time budget. No T({}) found yet.", n);
     } else {
-        eprintln!("\nSearch exhausted. No T({}) exists under the chosen symmetry gauge.", n);
+        eprintln!(
+            "\nSearch exhausted. No T({}) exists under the chosen symmetry gauge.",
+            n
+        );
     }
 }
 

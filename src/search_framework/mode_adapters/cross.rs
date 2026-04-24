@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::config::SearchConfig;
-use crate::enumerate::{build_w_candidates, for_each_zw_pair, CandidateZW};
+use crate::enumerate::{CandidateZW, build_w_candidates, for_each_zw_pair};
 use crate::legacy_search::SearchStats;
 use crate::search_framework::engine::{AdapterInit, SearchModeAdapter};
 use crate::search_framework::mass::{CoverageQuality, MassValue, SearchMassModel};
@@ -35,7 +35,7 @@ use crate::search_framework::stage::{
     StageContext, StageHandler, StageId, StageOutcome, WorkItem, WorkItemMeta,
 };
 use crate::spectrum::{SeqWithSpectrum, SpectralFilter, SpectralIndex};
-use crate::types::{verify_tt, PackedSeq, Problem, SumTuple};
+use crate::types::{PackedSeq, Problem, SumTuple, verify_tt};
 use crate::xy_sat::{SatXYTemplate, SolveXyPerCandidate, XyTryResult};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -110,7 +110,11 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
             eprintln!(
                 "cross: mdd_k={} caps the brute-force XY enumeration at 2^{} per (Z,W); \
                  reducing to mdd_k={} (boundary_bits={}). Use --wz=apart|together for k>{}.",
-                raw_k, 4 * raw_k, k, 2 * k, MAX_BOUNDARY_BITS / 2,
+                raw_k,
+                4 * raw_k,
+                k,
+                2 * k,
+                MAX_BOUNDARY_BITS / 2,
             );
         }
         let mut template_cache: HashMap<Vec<(i32, i32, i32, i32)>, SatXYTemplate> = HashMap::new();
@@ -235,13 +239,7 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                                     .fetch_add(stats.cover_micro, Ordering::Relaxed);
                             }
                             if let XyTryResult::Sat(x, y) = result {
-                                if verify_tt(
-                                    problem,
-                                    &x,
-                                    &y,
-                                    &z_seq_clone,
-                                    &w_seq_clone,
-                                ) {
+                                if verify_tt(problem, &x, &y, &z_seq_clone, &w_seq_clone) {
                                     found.store(true, Ordering::Relaxed);
                                     let _ = self.result_tx.send((
                                         x,
@@ -260,8 +258,10 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                         // cross a populated
                         // `StageOutcome::forcings` just like the
                         // MDD adapter stages.
-                        stage_forcings
-                            .extend(crate::mdd_pipeline::forcing_delta_triples(&state.solver, &xy_plk0));
+                        stage_forcings.extend(crate::mdd_pipeline::forcing_delta_triples(
+                            &state.solver,
+                            &xy_plk0,
+                        ));
                     }
                     !found.load(Ordering::Relaxed)
                 },
@@ -337,7 +337,10 @@ impl SearchMassModel for CrossMassModel {
         if self.tuples_total == 0 {
             MassValue::ZERO
         } else {
-            let done = self.tuples_done.load(Ordering::Relaxed).min(self.tuples_total);
+            let done = self
+                .tuples_done
+                .load(Ordering::Relaxed)
+                .min(self.tuples_total);
             MassValue(done as f64 / self.tuples_total as f64)
         }
     }
@@ -489,8 +492,11 @@ mod tests {
             in_flight_cov_micro: Arc::new(AtomicU64::new(0)),
             xy_per_tuple: 16,
         };
-        assert_ne!(model.quality(), CoverageQuality::Direct,
-            "cross mode uses uniform tuple weighting; label MUST stay non-Direct per TTC §7.1");
+        assert_ne!(
+            model.quality(),
+            CoverageQuality::Direct,
+            "cross mode uses uniform tuple weighting; label MUST stay non-Direct per TTC §7.1"
+        );
         assert_eq!(model.quality(), CoverageQuality::Hybrid);
     }
 

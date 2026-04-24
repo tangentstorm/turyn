@@ -44,11 +44,7 @@ pub struct ForcingRollups {
 }
 
 impl ForcingRollups {
-    pub fn apply(
-        &mut self,
-        stage: StageId,
-        delta: &crate::search_framework::stage::ForcingDelta,
-    ) {
+    pub fn apply(&mut self, stage: StageId, delta: &crate::search_framework::stage::ForcingDelta) {
         for &(level, feature, count) in &delta.by_level_feature {
             let c = count as u64;
             *self.stage_level.entry((stage, level)).or_insert(0) += c;

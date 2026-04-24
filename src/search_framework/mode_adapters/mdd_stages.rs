@@ -21,21 +21,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::config::SearchConfig;
+use crate::legacy_search::WarmStartState;
 use crate::mdd_pipeline::{
-    build_phase_b_context, enumerate_live_boundaries, mdd_navigate_to_outfix,
-    new_pipeline_metrics, process_boundary, process_solve_w, process_solve_wz, process_solve_z,
     BoundaryWork, PhaseBContext, PipelineMetrics, PipelineWork, SolveWWork, SolveWZWork,
-    SolveZWork, ZStageScratch,
+    SolveZWork, ZStageScratch, build_phase_b_context, enumerate_live_boundaries,
+    mdd_navigate_to_outfix, new_pipeline_metrics, process_boundary, process_solve_w,
+    process_solve_wz, process_solve_z,
 };
 use crate::search_framework::engine::{AdapterInit, SearchModeAdapter};
 use crate::search_framework::mass::{CoverageQuality, MassValue, SearchMassModel};
 use crate::search_framework::stage::{
     ForcingDelta, StageContext, StageHandler, StageId, StageOutcome, WorkItem, WorkItemMeta,
 };
-use crate::xy_sat::SatXYTemplate;
-use crate::legacy_search::WarmStartState;
 use crate::spectrum::{FftScratch, SpectralFilter};
 use crate::types::{Problem, SumTuple};
+use crate::xy_sat::SatXYTemplate;
 
 pub const STAGE_BOUNDARY: StageId = "mdd.boundary";
 pub const STAGE_SOLVE_W: StageId = "mdd.solve_w";
@@ -145,7 +145,10 @@ impl BoundaryProgress {
     pub fn mark_abandoned(&self, fanout_root_id: u64) {
         let mut guard = self.pending.lock().unwrap();
         let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
-            pending: 1, closed: false, abandoned_taint: false, in_flight_cov_micro: 0,
+            pending: 1,
+            closed: false,
+            abandoned_taint: false,
+            in_flight_cov_micro: 0,
         });
         entry.abandoned_taint = true;
     }
@@ -163,7 +166,10 @@ impl BoundaryProgress {
     pub fn note_handled(&self, fanout_root_id: u64, emitted: u64) -> bool {
         let mut guard = self.pending.lock().unwrap();
         let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
-            pending: 1, closed: false, abandoned_taint: false, in_flight_cov_micro: 0,
+            pending: 1,
+            closed: false,
+            abandoned_taint: false,
+            in_flight_cov_micro: 0,
         });
         entry.pending = entry.pending.saturating_sub(1) + emitted;
         if entry.pending == 0 && !entry.closed {
@@ -219,7 +225,10 @@ impl BoundaryProgress {
         }
         let mut guard = self.pending.lock().unwrap();
         let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
-            pending: 1, closed: false, abandoned_taint: false, in_flight_cov_micro: 0,
+            pending: 1,
+            closed: false,
+            abandoned_taint: false,
+            in_flight_cov_micro: 0,
         });
         if entry.closed {
             // Root already closed — clean closure has already
@@ -453,7 +462,9 @@ impl StageHandler<MddPayload> for SolveWStage {
             &mut timed_out,
         );
         let mut out = StageOutcome::default();
-        out.forcings = ForcingDelta { by_level_feature: forcings };
+        out.forcings = ForcingDelta {
+            by_level_feature: forcings,
+        };
         out.emitted = wrap_items(emitted_raw, &parent_meta, &self.item_ids);
         // TTC §4.1 compliance: if the W-enumeration exited via SAT
         // conflict-budget timeout, taint this boundary so it
@@ -537,7 +548,9 @@ impl StageHandler<MddPayload> for SolveWZStage {
         self.progress
             .add_partial_cov_micro(parent_meta.fanout_root_id, cov_micro_delta);
         let mut out = StageOutcome::default();
-        out.forcings = ForcingDelta { by_level_feature: forcings };
+        out.forcings = ForcingDelta {
+            by_level_feature: forcings,
+        };
         if let Some((item, _priority)) = deferred {
             // Framework priority is i32 (coarse tag); legacy f64
             // continuation priority is dropped. Re-enqueue as
@@ -661,7 +674,9 @@ impl StageHandler<MddPayload> for SolveZStage {
         // boundary is done.
         self.progress.note_handled(parent_meta.fanout_root_id, 0);
         let mut out = StageOutcome::default();
-        out.forcings = ForcingDelta { by_level_feature: forcings };
+        out.forcings = ForcingDelta {
+            by_level_feature: forcings,
+        };
         out
     }
 }
@@ -801,10 +816,18 @@ impl MddStagesAdapter {
         let seed_boundaries = if let Some(ref outfix) = cfg.test_outfix {
             let (z_bits, w_bits) = outfix.zw_bits;
             match mdd_navigate_to_outfix(
-                ctx.mdd.root, ctx.zw_depth, &ctx.xy_pos_order, &ctx.mdd.nodes,
-                z_bits, w_bits,
+                ctx.mdd.root,
+                ctx.zw_depth,
+                &ctx.xy_pos_order,
+                &ctx.mdd.nodes,
+                z_bits,
+                w_bits,
             ) {
-                Some(xy_root) => vec![BoundaryWork { z_bits, w_bits, xy_root }],
+                Some(xy_root) => vec![BoundaryWork {
+                    z_bits,
+                    w_bits,
+                    xy_root,
+                }],
                 None => {
                     eprintln!(
                         "[framework:{}] --outfix boundary (z_bits={:#x}, w_bits={:#x}) is not live in the MDD (pruned during gen); cannot search.",
@@ -1007,8 +1030,11 @@ mod tests {
         let frac = progress.partial_fraction();
         // total=10, so denom = 10 * 1_000_000. Sum = 750_000 ⇒
         // fraction = 750_000 / 10_000_000 = 0.075.
-        assert!((frac - 0.075).abs() < 1e-9,
-            "covered_partial must accumulate credit from every stage path, got {}", frac);
+        assert!(
+            (frac - 0.075).abs() < 1e-9,
+            "covered_partial must accumulate credit from every stage path, got {}",
+            frac
+        );
     }
 
     /// Regression test: the pre-fix `SolveWZStage` skipped
@@ -1027,8 +1053,10 @@ mod tests {
         unified.add_partial_cov_micro(1, 400_000);
         unified.add_partial_cov_micro(2, 600_000);
         only_solve_z.add_partial_cov_micro(1, 400_000);
-        assert!(unified.partial_fraction() > only_solve_z.partial_fraction(),
-            "spec requires every timeout-capable XY path to contribute; only-SolveZ must under-report vs unified");
+        assert!(
+            unified.partial_fraction() > only_solve_z.partial_fraction(),
+            "spec requires every timeout-capable XY path to contribute; only-SolveZ must under-report vs unified"
+        );
         assert!((unified.partial_fraction() - 0.25).abs() < 1e-9);
         assert!((only_solve_z.partial_fraction() - 0.10).abs() < 1e-9);
     }
@@ -1055,23 +1083,30 @@ mod tests {
         // credit) while still in flight.
         p.add_partial_cov_micro(1, 500_000);
         // Before completion: partial_fraction = 0.05 (live), exact = 0.
-        assert!((p.partial_fraction() - 0.05).abs() < 1e-9,
-            "pre-completion partial MUST reflect the in-flight credit");
+        assert!(
+            (p.partial_fraction() - 0.05).abs() < 1e-9,
+            "pre-completion partial MUST reflect the in-flight credit"
+        );
         assert!((p.covered_fraction() - 0.0).abs() < 1e-9);
         // Root 1 completes. Its 500_000 cov_micro are subsumed
         // by the fresh exact +1/10 credit; partial drops to 0.
         assert!(p.note_handled(1, 0));
-        assert!((p.covered_fraction() - 0.1).abs() < 1e-9,
-            "exact MUST bump by 1/total on completion");
-        assert!((p.partial_fraction() - 0.0).abs() < 1e-9,
+        assert!(
+            (p.covered_fraction() - 0.1).abs() < 1e-9,
+            "exact MUST bump by 1/total on completion"
+        );
+        assert!(
+            (p.partial_fraction() - 0.0).abs() < 1e-9,
             "partial MUST drop to 0 when the sole root closes; got {}",
-            p.partial_fraction());
+            p.partial_fraction()
+        );
         // Sum stays within [0, 1] and equals only the exact
         // credit — no double-count.
         let covered = p.covered_fraction() + p.partial_fraction();
         assert!(
             (covered - 0.1).abs() < 1e-9,
-            "covered = exact + partial MUST equal 0.1 (not 0.15); got {}", covered,
+            "covered = exact + partial MUST equal 0.1 (not 0.15); got {}",
+            covered,
         );
     }
 
@@ -1086,9 +1121,11 @@ mod tests {
         assert!((p.covered_fraction() - 0.25).abs() < 1e-9);
         // Stale timeout arrives after completion — ignored.
         p.add_partial_cov_micro(1, 800_000);
-        assert!((p.partial_fraction() - 0.0).abs() < 1e-9,
+        assert!(
+            (p.partial_fraction() - 0.0).abs() < 1e-9,
             "stale partial credit on a completed root MUST be ignored; got {}",
-            p.partial_fraction());
+            p.partial_fraction()
+        );
     }
 
     /// TTC §4.1: "A subproblem counts as exact coverage only when
@@ -1108,17 +1145,28 @@ mod tests {
         p.mark_abandoned(1);
         // Close the boundary (last descendant returns).
         let was_clean = p.note_handled(1, 0);
-        assert!(!was_clean, "abandoned closure MUST return false (not a clean completion)");
+        assert!(
+            !was_clean,
+            "abandoned closure MUST return false (not a clean completion)"
+        );
         // TTC §4.1: covered_exact MUST NOT increase.
-        assert_eq!(p.covered_fraction(), 0.0,
-            "abandoned boundary MUST NOT exact-credit; covered_fraction MUST stay 0");
-        assert_eq!(p.abandoned_count(), 1,
-            "abandoned counter MUST bump on taint closure");
+        assert_eq!(
+            p.covered_fraction(),
+            0.0,
+            "abandoned boundary MUST NOT exact-credit; covered_fraction MUST stay 0"
+        );
+        assert_eq!(
+            p.abandoned_count(),
+            1,
+            "abandoned counter MUST bump on taint closure"
+        );
         // Partial credit stays live — the timeouts that fired
         // ARE honest eliminated work.
-        assert!((p.partial_fraction() - 0.06).abs() < 1e-9,
+        assert!(
+            (p.partial_fraction() - 0.06).abs() < 1e-9,
             "abandoned closure MUST retain partial credit (not subsume); got {}",
-            p.partial_fraction());
+            p.partial_fraction()
+        );
     }
 
     /// Taint timing: `mark_abandoned` can fire at any point
@@ -1140,8 +1188,11 @@ mod tests {
         // still routes through abandoned path because the taint
         // persists.
         assert!(!p.note_handled(1, 0));
-        assert_eq!(p.covered_fraction(), 0.0,
-            "taint MUST survive intermediate note_handled calls");
+        assert_eq!(
+            p.covered_fraction(),
+            0.0,
+            "taint MUST survive intermediate note_handled calls"
+        );
         assert_eq!(p.abandoned_count(), 1);
     }
 
@@ -1174,16 +1225,23 @@ mod tests {
     fn note_handled_does_not_double_credit_on_stale_root_reentry() {
         let p = BoundaryProgress::new(2);
         // First call: fresh root, pending 1 -> 0, bump completed.
-        assert!(p.note_handled(7, 0), "first zero-transition MUST return true");
-        assert!((p.covered_fraction() - 0.5).abs() < 1e-9,
-            "one of two boundaries done ⇒ fraction = 0.5");
+        assert!(
+            p.note_handled(7, 0),
+            "first zero-transition MUST return true"
+        );
+        assert!(
+            (p.covered_fraction() - 0.5).abs() < 1e-9,
+            "one of two boundaries done ⇒ fraction = 0.5"
+        );
         // Stale call: same root arrives again. It would normally
         // re-insert (1, false) and drop to zero again; without the
         // guard we'd double-credit.
         assert!(!p.note_handled(7, 0), "stale re-entry MUST NOT re-credit");
-        assert!((p.covered_fraction() - 0.5).abs() < 1e-9,
+        assert!(
+            (p.covered_fraction() - 0.5).abs() < 1e-9,
             "covered_fraction MUST stay at 0.5 after stale re-entry; got {}",
-            p.covered_fraction());
+            p.covered_fraction()
+        );
         // A different root completing increments normally.
         assert!(p.note_handled(8, 0));
         assert!((p.covered_fraction() - 1.0).abs() < 1e-9);
@@ -1196,7 +1254,11 @@ mod tests {
         let progress = BoundaryProgress::new(1);
         progress.add_partial_cov_micro(1, 5_000_000); // 5× the denom.
         let frac = progress.partial_fraction();
-        assert!(frac <= 1.0 && frac >= 0.0, "partial_fraction MUST stay in [0, 1]; got {}", frac);
+        assert!(
+            frac <= 1.0 && frac >= 0.0,
+            "partial_fraction MUST stay in [0, 1]; got {}",
+            frac
+        );
     }
 
     /// TTC §4.2 rule 2: partial credit for one boundary MUST NOT
@@ -1234,8 +1296,11 @@ mod tests {
         // Root 1 contributes 1_000_000, root 2 contributes
         // 500_000, total 1_500_000 / (4 * 1_000_000) = 0.375.
         let frac = progress.partial_fraction();
-        assert!((frac - 0.375).abs() < 1e-9,
-            "two roots with their own caps must sum independently; got {}", frac);
+        assert!(
+            (frac - 0.375).abs() < 1e-9,
+            "two roots with their own caps must sum independently; got {}",
+            frac
+        );
     }
 
     /// TTC §10 item 7: "mode quality labels match the actual
@@ -1247,8 +1312,11 @@ mod tests {
     fn mdd_mass_model_quality_is_hybrid() {
         let progress = Arc::new(BoundaryProgress::new(1));
         let model = McddFractionMassModel { progress };
-        assert_eq!(model.quality(), CoverageQuality::Hybrid,
-            "MDD adapter mixes a direct boundary fraction with a projected XY-timeout shortfall; quality MUST be Hybrid per TTC §6.3");
+        assert_eq!(
+            model.quality(),
+            CoverageQuality::Hybrid,
+            "MDD adapter mixes a direct boundary fraction with a projected XY-timeout shortfall; quality MUST be Hybrid per TTC §6.3"
+        );
     }
 
     /// MDD mass model must publish `covered_exact + covered_partial`
@@ -1260,9 +1328,13 @@ mod tests {
     fn mdd_mass_model_published_mass_stays_bounded() {
         let progress = Arc::new(BoundaryProgress::new(1));
         progress.add_partial_cov_micro(1, 2_000_000); // 2× overflow
-        let model = McddFractionMassModel { progress: Arc::clone(&progress) };
-        assert!(model.covered_partial_mass().0 <= 1.0,
-            "covered_partial_mass MUST clamp to ≤ 1.0 even when cov_micro overflows denom");
+        let model = McddFractionMassModel {
+            progress: Arc::clone(&progress),
+        };
+        assert!(
+            model.covered_partial_mass().0 <= 1.0,
+            "covered_partial_mass MUST clamp to ≤ 1.0 even when cov_micro overflows denom"
+        );
     }
 
     /// End-to-end integration test: run the real `MddStagesAdapter`
@@ -1296,9 +1368,8 @@ mod tests {
         cfg.sat_config = radical::SolverConfig::default();
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let (adapter, _rx) = MddStagesAdapter::build(
-            problem, tuples, &cfg, 2, false, "apart", &cancel,
-        );
+        let (adapter, _rx) =
+            MddStagesAdapter::build(problem, tuples, &cfg, 2, false, "apart", &cancel);
         let mut engine = SearchEngine::<MddPayload>::new(
             EngineConfig {
                 progress_interval: Duration::from_millis(20),
@@ -1330,13 +1401,21 @@ mod tests {
         // the same event stream, so totals MUST agree.
         let sum_level: u64 = snap.forcings.stage_level.values().sum();
         let sum_feature: u64 = snap.forcings.stage_feature.values().sum();
-        assert_eq!(sum_level, sum_feature,
+        assert_eq!(
+            sum_level, sum_feature,
             "stage_level ({}) and stage_feature ({}) totals MUST agree per TELEMETRY §4",
-            sum_level, sum_feature);
+            sum_level, sum_feature
+        );
         // At least one of the rollup keys should be an MDD stage.
-        let has_mdd_stage = snap.forcings.stage_level.keys()
+        let has_mdd_stage = snap
+            .forcings
+            .stage_level
+            .keys()
             .any(|(stage, _)| stage.starts_with("mdd."));
-        assert!(has_mdd_stage, "forcings keys MUST include at least one mdd.* stage");
+        assert!(
+            has_mdd_stage,
+            "forcings keys MUST include at least one mdd.* stage"
+        );
 
         // TTC invariants from the spec, re-checked here in
         // integration context (debug_asserts in build_snapshot
@@ -1374,9 +1453,8 @@ mod tests {
         cfg.mdd_k = 2;
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let (adapter, _rx) = MddStagesAdapter::build(
-            problem, tuples, &cfg, 2, false, "together", &cancel,
-        );
+        let (adapter, _rx) =
+            MddStagesAdapter::build(problem, tuples, &cfg, 2, false, "together", &cancel);
         let mut engine = SearchEngine::<MddPayload>::new(
             EngineConfig {
                 progress_interval: Duration::from_millis(20),
@@ -1395,21 +1473,30 @@ mod tests {
 
         // SolveWZ's combined middle solver populates forcings,
         // so rollups MUST be non-empty.
-        assert!(!snap.forcings.stage_level.is_empty(),
-            "Together mode forcings.stage_level MUST be non-empty");
+        assert!(
+            !snap.forcings.stage_level.is_empty(),
+            "Together mode forcings.stage_level MUST be non-empty"
+        );
         // Specifically, at least one key should be `mdd.solve_wz`
         // (the Together-path stage).
-        let has_solve_wz = snap.forcings.stage_level.keys()
+        let has_solve_wz = snap
+            .forcings
+            .stage_level
+            .keys()
             .any(|(stage, _)| *stage == "mdd.solve_wz");
-        assert!(has_solve_wz,
+        assert!(
+            has_solve_wz,
             "Together mode forcings MUST include mdd.solve_wz key; got keys: {:?}",
-            snap.forcings.stage_level.keys().collect::<Vec<_>>());
+            snap.forcings.stage_level.keys().collect::<Vec<_>>()
+        );
         // §4 consistency rule on the real data.
         let sum_level: u64 = snap.forcings.stage_level.values().sum();
         let sum_feature: u64 = snap.forcings.stage_feature.values().sum();
-        assert_eq!(sum_level, sum_feature,
+        assert_eq!(
+            sum_level, sum_feature,
             "Together mode: stage_level ({}) and stage_feature ({}) totals MUST agree",
-            sum_level, sum_feature);
+            sum_level, sum_feature
+        );
         // TTC invariants on the live snapshot.
         assert!(snap.covered_mass.0 <= snap.total_mass.0 + 1e-9);
         assert!(snap.remaining_mass.0 >= 0.0);
@@ -1428,8 +1515,8 @@ mod tests {
         use crate::search_framework::events::SearchEvent;
         use crate::search_framework::queue::GoldThenWork;
         use crate::types::Problem;
-        use std::sync::atomic::AtomicBool;
         use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
         use std::time::Duration;
 
         let problem = Problem::new(6);
@@ -1440,9 +1527,8 @@ mod tests {
         cfg.mdd_k = 2;
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let (adapter, _rx) = MddStagesAdapter::build(
-            problem, tuples, &cfg, 2, false, "apart", &cancel,
-        );
+        let (adapter, _rx) =
+            MddStagesAdapter::build(problem, tuples, &cfg, 2, false, "apart", &cancel);
         let mut engine = SearchEngine::<MddPayload>::new(
             EngineConfig {
                 // Very short interval so multiple progress ticks
@@ -1463,14 +1549,20 @@ mod tests {
             history_cb.lock().unwrap().push(covered);
         });
         let history = history.lock().unwrap();
-        assert!(!history.is_empty(), "engine MUST emit at least the Finished snapshot");
+        assert!(
+            !history.is_empty(),
+            "engine MUST emit at least the Finished snapshot"
+        );
         // TTC §3.6: every consecutive snapshot MUST satisfy
         // covered[i+1] >= covered[i].
         for (i, w) in history.windows(2).enumerate() {
             assert!(
                 w[1] + 1e-9 >= w[0],
                 "tick {} -> {} violates monotonicity: {} -> {}",
-                i, i + 1, w[0], w[1],
+                i,
+                i + 1,
+                w[0],
+                w[1],
             );
         }
     }

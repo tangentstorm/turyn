@@ -305,7 +305,11 @@ fn main() {
         "Building 8-way T-sequence MDD for m={} (k={}), mode={}, naive tree size bound 8^{}={}",
         m,
         k,
-        if cross_only { "cross-only" } else { "all-pairs" },
+        if cross_only {
+            "cross-only"
+        } else {
+            "all-pairs"
+        },
         m,
         8u128.pow(m as u32)
     );
@@ -357,7 +361,11 @@ fn main() {
             let h = b.cache_hits[l];
             let d = b.dead_returns[l];
             if t > 0 {
-                let pct = if t > 0 { 100.0 * h as f64 / t as f64 } else { 0.0 };
+                let pct = if t > 0 {
+                    100.0 * h as f64 / t as f64
+                } else {
+                    0.0
+                };
                 eprintln!(
                     "  {:>5} {:>12} {:>10} {:>10} {:>10} {:>7.2}%",
                     l, t, n, d, h, pct

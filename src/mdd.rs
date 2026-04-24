@@ -8,7 +8,6 @@
 ///   0          = DEAD (no valid completion)
 ///   u32::MAX   = LEAF (valid terminal)
 ///   other      = index into nodes[]
-
 use rustc_hash::FxHashMap as HashMap;
 
 pub const DEAD: u32 = 0;
@@ -40,16 +39,17 @@ impl BoundaryMdd {
 
         // Build exact-lag bit pairs
         struct LagInfo {
-            pairs: Vec<(usize, usize)>,    // XY/Z pairs
-            w_pairs: Vec<(usize, usize)>,  // W pairs
+            pairs: Vec<(usize, usize)>,   // XY/Z pairs
+            w_pairs: Vec<(usize, usize)>, // W pairs
         }
         let mut lags: Vec<LagInfo> = Vec::new();
         for j in 0..k {
-            let pairs: Vec<(usize, usize)> = (0..k - j)
-                .map(|i| (i, k + i + j)).collect();
+            let pairs: Vec<(usize, usize)> = (0..k - j).map(|i| (i, k + i + j)).collect();
             let w_pairs: Vec<(usize, usize)> = if j < k - 1 {
                 (0..k - j - 1).map(|i| (i, k + i + j + 1)).collect()
-            } else { Vec::new() };
+            } else {
+                Vec::new()
+            };
             lags.push(LagInfo { pairs, w_pairs });
         }
 
@@ -58,8 +58,7 @@ impl BoundaryMdd {
         // is_xyzw=false: contributes 2*N_W only
         let mut events_at_level: Vec<Vec<(usize, usize, usize, bool)>> =
             (0..depth).map(|_| Vec::new()).collect();
-        let mut lag_check_at_level: Vec<Vec<usize>> =
-            (0..=depth).map(|_| Vec::new()).collect();
+        let mut lag_check_at_level: Vec<Vec<usize>> = (0..=depth).map(|_| Vec::new()).collect();
 
         for (li, lag) in lags.iter().enumerate() {
             let mut lag_complete = 0usize;
@@ -116,16 +115,21 @@ impl BoundaryMdd {
         let mut active_at_level: Vec<Vec<usize>> = vec![Vec::new(); depth + 1];
         for d in 0..depth {
             let mut active: Vec<usize> = if d > 0 {
-                active_at_level[d - 1].iter()
+                active_at_level[d - 1]
+                    .iter()
                     .filter(|&&p| last_use_level[p] >= d)
-                    .copied().collect()
-            } else { Vec::new() };
+                    .copied()
+                    .collect()
+            } else {
+                Vec::new()
+            };
             active.push(pos_order[d]);
             active.sort();
             active_at_level[d] = active;
         }
 
-        let active_indices: Vec<HashMap<usize, usize>> = active_at_level.iter()
+        let active_indices: Vec<HashMap<usize, usize>> = active_at_level
+            .iter()
             .map(|active| active.iter().enumerate().map(|(i, &p)| (p, i)).collect())
             .collect();
 
@@ -162,13 +166,16 @@ impl BoundaryMdd {
             use std::hash::{Hash, Hasher};
             let mut h = rustc_hash::FxHasher::default();
             level.hash(&mut h);
-            for &c in children { c.hash(&mut h); }
+            for &c in children {
+                c.hash(&mut h);
+            }
             h.finish()
         }
         let mut unique: HashMap<u64, u32> = HashMap::default();
 
         type StateKey = (u128, u64);
-        let mut memo: Vec<HashMap<StateKey, u32>> = (0..=depth).map(|_| HashMap::default()).collect();
+        let mut memo: Vec<HashMap<StateKey, u32>> =
+            (0..=depth).map(|_| HashMap::default()).collect();
 
         fn pack_sums(sums: &[i8]) -> u128 {
             let mut packed = 0u128;
@@ -196,7 +203,11 @@ impl BoundaryMdd {
             memo: &mut Vec<HashMap<StateKey, u32>>,
         ) -> u32 {
             if level == ctx.depth {
-                return if sums.iter().all(|&s| s == 0) { LEAF } else { DEAD };
+                return if sums.iter().all(|&s| s == 0) {
+                    LEAF
+                } else {
+                    DEAD
+                };
             }
 
             let active = &ctx.active_at_level[level];
@@ -226,7 +237,9 @@ impl BoundaryMdd {
 
             let mut children = [DEAD; 16];
             for sign_col in 0u32..16 {
-                if new_pos == 0 && sign_col != 0b1111 { continue; }
+                if new_pos == 0 && sign_col != 0b1111 {
+                    continue;
+                }
 
                 current_active_vals[new_idx] = sign_col as u8;
 
@@ -255,7 +268,10 @@ impl BoundaryMdd {
                 let mut ok = true;
                 // Exact check: completed lags must be zero
                 for &li in &ctx.lag_check_at_level[level] {
-                    if sums[li] != 0 { ok = false; break; }
+                    if sums[li] != 0 {
+                        ok = false;
+                        break;
+                    }
                 }
                 // Range check: partial sums must be achievable by remaining events
                 if ok && level + 1 < ctx.depth {
@@ -270,12 +286,20 @@ impl BoundaryMdd {
 
                 if ok {
                     children[sign_col as usize] = build_rec(
-                        level + 1, sums, &mut current_active_vals,
-                        ctx, nodes, unique, memo,
+                        level + 1,
+                        sums,
+                        &mut current_active_vals,
+                        ctx,
+                        nodes,
+                        unique,
+                        memo,
                     );
                     if level == 1 {
-                        eprint!("\r  Building: level 1 branch {}/16, {} nodes so far   ",
-                            sign_col + 1, nodes.len());
+                        eprint!(
+                            "\r  Building: level 1 branch {}/16, {} nodes so far   ",
+                            sign_col + 1,
+                            nodes.len()
+                        );
                     }
                 }
 
@@ -293,8 +317,9 @@ impl BoundaryMdd {
                     first
                 } else {
                     let key = hash_node(level as u8, &children);
-                    if let Some(&nid) = unique.get(&key) { nid }
-                    else {
+                    if let Some(&nid) = unique.get(&key) {
+                        nid
+                    } else {
                         let nid = nodes.len() as u32;
                         nodes.push(children);
                         unique.insert(key, nid);
@@ -310,14 +335,28 @@ impl BoundaryMdd {
         let mut sums = vec![0i8; k];
         let mut active_bits: Vec<u8> = Vec::new();
         let root = build_rec(
-            0, &mut sums, &mut active_bits,
-            &ctx, &mut nodes, &mut unique, &mut memo,
+            0,
+            &mut sums,
+            &mut active_bits,
+            &ctx,
+            &mut nodes,
+            &mut unique,
+            &mut memo,
         );
 
-        eprintln!("\rMDD k={}: {} nodes, {:.1} MB                          ",
-            k, nodes.len(), nodes.len() as f64 * 64.0 / 1_048_576.0);
+        eprintln!(
+            "\rMDD k={}: {} nodes, {:.1} MB                          ",
+            k,
+            nodes.len(),
+            nodes.len() as f64 * 64.0 / 1_048_576.0
+        );
 
-        BoundaryMdd { nodes, root, k, pos_order }
+        BoundaryMdd {
+            nodes,
+            root,
+            k,
+            pos_order,
+        }
     }
 
     /// Walk the MDD with z,w bits fixed, collecting valid (x_bits, y_bits) pairs.
@@ -327,9 +366,19 @@ impl BoundaryMdd {
         self.walk_xy(self.root, 0, z_bits, w_bits, 0, 0, out);
     }
 
-    fn walk_xy(&self, nid: u32, level: usize, z_bits: u32, w_bits: u32,
-               x_acc: u32, y_acc: u32, out: &mut Vec<(u32, u32)>) {
-        if nid == DEAD { return; }
+    fn walk_xy(
+        &self,
+        nid: u32,
+        level: usize,
+        z_bits: u32,
+        w_bits: u32,
+        x_acc: u32,
+        y_acc: u32,
+        out: &mut Vec<(u32, u32)>,
+    ) {
+        if nid == DEAD {
+            return;
+        }
         if level == 2 * self.k {
             if nid == LEAF {
                 out.push((x_acc, y_acc));
@@ -348,7 +397,9 @@ impl BoundaryMdd {
         for xy in 0u32..4 {
             let sign_col = xy | zw_bits;
             let child = self.nodes[nid as usize][sign_col as usize];
-            if child == DEAD { continue; }
+            if child == DEAD {
+                continue;
+            }
 
             let x_val = (xy >> 0) & 1;
             let y_val = (xy >> 1) & 1;
@@ -371,25 +422,42 @@ impl BoundaryMdd {
         let mut memo: HashMap<u32, u32> = HashMap::default();
 
         let root = Self::project_node(
-            self.root, 0, &self.nodes, self.k,
-            &mut nodes_4, &mut unique_4, &mut memo,
+            self.root,
+            0,
+            &self.nodes,
+            self.k,
+            &mut nodes_4,
+            &mut unique_4,
+            &mut memo,
         );
 
         eprintln!("ZW projection: {} nodes (4-way)", nodes_4.len());
-        ZwProjection { nodes: nodes_4, root, k: self.k, pos_order: self.pos_order.clone() }
+        ZwProjection {
+            nodes: nodes_4,
+            root,
+            k: self.k,
+            pos_order: self.pos_order.clone(),
+        }
     }
 
     fn project_node(
-        nid: u32, level: u8,
+        nid: u32,
+        level: u8,
         nodes_16: &[[u32; 16]],
         k: usize,
         nodes_4: &mut Vec<[u32; 4]>,
         unique_4: &mut HashMap<(u8, [u32; 4]), u32>,
         memo: &mut HashMap<u32, u32>,
     ) -> u32 {
-        if nid == DEAD { return DEAD; }
-        if nid == LEAF { return LEAF; }
-        if let Some(&cached) = memo.get(&nid) { return cached; }
+        if nid == DEAD {
+            return DEAD;
+        }
+        if nid == LEAF {
+            return LEAF;
+        }
+        if let Some(&cached) = memo.get(&nid) {
+            return cached;
+        }
 
         let mut children_4 = [DEAD; 4];
         for zw in 0u32..4 {
@@ -428,8 +496,13 @@ impl BoundaryMdd {
             } else if child_16s.len() == 1 {
                 // All live (x,y) lead to the same subtree — project it
                 children_4[zw as usize] = Self::project_node(
-                    child_16s[0], level + 1, nodes_16, k,
-                    nodes_4, unique_4, memo,
+                    child_16s[0],
+                    level + 1,
+                    nodes_16,
+                    k,
+                    nodes_4,
+                    unique_4,
+                    memo,
                 );
             } else {
                 // Multiple distinct subtrees. Project each and OR them together.
@@ -437,10 +510,8 @@ impl BoundaryMdd {
                 // Simple version: project each, then merge.
                 let mut merged = DEAD;
                 for &c16 in &child_16s {
-                    let projected = Self::project_node(
-                        c16, level + 1, nodes_16, k,
-                        nodes_4, unique_4, memo,
-                    );
+                    let projected =
+                        Self::project_node(c16, level + 1, nodes_16, k, nodes_4, unique_4, memo);
                     merged = or_4way(merged, projected, level + 1, nodes_4, unique_4);
                 }
                 children_4[zw as usize] = merged;
@@ -475,14 +546,24 @@ impl BoundaryMdd {
 #[allow(dead_code)]
 /// OR two 4-way MDD nodes: result has a branch if either input has it.
 fn or_4way(
-    a: u32, b: u32, level: u8,
+    a: u32,
+    b: u32,
+    level: u8,
     nodes: &mut Vec<[u32; 4]>,
     unique: &mut HashMap<(u8, [u32; 4]), u32>,
 ) -> u32 {
-    if a == DEAD { return b; }
-    if b == DEAD { return a; }
-    if a == LEAF || b == LEAF { return LEAF; }
-    if a == b { return a; }
+    if a == DEAD {
+        return b;
+    }
+    if b == DEAD {
+        return a;
+    }
+    if a == LEAF || b == LEAF {
+        return LEAF;
+    }
+    if a == b {
+        return a;
+    }
 
     let a_ch = nodes[a as usize];
     let b_ch = nodes[b as usize];
@@ -491,12 +572,18 @@ fn or_4way(
         children[i] = or_4way(a_ch[i], b_ch[i], level + 1, nodes, unique);
     }
 
-    if children.iter().all(|&c| c == DEAD) { return DEAD; }
+    if children.iter().all(|&c| c == DEAD) {
+        return DEAD;
+    }
     let first = children[0];
-    if children.iter().all(|&c| c == first) { return first; }
+    if children.iter().all(|&c| c == first) {
+        return first;
+    }
 
     let key = (level, children);
-    if let Some(&existing) = unique.get(&key) { return existing; }
+    if let Some(&existing) = unique.get(&key) {
+        return existing;
+    }
     let id = nodes.len() as u32;
     nodes.push(children);
     unique.insert(key, id);
@@ -520,25 +607,47 @@ impl ZwProjection {
     }
 
     fn walk<F: FnMut(u32, u32)>(
-        &self, nid: u32, level: usize, z_acc: u32, w_acc: u32, callback: &mut F,
+        &self,
+        nid: u32,
+        level: usize,
+        z_acc: u32,
+        w_acc: u32,
+        callback: &mut F,
     ) {
-        if nid == DEAD { return; }
+        if nid == DEAD {
+            return;
+        }
         if level == 2 * self.k {
-            if nid == LEAF { callback(z_acc, w_acc); }
+            if nid == LEAF {
+                callback(z_acc, w_acc);
+            }
             return;
         }
 
         let pos = self.pos_order[level];
         for zw in 0u32..4 {
             let child = self.nodes[nid as usize][zw as usize];
-            if child == DEAD { continue; }
+            if child == DEAD {
+                continue;
+            }
             let z_val = (zw >> 0) & 1;
             let w_val = (zw >> 1) & 1;
             if child == LEAF {
                 // All deeper positions are don't-care for ZW — enumerate remaining
-                self.walk_leaf(level + 1, z_acc | (z_val << pos), w_acc | (w_val << pos), callback);
+                self.walk_leaf(
+                    level + 1,
+                    z_acc | (z_val << pos),
+                    w_acc | (w_val << pos),
+                    callback,
+                );
             } else {
-                self.walk(child, level + 1, z_acc | (z_val << pos), w_acc | (w_val << pos), callback);
+                self.walk(
+                    child,
+                    level + 1,
+                    z_acc | (z_val << pos),
+                    w_acc | (w_val << pos),
+                    callback,
+                );
             }
         }
     }
@@ -546,7 +655,11 @@ impl ZwProjection {
     /// When we hit a LEAF in the projection, all remaining positions are free.
     /// Enumerate all 4^remaining (z,w) completions.
     fn walk_leaf<F: FnMut(u32, u32)>(
-        &self, level: usize, z_acc: u32, w_acc: u32, callback: &mut F,
+        &self,
+        level: usize,
+        z_acc: u32,
+        w_acc: u32,
+        callback: &mut F,
     ) {
         if level == 2 * self.k {
             callback(z_acc, w_acc);
@@ -556,7 +669,12 @@ impl ZwProjection {
         for zw in 0u32..4 {
             let z_val = (zw >> 0) & 1;
             let w_val = (zw >> 1) & 1;
-            self.walk_leaf(level + 1, z_acc | (z_val << pos), w_acc | (w_val << pos), callback);
+            self.walk_leaf(
+                level + 1,
+                z_acc | (z_val << pos),
+                w_acc | (w_val << pos),
+                callback,
+            );
         }
     }
 
@@ -564,11 +682,19 @@ impl ZwProjection {
     pub fn count_paths(&self) -> u128 {
         let mut memo: HashMap<u32, u128> = HashMap::default();
         fn count(nid: u32, nodes: &[[u32; 4]], memo: &mut HashMap<u32, u128>) -> u128 {
-            if nid == DEAD { return 0; }
-            if nid == LEAF { return 1; }
-            if let Some(&c) = memo.get(&nid) { return c; }
-            let total: u128 = nodes[nid as usize].iter()
-                .map(|&child| count(child, nodes, memo)).sum();
+            if nid == DEAD {
+                return 0;
+            }
+            if nid == LEAF {
+                return 1;
+            }
+            if let Some(&c) = memo.get(&nid) {
+                return c;
+            }
+            let total: u128 = nodes[nid as usize]
+                .iter()
+                .map(|&child| count(child, nodes, memo))
+                .sum();
             memo.insert(nid, total);
             total
         }
@@ -584,10 +710,16 @@ impl BoundaryMdd {
     /// is non-DEAD. If so, collect unique child nodes and recurse.
     /// Dedup at leaf via HashSet.
     pub fn walk_zw_unique(
-        &self, nid: u32, level: usize, z_acc: u32, w_acc: u32,
+        &self,
+        nid: u32,
+        level: usize,
+        z_acc: u32,
+        w_acc: u32,
         out: &mut std::collections::HashSet<(u32, u32)>,
     ) {
-        if nid == DEAD { return; }
+        if nid == DEAD {
+            return;
+        }
         if level == 2 * self.k {
             if nid == LEAF {
                 out.insert((z_acc, w_acc));
@@ -610,7 +742,9 @@ impl BoundaryMdd {
                     child_set.push(child);
                 }
             }
-            if child_set.is_empty() { continue; }
+            if child_set.is_empty() {
+                continue;
+            }
 
             let new_z = z_acc | (z_val << pos);
             let new_w = w_acc | (w_val << pos);
@@ -627,11 +761,18 @@ impl BoundaryMdd {
     }
 
     fn walk_all<F: FnMut(u32, u32, u32, u32)>(
-        &self, nid: u32, level: usize,
-        x_acc: u32, y_acc: u32, z_acc: u32, w_acc: u32,
+        &self,
+        nid: u32,
+        level: usize,
+        x_acc: u32,
+        y_acc: u32,
+        z_acc: u32,
+        w_acc: u32,
         callback: &mut F,
     ) {
-        if nid == DEAD { return; }
+        if nid == DEAD {
+            return;
+        }
         if level == 2 * self.k {
             if nid == LEAF {
                 callback(x_acc, y_acc, z_acc, w_acc);
@@ -642,7 +783,9 @@ impl BoundaryMdd {
         let pos = self.pos_order[level];
         for sign_col in 0u32..16 {
             let child = self.nodes[nid as usize][sign_col as usize];
-            if child == DEAD { continue; }
+            if child == DEAD {
+                continue;
+            }
 
             let x_val = (sign_col >> 0) & 1;
             let y_val = (sign_col >> 1) & 1;
@@ -650,7 +793,8 @@ impl BoundaryMdd {
             let w_val = (sign_col >> 3) & 1;
 
             self.walk_all(
-                child, level + 1,
+                child,
+                level + 1,
                 x_acc | (x_val << pos),
                 y_acc | (y_val << pos),
                 z_acc | (z_val << pos),
