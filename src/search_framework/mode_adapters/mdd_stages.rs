@@ -659,23 +659,28 @@ impl StageHandler<MddPayload> for SolveZStage {
 
 /// Fractional mass model for the staged MDD adapter.
 /// `total_mass = 1.0` (the whole search space). Coverage is
-/// polled from the adapter's `BoundaryProgress` and equals
-/// `completed_boundaries / seed_boundaries`: a boundary counts
-/// as complete once every one of its descendants (SolveW,
-/// SolveWZ, SolveZ, or the inline XY walk) has returned.
+/// polled from the adapter's `BoundaryProgress`:
 ///
-/// Two sources of approximation that keep this labeled `Hybrid`:
+/// - `covered_exact = clean_completed / total`. A boundary
+///   contributes to the exact numerator only when its entire
+///   descendant search terminated CLEANLY (UNSAT / all
+///   candidates enumerated), never when a W or Z
+///   conflict-budget timeout cut it off. Timeout-closed
+///   boundaries are marked "abandoned" (see
+///   `BoundaryProgress::mark_abandoned`) and contribute ONLY to
+///   partial credit via retained `in_flight_cov_micro`.
+/// - `covered_partial = live_partial_cov_micro / (total * 1M)`.
+///   Sum of per-XY-timeout `cover_micro` across live AND
+///   abandoned boundaries; each clean closure subsumes its
+///   root's contribution into exact, each abandoned closure
+///   retains it.
 ///
-/// 1. `covered_partial` is XY-timeout shortfall credit — a
-///    projected estimate of sub-cube elimination, not a direct
-///    measurement of search-space bytes removed.
-/// 2. `covered_exact` closes a boundary whenever its descendant
-///    search returns, even when that return was a SolveW or
-///    SolveZ conflict-budget timeout (tracked as
-///    `flow_w_timeout` / `flow_z_timeout`) rather than a clean
-///    UNSAT. Per TTC §4.1 that's strictly not "no residual work
-///    remains", but §5.1 / §6.3 permit this as an approximation
-///    as long as the label stays non-`Direct`.
+/// `Hybrid` label per TTC §6.3 because `covered_partial` is a
+/// projected estimate of XY sub-cube elimination, not a direct
+/// measurement. `covered_exact` is a real additive fraction
+/// (abandoned boundaries excluded), so only partial is the
+/// approximation source now — TTC §4.1 is fully satisfied since
+/// round 25.
 ///
 /// No push-based `mass_delta` — relying on push would double-
 /// count when one boundary fans out to multiple SolveZs, and
