@@ -907,4 +907,84 @@ mod tests {
         assert!(model.covered_partial_mass().0 <= 1.0,
             "covered_partial_mass MUST clamp to ≤ 1.0 even when cov_micro overflows denom");
     }
+
+    /// End-to-end integration test: run the real `MddStagesAdapter`
+    /// on a small problem (n=6) and assert the final
+    /// `ProgressSnapshot.forcings` is non-empty — concretely verifies
+    /// that the MDD stages' forcing sinks actually flow into
+    /// `ForcingRollups` (docs/TELEMETRY.md §4 / §9). Uses the
+    /// in-memory BFS-built MDD fallback so it doesn't require
+    /// `mdd-<k>.bin` on disk.
+    #[test]
+    fn mdd_live_run_populates_forcing_rollups() {
+        use crate::config::{SearchConfig, WzMode};
+        use crate::enumerate::phase_a_tuples;
+        use crate::search_framework::engine::{EngineConfig, SearchEngine};
+        use crate::search_framework::events::SearchEvent;
+        use crate::search_framework::queue::GoldThenWork;
+        use crate::types::Problem;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let problem = Problem::new(6);
+        let tuples = phase_a_tuples(problem, None);
+        // n=6 tuple list should be non-empty; if it isn't the
+        // search has nothing to do and the test is meaningless.
+        assert!(!tuples.is_empty(), "n=6 phase-A tuples MUST be non-empty");
+
+        let mut cfg = SearchConfig::default();
+        cfg.problem = problem;
+        cfg.wz_mode = Some(WzMode::Apart);
+        cfg.mdd_k = 2;
+        cfg.sat_config = radical::SolverConfig::default();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (adapter, _rx) = MddStagesAdapter::build(
+            problem, tuples, &cfg, 2, false, "apart", &cancel,
+        );
+        let mut engine = SearchEngine::<MddPayload>::new(
+            EngineConfig {
+                progress_interval: Duration::from_millis(20),
+                worker_count: 1,
+            },
+            Box::new(GoldThenWork::new(4)),
+        );
+
+        let mut final_snap = None;
+        engine.run(&adapter, |event| {
+            if let SearchEvent::Finished(p) = event {
+                final_snap = Some(p);
+            }
+        });
+        let snap = final_snap.expect("Finished event not emitted");
+
+        // docs/TELEMETRY.md §9 says MDD stages populate forcings.
+        // The actual CDCL propagation from the Z/W/XY solvers MUST
+        // produce at least one attributed forcing for this run.
+        assert!(
+            !snap.forcings.stage_level.is_empty(),
+            "MDD forcings.stage_level MUST be populated for a real run; got empty",
+        );
+        assert!(
+            !snap.forcings.stage_feature.is_empty(),
+            "MDD forcings.stage_feature MUST be populated for a real run; got empty",
+        );
+        // Consistency rule (TELEMETRY.md §4): both axes come from
+        // the same event stream, so totals MUST agree.
+        let sum_level: u64 = snap.forcings.stage_level.values().sum();
+        let sum_feature: u64 = snap.forcings.stage_feature.values().sum();
+        assert_eq!(sum_level, sum_feature,
+            "stage_level ({}) and stage_feature ({}) totals MUST agree per TELEMETRY §4",
+            sum_level, sum_feature);
+        // At least one of the rollup keys should be an MDD stage.
+        let has_mdd_stage = snap.forcings.stage_level.keys()
+            .any(|(stage, _)| stage.starts_with("mdd."));
+        assert!(has_mdd_stage, "forcings keys MUST include at least one mdd.* stage");
+
+        // TTC invariants from the spec, re-checked here in
+        // integration context (debug_asserts in build_snapshot
+        // already fired for any failure).
+        assert!(snap.covered_mass.0 <= snap.total_mass.0 + 1e-9);
+        assert!(snap.remaining_mass.0 >= 0.0);
+    }
 }

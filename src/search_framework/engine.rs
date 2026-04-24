@@ -459,12 +459,49 @@ fn build_snapshot(
     fanout_roots: &BTreeMap<u64, FanoutRootCounters>,
     forcings: &ForcingRollups,
 ) -> ProgressSnapshot {
+    let covered = mass.covered();
+    let remaining = mass.remaining();
+    // TELEMETRY.md §7 SHOULD checks, enforced as debug asserts so
+    // any regression breaks tests and debug builds immediately
+    // without burdening release runs. Each invariant:
+    //   1. covered_mass <= 1.0 (also TTC §3 invariant 4)
+    //   2. remaining_mass >= 0 (TTC §3 invariant 5)
+    //   3. live_descendants never negative (u64 saturating, but
+    //      we still require it to stay inside representable range
+    //      across every fan-out root)
+    //   4. forcing axis totals agree when both are populated
+    //      (TELEMETRY.md §4 consistency rule)
+    debug_assert!(
+        covered.0 <= mass.total.0 + 1e-9,
+        "TELEMETRY §7.1: covered_mass={} MUST be <= total_mass={}",
+        covered.0, mass.total.0,
+    );
+    debug_assert!(
+        remaining.0 + 1e-9 >= 0.0,
+        "TELEMETRY §7.2: remaining_mass={} MUST be >= 0",
+        remaining.0,
+    );
+    // `live_descendants` is u64, so non-negativity is structural.
+    // Assert on the aggregate too so an overflow at u64::MAX fails
+    // loudly rather than wrapping silently.
+    debug_assert!(
+        fanout_roots.values().all(|c| c.live_descendants != u64::MAX),
+        "TELEMETRY §7.3: fanout_roots.live_descendants MUST NOT saturate at u64::MAX",
+    );
+    let sum_level: u64 = forcings.stage_level.values().sum();
+    let sum_feature: u64 = forcings.stage_feature.values().sum();
+    if !forcings.stage_level.is_empty() && !forcings.stage_feature.is_empty() {
+        debug_assert_eq!(
+            sum_level, sum_feature,
+            "TELEMETRY §4 consistency rule: stage_level and stage_feature totals MUST agree when both populated",
+        );
+    }
     ProgressSnapshot {
         elapsed,
         throughput_per_sec: mass.throughput_per_sec(elapsed),
-        covered_mass: mass.covered(),
+        covered_mass: covered,
         total_mass: mass.total,
-        remaining_mass: mass.remaining(),
+        remaining_mass: remaining,
         ttc: mass.ttc(elapsed),
         quality,
         edge_flow: edge_flow.clone(),
