@@ -807,6 +807,12 @@ pub(crate) fn process_solve_z(
     result_tx: &std::sync::mpsc::Sender<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
     rng: &mut u64,
     forcings_out: &mut Vec<(u16, u8, u32)>,
+    // Per-call accumulator for XY-timeout `cover_micro` values.
+    // A local u64 rather than snapshot-diff on the global
+    // `flow_xy_timeout_cov_micro` atomic, which double-attributes
+    // XY timeouts across concurrent handlers under
+    // `worker_count > 1`.
+    cov_micro_out: &mut u64,
 ) {
     let k = ctx.k;
     let n = ctx.problem.n;
@@ -1110,6 +1116,7 @@ pub(crate) fn process_solve_z(
                         XyTryResult::Timeout => {
                             metrics.flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed);
                             metrics.flow_xy_timeout_cov_micro.fetch_add(stats.cover_micro, AtomicOrdering::Relaxed);
+                            *cov_micro_out = cov_micro_out.saturating_add(stats.cover_micro);
                         }
                     };
                     if !matches!(result, XyTryResult::Pruned) {
@@ -1193,6 +1200,8 @@ pub(crate) fn process_solve_wz(
     result_tx: &std::sync::mpsc::Sender<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
     rng: &mut u64,
     forcings_out: &mut Vec<(u16, u8, u32)>,
+    // Per-call cov_micro accumulator; see `process_solve_z`.
+    cov_micro_out: &mut u64,
 ) -> Option<(PipelineWork, f64)> {
     let k = ctx.k;
     let n = ctx.problem.n;
@@ -1683,6 +1692,7 @@ pub(crate) fn process_solve_wz(
                         None => {
                             let cover = xy_cover_micro(result, xy_decisions, xy_free_vars);
                             metrics.flow_xy_timeout_cov_micro.fetch_add(cover, AtomicOrdering::Relaxed);
+                            *cov_micro_out = cov_micro_out.saturating_add(cover);
                             metrics.flow_xy_timeout.fetch_add(1, AtomicOrdering::Relaxed)
                         }
                     };

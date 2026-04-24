@@ -419,17 +419,17 @@ impl StageHandler<MddPayload> for SolveWZStage {
             template_cache,
             rng,
         } = &mut *guard;
-        // Snapshot `flow_xy_timeout_cov_micro` before/after so any
-        // timeout-capable XY work triggered inside `process_solve_wz`
-        // contributes partial credit to the same boundary-mass
-        // ledger `SolveZ` uses. Without this, `--wz=together`
-        // undercounts `covered_partial`; see `docs/TTC.md` §4.2
-        // (bundled-stage rule) and §7.2 (apart/together parity).
-        let cov_micro_before = self
-            .metrics
-            .flow_xy_timeout_cov_micro
-            .load(std::sync::atomic::Ordering::Relaxed);
+        // Per-call cov_micro accumulator. Previous code
+        // snapshot-diffed the global `flow_xy_timeout_cov_micro`
+        // atomic, which double-attributes XY timeouts to
+        // multiple concurrent boundaries when `worker_count > 1`
+        // (both workers see the combined delta). A per-call local
+        // `u64` threaded through `process_solve_wz` is safe under
+        // any worker count. `docs/TTC.md` §4.2 rule 4 ("added
+        // exactly once per interrupted attempt") and §7.2
+        // (apart/together parity).
         let mut forcings: Vec<(u16, u8, u32)> = Vec::new();
+        let mut cov_micro_delta: u64 = 0;
         let deferred = process_solve_wz(
             swz,
             &self.ctx,
@@ -439,15 +439,10 @@ impl StageHandler<MddPayload> for SolveWZStage {
             &self.result_tx,
             rng,
             &mut forcings,
+            &mut cov_micro_delta,
         );
-        let cov_micro_after = self
-            .metrics
-            .flow_xy_timeout_cov_micro
-            .load(std::sync::atomic::Ordering::Relaxed);
-        self.progress.add_partial_cov_micro(
-            parent_meta.fanout_root_id,
-            cov_micro_after.saturating_sub(cov_micro_before),
-        );
+        self.progress
+            .add_partial_cov_micro(parent_meta.fanout_root_id, cov_micro_delta);
         let mut out = StageOutcome::default();
         out.forcings = ForcingDelta { by_level_feature: forcings };
         if let Some((item, _priority)) = deferred {
@@ -528,11 +523,13 @@ impl StageHandler<MddPayload> for SolveZStage {
         // timeouts during *this* call. `process_solve_z` is
         // terminal — it fires XY solves inline and reports
         // solutions through `result_tx`.
-        let cov_micro_before = self
-            .metrics
-            .flow_xy_timeout_cov_micro
-            .load(std::sync::atomic::Ordering::Relaxed);
+        // Per-call cov_micro accumulator threaded into
+        // `process_solve_z`; see `SolveWZStage::handle` for why
+        // this replaces the earlier snapshot-diff on the global
+        // `flow_xy_timeout_cov_micro` atomic (concurrency-safe
+        // under any `worker_count`).
         let mut forcings: Vec<(u16, u8, u32)> = Vec::new();
+        let mut cov_micro_delta: u64 = 0;
         process_solve_z(
             sz,
             &self.ctx,
@@ -546,11 +543,8 @@ impl StageHandler<MddPayload> for SolveZStage {
             &self.result_tx,
             rng,
             &mut forcings,
+            &mut cov_micro_delta,
         );
-        let cov_micro_after = self
-            .metrics
-            .flow_xy_timeout_cov_micro
-            .load(std::sync::atomic::Ordering::Relaxed);
         // Partial credit MUST be registered BEFORE note_handled.
         // If this is the last in-flight descendant of the
         // boundary, note_handled will subsume the accumulated
@@ -559,10 +553,8 @@ impl StageHandler<MddPayload> for SolveZStage {
         // operate on it. Registering after would briefly
         // double-count between the exact bump and the partial
         // drain.
-        self.progress.add_partial_cov_micro(
-            parent_meta.fanout_root_id,
-            cov_micro_after.saturating_sub(cov_micro_before),
-        );
+        self.progress
+            .add_partial_cov_micro(parent_meta.fanout_root_id, cov_micro_delta);
         // Mass credit: one more pending descendant of this
         // boundary is done. When the last SolveZ for a boundary
         // returns, `note_handled` drops the pending count to zero
