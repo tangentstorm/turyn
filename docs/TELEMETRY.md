@@ -21,9 +21,9 @@ schema is defined in `src/search_framework/events.rs`:
 ```rust
 pub struct ProgressSnapshot {
     pub elapsed: Duration,
-    pub throughput_per_sec: MassValue,   // bits / second
-    pub covered_mass: MassValue,         // bits covered so far
-    pub total_mass: MassValue,           // log2(|full search space|)
+    pub throughput_per_sec: MassValue,   // fraction / second
+    pub covered_mass: MassValue,         // covered_exact + covered_partial (in [0, 1])
+    pub total_mass: MassValue,           // 1.0
     pub remaining_mass: MassValue,
     pub ttc: Option<Duration>,           // remaining_mass / throughput
     pub quality: TtcQuality,             // Direct | Projected | Hybrid
@@ -35,28 +35,42 @@ pub struct ProgressSnapshot {
 
 ### TTC (mode-agnostic)
 
-One metric, one unit across every mode:
+One metric, one unit across every mode. The unit is a **fraction**
+of the total search space in `[0, 1]` — additive over disjoint
+sub-cubes. (A previous iteration used `log2(|sub-cube|)` bits, but
+log sizes aren't additive when sub-cubes compose, so the unit
+was switched to fractions. See `src/search_framework/mass.rs`'s
+`disjoint_fractions_sum_to_one` test for the additive invariant.)
 
-- **unit:** search-space bits, `log2(|cube|)`.
-- **`total_mass`:** `log2` of the enumeration size of the mode's
-  fully-free search space (e.g. `log2(2^n × 2^n × ...)` for
-  binary-valued sequence searches).
-- **`covered_mass`:** Σ over stage handler calls of
-  `log2(|sub-cube eliminated|)`. A handler that forces one variable
-  at a decision level where `k` variables remain unfixed contributes
-  `1 bit` (it halved the residual). A handler that proves a whole
-  sub-tree UNSAT contributes the full `log2` of that sub-tree.
-- **`throughput_per_sec`:** `covered_mass / elapsed` — bits per
-  second.
+- **unit:** fraction of the full search space, in `[0, 1]`.
+- **`total_mass`:** always `1.0`.
+- **`covered_mass`:** `covered_exact + covered_partial` (both
+  individual fields are exposed on `MassSnapshot`; the published
+  `ProgressSnapshot.covered_mass` sums them, clamped to `total_mass`).
+  - `covered_exact` = fraction of the search space the adapter
+    has provably ruled out (e.g. MDD boundaries whose whole
+    sub-tree returned SAT/UNSAT without hitting the XY conflict
+    budget).
+  - `covered_partial` = fractional credit from interrupted
+    sub-cubes, e.g. XY timeouts where the SAT solver pruned
+    part of the sub-cube before the conflict limit fired
+    (`xy_cover_micro / 1_000_000`, see `docs/TTC.md`).
+- **`throughput_per_sec`:** `covered_mass / elapsed` — fraction
+  per second.
 - **`ttc`:** `remaining_mass / throughput_per_sec`, labelled with
   `TtcQuality`:
-  - `Direct` — sampled coverage is trusted to continue; TTC is
-    `elapsed / cumulative_coverage_fraction`.
-  - `Projected` — TTC from an explicit branching-factor extrapolation
-    (currently only sync-mode Block 2).
-  - `Hybrid` — direct with projected smoothing on the remainder.
+  - `Direct` — `covered_exact` is a real additive fraction; TTC
+    is a leading indicator.
+  - `Projected` — `covered_mass` is estimate-only (sync walker,
+    stochastic sampler). The number is present for dashboard
+    continuity; mode-specific telemetry is authoritative.
+  - `Hybrid` — direct `covered_exact` with projected/partial
+    smoothing via `covered_partial`. Used by
+    `apart|together|cross` where the base fraction counts
+    fully-explored sub-cubes and `covered_partial` adds the
+    XY-timeout shortfall credit.
 
-The coverage-bits unit replaces all pre-universal-review mode-specific
+The fraction unit replaces all pre-universal-review mode-specific
 units (XY candidate solves, boundary count, walker nodes). Nothing
 outside `ProgressSnapshot` should carry an ad-hoc TTC denominator.
 
@@ -115,15 +129,17 @@ Together these support the "Sankey-like text flow report" and
 ### Deferrals, not timeouts
 
 Stage handlers do not return "timed out". On budget exhaustion they
-return a `MassDelta` (bits actually covered) plus a `Continuation`:
-either `Split(children)` (residual branched into smaller items) or
-`Resume(item)` (same sub-cube, saved-solver-checkpoint payload).
-Both variants add their items to the same `edge_flow` and forcing
-rollups as fresh work.
+return a `MassDelta` (fraction actually covered) plus a
+`Continuation`: either `Split(children)` (residual branched into
+smaller items) or `Resume(item)` (same sub-cube, saved-solver-
+checkpoint payload). Both variants add their items to the same
+`edge_flow` and forcing rollups as fresh work.
 
 The TTC denominator therefore never double-counts coverage: a
 handler only credits the sub-cube it actually eliminated; the rest
-goes back to the queue as a smaller problem.
+goes back to the queue as a smaller problem. XY timeouts with
+`xy_cover_micro < 1_000_000` are credited as `covered_partial` per
+`docs/TTC.md` and clamped below the residual `1 - covered_exact`.
 
 ---
 

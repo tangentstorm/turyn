@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use crate::search_framework::events::{
     EdgeFlowCounters, FanoutRootCounters, ForcingRollups, ProgressSnapshot, SearchEvent,
 };
-use crate::search_framework::mass::{MassSnapshot, SearchMassModel, TtcQuality};
+use crate::search_framework::mass::{MassSnapshot, MassValue, SearchMassModel, TtcQuality};
 use crate::search_framework::queue::SchedulerPolicy;
 use crate::search_framework::stage::{
     Continuation, StageContext, StageHandler, StageId, StageOutcome, WorkItem,
@@ -66,6 +66,11 @@ pub struct SearchEngine<T> {
 
 struct WorkerReport<T> {
     from_stage: StageId,
+    /// The `fanout_root_id` of the item that produced this report.
+    /// Carried so `apply_report` can decrement
+    /// `FanoutRootCounters.live_descendants` when the item
+    /// finishes (subtree-size tracking; issue flagged in review).
+    fanout_root_id: u64,
     outcome: StageOutcome<T>,
 }
 
@@ -155,6 +160,15 @@ impl<T: Send + 'static> SearchEngine<T> {
                 {
                     break;
                 }
+                // Seed items each start one in-flight descendant
+                // for their fanout_root. `apply_report` decrements
+                // as items complete and increments by emitted
+                // children, so `live_descendants` tracks the real
+                // mid-flight subtree size.
+                fanout_roots
+                    .entry(seed.meta.fanout_root_id)
+                    .or_default()
+                    .live_descendants += 1;
                 guard.push(seed);
             }
         }
@@ -207,6 +221,7 @@ impl<T: Send + 'static> SearchEngine<T> {
                         // running long internal loops (cross's
                         // brute-force XY walk, sync's DFS) can poll it
                         // without relying on a dispatch-time snapshot.
+                        let fanout_root_id = item.meta.fanout_root_id;
                         let ctx = StageContext {
                             cancelled: &cancelled,
                             now_millis: start_clone.elapsed().as_millis(),
@@ -216,6 +231,7 @@ impl<T: Send + 'static> SearchEngine<T> {
                         if event_tx
                             .send(WorkerReport {
                                 from_stage: stage_id,
+                                fanout_root_id,
                                 outcome,
                             })
                             .is_err()
@@ -260,14 +276,22 @@ impl<T: Send + 'static> SearchEngine<T> {
 
                 if last_progress.elapsed() >= self.cfg.progress_interval {
                     last_progress = Instant::now();
-                    // Pull any live-polled coverage from the mass
-                    // model. Adapters with a running counter (e.g.
-                    // `tuples_done`) surface progress here even when
-                    // they don't push `MassDelta` per handler. Takes
-                    // the max so push-based deltas aren't clobbered.
+                    // Pull both live-polled coverage streams from
+                    // the mass model. Adapters with a running
+                    // counter surface progress here even when they
+                    // don't push `MassDelta` per handler; takes the
+                    // max so push-based deltas aren't clobbered.
                     let polled = mass_model.covered_mass();
                     if polled.0 > mass.covered_exact.0 {
                         mass.covered_exact = polled;
+                    }
+                    let polled_partial = mass_model.covered_partial_mass();
+                    if polled_partial.0 > mass.covered_partial.0 {
+                        // Clamp under residual so we don't exceed
+                        // the total — matches `apply_delta`.
+                        let cap =
+                            (mass.total.0 - mass.covered_exact.0).max(0.0);
+                        mass.covered_partial = MassValue(polled_partial.0.min(cap));
                     }
                     on_event(SearchEvent::Progress(build_snapshot(
                         start.elapsed(),
@@ -307,6 +331,11 @@ impl<T: Send + 'static> SearchEngine<T> {
         if polled.0 > mass.covered_exact.0 {
             mass.covered_exact = polled;
         }
+        let polled_partial = mass_model.covered_partial_mass();
+        if polled_partial.0 > mass.covered_partial.0 {
+            let cap = (mass.total.0 - mass.covered_exact.0).max(0.0);
+            mass.covered_partial = MassValue(polled_partial.0.min(cap));
+        }
         on_event(SearchEvent::Finished(build_snapshot(
             start.elapsed(),
             &mass,
@@ -338,16 +367,25 @@ fn apply_report<T>(
     fanout_roots: &mut BTreeMap<u64, FanoutRootCounters>,
 ) {
     let from_stage = report.from_stage;
+    let fanout_root_id = report.fanout_root_id;
     let outcome = report.outcome;
     mass.apply_delta(outcome.mass_delta);
     forcings.apply(from_stage, &outcome.forcings);
 
     let emitted_len = outcome.emitted.len() as u64;
-    if let Some(first) = outcome.emitted.first() {
-        fanout_roots
-            .entry(first.meta.fanout_root_id)
-            .or_default()
-            .live_descendants += emitted_len;
+    // Update `live_descendants` as a true *in-flight* subtree
+    // count: +1 per emitted child, and -1 for the item we just
+    // finished processing. Previously only the emissions were
+    // counted, so `fanout_roots.live_descendants` monotonically
+    // grew and misled consumers. Seed items never pass through
+    // here unless they themselves emit, so subtract 1 only when
+    // this item completes (every call of `apply_report`).
+    {
+        let entry = fanout_roots.entry(fanout_root_id).or_default();
+        entry.live_descendants = entry
+            .live_descendants
+            .saturating_add(emitted_len)
+            .saturating_sub(1);
     }
 
     let mut notify = false;
@@ -413,7 +451,7 @@ fn build_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search_framework::mass::{CoverageQuality, MassDelta, MassValue};
+    use crate::search_framework::mass::{CoverageQuality, MassDelta};
     use crate::search_framework::queue::GoldThenWork;
     use crate::search_framework::stage::{
         Continuation, ForcingDelta, StageOutcome, WorkItemMeta,

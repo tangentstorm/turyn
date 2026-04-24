@@ -140,7 +140,21 @@ pub trait SearchMassModel: Send + Sync {
     fn total_mass(&self) -> MassValue {
         MassValue::ONE
     }
+    /// Fraction of the search space the adapter has *fully*
+    /// ruled out (additive over disjoint sub-cubes). Published
+    /// as `MassSnapshot.covered_exact`.
     fn covered_mass(&self) -> MassValue;
+    /// Fraction of partial-coverage credit the adapter has
+    /// accumulated from interrupted sub-cubes (e.g. XY SAT
+    /// timeouts whose solver pruned part of the sub-cube before
+    /// the conflict limit fired). Published as
+    /// `MassSnapshot.covered_partial` and clamped by
+    /// `apply_delta` to stay within the residual
+    /// `1 - covered_exact`. Default `ZERO` for adapters that do
+    /// not track partial credit.
+    fn covered_partial_mass(&self) -> MassValue {
+        MassValue::ZERO
+    }
     fn quality(&self) -> CoverageQuality;
 }
 

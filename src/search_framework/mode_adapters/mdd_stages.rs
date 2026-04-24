@@ -46,24 +46,34 @@ pub const STAGE_SOLVE_Z: StageId = "mdd.solve_z";
 /// `fanout_root_id` = its seed index) may dispatch through multiple
 /// stage handlers: Boundary → SolveW → SolveZ, or Boundary →
 /// SolveWZ, with stage 2/3 sometimes emitting zero follow-ups
-/// because of filter rejection or re-queue semantics. The mass
-/// model treats a boundary as "complete" when *all* of its in-
-/// flight descendants have finished — not when any one stage
-/// returns — so the published fraction equals `completed_boundaries
-/// / seed_boundaries.len()`, a real additive-over-disjoint
-/// coverage measure.
+/// because of filter rejection or re-queue semantics.
+///
+/// Two coverage streams:
+///
+/// * `completed_boundaries / total` — the "exact" fraction
+///   (additive over disjoint boundaries). Incremented when a
+///   boundary's pending-count hits zero.
+/// * `partial_cov_micro / (total * 1_000_000)` — the
+///   timeout-shortfall fraction. Each XY timeout inside
+///   `process_solve_z` reports a `cover_micro ∈ [0, 1_000_000]`
+///   reflecting how much of that sub-cube the SAT solver actually
+///   ruled out before hitting its conflict budget. We sum those
+///   `cover_micro` values across all XY solves anywhere in the
+///   search and surface the ratio as `covered_partial` on the
+///   `ProgressSnapshot` — matches the `xy_cover_micro` accounting
+///   documented in `docs/TTC.md`.
 ///
 /// Algorithm: each stage handler calls `note_handled` with its
-/// item's `fanout_root_id` plus the number of children emitted.
-/// The pending count for that boundary decreases by 1 (this item
-/// done) and increases by `emitted`. When pending hits 0 the
-/// boundary is removed from the map and `completed` ticks up.
-/// Seed boundaries start at `pending = 1` lazily when first seen —
-/// `or_insert(1)` matches the one-unit-per-processed-item
-/// invariant below.
+/// item's `fanout_root_id` plus the number of children emitted
+/// and (for SolveZ) the `cover_micro_delta` accumulated during
+/// its inline XY walk. Pending count for the boundary decreases
+/// by 1 and increases by `emitted`; when it hits 0 the boundary
+/// is removed from the map and `completed` ticks up. Seed
+/// boundaries start at `pending = 1` lazily when first seen.
 pub struct BoundaryProgress {
     pending: Mutex<HashMap<u64, u64>>,
     completed: AtomicU64,
+    partial_cov_micro: AtomicU64,
     total: u64,
 }
 
@@ -72,6 +82,7 @@ impl BoundaryProgress {
         Self {
             pending: Mutex::new(HashMap::new()),
             completed: AtomicU64::new(0),
+            partial_cov_micro: AtomicU64::new(0),
             total,
         }
     }
@@ -94,12 +105,46 @@ impl BoundaryProgress {
         }
     }
 
+    /// Add `cov_micro` (sum of per-XY-timeout `cover_micro ∈ [0,
+    /// 1_000_000]`) to the running partial-coverage accumulator.
+    /// Called by `SolveZStage` after its inline XY walk returns.
+    pub fn add_partial_cov_micro(&self, cov_micro: u64) {
+        if cov_micro > 0 {
+            self.partial_cov_micro
+                .fetch_add(cov_micro, Ordering::Relaxed);
+        }
+    }
+
+    /// Fraction of the search space *fully* covered — i.e.
+    /// boundaries whose entire sub-tree of SolveW/Z/XY work
+    /// returned without timing out. Additive over disjoint
+    /// boundaries.
     pub fn covered_fraction(&self) -> f64 {
         if self.total == 0 {
             0.0
         } else {
             let done = self.completed.load(Ordering::Relaxed);
             (done as f64 / self.total as f64).clamp(0.0, 1.0)
+        }
+    }
+
+    /// Fractional credit from XY timeouts across the whole search.
+    /// Scaled so that if every SolveXY timed out with full
+    /// `cover_micro = 1_000_000` (i.e. the conflict budget
+    /// exhausted *after* fully pruning the sub-cube), the
+    /// returned fraction equals `average_xy_solves_per_boundary /
+    /// total_boundaries` — which with `apply_delta` is clamped
+    /// below the residual `1 - covered_exact`, so the published
+    /// `covered = covered_exact + covered_partial` stays ≤ 1.
+    /// The denominator uses `total * 1_000_000` so a single
+    /// fully-credited timeout is worth `1 / total` — same unit as
+    /// a fully-completed boundary.
+    pub fn partial_fraction(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            let sum = self.partial_cov_micro.load(Ordering::Relaxed);
+            (sum as f64 / (self.total as f64 * 1_000_000.0)).clamp(0.0, 1.0)
         }
     }
 }
@@ -405,9 +450,17 @@ impl StageHandler<MddPayload> for SolveZStage {
             warm,
             rng,
         } = &mut *guard;
-        // `process_solve_z` is terminal (no follow-up items emitted
-        // via the queue — it fires XY solves inline and reports
-        // solutions through `result_tx`). Returns nothing.
+        // Snapshot `flow_xy_timeout_cov_micro` before/after so we
+        // can attribute the partial-XY credit this SolveZ just
+        // earned. The atomic is a global counter across the whole
+        // search; the delta is the sub-cube credit from inline XY
+        // timeouts during *this* call. `process_solve_z` is
+        // terminal — it fires XY solves inline and reports
+        // solutions through `result_tx`.
+        let cov_micro_before = self
+            .metrics
+            .flow_xy_timeout_cov_micro
+            .load(std::sync::atomic::Ordering::Relaxed);
         process_solve_z(
             sz,
             &self.ctx,
@@ -421,13 +474,21 @@ impl StageHandler<MddPayload> for SolveZStage {
             &self.result_tx,
             rng,
         );
+        let cov_micro_after = self
+            .metrics
+            .flow_xy_timeout_cov_micro
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.progress
+            .add_partial_cov_micro(cov_micro_after.saturating_sub(cov_micro_before));
         // Mass credit: one more pending descendant of this
         // boundary is done. When the last SolveZ for a boundary
         // returns, `note_handled` drops the pending count to zero
         // and the poll-based `covered_fraction` ticks up by
-        // exactly `1/N`. No push-based `mass_delta` here —
-        // relying on push would overcount whenever one boundary
-        // fans out to multiple `SolveZ`s.
+        // exactly `1/N`. Inline XY timeouts that didn't drop
+        // pending still contribute via `add_partial_cov_micro`
+        // above — the mass model surfaces them as
+        // `covered_partial`, matching the timeout-shortfall
+        // credit described in `docs/TTC.md`.
         self.progress.note_handled(parent_meta.fanout_root_id, 0);
         StageOutcome::default()
     }
@@ -452,8 +513,17 @@ impl SearchMassModel for McddFractionMassModel {
     fn covered_mass(&self) -> MassValue {
         MassValue(self.progress.covered_fraction())
     }
+    fn covered_partial_mass(&self) -> MassValue {
+        MassValue(self.progress.partial_fraction())
+    }
     fn quality(&self) -> CoverageQuality {
-        CoverageQuality::Direct
+        // `covered_exact` is a real additive-over-disjoint
+        // boundary fraction, but `covered_partial` is an
+        // approximation of XY-timeout shortfall credit (per
+        // `docs/TTC.md`). Mark as `Hybrid` because the published
+        // `covered = exact + partial` blends a direct fraction
+        // with a projected-shortfall estimate.
+        CoverageQuality::Hybrid
     }
 }
 

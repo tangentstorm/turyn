@@ -991,9 +991,58 @@ fn search_sync_parallel(
         clauses: std::sync::Mutex::new(Vec::new()),
     });
 
+    // Worker liveness counter: the monitor thread exits when this
+    // drops to zero (every worker has returned), independent of
+    // the solution-found `cancel` path. Needed because workers
+    // time out without touching `cancel`, and we can't add a
+    // signal *after* `thread::scope` — scope joins its spawned
+    // threads (including the monitor) before returning.
+    let live_workers = Arc::new(std::sync::atomic::AtomicUsize::new(n_workers));
     thread::scope(|s| {
+        // Monitor thread: periodically recompute the walker's
+        // projected-fraction covered and publish it via
+        // `SyncConfig::projected_fraction_ppm`. Lets the framework
+        // adapter's `SyncWalkMassModel::covered_mass` return a
+        // non-zero fraction *during* the walk, not just at the
+        // end — matches the fixed-tick universal `ProgressSnapshot`
+        // schema documented in `docs/TELEMETRY.md`.
+        //
+        // Caveat: workers aggregate their stats into `stats_agg`
+        // only at the end of their serial walk today, so mid-walk
+        // reads here usually see zeros until a worker finishes.
+        // That's still an improvement — mid-run reads become
+        // non-zero as workers complete, instead of staying zero
+        // right up to program exit.
+        if let Some(sink) = cfg.projected_fraction_ppm.as_ref() {
+            let sink = Arc::clone(sink);
+            let stats_agg = Arc::clone(&stats_agg);
+            let cancel_monitor = Arc::clone(&cancel);
+            let live_workers_monitor = Arc::clone(&live_workers);
+            let n = problem.n;
+            s.spawn(move || {
+                loop {
+                    if cancel_monitor.load(AtomicOrdering::Relaxed)
+                        || live_workers_monitor.load(AtomicOrdering::Relaxed) == 0
+                    {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    let snapshot = stats_agg.lock().unwrap().clone();
+                    if let Some(f) = projected_fraction(
+                        &snapshot,
+                        n,
+                        start.elapsed().as_secs_f64(),
+                        n_workers,
+                    ) {
+                        sink.store((f * 1_000_000.0) as u64, AtomicOrdering::Relaxed);
+                    }
+                }
+            });
+        }
+
         for worker_id in 0..n_workers {
             let cfg = cfg.clone();
+            let live_workers = Arc::clone(&live_workers);
             let cancel = Arc::clone(&cancel);
             let result = Arc::clone(&result);
             let stats_agg = Arc::clone(&stats_agg);
@@ -1081,6 +1130,10 @@ fn search_sync_parallel(
                         cancel.store(true, AtomicOrdering::Release);
                     }
                 }
+                // Decrement liveness so the monitor can exit when
+                // the last worker returns — even without a
+                // solution to flip `cancel`.
+                live_workers.fetch_sub(1, AtomicOrdering::AcqRel);
             });
         }
     });

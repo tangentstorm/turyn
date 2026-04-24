@@ -19,9 +19,12 @@ pub struct EdgeFlowCounters {
     pub spawned: u64,
 }
 
-/// Per-fan-out-root counter. Only `live_descendants` is tracked
-/// today. `completed_descendants` / `credited_mass` are part of
-/// the proposed fan-out viz schema but not wired; see the
+/// Per-fan-out-root counter. `live_descendants` tracks the
+/// current in-flight subtree size — incremented by 1 per
+/// emitted child and decremented by 1 per completed item, so
+/// the count hits zero when the whole subtree finishes.
+/// `completed_descendants` / `credited_mass` are part of the
+/// proposed fan-out viz schema but not wired; see the
 /// [`EdgeFlowCounters`] note above.
 #[derive(Clone, Debug, Default)]
 pub struct FanoutRootCounters {

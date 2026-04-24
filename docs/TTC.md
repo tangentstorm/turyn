@@ -44,156 +44,200 @@ when one of the four primary metrics moves unexpectedly.
 
 ## Path-by-path implementation
 
+All modes publish through the same `SearchMassModel` interface
+(`src/search_framework/mass.rs`) and the same `MassSnapshot::ttc`
+algebra. The numerator in every case is the sum of two fractions:
+
+- `covered_exact` — fraction of the search space provably ruled out
+  (SAT/UNSAT returned within the conflict budget).
+- `covered_partial` — fractional credit from interrupted sub-cubes
+  (XY timeouts where the SAT solver pruned part of the cube before
+  the conflict limit fired).
+
+`ProgressSnapshot.covered_mass = covered_exact + covered_partial`,
+clamped to `total_mass = 1.0`.
+
 ## 1) `--wz=cross`
 
 ### Work unit
-- XY candidate SAT solves.
+- Tuple shells (one `SumTuple` = one logical "work slot"). Each
+  tuple fans out to all `Z × W` pairs in its shell.
 
-### Denominator (`total_search_mass`)
-- `cross_estimated_total_xy(...)` in `xy_sat.rs`:
-  - while tuple generation is still running: extrapolated total
-    `xy_pushed * tuples_total / tuples_done`
-  - once done: exact `xy_pushed`.
+### Denominator
+- `total_mass = 1.0` (the whole search space).
 
-### Covered mass (`covered_search_mass`)
-- `effective_xy_done(...)` in `xy_sat.rs`:
-  - SAT + UNSAT each count as `1.0`
-  - timeout counts as `xy_cover_micro / 1_000_000`.
+### Numerator
+- `covered_exact = tuples_done / tuples_total` — updated at the
+  bottom of the tuple loop in `CrossEnumerateStage::handle`
+  (`src/search_framework/mode_adapters/cross.rs`). `covered_partial`
+  is not tracked in cross today (every XY attempt runs to SAT/
+  UNSAT under a fixed conflict budget; timeouts fall through to
+  the next pair rather than feed back as credit).
 
-### Timeout fractional coverage
-- `xy_cover_micro(...)` in `xy_sat.rs`:
-  - SAT/UNSAT => `1_000_000`
-  - timeout => `log2(decisions + 1) / free_vars`, clamped `[0,1]`.
-
-### TTC report site
-- Progress snapshots and final summary in `mdd_pipeline.rs` (cross branch).
+### Quality
+- `Hybrid`: the tuple count is direct, but equating tuples with
+  a uniform-weight fraction of the XY search space is a
+  projection — tuple shells have different `(Z, W)` pair counts
+  and XY-candidate depths. A per-tuple weight estimate is a
+  follow-up.
 
 ## 2) `--wz=apart` and `--wz=together`
 
-These share the same TTC machinery in the MDD pipeline.
+Both route through `MddStagesAdapter` (five stage handlers around
+the MDD pipeline helpers: `process_boundary`, `process_solve_w`,
+`process_solve_wz`, `process_solve_z`).
 
 ### Work unit
-- MDD live ZW boundary paths ("walked boundaries"), with timeout
-  shortfall correction from downstream XY solves.
+- Live MDD ZW boundary paths: one `BoundaryWork` per path, seeded
+  upfront by `enumerate_live_boundaries` (or a single path via
+  `mdd_navigate_to_outfix` when `--outfix` pins the boundary).
 
-### Denominator (`total_search_mass`)
-- `live_zw_paths = mdd.count_live_paths()` in `mdd_pipeline.rs`.
-- This is the MDD-pruned boundary space; if MDD construction or
-  constraints remove boundaries, denominator shrinks accordingly.
+### Denominator
+- `total_mass = 1.0`; each boundary represents `1 / N` of the
+  search space where `N = seed_boundaries.len()`.
 
-### Covered mass (`covered_search_mass`)
-- `effective_coverage_metric(...)` in `xy_sat.rs`:
-  - start from completed boundaries (`stage_exit[0]`)
-  - apply shortfall factor from XY timeout partial coverage.
+### Numerator
+- `covered_exact = completed_boundaries / N`. A boundary is
+  "complete" when every one of its descendants (SolveW → SolveZ
+  → inline XY) has returned. Tracked by `BoundaryProgress` in
+  `src/search_framework/mode_adapters/mdd_stages.rs` — a per-
+  boundary pending-count map: decrement per completed handler
+  call, increment per emitted child, and tick `completed` when
+  the count hits zero. Additive over disjoint boundaries
+  (unit test: `disjoint_fractions_sum_to_one` in
+  `src/search_framework/mass.rs`).
+- `covered_partial = Σ xy_cover_micro / (N × 1_000_000)`.
+  `SolveZStage::handle` snapshots the global
+  `flow_xy_timeout_cov_micro` counter before and after calling
+  `process_solve_z`; the delta is per-call XY-timeout credit
+  for this boundary. `BoundaryProgress::add_partial_cov_micro`
+  sums it; `partial_fraction` divides by `N × 1_000_000` so a
+  single fully-credited timeout is worth `1 / N` — the same
+  unit as a fully-completed boundary. `apply_delta` clamps the
+  sum so `covered_exact + covered_partial ≤ 1`.
 
-### Timeout fractional coverage
-- Same `xy_cover_micro(...)` logic as cross mode.
-
-### TTC report site
-- Progress snapshots and final summary in `mdd_pipeline.rs`
-  (non-cross branch).
+### Quality
+- `Hybrid`. The `covered_exact` stream is a real additive-over-
+  disjoint boundary fraction (Direct-quality on its own), but
+  `covered_partial` blends a branching-factor-style shortfall
+  estimate onto the tail — so the published `covered_mass` is
+  not strictly a count of what's been ruled out.
 
 ## 3) `--wz=sync`
 
-Sync mode currently prints two TTC-style estimates from walker telemetry.
+Sync mode wraps the walker (`sync_walker::search_sync`) as a
+single `SyncWalkStage` and surfaces the walker's own projected
+TTC through the universal snapshot.
 
-### A) Projected TTC (`project_ttc`)
+### Work unit
+- Walker nodes visited.
+
+### Denominator
+- `total_mass = 1.0`.
+
+### Numerator
+- `covered_exact = 0.0` (the walker runs inside a single handler
+  call and doesn't emit per-node stage transitions).
+- `covered_partial = elapsed / TTC_parallel` (the fraction of
+  projected wall-clock actually spent). Written to
+  `SyncConfig::projected_fraction_ppm` from a monitor thread in
+  `search_sync_parallel` every 250ms (mid-run) and once more
+  from the walker's final aggregation. Read by
+  `SyncWalkMassModel::covered_mass` / `covered_partial_mass`
+  via the engine's per-tick poll. At n ≈ the walker's own
+  Block-2/Block-3 telemetry is still the authoritative direct
+  estimate; the universal fraction exists for dashboard
+  continuity.
+
+### Quality
+- `Projected`. The fraction is a branching-factor extrapolation,
+  not a count of provably-ruled-out nodes. Consumers should
+  pair it with the walker's own per-level telemetry blocks
+  documented below.
+
+### Walker telemetry (authoritative per-mode)
+The walker prints two TTC-style estimates after a run:
+
+#### A) Projected TTC (`project_ttc`)
 - Uses per-level effective branching factors:
   `b_eff(L) = children_by_level[L] / nodes_by_level[L]`.
 - Projects full tree size from the product of branching factors.
 - Converts to TTC by dividing projected nodes by observed node rate.
 
-### B) Direct TTC from coverage product
+#### B) Direct TTC from coverage product
 - Computes per-level coverage `cov(L) = processed_children / children`.
 - Root coverage = `Π_L cov(L)`.
 - TTC estimate: `elapsed / root_coverage`.
 
-### TTC report sites
-- `project_ttc(...)` and per-level telemetry formatting in
-  `sync_walker.rs`.
+Both live in `project_ttc(...)` / `format_per_level_telemetry_with_ttc(...)` in `src/sync_walker.rs`.
 
 ## How search-space trimming affects TTC
 
-Under the uniform contract, **any mechanism that removes admissible
-search states should reduce denominator and/or increase covered fraction**:
+Under the fraction-based contract, **any mechanism that removes
+admissible search states should reduce the residual or increase
+covered fraction**:
 
-- MDD/static pruning reduces `live_zw_paths` (apart/together denominator).
-- Cross tuple/pair pruning reduces total XY candidates (cross denominator).
-- SAT root propagation and forced vars reduce `free_vars`, which raises
-  timeout coverage credit for a fixed decision budget.
-- Sync-level forcing/pruning lowers effective branching or increases level
-  coverage, reducing projected/direct TTC.
+- MDD/static pruning reduces the live boundary set before it's
+  seeded → each completed boundary is worth a larger fraction.
+- Cross tuple/pair pruning shortens `tuples` → denominator shrinks.
+- SAT root propagation and forced vars reduce `free_vars`, which
+  raises `xy_cover_micro` per timeout → `covered_partial` grows
+  faster.
+- Sync-level forcing/pruning lowers effective branching or
+  increases level coverage → projected fraction grows faster.
 
-In short: if a change really trims search mass, TTC should improve even
-when wall-clock throughput is unchanged.
+In short: if a change really trims search mass, TTC should improve
+even when wall-clock throughput is unchanged.
 
 ## Contract gaps (what is still missing / non-uniform)
 
-If we enforce the strict contract "TTC measures time to cover the full
-remaining search space for this problem instance", these are the current
-gaps:
+1. **`--wz=cross` weights tuples uniformly.** Each tuple shell is
+   treated as `1 / tuples_total` of the search space, but tuple
+   shells have different `(Z, W)` pair counts. Mass model is
+   therefore `Hybrid`, not `Direct`. A per-tuple weight estimate
+   (e.g. the cumulative XY attempts seen per tuple) is a follow-
+   up.
 
-1. **`--wz=cross` uses an extrapolated denominator before producer done.**
-   - `cross_estimated_total_xy(...)` is a projection while tuples are still
-     being enumerated, so `total_search_mass` is not exact until
-     `cross_done=true`.
-   - This is useful online telemetry, but strictly it is an estimate of TTC,
-     not exact TTC.
+2. **`--wz=apart|together` weights boundaries uniformly.** Same
+   story: each boundary is worth `1 / N` regardless of how large
+   its XY subtree is. An optimization that forces many XY vars
+   early (shrinking the subtree without changing the boundary
+   count) isn't reflected in the fraction. The `covered_partial`
+   timeout credit does vary per boundary, which partially
+   compensates, but the base weight is still uniform.
 
-2. **`--wz=apart|together` denominator is boundary-count only.**
-   - `live_zw_paths` counts surviving ZW boundaries, but does not weight each
-     boundary by the actual remaining XY subtree mass.
-   - If one optimization forces many XY vars early (shrinking subtree mass)
-     without changing boundary count, denominator does not drop accordingly.
-
-3. **`effective_coverage_metric(...)` applies timeout shortfall globally.**
-   - It uses an aggregate timeout shortfall factor over all XY solves.
-   - That means coverage credit is approximate when timeout difficulty is
-     highly non-uniform across boundaries.
-
-4. **`--wz=sync` has two TTC estimators, not one canonical TTC.**
-   - `project_ttc` (branching projection) and direct `elapsed / Πcov` are
-     both estimates from partial traversal telemetry.
-   - Neither is currently wired into the same denominator/numerator interface
-     used by cross/apart/together final `Time to cover:` reporting.
-
-5. **No common cross-mode mass unit yet.**
-   - Cross uses "effective XY solves", apart/together use "effective
-     boundaries", sync uses projected/covered nodes.
-   - Algebra is shared, but unit definitions differ, so TTC is most reliable
-     for within-mode comparisons.
+3. **`--wz=sync` publishes only the `projected_fraction` estimator
+   through the universal snapshot.** The walker's per-level
+   `project_ttc` and direct `elapsed / Πcov` blocks are still
+   only emitted to stderr after the run; the universal
+   `covered_mass` is driven by the branching-factor projection
+   alone (quality = `Projected`). Sync mid-run `covered_mass`
+   can lag the direct estimator because workers aggregate stats
+   into the shared accumulator only at the end of their
+   sub-walks.
 
 ## What currently *does* satisfy the contract
 
-- Partial work from timeouts is credited (via `xy_cover_micro`) in cross and
-  MDD modes, so covered mass is not binary SAT/UNSAT only.
-- MDD/static pruning that removes full boundaries reduces denominator in
-  apart/together.
-- Sync pruning/forcing affects measured branching/coverage and therefore both
-  sync TTC estimators.
-
-## Tightening plan (to make TTC truly uniform)
-
-1. Promote one explicit `SearchMass` interface in code:
-   - `total_mass(problem, mode)`
-   - `covered_mass(progress)`
-   - `ttc = (total - covered) / (covered / elapsed)`
-2. For apart/together, weight denominator by per-boundary XY mass estimate
-   (or exact count where available), not just boundary cardinality.
-3. For cross, label pre-`cross_done` output as `estimated TTC` explicitly,
-   and switch to exact TTC when enumeration completes.
-4. For sync, publish one canonical TTC field using the same interface
-   (keep projection/direct as diagnostics).
+- All modes expose the same `SearchMassModel` interface
+  (`total_mass`, `covered_mass`, `covered_partial_mass`,
+  `quality`) and flow through `MassSnapshot::ttc`.
+- Partial work from XY timeouts is credited via
+  `covered_partial` in apart/together.
+- MDD pruning reduces the seeded boundary count, which reduces
+  the denominator directly.
+- Sync pruning/forcing affects the walker's own branching
+  factors, which feeds back into `projected_fraction` and
+  therefore the universal `covered_mass`.
 
 ## Practical notes on comparability
 
-- Cross TTC units are XY-candidate solves.
-- Apart/together TTC units are effective MDD boundaries.
-- Sync TTC units are projected/covered walker nodes.
-
-All three obey the same algebra (`remaining_mass / mass_rate`) but use
-mode-specific mass definitions. For strict apples-to-apples comparison,
-compare TTC **within a mode** at fixed `n` and comparable limits.
+All modes use the same fraction unit (`total_mass = 1.0`) and the
+same `MassSnapshot::ttc` algebra, so numbers are structurally
+comparable. But the semantic meaning of a "unit of covered mass"
+differs per mode (a completed tuple shell, a completed boundary,
+or a projected fraction of walker nodes), so compare TTC **within
+a mode** at fixed `n` and comparable limits for the most useful
+signal.
 
 ## Recommended interpretation rule
 

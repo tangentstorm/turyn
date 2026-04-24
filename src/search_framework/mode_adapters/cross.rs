@@ -240,6 +240,16 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
     }
 }
 
+/// Cross-mode mass model. `covered_mass = tuples_done /
+/// tuples_total` treats every tuple shell as weighing the same
+/// fraction of the search space, which isn't quite right — tuple
+/// shells have different `(Z, W)` pair counts and XY-candidate
+/// depths — so the published fraction is a uniform-weight
+/// approximation, not a true XY-work fraction. Marked
+/// `Hybrid` to reflect the blend: the tuple count is direct,
+/// but mapping tuples to a fraction of the XY search space is
+/// projected. A per-tuple weight estimate is a follow-up (see
+/// `docs/TTC.md`'s "Contract gaps" section).
 pub struct CrossMassModel {
     tuples_done: Arc<AtomicUsize>,
     tuples_total: usize,
@@ -255,7 +265,7 @@ impl SearchMassModel for CrossMassModel {
         }
     }
     fn quality(&self) -> CoverageQuality {
-        CoverageQuality::Direct
+        CoverageQuality::Hybrid
     }
 }
 
