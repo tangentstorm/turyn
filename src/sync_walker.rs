@@ -1117,6 +1117,7 @@ fn search_sync_parallel(
             let stats_agg = Arc::clone(&stats_agg);
             let exchange = Arc::clone(&exchange);
             let live_sink = Arc::clone(&live_sinks[worker_id]);
+            let live_sink_for_flush = Arc::clone(&live_sink);
             s.spawn(move || {
                 // Worker 0: seed=0 → score-sorted best-first siblings.
                 // Worker k>0: seed=k → randomised ordering distinct
@@ -1129,6 +1130,34 @@ fn search_sync_parallel(
                     ..cfg
                 };
                 let (sol, stats, _) = search_sync_serial(problem, &worker_cfg, false, start);
+                // Final flush into this worker's `live_sink` before
+                // merging into `stats_agg` and dropping
+                // `live_workers`. The in-loop flush runs every
+                // `LIVE_FLUSH_STRIDE` nodes, so a worker that
+                // exited at `k * LIVE_FLUSH_STRIDE + r` otherwise
+                // loses the trailing `r` nodes' worth of progress
+                // from the monitor's aggregate (and a worker that
+                // stopped at < stride would contribute 0 forever).
+                {
+                    let mut snap = live_sink_for_flush.lock().unwrap();
+                    snap.nodes_visited = stats.nodes_visited;
+                    if snap.nodes_by_level.len() < stats.nodes_by_level.len() {
+                        snap.nodes_by_level
+                            .resize(stats.nodes_by_level.len(), 0);
+                    }
+                    snap.nodes_by_level
+                        .iter_mut()
+                        .zip(stats.nodes_by_level.iter())
+                        .for_each(|(d, s)| *d = *s);
+                    if snap.children_by_level.len() < stats.children_by_level.len() {
+                        snap.children_by_level
+                            .resize(stats.children_by_level.len(), 0);
+                    }
+                    snap.children_by_level
+                        .iter_mut()
+                        .zip(stats.children_by_level.iter())
+                        .for_each(|(d, s)| *d = *s);
+                }
                 let mut agg = stats_agg.lock().unwrap();
                 agg.nodes_visited += stats.nodes_visited;
                 agg.memo_hits += stats.memo_hits;
