@@ -49,7 +49,7 @@ impl StageHandler<SyncPayload> for SyncWalkStage {
         _item: WorkItem<SyncPayload>,
         _ctx: &StageContext<'_>,
     ) -> StageOutcome<SyncPayload> {
-        let (found, _stats, _elapsed) = search_sync(self.problem, &self.cfg, self.verbose);
+        let (found, stats, _elapsed) = search_sync(self.problem, &self.cfg, self.verbose);
         if let Some(sol) = found {
             let _ = self.result_tx.send(sol);
         }
@@ -59,7 +59,30 @@ impl StageHandler<SyncPayload> for SyncWalkStage {
         // universal `ProgressSnapshot.ttc` reflects the walker's
         // own projection rather than a bogus "1.0 at end"
         // saturation the handler would otherwise trigger.
-        StageOutcome::default()
+        let mut out = StageOutcome::default();
+        // Flatten the sync walker's aggregated
+        // `forced_by_level_kind[level][kind]` matrix into the
+        // universal `(level, feature, count)` triples. The
+        // walker aggregates per-worker counters across every
+        // CDCL solver it owns, so this attributes all sync SAT
+        // propagation to the sync stage — matching the
+        // `docs/TELEMETRY.md` §4 attribution rule.
+        let mut triples: Vec<(u16, u8, u32)> = Vec::new();
+        for (level, row) in stats.forced_by_level_kind.iter().enumerate() {
+            for (kind, &count) in row.iter().enumerate() {
+                if count > 0 {
+                    triples.push((
+                        level as u16,
+                        kind as u8,
+                        count.min(u32::MAX as u64) as u32,
+                    ));
+                }
+            }
+        }
+        out.forcings = crate::search_framework::stage::ForcingDelta {
+            by_level_feature: triples,
+        };
+        out
     }
 }
 

@@ -1240,6 +1240,7 @@ pub(crate) fn try_candidate_via_mdd(
     nodes: &[[u32; 4]],
     pos_order: &[usize],
     conflict_limit: u64,
+    forcings_out: Option<&mut Vec<(u16, u8, u32)>>,
 ) -> (Option<(PackedSeq, PackedSeq)>, XyStats) {
     let n = problem.n;
     if !template.is_feasible(candidate) {
@@ -1289,6 +1290,16 @@ pub(crate) fn try_candidate_via_mdd(
     let propagations = solver.num_propagations().saturating_sub(p0);
     let cover_micro  = xy_cover_micro(result, decisions, free_vars);
     let stats = XyStats { decisions, propagations, vars_pre_forced, free_vars, cover_micro };
+
+    if let Some(sink) = forcings_out {
+        // Solver is freshly cloned from the template; an empty
+        // baseline attributes the full run of propagations to
+        // this stage call (the solver dies at the end of this
+        // function). Matches `docs/TELEMETRY.md` §4 attribution
+        // rule — the caller stage owns every forcing the solver
+        // did here.
+        sink.extend(crate::mdd_pipeline::forcing_delta_triples(&solver, &[]));
+    }
 
     let xy = match result {
         Some(true) => {

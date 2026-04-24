@@ -82,6 +82,12 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
         let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
         let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
         let mut stats = SearchStats::default();
+        // Accumulates `(level, feature, count)` triples from every
+        // per-(Z,W) XY SAT solver this stage spins up, so the
+        // coordinator's `forcings.stage_level` / `stage_feature`
+        // rollups include cross-mode propagation work. Returned
+        // as `StageOutcome::forcings` below.
+        let mut stage_forcings: Vec<(u16, u8, u32)> = Vec::new();
         // Per-|σ_W| cache: W candidate arrays + `SpectralIndex`
         // reused across tuples that share a `|σ_W|`.
         let mut w_cache: HashMap<i32, (Vec<SeqWithSpectrum>, SpectralIndex)> = HashMap::new();
@@ -184,6 +190,16 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                         if problem.n > 30 {
                             state.solver.set_conflict_limit(5000);
                         }
+                        // Snapshot so only the try_candidate
+                        // loop's own forcings are attributed. The
+                        // constructor has already propagated its
+                        // setup clauses; those are stage-setup
+                        // work and are excluded from the drain
+                        // below, matching the `docs/TELEMETRY.md`
+                        // §4 attribution rule (stage's own
+                        // action, not cumulative history).
+                        let xy_plk0: Vec<[u64; radical::PropKind::COUNT]> =
+                            state.solver.propagations_by_kind_level().to_vec();
                         let boundary_bits = 2 * k;
                         // Widen to u64 before shifting: the old `1u32 <<
                         // (2 * boundary_bits)` overflowed once
@@ -237,6 +253,15 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                                 }
                             }
                         }
+                        // Drain the per-(Z,W) XY solver's
+                        // propagation delta into the stage's
+                        // forcing sink. Summed across every (Z,W)
+                        // pair across every tuple, this gives
+                        // cross a populated
+                        // `StageOutcome::forcings` just like the
+                        // MDD adapter stages.
+                        stage_forcings
+                            .extend(crate::mdd_pipeline::forcing_delta_triples(&state.solver, &xy_plk0));
                     }
                     !found.load(Ordering::Relaxed)
                 },
@@ -263,7 +288,11 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
         // actually completed; the engine polls `CrossMassModel::
         // covered_mass()` per progress tick and at Finished so
         // the published fraction matches reality.
-        StageOutcome::default()
+        let mut out = StageOutcome::default();
+        out.forcings = crate::search_framework::stage::ForcingDelta {
+            by_level_feature: stage_forcings,
+        };
+        out
     }
 }
 

@@ -219,14 +219,26 @@ As of this tree:
 - the MDD adapter stages (`mdd.solve_w`, `mdd.solve_wz`, `mdd.solve_z`)
   populate `StageOutcome::forcings` from their primary middle-solver's
   `propagations_by_kind_level()` delta
-- inline XY-path solvers inside `process_solve_z` / `process_solve_wz`
-  are not yet attributed — their forcings are structurally present but
-  semantically absent, matching the "intentionally partial" policy in §6
-- sync / cross / stochastic adapters still leave `StageOutcome::forcings`
-  empty
+- inline XY-path solvers inside `process_solve_z` and `process_solve_wz`
+  (the `SolveXyPerCandidate` walk loop and the per-(W,Z) `xy_solver`)
+  now drain into the same sink via before/after snapshot diffs, so
+  `mdd.solve_z` and `mdd.solve_wz` attribute both the middle solver and
+  every inline XY solve to the stage that owned them
+- the MDD-backed XY path (`try_candidate_via_mdd`) takes an optional
+  `forcings_out` sink and contributes when running under
+  `ctx.xy_mdd_mode`
+- the `cross.enumerate` stage aggregates every per-(Z,W)
+  `SolveXyPerCandidate` solver's forcing delta into
+  `StageOutcome::forcings`
+- the `sync.walk` stage flattens the walker's aggregated
+  `forced_by_level_kind[level][kind]` matrix into `(level, feature,
+  count)` triples
+- the `stochastic` adapter still leaves `StageOutcome::forcings` empty
+  (the stochastic sampler does not run a CDCL solver the same way)
 
-Readers should therefore treat empty stage-based forcing tables as “not yet
-populated”, not as proof that no forcings occurred.
+Readers should therefore treat empty stage-based forcing tables only for
+stochastic today; the other modes publish real per-(stage, level, feature)
+attribution.
 
 ## 10. Edge-flow / fan-out status
 

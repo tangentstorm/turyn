@@ -1027,6 +1027,11 @@ pub(crate) fn process_solve_z(
                 ctx.problem, &candidate, template, k,
                 sz.xy_root, &ctx.mdd.nodes, &ctx.xy_pos_order,
                 conflict_limit,
+                // Accumulate the fresh XY-MDD solver's forcing
+                // triples into the stage's sink so the MDD
+                // adapter's `StageOutcome::forcings` covers the
+                // inline XY work, not just the outer z_solver.
+                Some(forcings_out),
             );
             metrics.stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
             metrics.items_completed.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1056,6 +1061,16 @@ pub(crate) fn process_solve_z(
                 if let Some(ref ph) = warm.phase { state.solver.set_phase(ph); }
             }
 
+            // Snapshot the XY solver BEFORE the walk so only the
+            // walk's contributions (many `try_candidate` calls,
+            // each propagating on top of the previous trail) are
+            // attributed. The solver already did some level-0
+            // propagation at construction; those are part of the
+            // stage's own setup work, so including them is OK,
+            // but taking the snapshot now keeps it to the walk
+            // proper — same contract as the outer z_solver.
+            let xy_plk0: Vec<[u64; radical::PropKind::COUNT]> =
+                state.solver.propagations_by_kind_level().to_vec();
             walk_xy_sub_mdd(
                 sz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
                 &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
@@ -1112,6 +1127,12 @@ pub(crate) fn process_solve_z(
                     }
                 },
             );
+            // Drain the XY solver's propagation delta into the
+            // stage's forcing sink so `StageOutcome::forcings`
+            // reflects the actual inline XY work, not just the
+            // outer z_solver. See `docs/TELEMETRY.md` §4
+            // attribution rule.
+            forcings_out.extend(forcing_delta_triples(&state.solver, &xy_plk0));
             warm.phase = Some(state.solver.get_phase());
         } else {
             metrics.flow_z_prep_fail.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1591,6 +1612,14 @@ pub(crate) fn process_solve_wz(
         let candidate = CandidateZW { zw_autocorr };
         if let Some(mut xy_solver) = template.prepare_candidate_solver(&candidate) {
             if n > 30 { xy_solver.set_conflict_limit(5000); }
+            // Snapshot before the walk so only the per-(W,Z) SAT
+            // work is attributed. `prepare_candidate_solver`
+            // clones the template and injects candidate-specific
+            // constraints; the resulting solver's prop counters
+            // start at the cloned base, so snapshotting-then-diff
+            // is needed to isolate this call's work.
+            let xy_plk0: Vec<[u64; radical::PropKind::COUNT]> =
+                xy_solver.propagations_by_kind_level().to_vec();
             walk_xy_sub_mdd(
                 swz.xy_root, 0, ctx.xy_zw_depth, 0, 0,
                 &ctx.xy_pos_order, &ctx.mdd.nodes, ctx.max_bnd_sum,
@@ -1666,6 +1695,11 @@ pub(crate) fn process_solve_wz(
                     }
                 },
             );
+            // Drain the XY solver's propagation delta into the
+            // stage's forcing sink so `StageOutcome::forcings`
+            // reflects the actual inline XY work alongside the
+            // outer combined solver.
+            forcings_out.extend(forcing_delta_triples(&xy_solver, &xy_plk0));
         }
     }
 
@@ -1687,8 +1721,10 @@ pub(crate) fn process_solve_wz(
     metrics.flow_z_free_sum.fetch_add(wz_free_vars, AtomicOrdering::Relaxed);
     // `solver` is the combined W+Z middle solver built fresh in
     // this call; empty baseline gives full attribution. Inline
-    // per-(W,Z) XY solvers (`xy_solver`) are not yet threaded
-    // through — documented in `docs/TELEMETRY.md` Part 2.
+    // per-(W,Z) XY solvers (`xy_solver`) are drained into the same
+    // sink inside the walk loop above, so `forcings_out` now
+    // covers both the outer middle solver and every per-pair XY
+    // solve.
     forcings_out.extend(forcing_delta_triples(&solver, &[]));
 
     metrics.stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
