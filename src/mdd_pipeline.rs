@@ -554,16 +554,19 @@ pub(crate) fn process_boundary(
 /// `SolveWStage` adapter. Returns the `SolveZ` follow-up items
 /// produced by enumerating W middles that pass the spectral filter.
 ///
-/// Per-worker scratch is passed in as `&mut`: `w_bases` is the
-/// HashMap caching SAT-base solvers across calls, `spectral_w` and
+/// Per-worker scratch is passed in as `&mut`: `spectral_w` and
 /// `fft_buf_w` back the FFT spectral check, and `rng` is the
 /// worker's xorshift state (also advanced here so the branching
-/// phase decisions differ across retries).
+/// phase decisions differ across retries). The `_w_bases` slot is
+/// retained for API/storage compatibility with the legacy layout
+/// but is no longer read or written — see the fresh-per-call
+/// comment at the SAT-branch solver construction for why.
 ///
 /// Side effects on `metrics`:
 /// - `flow_w_solutions` +1 per solver hit,
 /// - `flow_w_spec_fail` / `flow_w_spec_pass` +1 per FFT verdict,
 /// - `flow_w_unsat` +1 if no W passed at all,
+/// - `flow_w_timeout` +1 per SAT conflict-budget timeout exit,
 /// - `flow_w_solves`, `flow_w_decisions`, `flow_w_propagations`,
 ///   `flow_w_root_forced`, `flow_w_free_sum` aggregated over the
 ///   SAT path,
@@ -573,7 +576,7 @@ pub(crate) fn process_solve_w(
     sw: SolveWWork,
     ctx: &PhaseBContext,
     metrics: &PipelineMetrics,
-    w_bases: &mut HashMap<i32, radical::Solver>,
+    _w_bases: &mut HashMap<i32, radical::Solver>,
     spectral_w: &SpectralFilter,
     fft_buf_w: &mut FftScratch,
     rng: &mut u64,
@@ -808,15 +811,13 @@ pub(crate) fn process_solve_w(
         metrics.flow_w_free_sum.fetch_add(w_free_vars, AtomicOrdering::Relaxed);
         forcings_out.extend(forcing_delta_triples(&w_solver, &w_plk0));
 
-        // Fresh-per-call policy: don't re-insert into `w_bases`.
-        // The HashMap remains allocated and owned by scratch, but
-        // stays empty from the first call onward. `w_cp` was still
-        // taken above so the local `restore_checkpoint` would be
-        // cheap if we ever re-enabled caching; keeping the name
-        // `_w_cp` documents intent without a removed binding.
+        // Fresh-per-call policy: `w_solver` is dropped at scope
+        // exit (end of this `else` block). `w_cp` was taken above
+        // to keep the legacy checkpoint/restore flow available if
+        // caching is ever re-enabled; today it simply dies with
+        // the solver.
         let _w_cp = w_cp;
         w_solver.spectral = None;
-        let _ = &mut *w_bases; // silence unused-mut warning for &mut HashMap
     }
     if !w_found_any { metrics.flow_w_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
     if trace_w {
