@@ -1531,6 +1531,138 @@ mod tests {
         assert!((mass.covered().0 - 1.0).abs() < 1e-9);
     }
 
+    /// TELEMETRY §7.5 "edge-flow semantics for split/resume are
+    /// internally consistent": every handle() call either came
+    /// from a seed OR was spawned via `emitted` / Split / Resume
+    /// on some edge. So:
+    ///
+    ///     sum(edge_flow[e].spawned) + seeds == total handle() calls
+    ///
+    /// must hold across a mixed emit + Split + Resume run. This
+    /// locks in the book-balance of the engine's accounting.
+    #[test]
+    fn edge_flow_conservation_across_mixed_continuations() {
+        use std::sync::atomic::AtomicU64 as A64;
+
+        /// Handler that takes one of three actions based on
+        /// payload: emit a child, split into two children, or
+        /// resume itself. After each action, payload increments;
+        /// at payload=10 the handler stops.
+        struct MixedStage { calls: Arc<A64> }
+        impl StageHandler<u64> for MixedStage {
+            fn id(&self) -> StageId { "mixed" }
+            fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                let mut out = StageOutcome::default();
+                let mk = |bump: u64, payload: u64| WorkItem {
+                    stage_id: "mixed",
+                    priority: 0,
+                    cost_hint: 1,
+                    replay_key: 0,
+                    mass_hint: None,
+                    meta: WorkItemMeta {
+                        item_id: item.meta.item_id * 100 + bump,
+                        parent_item_id: Some(item.meta.item_id),
+                        fanout_root_id: item.meta.fanout_root_id,
+                        depth_from_root: item.meta.depth_from_root + 1,
+                        spawn_seq: bump as u32,
+                    },
+                    payload,
+                };
+                match item.payload % 3 {
+                    0 if item.payload < 9 => {
+                        // Emit one child.
+                        out.emitted.push(mk(1, item.payload + 1));
+                    }
+                    1 if item.payload < 9 => {
+                        // Split into two children.
+                        out.continuation = Continuation::Split(vec![
+                            mk(1, item.payload + 1),
+                            mk(2, item.payload + 1),
+                        ]);
+                    }
+                    2 if item.payload < 9 => {
+                        // Resume this same logical item.
+                        out.continuation = Continuation::Resume(WorkItem {
+                            stage_id: "mixed",
+                            priority: 0,
+                            cost_hint: 1,
+                            replay_key: 0,
+                            mass_hint: None,
+                            meta: WorkItemMeta {
+                                item_id: item.meta.item_id,
+                                parent_item_id: item.meta.parent_item_id,
+                                fanout_root_id: item.meta.fanout_root_id,
+                                depth_from_root: item.meta.depth_from_root,
+                                spawn_seq: item.meta.spawn_seq + 1,
+                            },
+                            payload: item.payload + 1,
+                        });
+                    }
+                    _ => {}
+                }
+                out
+            }
+        }
+
+        const SEEDS: u64 = 3;
+        struct MixedAdapter { calls: Arc<A64> }
+        impl SearchModeAdapter<u64> for MixedAdapter {
+            fn name(&self) -> &'static str { "mixed" }
+            fn init(&self) -> AdapterInit<u64> {
+                let seed_items = (0..SEEDS).map(|i| WorkItem {
+                    stage_id: "mixed",
+                    priority: 0,
+                    cost_hint: 1,
+                    replay_key: i,
+                    mass_hint: None,
+                    meta: WorkItemMeta {
+                        item_id: i + 1,
+                        parent_item_id: None,
+                        fanout_root_id: i + 1,
+                        depth_from_root: 0,
+                        spawn_seq: 0,
+                    },
+                    payload: 0,
+                }).collect();
+                AdapterInit { seed_items }
+            }
+            fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<u64>>> {
+                let mut m: BTreeMap<StageId, Box<dyn StageHandler<u64>>> = BTreeMap::new();
+                m.insert("mixed", Box::new(MixedStage {
+                    calls: Arc::clone(&self.calls),
+                }));
+                m
+            }
+            fn mass_model(&self) -> Box<dyn SearchMassModel> {
+                Box::new(CounterMass { total: MassValue::ONE })
+            }
+        }
+
+        let calls = Arc::new(A64::new(0));
+        let adapter = MixedAdapter { calls: Arc::clone(&calls) };
+        let p = final_snapshot::<u64>(&adapter);
+        let total_calls = calls.load(Ordering::Relaxed);
+        let total_spawned: u64 = p
+            .edge_flow
+            .values()
+            .map(|c| c.spawned)
+            .sum();
+        // Book-balance: every handle() call was either a seed or
+        // spawned on some edge.
+        assert_eq!(
+            total_spawned + SEEDS,
+            total_calls,
+            "TELEMETRY §7.5 edge-flow conservation: spawned({}) + seeds({}) MUST equal calls({})",
+            total_spawned, SEEDS, total_calls,
+        );
+        // And the engine drained to zero live descendants.
+        for (root, c) in &p.fanout_roots {
+            assert_eq!(c.live_descendants, 0,
+                "root {} leaked live_descendants={}", root, c.live_descendants);
+        }
+    }
+
     /// TELEMETRY.md §4 consistency rule, direct unit test at the
     /// rollup helper level so future adapter code can't silently
     /// diverge the two axes. Any single `ForcingDelta` applied via
