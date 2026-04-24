@@ -565,7 +565,9 @@ pub(crate) fn process_boundary(
 /// Side effects on `metrics`:
 /// - `flow_w_solutions` +1 per solver hit,
 /// - `flow_w_spec_fail` / `flow_w_spec_pass` +1 per FFT verdict,
-/// - `flow_w_unsat` +1 if no W passed at all,
+/// - `flow_w_unsat` +1 if no W passed at all AND the exit was
+///   clean (not via conflict-budget timeout); timeout exits are
+///   exclusively counted in `flow_w_timeout`,
 /// - `flow_w_timeout` +1 per SAT conflict-budget timeout exit,
 /// - `flow_w_solves`, `flow_w_decisions`, `flow_w_propagations`,
 ///   `flow_w_root_forced`, `flow_w_free_sum` aggregated over the
@@ -824,7 +826,15 @@ pub(crate) fn process_solve_w(
         let _w_cp = w_cp;
         w_solver.spectral = None;
     }
-    if !w_found_any { metrics.flow_w_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
+    // Only attribute `flow_w_unsat` to runs where the W enumeration
+    // terminated cleanly without finding any candidate. If we
+    // exited via conflict-budget timeout (`*timed_out`), bumping
+    // this counter would double-attribute the same exit as both
+    // "unsat" and "timeout" in the diagnostic summary — the
+    // boundary is genuinely incomplete, not proven empty.
+    if !w_found_any && !*timed_out {
+        metrics.flow_w_unsat.fetch_add(1, AtomicOrdering::Relaxed);
+    }
     if trace_w {
         eprintln!("TRACE: SolveW done: {} W middles checked, {} passed spectral",
             trace_w_total, trace_w_pass);
