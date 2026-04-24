@@ -1,455 +1,336 @@
-# Telemetry
+# Telemetry: normative schema and implementation notes
 
-This doc has two parts:
+This document has three parts:
 
-1. **Universal schema** (below) — the shared `ProgressSnapshot` that
-   every mode (`cross`, `apart`, `together`, `sync`, `stochastic`)
-   emits through `SearchEngine`. Describes the one TTC metric, the
-   three 2-D forcing rollups, and the fan-out / edge-flow counters.
-2. **`--wz=sync` specifics** — the five historical
-   text blocks the sync walker prints after a run. These remain
-   because the walker has rich, sync-specific diagnostics that
-   aren't yet folded into the universal snapshot; they read cleanly
-   against the universal schema below.
+1. **Normative schema**: the required meaning of every universal telemetry
+   field.
+2. **Implementation status**: what the current tree does or does not yet
+   populate.
+3. **Legacy sync blocks**: the sync walker's mode-specific text output.
 
-## Universal schema
+Only Part 1 is normative. Parts 2 and 3 are explanatory.
 
-Every run emits `ProgressSnapshot`s on a fixed tick (`EngineConfig::progress_interval`,
-default 1 s) and one final `SearchEvent::Finished` snapshot. The
-schema is defined in `src/search_framework/events.rs`:
+## Part 1: Normative schema
+
+Every run MUST emit `ProgressSnapshot`s on a fixed tick and one final
+`Finished` snapshot.
+
+The universal schema is:
 
 ```rust
 pub struct ProgressSnapshot {
     pub elapsed: Duration,
-    pub throughput_per_sec: MassValue,   // fraction / second
-    pub covered_mass: MassValue,         // covered_exact + covered_partial (in [0, 1])
-    pub total_mass: MassValue,           // 1.0
+    pub throughput_per_sec: MassValue,
+    pub covered_mass: MassValue,
+    pub total_mass: MassValue,
     pub remaining_mass: MassValue,
-    pub ttc: Option<Duration>,           // remaining_mass / throughput
-    pub quality: TtcQuality,             // Direct | Projected | Hybrid
+    pub ttc: Option<Duration>,
+    pub quality: TtcQuality,
     pub edge_flow: BTreeMap<(String, String), EdgeFlowCounters>,
     pub fanout_roots: BTreeMap<u64, FanoutRootCounters>,
-    pub forcings: ForcingRollups,        // stage×level + stage×feature
+    pub forcings: ForcingRollups,
 }
 ```
 
-### TTC (mode-agnostic)
+## 1. Elapsed / coverage / TTC
 
-One metric, one unit across every mode. The unit is a **fraction**
-of the total search space in `[0, 1]` — additive over disjoint
-sub-cubes. (A previous iteration used `log2(|sub-cube|)` bits, but
-log sizes aren't additive when sub-cubes compose, so the unit
-was switched to fractions. See `src/search_framework/mass.rs`'s
-`disjoint_fractions_sum_to_one` test for the additive invariant.)
+These fields MUST follow `docs/TTC.md`.
 
-- **unit:** fraction of the full search space, in `[0, 1]`.
-- **`total_mass`:** always `1.0`.
-- **`covered_mass`:** `covered_exact + covered_partial` (both
-  individual fields are exposed on `MassSnapshot`; the published
-  `ProgressSnapshot.covered_mass` sums them, clamped to `total_mass`).
-  - `covered_exact` = fraction of the search space the adapter
-    has provably ruled out (e.g. MDD boundaries whose whole
-    sub-tree returned SAT/UNSAT without hitting the XY conflict
-    budget).
-  - `covered_partial` = fractional credit from interrupted
-    sub-cubes, e.g. XY timeouts where the SAT solver pruned
-    part of the sub-cube before the conflict limit fired
-    (`xy_cover_micro / 1_000_000`, see `docs/TTC.md`).
-- **`throughput_per_sec`:** `covered_mass / elapsed` — fraction
-  per second.
-- **`ttc`:** `remaining_mass / throughput_per_sec`, labelled with
-  `TtcQuality`:
-  - `Direct` — `covered_exact` is a real additive fraction; TTC
-    is a leading indicator.
-  - `Projected` — `covered_mass` is estimate-only (sync walker,
-    stochastic sampler). The number is present for dashboard
-    continuity; mode-specific telemetry is authoritative.
-  - `Hybrid` — direct `covered_exact` with projected/partial
-    smoothing via `covered_partial`. Used by
-    `apart|together|cross` where the base fraction counts
-    fully-explored sub-cubes and `covered_partial` adds the
-    XY-timeout shortfall credit.
+- `elapsed`: wall-clock duration covered by this run's telemetry contract
+- `throughput_per_sec`: `covered_mass / elapsed`
+- `covered_mass`: `covered_exact + covered_partial` as published through the
+  mass model
+- `total_mass`: always `1.0`
+- `remaining_mass`: `max(total_mass - covered_mass, 0)`
+- `ttc`: `remaining_mass / throughput_per_sec`, or `None` if rate is zero
+- `quality`: `Direct | Projected | Hybrid`
 
-The fraction unit replaces all pre-universal-review mode-specific
-units (XY candidate solves, boundary count, walker nodes). Nothing
-outside `ProgressSnapshot` should carry an ad-hoc TTC denominator.
+The universal snapshot MUST NOT invent a mode-specific denominator outside this
+fraction-based contract.
 
-### Forcing rollups (three 2-D tables)
+## 2. Edge flow
 
-**Status (this PR): `[feature, level]` is plumbed; the two
-`[stage, *]` rollups are plumbed but **not yet populated by
-adapters**.** `StageOutcome::forcings` currently returns an
-empty `ForcingDelta` from every MDD / sync / cross / stochastic
-handler in `mode_adapters/`. `ForcingRollups::apply` is ready
-to aggregate the deltas the moment adapters start returning
-them — but until that lands, `progress.forcings.stage_level`
-and `progress.forcings.stage_feature` are empty. Readers should
-fall back to `Solver::propagations_by_kind_level()` (radical)
-for the `[feature, level]` axis.
+`edge_flow[(from_stage, to_stage)]` describes logical work transitions from one
+stage to another.
 
-`ForcingRollups` is published on every tick. When all three are
-wired, the schema will be:
+### Required semantics
 
-| Axis pair         | Owner        | Source                                                 | Wired today? |
-|-------------------|--------------|--------------------------------------------------------|--------------|
-| `[feature, level]` | `radical`    | `Solver::propagations_by_kind_level()` (2-D `Vec`)     | yes          |
-| `[stage, level]`   | coordinator  | Sum of `ForcingDelta::by_level_feature` per stage     | not yet      |
-| `[stage, feature]` | coordinator  | Same source, rolled up along the other axis          | not yet      |
+At minimum, every implementation MUST define `spawned` as:
 
-"Feature" is a `PropKind` (`Clause`, `Pb`, `QuadPb`, `Xor`,
-`Spectral`, `Mdd`, `PbSetEq`). "Level" is the SAT solver's decision
-level at the moment the literal was forced. "Stage" is the framework
-`StageId` of the handler that produced the forcing event (e.g.
-`"boundary"`, `"solve_w"`, `"solve_z"`).
+- the number of logical child work items created on that edge
 
-Sum of `[feature, level]` equals `Solver::num_propagations()` — the
-main correctness invariant; the matching check for the `[stage, *]`
-rollups is deferred until adapters populate them.
+The metric MUST count logical work transitions, not arbitrary queue pushes.
 
-### Fan-out and edge flow
+### Continuation rules
 
-**Status (this PR):** only per-edge `spawned` and per-root
-`live_descendants` are populated. The other proposed lifecycle
-columns (`dropped`, `queued`, `started`, `completed`,
-`completed_descendants`, `credited_mass`) live in
-`UNIFIED_SEARCH_FRAMEWORK_SPEC.md` §8.1 and will land once the
-coordinator tracks per-edge item transitions; they're removed
-from the current struct definitions so nothing downstream sees
-an apparently-richer surface than the data supports.
+If the framework supports split or resume:
 
-`edge_flow: BTreeMap<(from_stage, to_stage), EdgeFlowCounters>`
-counts items pushed by each stage → child-stage edge. The
-companion `fanout_roots: BTreeMap<fanout_root_id,
-FanoutRootCounters>` carries `live_descendants` per subtree root.
+- `Split(children)` MUST contribute one spawned count per child edge
+- `Resume(item)` MUST be represented consistently
 
-Together these support the "Sankey-like text flow report" and
-"per-level cut attribution" required by §8.1 of
-`UNIFIED_SEARCH_FRAMEWORK_SPEC.md`.
+For `Resume`, an implementation MUST choose one of these two models and use it
+consistently:
 
-### Deferrals, not timeouts
+1. treat it as an explicit self-edge transition and count it in `edge_flow`, or
+2. exclude it from `edge_flow` entirely and document that `edge_flow` covers
+   only stage-to-stage transitions, not same-stage resumptions
 
-Stage handlers do not return "timed out". On budget exhaustion they
-return a `MassDelta` (fraction actually covered) plus a
-`Continuation`: either `Split(children)` (residual branched into
-smaller items) or `Resume(item)` (same sub-cube, saved-solver-
-checkpoint payload). Both variants add their items to the same
-`edge_flow` and forcing rollups as fresh work.
+Mixing the two interpretations is forbidden.
 
-The TTC denominator therefore never double-counts coverage: a
-handler only credits the sub-cube it actually eliminated; the rest
-goes back to the queue as a smaller problem. XY timeouts with
-`xy_cover_micro < 1_000_000` are credited as `covered_partial` per
-`docs/TTC.md` and clamped below the residual `1 - covered_exact`.
+## 3. Fan-out roots
 
----
+`fanout_roots[root_id]` tracks subtree state for one logical root of emitted
+work.
 
-# `--wz=sync` blocks
+### Required semantics
 
-A verbose run of `--wz=sync` emits four blocks after the search ends
-(whether it found a solution, hit `--sat-secs` timeout, or exhausted
-the tree). All four are written to stderr so they survive timeouts
-and redirections that only capture stdout. This doc is the reader's
-guide to those blocks. The blocks pre-date the universal schema
-above and remain until the sync walker is ported onto the framework
-engine (see `UNIFIED_SEARCH_FRAMEWORK_SPEC.md` §5.3).
+`live_descendants` MUST mean:
 
-Example invocation used throughout:
+- the number of in-flight logical descendants currently outstanding for that
+  root
+
+This counter MUST:
+
+- increment when new residual or child work becomes live
+- decrement when an in-flight item completes
+- include split children
+- include resumed work exactly when the implementation's declared `Resume`
+  accounting model treats resumed work as live descendant work
+- never go negative
+
+An implementation MUST NOT update `live_descendants` using only one class of
+emission if other continuation paths also create live work.
+
+## 4. Forcing rollups
+
+`forcings` contains coordinator-owned rollups of forced literals by stage.
+
+```rust
+pub struct ForcingRollups {
+    pub stage_level: BTreeMap<(StageId, u16), u64>,
+    pub stage_feature: BTreeMap<(StageId, u8), u64>,
+}
+```
+
+### Required semantics
+
+- `stage_level[(stage, level)]` = total forced literals attributed to `stage`
+  at SAT decision level `level`
+- `stage_feature[(stage, feature)]` = total forced literals attributed to
+  `stage` caused by propagator family `feature`
+
+The source event is `StageOutcome::forcings`.
+
+### Attribution rule
+
+A stage that performs solver work MUST attribute the forcing delta caused by
+that stage's own action, not the cumulative solver history of the run.
+
+### Consistency rule
+
+If an adapter populates both axes from the same forcing events, then:
+
+- sum over `stage_level` MUST equal sum over `stage_feature`
+
+This equality assumes each forcing event is attributed exactly once to one
+`(stage, level, feature)` bucket. If an implementation intentionally emits
+multiple attributions for one logical event, it MUST document that explicitly
+and MUST NOT claim this equality as an invariant.
+
+## 5. Deferrals instead of timeouts
+
+The framework contract is based on credited coverage plus residual work, not a
+raw timeout flag.
+
+When a handler exhausts budget it MUST return:
+
+1. the mass it actually covered, and
+2. a continuation describing the remainder
+
+Telemetry MUST reflect both:
+
+- credited mass appears in TTC fields
+- remaining logical work appears in edge-flow / fan-out state
+
+The same residual search space MUST NOT be counted both as covered and as fully
+live remainder.
+
+This is the telemetry-side form of the split/resume accounting rule in
+`docs/TTC.md`.
+
+## 6. Field population requirements
+
+The universal schema allows partial implementation, but the status of each
+field MUST be clear.
+
+### Mandatory in every mode
+
+- `elapsed`
+- `covered_mass`
+- `total_mass`
+- `remaining_mass`
+- `ttc`
+- `quality`
+
+### Mandatory when the engine exposes staged work
+
+- `edge_flow`
+- `fanout_roots`
+
+For this purpose, "exposes staged work" means the run is represented to the
+framework as one or more `StageHandler` executions, including the degenerate
+case of a single stage wrapping a whole mode.
+
+### Mandatory when adapters can attribute stage-local forcing deltas
+
+- `forcings.stage_level`
+- `forcings.stage_feature`
+
+If a field is structurally present but semantically unpopulated, documentation
+MUST say so explicitly.
+
+## 7. Validation rules
+
+Implementations SHOULD check:
+
+1. `covered_mass <= 1.0`
+2. `remaining_mass >= 0`
+3. `fanout_roots.live_descendants >= 0`
+4. forcing totals across both forcing axes agree when both are populated
+5. edge-flow semantics for split/resume are internally consistent
+
+## Part 2: Current implementation status
+
+This section is descriptive, not normative.
+
+## 8. Universal TTC status
+
+Status snapshot last audited: April 24, 2026.
+
+The current tree uses the fraction-based TTC contract from `docs/TTC.md`.
+
+## 9. Forcing-rollup status
+
+As of this tree:
+
+- `[feature, level]` exists in `radical`
+- the coordinator rollups `[stage, level]` and `[stage, feature]` are wired in
+  the schema
+- adapters may still leave `StageOutcome::forcings` empty
+
+Readers should therefore treat empty stage-based forcing tables as “not yet
+populated”, not as proof that no forcings occurred.
+
+## 10. Edge-flow / fan-out status
+
+As of this tree:
+
+- `edge_flow.spawned` is the primary populated lifecycle field
+- `fanout_roots.live_descendants` is intended to track live subtree size
+
+If continuation paths evolve, this section should be updated to state whether
+resume operations are represented as self-edges, omitted from edge-flow, or
+counted some other way.
+
+## Part 3: `--wz=sync` legacy telemetry blocks
+
+The sync walker still emits mode-specific text blocks after a run. These blocks
+are not part of the universal schema, but remain authoritative for sync-mode
+analysis until equivalent detail is folded into universal telemetry.
+
+Example invocation:
 
 ```bash
 target/release/turyn --n=56 --wz=sync --sat-secs=30
 ```
 
-## Minimal dashboard (recommended)
+## 11. Sync dashboard
 
-If the goal is to avoid over-tracking, use this compact dashboard and
-ignore the rest unless debugging:
+Recommended KPIs:
 
-- **Primary 1: TTC_parallel**
-  - For `--wz=sync`: Block 2 `TTC_parallel` (and Block 3 direct TTC as a
-    consistency check).
-  - For `cross/apart/together`: final `Time to cover` line.
-- **Primary 2: Progress % (effective coverage)**
-  - From the pipeline `Progress:` line (effective covered mass / total
-    mass for that mode).
-- **Primary 3: Timeout quality**
-  - `XY timeout` line (rate + coverage credit behavior).
-- **Primary 4: Conjecture pruning activity (only when enabled)**
-  - `--conj-zw-bound rejects`.
+1. TTC
+2. effective coverage progress
+3. timeout coverage quality
+4. conjecture pruning activity when conjectures are enabled
 
-Treat all other telemetry blocks as root-cause diagnostics, not KPIs.
+Treat the rest as diagnostics.
 
-## Block 1 — scalar summary line
+## 12. Block 1: scalar summary
 
 ```
-sync_walker(parallel x16): nodes=… cap_rejects=… tuple_rejects=…
-    rule_rejects=… sat_unsat=… leaves=… max_lvl=…
-    elapsed=… time_to_first_leaf=… avg_nogood=…/… (…x shrink)
-    peer_imports=…
+sync_walker(parallel x16): nodes=... cap_rejects=... tuple_rejects=...
+    rule_rejects=... sat_unsat=... leaves=... max_lvl=...
+    elapsed=... time_to_first_leaf=... avg_nogood=.../... (...x shrink)
+    peer_imports=...
 ```
 
-- `nodes` — DFS visits summed across all workers.
-- `cap_rejects` — walker-side capacity violations (`|S(s)| >
-  max_remaining[level][s]`).  Rejected without a SAT call.
-- `tuple_rejects` — sibling candidates discarded because they could
-  not land on any feasible sum tuple.
-- `rule_rejects` — rejected by a BDKR canonicalization rule without
-  calling the solver.
-- `sat_unsat` — propagate\_only returned UNSAT; a nogood was
-  installed. This is the only place `avg_nogood` has a denominator.
-- `leaves` — DFS frames that reached `level == depth`; must be
-  verified by `verify_tt` before being reported.
-- `max_lvl` — deepest level any worker reached.
-- `avg_nogood` — mean learnt-clause size (`final / pre-minimization`,
-  ratio is the minimization shrink factor).
-- `peer_imports` — learnt clauses pulled from the shared
-  `ClauseExchange` into each worker's local solver.
+- `nodes`: DFS visits across workers
+- `cap_rejects`: walker-side capacity rejects
+- `tuple_rejects`: tuple-reachability rejects
+- `rule_rejects`: canonical-rule rejects
+- `sat_unsat`: propagate-only UNSAT returns
+- `leaves`: frames that reached full depth
+- `max_lvl`: deepest level reached
+- `avg_nogood`: mean learnt-clause size before and after minimization
+- `peer_imports`: imported peer clauses
 
-## Block 2 — TTC projection (`project_ttc`)
+## 13. Block 2: TTC projection
 
 ```
-TTC projection (n=…):
+TTC projection (n=...):
   level  parent   child    b_eff   note
-  …      …        …        …       …
-  …
-  N_total ≈ …
-  rate (nodes/s, parallel) = …
-  TTC_serial   ≈ …s
-  TTC_parallel ≈ …s
+  ...
+  N_total ~= ...
+  rate (nodes/s, parallel) = ...
+  TTC_serial   ~= ...s
+  TTC_parallel ~= ...s
 ```
 
-Projects full-cover tree size from per-level true branching factor
-`b_eff(L) = children_by_level[L] / nodes_by_level[L]`. Levels with
-fewer than `NOISY_THRESHOLD=32` parents are flagged `?` but still
-used. This is the headline TTC; the "direct TTC" in Block 4 is the
-cross-check from DFS coverage.
+This is the walker's projected TTC based on effective branching factors.
 
-## Block 3 — per-level table
+## 14. Block 3: per-level table
 
 ```
 Per-level: lvl |   nodes |  children | proc'd | cov% |   forced | f/node |   time(s) |  t/node
-Per-level:   0 |       1 |       256 |    256 | 100.0 |       32 |   32.00 |    29.876 | 29.876000
-Per-level:   1 |     256 |     12288 |    328 |   2.7 |     4096 |   16.00 |    29.800 |  0.116406
-…
-Per-level: cumulative root-coverage (∏ cov) = 3.102e-09  →  direct TTC = elapsed / coverage
-Per-level: total walker-var forcings = 1234567 (avg 2^7.42 shrink per propagate call)
+...
+Per-level: cumulative root-coverage (product of cov) = ...  ->  direct TTC = elapsed / coverage
+Per-level: total walker-var forcings = ...
 ```
 
-Columns:
+- `nodes`: parents visited at this level
+- `children`: generated siblings
+- `proc'd`: children that survived to the next DFS frame
+- `cov%`: `proc'd / children`
+- `forced`: walker-var forcings triggered by SAT propagation
+- `f/node`: forced per parent
+- `time(s)`: cumulative inclusive wall time for frames rooted here
+- `t/node`: time per node
 
-- `nodes` — DFS parents visited at this level (all workers).
-- `children` — sibling candidates generated at this level before
-  walker/SAT pruning.
-- `proc'd` — children that passed walker + SAT filters and became
-  new DFS frames.
-- `cov%` — `proc'd / children`. Coverage fraction "out of this
-  parent's siblings, what share survived at least to the next
-  propagate\_only call?"
-- `forced` — walker-var forcings that this level's new assumptions
-  caused the SAT solver to propagate (incremental over the parent
-  level). Each forced walker var is a 1-bit sub-cube pruned.
-- `f/node` — `forced / nodes`. `2^(f/node)` is the typical per-
-  propagate sub-cube shrink at this level.
-- `time(s)` — cumulative wall-seconds spent in DFS frames rooted at
-  this level, inclusive of descendants. Summing across levels
-  double-counts.
-- `t/node` — `time / nodes`. Per-sub-cube cost at this level.
+The cumulative root-coverage line is a direct cross-check against Block 2.
 
-The `cumulative root-coverage` line is `Π_L cov(L)` over all levels
-with generated candidates, and `direct TTC = elapsed / coverage`
-assumes an even distribution of "missed" paths. Use it as a
-reality check against Block 2's projected TTC.
-
-## Block 4 — per-feature forcings
+## 15. Block 4: per-feature forcings
 
 ```
-Per-feature forcings (total 12345678): clause=9989012 (80.9%)  quadpb=2271156 (18.4%)  pbseteq=85510 (0.7%)
+Per-feature forcings (total 12345678): clause=... quadpb=... pbseteq=...
 ```
 
-One line, broken down by SAT propagator family (`PropKind` in
-`radical/src/lib.rs`): `clause`, `pb`, `quadpb`, `xor`, `spect`,
-`mdd`, `pbseteq`. Only kinds with non-zero counts are shown.
-Totals are summed from `solver.propagations_by_kind(kind)` deltas
-captured around each `propagate_only` call.
+This summarizes propagation by SAT propagator family.
 
-Interpretation cheat-sheet:
-
-- `clause` high, `quadpb` low: most work is pure CNF propagation;
-  the Turyn identity is mostly satisfied-by-default.
-- `quadpb` high: the per-lag identity is doing heavy lifting; worth
-  investigating whether a cheaper lag subset suffices.
-- `pbseteq` non-zero only near leaves: expected — it's the
-  sum-constraint tightening that fires when most boundary is pinned.
-- `xor` high: Tseitin XOR chains from canonicalization are the
-  limiting propagator; BDKR rules (ii..vi) lean on XOR semantics.
-- `spect`, `mdd`: currently always zero in sync mode (those
-  propagators are not attached).
-
-## Block 5 — per-(level, feature) matrix
+## 16. Block 5: per-(level, feature) matrix
 
 ```
-Per-level forcings by feature: lvl |     clause |     quadpb |    pbseteq
-Per-level forcings by feature:   0 |       1234 |        456 |          0
-…
-Per-level forcings by feature:  15 |    4321000 |     982100 |      12345
-Per-level forcings by feature:  16 |    3210000 |     783200 |      65432
-Per-level forcings by feature:  17 |    1210000 |     471200 |      43210
+Per-level forcings by feature: lvl | clause | quadpb | pbseteq
+...
 ```
 
-Only kinds that were non-zero at some level appear as columns, and
-only levels with non-zero total appear as rows. This is the 2D
-breakdown of Block 4: "which propagator is hottest at which depth?"
+This is the 2-D expansion of Block 4.
 
-Typical pattern observed at `n=18`:
-- Ratio between `clause` and `quadpb` is roughly uniform across all
-  levels (~4:1).
-- `pbseteq` activates only at depth ≥ 11.
-- Levels `n-3 .. n-1` do 99% of propagation work — expected because
-  DFS spends most of its time near leaves.
+## 17. Practical reading rule
 
+For sync runs:
 
-## Smart-clause feature audit (what moves PropKind numbers vs not)
-
-The `prop_by_kind` counters are incremented **only** when `enqueue(...)`
-assigns a previously-unset variable with a non-`Decision` reason.
-So these numbers are "forced literals by reason family", not total CPU
-spent in each mechanism.
-
-### Correctly reflected in current counters
-
-- **CNF clause BCP** (including binary implications and learnt clauses)
-  increments `clause` via `Reason::Clause`.
-- **PB / quad-PB / PB-set-eq** propagations increment `pb`, `quadpb`,
-  `pbseteq` respectively.
-- **Native XOR constraints** (when added via `add_xor`) increment `xor`.
-- **MDD forced literals** increment `mdd`.
-
-### Not (fully) reflected / currently misleading
-
-1. **Binary-watch fastpath (`bin_watch_fastpath`)**
-   - Changes clause-propagation cost, but not reason type.
-   - Effect appears only indirectly in wall-clock/TTC, not as a new
-     per-feature counter.
-
-2. **Clause DB maintenance (`reduce_db`, vivification, compaction)**
-   - Can materially change runtime and future clause quality.
-   - Not represented in `prop_by_kind`; only downstream clause forcing
-     may change.
-
-3. **Peer clause import (`add_clause_deferred`)**
-   - Import activity is tracked separately (`peer_imports`), but imports
-     do not increment `clause` until they later force literals.
-
-4. **Spectral pruning in current code path**
-   - The active spectral path learns/returns a clause conflict
-     (`Reason::Clause`), so pruning work is attributed to `clause`, not
-     `spect`.
-   - `spect` only increments if spectral unit-propagation enqueues
-     literals with `Reason::Spectral` (currently disabled in this path).
-
-5. **Tseitin-encoded XOR logic**
-   - If modeled as CNF clauses (current sync setup), effects are counted
-     under `clause`, not `xor`.
-   - `xor` counter represents only native XOR propagator activity.
-
-6. **`xor_propagation` config flag caveat**
-   - `SolverConfig` exposes this flag, but propagation is currently gated
-     by constraint presence (`xor_constraints`) rather than the flag in
-     the hot `propagate()` path. Treat this as a wiring gap when
-     interpreting "feature on/off" experiments.
-
-### Practical TTC implication
-
-A SAT feature can improve TTC without moving the corresponding
-`PropKind` bucket if it changes cost per propagation (fast paths,
-vivification, clause exchange) instead of changing which propagator
-*caused* assignments. Use PropKind together with wall-time and stage
-throughput, not as a standalone cost model.
-
-## How to read a run together
-
-1. Block 2's `TTC_parallel` is the headline. If it's too large to
-   be feasible, Block 3's `cov%` column tells you which level is
-   the widest — that's where pruning needs to improve.
-2. Block 4 tells you *which propagator* is slowest. Multiply by
-   Block 3's `time(s)` to map propagator work onto wall clock.
-3. Block 5 tells you *where in the tree* each propagator pays off.
-   If `quadpb` dominates near the root but `clause` dominates near
-   leaves, a shallower quad-PB subset plus aggressive Tseitin
-   learning would be a plausible win.
-4. Compare `TTC_parallel` (Block 2) vs. `direct TTC` (Block 3): if
-   they disagree by more than ~5×, one of them is mis-estimating
-   (usually Block 2's `b_eff` on a level with `?` flag).
-
-## Calibration target
-
-The search-space size — number of distinct Turyn quadruples — at
-a given `n` is known from the literature: `|TT(18)| = 675`,
-`|TT(22)| = 3105`, `|TT(26)| = 3753`. Under perfect pipeline
-efficiency (one propagate\_only call per solution), we would expect
-`TTC_parallel / (time_per_propagate) ≈ |TT(n)|`. Any order-of-
-magnitude gap is "room to prune". Use this as the sanity check
-when a micro-optimization claims a 10× win.
-
-## Publishing on timeout
-
-All five blocks are printed unconditionally at the end of
-`search_sync`, inside `thread::scope`, regardless of whether a
-solution was found or the deadline fired. If you kill the process
-with `SIGINT` *before* `thread::scope` returns, you lose the blocks;
-use `--sat-secs=N` and let the walker time out naturally.
-
-## Where this is implemented
-
-- `radical/src/lib.rs`:
-  - `PropKind` enum + `Reason::prop_kind()` mapping
-  - `Solver::prop_by_kind` counter array, incremented in `enqueue`
-  - `Solver::propagations_by_kind(kind)` public accessor
-- `src/sync_walker.rs`:
-  - `SyncStats::{prop_by_kind_total, forced_by_level_kind}`
-  - Delta capture around each `propagate_only` call in `dfs`
-  - `format_per_level_telemetry`, `format_prop_by_kind_summary`,
-    `format_per_level_kind_table`, `project_ttc`
-  - Final block printed in `search_sync` under `if verbose`
-
-The `cross`/`apart`/`together` modes do not currently plumb
-per-feature counters. Adding them requires capturing deltas around
-`SolveXyPerCandidate::try_candidate`, `SolveW`, and `SolveZ` solver
-calls and aggregating across clones — see `SearchStats` in
-`src/legacy_search.rs` and `src/mdd_pipeline.rs` for the
-aggregation points.
-
-
-## Conjecture flags and telemetry (April 2026 update)
-
-The conjecture flags are now live in CLI and pipeline modes:
-
-- `--conj-xy-product`
-- `--conj-zw-bound`
-- `--conj-tuple`
-
-How they interact with telemetry:
-
-1. **`--wz=sync` blocks in this document are unchanged.**
-   - These five blocks come from `search_sync` walker stats.
-   - Current sync path does not apply conjecture toggles, so Block 2/3
-     TTC values should be compared only against other sync runs with the
-     same core sync settings.
-
-2. **`cross/apart/together` print conjecture status in pipeline output.**
-   - Verbose startup prints active `--conj-*` toggles.
-   - `--conj-zw-bound` additionally prints a reject counter in the final
-     summary (`--conj-zw-bound rejects: ...`).
-
-3. **TTC comparison rule:**
-   - If any conjecture flag is enabled, label runs as
-     `conjecture-constrained` when comparing TTC to baseline.
-   - In particular, `--conj-tuple` restricts tuple shells and can make
-     progress/TTC look better while targeting a narrower search problem.
-
-Practical workflow when testing conjecture impact:
-
-- Keep mode, `n`, thread count, `--sat-secs`, and MDD settings fixed.
-- Run baseline, then one flag at a time, then combined flags.
-- Record both TTC and any conjecture-specific counters (especially
-  `--conj-zw-bound rejects`) to separate "real pruning activity" from
-  pure throughput noise.
+1. use Block 2 TTC as the headline estimate
+2. use Block 3 to locate width and coverage bottlenecks
+3. use Block 4 and Block 5 to identify the propagator family and depth doing
+   the work
+4. compare projected TTC to direct TTC as a sanity check
