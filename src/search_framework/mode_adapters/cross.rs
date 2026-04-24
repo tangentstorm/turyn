@@ -266,18 +266,20 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                     !found.load(Ordering::Relaxed)
                 },
             );
-            // Tuple (tuple_idx) fully processed — publish
-            // `tuple_idx + 1` tuples done. The earlier placement
-            // at loop-top stored the zero-based index *before*
-            // processing, making the live fraction one tuple
-            // behind and the TTC readout systematically pessimistic
-            // (PR review follow-up).
-            self.tuples_done.store(tuple_idx + 1, Ordering::Relaxed);
-            // Any XY-timeout partial credit accumulated during
-            // this tuple is now subsumed by the tuple's exact
-            // credit. Zero the in-flight counter so the next
-            // tuple starts fresh and we don't double-credit.
+            // Tuple (tuple_idx) fully processed. Publish
+            // `tuple_idx + 1` tuples done, but reset the
+            // in-flight cov_micro FIRST. If we did the stores
+            // in the opposite order, a poll between the two
+            // would see `new_tuples_done + old_in_flight_cov_micro`
+            // — the same sub-cube credited to both exact (via
+            // the tuple bump) and partial (via the un-zeroed
+            // accumulator). The reverse order only yields
+            // `old_tuples_done + 0` transiently, which
+            // under-reports monotonically. The engine's
+            // `poll_mass` monotone envelope then absorbs the
+            // under-report safely.
             self.in_flight_cov_micro.store(0, Ordering::Relaxed);
+            self.tuples_done.store(tuple_idx + 1, Ordering::Relaxed);
         }
         // Do NOT force `tuples_done = tuples.len()` here, and do
         // NOT emit a terminal `mass_delta = 1.0`. Either of those
