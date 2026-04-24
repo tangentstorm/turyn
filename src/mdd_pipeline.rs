@@ -1634,9 +1634,11 @@ pub(crate) fn process_solve_wz(
             // Conflict limit hit — more solutions may exist.
             more_possible = true;
             metrics.flow_wz_budget_hit.fetch_add(1, AtomicOrdering::Relaxed);
-            if wz_count == 0 {
-                metrics.flow_wz_first_unsat.fetch_add(1, AtomicOrdering::Relaxed);
-            }
+            // Don't bump flow_wz_first_unsat here: the field name
+            // means "first iteration reported UNSAT", and a
+            // conflict-budget timeout is not UNSAT. Mirrors the
+            // round-28 fix for the analogous flow_w_unsat /
+            // flow_w_timeout mutual exclusion.
             break;
         }
         if sat_res == Some(false) {
