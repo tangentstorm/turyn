@@ -392,6 +392,22 @@ fn apply_report<T>(
     let new_live = outcome.emitted.len() as u64 + split_count;
     {
         let entry = fanout_roots.entry(fanout_root_id).or_default();
+        // TELEMETRY.md §3 invariant: `live_descendants` MUST
+        // decrement when an in-flight item completes — which is
+        // exactly what this call models. If the entry was 0 going
+        // in, either seeding failed to register this root or a
+        // handler emitted a child with a stale / unknown
+        // `fanout_root_id`. The spec says the counter must never
+        // go negative; u64 saturating_sub enforces that
+        // structurally, but a pre-decrement count of 0 signals a
+        // real bookkeeping bug. Catch it in debug/test builds
+        // instead of silently absorbing the decrement.
+        debug_assert!(
+            entry.live_descendants >= 1,
+            "TELEMETRY §3: apply_report on fanout_root_id={} found live_descendants=0 before decrement; \
+             seeding did not register this root or a handler produced a stale root_id",
+            fanout_root_id,
+        );
         entry.live_descendants = entry
             .live_descendants
             .saturating_add(new_live)
@@ -481,12 +497,18 @@ fn build_snapshot(
         "TELEMETRY §7.2: remaining_mass={} MUST be >= 0",
         remaining.0,
     );
-    // `live_descendants` is u64, so non-negativity is structural.
-    // Assert on the aggregate too so an overflow at u64::MAX fails
-    // loudly rather than wrapping silently.
+    // `live_descendants` is u64, so non-negativity is structural
+    // (TELEMETRY.md §3 "never go negative"). The real bookkeeping
+    // bugs we care about are caught by the pre-decrement guard
+    // inside `apply_report`; here we only sanity-check that no
+    // entry has saturated at the upper bound, which would be a
+    // runaway `saturating_add` producing a telemetry value that
+    // can no longer shrink back.
     debug_assert!(
-        fanout_roots.values().all(|c| c.live_descendants != u64::MAX),
-        "TELEMETRY §7.3: fanout_roots.live_descendants MUST NOT saturate at u64::MAX",
+        fanout_roots.values().all(|c| c.live_descendants < u64::MAX / 2),
+        "TELEMETRY §3: fanout_roots.live_descendants has saturated near u64::MAX ({} entries > half-range); \
+         a handler is emitting children without corresponding completions",
+        fanout_roots.values().filter(|c| c.live_descendants >= u64::MAX / 2).count(),
     );
     let sum_level: u64 = forcings.stage_level.values().sum();
     let sum_feature: u64 = forcings.stage_feature.values().sum();
@@ -1295,6 +1317,49 @@ mod tests {
                 w[0].0, w[1].0,
             );
         }
+    }
+
+    /// Verifies the TELEMETRY §3 pre-decrement assertion in
+    /// `apply_report` actually fires when the fanout root entry
+    /// is zero before decrement. Without the assertion,
+    /// saturating_sub would silently absorb the underflow and
+    /// hide a bookkeeping bug (e.g. a handler emitting a child
+    /// with a stale / unregistered `fanout_root_id`). Calls
+    /// `apply_report` directly rather than running a full engine
+    /// — an engine-harness panic fires inside a worker thread and
+    /// the coordinator deadlocks, which `#[should_panic]` can't
+    /// observe cleanly.
+    #[test]
+    #[should_panic(expected = "apply_report on fanout_root_id=")]
+    #[cfg(debug_assertions)]
+    fn apply_report_panics_on_unregistered_root() {
+        use crate::search_framework::mass::MassSnapshot;
+        use crate::search_framework::queue::GoldThenWork;
+
+        let scheduler: SharedScheduler<u64> = Arc::new((
+            Mutex::new(Box::new(GoldThenWork::new(4)) as Box<dyn SchedulerPolicy<u64>>),
+            Condvar::new(),
+        ));
+        let mut mass = MassSnapshot::new(MassValue::ONE);
+        let mut forcings = ForcingRollups::default();
+        let mut edge_flow: BTreeMap<(String, String), EdgeFlowCounters> = BTreeMap::new();
+        // Empty `fanout_roots` intentionally — the decrement path
+        // should catch this before saturating_sub masks it.
+        let mut fanout_roots: BTreeMap<u64, FanoutRootCounters> = BTreeMap::new();
+
+        let report = WorkerReport::<u64> {
+            from_stage: "ghost",
+            fanout_root_id: 0xDEADBEEF, // never seeded
+            outcome: StageOutcome::default(),
+        };
+        apply_report(
+            report,
+            &scheduler,
+            &mut mass,
+            &mut forcings,
+            &mut edge_flow,
+            &mut fanout_roots,
+        );
     }
 
     /// TELEMETRY.md §5 deferrals: "The same residual search space
