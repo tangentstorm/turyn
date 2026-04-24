@@ -592,6 +592,7 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
         cancel: Some(std::sync::Arc::clone(&engine_cancel)),
         exchange: None,
         projected_fraction_ppm: None,
+        live_sink: None,
     };
     let (adapter, result_rx) = SyncAdapter::build(problem, sync_cfg, verbose);
     let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
