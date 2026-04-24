@@ -130,6 +130,17 @@ impl<T: Send + 'static> SearchEngine<T> {
         // double-counts one) trips the assertion immediately.
         let mut seed_count: u64 = 0;
         let mut handled_count: u64 = 0;
+        // Monotone envelope of source's total covered fraction
+        // (polled_exact + polled_partial). Tracked separately from
+        // `mass.covered_partial` so stale partial values can't
+        // contaminate it: when the source drops partial to zero
+        // because of subsume-into-exact, `high_total` advances to
+        // the new polled_total (which equals the new
+        // polled_exact), and derived partial correctly drops to
+        // 0. Using `mass.covered_partial` as a monotone
+        // high-water would retain the pre-subsume partial and
+        // double-count against the new exact credit.
+        let mut high_total: f64 = 0.0;
         // Hold the mass model across the run so progress ticks can
         // publish the adapter's current `quality()` rather than a
         // hardcoded placeholder, and so the coordinator can poll
@@ -288,7 +299,7 @@ impl<T: Send + 'static> SearchEngine<T> {
 
                 if last_progress.elapsed() >= self.cfg.progress_interval {
                     last_progress = Instant::now();
-                    poll_mass(&*mass_model, &mut mass);
+                    poll_mass(&*mass_model, &mut mass, &mut high_total);
                     on_event(SearchEvent::Progress(build_snapshot(
                         start.elapsed(),
                         &mass,
@@ -326,7 +337,7 @@ impl<T: Send + 'static> SearchEngine<T> {
 
         // Final poll for any live-counted coverage the last tick
         // missed — same policy as the in-loop tick.
-        poll_mass(&*mass_model, &mut mass);
+        poll_mass(&*mass_model, &mut mass, &mut high_total);
         // TELEMETRY §7.5 Finished-time equality. Mid-run we only
         // have `handled_count <= seed_count + sum(spawned)` (a
         // spawned child can exist in the queue before any handler
@@ -363,51 +374,40 @@ type SharedScheduler<T> = Arc<(Mutex<Box<dyn SchedulerPolicy<T>>>, Condvar)>;
 ///
 /// Design per TTC spec invariants:
 ///
-/// - `covered_exact` is **monotone non-decreasing** (TTC §3.6) via
-///   max-clamp on the polled exact fraction.
-/// - The published **total** `covered_exact + covered_partial` is
-///   also monotone. We track it via `mass.covered_partial`
-///   derived-from-total semantics:
+/// - `covered_exact` is monotone non-decreasing (§3.6) via
+///   max-clamp on polled_exact.
+/// - `high_total` is the monotone envelope of the adapter's
+///   `polled_exact + polled_partial` across ticks. Published
+///   partial is derived as `high_total - mass.covered_exact`,
+///   which guarantees:
 ///
-///       high_total = max over time of (polled_exact + polled_partial)
-///       published_exact = high_exact
-///       published_partial = high_total - high_exact
-///
-///   This holds TTC §3.6 (total monotone) even when the adapter
-///   intentionally drops polled partial on completion (MDD
-///   subsume, Cross tuple reset) AND when polled exact happens to
-///   fluctuate backward (sync projected estimator). Naïve
-///   monotone-clamp on `covered_partial` alone would retain the
-///   partial high-water alongside the new exact credit for the
-///   same sub-cube — violating §3.7 "no completed subproblem may
-///   be credited more than once". Naïve trust-the-source on
-///   partial breaks §3.6 when both components fluctuate down.
+///     - published total = covered_exact + covered_partial =
+///       high_total is monotone (§3.6).
+///     - when the adapter subsumes partial into exact on
+///       completion (MDD, Cross), published partial correctly
+///       drops to match the new polled_total, NOT the stale
+///       pre-subsume partial high-water. That keeps §3.7 "no
+///       completed subproblem credited more than once".
+///     - when the adapter's estimator fluctuates backward (sync),
+///       published values stay at the envelope. §3.6 preserved.
 /// - `covered_partial ≤ total - covered_exact` (§3.2) enforced
 ///   by clamping after derivation.
-fn poll_mass(model: &dyn SearchMassModel, mass: &mut MassSnapshot) {
+///
+/// `high_total` MUST be tracked by the caller as a separate
+/// monotone counter; using `mass.covered_exact + mass.covered_partial`
+/// as a proxy would double-count stale partial against fresh
+/// exact credit.
+fn poll_mass(model: &dyn SearchMassModel, mass: &mut MassSnapshot, high_total: &mut f64) {
     let polled_exact = model.covered_mass();
     let polled_partial = model.covered_partial_mass();
     if polled_exact.0 > mass.covered_exact.0 {
         mass.covered_exact = polled_exact;
     }
-    // Track the high-water-mark of the *total* covered fraction,
-    // then derive partial as (high_total - high_exact). Using
-    // `covered_partial`'s stored value as `high_total - high_exact`
-    // from the previous tick, the candidate new high_total is
-    // `max(prev_total, polled_total)` where prev_total =
-    // stored_exact + stored_partial (pre-update) and polled_total
-    // = polled_exact + polled_partial.
     let polled_total = polled_exact.0 + polled_partial.0;
-    // stored_total as of *before* the exact-update above:
-    let stored_total_candidate = {
-        // Re-derive: the previous tick left stored covered =
-        // prev_exact + prev_partial. After the exact update the
-        // stored exact may have grown; adding the previous partial
-        // gives a lower-bound on what the total should now be.
-        mass.covered_exact.0 + mass.covered_partial.0
-    };
-    let high_total = polled_total.max(stored_total_candidate);
-    let derived_partial = (high_total - mass.covered_exact.0).max(0.0);
+    if polled_total > *high_total {
+        *high_total = polled_total;
+    }
+    let derived_partial = (*high_total - mass.covered_exact.0).max(0.0);
     let cap = (mass.total.0 - mass.covered_exact.0).max(0.0);
     mass.covered_partial = MassValue(derived_partial.min(cap));
 }
@@ -1582,15 +1582,16 @@ mod tests {
             partial: std::sync::Mutex::new(0.0),
         };
         let mut mass = MassSnapshot::new(MassValue::ONE);
+        let mut high_total: f64 = 0.0;
 
         // Tick 1: exact=0, partial=0.3 in-flight.
         *model.partial.lock().unwrap() = 0.3;
-        poll_mass(&model, &mut mass);
+        poll_mass(&model, &mut mass, &mut high_total);
         assert!((mass.covered().0 - 0.3).abs() < 1e-9);
 
         // Tick 2: partial transient peaks at 0.6; still room under 1.0.
         *model.partial.lock().unwrap() = 0.6;
-        poll_mass(&model, &mut mass);
+        poll_mass(&model, &mut mass, &mut high_total);
         assert!((mass.covered().0 - 0.6).abs() < 1e-9);
 
         // Tick 3: a chunk completes — exact jumps to 0.8 and the
@@ -1599,7 +1600,7 @@ mod tests {
         // 1.0 - 0.8 = 0.2 so the published covered stays ≤ 1.0.
         *model.exact.lock().unwrap() = 0.8;
         *model.partial.lock().unwrap() = 0.0;
-        poll_mass(&model, &mut mass);
+        poll_mass(&model, &mut mass, &mut high_total);
         assert!(mass.covered().0 <= 1.0 + 1e-12,
             "covered MUST stay ≤ total; got exact={} partial={}",
             mass.covered_exact.0, mass.covered_partial.0);
@@ -1607,8 +1608,58 @@ mod tests {
             "covered_exact is monotone non-decreasing");
         // Tick 4: exact advances further. Partial stays ≤ residual.
         *model.exact.lock().unwrap() = 1.0;
-        poll_mass(&model, &mut mass);
+        poll_mass(&model, &mut mass, &mut high_total);
         assert!((mass.covered().0 - 1.0).abs() < 1e-9);
+    }
+
+    /// TTC §3.7 "no completed subproblem may be credited more
+    /// than once" at the engine poll-path level. Regression for
+    /// the bug where `poll_mass` monotone-clamped
+    /// `covered_partial` independently, retaining a stale partial
+    /// high-water alongside the new exact credit that had
+    /// subsumed it.
+    ///
+    /// Scenario mirrors what MDD does on clean completion:
+    ///   - Tick 1: source publishes (exact=0, partial=0.03).
+    ///   - Tick 2: source subsumes → (exact=0.1, partial=0).
+    /// Published total MUST be 0.1, not 0.13.
+    #[test]
+    fn poll_mass_does_not_double_count_subsumed_partial() {
+        use crate::search_framework::mass::MassSnapshot;
+        struct SrcModel {
+            e: std::sync::Mutex<f64>,
+            p: std::sync::Mutex<f64>,
+        }
+        impl SearchMassModel for SrcModel {
+            fn covered_mass(&self) -> MassValue { MassValue(*self.e.lock().unwrap()) }
+            fn covered_partial_mass(&self) -> MassValue { MassValue(*self.p.lock().unwrap()) }
+            fn quality(&self) -> CoverageQuality { CoverageQuality::Hybrid }
+        }
+
+        let model = SrcModel {
+            e: std::sync::Mutex::new(0.0),
+            p: std::sync::Mutex::new(0.03),
+        };
+        let mut mass = MassSnapshot::new(MassValue::ONE);
+        let mut high_total: f64 = 0.0;
+
+        // Tick 1: exact=0, partial=0.03.
+        poll_mass(&model, &mut mass, &mut high_total);
+        assert!((mass.covered().0 - 0.03).abs() < 1e-9);
+
+        // Tick 2: source subsumes → exact=0.1, partial=0.
+        // Total 0.03 → 0.1 is monotone. Published should be 0.1.
+        *model.e.lock().unwrap() = 0.1;
+        *model.p.lock().unwrap() = 0.0;
+        poll_mass(&model, &mut mass, &mut high_total);
+        assert!(
+            (mass.covered().0 - 0.1).abs() < 1e-9,
+            "TTC §3.7: subsumed partial MUST NOT remain in published total; got {}",
+            mass.covered().0,
+        );
+        assert!((mass.covered_exact.0 - 0.1).abs() < 1e-9);
+        assert!((mass.covered_partial.0 - 0.0).abs() < 1e-9,
+            "partial MUST drop with source when subsumed; got {}", mass.covered_partial.0);
     }
 
     /// TELEMETRY §7.5 "edge-flow semantics for split/resume are
