@@ -142,12 +142,29 @@ impl BoundaryProgress {
         }
     }
 
+    /// Per-boundary cov_micro cap: one full boundary weighs
+    /// `1/total` of the search, which in the micro-denominator is
+    /// `1_000_000`. Partial credit accumulated for ONE boundary
+    /// therefore MUST NOT exceed `1_000_000` — otherwise TTC
+    /// §4.2 rule 2 ("partial credit MUST represent only the
+    /// eliminated portion of the interrupted subproblem") would
+    /// be violated. Subsume-on-completion usually hides this
+    /// because closed boundaries drain their cov_micro, but an
+    /// in-flight boundary with many XY timeouts could otherwise
+    /// briefly over-report. This cap enforces the invariant
+    /// structurally.
+    const PER_ROOT_COV_MICRO_CAP: u64 = 1_000_000;
+
     /// Add `cov_micro` (sum of per-XY-timeout `cover_micro ∈ [0,
     /// 1_000_000]`) attributed to the in-flight boundary
     /// `fanout_root_id`. Called by `SolveZStage` / `SolveWZStage`
     /// after their inline XY walks return. On subsequent root
     /// completion, this contribution is subtracted from the
     /// running partial fraction — see `note_handled`.
+    ///
+    /// Per-root total is capped at `PER_ROOT_COV_MICRO_CAP` so no
+    /// single boundary claims more partial credit than its own
+    /// full weight (TTC §4.2 rule 2).
     pub fn add_partial_cov_micro(&self, fanout_root_id: u64, cov_micro: u64) {
         if cov_micro == 0 {
             return;
@@ -158,12 +175,22 @@ impl BoundaryProgress {
         });
         if entry.completed {
             // Root already closed — its exact credit covers this
-            // cub-cube. Don't bump partial.
+            // sub-cube. Don't bump partial.
             return;
         }
-        entry.in_flight_cov_micro = entry.in_flight_cov_micro.saturating_add(cov_micro);
+        // Clamp to the per-root cap before updating either the
+        // entry or the live aggregate, so both stay consistent
+        // with the §4.2 invariant.
+        let before = entry.in_flight_cov_micro;
+        let proposed = before.saturating_add(cov_micro);
+        let after = proposed.min(Self::PER_ROOT_COV_MICRO_CAP);
+        let actual_delta = after - before;
+        if actual_delta == 0 {
+            return;
+        }
+        entry.in_flight_cov_micro = after;
         self.live_partial_cov_micro
-            .fetch_add(cov_micro, Ordering::Relaxed);
+            .fetch_add(actual_delta, Ordering::Relaxed);
     }
 
     /// Fraction of the search space *fully* covered — i.e.
@@ -1014,6 +1041,45 @@ mod tests {
         progress.add_partial_cov_micro(1, 5_000_000); // 5× the denom.
         let frac = progress.partial_fraction();
         assert!(frac <= 1.0 && frac >= 0.0, "partial_fraction MUST stay in [0, 1]; got {}", frac);
+    }
+
+    /// TTC §4.2 rule 2: partial credit for one boundary MUST NOT
+    /// exceed that boundary's own weight. `1_000_000` cov_micro
+    /// per root = `1/total`. Accumulating more from many XY
+    /// timeouts inside one boundary would over-report even before
+    /// subsume-on-completion kicks in. The per-root cap enforces
+    /// the invariant.
+    #[test]
+    fn per_root_cov_micro_is_capped_at_boundary_weight() {
+        let progress = BoundaryProgress::new(10);
+        // Stuff way more than 1_000_000 into a single root.
+        for _ in 0..20 {
+            progress.add_partial_cov_micro(1, 800_000);
+        }
+        // Partial fraction for this one root capped at
+        // 1_000_000 / (10 * 1_000_000) = 0.1, not 16_000_000 /
+        // 10_000_000 = 1.6.
+        let frac = progress.partial_fraction();
+        assert!(
+            (frac - 0.1).abs() < 1e-9,
+            "per-root cap MUST clamp at 1/total = 0.1; got {}",
+            frac,
+        );
+    }
+
+    /// The cap is per-root — another in-flight root adding its
+    /// own credit still accumulates correctly, up to its own cap.
+    #[test]
+    fn per_root_cap_is_independent_across_roots() {
+        let progress = BoundaryProgress::new(4);
+        progress.add_partial_cov_micro(1, 900_000);
+        progress.add_partial_cov_micro(1, 900_000); // capped to 1_000_000
+        progress.add_partial_cov_micro(2, 500_000);
+        // Root 1 contributes 1_000_000, root 2 contributes
+        // 500_000, total 1_500_000 / (4 * 1_000_000) = 0.375.
+        let frac = progress.partial_fraction();
+        assert!((frac - 0.375).abs() < 1e-9,
+            "two roots with their own caps must sum independently; got {}", frac);
     }
 
     /// TTC §10 item 7: "mode quality labels match the actual
