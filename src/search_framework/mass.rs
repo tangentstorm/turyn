@@ -193,6 +193,25 @@ mod tests {
         assert!(snap.ttc(Duration::from_secs(5)).is_none());
     }
 
+    /// TTC §1 equivalent form: `TTC = elapsed * (1 - covered) / covered`.
+    /// At 25% covered after 10 seconds, the predicted remainder is
+    /// 30 seconds (three more 10-second chunks at the observed rate).
+    #[test]
+    fn ttc_matches_published_formula() {
+        let mut snap = MassSnapshot::new(MassValue::ONE);
+        snap.apply_delta(MassDelta {
+            covered_exact: MassValue(0.25),
+            covered_partial: MassValue::ZERO,
+        });
+        let elapsed = Duration::from_secs(10);
+        let ttc = snap.ttc(elapsed).expect("rate > 0 MUST produce a TTC");
+        // elapsed * (1 - 0.25) / 0.25 = 10 * 3 = 30 seconds.
+        let expected = Duration::from_secs_f64(30.0);
+        let delta = if ttc > expected { ttc - expected } else { expected - ttc };
+        assert!(delta < Duration::from_millis(1),
+            "TTC MUST equal elapsed * (total - covered) / covered ≈ 30s; got {:?}", ttc);
+    }
+
     #[test]
     fn disjoint_fractions_sum_to_one() {
         // The core reason we use fractions, not log2(sub-cube size):

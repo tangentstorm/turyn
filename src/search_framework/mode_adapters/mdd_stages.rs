@@ -71,7 +71,13 @@ pub const STAGE_SOLVE_Z: StageId = "mdd.solve_z";
 /// is removed from the map and `completed` ticks up. Seed
 /// boundaries start at `pending = 1` lazily when first seen.
 pub struct BoundaryProgress {
-    pending: Mutex<HashMap<u64, u64>>,
+    /// `(pending_count, already_completed)` per root. Keeping
+    /// `already_completed` on the entry lets `note_handled` stay
+    /// idempotent for a given root even if a stale item arrives
+    /// after the pending count first reached zero. TTC §3
+    /// invariant 7: "no completed subproblem may be credited more
+    /// than once".
+    pending: Mutex<HashMap<u64, (u64, bool)>>,
     completed: AtomicU64,
     partial_cov_micro: AtomicU64,
     total: u64,
@@ -89,15 +95,18 @@ impl BoundaryProgress {
 
     /// Record that a stage handler just finished processing an item
     /// belonging to `fanout_root_id` and emitted `emitted` child
-    /// items. Returns `true` when this was the last in-flight
-    /// descendant of the boundary (i.e. the boundary is now
-    /// complete).
+    /// items. Returns `true` exactly once — the first time the
+    /// boundary's pending count hits zero. Subsequent calls for
+    /// the same root return `false` without re-incrementing the
+    /// `completed` counter, keeping the
+    /// "no-double-credit" invariant (TTC §3.7) even if a stale
+    /// emission arrives after the boundary was already closed.
     pub fn note_handled(&self, fanout_root_id: u64, emitted: u64) -> bool {
         let mut guard = self.pending.lock().unwrap();
-        let entry = guard.entry(fanout_root_id).or_insert(1);
-        *entry = entry.saturating_sub(1) + emitted;
-        if *entry == 0 {
-            guard.remove(&fanout_root_id);
+        let entry = guard.entry(fanout_root_id).or_insert((1, false));
+        entry.0 = entry.0.saturating_sub(1) + emitted;
+        if entry.0 == 0 && !entry.1 {
+            entry.1 = true;
             self.completed.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -869,6 +878,32 @@ mod tests {
             "spec requires every timeout-capable XY path to contribute; only-SolveZ must under-report vs unified");
         assert!((unified.partial_fraction() - 0.25).abs() < 1e-9);
         assert!((only_solve_z.partial_fraction() - 0.10).abs() < 1e-9);
+    }
+
+    /// TTC §3 invariant 7: "no completed subproblem may be
+    /// credited more than once." `note_handled` must only bump
+    /// `completed` on the FIRST transition to zero pending, even
+    /// if a stale item with the same root_id arrives later and
+    /// re-enters the hashmap. Before the hardening this returned
+    /// `true` twice and `covered_fraction` climbed past 1/total
+    /// per boundary.
+    #[test]
+    fn note_handled_does_not_double_credit_on_stale_root_reentry() {
+        let p = BoundaryProgress::new(2);
+        // First call: fresh root, pending 1 -> 0, bump completed.
+        assert!(p.note_handled(7, 0), "first zero-transition MUST return true");
+        assert!((p.covered_fraction() - 0.5).abs() < 1e-9,
+            "one of two boundaries done ⇒ fraction = 0.5");
+        // Stale call: same root arrives again. It would normally
+        // re-insert (1, false) and drop to zero again; without the
+        // guard we'd double-credit.
+        assert!(!p.note_handled(7, 0), "stale re-entry MUST NOT re-credit");
+        assert!((p.covered_fraction() - 0.5).abs() < 1e-9,
+            "covered_fraction MUST stay at 0.5 after stale re-entry; got {}",
+            p.covered_fraction());
+        // A different root completing increments normally.
+        assert!(p.note_handled(8, 0));
+        assert!((p.covered_fraction() - 1.0).abs() < 1e-9);
     }
 
     /// TTC §3 mass invariants: partial_fraction is clamped to
