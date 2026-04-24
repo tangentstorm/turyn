@@ -71,16 +71,30 @@ pub const STAGE_SOLVE_Z: StageId = "mdd.solve_z";
 /// is removed from the map and `completed` ticks up. Seed
 /// boundaries start at `pending = 1` lazily when first seen.
 pub struct BoundaryProgress {
-    /// `(pending_count, already_completed)` per root. Keeping
-    /// `already_completed` on the entry lets `note_handled` stay
-    /// idempotent for a given root even if a stale item arrives
-    /// after the pending count first reached zero. TTC §3
-    /// invariant 7: "no completed subproblem may be credited more
-    /// than once".
-    pending: Mutex<HashMap<u64, (u64, bool)>>,
+    /// Per-root state: `(pending_count, already_completed,
+    /// in_flight_cov_micro)`. Keeping `already_completed` on the
+    /// entry keeps `note_handled` idempotent against stale
+    /// re-entries (TTC §3.7). Keeping `in_flight_cov_micro` on the
+    /// entry and removing it on completion keeps partial coverage
+    /// from double-counting against the exact credit the boundary
+    /// earns when it finishes — a root's XY-timeout contributions
+    /// are already subsumed by the exact 1/total credit once it
+    /// closes.
+    pending: Mutex<HashMap<u64, BoundaryState>>,
     completed: AtomicU64,
-    partial_cov_micro: AtomicU64,
+    /// Sum of `in_flight_cov_micro` across *currently live* roots.
+    /// Boundaries that have completed drop out; their contributions
+    /// were subsumed by the exact ledger. Published as
+    /// `partial_fraction()`.
+    live_partial_cov_micro: AtomicU64,
     total: u64,
+}
+
+#[derive(Default, Clone, Copy)]
+struct BoundaryState {
+    pending: u64,
+    completed: bool,
+    in_flight_cov_micro: u64,
 }
 
 impl BoundaryProgress {
@@ -88,7 +102,7 @@ impl BoundaryProgress {
         Self {
             pending: Mutex::new(HashMap::new()),
             completed: AtomicU64::new(0),
-            partial_cov_micro: AtomicU64::new(0),
+            live_partial_cov_micro: AtomicU64::new(0),
             total,
         }
     }
@@ -101,12 +115,26 @@ impl BoundaryProgress {
     /// `completed` counter, keeping the
     /// "no-double-credit" invariant (TTC §3.7) even if a stale
     /// emission arrives after the boundary was already closed.
+    ///
+    /// On first completion of a root, the root's in-flight partial
+    /// credit is subtracted from `live_partial_cov_micro` — those
+    /// cov_micro values are subsumed by the exact `+1/total`
+    /// credit the root just earned (TTC §3.7 again).
     pub fn note_handled(&self, fanout_root_id: u64, emitted: u64) -> bool {
         let mut guard = self.pending.lock().unwrap();
-        let entry = guard.entry(fanout_root_id).or_insert((1, false));
-        entry.0 = entry.0.saturating_sub(1) + emitted;
-        if entry.0 == 0 && !entry.1 {
-            entry.1 = true;
+        let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
+            pending: 1, completed: false, in_flight_cov_micro: 0,
+        });
+        entry.pending = entry.pending.saturating_sub(1) + emitted;
+        if entry.pending == 0 && !entry.completed {
+            entry.completed = true;
+            // Subsume this root's in-flight XY-timeout credit into
+            // its fresh exact credit.
+            let subsumed = std::mem::take(&mut entry.in_flight_cov_micro);
+            if subsumed > 0 {
+                self.live_partial_cov_micro
+                    .fetch_sub(subsumed, Ordering::Relaxed);
+            }
             self.completed.fetch_add(1, Ordering::Relaxed);
             true
         } else {
@@ -115,13 +143,27 @@ impl BoundaryProgress {
     }
 
     /// Add `cov_micro` (sum of per-XY-timeout `cover_micro ∈ [0,
-    /// 1_000_000]`) to the running partial-coverage accumulator.
-    /// Called by `SolveZStage` after its inline XY walk returns.
-    pub fn add_partial_cov_micro(&self, cov_micro: u64) {
-        if cov_micro > 0 {
-            self.partial_cov_micro
-                .fetch_add(cov_micro, Ordering::Relaxed);
+    /// 1_000_000]`) attributed to the in-flight boundary
+    /// `fanout_root_id`. Called by `SolveZStage` / `SolveWZStage`
+    /// after their inline XY walks return. On subsequent root
+    /// completion, this contribution is subtracted from the
+    /// running partial fraction — see `note_handled`.
+    pub fn add_partial_cov_micro(&self, fanout_root_id: u64, cov_micro: u64) {
+        if cov_micro == 0 {
+            return;
         }
+        let mut guard = self.pending.lock().unwrap();
+        let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
+            pending: 1, completed: false, in_flight_cov_micro: 0,
+        });
+        if entry.completed {
+            // Root already closed — its exact credit covers this
+            // cub-cube. Don't bump partial.
+            return;
+        }
+        entry.in_flight_cov_micro = entry.in_flight_cov_micro.saturating_add(cov_micro);
+        self.live_partial_cov_micro
+            .fetch_add(cov_micro, Ordering::Relaxed);
     }
 
     /// Fraction of the search space *fully* covered — i.e.
@@ -137,22 +179,18 @@ impl BoundaryProgress {
         }
     }
 
-    /// Fractional credit from XY timeouts across the whole search.
-    /// Scaled so that if every SolveXY timed out with full
-    /// `cover_micro = 1_000_000` (i.e. the conflict budget
-    /// exhausted *after* fully pruning the sub-cube), the
-    /// returned fraction equals `average_xy_solves_per_boundary /
-    /// total_boundaries` — which with `apply_delta` is clamped
-    /// below the residual `1 - covered_exact`, so the published
-    /// `covered = covered_exact + covered_partial` stays ≤ 1.
-    /// The denominator uses `total * 1_000_000` so a single
+    /// Fractional credit from XY timeouts across *in-flight* roots.
+    /// Completed boundaries have already had their cov_micro
+    /// subtracted; this counter only reflects partial coverage
+    /// from roots whose exact credit has NOT yet been booked.
+    /// Denominator uses `total * 1_000_000` so a single
     /// fully-credited timeout is worth `1 / total` — same unit as
     /// a fully-completed boundary.
     pub fn partial_fraction(&self) -> f64 {
         if self.total == 0 {
             0.0
         } else {
-            let sum = self.partial_cov_micro.load(Ordering::Relaxed);
+            let sum = self.live_partial_cov_micro.load(Ordering::Relaxed);
             (sum as f64 / (self.total as f64 * 1_000_000.0)).clamp(0.0, 1.0)
         }
     }
@@ -406,8 +444,10 @@ impl StageHandler<MddPayload> for SolveWZStage {
             .metrics
             .flow_xy_timeout_cov_micro
             .load(std::sync::atomic::Ordering::Relaxed);
-        self.progress
-            .add_partial_cov_micro(cov_micro_after.saturating_sub(cov_micro_before));
+        self.progress.add_partial_cov_micro(
+            parent_meta.fanout_root_id,
+            cov_micro_after.saturating_sub(cov_micro_before),
+        );
         let mut out = StageOutcome::default();
         out.forcings = ForcingDelta { by_level_feature: forcings };
         if let Some((item, _priority)) = deferred {
@@ -511,17 +551,23 @@ impl StageHandler<MddPayload> for SolveZStage {
             .metrics
             .flow_xy_timeout_cov_micro
             .load(std::sync::atomic::Ordering::Relaxed);
-        self.progress
-            .add_partial_cov_micro(cov_micro_after.saturating_sub(cov_micro_before));
+        // Partial credit MUST be registered BEFORE note_handled.
+        // If this is the last in-flight descendant of the
+        // boundary, note_handled will subsume the accumulated
+        // in-flight cov_micro into the exact credit — but the
+        // contribution has to be there first for the subsume to
+        // operate on it. Registering after would briefly
+        // double-count between the exact bump and the partial
+        // drain.
+        self.progress.add_partial_cov_micro(
+            parent_meta.fanout_root_id,
+            cov_micro_after.saturating_sub(cov_micro_before),
+        );
         // Mass credit: one more pending descendant of this
         // boundary is done. When the last SolveZ for a boundary
         // returns, `note_handled` drops the pending count to zero
         // and the poll-based `covered_fraction` ticks up by
-        // exactly `1/N`. Inline XY timeouts that didn't drop
-        // pending still contribute via `add_partial_cov_micro`
-        // above — the mass model surfaces them as
-        // `covered_partial`, matching the timeout-shortfall
-        // credit described in `docs/TTC.md`.
+        // exactly `1/N`.
         self.progress.note_handled(parent_meta.fanout_root_id, 0);
         let mut out = StageOutcome::default();
         out.forcings = ForcingDelta { by_level_feature: forcings };
@@ -843,14 +889,13 @@ mod tests {
     #[test]
     fn partial_credit_ledger_is_additive_across_stage_paths() {
         let progress = BoundaryProgress::new(10);
-        // Simulate SolveZ reporting 500_000 cov-micros from an XY
-        // timeout (half the full sub-cube credit).
-        progress.add_partial_cov_micro(500_000);
-        // Simulate SolveWZ reporting another 250_000 cov-micros.
-        // Per the spec this MUST increase `partial_fraction`; if
-        // the adapter skips this call, `partial_fraction` would
-        // under-report.
-        progress.add_partial_cov_micro(250_000);
+        // Simulate SolveZ reporting 500_000 cov-micros for root 1
+        // (half the full sub-cube credit).
+        progress.add_partial_cov_micro(1, 500_000);
+        // Simulate SolveWZ reporting another 250_000 cov-micros
+        // for root 2. Both roots are in-flight, so both
+        // contribute to partial_fraction.
+        progress.add_partial_cov_micro(2, 250_000);
         let frac = progress.partial_fraction();
         // total=10, so denom = 10 * 1_000_000. Sum = 750_000 ⇒
         // fraction = 750_000 / 10_000_000 = 0.075.
@@ -868,12 +913,12 @@ mod tests {
     fn only_solve_z_credit_would_under_report_partial_vs_unified() {
         let unified = BoundaryProgress::new(4);
         let only_solve_z = BoundaryProgress::new(4);
-        // Pretend SolveZ reported 400_000 cov-micro, SolveWZ reported
-        // 600_000. The unified ledger credits both; the buggy
-        // "only SolveZ" ledger credits just 400_000.
-        unified.add_partial_cov_micro(400_000);
-        unified.add_partial_cov_micro(600_000);
-        only_solve_z.add_partial_cov_micro(400_000);
+        // Pretend SolveZ reported 400_000 cov-micro for root 1,
+        // SolveWZ reported 600_000 for root 2. Unified credits
+        // both; buggy "only SolveZ" credits just 400_000.
+        unified.add_partial_cov_micro(1, 400_000);
+        unified.add_partial_cov_micro(2, 600_000);
+        only_solve_z.add_partial_cov_micro(1, 400_000);
         assert!(unified.partial_fraction() > only_solve_z.partial_fraction(),
             "spec requires every timeout-capable XY path to contribute; only-SolveZ must under-report vs unified");
         assert!((unified.partial_fraction() - 0.25).abs() < 1e-9);
@@ -887,6 +932,57 @@ mod tests {
     /// re-enters the hashmap. Before the hardening this returned
     /// `true` twice and `covered_fraction` climbed past 1/total
     /// per boundary.
+    /// TTC §3.7 "no completed subproblem may be credited more
+    /// than once." When a root accumulates XY-timeout partial
+    /// credit and then completes, the exact `+1/total` credit
+    /// MUST subsume the partial — otherwise the published
+    /// `covered = exact + partial` double-credits the sub-cubes
+    /// inside the now-closed root. Regression test for the
+    /// silent double-count that persisted through the rest of
+    /// the TTC partial-credit wiring.
+    #[test]
+    fn completion_subsumes_in_flight_partial_credit() {
+        let p = BoundaryProgress::new(10);
+        // Root 1 accumulates 500_000 cov_micro (half a sub-cube
+        // credit) while still in flight.
+        p.add_partial_cov_micro(1, 500_000);
+        // Before completion: partial_fraction = 0.05 (live), exact = 0.
+        assert!((p.partial_fraction() - 0.05).abs() < 1e-9,
+            "pre-completion partial MUST reflect the in-flight credit");
+        assert!((p.covered_fraction() - 0.0).abs() < 1e-9);
+        // Root 1 completes. Its 500_000 cov_micro are subsumed
+        // by the fresh exact +1/10 credit; partial drops to 0.
+        assert!(p.note_handled(1, 0));
+        assert!((p.covered_fraction() - 0.1).abs() < 1e-9,
+            "exact MUST bump by 1/total on completion");
+        assert!((p.partial_fraction() - 0.0).abs() < 1e-9,
+            "partial MUST drop to 0 when the sole root closes; got {}",
+            p.partial_fraction());
+        // Sum stays within [0, 1] and equals only the exact
+        // credit — no double-count.
+        let covered = p.covered_fraction() + p.partial_fraction();
+        assert!(
+            (covered - 0.1).abs() < 1e-9,
+            "covered = exact + partial MUST equal 0.1 (not 0.15); got {}", covered,
+        );
+    }
+
+    /// Post-completion calls to `add_partial_cov_micro` on a
+    /// closed root MUST be no-ops (otherwise stale SolveXY
+    /// timeouts could re-inflate partial after the root has
+    /// already been exact-credited).
+    #[test]
+    fn add_partial_on_completed_root_is_noop() {
+        let p = BoundaryProgress::new(4);
+        p.note_handled(1, 0); // close root 1 immediately
+        assert!((p.covered_fraction() - 0.25).abs() < 1e-9);
+        // Stale timeout arrives after completion — ignored.
+        p.add_partial_cov_micro(1, 800_000);
+        assert!((p.partial_fraction() - 0.0).abs() < 1e-9,
+            "stale partial credit on a completed root MUST be ignored; got {}",
+            p.partial_fraction());
+    }
+
     #[test]
     fn note_handled_does_not_double_credit_on_stale_root_reentry() {
         let p = BoundaryProgress::new(2);
@@ -911,7 +1007,7 @@ mod tests {
     #[test]
     fn partial_fraction_is_clamped_to_one() {
         let progress = BoundaryProgress::new(1);
-        progress.add_partial_cov_micro(5_000_000); // 5× the denom.
+        progress.add_partial_cov_micro(1, 5_000_000); // 5× the denom.
         let frac = progress.partial_fraction();
         assert!(frac <= 1.0 && frac >= 0.0, "partial_fraction MUST stay in [0, 1]; got {}", frac);
     }
@@ -937,7 +1033,7 @@ mod tests {
     #[test]
     fn mdd_mass_model_published_mass_stays_bounded() {
         let progress = Arc::new(BoundaryProgress::new(1));
-        progress.add_partial_cov_micro(2_000_000); // 2× overflow
+        progress.add_partial_cov_micro(1, 2_000_000); // 2× overflow
         let model = McddFractionMassModel { progress: Arc::clone(&progress) };
         assert!(model.covered_partial_mass().0 <= 1.0,
             "covered_partial_mass MUST clamp to ≤ 1.0 even when cov_micro overflows denom");
