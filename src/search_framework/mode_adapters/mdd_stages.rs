@@ -880,4 +880,31 @@ mod tests {
         let frac = progress.partial_fraction();
         assert!(frac <= 1.0 && frac >= 0.0, "partial_fraction MUST stay in [0, 1]; got {}", frac);
     }
+
+    /// TTC §10 item 7: "mode quality labels match the actual
+    /// estimator semantics." The MDD staged adapter publishes a
+    /// hybrid estimator — `covered_exact` is a real additive
+    /// fraction but `covered_partial` is an XY-timeout shortfall
+    /// approximation — so its label MUST be `Hybrid`.
+    #[test]
+    fn mdd_mass_model_quality_is_hybrid() {
+        let progress = Arc::new(BoundaryProgress::new(1));
+        let model = McddFractionMassModel { progress };
+        assert_eq!(model.quality(), CoverageQuality::Hybrid,
+            "MDD adapter mixes a direct boundary fraction with a projected XY-timeout shortfall; quality MUST be Hybrid per TTC §6.3");
+    }
+
+    /// MDD mass model must publish `covered_exact + covered_partial`
+    /// clamped to ≤ 1.0 under the aggregation site in
+    /// `MassSnapshot::apply_delta`. This test exercises the mass
+    /// model directly with full partial credit to show the clamp
+    /// is load-bearing even in pathological cases.
+    #[test]
+    fn mdd_mass_model_published_mass_stays_bounded() {
+        let progress = Arc::new(BoundaryProgress::new(1));
+        progress.add_partial_cov_micro(2_000_000); // 2× overflow
+        let model = McddFractionMassModel { progress: Arc::clone(&progress) };
+        assert!(model.covered_partial_mass().0 <= 1.0,
+            "covered_partial_mass MUST clamp to ≤ 1.0 even when cov_micro overflows denom");
+    }
 }

@@ -138,3 +138,15 @@ impl SearchModeAdapter<StochasticPayload> for StochasticAdapter {
         Box::new(StochasticMassModel)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TTC §10 item 7: stochastic is an estimator-only sampler, so
+    /// its quality MUST be `Projected`.
+    #[test]
+    fn stochastic_mass_model_is_projected() {
+        assert_eq!(StochasticMassModel.quality(), CoverageQuality::Projected);
+    }
+}

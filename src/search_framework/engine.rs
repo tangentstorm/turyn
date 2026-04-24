@@ -828,8 +828,15 @@ mod tests {
         // Each handle() contributes (level=0, kind=0, count=3) and
         // (level=1, kind=2, count=5). Seeds=2, cascade depth 3 each:
         // 6 total handle() calls.
-        let total: u64 = forcings.stage_level.values().sum();
-        assert_eq!(total, 6 * (3 + 5));
+        let total_level: u64 = forcings.stage_level.values().sum();
+        let total_feature: u64 = forcings.stage_feature.values().sum();
+        assert_eq!(total_level, 6 * (3 + 5));
+        // docs/TELEMETRY.md §4 consistency rule: when both axes are
+        // populated from the same forcing events, their totals MUST
+        // be equal. CounterStage emits each event exactly once per
+        // (level, feature) pair, so this equality is invariant.
+        assert_eq!(total_level, total_feature,
+            "TELEMETRY.md §4 consistency rule: stage_level and stage_feature MUST sum to the same total when populated from the same events");
         let lvl0_clause = forcings
             .stage_level
             .get(&("counter", 0))
@@ -842,5 +849,27 @@ mod tests {
             .copied()
             .unwrap_or(0);
         assert_eq!(feat_clause, 6 * 3);
+    }
+
+    /// TELEMETRY.md §4 consistency rule, direct unit test at the
+    /// rollup helper level so future adapter code can't silently
+    /// diverge the two axes. Any single `ForcingDelta` applied via
+    /// `ForcingRollups::apply` MUST produce equal totals across
+    /// `stage_level` and `stage_feature`.
+    #[test]
+    fn forcing_rollups_consistency_equality_invariant() {
+        let mut rollups = ForcingRollups::default();
+        let deltas = [
+            ForcingDelta { by_level_feature: vec![(0, 0, 3), (1, 2, 5), (3, 4, 7)] },
+            ForcingDelta { by_level_feature: vec![(0, 4, 1), (2, 0, 9)] },
+        ];
+        for d in &deltas {
+            rollups.apply("stageA", d);
+        }
+        rollups.apply("stageB", &ForcingDelta { by_level_feature: vec![(0, 0, 11)] });
+        let sum_level: u64 = rollups.stage_level.values().sum();
+        let sum_feature: u64 = rollups.stage_feature.values().sum();
+        assert_eq!(sum_level, sum_feature,
+            "forcing axes MUST sum to the same total per TELEMETRY.md §4 consistency rule");
     }
 }

@@ -264,6 +264,15 @@ impl SearchMassModel for CrossMassModel {
             MassValue(done as f64 / self.tuples_total as f64)
         }
     }
+    /// Cross mode runs timeout-capable XY SAT per (Z,W) pair
+    /// (`state.solver.set_conflict_limit(5000)` for n>30 inside
+    /// the brute-force loop), but the adapter does NOT yet
+    /// surface per-timeout `cover_micro` credit as `covered_partial`.
+    /// Per `docs/TTC.md` §7.1 this omission MUST be documented
+    /// and the adapter's quality label MUST stay non-`Direct`;
+    /// `quality()` below keeps it as `Hybrid` to honor that
+    /// constraint. `covered_partial_mass` returns zero here (the
+    /// default), which is the honest reporting choice.
     fn quality(&self) -> CoverageQuality {
         CoverageQuality::Hybrid
     }
@@ -355,5 +364,43 @@ impl SearchModeAdapter<CrossPayload> for CrossAdapter {
             tuples_done: Arc::clone(&self.tuples_done),
             tuples_total: self.tuples.len(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TTC §7.1 + §10 item 7: cross mode uses uniform tuple
+    /// weighting (an approximation) and does not yet surface
+    /// XY-timeout partial credit, so it MUST remain non-`Direct`.
+    /// `Hybrid` is the intended label.
+    #[test]
+    fn cross_mass_model_is_non_direct() {
+        let model = CrossMassModel {
+            tuples_done: Arc::new(AtomicUsize::new(0)),
+            tuples_total: 3,
+        };
+        assert_ne!(model.quality(), CoverageQuality::Direct,
+            "cross mode uses uniform tuple weighting + no timeout partial credit; label MUST stay non-Direct per TTC §7.1");
+        // Per the current design we've chosen Hybrid rather than
+        // Projected. That's still non-Direct, matching the spec.
+        assert_eq!(model.quality(), CoverageQuality::Hybrid);
+    }
+
+    /// Cross currently publishes zero partial credit despite
+    /// timeout-capable XY sub-solves (`state.solver.set_conflict_limit(5000)`
+    /// for n > 30). Per `docs/TTC.md` §7.1 that omission is
+    /// permitted only while the adapter stays non-Direct and
+    /// documents the gap in source — the test documents the
+    /// observed state so a future change surfacing partial credit
+    /// updates it together with the doc.
+    #[test]
+    fn cross_partial_mass_is_zero_until_timeout_credit_is_wired() {
+        let model = CrossMassModel {
+            tuples_done: Arc::new(AtomicUsize::new(0)),
+            tuples_total: 3,
+        };
+        assert_eq!(model.covered_partial_mass().0, 0.0);
     }
 }

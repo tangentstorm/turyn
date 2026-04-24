@@ -310,6 +310,19 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
     }
 }
 
+/// Qualifier appended to framework-mode Finished lines so TTC
+/// numbers from `--conj-*` runs are not mistaken for the
+/// unconstrained baseline. `docs/TTC.md` §9 requires this tag on
+/// every user-facing TTC report when the search space is
+/// conjecture-restricted.
+fn conjecture_ttc_qualifier(cfg: &SearchConfig) -> &'static str {
+    if cfg.conj_xy_product || cfg.conj_zw_bound || cfg.conj_tuple {
+        " [TTC:conjecture-constrained]"
+    } else {
+        " [TTC:unconstrained baseline]"
+    }
+}
+
 /// Spawn a wall-clock watchdog that flips `cancel` once `sat_secs`
 /// seconds have passed. Caller is responsible for joining the
 /// returned handle *after* also flipping `cancel` (or dropping the
@@ -382,6 +395,7 @@ fn run_framework_mdd_mode(
         solutions
     });
 
+    let ttc_tag = conjecture_ttc_qualifier(cfg);
     engine.run_since(start, &adapter, move |event| match event {
         SearchEvent::Progress(p) => {
             if verbose {
@@ -393,8 +407,8 @@ fn run_framework_mdd_mode(
         }
         SearchEvent::Finished(p) => {
             println!(
-                "Framework search (--wz={}): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?}",
-                mode_name, p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc
+                "Framework search (--wz={}): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?} (quality={:?}){}",
+                mode_name, p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc, p.quality, ttc_tag
             );
         }
     });
@@ -499,8 +513,9 @@ fn run_framework_stochastic_mode(
         }
         SearchEvent::Finished(p) => {
             println!(
-                "Framework search (--stochastic): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?} (quality={:?})",
-                p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc, p.quality
+                "Framework search (--stochastic): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?} (quality={:?}){}",
+                p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc, p.quality,
+                conjecture_ttc_qualifier(cfg)
             );
         }
     });
@@ -540,7 +555,8 @@ fn run_framework_cross_mode(
     });
     let watchdog_handle =
         spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
-    engine.run_since(start, &adapter, |event| match event {
+    let ttc_tag = conjecture_ttc_qualifier(cfg);
+    engine.run_since(start, &adapter, move |event| match event {
         SearchEvent::Progress(p) => {
             if verbose {
                 eprintln!(
@@ -551,8 +567,8 @@ fn run_framework_cross_mode(
         }
         SearchEvent::Finished(p) => {
             println!(
-                "Framework search (--wz=cross): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?}",
-                p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc
+                "Framework search (--wz=cross): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?} (quality={:?}){}",
+                p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc, p.quality, ttc_tag
             );
         }
     });
@@ -606,7 +622,8 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
     });
     let watchdog_handle =
         spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
-    engine.run_since(start, &adapter, |event| match event {
+    let ttc_tag = conjecture_ttc_qualifier(cfg);
+    engine.run_since(start, &adapter, move |event| match event {
         SearchEvent::Progress(p) => {
             if verbose {
                 eprintln!(
@@ -617,8 +634,8 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
         }
         SearchEvent::Finished(p) => {
             println!(
-                "Framework search (--wz=sync): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?}",
-                p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc
+                "Framework search (--wz=sync): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?} (quality={:?}){}",
+                p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc, p.quality, ttc_tag
             );
         }
     });

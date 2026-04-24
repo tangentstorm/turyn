@@ -164,3 +164,19 @@ impl SearchModeAdapter<SyncPayload> for SyncAdapter {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TTC §7.3 + §10 item 7: sync publishes a branching-factor
+    /// projection, not a direct count. Quality MUST be `Projected`.
+    #[test]
+    fn sync_mass_model_is_projected() {
+        let model = SyncWalkMassModel {
+            projected_fraction_ppm: Arc::new(AtomicU64::new(0)),
+        };
+        assert_eq!(model.quality(), CoverageQuality::Projected,
+            "sync fraction is an estimator output; quality MUST be Projected per TTC §7.3");
+    }
+}
