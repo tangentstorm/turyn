@@ -1022,4 +1022,64 @@ mod tests {
         assert!(snap.covered_mass.0 <= snap.total_mass.0 + 1e-9);
         assert!(snap.remaining_mass.0 >= 0.0);
     }
+
+    /// TTC §3 invariant 6 + §10 item 3 "covered mass is monotone"
+    /// against a REAL MDD run. Prior monotone tests used synthetic
+    /// adapters; this one drives the full MDD pipeline on n=6 with
+    /// a short progress interval and asserts every successive
+    /// `ProgressSnapshot.covered_mass` is non-decreasing.
+    #[test]
+    fn mdd_live_run_has_monotone_covered_mass() {
+        use crate::config::{SearchConfig, WzMode};
+        use crate::enumerate::phase_a_tuples;
+        use crate::search_framework::engine::{EngineConfig, SearchEngine};
+        use crate::search_framework::events::SearchEvent;
+        use crate::search_framework::queue::GoldThenWork;
+        use crate::types::Problem;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        let problem = Problem::new(6);
+        let tuples = phase_a_tuples(problem, None);
+        let mut cfg = SearchConfig::default();
+        cfg.problem = problem;
+        cfg.wz_mode = Some(WzMode::Apart);
+        cfg.mdd_k = 2;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (adapter, _rx) = MddStagesAdapter::build(
+            problem, tuples, &cfg, 2, false, "apart", &cancel,
+        );
+        let mut engine = SearchEngine::<MddPayload>::new(
+            EngineConfig {
+                // Very short interval so multiple progress ticks
+                // are likely to fire during the small n=6 run.
+                progress_interval: Duration::from_millis(5),
+                worker_count: 1,
+            },
+            Box::new(GoldThenWork::new(4)),
+        );
+
+        let history = Arc::new(Mutex::new(Vec::<f64>::new()));
+        let history_cb = Arc::clone(&history);
+        engine.run(&adapter, move |event| {
+            let covered = match event {
+                SearchEvent::Progress(p) => p.covered_mass.0,
+                SearchEvent::Finished(p) => p.covered_mass.0,
+            };
+            history_cb.lock().unwrap().push(covered);
+        });
+        let history = history.lock().unwrap();
+        assert!(!history.is_empty(), "engine MUST emit at least the Finished snapshot");
+        // TTC §3.6: every consecutive snapshot MUST satisfy
+        // covered[i+1] >= covered[i].
+        for (i, w) in history.windows(2).enumerate() {
+            assert!(
+                w[1] + 1e-9 >= w[0],
+                "tick {} -> {} violates monotonicity: {} -> {}",
+                i, i + 1, w[0], w[1],
+            );
+        }
+    }
 }
