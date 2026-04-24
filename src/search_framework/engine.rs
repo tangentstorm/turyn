@@ -1125,6 +1125,178 @@ mod tests {
             "covered MUST stay ≤ total per TTC §3");
     }
 
+    /// TTC §3 invariant 6 + §7.3 monotone envelope: a
+    /// `SearchMassModel` whose `covered_mass()` fluctuates downward
+    /// between ticks (e.g., sync walker's projected-fraction
+    /// estimator lowering as new samples arrive) MUST NOT cause
+    /// the published `ProgressSnapshot.covered_mass` to decrease.
+    /// The engine's `poll_mass` helper holds the high-water mark;
+    /// this end-to-end test exercises that contract against the
+    /// real engine coordinator loop, not just the helper in
+    /// isolation.
+    #[test]
+    fn engine_publishes_monotone_envelope_against_fluctuating_model() {
+        use crate::search_framework::mass::MassSnapshot;
+        use std::sync::atomic::AtomicU64 as A64;
+        use std::time::Duration;
+
+        /// Mass model whose `covered_mass` reads a sequence of
+        /// published ppm values that go up, then down, then up
+        /// again. The engine poll_mass MUST hold the high-water.
+        struct FluctuatingMass {
+            ppm: Arc<A64>,
+        }
+        impl SearchMassModel for FluctuatingMass {
+            fn covered_mass(&self) -> MassValue {
+                MassValue(self.ppm.load(Ordering::Relaxed) as f64 / 1_000_000.0)
+            }
+            fn quality(&self) -> CoverageQuality {
+                CoverageQuality::Projected
+            }
+        }
+
+        /// Long-running handler that advances `ppm` through a
+        /// non-monotone sequence between progress ticks, then
+        /// terminates. Emits a trickle of successor items so the
+        /// engine coordinator loop stays alive long enough to
+        /// observe multiple progress ticks.
+        struct FluctuatingStage {
+            ppm: Arc<A64>,
+            schedule: Arc<Vec<u64>>,
+            calls: Arc<A64>,
+        }
+        impl StageHandler<u64> for FluctuatingStage {
+            fn id(&self) -> StageId { "fluctuating" }
+            fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
+                let idx = self.calls.fetch_add(1, Ordering::Relaxed) as usize;
+                if let Some(&v) = self.schedule.get(idx) {
+                    self.ppm.store(v, Ordering::Relaxed);
+                }
+                let mut out = StageOutcome::default();
+                // Sleep briefly so the engine's progress_interval
+                // fires between successive handle() calls.
+                std::thread::sleep(Duration::from_millis(25));
+                if (idx + 1) < self.schedule.len() {
+                    out.emitted.push(WorkItem {
+                        stage_id: "fluctuating",
+                        priority: 0,
+                        cost_hint: 1,
+                        replay_key: 0,
+                        mass_hint: None,
+                        meta: WorkItemMeta {
+                            item_id: (idx as u64) + 100,
+                            parent_item_id: Some(item.meta.item_id),
+                            fanout_root_id: item.meta.fanout_root_id,
+                            depth_from_root: item.meta.depth_from_root + 1,
+                            spawn_seq: 0,
+                        },
+                        payload: item.payload + 1,
+                    });
+                }
+                out
+            }
+        }
+
+        struct FluctuatingAdapter {
+            ppm: Arc<A64>,
+            schedule: Arc<Vec<u64>>,
+            calls: Arc<A64>,
+        }
+        impl SearchModeAdapter<u64> for FluctuatingAdapter {
+            fn name(&self) -> &'static str { "fluctuating" }
+            fn init(&self) -> AdapterInit<u64> {
+                AdapterInit {
+                    seed_items: vec![WorkItem {
+                        stage_id: "fluctuating",
+                        priority: 0,
+                        cost_hint: 1,
+                        replay_key: 0,
+                        mass_hint: None,
+                        meta: WorkItemMeta {
+                            item_id: 1,
+                            parent_item_id: None,
+                            fanout_root_id: 1,
+                            depth_from_root: 0,
+                            spawn_seq: 0,
+                        },
+                        payload: 0,
+                    }],
+                }
+            }
+            fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<u64>>> {
+                let mut m: BTreeMap<StageId, Box<dyn StageHandler<u64>>> = BTreeMap::new();
+                m.insert("fluctuating", Box::new(FluctuatingStage {
+                    ppm: Arc::clone(&self.ppm),
+                    schedule: Arc::clone(&self.schedule),
+                    calls: Arc::clone(&self.calls),
+                }));
+                m
+            }
+            fn mass_model(&self) -> Box<dyn SearchMassModel> {
+                Box::new(FluctuatingMass { ppm: Arc::clone(&self.ppm) })
+            }
+        }
+
+        // The estimator climbs to 50%, drops to 30%, climbs to
+        // 70%, drops to 40%, lands at 80%. The engine snapshot
+        // stream MUST stay monotone across ticks regardless.
+        let schedule = Arc::new(vec![
+            500_000,
+            300_000,  // drop — engine MUST ignore this downward move
+            700_000,
+            400_000,  // drop — engine MUST still hold 700_000 high-water
+            800_000,
+        ]);
+        let ppm = Arc::new(A64::new(0));
+        let calls = Arc::new(A64::new(0));
+        let adapter = FluctuatingAdapter {
+            ppm: Arc::clone(&ppm),
+            schedule: Arc::clone(&schedule),
+            calls: Arc::clone(&calls),
+        };
+
+        let cfg = EngineConfig {
+            progress_interval: Duration::from_millis(10),
+            worker_count: 1,
+        };
+        let mut engine = SearchEngine::<u64>::new(cfg, Box::new(GoldThenWork::new(4)));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::<(f64, MassSnapshot)>::new()));
+        let observed_cb = Arc::clone(&observed);
+        engine.run(&adapter, move |event| {
+            let (covered, snap_total) = match &event {
+                SearchEvent::Progress(p) => (p.covered_mass.0, p.total_mass),
+                SearchEvent::Finished(p) => (p.covered_mass.0, p.total_mass),
+            };
+            observed_cb.lock().unwrap().push((
+                covered,
+                MassSnapshot {
+                    total: snap_total,
+                    covered_exact: MassValue(covered),
+                    covered_partial: MassValue::ZERO,
+                },
+            ));
+        });
+
+        let observed = observed.lock().unwrap();
+        assert!(!observed.is_empty(), "engine MUST emit at least one snapshot");
+        // Final value MUST reflect the highest ever observed ppm
+        // (which is 800_000 = 0.8).
+        let final_covered = observed.last().unwrap().0;
+        assert!(
+            (final_covered - 0.8).abs() < 1e-9,
+            "engine Finished covered_mass MUST reflect the high-water mark (0.8); got {}",
+            final_covered,
+        );
+        // Strict monotonicity across every consecutive snapshot.
+        for w in observed.windows(2) {
+            assert!(
+                w[1].0 + 1e-9 >= w[0].0,
+                "covered_mass MUST be monotone non-decreasing: {} -> {} violates §3.6 / §7.3",
+                w[0].0, w[1].0,
+            );
+        }
+    }
+
     /// TELEMETRY.md §5 deferrals: "The same residual search space
     /// MUST NOT be counted both as covered and as fully live
     /// remainder." Verifies that a handler which credits 0.4 and
