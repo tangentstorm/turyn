@@ -327,6 +327,23 @@ impl<T: Send + 'static> SearchEngine<T> {
         // Final poll for any live-counted coverage the last tick
         // missed — same policy as the in-loop tick.
         poll_mass(&*mass_model, &mut mass);
+        // TELEMETRY §7.5 Finished-time equality. Mid-run we only
+        // have `handled_count <= seed_count + sum(spawned)` (a
+        // spawned child can exist in the queue before any handler
+        // picks it up). But if the engine drained to quiescence
+        // without being externally cancelled, every spawned item
+        // was eventually handled, and equality holds. If the run
+        // was cancelled (watchdog, external stop, solution drain),
+        // residual items may remain in the queue — equality is
+        // not guaranteed, skip the check.
+        if !self.cancelled.load(Ordering::Relaxed) {
+            let total_spawned: u64 = edge_flow.values().map(|c| c.spawned).sum();
+            debug_assert_eq!(
+                handled_count, seed_count + total_spawned,
+                "TELEMETRY §7.5 at Finished (uncancelled): handled ({}) MUST equal seeds ({}) + spawned ({})",
+                handled_count, seed_count, total_spawned,
+            );
+        }
         on_event(SearchEvent::Finished(build_snapshot(
             start.elapsed(),
             &mass,
