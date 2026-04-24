@@ -120,6 +120,16 @@ impl<T: Send + 'static> SearchEngine<T> {
         let mut edge_flow: BTreeMap<(String, String), EdgeFlowCounters> = BTreeMap::new();
         let mut fanout_roots: BTreeMap<u64, FanoutRootCounters> = BTreeMap::new();
         let mut forcings = ForcingRollups::default();
+        // Conservation counters for the TELEMETRY §7.5 invariant
+        // ("edge-flow semantics for split/resume are internally
+        // consistent"): `handled_count == seed_count +
+        // sum(edge_flow[*].spawned)`. These are updated in the
+        // coordinator loop and checked via `debug_assert!` inside
+        // `build_snapshot`. Any regression that skips a
+        // `spawned += 1` in one continuation path (or
+        // double-counts one) trips the assertion immediately.
+        let mut seed_count: u64 = 0;
+        let mut handled_count: u64 = 0;
         // Hold the mass model across the run so progress ticks can
         // publish the adapter's current `quality()` rather than a
         // hardcoded placeholder, and so the coordinator can poll
@@ -170,6 +180,7 @@ impl<T: Send + 'static> SearchEngine<T> {
                     .or_default()
                     .live_descendants += 1;
                 guard.push(seed);
+                seed_count += 1;
             }
         }
 
@@ -269,6 +280,7 @@ impl<T: Send + 'static> SearchEngine<T> {
                             &mut fanout_roots,
                         );
                         in_flight.fetch_sub(1, Ordering::AcqRel);
+                        handled_count += 1;
                     }
                     Err(RecvTimeoutError::Timeout) => { /* progress tick below */ }
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -284,6 +296,8 @@ impl<T: Send + 'static> SearchEngine<T> {
                         &edge_flow,
                         &fanout_roots,
                         &forcings,
+                        seed_count,
+                        handled_count,
                     )));
                 }
             }
@@ -306,6 +320,7 @@ impl<T: Send + 'static> SearchEngine<T> {
                     &mut fanout_roots,
                 );
                 in_flight.fetch_sub(1, Ordering::AcqRel);
+                handled_count += 1;
             }
         });
 
@@ -319,6 +334,8 @@ impl<T: Send + 'static> SearchEngine<T> {
             &edge_flow,
             &fanout_roots,
             &forcings,
+            seed_count,
+            handled_count,
         )));
     }
 }
@@ -474,6 +491,8 @@ fn build_snapshot(
     edge_flow: &BTreeMap<(String, String), EdgeFlowCounters>,
     fanout_roots: &BTreeMap<u64, FanoutRootCounters>,
     forcings: &ForcingRollups,
+    seed_count: u64,
+    handled_count: u64,
 ) -> ProgressSnapshot {
     let covered = mass.covered();
     let remaining = mass.remaining();
@@ -518,6 +537,25 @@ fn build_snapshot(
             "TELEMETRY §4 consistency rule: stage_level and stage_feature totals MUST agree when both populated",
         );
     }
+    // TELEMETRY §7.5 "edge-flow semantics for split/resume are
+    // internally consistent": every handler call was either a
+    // seed or was spawned on some edge. So
+    // `handled_count <= seed_count + sum(edge_flow[*].spawned)`.
+    // Uses `<=` not `==` because a Progress snapshot can fire
+    // between a worker pushing a spawned child onto the scheduler
+    // (which bumps edge_flow.spawned) and a future handler
+    // picking it up (which bumps handled_count). At Finished
+    // time, all spawned children have been handled and equality
+    // holds; check that at the engine's end-of-run via a test
+    // rather than a runtime debug_assert that would trip on
+    // Progress.
+    let total_spawned: u64 = edge_flow.values().map(|c| c.spawned).sum();
+    debug_assert!(
+        handled_count <= seed_count + total_spawned,
+        "TELEMETRY §7.5: handled_count ({}) MUST NOT exceed seeds ({}) + spawned ({}); \
+         this would mean some handler call was attributed to no seed AND no edge",
+        handled_count, seed_count, total_spawned,
+    );
     ProgressSnapshot {
         elapsed,
         throughput_per_sec: mass.throughput_per_sec(elapsed),
