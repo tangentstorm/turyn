@@ -359,32 +359,57 @@ impl<T: Send + 'static> SearchEngine<T> {
 
 type SharedScheduler<T> = Arc<(Mutex<Box<dyn SchedulerPolicy<T>>>, Condvar)>;
 
-/// Merge the latest polled coverage from `model` into `mass`, preserving
-/// the TTC-spec invariants:
+/// Merge the latest polled coverage from `model` into `mass`.
 ///
-/// - `covered_exact` and `covered_partial` are both **monotone
-///   non-decreasing** (TTC §3 invariant 6). The polled value only
-///   displaces the stored value when strictly greater.
-/// - `covered_exact + covered_partial ≤ total` (TTC §3 invariants 2/4).
-///   When `covered_exact` grows through polling, `covered_partial` is
-///   re-clamped against the new residual. Without this re-clamp,
-///   `covered_partial`'s high-water mark could ride above the residual
-///   (possible when an adapter like Cross zeros its in-flight
-///   `cov_micro` after a tuple completes while `covered_exact` bumps up
-///   in the same tick — sum could exceed 1.0).
+/// Design per TTC spec invariants:
+///
+/// - `covered_exact` is **monotone non-decreasing** (TTC §3.6) via
+///   max-clamp on the polled exact fraction.
+/// - The published **total** `covered_exact + covered_partial` is
+///   also monotone. We track it via `mass.covered_partial`
+///   derived-from-total semantics:
+///
+///       high_total = max over time of (polled_exact + polled_partial)
+///       published_exact = high_exact
+///       published_partial = high_total - high_exact
+///
+///   This holds TTC §3.6 (total monotone) even when the adapter
+///   intentionally drops polled partial on completion (MDD
+///   subsume, Cross tuple reset) AND when polled exact happens to
+///   fluctuate backward (sync projected estimator). Naïve
+///   monotone-clamp on `covered_partial` alone would retain the
+///   partial high-water alongside the new exact credit for the
+///   same sub-cube — violating §3.7 "no completed subproblem may
+///   be credited more than once". Naïve trust-the-source on
+///   partial breaks §3.6 when both components fluctuate down.
+/// - `covered_partial ≤ total - covered_exact` (§3.2) enforced
+///   by clamping after derivation.
 fn poll_mass(model: &dyn SearchMassModel, mass: &mut MassSnapshot) {
-    let polled = model.covered_mass();
-    if polled.0 > mass.covered_exact.0 {
-        mass.covered_exact = polled;
-    }
+    let polled_exact = model.covered_mass();
     let polled_partial = model.covered_partial_mass();
-    if polled_partial.0 > mass.covered_partial.0 {
-        mass.covered_partial = polled_partial;
+    if polled_exact.0 > mass.covered_exact.0 {
+        mass.covered_exact = polled_exact;
     }
+    // Track the high-water-mark of the *total* covered fraction,
+    // then derive partial as (high_total - high_exact). Using
+    // `covered_partial`'s stored value as `high_total - high_exact`
+    // from the previous tick, the candidate new high_total is
+    // `max(prev_total, polled_total)` where prev_total =
+    // stored_exact + stored_partial (pre-update) and polled_total
+    // = polled_exact + polled_partial.
+    let polled_total = polled_exact.0 + polled_partial.0;
+    // stored_total as of *before* the exact-update above:
+    let stored_total_candidate = {
+        // Re-derive: the previous tick left stored covered =
+        // prev_exact + prev_partial. After the exact update the
+        // stored exact may have grown; adding the previous partial
+        // gives a lower-bound on what the total should now be.
+        mass.covered_exact.0 + mass.covered_partial.0
+    };
+    let high_total = polled_total.max(stored_total_candidate);
+    let derived_partial = (high_total - mass.covered_exact.0).max(0.0);
     let cap = (mass.total.0 - mass.covered_exact.0).max(0.0);
-    if mass.covered_partial.0 > cap {
-        mass.covered_partial = MassValue(cap);
-    }
+    mass.covered_partial = MassValue(derived_partial.min(cap));
 }
 
 fn is_quiescent<T>(scheduler: &SharedScheduler<T>, in_flight: &AtomicUsize) -> bool {

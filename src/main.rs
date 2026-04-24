@@ -310,16 +310,16 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
     }
 }
 
-/// Qualifier appended to framework-mode Finished lines so TTC
-/// numbers from `--conj-*` runs are not mistaken for the
-/// unconstrained baseline. `docs/TTC.md` §9 requires this tag on
-/// every user-facing TTC report when the search space is
-/// conjecture-restricted.
+/// Qualifier appended to framework-mode TTC lines so the number is
+/// not mistaken between the unconstrained baseline and a
+/// conjecture-restricted run. `docs/TTC.md` §9 requires the exact
+/// labels `TTC (unconstrained baseline)` and
+/// `TTC (conjecture-constrained)` on every user-facing TTC report.
 fn conjecture_ttc_qualifier(cfg: &SearchConfig) -> &'static str {
     if cfg.conj_xy_product || cfg.conj_zw_bound || cfg.conj_tuple {
-        " [TTC:conjecture-constrained]"
+        " TTC (conjecture-constrained)"
     } else {
-        " [TTC:unconstrained baseline]"
+        " TTC (unconstrained baseline)"
     }
 }
 
@@ -379,6 +379,9 @@ fn run_framework_mdd_mode(
     let (adapter, result_rx) =
         MddStagesAdapter::build(problem, tuples, cfg, k, verbose, mode_name, &engine_cancel);
     let found_ctx = std::sync::Arc::clone(&adapter.ctx.found);
+    // Clone the progress handle so we can read
+    // `abandoned_count()` after the adapter is dropped below.
+    let progress_handle = std::sync::Arc::clone(&adapter.progress);
 
     let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
     // Drain-thread: polls the solution channel; on first hit sets
@@ -489,6 +492,17 @@ fn run_framework_mdd_mode(
         metrics.flow_xy_solves.load(Ord::Relaxed),
         metrics.flow_xy_zw_bound_rej.load(Ord::Relaxed),
         metrics.extensions_pruned.load(Ord::Relaxed),
+    );
+    // Count of boundaries closed with the abandoned taint (SAT
+    // timeout cut off W/Z enumeration). Non-zero is the exact
+    // reason covered_exact could plateau below 1.0 on a run that
+    // drained its work queue — those boundaries contribute only
+    // to covered_partial, never to covered_exact. TTC §4.1 / §9
+    // Hybrid-label approximation made visible.
+    let abandoned = progress_handle.abandoned_count();
+    eprintln!(
+        "[framework:{}] boundaries: abandoned={} (SAT-timeout-closed, retained partial only)",
+        mode_name, abandoned,
     );
     let _ = engine_cancel; // keep the Arc alive until the end
 }

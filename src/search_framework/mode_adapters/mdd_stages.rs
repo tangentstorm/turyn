@@ -71,21 +71,30 @@ pub const STAGE_SOLVE_Z: StageId = "mdd.solve_z";
 /// is removed from the map and `completed` ticks up. Seed
 /// boundaries start at `pending = 1` lazily when first seen.
 pub struct BoundaryProgress {
-    /// Per-root state: `(pending_count, already_completed,
-    /// in_flight_cov_micro)`. Keeping `already_completed` on the
-    /// entry keeps `note_handled` idempotent against stale
-    /// re-entries (TTC §3.7). Keeping `in_flight_cov_micro` on the
-    /// entry and removing it on completion keeps partial coverage
-    /// from double-counting against the exact credit the boundary
-    /// earns when it finishes — a root's XY-timeout contributions
-    /// are already subsumed by the exact 1/total credit once it
-    /// closes.
+    /// Per-root state. Keeping `closed` on the entry keeps
+    /// `note_handled` idempotent against stale re-entries (TTC
+    /// §3.7). Keeping `in_flight_cov_micro` on the entry lets
+    /// clean closures subsume partial into exact and abandoned
+    /// closures retain partial for the whole run. `abandoned`
+    /// taints roots whose descendant search was cut off by a SAT
+    /// conflict-budget timeout — they NEVER exact-credit (TTC
+    /// §4.1: exact coverage requires no residual work remains).
     pending: Mutex<HashMap<u64, BoundaryState>>,
+    /// Count of boundaries closed with clean exact credit. Published
+    /// as `covered_exact` via `covered_fraction()`. Excludes
+    /// abandoned boundaries.
     completed: AtomicU64,
-    /// Sum of `in_flight_cov_micro` across *currently live* roots.
-    /// Boundaries that have completed drop out; their contributions
-    /// were subsumed by the exact ledger. Published as
-    /// `partial_fraction()`.
+    /// Count of boundaries closed with an abandoned taint (SAT
+    /// timeout cut off W/Z enumeration). Contributes only to
+    /// `covered_partial` via retained `in_flight_cov_micro`, never
+    /// to `covered_exact`. Surfaced via `abandoned_count()` for
+    /// diagnostics.
+    abandoned: AtomicU64,
+    /// Sum of `in_flight_cov_micro` across currently live PLUS
+    /// abandoned-but-not-yet-subsumed roots. Clean-closed
+    /// boundaries drain their contribution; abandoned ones
+    /// retain it (their residual really was eliminated, even
+    /// though the boundary as a whole is incomplete).
     live_partial_cov_micro: AtomicU64,
     total: u64,
 }
@@ -93,7 +102,15 @@ pub struct BoundaryProgress {
 #[derive(Default, Clone, Copy)]
 struct BoundaryState {
     pending: u64,
-    completed: bool,
+    /// Set once the root has been "closed" in either sense —
+    /// clean or abandoned. Gates future note_handled calls
+    /// against double-credit.
+    closed: bool,
+    /// Set when a SAT timeout made the root's descendant search
+    /// incomplete. A tainted root, on final pending=0, closes
+    /// as `abandoned` (retains partial credit, never bumps the
+    /// exact counter).
+    abandoned_taint: bool,
     in_flight_cov_micro: u64,
 }
 
@@ -102,41 +119,63 @@ impl BoundaryProgress {
         Self {
             pending: Mutex::new(HashMap::new()),
             completed: AtomicU64::new(0),
+            abandoned: AtomicU64::new(0),
             live_partial_cov_micro: AtomicU64::new(0),
             total,
         }
     }
 
+    /// Mark a root as "abandoned" — its descendant search was cut
+    /// off by a SAT conflict-budget timeout and we cannot prove the
+    /// W/Z enumeration exhausted. The taint persists through all
+    /// further `note_handled` calls for this root; when pending
+    /// finally drops to 0, closure routes through the abandoned
+    /// path (bumps `abandoned` counter, NEVER bumps `completed`,
+    /// NEVER subsumes `in_flight_cov_micro`). TTC §4.1: "exact
+    /// coverage ... only when no residual work remains".
+    pub fn mark_abandoned(&self, fanout_root_id: u64) {
+        let mut guard = self.pending.lock().unwrap();
+        let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
+            pending: 1, closed: false, abandoned_taint: false, in_flight_cov_micro: 0,
+        });
+        entry.abandoned_taint = true;
+    }
+
     /// Record that a stage handler just finished processing an item
     /// belonging to `fanout_root_id` and emitted `emitted` child
     /// items. Returns `true` exactly once — the first time the
-    /// boundary's pending count hits zero. Subsequent calls for
-    /// the same root return `false` without re-incrementing the
-    /// `completed` counter, keeping the
-    /// "no-double-credit" invariant (TTC §3.7) even if a stale
-    /// emission arrives after the boundary was already closed.
+    /// boundary closes cleanly (abandoned closures return false).
+    /// Subsequent calls for a closed root return `false`.
     ///
-    /// On first completion of a root, the root's in-flight partial
-    /// credit is subtracted from `live_partial_cov_micro` — those
-    /// cov_micro values are subsumed by the exact `+1/total`
-    /// credit the root just earned (TTC §3.7 again).
+    /// On clean closure: subsume in_flight cov_micro into exact
+    /// credit, bump `completed`. On abandoned closure: keep
+    /// in_flight cov_micro live (it's retained partial credit),
+    /// bump `abandoned`, do NOT bump `completed`.
     pub fn note_handled(&self, fanout_root_id: u64, emitted: u64) -> bool {
         let mut guard = self.pending.lock().unwrap();
         let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
-            pending: 1, completed: false, in_flight_cov_micro: 0,
+            pending: 1, closed: false, abandoned_taint: false, in_flight_cov_micro: 0,
         });
         entry.pending = entry.pending.saturating_sub(1) + emitted;
-        if entry.pending == 0 && !entry.completed {
-            entry.completed = true;
-            // Subsume this root's in-flight XY-timeout credit into
-            // its fresh exact credit.
-            let subsumed = std::mem::take(&mut entry.in_flight_cov_micro);
-            if subsumed > 0 {
-                self.live_partial_cov_micro
-                    .fetch_sub(subsumed, Ordering::Relaxed);
+        if entry.pending == 0 && !entry.closed {
+            entry.closed = true;
+            if entry.abandoned_taint {
+                // Abandoned closure: keep in_flight partial credit
+                // live as the root's eliminated-work accounting.
+                // Do NOT bump exact. TTC §4.1 compliance.
+                self.abandoned.fetch_add(1, Ordering::Relaxed);
+                false
+            } else {
+                // Clean closure: subsume in_flight cov_micro into
+                // exact credit.
+                let subsumed = std::mem::take(&mut entry.in_flight_cov_micro);
+                if subsumed > 0 {
+                    self.live_partial_cov_micro
+                        .fetch_sub(subsumed, Ordering::Relaxed);
+                }
+                self.completed.fetch_add(1, Ordering::Relaxed);
+                true
             }
-            self.completed.fetch_add(1, Ordering::Relaxed);
-            true
         } else {
             false
         }
@@ -171,11 +210,13 @@ impl BoundaryProgress {
         }
         let mut guard = self.pending.lock().unwrap();
         let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
-            pending: 1, completed: false, in_flight_cov_micro: 0,
+            pending: 1, closed: false, abandoned_taint: false, in_flight_cov_micro: 0,
         });
-        if entry.completed {
-            // Root already closed — its exact credit covers this
-            // sub-cube. Don't bump partial.
+        if entry.closed {
+            // Root already closed — clean closure has already
+            // subsumed its credit into exact; abandoned closure
+            // has its credit locked at the pre-close value.
+            // Further partial-credit calls are no-ops.
             return;
         }
         // Clamp to the per-root cap before updating either the
@@ -195,8 +236,9 @@ impl BoundaryProgress {
 
     /// Fraction of the search space *fully* covered — i.e.
     /// boundaries whose entire sub-tree of SolveW/Z/XY work
-    /// returned without timing out. Additive over disjoint
-    /// boundaries.
+    /// returned with clean termination (no SAT-budget timeouts in
+    /// the descendant search). Additive over disjoint boundaries.
+    /// Abandoned boundaries do NOT contribute — TTC §4.1.
     pub fn covered_fraction(&self) -> f64 {
         if self.total == 0 {
             0.0
@@ -204,6 +246,15 @@ impl BoundaryProgress {
             let done = self.completed.load(Ordering::Relaxed);
             (done as f64 / self.total as f64).clamp(0.0, 1.0)
         }
+    }
+
+    /// Count of boundaries that closed via abandoned-taint (SAT
+    /// timeout in W/Z descendant search). These boundaries retain
+    /// their partial credit indefinitely (never subsumed) and are
+    /// excluded from exact coverage. Published to operators so the
+    /// Hybrid-label's approximation sources are visible.
+    pub fn abandoned_count(&self) -> u64 {
+        self.abandoned.load(Ordering::Relaxed)
     }
 
     /// Fractional credit from XY timeouts across *in-flight* roots.
@@ -380,6 +431,7 @@ impl StageHandler<MddPayload> for SolveWStage {
             rng,
         } = &mut *guard;
         let mut forcings: Vec<(u16, u8, u32)> = Vec::new();
+        let mut timed_out = false;
         let emitted_raw = process_solve_w(
             sw,
             &self.ctx,
@@ -389,16 +441,21 @@ impl StageHandler<MddPayload> for SolveWStage {
             fft_buf_w,
             rng,
             &mut forcings,
+            &mut timed_out,
         );
         let mut out = StageOutcome::default();
         out.forcings = ForcingDelta { by_level_feature: forcings };
         out.emitted = wrap_items(emitted_raw, &parent_meta, &self.item_ids);
-        // Handoff to the boundary's pending-counter: this SolveW
-        // item consumes one unit and emits `out.emitted.len()` new
-        // ones. If that takes the boundary's pending count to zero
-        // (e.g. no SolveZ candidates survived and this was the last
-        // in-flight W) the boundary is counted complete — so a
-        // pruned sub-cube still credits coverage.
+        // TTC §4.1 compliance: if the W-enumeration exited via SAT
+        // conflict-budget timeout, taint this boundary so it
+        // NEVER exact-credits even after downstream SolveZ /
+        // SolveXY items finish. Abandoned boundaries retain their
+        // accumulated partial credit as an honest record of
+        // eliminated work.
+        if timed_out {
+            self.progress.mark_abandoned(parent_meta.fanout_root_id);
+        }
+        // Handoff to the boundary's pending-counter.
         self.progress
             .note_handled(parent_meta.fanout_root_id, out.emitted.len() as u64);
         out
@@ -557,6 +614,7 @@ impl StageHandler<MddPayload> for SolveZStage {
         // under any `worker_count`).
         let mut forcings: Vec<(u16, u8, u32)> = Vec::new();
         let mut cov_micro_delta: u64 = 0;
+        let mut timed_out = false;
         process_solve_z(
             sz,
             &self.ctx,
@@ -571,6 +629,7 @@ impl StageHandler<MddPayload> for SolveZStage {
             rng,
             &mut forcings,
             &mut cov_micro_delta,
+            &mut timed_out,
         );
         // Partial credit MUST be registered BEFORE note_handled.
         // If this is the last in-flight descendant of the
@@ -582,11 +641,15 @@ impl StageHandler<MddPayload> for SolveZStage {
         // drain.
         self.progress
             .add_partial_cov_micro(parent_meta.fanout_root_id, cov_micro_delta);
+        // TTC §4.1: if the Z-enumeration exited via SAT
+        // conflict-budget timeout, taint the boundary so it does
+        // not exact-credit. Partial credit already registered
+        // above stays live as the honest eliminated-work count.
+        if timed_out {
+            self.progress.mark_abandoned(parent_meta.fanout_root_id);
+        }
         // Mass credit: one more pending descendant of this
-        // boundary is done. When the last SolveZ for a boundary
-        // returns, `note_handled` drops the pending count to zero
-        // and the poll-based `covered_fraction` ticks up by
-        // exactly `1/N`.
+        // boundary is done.
         self.progress.note_handled(parent_meta.fanout_root_id, 0);
         let mut out = StageOutcome::default();
         out.forcings = ForcingDelta { by_level_feature: forcings };
@@ -1012,6 +1075,85 @@ mod tests {
         assert!((p.partial_fraction() - 0.0).abs() < 1e-9,
             "stale partial credit on a completed root MUST be ignored; got {}",
             p.partial_fraction());
+    }
+
+    /// TTC §4.1: "A subproblem counts as exact coverage only when
+    /// no residual work remains for that subproblem." Regression
+    /// test: a boundary whose W/Z descendant search exited via
+    /// SAT conflict-budget timeout (via `mark_abandoned`) MUST
+    /// close WITHOUT bumping the exact counter, even when its
+    /// pending count drops to 0. The accumulated partial credit
+    /// stays live as the honest eliminated-work record.
+    #[test]
+    fn abandoned_boundary_does_not_exact_credit() {
+        let p = BoundaryProgress::new(10);
+        // Accumulate some partial credit first.
+        p.add_partial_cov_micro(1, 600_000);
+        assert!((p.partial_fraction() - 0.06).abs() < 1e-9);
+        // Simulate SAT-timeout tainting the root.
+        p.mark_abandoned(1);
+        // Close the boundary (last descendant returns).
+        let was_clean = p.note_handled(1, 0);
+        assert!(!was_clean, "abandoned closure MUST return false (not a clean completion)");
+        // TTC §4.1: covered_exact MUST NOT increase.
+        assert_eq!(p.covered_fraction(), 0.0,
+            "abandoned boundary MUST NOT exact-credit; covered_fraction MUST stay 0");
+        assert_eq!(p.abandoned_count(), 1,
+            "abandoned counter MUST bump on taint closure");
+        // Partial credit stays live — the timeouts that fired
+        // ARE honest eliminated work.
+        assert!((p.partial_fraction() - 0.06).abs() < 1e-9,
+            "abandoned closure MUST retain partial credit (not subsume); got {}",
+            p.partial_fraction());
+    }
+
+    /// Taint timing: `mark_abandoned` can fire at any point
+    /// before the root's final `note_handled(pending=0)`. The
+    /// taint persists through intermediate note_handled calls
+    /// that don't close the boundary.
+    #[test]
+    fn abandoned_taint_persists_through_intermediate_calls() {
+        let p = BoundaryProgress::new(4);
+        // Boundary emits 2 SolveZ children initially.
+        p.note_handled(1, 2); // pending: 1 - 1 + 2 = 2, clean
+        // SolveZ #1 times out → tainted.
+        p.mark_abandoned(1);
+        p.add_partial_cov_micro(1, 300_000);
+        // SolveZ #1 returns (pending 2 -> 1). Doesn't close.
+        assert!(!p.note_handled(1, 0));
+        assert_eq!(p.covered_fraction(), 0.0);
+        // SolveZ #2 returns cleanly (pending 1 -> 0). Closure
+        // still routes through abandoned path because the taint
+        // persists.
+        assert!(!p.note_handled(1, 0));
+        assert_eq!(p.covered_fraction(), 0.0,
+            "taint MUST survive intermediate note_handled calls");
+        assert_eq!(p.abandoned_count(), 1);
+    }
+
+    /// Clean boundaries and abandoned boundaries coexist across
+    /// a run. The covered_fraction sums only clean closures; the
+    /// abandoned_count tracks the other population separately.
+    #[test]
+    fn clean_and_abandoned_closures_are_separately_counted() {
+        let p = BoundaryProgress::new(4);
+        // Root 1: clean closure.
+        p.note_handled(1, 0);
+        // Root 2: abandoned.
+        p.mark_abandoned(2);
+        p.note_handled(2, 0);
+        // Root 3: clean.
+        p.note_handled(3, 0);
+        // Root 4: abandoned with partial credit.
+        p.add_partial_cov_micro(4, 500_000);
+        p.mark_abandoned(4);
+        p.note_handled(4, 0);
+
+        assert_eq!(p.covered_fraction(), 0.5, "2/4 clean");
+        assert_eq!(p.abandoned_count(), 2);
+        // Root 4 retained its 500_000 cov_micro.
+        // Denom = 4 * 1_000_000; 500_000 / 4_000_000 = 0.125.
+        assert!((p.partial_fraction() - 0.125).abs() < 1e-9);
     }
 
     #[test]

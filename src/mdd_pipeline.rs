@@ -581,6 +581,11 @@ pub(crate) fn process_solve_w(
     fft_buf_w: &mut FftScratch,
     rng: &mut u64,
     forcings_out: &mut Vec<(u16, u8, u32)>,
+    // Set to true if the SAT W-enumeration exited via conflict-
+    // budget timeout (residual W candidates MAY exist). The caller
+    // marks the boundary abandoned on true so it's never
+    // exact-credited (TTC §4.1).
+    timed_out: &mut bool,
 ) -> Vec<PipelineWork> {
     let k = ctx.k;
     let m = ctx.problem.m();
@@ -752,14 +757,14 @@ pub(crate) fn process_solve_w(
                 }
                 None => {
                     // Conflict budget exhausted. Residual W
-                    // candidates MAY exist; the boundary's
-                    // exact credit will be approximate (hence
-                    // `Hybrid` on `McddFractionMassModel`).
-                    // Spec §4.1: "A subproblem counts as exact
-                    // coverage only when no residual work remains"
-                    // — strictly violated here but permitted by
-                    // §5.1 / §6.3 Hybrid labeling.
+                    // candidates MAY exist. Per TTC §4.1 the
+                    // boundary MUST NOT be exact-credited — the
+                    // caller reads `*timed_out` and routes the
+                    // boundary through `mark_abandoned` so it
+                    // retains its accumulated partial credit but
+                    // never bumps exact.
                     metrics.flow_w_timeout.fetch_add(1, AtomicOrdering::Relaxed);
+                    *timed_out = true;
                     break;
                 }
             }
@@ -858,6 +863,10 @@ pub(crate) fn process_solve_z(
     // XY timeouts across concurrent handlers under
     // `worker_count > 1`.
     cov_micro_out: &mut u64,
+    // Set to true if the SAT Z-enumeration exited via
+    // conflict-budget timeout (residual Z candidates MAY exist).
+    // Caller marks the boundary abandoned on true.
+    timed_out: &mut bool,
 ) {
     let k = ctx.k;
     let n = ctx.problem.n;
@@ -1037,11 +1046,12 @@ pub(crate) fn process_solve_z(
             }
             None => {
                 // Z-search hit its conflict budget. Residual Z
-                // candidates MAY exist; boundary's exact credit
-                // will be approximate, consistent with Hybrid
-                // labeling. Tracked under `flow_z_timeout` for
-                // diagnostics.
+                // candidates MAY exist. Per TTC §4.1 the caller
+                // marks the boundary abandoned so it retains its
+                // accumulated partial credit but never bumps
+                // exact.
                 metrics.flow_z_timeout.fetch_add(1, AtomicOrdering::Relaxed);
+                *timed_out = true;
                 break;
             }
         }
