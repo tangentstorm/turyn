@@ -674,10 +674,18 @@ pub(crate) fn process_solve_w(
             });
         }
     } else {
-        // SAT-based W generation.
-        let mut w_solver = w_bases.remove(&0i32).unwrap_or_else(||
-            ctx.w_tmpl.build_base_solver_pb_set(ctx.middle_m, &w_counts)
-        );
+        // SAT-based W generation. Always build a fresh solver per
+        // call — the earlier `w_bases` cache keyed everything on
+        // `0i32`, which meant boundary A's cached solver (with a
+        // `PbSetEq` constraint encoding A's `w_counts`) was reused
+        // for boundary B whose `w_counts` may differ. B's search
+        // would then be constrained by A's counts and miss
+        // solutions. Mirrors the same fresh-per-call policy
+        // `process_solve_z` adopted after the same class of bug.
+        // TTC §4.1 / §2: the denominator and numerator must refer
+        // to the same search space — a stale cached solver
+        // changes the effective search space silently.
+        let mut w_solver = ctx.w_tmpl.build_base_solver_pb_set(ctx.middle_m, &w_counts);
         let w_cp = w_solver.save_checkpoint();
         sat_z_middle::fill_w_solver(&mut w_solver, &ctx.w_tmpl, m, &w_boundary);
         if rule_v_state == sat_z_middle::BoundaryRuleState::DeferredToMiddle {
@@ -705,12 +713,12 @@ pub(crate) fn process_solve_w(
         let w_p0 = w_solver.num_propagations();
         let w_l0 = w_solver.num_level0_vars();
         let w_nv = w_solver.num_vars();
-        // Baseline for forcing attribution. `w_solver` is reused
-        // across SolveW calls (cached in `w_bases`), so
-        // `prop_by_kind_level` already contains cumulative history
-        // from prior boundaries. The delta computed after the
-        // solve loop reflects only this stage call — matching the
-        // attribution rule in `docs/TELEMETRY.md` §4.
+        // Baseline for forcing attribution. `w_solver` is now
+        // freshly built per call (the prior `w_bases` cache was
+        // unsafe across boundaries — see the comment at
+        // construction), so an empty baseline would be equivalent.
+        // Keep the snapshot to preserve semantics if the solver is
+        // ever built with pre-loaded blocks from a prior attempt.
         let w_plk0: Vec<[u64; radical::PropKind::COUNT]> =
             w_solver.propagations_by_kind_level().to_vec();
 
@@ -800,9 +808,15 @@ pub(crate) fn process_solve_w(
         metrics.flow_w_free_sum.fetch_add(w_free_vars, AtomicOrdering::Relaxed);
         forcings_out.extend(forcing_delta_triples(&w_solver, &w_plk0));
 
+        // Fresh-per-call policy: don't re-insert into `w_bases`.
+        // The HashMap remains allocated and owned by scratch, but
+        // stays empty from the first call onward. `w_cp` was still
+        // taken above so the local `restore_checkpoint` would be
+        // cheap if we ever re-enabled caching; keeping the name
+        // `_w_cp` documents intent without a removed binding.
+        let _w_cp = w_cp;
         w_solver.spectral = None;
-        w_solver.restore_checkpoint(w_cp);
-        w_bases.insert(0i32, w_solver);
+        let _ = &mut *w_bases; // silence unused-mut warning for &mut HashMap
     }
     if !w_found_any { metrics.flow_w_unsat.fetch_add(1, AtomicOrdering::Relaxed); }
     if trace_w {
