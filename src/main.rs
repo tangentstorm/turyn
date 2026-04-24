@@ -454,19 +454,27 @@ fn run_framework_mdd_mode(
         stage_exit.get(2).copied().unwrap_or(0),
         stage_exit.get(3).copied().unwrap_or(0),
     );
+    // `timeout` counts are the approximation sources that keep the
+    // MDD mass model's quality label at `Hybrid` rather than
+    // `Direct` (per TTC §4.1 / §6.3): each W or Z conflict-budget
+    // timeout closes a boundary whose descendant search may still
+    // have residual work. Zero timeouts means the only source of
+    // approximation is XY-timeout shortfall credit.
     eprintln!(
-        "[framework:{}] flow W: unsat={} sol={} spec_fail={} spec_pass={} solves={}",
+        "[framework:{}] flow W: unsat={} timeout={} sol={} spec_fail={} spec_pass={} solves={}",
         mode_name,
         metrics.flow_w_unsat.load(Ord::Relaxed),
+        metrics.flow_w_timeout.load(Ord::Relaxed),
         metrics.flow_w_solutions.load(Ord::Relaxed),
         metrics.flow_w_spec_fail.load(Ord::Relaxed),
         metrics.flow_w_spec_pass.load(Ord::Relaxed),
         metrics.flow_w_solves.load(Ord::Relaxed),
     );
     eprintln!(
-        "[framework:{}] flow Z: unsat={} sol={} pair_fail={} spec_fail={} solves={}",
+        "[framework:{}] flow Z: unsat={} timeout={} sol={} pair_fail={} spec_fail={} solves={}",
         mode_name,
         metrics.flow_z_unsat.load(Ord::Relaxed),
+        metrics.flow_z_timeout.load(Ord::Relaxed),
         metrics.flow_z_solutions.load(Ord::Relaxed),
         metrics.flow_z_pair_fail.load(Ord::Relaxed),
         metrics.flow_z_spec_fail.load(Ord::Relaxed),
