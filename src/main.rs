@@ -400,8 +400,8 @@ fn run_framework_mdd_mode(
         SearchEvent::Progress(p) => {
             if verbose {
                 eprintln!(
-                    "[framework:{}] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}",
-                    mode_name, p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc
+                    "[framework:{}] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}{}",
+                    mode_name, p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc, ttc_tag
                 );
             }
         }
@@ -502,12 +502,13 @@ fn run_framework_stochastic_mode(
         EngineConfig::default(),
         Box::new(GoldThenWork::new(32)),
     );
-    engine.run_since(start, &adapter, |event| match event {
+    let stoch_ttc_tag = conjecture_ttc_qualifier(cfg);
+    engine.run_since(start, &adapter, move |event| match event {
         SearchEvent::Progress(p) => {
             if verbose {
                 eprintln!(
-                    "[framework:stochastic] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?} (estimate-only)",
-                    p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc
+                    "[framework:stochastic] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?} (estimate-only){}",
+                    p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc, stoch_ttc_tag
                 );
             }
         }
@@ -560,8 +561,8 @@ fn run_framework_cross_mode(
         SearchEvent::Progress(p) => {
             if verbose {
                 eprintln!(
-                    "[framework:cross] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}",
-                    p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc
+                    "[framework:cross] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}{}",
+                    p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc, ttc_tag
                 );
             }
         }
@@ -627,8 +628,8 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
         SearchEvent::Progress(p) => {
             if verbose {
                 eprintln!(
-                    "[framework:sync] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}",
-                    p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc
+                    "[framework:sync] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}{}",
+                    p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc, ttc_tag
                 );
             }
         }
