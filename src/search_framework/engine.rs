@@ -276,23 +276,7 @@ impl<T: Send + 'static> SearchEngine<T> {
 
                 if last_progress.elapsed() >= self.cfg.progress_interval {
                     last_progress = Instant::now();
-                    // Pull both live-polled coverage streams from
-                    // the mass model. Adapters with a running
-                    // counter surface progress here even when they
-                    // don't push `MassDelta` per handler; takes the
-                    // max so push-based deltas aren't clobbered.
-                    let polled = mass_model.covered_mass();
-                    if polled.0 > mass.covered_exact.0 {
-                        mass.covered_exact = polled;
-                    }
-                    let polled_partial = mass_model.covered_partial_mass();
-                    if polled_partial.0 > mass.covered_partial.0 {
-                        // Clamp under residual so we don't exceed
-                        // the total — matches `apply_delta`.
-                        let cap =
-                            (mass.total.0 - mass.covered_exact.0).max(0.0);
-                        mass.covered_partial = MassValue(polled_partial.0.min(cap));
-                    }
+                    poll_mass(&*mass_model, &mut mass);
                     on_event(SearchEvent::Progress(build_snapshot(
                         start.elapsed(),
                         &mass,
@@ -327,15 +311,7 @@ impl<T: Send + 'static> SearchEngine<T> {
 
         // Final poll for any live-counted coverage the last tick
         // missed — same policy as the in-loop tick.
-        let polled = mass_model.covered_mass();
-        if polled.0 > mass.covered_exact.0 {
-            mass.covered_exact = polled;
-        }
-        let polled_partial = mass_model.covered_partial_mass();
-        if polled_partial.0 > mass.covered_partial.0 {
-            let cap = (mass.total.0 - mass.covered_exact.0).max(0.0);
-            mass.covered_partial = MassValue(polled_partial.0.min(cap));
-        }
+        poll_mass(&*mass_model, &mut mass);
         on_event(SearchEvent::Finished(build_snapshot(
             start.elapsed(),
             &mass,
@@ -348,6 +324,34 @@ impl<T: Send + 'static> SearchEngine<T> {
 }
 
 type SharedScheduler<T> = Arc<(Mutex<Box<dyn SchedulerPolicy<T>>>, Condvar)>;
+
+/// Merge the latest polled coverage from `model` into `mass`, preserving
+/// the TTC-spec invariants:
+///
+/// - `covered_exact` and `covered_partial` are both **monotone
+///   non-decreasing** (TTC §3 invariant 6). The polled value only
+///   displaces the stored value when strictly greater.
+/// - `covered_exact + covered_partial ≤ total` (TTC §3 invariants 2/4).
+///   When `covered_exact` grows through polling, `covered_partial` is
+///   re-clamped against the new residual. Without this re-clamp,
+///   `covered_partial`'s high-water mark could ride above the residual
+///   (possible when an adapter like Cross zeros its in-flight
+///   `cov_micro` after a tuple completes while `covered_exact` bumps up
+///   in the same tick — sum could exceed 1.0).
+fn poll_mass(model: &dyn SearchMassModel, mass: &mut MassSnapshot) {
+    let polled = model.covered_mass();
+    if polled.0 > mass.covered_exact.0 {
+        mass.covered_exact = polled;
+    }
+    let polled_partial = model.covered_partial_mass();
+    if polled_partial.0 > mass.covered_partial.0 {
+        mass.covered_partial = polled_partial;
+    }
+    let cap = (mass.total.0 - mass.covered_exact.0).max(0.0);
+    if mass.covered_partial.0 > cap {
+        mass.covered_partial = MassValue(cap);
+    }
+}
 
 fn is_quiescent<T>(scheduler: &SharedScheduler<T>, in_flight: &AtomicUsize) -> bool {
     if in_flight.load(Ordering::Acquire) > 0 {
@@ -529,18 +533,28 @@ mod tests {
         }
     }
 
+    /// Test-only mass model. Obeys the TTC §1 contract
+    /// (`total_mass == 1.0`) so the engine's internal
+    /// `MassSnapshot.total` stays consistent with the public
+    /// universal schema.
     struct CounterMass {
         total: MassValue,
     }
     impl SearchMassModel for CounterMass {
-        fn total_mass(&self) -> MassValue {
-            self.total
-        }
         fn covered_mass(&self) -> MassValue {
             MassValue::ZERO
         }
         fn quality(&self) -> CoverageQuality {
             CoverageQuality::Exact
+        }
+    }
+    impl CounterMass {
+        #[allow(dead_code)]
+        fn for_seeds(_seeds: usize) -> Self {
+            // `total_mass` is defaulted to `MassValue::ONE` per
+            // the spec. `total` is retained only as a marker for
+            // test legibility; the trait impl never reads it.
+            Self { total: MassValue::ONE }
         }
     }
 
@@ -579,9 +593,10 @@ mod tests {
             m
         }
         fn mass_model(&self) -> Box<dyn SearchMassModel> {
-            Box::new(CounterMass {
-                total: MassValue(self.seeds as f64 * 3.0),
-            })
+            // Per TTC §1, `total_mass` must be 1.0; the former
+            // `seeds * 3.0` value predated the fraction-based
+            // contract.
+            Box::new(CounterMass { total: MassValue::ONE })
         }
     }
 
@@ -849,6 +864,180 @@ mod tests {
             .copied()
             .unwrap_or(0);
         assert_eq!(feat_clause, 6 * 3);
+    }
+
+    /// TTC §5.1 + §10 item 5: split paths MUST NOT double-count
+    /// credited mass. A parent that credits 0.3 and splits into
+    /// two children, where each child credits 0.2, should yield
+    /// total covered = 0.7 — not 0.7 doubled. The engine applies
+    /// `mass_delta` exactly once per `apply_report` call, so the
+    /// correctness of this rule depends on adapters not
+    /// re-crediting residuals; this test is a belt-and-braces
+    /// assertion against the engine-side plumbing.
+    #[test]
+    fn split_credit_flows_once_per_apply_report() {
+        struct SplitCreditStage {
+            counter: Arc<AtomicU64>,
+        }
+        impl StageHandler<u64> for SplitCreditStage {
+            fn id(&self) -> StageId { "split_credit" }
+            fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
+                self.counter.fetch_add(1, Ordering::Relaxed);
+                let mut out = StageOutcome::default();
+                match item.payload {
+                    0 => {
+                        // Parent: credit 0.3 exact and split into
+                        // two residual children that each credit
+                        // 0.2 — total credited mass 0.7.
+                        out.mass_delta = MassDelta {
+                            covered_exact: MassValue(0.3),
+                            covered_partial: MassValue::ZERO,
+                        };
+                        let mk_child = |bump: u64| WorkItem {
+                            stage_id: "split_credit",
+                            priority: 0,
+                            cost_hint: 1,
+                            replay_key: 0,
+                            mass_hint: None,
+                            meta: WorkItemMeta {
+                                item_id: bump,
+                                parent_item_id: Some(item.meta.item_id),
+                                fanout_root_id: item.meta.fanout_root_id,
+                                depth_from_root: 1,
+                                spawn_seq: bump as u32,
+                            },
+                            payload: 1,
+                        };
+                        out.continuation = Continuation::Split(vec![mk_child(10), mk_child(11)]);
+                    }
+                    _ => {
+                        out.mass_delta = MassDelta {
+                            covered_exact: MassValue(0.2),
+                            covered_partial: MassValue::ZERO,
+                        };
+                    }
+                }
+                out
+            }
+        }
+
+        struct SplitCreditAdapter { counter: Arc<AtomicU64> }
+        impl SearchModeAdapter<u64> for SplitCreditAdapter {
+            fn name(&self) -> &'static str { "split_credit" }
+            fn init(&self) -> AdapterInit<u64> {
+                AdapterInit {
+                    seed_items: vec![WorkItem {
+                        stage_id: "split_credit",
+                        priority: 0,
+                        cost_hint: 1,
+                        replay_key: 0,
+                        mass_hint: None,
+                        meta: WorkItemMeta {
+                            item_id: 1,
+                            parent_item_id: None,
+                            fanout_root_id: 1,
+                            depth_from_root: 0,
+                            spawn_seq: 0,
+                        },
+                        payload: 0,
+                    }],
+                }
+            }
+            fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<u64>>> {
+                let mut m: BTreeMap<StageId, Box<dyn StageHandler<u64>>> = BTreeMap::new();
+                m.insert("split_credit", Box::new(SplitCreditStage {
+                    counter: Arc::clone(&self.counter),
+                }));
+                m
+            }
+            fn mass_model(&self) -> Box<dyn SearchMassModel> {
+                Box::new(CounterMass { total: MassValue::ONE })
+            }
+        }
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let adapter = SplitCreditAdapter { counter: Arc::clone(&counter) };
+        let p = final_snapshot::<u64>(&adapter);
+        // Three handle() calls: parent + 2 children.
+        assert_eq!(counter.load(Ordering::Relaxed), 3);
+        let covered = p.covered_mass.0;
+        // Expected: 0.3 + 0.2 + 0.2 = 0.7. Any double-count would
+        // push this above 0.7 (or trip the 1.0 clamp and still be
+        // wrong).
+        assert!((covered - 0.7).abs() < 1e-9,
+            "split credit must be additive, not double-counted: got {}", covered);
+        assert!(covered <= p.total_mass.0 + 1e-12,
+            "covered_mass MUST stay ≤ total per TTC §3");
+    }
+
+    /// TTC §1: `total_search_mass MUST equal 1.0` for every live
+    /// adapter's mass model. Synthetic test adapters get the same
+    /// contract — the test-only `CounterMass` returns the
+    /// default.
+    #[test]
+    fn all_test_adapters_total_mass_is_one() {
+        assert_eq!(CounterMass { total: MassValue::ONE }.total_mass().0, 1.0);
+    }
+
+    /// TTC §3 invariants + §7.3 monotone envelope: the coordinator's
+    /// `poll_mass` helper MUST (a) never let either axis decrease,
+    /// (b) always keep `covered_exact + covered_partial ≤ total`
+    /// even when `covered_exact` grows in the same tick that the
+    /// mass model's partial counter has reset to a lower value.
+    /// This reproduces the pre-fix Cross scenario: partial hit a
+    /// high-water mark mid-tuple, then a tuple completed (exact
+    /// bumped, partial counter zeroed) — without the re-clamp the
+    /// published covered could exceed 1.0.
+    #[test]
+    fn poll_mass_clamps_high_water_partial_when_exact_grows() {
+        use crate::search_framework::mass::MassSnapshot;
+        struct TestModel {
+            exact: std::sync::Mutex<f64>,
+            partial: std::sync::Mutex<f64>,
+        }
+        impl SearchMassModel for TestModel {
+            fn covered_mass(&self) -> MassValue {
+                MassValue(*self.exact.lock().unwrap())
+            }
+            fn covered_partial_mass(&self) -> MassValue {
+                MassValue(*self.partial.lock().unwrap())
+            }
+            fn quality(&self) -> CoverageQuality {
+                CoverageQuality::Hybrid
+            }
+        }
+        let model = TestModel {
+            exact: std::sync::Mutex::new(0.0),
+            partial: std::sync::Mutex::new(0.0),
+        };
+        let mut mass = MassSnapshot::new(MassValue::ONE);
+
+        // Tick 1: exact=0, partial=0.3 in-flight.
+        *model.partial.lock().unwrap() = 0.3;
+        poll_mass(&model, &mut mass);
+        assert!((mass.covered().0 - 0.3).abs() < 1e-9);
+
+        // Tick 2: partial transient peaks at 0.6; still room under 1.0.
+        *model.partial.lock().unwrap() = 0.6;
+        poll_mass(&model, &mut mass);
+        assert!((mass.covered().0 - 0.6).abs() < 1e-9);
+
+        // Tick 3: a chunk completes — exact jumps to 0.8 and the
+        // model zeros its in-flight partial. `covered_partial`
+        // must NOT stay at its 0.6 high-water; it MUST clamp to
+        // 1.0 - 0.8 = 0.2 so the published covered stays ≤ 1.0.
+        *model.exact.lock().unwrap() = 0.8;
+        *model.partial.lock().unwrap() = 0.0;
+        poll_mass(&model, &mut mass);
+        assert!(mass.covered().0 <= 1.0 + 1e-12,
+            "covered MUST stay ≤ total; got exact={} partial={}",
+            mass.covered_exact.0, mass.covered_partial.0);
+        assert!(mass.covered_exact.0 >= 0.8,
+            "covered_exact is monotone non-decreasing");
+        // Tick 4: exact advances further. Partial stays ≤ residual.
+        *model.exact.lock().unwrap() = 1.0;
+        poll_mass(&model, &mut mass);
+        assert!((mass.covered().0 - 1.0).abs() < 1e-9);
     }
 
     /// TELEMETRY.md §4 consistency rule, direct unit test at the

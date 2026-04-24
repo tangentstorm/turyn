@@ -37,7 +37,7 @@ use crate::search_framework::stage::{
 use crate::spectrum::{SeqWithSpectrum, SpectralFilter, SpectralIndex};
 use crate::types::{verify_tt, PackedSeq, Problem, SumTuple};
 use crate::xy_sat::{SatXYTemplate, SolveXyPerCandidate, XyTryResult};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub const STAGE_CROSS: StageId = "cross.enumerate";
 
@@ -53,6 +53,15 @@ pub struct CrossEnumerateStage {
     /// Counter published to the adapter so its mass model can emit
     /// a live fraction: `tuples_done / tuples.len()`.
     tuples_done: Arc<AtomicUsize>,
+    /// Sum of `XyStats::cover_micro` across *in-flight* XY timeouts
+    /// within the tuple currently being enumerated. Reset to zero
+    /// when that tuple's enumeration completes (because
+    /// `tuples_done += 1` then credits the whole tuple exactly).
+    /// Read by `CrossMassModel::covered_partial_mass`. Satisfies
+    /// `docs/TTC.md` §7.1: "if cross mode contains timeout-capable
+    /// internal sub-solves that can report eliminated search mass,
+    /// it MUST surface that mass as `covered_partial`".
+    in_flight_cov_micro: Arc<AtomicU64>,
     found: Arc<AtomicBool>,
     result_tx: std::sync::mpsc::Sender<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
 }
@@ -195,7 +204,20 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                             }
                             let x_bits = (code & ((1u64 << boundary_bits) - 1)) as u32;
                             let y_bits = (code >> boundary_bits) as u32;
-                            let (result, _stats) = state.try_candidate(x_bits, y_bits);
+                            let (result, stats) = state.try_candidate(x_bits, y_bits);
+                            // XY timeout partial credit: each
+                            // timeout's `cover_micro ∈ [0, 1_000_000]`
+                            // is the fraction of this one XY
+                            // sub-cube the SAT solver actually
+                            // eliminated before the conflict
+                            // budget fired. Accumulate for the
+                            // current tuple; reset to 0 when the
+                            // tuple completes so finished tuples
+                            // are credited only by `tuples_done`.
+                            if matches!(result, XyTryResult::Timeout) {
+                                self.in_flight_cov_micro
+                                    .fetch_add(stats.cover_micro, Ordering::Relaxed);
+                            }
                             if let XyTryResult::Sat(x, y) = result {
                                 if verify_tt(
                                     problem,
@@ -226,6 +248,11 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
             // behind and the TTC readout systematically pessimistic
             // (PR review follow-up).
             self.tuples_done.store(tuple_idx + 1, Ordering::Relaxed);
+            // Any XY-timeout partial credit accumulated during
+            // this tuple is now subsumed by the tuple's exact
+            // credit. Zero the in-flight counter so the next
+            // tuple starts fresh and we don't double-credit.
+            self.in_flight_cov_micro.store(0, Ordering::Relaxed);
         }
         // Do NOT force `tuples_done = tuples.len()` here, and do
         // NOT emit a terminal `mass_delta = 1.0`. Either of those
@@ -248,11 +275,30 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
 /// approximation, not a true XY-work fraction. Marked
 /// `Hybrid` to reflect the blend: the tuple count is direct,
 /// but mapping tuples to a fraction of the XY search space is
-/// projected. A per-tuple weight estimate is a follow-up (see
-/// `docs/TTC.md`'s "Contract gaps" section).
+/// projected.
+///
+/// Partial coverage (`docs/TTC.md` §7.1, §4.2 bundled-stage
+/// rule): each XY-SAT timeout inside the enumerate loop reports
+/// a `cover_micro` — the fraction of that single XY sub-cube the
+/// solver actually ruled out before the conflict budget fired.
+/// We sum those micros across the currently in-flight tuple and
+/// divide by the total XY sub-cube weight
+/// (`tuples_total * total_xy_per_tuple * 1_000_000`) to get the
+/// covered-partial fraction in the same unit as
+/// `tuples_done / tuples_total`. Completed tuples zero the
+/// in-flight accumulator so per-attempt timeouts are never
+/// double-credited alongside the tuple's exact weight.
 pub struct CrossMassModel {
     tuples_done: Arc<AtomicUsize>,
     tuples_total: usize,
+    /// Shared with the stage; sum of `cover_micro` for XY
+    /// timeouts in the current tuple. Cleared when the tuple
+    /// completes.
+    in_flight_cov_micro: Arc<AtomicU64>,
+    /// `2^(4k)` — number of XY `(x_bits, y_bits)` combinations
+    /// per tuple in the brute-force enumeration. Used as part of
+    /// the partial-coverage denominator.
+    xy_per_tuple: u64,
 }
 
 impl SearchMassModel for CrossMassModel {
@@ -264,15 +310,19 @@ impl SearchMassModel for CrossMassModel {
             MassValue(done as f64 / self.tuples_total as f64)
         }
     }
-    /// Cross mode runs timeout-capable XY SAT per (Z,W) pair
-    /// (`state.solver.set_conflict_limit(5000)` for n>30 inside
-    /// the brute-force loop), but the adapter does NOT yet
-    /// surface per-timeout `cover_micro` credit as `covered_partial`.
-    /// Per `docs/TTC.md` §7.1 this omission MUST be documented
-    /// and the adapter's quality label MUST stay non-`Direct`;
-    /// `quality()` below keeps it as `Hybrid` to honor that
-    /// constraint. `covered_partial_mass` returns zero here (the
-    /// default), which is the honest reporting choice.
+    fn covered_partial_mass(&self) -> MassValue {
+        if self.tuples_total == 0 || self.xy_per_tuple == 0 {
+            return MassValue::ZERO;
+        }
+        let micros = self.in_flight_cov_micro.load(Ordering::Relaxed) as f64;
+        let denom = self.tuples_total as f64 * self.xy_per_tuple as f64 * 1_000_000.0;
+        MassValue((micros / denom).clamp(0.0, 1.0))
+    }
+    /// Hybrid: tuple-count numerator is direct but the mapping
+    /// to XY-search fraction is projected (uniform tuple
+    /// weighting). Per `docs/TTC.md` §7.1 this MUST remain
+    /// non-`Direct` until both tuple weighting and timeout
+    /// credits become direct search-mass fractions.
     fn quality(&self) -> CoverageQuality {
         CoverageQuality::Hybrid
     }
@@ -285,6 +335,9 @@ pub struct CrossAdapter {
     pub verbose: bool,
     pub k: usize,
     pub tuples_done: Arc<AtomicUsize>,
+    /// Shared in-flight XY-timeout `cover_micro` counter. Stage
+    /// writes; mass model reads.
+    pub in_flight_cov_micro: Arc<AtomicU64>,
     pub found: Arc<AtomicBool>,
     pub result_tx: std::sync::mpsc::Sender<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
 }
@@ -302,6 +355,7 @@ impl CrossAdapter {
     ) {
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let tuples_done = Arc::new(AtomicUsize::new(0));
+        let in_flight_cov_micro = Arc::new(AtomicU64::new(0));
         let found = Arc::new(AtomicBool::new(false));
         (
             CrossAdapter {
@@ -311,11 +365,25 @@ impl CrossAdapter {
                 verbose,
                 k,
                 tuples_done,
+                in_flight_cov_micro,
                 found,
                 result_tx,
             },
             result_rx,
         )
+    }
+
+    /// Same `k`-clamp the stage applies inside `handle`. Cross
+    /// caps `k` so `2^(4k)` fits inside the brute-force XY loop's
+    /// `u32` shift, which decides the XY-per-tuple denominator
+    /// used for partial-coverage scaling.
+    fn effective_k(&self) -> usize {
+        const MAX_BOUNDARY_BITS: usize = 16;
+        let raw_k = self
+            .k
+            .min((self.problem.n - 1) / 2)
+            .min(self.problem.m() / 2);
+        raw_k.min(MAX_BOUNDARY_BITS / 2)
     }
 }
 
@@ -353,6 +421,7 @@ impl SearchModeAdapter<CrossPayload> for CrossAdapter {
                 verbose: self.verbose,
                 k: self.k,
                 tuples_done: Arc::clone(&self.tuples_done),
+                in_flight_cov_micro: Arc::clone(&self.in_flight_cov_micro),
                 found: Arc::clone(&self.found),
                 result_tx: self.result_tx.clone(),
             }),
@@ -360,9 +429,15 @@ impl SearchModeAdapter<CrossPayload> for CrossAdapter {
         m
     }
     fn mass_model(&self) -> Box<dyn SearchMassModel> {
+        let k_eff = self.effective_k();
+        // `xy_per_tuple = 2^(4 * k_eff)`. `k_eff <= 8`, so the
+        // shift is ≤ 32 and stays inside a `u64`.
+        let xy_per_tuple: u64 = if k_eff == 0 { 1 } else { 1u64 << (4 * k_eff) };
         Box::new(CrossMassModel {
             tuples_done: Arc::clone(&self.tuples_done),
             tuples_total: self.tuples.len(),
+            in_flight_cov_micro: Arc::clone(&self.in_flight_cov_micro),
+            xy_per_tuple,
         })
     }
 }
@@ -372,35 +447,53 @@ mod tests {
     use super::*;
 
     /// TTC §7.1 + §10 item 7: cross mode uses uniform tuple
-    /// weighting (an approximation) and does not yet surface
-    /// XY-timeout partial credit, so it MUST remain non-`Direct`.
-    /// `Hybrid` is the intended label.
+    /// weighting (an approximation), so it MUST remain
+    /// non-`Direct` even though timeout partial credit is now
+    /// wired.
     #[test]
     fn cross_mass_model_is_non_direct() {
         let model = CrossMassModel {
             tuples_done: Arc::new(AtomicUsize::new(0)),
             tuples_total: 3,
+            in_flight_cov_micro: Arc::new(AtomicU64::new(0)),
+            xy_per_tuple: 16,
         };
         assert_ne!(model.quality(), CoverageQuality::Direct,
-            "cross mode uses uniform tuple weighting + no timeout partial credit; label MUST stay non-Direct per TTC §7.1");
-        // Per the current design we've chosen Hybrid rather than
-        // Projected. That's still non-Direct, matching the spec.
+            "cross mode uses uniform tuple weighting; label MUST stay non-Direct per TTC §7.1");
         assert_eq!(model.quality(), CoverageQuality::Hybrid);
     }
 
-    /// Cross currently publishes zero partial credit despite
-    /// timeout-capable XY sub-solves (`state.solver.set_conflict_limit(5000)`
-    /// for n > 30). Per `docs/TTC.md` §7.1 that omission is
-    /// permitted only while the adapter stays non-Direct and
-    /// documents the gap in source — the test documents the
-    /// observed state so a future change surfacing partial credit
-    /// updates it together with the doc.
+    /// TTC §7.1: "every timeout-capable XY attempt ... MUST
+    /// contribute its partial credit". The cross adapter writes
+    /// `in_flight_cov_micro` on every XY timeout; the mass model
+    /// must surface that as `covered_partial` in the same
+    /// fraction unit as `tuples_done / tuples_total`.
     #[test]
-    fn cross_partial_mass_is_zero_until_timeout_credit_is_wired() {
+    fn cross_partial_mass_reflects_in_flight_xy_timeouts() {
+        let cov = Arc::new(AtomicU64::new(0));
         let model = CrossMassModel {
             tuples_done: Arc::new(AtomicUsize::new(0)),
-            tuples_total: 3,
+            tuples_total: 4,
+            in_flight_cov_micro: Arc::clone(&cov),
+            xy_per_tuple: 16, // denom = 4 * 16 * 1e6 = 64_000_000
         };
         assert_eq!(model.covered_partial_mass().0, 0.0);
+        cov.store(32_000_000, Ordering::Relaxed); // half the denom
+        assert!((model.covered_partial_mass().0 - 0.5).abs() < 1e-9);
+    }
+
+    /// TTC §3 clamp: even if `in_flight_cov_micro` somehow
+    /// overflows the denominator, the published partial fraction
+    /// MUST stay in `[0, 1]`.
+    #[test]
+    fn cross_partial_mass_clamps_to_one() {
+        let cov = Arc::new(AtomicU64::new(u64::MAX));
+        let model = CrossMassModel {
+            tuples_done: Arc::new(AtomicUsize::new(0)),
+            tuples_total: 4,
+            in_flight_cov_micro: cov,
+            xy_per_tuple: 16,
+        };
+        assert!(model.covered_partial_mass().0 <= 1.0);
     }
 }
