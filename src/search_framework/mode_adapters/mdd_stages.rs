@@ -48,28 +48,37 @@ pub const STAGE_SOLVE_Z: StageId = "mdd.solve_z";
 /// SolveWZ, with stage 2/3 sometimes emitting zero follow-ups
 /// because of filter rejection or re-queue semantics.
 ///
-/// Two coverage streams:
+/// Coverage streams exposed to the mass model:
 ///
-/// * `completed_boundaries / total` — the "exact" fraction
-///   (additive over disjoint boundaries). Incremented when a
-///   boundary's pending-count hits zero.
-/// * `partial_cov_micro / (total * 1_000_000)` — the
-///   timeout-shortfall fraction. Each XY timeout inside
-///   `process_solve_z` reports a `cover_micro ∈ [0, 1_000_000]`
-///   reflecting how much of that sub-cube the SAT solver actually
-///   ruled out before hitting its conflict budget. We sum those
-///   `cover_micro` values across all XY solves anywhere in the
-///   search and surface the ratio as `covered_partial` on the
-///   `ProgressSnapshot` — matches the `xy_cover_micro` accounting
-///   documented in `docs/TTC.md`.
+/// * `covered_fraction() = completed / total` — the "exact"
+///   fraction, additive over disjoint boundaries. A boundary
+///   bumps `completed` ONLY when it closes cleanly (UNSAT or
+///   enumerated-to-exhaustion descendant search). Boundaries
+///   whose descendant search was cut off by a W or Z SAT
+///   conflict-budget timeout are marked abandoned and EXCLUDED
+///   from this counter — TTC §4.1 compliance.
+/// * `partial_fraction() = live_partial_cov_micro / (total *
+///   1_000_000)` — XY-timeout shortfall credit. Each XY timeout
+///   reports a `cover_micro ∈ [0, 1_000_000]` reflecting how
+///   much of that sub-cube the SAT solver ruled out before
+///   budget exhaustion. Contributions from a root are subsumed
+///   into exact on clean closure (drained from the aggregate)
+///   and retained indefinitely on abandoned closure (the
+///   boundary never exact-credits, so partial is its only
+///   honest crediting channel).
 ///
-/// Algorithm: each stage handler calls `note_handled` with its
-/// item's `fanout_root_id` plus the number of children emitted
-/// and (for SolveZ) the `cover_micro_delta` accumulated during
-/// its inline XY walk. Pending count for the boundary decreases
-/// by 1 and increases by `emitted`; when it hits 0 the boundary
-/// is removed from the map and `completed` ticks up. Seed
-/// boundaries start at `pending = 1` lazily when first seen.
+/// Algorithm: each stage handler calls `note_handled(root_id,
+/// emitted)` after processing its item, and optionally
+/// `mark_abandoned(root_id)` first when a SAT conflict-budget
+/// timeout made the descendant search incomplete. Pending count
+/// decreases by 1 per processed item and increases by `emitted`;
+/// when it hits 0, closure routes through the clean path (exact
+/// bump + subsume) unless the abandoned taint is set, in which
+/// case it routes through the abandoned path (no exact bump,
+/// partial retained). Entries stay in the map after closure —
+/// the `closed` flag keeps `note_handled` idempotent against
+/// stale re-entries (TTC §3.7). Seed boundaries start at
+/// `pending = 1` lazily when first seen.
 pub struct BoundaryProgress {
     /// Per-root state. Keeping `closed` on the entry keeps
     /// `note_handled` idempotent against stale re-entries (TTC
