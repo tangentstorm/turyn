@@ -662,7 +662,7 @@ fn build_snapshot(
 mod tests {
     use super::*;
     use crate::search_framework::mass::{CoverageQuality, MassDelta};
-    use crate::search_framework::queue::GoldThenWork;
+    use crate::search_framework::queue::LaneByPriority;
     use crate::search_framework::stage::{Continuation, ForcingDelta, StageOutcome, WorkItemMeta};
     use std::sync::atomic::AtomicU64;
 
@@ -692,6 +692,7 @@ mod tests {
                 out.emitted.push(WorkItem {
                     stage_id: "counter",
                     priority: 0,
+                    gold: false,
                     cost_hint: 1,
                     replay_key: item.payload * 10 + 1,
                     mass_hint: Some(1.0),
@@ -748,6 +749,7 @@ mod tests {
                 .map(|i| WorkItem {
                     stage_id: "counter",
                     priority: 0,
+                    gold: false,
                     cost_hint: 1,
                     replay_key: i,
                     mass_hint: Some(1.0),
@@ -794,7 +796,7 @@ mod tests {
             worker_count,
             bench_stop_log2_work: None,
         };
-        let mut engine = SearchEngine::<u64>::new(cfg, Box::new(GoldThenWork::new(4)));
+        let mut engine = SearchEngine::<u64>::new(cfg, Box::new(LaneByPriority::new()));
 
         let mut final_forcings: Option<ForcingRollups> = None;
         engine.run(&adapter, |event| {
@@ -842,6 +844,7 @@ mod tests {
                 let mk_child = |bump: u64| WorkItem {
                     stage_id: "split",
                     priority: 0,
+                    gold: false,
                     cost_hint: 1,
                     replay_key: 0,
                     mass_hint: None,
@@ -873,6 +876,7 @@ mod tests {
                 seed_items: vec![WorkItem {
                     stage_id: "split",
                     priority: 0,
+                    gold: false,
                     cost_hint: 1,
                     replay_key: 0,
                     mass_hint: None,
@@ -923,6 +927,7 @@ mod tests {
                 out.continuation = Continuation::Resume(WorkItem {
                     stage_id: "resume",
                     priority: 0,
+                    gold: false,
                     cost_hint: 1,
                     replay_key: 0,
                     mass_hint: None,
@@ -953,6 +958,7 @@ mod tests {
                 seed_items: vec![WorkItem {
                     stage_id: "resume",
                     priority: 0,
+                    gold: false,
                     cost_hint: 1,
                     replay_key: 0,
                     mass_hint: None,
@@ -991,7 +997,7 @@ mod tests {
             worker_count: 1,
             bench_stop_log2_work: None,
         };
-        let mut engine = SearchEngine::<T>::new(cfg, Box::new(GoldThenWork::new(4)));
+        let mut engine = SearchEngine::<T>::new(cfg, Box::new(LaneByPriority::new()));
         let mut final_snap: Option<ProgressSnapshot> = None;
         engine.run(adapter, |event| {
             if let SearchEvent::Finished(p) = event {
@@ -1133,6 +1139,7 @@ mod tests {
                         let mk_child = |bump: u64| WorkItem {
                             stage_id: "split_credit",
                             priority: 0,
+                            gold: false,
                             cost_hint: 1,
                             replay_key: 0,
                             mass_hint: None,
@@ -1170,6 +1177,7 @@ mod tests {
                     seed_items: vec![WorkItem {
                         stage_id: "split_credit",
                         priority: 0,
+                        gold: false,
                         cost_hint: 1,
                         replay_key: 0,
                         mass_hint: None,
@@ -1274,6 +1282,7 @@ mod tests {
                         out.continuation = Continuation::Resume(WorkItem {
                             stage_id: "resume_credit",
                             priority: 0,
+                            gold: false,
                             cost_hint: 1,
                             replay_key: 0,
                             mass_hint: None,
@@ -1316,6 +1325,7 @@ mod tests {
                     seed_items: vec![WorkItem {
                         stage_id: "resume_credit",
                         priority: 0,
+                        gold: false,
                         cost_hint: 1,
                         replay_key: 0,
                         mass_hint: None,
@@ -1425,6 +1435,7 @@ mod tests {
                     out.emitted.push(WorkItem {
                         stage_id: "fluctuating",
                         priority: 0,
+                        gold: false,
                         cost_hint: 1,
                         replay_key: 0,
                         mass_hint: None,
@@ -1456,6 +1467,7 @@ mod tests {
                     seed_items: vec![WorkItem {
                         stage_id: "fluctuating",
                         priority: 0,
+                        gold: false,
                         cost_hint: 1,
                         replay_key: 0,
                         mass_hint: None,
@@ -1510,7 +1522,7 @@ mod tests {
             worker_count: 1,
             bench_stop_log2_work: None,
         };
-        let mut engine = SearchEngine::<u64>::new(cfg, Box::new(GoldThenWork::new(4)));
+        let mut engine = SearchEngine::<u64>::new(cfg, Box::new(LaneByPriority::new()));
         let observed = Arc::new(std::sync::Mutex::new(Vec::<(f64, MassSnapshot)>::new()));
         let observed_cb = Arc::clone(&observed);
         engine.run(&adapter, move |event| {
@@ -1567,10 +1579,10 @@ mod tests {
     #[cfg(debug_assertions)]
     fn apply_report_panics_on_unregistered_root() {
         use crate::search_framework::mass::MassSnapshot;
-        use crate::search_framework::queue::GoldThenWork;
+        use crate::search_framework::queue::LaneByPriority;
 
         let scheduler: SharedScheduler<u64> = Arc::new((
-            Mutex::new(Box::new(GoldThenWork::new(4)) as Box<dyn SchedulerPolicy<u64>>),
+            Mutex::new(Box::new(LaneByPriority::new()) as Box<dyn SchedulerPolicy<u64>>),
             Condvar::new(),
         ));
         let mut mass = MassSnapshot::new(MassValue::ONE);
@@ -1628,6 +1640,7 @@ mod tests {
                         out.continuation = Continuation::Split(vec![WorkItem {
                             stage_id: "defer_credit",
                             priority: 0,
+                            gold: false,
                             cost_hint: 1,
                             replay_key: 0,
                             mass_hint: None,
@@ -1665,6 +1678,7 @@ mod tests {
                     seed_items: vec![WorkItem {
                         stage_id: "defer_credit",
                         priority: 0,
+                        gold: false,
                         cost_hint: 1,
                         replay_key: 0,
                         mass_hint: None,
@@ -1881,6 +1895,7 @@ mod tests {
                 let mk = |bump: u64, payload: u64| WorkItem {
                     stage_id: "mixed",
                     priority: 0,
+                    gold: false,
                     cost_hint: 1,
                     replay_key: 0,
                     mass_hint: None,
@@ -1910,6 +1925,7 @@ mod tests {
                         out.continuation = Continuation::Resume(WorkItem {
                             stage_id: "mixed",
                             priority: 0,
+                            gold: false,
                             cost_hint: 1,
                             replay_key: 0,
                             mass_hint: None,
@@ -1942,6 +1958,7 @@ mod tests {
                     .map(|i| WorkItem {
                         stage_id: "mixed",
                         priority: 0,
+                        gold: false,
                         cost_hint: 1,
                         replay_key: i,
                         mass_hint: None,

@@ -591,22 +591,59 @@ pub(crate) fn process_boundary(
     // Phase 1: cheap σ-feasibility filter per tuple.  Builds a bitmask
     // `sigma_pass_mask` of tuples that survive both the σ_Z and σ_W
     // count checks.  Phase 2 then walks the XY sub-MDD ONCE for the
-    // surviving set instead of once per tuple — at n=26 the σ check
-    // is essentially always true, so the multi-tuple XY walk is the
-    // real win.
+    // surviving set instead of once per tuple.
+    //
+    // The σ_Z check depends only on (|tuple.z|, z_bnd_sum,
+    // ctx.middle_n).  Across the tuple list there are at most ~5
+    // distinct |σ_Z| values (e.g. {0,2,4,6,8} at n=26), so memoize
+    // the per-|σ| verdict in a small array so we do at most 2 ×
+    // unique(|σ|) `sigma_full_to_cnt` calls per boundary instead of
+    // 4 × ctx.tuples.len().
     debug_assert!(
         ctx.tuples.len() <= 32,
         "valid_xy_tuple_mask uses a u32 bitmask",
     );
+    let middle_n = ctx.middle_n;
+    let middle_m = ctx.middle_m;
+    let mut z_abs_ok: [i8; 33] = [-1; 33]; // -1 = unknown, 0/1 = false/true
+    let mut w_abs_ok: [i8; 33] = [-1; 33];
+    let check_z = |abs: i32| -> bool {
+        crate::spectrum::sigma_full_to_cnt(abs, z_bnd_sum, middle_n).is_some()
+            || crate::spectrum::sigma_full_to_cnt(-abs, z_bnd_sum, middle_n).is_some()
+    };
+    let check_w = |abs: i32| -> bool {
+        crate::spectrum::sigma_full_to_cnt(abs, w_bnd_sum, middle_m).is_some()
+            || crate::spectrum::sigma_full_to_cnt(-abs, w_bnd_sum, middle_m).is_some()
+    };
     let mut sigma_pass_mask = 0u32;
     let mut sigma_fail_count = 0u64;
     for (i, &tuple) in ctx.tuples.iter().enumerate() {
-        let z_feas = [tuple.z.abs(), -tuple.z.abs()]
-            .iter()
-            .any(|&s| crate::spectrum::sigma_full_to_cnt(s, z_bnd_sum, ctx.middle_n).is_some());
-        let w_feas = [tuple.w.abs(), -tuple.w.abs()]
-            .iter()
-            .any(|&s| crate::spectrum::sigma_full_to_cnt(s, w_bnd_sum, ctx.middle_m).is_some());
+        let za = tuple.z.abs() as usize;
+        let z_feas = if za < z_abs_ok.len() {
+            let v = z_abs_ok[za];
+            if v >= 0 {
+                v == 1
+            } else {
+                let r = check_z(tuple.z.abs());
+                z_abs_ok[za] = r as i8;
+                r
+            }
+        } else {
+            check_z(tuple.z.abs())
+        };
+        let wa = tuple.w.abs() as usize;
+        let w_feas = if wa < w_abs_ok.len() {
+            let v = w_abs_ok[wa];
+            if v >= 0 {
+                v == 1
+            } else {
+                let r = check_w(tuple.w.abs());
+                w_abs_ok[wa] = r as i8;
+                r
+            }
+        } else {
+            check_w(tuple.w.abs())
+        };
         if z_feas && w_feas {
             sigma_pass_mask |= 1u32 << i;
         } else {
@@ -736,10 +773,12 @@ pub(crate) fn process_solve_w(
     w_boundary[m - k..].copy_from_slice(&w_suffix);
 
     // BDKR rule (v) boundary pre-filter. Skip this SolveW if the W
-    // boundary already fails rule (v). Legacy `continue` skipped
-    // the stage_exit[1] bump; preserved here for exact parity.
+    // boundary already fails rule (v). Stage 1 is logically done for
+    // this boundary, so credit the exit; otherwise SolveW items that
+    // all bail here look like they never run at all in telemetry.
     let rule_v_state = sat_z_middle::check_w_boundary_rule_v(m, k, &w_boundary);
     if rule_v_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary {
+        metrics.stage_exit[1].fetch_add(1, AtomicOrdering::Relaxed);
         return Vec::new();
     }
 
@@ -1121,6 +1160,12 @@ pub(crate) fn process_solve_z(
 
     let rule_iv_state = sat_z_middle::check_z_boundary_rule_iv(n, k, &z_boundary);
     if rule_iv_state == sat_z_middle::BoundaryRuleState::ViolatedAtBoundary {
+        // Rule (iv) rejects at the boundary: stage 2 is logically
+        // done for this `(Z, W)` pair, so credit the stage exit just
+        // as the `z_counts.is_empty()` early-return below does.
+        // Otherwise SolveZ items that all bail here look like they
+        // never run at all in the telemetry.
+        metrics.stage_exit[2].fetch_add(1, AtomicOrdering::Relaxed);
         return;
     }
 
@@ -2759,7 +2804,7 @@ pub(crate) fn run_mdd_sat_search(
     use crate::search_framework::events::SearchEvent;
     use crate::search_framework::mode_adapters::mdd_stages::{MddPayload, MddStagesAdapter};
     use crate::search_framework::mode_adapters::sync::{SyncAdapter, SyncPayload};
-    use crate::search_framework::queue::GoldThenWork;
+    use crate::search_framework::queue::LaneByPriority;
 
     let start = std::time::Instant::now();
 
@@ -2781,7 +2826,7 @@ pub(crate) fn run_mdd_sat_search(
         let (adapter, result_rx) = SyncAdapter::build(problem, sync_cfg, verbose);
         let mut engine = SearchEngine::<SyncPayload>::new(
             EngineConfig::default(),
-            Box::new(GoldThenWork::new(32)),
+            Box::new(LaneByPriority::new()),
         );
         let cancel_flag = engine.cancel_flag();
         let drain = std::thread::spawn(move || {
@@ -2824,7 +2869,7 @@ pub(crate) fn run_mdd_sat_search(
         WzMode::Sync => unreachable!("sync branched above"),
     };
     let mut engine =
-        SearchEngine::<MddPayload>::new(EngineConfig::default(), Box::new(GoldThenWork::new(32)));
+        SearchEngine::<MddPayload>::new(EngineConfig::default(), Box::new(LaneByPriority::new()));
     let cancel_flag = engine.cancel_flag();
     let (adapter, result_rx) = MddStagesAdapter::build(
         problem,

@@ -442,6 +442,7 @@ impl SearchModeAdapter<CrossPayload> for CrossAdapter {
             seed_items: vec![WorkItem {
                 stage_id: STAGE_CROSS,
                 priority: 0,
+                gold: false,
                 cost_hint: 1,
                 replay_key: 0,
                 mass_hint: Some(1.0),

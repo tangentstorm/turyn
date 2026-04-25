@@ -38,7 +38,7 @@ use crate::search_framework::events::SearchEvent;
 use crate::search_framework::mode_adapters::mdd_stages::{MddPayload, MddStagesAdapter};
 use crate::search_framework::mode_adapters::stochastic::{StochasticAdapter, StochasticPayload};
 use crate::search_framework::mode_adapters::sync::{SyncAdapter, SyncPayload};
-use crate::search_framework::queue::GoldThenWork;
+use crate::search_framework::queue::LaneByPriority;
 use crate::spectrum::*;
 use crate::stochastic::*;
 use crate::types::*;
@@ -395,7 +395,7 @@ fn run_framework_mdd_mode(
             bench_stop_log2_work: cfg.bench_cover_log2,
             ..EngineConfig::default()
         },
-        Box::new(GoldThenWork::new(32)),
+        Box::new(LaneByPriority::new()),
     );
     let engine_cancel = engine.cancel_flag();
     let watchdog_handle =
@@ -488,8 +488,21 @@ fn run_framework_mdd_mode(
         .iter()
         .map(|c| c.load(Ord::Relaxed))
         .collect();
+    let stage_enter: Vec<u64> = metrics
+        .stage_enter
+        .iter()
+        .map(|c| c.load(Ord::Relaxed))
+        .collect();
     eprintln!(
-        "[framework:{}] stage_exit bnd/W/Z/XY = {}/{}/{}/{}",
+        "[framework:{}] stage_enter bnd/W/Z/XY = {}/{}/{}/{}",
+        mode_name,
+        stage_enter.first().copied().unwrap_or(0),
+        stage_enter.get(1).copied().unwrap_or(0),
+        stage_enter.get(2).copied().unwrap_or(0),
+        stage_enter.get(3).copied().unwrap_or(0),
+    );
+    eprintln!(
+        "[framework:{}] stage_exit  bnd/W/Z/XY = {}/{}/{}/{}",
         mode_name,
         stage_exit.first().copied().unwrap_or(0),
         stage_exit.get(1).copied().unwrap_or(0),
@@ -561,7 +574,7 @@ fn run_framework_stochastic_mode(
     let (adapter, found) = StochasticAdapter::build(problem, test_tuple, verbose, time_limit);
     let mut engine = SearchEngine::<StochasticPayload>::new(
         EngineConfig::default(),
-        Box::new(GoldThenWork::new(32)),
+        Box::new(LaneByPriority::new()),
     );
     let stoch_ttc_tag = conjecture_ttc_qualifier(cfg);
     engine.run_since(start, &adapter, move |event| match event {
@@ -609,7 +622,7 @@ fn run_framework_cross_mode(
             bench_stop_log2_work: cfg.bench_cover_log2,
             ..EngineConfig::default()
         },
-        Box::new(GoldThenWork::new(32)),
+        Box::new(LaneByPriority::new()),
     );
     let engine_cancel = engine.cancel_flag();
     let found_flag = std::sync::Arc::clone(&adapter.found);
@@ -682,7 +695,7 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
             bench_stop_log2_work: cfg.bench_cover_log2,
             ..EngineConfig::default()
         },
-        Box::new(GoldThenWork::new(32)),
+        Box::new(LaneByPriority::new()),
     );
     let engine_cancel = engine.cancel_flag();
     // Forward the same cancel flag into the walker so its internal

@@ -16,25 +16,26 @@ pub struct WorkItemMeta {
 
 /// A scheduled unit of search work.
 ///
-/// `priority` is a loose tag that the baseline scheduler reads as
-/// `> 0` ⇒ "gold" lane, `<= 0` ⇒ "work" lane. Handlers that defer
-/// residual sub-cubes back onto the queue should set a priority that
-/// reflects their own confidence in the remainder:
+/// `priority` encodes pipeline-stage depth: later stages get higher
+/// priority so they pop ahead of earlier ones.  This drives the
+/// just-in-time scheduling model — every worker is interchangeable and
+/// always pulls the deepest available stage so the pipeline drains as
+/// soon as terminal work appears.  Default values for the MDD pipeline
+/// are: `STAGE_BOUNDARY = 0`, `STAGE_SOLVE_W / STAGE_SOLVE_WZ = 1`,
+/// `STAGE_SOLVE_Z = 2` (see `default_priority_for_stage` in
+/// `mode_adapters/mdd_stages.rs`).
 ///
-///   * `priority = 2+` — "valuable": likely to contain a solution or
-///     shrink a tight bound; the scheduler should pull it before
-///     fresh low-ranked items.
-///   * `priority = 1` — "maybe": ordinary work, same lane as fresh
-///     items.
-///   * `priority = 0` — "junk": large but low-yield residual, pulled
-///     only when nothing else is available.
-///
-/// Absolute values above 2 are not meaningful to the baseline
-/// scheduler but may be read by custom policies.
+/// `gold` is an explicit "skip the line" promotion flag.  It is
+/// experimentation infrastructure — set it to `true` when a
+/// per-item signal says "this cube is more likely than usual to
+/// contain an answer" so the scheduler can pull it in front of the
+/// regular priority queue.  Nothing currently sets `gold = true`, so
+/// the gold lane is expected to stay empty in default runs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkItem<T> {
     pub stage_id: StageId,
     pub priority: i32,
+    pub gold: bool,
     pub cost_hint: u32,
     pub replay_key: u64,
     pub mass_hint: Option<f64>,

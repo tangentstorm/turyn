@@ -426,6 +426,7 @@ fn wrap_items(
             Some(WorkItem {
                 stage_id,
                 priority: default_priority_for_stage(stage_id),
+                gold: false,
                 cost_hint: 1,
                 replay_key: parent.item_id,
                 mass_hint: None,
@@ -1035,6 +1036,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
             seed_items.push(WorkItem {
                 stage_id: STAGE_BOUNDARY,
                 priority: 0,
+                gold: false,
                 cost_hint: 1,
                 replay_key: i as u64,
                 mass_hint: Some(weight_hint),
@@ -1574,7 +1576,7 @@ mod tests {
         use crate::enumerate::phase_a_tuples;
         use crate::search_framework::engine::{EngineConfig, SearchEngine};
         use crate::search_framework::events::SearchEvent;
-        use crate::search_framework::queue::GoldThenWork;
+        use crate::search_framework::queue::LaneByPriority;
         use crate::types::Problem;
         use std::sync::atomic::AtomicBool;
         use std::time::Duration;
@@ -1600,7 +1602,7 @@ mod tests {
                 worker_count: 1,
                 bench_stop_log2_work: None,
             },
-            Box::new(GoldThenWork::new(4)),
+            Box::new(LaneByPriority::new()),
         );
 
         let mut final_snap = None;
@@ -1662,7 +1664,7 @@ mod tests {
         use crate::enumerate::phase_a_tuples;
         use crate::search_framework::engine::{EngineConfig, SearchEngine};
         use crate::search_framework::events::SearchEvent;
-        use crate::search_framework::queue::GoldThenWork;
+        use crate::search_framework::queue::LaneByPriority;
         use crate::types::Problem;
         use std::sync::atomic::AtomicBool;
         use std::time::Duration;
@@ -1686,7 +1688,7 @@ mod tests {
                 worker_count: 1,
                 bench_stop_log2_work: None,
             },
-            Box::new(GoldThenWork::new(4)),
+            Box::new(LaneByPriority::new()),
         );
 
         let mut final_snap = None;
@@ -1739,7 +1741,7 @@ mod tests {
         use crate::enumerate::phase_a_tuples;
         use crate::search_framework::engine::{EngineConfig, SearchEngine};
         use crate::search_framework::events::SearchEvent;
-        use crate::search_framework::queue::GoldThenWork;
+        use crate::search_framework::queue::LaneByPriority;
         use crate::types::Problem;
         use std::sync::Mutex;
         use std::sync::atomic::AtomicBool;
@@ -1763,7 +1765,7 @@ mod tests {
                 worker_count: 1,
                 bench_stop_log2_work: None,
             },
-            Box::new(GoldThenWork::new(4)),
+            Box::new(LaneByPriority::new()),
         );
 
         let history = Arc::new(Mutex::new(Vec::<f64>::new()));

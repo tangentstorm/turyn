@@ -105,6 +105,7 @@ impl SearchModeAdapter<StochasticPayload> for StochasticAdapter {
             seed_items: vec![WorkItem {
                 stage_id: STAGE_STOCHASTIC,
                 priority: 0,
+                gold: false,
                 cost_hint: 1,
                 replay_key: 0,
                 mass_hint: Some(1.0),
