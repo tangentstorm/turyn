@@ -5,8 +5,8 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rustfft::num_complex::Complex;
@@ -257,10 +257,16 @@ pub(crate) enum PipelineWork {
     SolveZ(SolveZWork),
 }
 
+#[derive(Clone)]
+pub(crate) struct XyRuntimeGraph {
+    pub(crate) root: u32,
+    pub(crate) nodes: Option<Arc<Vec<[u32; 4]>>>,
+}
+
 pub(crate) struct BoundaryWork {
     pub(crate) z_bits: u32,
     pub(crate) w_bits: u32,
-    pub(crate) xy_root: u32,
+    pub(crate) xy_graph: XyRuntimeGraph,
 }
 
 pub(crate) struct SolveWZWork {
@@ -269,7 +275,7 @@ pub(crate) struct SolveWZWork {
     pub(crate) tuple: SumTuple,
     pub(crate) z_bits: u32,
     pub(crate) w_bits: u32,
-    pub(crate) xy_root: u32,
+    pub(crate) xy_graph: XyRuntimeGraph,
     /// All tuples this boundary is compatible with; the combined SAT
     /// sees `V_w` = union of ±|σ_W| counts and `V_z` = union of ±|σ_Z|
     /// counts across this list.
@@ -298,7 +304,7 @@ pub(crate) struct SolveWWork {
     pub(crate) tuple: SumTuple,
     pub(crate) z_bits: u32,
     pub(crate) w_bits: u32,
-    pub(crate) xy_root: u32,
+    pub(crate) xy_graph: XyRuntimeGraph,
     /// All unsigned tuples this boundary is compatible with.  The W SAT
     /// is built with a `PbSetEq` over the union of their ±|σ_W| counts;
     /// each solved W middle decodes to a specific σ_W which narrows this
@@ -312,7 +318,7 @@ pub(crate) struct SolveZWork {
     pub(crate) w_bits: u32,
     pub(crate) w_vals: Vec<i8>,
     pub(crate) w_spectrum: Vec<f64>,
-    pub(crate) xy_root: u32,
+    pub(crate) xy_graph: XyRuntimeGraph,
     /// Tuples surviving the σ_W narrowing (|σ_W| of candidate matches
     /// the W the solver locked in).  The Z SAT is built with a
     /// `PbSetEq` over the union of their ±|σ_Z| counts.
@@ -356,6 +362,8 @@ pub(crate) struct PhaseBContext {
     /// `MddConstraint` propagator. Gated by env `XY_MDD=1`. Only the
     /// `--wz=apart` SolveZ stage is wired in this prototype.
     pub(crate) xy_mdd_mode: bool,
+    pub(crate) structural_xy_runtime: bool,
+    pub(crate) structural_xy_cache: Arc<Mutex<HashMap<u128, XyRuntimeGraph>>>,
     pub(crate) w_mid_vars: Vec<i32>,
     pub(crate) z_mid_vars: Vec<i32>,
     pub(crate) z_spectral_tables: Option<radical::SpectralTables>,
@@ -465,6 +473,73 @@ pub(crate) struct ZStageScratch {
     pub(crate) ext_cache: HashMap<u128, bool>,
 }
 
+fn compute_zw_sums_for_boundary(k: usize, z_bits: u32, w_bits: u32) -> Vec<i8> {
+    let mut zw_sums = vec![0i8; k];
+    for j in 0..k {
+        let mut sum = 0i32;
+        for i in 0..k - j {
+            let pos_a = i;
+            let pos_b = k + i + j;
+            let za = if (z_bits >> pos_a) & 1 == 1 { 1i32 } else { -1 };
+            let zb = if (z_bits >> pos_b) & 1 == 1 { 1i32 } else { -1 };
+            sum += 2 * za * zb;
+        }
+        if j < k - 1 {
+            for i in 0..k - j - 1 {
+                let pos_a = i;
+                let pos_b = k + i + j + 1;
+                let wa = if (w_bits >> pos_a) & 1 == 1 { 1i32 } else { -1 };
+                let wb = if (w_bits >> pos_b) & 1 == 1 { 1i32 } else { -1 };
+                sum += 2 * wa * wb;
+            }
+        }
+        zw_sums[j] = sum as i8;
+    }
+    zw_sums
+}
+
+pub(crate) fn loaded_xy_graph(xy_root: u32) -> XyRuntimeGraph {
+    XyRuntimeGraph {
+        root: xy_root,
+        nodes: None,
+    }
+}
+
+pub(crate) fn resolve_xy_graph<'a>(
+    xy_graph: &'a XyRuntimeGraph,
+    fallback_nodes: &'a [[u32; 4]],
+) -> (u32, &'a [[u32; 4]]) {
+    match &xy_graph.nodes {
+        Some(nodes) => (xy_graph.root, nodes.as_slice()),
+        None => (xy_graph.root, fallback_nodes),
+    }
+}
+
+pub(crate) fn xy_graph_for_boundary(
+    ctx: &PhaseBContext,
+    z_bits: u32,
+    w_bits: u32,
+    loaded_root: u32,
+) -> XyRuntimeGraph {
+    if !ctx.structural_xy_runtime {
+        return loaded_xy_graph(loaded_root);
+    }
+
+    let zw_sums = compute_zw_sums_for_boundary(ctx.k, z_bits, w_bits);
+    let key = mdd_zw_first::pack_sums(&zw_sums);
+    let mut cache = ctx.structural_xy_cache.lock().unwrap();
+    cache
+        .entry(key)
+        .or_insert_with(|| {
+            let (nodes, root) = mdd_zw_first::build_xy_for_boundary(ctx.k, &zw_sums);
+            XyRuntimeGraph {
+                root,
+                nodes: Some(Arc::new(nodes)),
+            }
+        })
+        .clone()
+}
+
 /// Boundary (stage 0) handler body, callable from both the legacy
 /// worker loop (`run_mdd_sat_search`) and the framework
 /// `BoundaryStage` adapter. Returns the 0-or-1 follow-up
@@ -487,7 +562,7 @@ pub(crate) fn process_boundary(
     if trace_bnd {
         eprintln!(
             "TRACE: found target boundary z=43 w=47 xy_root={}",
-            bnd.xy_root
+            bnd.xy_graph.root
         );
     }
     // Boundary dequeued — the walker is free to push another.
@@ -495,8 +570,10 @@ pub(crate) fn process_boundary(
         .pending_boundaries
         .fetch_sub(1, AtomicOrdering::Relaxed);
 
+    let xy_graph = xy_graph_for_boundary(ctx, bnd.z_bits, bnd.w_bits, bnd.xy_graph.root);
     let z_bnd_sum = 2 * (bnd.z_bits.count_ones() as i32) - ctx.max_bnd_sum;
     let w_bnd_sum = 2 * (bnd.w_bits.count_ones() as i32) - ctx.max_bnd_sum;
+    let (xy_root, xy_nodes) = resolve_xy_graph(&xy_graph, &ctx.mdd.nodes);
 
     let mut candidate_tuples: Vec<SumTuple> = Vec::with_capacity(ctx.tuples.len());
     for &tuple in &ctx.tuples {
@@ -516,13 +593,13 @@ pub(crate) fn process_boundary(
         }
         // MDD-guided fail-fast on XY sub-tree compatibility.
         if !crate::xy_sat::any_valid_xy(
-            bnd.xy_root,
+            xy_root,
             0,
             ctx.xy_zw_depth,
             0,
             0,
             &ctx.xy_pos_order,
-            &ctx.mdd.nodes,
+            xy_nodes,
             ctx.max_bnd_sum,
             ctx.middle_n as i32,
             tuple,
@@ -547,7 +624,7 @@ pub(crate) fn process_boundary(
             tuple: rep,
             z_bits: bnd.z_bits,
             w_bits: bnd.w_bits,
-            xy_root: bnd.xy_root,
+            xy_graph: xy_graph.clone(),
             candidate_tuples,
             attempt: 0,
             prior_blocks: Vec::new(),
@@ -557,7 +634,7 @@ pub(crate) fn process_boundary(
             tuple: rep,
             z_bits: bnd.z_bits,
             w_bits: bnd.w_bits,
-            xy_root: bnd.xy_root,
+            xy_graph: xy_graph.clone(),
             candidate_tuples,
         })
     };
@@ -729,7 +806,7 @@ pub(crate) fn process_solve_w(
                             w_bits: sw.w_bits,
                             w_vals,
                             w_spectrum: spec_buf.clone(),
-                            xy_root: sw.xy_root,
+                            xy_graph: sw.xy_graph.clone(),
                             candidate_tuples: narrowed,
                         }));
                     } else {
@@ -903,7 +980,7 @@ pub(crate) fn process_solve_w(
                 w_bits: sw.w_bits,
                 w_vals,
                 w_spectrum,
-                xy_root: sw.xy_root,
+                xy_graph: sw.xy_graph.clone(),
                 candidate_tuples: narrowed,
             }));
         }
@@ -1285,13 +1362,14 @@ pub(crate) fn process_solve_z(
         let candidate = CandidateZW { zw_autocorr };
         if ctx.xy_mdd_mode {
             let conflict_limit = if n > 30 { 5000 } else { 0 };
+            let (xy_root, xy_nodes) = resolve_xy_graph(&sz.xy_graph, &ctx.mdd.nodes);
             let (xy_res, stats) = try_candidate_via_mdd(
                 ctx.problem,
                 &candidate,
                 template,
                 k,
-                sz.xy_root,
-                &ctx.mdd.nodes,
+                xy_root,
+                xy_nodes,
                 &ctx.xy_pos_order,
                 conflict_limit,
                 // Accumulate the fresh XY-MDD solver's forcing
@@ -1352,14 +1430,15 @@ pub(crate) fn process_solve_z(
             // proper — same contract as the outer z_solver.
             let xy_plk0: Vec<[u64; radical::PropKind::COUNT]> =
                 state.solver.propagations_by_kind_level().to_vec();
+            let (xy_root, xy_nodes) = resolve_xy_graph(&sz.xy_graph, &ctx.mdd.nodes);
             walk_xy_sub_mdd(
-                sz.xy_root,
+                xy_root,
                 0,
                 ctx.xy_zw_depth,
                 0,
                 0,
                 &ctx.xy_pos_order,
-                &ctx.mdd.nodes,
+                xy_nodes,
                 ctx.max_bnd_sum,
                 ctx.middle_n as i32,
                 &sz.candidate_tuples,
@@ -2054,14 +2133,15 @@ pub(crate) fn process_solve_wz(
             // is needed to isolate this call's work.
             let xy_plk0: Vec<[u64; radical::PropKind::COUNT]> =
                 xy_solver.propagations_by_kind_level().to_vec();
+            let (xy_root, xy_nodes) = resolve_xy_graph(&swz.xy_graph, &ctx.mdd.nodes);
             walk_xy_sub_mdd(
-                swz.xy_root,
+                xy_root,
                 0,
                 ctx.xy_zw_depth,
                 0,
                 0,
                 &ctx.xy_pos_order,
-                &ctx.mdd.nodes,
+                xy_nodes,
                 ctx.max_bnd_sum,
                 ctx.middle_n as i32,
                 &swz.candidate_tuples,
@@ -2272,7 +2352,7 @@ pub(crate) fn process_solve_wz(
                 tuple: swz.tuple,
                 z_bits: swz.z_bits,
                 w_bits: swz.w_bits,
-                xy_root: swz.xy_root,
+                xy_graph: swz.xy_graph.clone(),
                 candidate_tuples: swz.candidate_tuples.clone(),
                 attempt: swz.attempt + 1,
                 prior_blocks: carried_blocks,
@@ -2366,6 +2446,8 @@ pub(crate) fn build_phase_b_context(
         conj_xy_product: cfg.conj_xy_product,
         conj_zw_bound: cfg.conj_zw_bound,
         xy_mdd_mode: std::env::var("XY_MDD").ok().as_deref() == Some("1"),
+        structural_xy_runtime: std::env::var("MDD_XY_RAW").ok().as_deref() != Some("1"),
+        structural_xy_cache: Arc::new(Mutex::new(HashMap::default())),
         w_mid_vars: (0..middle_m).map(|i| (i + 1) as i32).collect(),
         z_mid_vars: (0..middle_n).map(|i| (i + 1) as i32).collect(),
         z_spectral_tables: if middle_n >= 8 {
@@ -2482,7 +2564,7 @@ pub(crate) fn enumerate_live_boundaries(
             out.push(BoundaryWork {
                 z_bits,
                 w_bits,
-                xy_root: nid,
+                xy_graph: loaded_xy_graph(nid),
             });
             return;
         }

@@ -24,7 +24,7 @@ use crate::config::SearchConfig;
 use crate::legacy_search::WarmStartState;
 use crate::mdd_pipeline::{
     BoundaryWork, PhaseBContext, PipelineMetrics, PipelineWork, SolveWWork, SolveWZWork,
-    SolveZWork, ZStageScratch, build_phase_b_context, enumerate_live_boundaries,
+    SolveZWork, ZStageScratch, build_phase_b_context, enumerate_live_boundaries, loaded_xy_graph,
     mdd_navigate_to_outfix, new_pipeline_metrics, process_boundary, process_solve_w,
     process_solve_wz, process_solve_z,
 };
@@ -826,7 +826,7 @@ impl MddStagesAdapter {
                 Some(xy_root) => vec![BoundaryWork {
                     z_bits,
                     w_bits,
-                    xy_root,
+                    xy_graph: loaded_xy_graph(xy_root),
                 }],
                 None => {
                     eprintln!(
@@ -903,7 +903,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                 payload: MddPayload::Boundary(BoundaryWork {
                     z_bits: b.z_bits,
                     w_bits: b.w_bits,
-                    xy_root: b.xy_root,
+                    xy_graph: b.xy_graph.clone(),
                 }),
             });
         }

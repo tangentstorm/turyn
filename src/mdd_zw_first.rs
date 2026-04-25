@@ -12,6 +12,7 @@
 /// Each path through the top half arrives at a node that roots the sub-MDD of valid (x,y)
 /// pairs for that (z,w) boundary. This gives us the (z,w) → [(x,y)] mapping for free.
 use rustc_hash::FxHashMap as HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const DEAD: u32 = 0;
 pub const LEAF: u32 = u32::MAX;
@@ -26,7 +27,7 @@ pub type StateKey = (u128, u64);
 /// Bit layout depends on which half we're in (see BDKR_RULE_* constants):
 ///   ZW build: bit 0 = rule (iv) fired on Z, bit 1 = rule (v) fired on W
 ///   XY build: bit 0 = rule (ii) fired on X, bit 1 = rule (iii) fired on Y
-pub type BuildMemoKey = (u128, u64, u8);
+pub type BuildMemoKey = (u128, u64, u8, i16);
 
 /// BDKR rule-fired state bit positions (XY half).
 pub const BDKR_RULE_II_FIRED: u8 = 1 << 0;
@@ -42,6 +43,16 @@ pub const BDKR_RULE_V_FIRED: u8 = 1 << 1;
 pub const BDKR_W_TAIL_BIT: u8 = 1 << 2;
 pub const BDKR_W_TAIL_KNOWN: u8 = 1 << 3;
 
+static XY_PRODUCT_PRUNES: AtomicU64 = AtomicU64::new(0);
+
+pub fn reset_xy_product_prunes() {
+    XY_PRODUCT_PRUNES.store(0, Ordering::Relaxed);
+}
+
+pub fn xy_product_prunes() -> u64 {
+    XY_PRODUCT_PRUNES.load(Ordering::Relaxed)
+}
+
 pub fn pack_sums(sums: &[i8]) -> u128 {
     let mut packed = 0u128;
     for (i, &s) in sums.iter().enumerate() {
@@ -54,6 +65,37 @@ pub fn pack_active(vals: &[u8]) -> u64 {
     let mut packed = 0u64;
     for (i, &v) in vals.iter().enumerate() {
         packed |= (v as u64) << (i * 2);
+    }
+    packed
+}
+
+#[inline]
+pub fn bit_pair_inner(bit_xy: u8) -> i16 {
+    let x = bit_xy & 1;
+    let y = (bit_xy >> 1) & 1;
+    if x == y { 1 } else { -1 }
+}
+
+pub fn pack_active_xu(active: &[usize], vals: &[u8], k: usize) -> u64 {
+    let mut packed = 0u64;
+    let mut shift = 0u32;
+    let mut present = [false; 32];
+    for &p in active {
+        present[p] = true;
+    }
+    for (i, &p) in active.iter().enumerate() {
+        let bits = vals[i];
+        let x = bits & 1;
+        let y = (bits >> 1) & 1;
+        let u = if x == y { 1u8 } else { 0u8 };
+        packed |= (x as u64) << shift;
+        shift += 1;
+        let mirror = 2 * k - 1 - p;
+        let omit_u = p >= k && mirror < p && present[mirror];
+        if !omit_u {
+            packed |= (u as u64) << shift;
+            shift += 1;
+        }
     }
     packed
 }
@@ -850,6 +892,7 @@ impl ZwFirstMdd {
             close_pair_at_level: close_pair_at_level.clone(),
             w_tail_pos,
             target_pair_offset: 0,
+            lag_n2_filter: std::env::var("MDD_LAG_N2_FILTER").is_ok(),
         };
         let xy_ctx = XyBuildCtx {
             pos_order: pos_order.clone(),
@@ -865,6 +908,12 @@ impl ZwFirstMdd {
             close_pair_at_level,
             target_pair_offset: 0,
             initial_xy_rule_state: 0,
+            structural_xy_builder: std::env::var("MDD_XY_RAW").is_err(),
+            structural_ctx: Some(build_xy_structural_ctx(k)),
+            disable_xy_range_pruning: std::env::var("MDD_NO_XY_RANGE").is_ok(),
+            xy_inner_product_rule: std::env::var("MDD_XY_INNER").is_ok(),
+            xy_inner_product_target: 2,
+            initial_xy_sum: 0,
         };
 
         let mut nodes: Vec<[u32; 4]> = Vec::new();
@@ -1172,6 +1221,10 @@ pub struct ZwBuildCtx {
     /// the main build; equal to `base_k` in `build_extension` where the
     /// extension MDD starts at target pair `base_k`.
     pub target_pair_offset: usize,
+    /// Optional lag-(n-2) endpoint filter from Canonical1:
+    /// reject `z[n-2] - z[1] + w[n-2] = ±3`, equivalently
+    /// `(z_tail == w_tail) && (z_head != z_tail)`.
+    pub lag_n2_filter: bool,
 }
 
 /// DFS builder for ZW half. At the boundary, delegates to build_xy_dfs.
@@ -1226,17 +1279,34 @@ pub fn build_zw_dfs(
         }
         let target: Vec<i8> = sums.iter().map(|&s| -s).collect();
         let mut xy_sums = vec![0i8; ctx.k];
-        let result = build_xy_dfs(
-            0,
-            &mut xy_sums,
-            &[],
-            &target,
-            xy_ctx.initial_xy_rule_state,
-            xy_ctx,
-            nodes,
-            unique,
-            xy_memo,
-        );
+        let result = if xy_ctx.structural_xy_builder {
+            let structural_ctx = xy_ctx
+                .structural_ctx
+                .as_ref()
+                .expect("structural XY builder requires structural_ctx");
+            build_xy_structural_dfs(
+                &target,
+                xy_ctx.initial_xy_rule_state,
+                xy_ctx.initial_xy_sum + 2,
+                structural_ctx,
+                xy_ctx,
+                nodes,
+                unique,
+            )
+        } else {
+            build_xy_dfs(
+                0,
+                &mut xy_sums,
+                &[],
+                &target,
+                xy_ctx.initial_xy_rule_state,
+                xy_ctx.initial_xy_sum,
+                xy_ctx,
+                nodes,
+                unique,
+                xy_memo,
+            )
+        };
         xy_cache.insert(sums_key, result);
         return result;
     }
@@ -1263,6 +1333,7 @@ pub fn build_zw_dfs(
         pack_sums(sums),
         pack_active(&current_vals[..n_active]),
         zw_rule_state,
+        0,
     );
     if let Some(&cached) = zw_memo[level].get(&state_key) {
         return cached;
@@ -1358,6 +1429,22 @@ pub fn build_zw_dfs(
                             continue;
                         }
                         new_rule_state |= BDKR_RULE_V_FIRED;
+                    }
+                }
+
+                // Lag-(n-2) endpoint filter under Canonical1:
+                //   x[n-2] + x[1] + y[n-2] + y[1] = -2(z[n-2] - z[1] + w[n-2]).
+                // The left side is in {-4,-2,0,2,4}, so the right side cannot
+                // be ±6. That forbids z[n-2] - z[1] + w[n-2] = ±3, i.e.
+                // `zm == w_tail && zj != zm`.
+                if ctx.lag_n2_filter && target_j == 1 && new_rule_state & BDKR_W_TAIL_KNOWN != 0 {
+                    let w_tail = if new_rule_state & BDKR_W_TAIL_BIT != 0 {
+                        1u8
+                    } else {
+                        0
+                    };
+                    if zm == w_tail && zj != zm {
+                        continue;
                     }
                 }
             }
@@ -1459,6 +1546,32 @@ pub struct XyBuildCtx {
     /// `build_extension` seeded from the base bits so rules already fired in
     /// the base aren't re-checked.
     pub initial_xy_rule_state: u8,
+    /// Experimental structural XY builder: branch on `(X, U_half)` at the
+    /// ZW boundary instead of raw `(X, Y)` positions.
+    pub structural_xy_builder: bool,
+    /// Precomputed pair-level context for the structural XY builder.  This is
+    /// only used by the main ZW-boundary handoff; extension builds stay on the
+    /// raw XY builder in this first pass.
+    pub structural_ctx: Option<XyStructuralBuildCtx>,
+    /// Disable XY-half max-remaining range pruning while retaining exact
+    /// equality checks on completed lags.
+    pub disable_xy_range_pruning: bool,
+    /// Optional global inner-product filter: track Σ x_i y_i and require it
+    /// to reach the target at the leaf.
+    pub xy_inner_product_rule: bool,
+    pub xy_inner_product_target: i16,
+    pub initial_xy_sum: i16,
+}
+
+pub struct XyStructuralBuildCtx {
+    pub step_positions: Vec<(usize, usize)>,
+    pub events_at_level: Vec<Vec<(usize, usize, usize)>>,
+    pub lag_check_at_level: Vec<Vec<usize>>,
+    pub max_remaining: Vec<Vec<i32>>,
+    pub active_at_level: Vec<Vec<usize>>,
+    pub active_indices: Vec<Vec<usize>>,
+    pub k: usize,
+    pub depth: usize,
 }
 
 /// Returns true iff `pos_order` is the default bouncing layout — pair `j`
@@ -1496,6 +1609,111 @@ pub fn compute_close_pair_at_level(pos_order: &[usize], k: usize) -> Vec<Option<
     close
 }
 
+pub fn build_xy_structural_ctx(k: usize) -> XyStructuralBuildCtx {
+    let depth = k.saturating_sub(1);
+    let npos = 2 * k;
+    let pair_of_pos = |p: usize| -> Option<usize> {
+        if p == 0 || p + 1 == npos {
+            None
+        } else {
+            Some(std::cmp::min(p, npos - 1 - p) - 1)
+        }
+    };
+    let step_positions: Vec<(usize, usize)> = (1..k).map(|j| (j, npos - 1 - j)).collect();
+
+    let mut events_at_level: Vec<Vec<(usize, usize, usize)>> =
+        (0..depth).map(|_| Vec::new()).collect();
+    let mut lag_check_at_level: Vec<Vec<usize>> = (0..depth).map(|_| Vec::new()).collect();
+    let mut max_remaining: Vec<Vec<i32>> = vec![vec![0i32; k]; depth + 1];
+
+    for lag in 0..k {
+        let xy_pairs: Vec<(usize, usize)> = (0..k - lag).map(|i| (i, k + i + lag)).collect();
+        let mut complete_level = 0usize;
+        for &(a, b) in &xy_pairs {
+            let la = pair_of_pos(a).unwrap_or(0);
+            let lb = pair_of_pos(b).unwrap_or(0);
+            let level = la.max(lb);
+            if depth > 0 {
+                events_at_level[level].push((lag, a, b));
+            }
+            complete_level = complete_level.max(level);
+            for t in 0..=level {
+                max_remaining[t][lag] += 2;
+            }
+        }
+        if depth > 0 {
+            lag_check_at_level[complete_level].push(lag);
+        }
+    }
+
+    let mut last_use = vec![0usize; npos];
+    for (level, evs) in events_at_level.iter().enumerate() {
+        for &(_, a, b) in evs {
+            last_use[a] = last_use[a].max(level);
+            last_use[b] = last_use[b].max(level);
+        }
+    }
+
+    let mut active_at_level: Vec<Vec<usize>> = vec![Vec::new(); depth];
+    let mut active_indices: Vec<Vec<usize>> = vec![vec![usize::MAX; npos]; depth];
+    let mut active_prev: Vec<usize> = if npos == 0 {
+        Vec::new()
+    } else {
+        vec![0, npos - 1]
+    };
+    active_prev.sort_unstable();
+    active_prev.dedup();
+    for level in 0..depth {
+        let mut active: Vec<usize> = active_prev
+            .iter()
+            .copied()
+            .filter(|&p| last_use[p] >= level)
+            .collect();
+        let (a, b) = step_positions[level];
+        active.push(a);
+        active.push(b);
+        active.sort_unstable();
+        active.dedup();
+        for (i, &p) in active.iter().enumerate() {
+            active_indices[level][p] = i;
+        }
+        active_prev = active.clone();
+        active_at_level[level] = active;
+    }
+
+    XyStructuralBuildCtx {
+        step_positions,
+        events_at_level,
+        lag_check_at_level,
+        max_remaining,
+        active_at_level,
+        active_indices,
+        k,
+        depth,
+    }
+}
+
+pub fn derive_y_bits_from_x_u_half(x_bits: u32, u_half_bits: u32, k: usize) -> u32 {
+    let npos = 2 * k;
+    let mut y_bits = 0u32;
+    if npos == 0 {
+        return y_bits;
+    }
+    y_bits |= 1; // y[0] = +1
+    y_bits |= 1u32 << (npos - 1); // y[n-1] = +1
+    for j in 1..k {
+        let xj = ((x_bits >> j) & 1) as u8;
+        let xm = ((x_bits >> (npos - 1 - j)) & 1) as u8;
+        let uj = ((u_half_bits >> (j - 1)) & 1) as u8;
+        let um = 1 - uj;
+        let yj = if uj == 1 { xj } else { 1 - xj };
+        let ym = if um == 1 { xm } else { 1 - xm };
+        y_bits |= (yj as u32) << j;
+        y_bits |= (ym as u32) << (npos - 1 - j);
+    }
+    y_bits
+}
+
 /// DFS builder for XY sub-MDD. Builds the 4-way MDD for (x,y) assignments
 /// that make sums reach target_sums at each lag.
 ///
@@ -1509,12 +1727,16 @@ pub fn build_xy_dfs(
     active_bits: &[u8],
     target_sums: &[i8],
     xy_rule_state: u8,
+    xy_sum: i16,
     ctx: &XyBuildCtx,
     nodes: &mut Vec<[u32; 4]>,
     unique: &mut HashMap<u64, u32>,
     memo: &mut Vec<HashMap<BuildMemoKey, u32>>,
 ) -> u32 {
     if level == ctx.depth {
+        if ctx.xy_inner_product_rule && xy_sum != ctx.xy_inner_product_target {
+            return DEAD;
+        }
         for li in 0..ctx.k {
             if sums[li] != target_sums[li] {
                 return DEAD;
@@ -1545,6 +1767,7 @@ pub fn build_xy_dfs(
         pack_sums(sums),
         pack_active(&current_vals[..n_active]),
         xy_rule_state,
+        xy_sum,
     );
     if let Some(&cached) = memo[level].get(&state_key) {
         return cached;
@@ -1569,6 +1792,7 @@ pub fn build_xy_dfs(
             continue;
         }
         current_vals[new_idx] = branch as u8;
+        let new_xy_sum = xy_sum + bit_pair_inner(branch as u8);
 
         let mut new_rule_state = xy_rule_state;
         if let Some(j) = close_j {
@@ -1629,13 +1853,19 @@ pub fn build_xy_dfs(
         }
 
         let mut ok = true;
+        if ctx.xy_inner_product_rule {
+            let remaining = (ctx.depth - (level + 1)) as i16;
+            if (ctx.xy_inner_product_target - new_xy_sum).abs() > remaining {
+                ok = false;
+            }
+        }
         for &li in &ctx.lag_check[level] {
             if sums[li] != target_sums[li] {
                 ok = false;
                 break;
             }
         }
-        if ok && level + 1 < ctx.depth {
+        if ok && !ctx.disable_xy_range_pruning && level + 1 < ctx.depth {
             for li in 0..ctx.k {
                 let gap = (sums[li] as i32) - (target_sums[li] as i32);
                 let remaining = ctx.max_remaining[level + 1][li];
@@ -1653,6 +1883,7 @@ pub fn build_xy_dfs(
                 &current_vals[..n_active],
                 target_sums,
                 new_rule_state,
+                new_xy_sum,
                 ctx,
                 nodes,
                 unique,
@@ -1672,7 +1903,233 @@ pub fn build_xy_dfs(
     result
 }
 
+pub fn build_xy_structural_dfs(
+    target_sums: &[i8],
+    initial_rule_state: u8,
+    initial_xy_sum: i16,
+    structural_ctx: &XyStructuralBuildCtx,
+    ctx: &XyBuildCtx,
+    nodes: &mut Vec<[u32; 4]>,
+    unique: &mut HashMap<u64, u32>,
+) -> u32 {
+    fn dfs(
+        pair_level: usize,
+        sums: &mut [i8],
+        active_bits: &[u8],
+        xy_rule_state: u8,
+        xy_sum: i16,
+        structural_ctx: &XyStructuralBuildCtx,
+        target_sums: &[i8],
+        ctx: &XyBuildCtx,
+        nodes: &mut Vec<[u32; 4]>,
+        unique: &mut HashMap<u64, u32>,
+        memo: &mut Vec<HashMap<BuildMemoKey, u32>>,
+    ) -> u32 {
+        if pair_level == structural_ctx.depth {
+            if ctx.xy_inner_product_rule && xy_sum != ctx.xy_inner_product_target {
+                return DEAD;
+            }
+            for li in 0..structural_ctx.k {
+                if sums[li] != target_sums[li] {
+                    return DEAD;
+                }
+            }
+            return LEAF;
+        }
+
+        let active = &structural_ctx.active_at_level[pair_level];
+        let n_active = active.len();
+        let mut current_vals = [0u8; 32];
+        if pair_level > 0 {
+            let prev_indices = &structural_ctx.active_indices[pair_level - 1];
+            for (i, &pos) in active.iter().enumerate() {
+                let (step_a, step_b) = structural_ctx.step_positions[pair_level];
+                if pos != step_a && pos != step_b {
+                    let pi = prev_indices[pos];
+                    if pi != usize::MAX {
+                        current_vals[i] = active_bits[pi];
+                    }
+                }
+            }
+        }
+        if let Some(idx0) = active.iter().position(|&p| p == 0) {
+            current_vals[idx0] = 0b11;
+        }
+        if let Some(idx1) = active.iter().position(|&p| p == 2 * structural_ctx.k - 1) {
+            current_vals[idx1] = 0b11;
+        }
+
+        let state_key: BuildMemoKey = (
+            pack_sums(sums),
+            pack_active_xu(active, &current_vals[..n_active], structural_ctx.k),
+            xy_rule_state,
+            xy_sum,
+        );
+        if let Some(&cached) = memo[pair_level].get(&state_key) {
+            return cached;
+        }
+
+        let actual_level = 2 + 2 * pair_level;
+        let (j, mirror) = structural_ctx.step_positions[pair_level];
+        let idx_j = structural_ctx.active_indices[pair_level][j];
+        let idx_m = structural_ctx.active_indices[pair_level][mirror];
+        let mut front_children = [DEAD; 4];
+
+        for front_branch in 0u32..4 {
+            let xj = (front_branch & 1) as u8;
+            let yj = ((front_branch >> 1) & 1) as u8;
+            current_vals[idx_j] = front_branch as u8;
+            let uj = (xj == yj) as u8;
+            let mut mirror_children = [DEAD; 4];
+
+            for mirror_branch in 0u32..4 {
+                let xm = (mirror_branch & 1) as u8;
+                let ym = ((mirror_branch >> 1) & 1) as u8;
+                let um = (xm == ym) as u8;
+                if um == uj {
+                    XY_PRODUCT_PRUNES.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                current_vals[idx_m] = mirror_branch as u8;
+                let new_xy_sum = xy_sum
+                    + bit_pair_inner(front_branch as u8)
+                    + bit_pair_inner(mirror_branch as u8);
+
+                let mut new_rule_state = xy_rule_state;
+                if xy_rule_state & BDKR_RULE_II_FIRED == 0 && xj != xm {
+                    if xj != 1 {
+                        continue;
+                    }
+                    new_rule_state |= BDKR_RULE_II_FIRED;
+                }
+                if xy_rule_state & BDKR_RULE_III_FIRED == 0 && yj != ym {
+                    if yj != 1 {
+                        continue;
+                    }
+                    new_rule_state |= BDKR_RULE_III_FIRED;
+                }
+                let target_j = ctx.target_pair_offset + j;
+                if target_j == 1 {
+                    if xj != yj {
+                        if xj != 1 {
+                            continue;
+                        }
+                    } else if xm != 1 || ym != 0 {
+                        continue;
+                    }
+                }
+
+                let xy_delta = make_xy_delta();
+                for &(lag_idx, a, b) in &structural_ctx.events_at_level[pair_level] {
+                    let ia = structural_ctx.active_indices[pair_level][a];
+                    let ib = structural_ctx.active_indices[pair_level][b];
+                    let ba = current_vals[ia] as usize;
+                    let bb = current_vals[ib] as usize;
+                    sums[lag_idx] += xy_delta[ba * 4 + bb];
+                }
+
+                let mut ok = true;
+                if ctx.xy_inner_product_rule {
+                    let remaining = 2 * (structural_ctx.depth - (pair_level + 1)) as i16;
+                    if (ctx.xy_inner_product_target - new_xy_sum).abs() > remaining {
+                        ok = false;
+                    }
+                }
+                for &li in &structural_ctx.lag_check_at_level[pair_level] {
+                    if sums[li] != target_sums[li] {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok && !ctx.disable_xy_range_pruning && pair_level + 1 < structural_ctx.depth {
+                    for li in 0..structural_ctx.k {
+                        let gap = sums[li] as i32 - target_sums[li] as i32;
+                        let remaining = structural_ctx.max_remaining[pair_level + 1][li];
+                        if gap.abs() > remaining {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+
+                if ok {
+                    mirror_children[mirror_branch as usize] = dfs(
+                        pair_level + 1,
+                        sums,
+                        &current_vals[..n_active],
+                        new_rule_state,
+                        new_xy_sum,
+                        structural_ctx,
+                        target_sums,
+                        ctx,
+                        nodes,
+                        unique,
+                        memo,
+                    );
+                }
+
+                for &(lag_idx, a, b) in &structural_ctx.events_at_level[pair_level] {
+                    let ia = structural_ctx.active_indices[pair_level][a];
+                    let ib = structural_ctx.active_indices[pair_level][b];
+                    let ba = current_vals[ia] as usize;
+                    let bb = current_vals[ib] as usize;
+                    sums[lag_idx] -= xy_delta[ba * 4 + bb];
+                }
+            }
+
+            front_children[front_branch as usize] =
+                reduce_node((actual_level + 1) as u8, mirror_children, nodes, unique);
+        }
+
+        let result = reduce_node(actual_level as u8, front_children, nodes, unique);
+        memo[pair_level].insert(state_key, result);
+        result
+    }
+
+    if structural_ctx.k == 0 {
+        return DEAD;
+    }
+
+    if structural_ctx.k == 1 {
+        let mut sums = vec![0i8; 1];
+        sums[0] = 2;
+        let live = sums[0] == target_sums[0]
+            && (!ctx.xy_inner_product_rule || initial_xy_sum == ctx.xy_inner_product_target);
+        let leaf = if live { LEAF } else { DEAD };
+        let endpoint_1 = reduce_node(1, [DEAD, DEAD, DEAD, leaf], nodes, unique);
+        return reduce_node(0, [DEAD, DEAD, DEAD, endpoint_1], nodes, unique);
+    }
+
+    let mut memo: Vec<HashMap<BuildMemoKey, u32>> = (0..=structural_ctx.depth)
+        .map(|_| HashMap::default())
+        .collect();
+    let mut sums = vec![0i8; structural_ctx.k];
+    let interior_root = dfs(
+        0,
+        &mut sums,
+        &[],
+        initial_rule_state,
+        initial_xy_sum,
+        structural_ctx,
+        target_sums,
+        ctx,
+        nodes,
+        unique,
+        &mut memo,
+    );
+    let endpoint_1 = reduce_node(1, [DEAD, DEAD, DEAD, interior_root], nodes, unique);
+    reduce_node(0, [DEAD, DEAD, DEAD, endpoint_1], nodes, unique)
+}
+
 pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
+    if std::env::var("MDD_XY_RAW").is_ok() {
+        build_xy_for_boundary_raw(k, zw_sums)
+    } else {
+        build_xy_structural_for_boundary(k, zw_sums)
+    }
+}
+
+pub fn build_xy_for_boundary_raw(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
     assert_eq!(zw_sums.len(), k, "zw_sums must have k={} elements", k);
 
     let zw_depth = 2 * k;
@@ -1786,6 +2243,12 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
         close_pair_at_level,
         target_pair_offset: 0,
         initial_xy_rule_state: 0,
+        structural_xy_builder: false,
+        structural_ctx: None,
+        disable_xy_range_pruning: std::env::var("MDD_NO_XY_RANGE").is_ok(),
+        xy_inner_product_rule: std::env::var("MDD_XY_INNER").is_ok(),
+        xy_inner_product_target: 2,
+        initial_xy_sum: 0,
     };
 
     let target: Vec<i8> = zw_sums.iter().map(|&s| -s).collect();
@@ -1796,12 +2259,54 @@ pub fn build_xy_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
         &[],
         &target,
         0,
+        0,
         &ctx,
         &mut nodes,
         &mut unique,
         &mut memo,
     );
 
+    (nodes, root)
+}
+
+pub fn build_xy_structural_for_boundary(k: usize, zw_sums: &[i8]) -> (Vec<[u32; 4]>, u32) {
+    assert_eq!(zw_sums.len(), k, "zw_sums must have k={} elements", k);
+    let target: Vec<i8> = zw_sums.iter().map(|&s| -s).collect();
+    let structural_ctx = build_xy_structural_ctx(k);
+    let raw_pos_order: Vec<usize> = (0..k).flat_map(|t| [t, 2 * k - 1 - t]).collect();
+    let ctx = XyBuildCtx {
+        pos_order: raw_pos_order.clone(),
+        events: Vec::new(),
+        lag_check: Vec::new(),
+        max_remaining: Vec::new(),
+        active_at_level: Vec::new(),
+        active_indices: Vec::new(),
+        k,
+        depth: 2 * k,
+        symmetry_break: true,
+        canonical_rules: is_bouncing_order(&raw_pos_order, k),
+        close_pair_at_level: compute_close_pair_at_level(&raw_pos_order, k),
+        target_pair_offset: 0,
+        initial_xy_rule_state: 0,
+        structural_xy_builder: true,
+        structural_ctx: Some(build_xy_structural_ctx(k)),
+        disable_xy_range_pruning: std::env::var("MDD_NO_XY_RANGE").is_ok(),
+        xy_inner_product_rule: std::env::var("MDD_XY_INNER").is_ok(),
+        xy_inner_product_target: 2,
+        initial_xy_sum: 0,
+    };
+    let mut nodes: Vec<[u32; 4]> = Vec::new();
+    nodes.push([DEAD; 4]);
+    let mut unique: HashMap<u64, u32> = HashMap::default();
+    let root = build_xy_structural_dfs(
+        &target,
+        0,
+        2,
+        &structural_ctx,
+        &ctx,
+        &mut nodes,
+        &mut unique,
+    );
     (nodes, root)
 }
 
@@ -1897,6 +2402,16 @@ pub fn compute_extension_initial_rule_state(
     }
 
     Some((zw, xy))
+}
+
+fn xy_inner_sum_for_bits(bits_x: u32, bits_y: u32, len: usize) -> i16 {
+    let mut total = 0i16;
+    for i in 0..len {
+        let x = ((bits_x >> i) & 1) as u8;
+        let y = ((bits_y >> i) & 1) as u8;
+        total += if x == y { 1 } else { -1 };
+    }
+    total
 }
 
 /// Build an MDD that extends a k=base_k boundary to k=target_k.
@@ -2441,6 +2956,7 @@ pub fn build_extension(
         // position ever matches and the DFS never re-snapshots.
         w_tail_pos: usize::MAX,
         target_pair_offset: base_k,
+        lag_n2_filter: std::env::var("MDD_LAG_N2_FILTER").is_ok(),
     };
     let ext_xy_ctx = XyBuildCtx {
         pos_order,
@@ -2456,6 +2972,12 @@ pub fn build_extension(
         close_pair_at_level,
         target_pair_offset: base_k,
         initial_xy_rule_state: init_xy_state,
+        structural_xy_builder: false,
+        structural_ctx: None,
+        disable_xy_range_pruning: std::env::var("MDD_NO_XY_RANGE").is_ok(),
+        xy_inner_product_rule: std::env::var("MDD_XY_INNER").is_ok(),
+        xy_inner_product_target: 2,
+        initial_xy_sum: xy_inner_sum_for_bits(x_bits, y_bits, 2 * base_k),
     };
     let mut sums = initial_sums;
     let mut zw_memo_count = 0usize;
@@ -2795,6 +3317,274 @@ pub fn has_extension_fast(
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn compute_zw_sums(k: usize, z_bits: u32, w_bits: u32) -> Vec<i8> {
+        let mut zw_sums = vec![0i8; k];
+        for j in 0..k {
+            let mut sum = 0i32;
+            for i in 0..k - j {
+                let pos_a = i;
+                let pos_b = k + i + j;
+                let za = if (z_bits >> pos_a) & 1 == 1 { 1i32 } else { -1 };
+                let zb = if (z_bits >> pos_b) & 1 == 1 { 1i32 } else { -1 };
+                sum += 2 * za * zb;
+            }
+            if j < k - 1 {
+                for i in 0..k - j - 1 {
+                    let pos_a = i;
+                    let pos_b = k + i + j + 1;
+                    let wa = if (w_bits >> pos_a) & 1 == 1 { 1i32 } else { -1 };
+                    let wb = if (w_bits >> pos_b) & 1 == 1 { 1i32 } else { -1 };
+                    sum += 2 * wa * wb;
+                }
+            }
+            zw_sums[j] = sum as i8;
+        }
+        zw_sums
+    }
+
+    fn compute_xy_sums(k: usize, x_bits: u32, y_bits: u32) -> Vec<i8> {
+        let mut xy_sums = vec![0i8; k];
+        for j in 0..k {
+            let mut sum = 0i32;
+            for i in 0..k - j {
+                let pos_a = i;
+                let pos_b = k + i + j;
+                let xa = if (x_bits >> pos_a) & 1 == 1 { 1i32 } else { -1 };
+                let xb = if (x_bits >> pos_b) & 1 == 1 { 1i32 } else { -1 };
+                let ya = if (y_bits >> pos_a) & 1 == 1 { 1i32 } else { -1 };
+                let yb = if (y_bits >> pos_b) & 1 == 1 { 1i32 } else { -1 };
+                sum += xa * xb + ya * yb;
+            }
+            xy_sums[j] = sum as i8;
+        }
+        xy_sums
+    }
+
+    fn xy_product_law_holds(x_bits: u32, y_bits: u32, k: usize) -> bool {
+        let npos = 2 * k;
+        let same_u = |pos: usize| ((x_bits >> pos) & 1) == ((y_bits >> pos) & 1);
+        if !same_u(0) || !same_u(npos - 1) {
+            return false;
+        }
+        for j in 1..k {
+            let mirror = npos - 1 - j;
+            if same_u(j) == same_u(mirror) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn canonical_xy_rules_hold(x_bits: u32, y_bits: u32, k: usize) -> bool {
+        let bit = |bits: u32, i: usize| ((bits >> i) & 1) as u8;
+        let mut rule_ii_fired = false;
+        let mut rule_iii_fired = false;
+        for j in 0..k {
+            let mirror = 2 * k - 1 - j;
+            let xj = bit(x_bits, j);
+            let xm = bit(x_bits, mirror);
+            let yj = bit(y_bits, j);
+            let ym = bit(y_bits, mirror);
+            if !rule_ii_fired && xj != xm {
+                if xj != 1 {
+                    return false;
+                }
+                rule_ii_fired = true;
+            }
+            if !rule_iii_fired && yj != ym {
+                if yj != 1 {
+                    return false;
+                }
+                rule_iii_fired = true;
+            }
+            if j == 1 {
+                if xj != yj {
+                    if xj != 1 {
+                        return false;
+                    }
+                } else if xm != 1 || ym != 0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn u_half_bits_from_xy(x_bits: u32, y_bits: u32, k: usize) -> u32 {
+        let mut u_half_bits = 0u32;
+        for j in 1..k {
+            let u = (((x_bits >> j) & 1) == ((y_bits >> j) & 1)) as u32;
+            u_half_bits |= u << (j - 1);
+        }
+        u_half_bits
+    }
+
+    fn boundary_mdd(k: usize, nodes: Vec<[u32; 4]>) -> ZwFirstMdd {
+        ZwFirstMdd {
+            nodes,
+            root: 1,
+            k,
+            total_depth: 4 * k,
+            zw_depth: 2 * k,
+            zw_pos_order: (0..k).flat_map(|t| [t, 2 * k - 1 - t]).collect(),
+            xy_pos_order: (0..k).flat_map(|t| [t, 2 * k - 1 - t]).collect(),
+        }
+    }
+
+    fn collect_xy_leaves(k: usize, nodes: Vec<[u32; 4]>, root: u32) -> HashSet<(u32, u32)> {
+        let mdd = boundary_mdd(k, nodes);
+        let mut leaves = HashSet::new();
+        mdd.enumerate_xy(root, |x_bits, y_bits| {
+            leaves.insert((x_bits, y_bits));
+        });
+        leaves
+    }
+
+    fn distinct_zw_sums(k: usize) -> Vec<Vec<i8>> {
+        let full = ZwFirstMdd::build(k);
+        let mut distinct = HashMap::<Vec<i8>, ()>::default();
+        full.enumerate_zw(|z_bits, w_bits, _xy_root| {
+            distinct.insert(compute_zw_sums(k, z_bits, w_bits), ());
+        });
+        distinct.into_keys().collect()
+    }
+
+    #[test]
+    fn structural_xy_equals_raw_builder_filtered_by_product_law() {
+        for k in 2..=5 {
+            let zw_sum_cases = distinct_zw_sums(k);
+            assert!(
+                !zw_sum_cases.is_empty(),
+                "expected at least one distinct zw_sums case for k={k}"
+            );
+
+            for zw_sums in &zw_sum_cases {
+                let (raw_nodes, raw_root) = build_xy_for_boundary_raw(k, zw_sums);
+                let raw_filtered: HashSet<_> = collect_xy_leaves(k, raw_nodes, raw_root)
+                    .into_iter()
+                    .filter(|&(x_bits, y_bits)| {
+                        xy_product_law_holds(x_bits, y_bits, k)
+                            && canonical_xy_rules_hold(x_bits, y_bits, k)
+                    })
+                    .collect();
+
+                let (struct_nodes, struct_root) = build_xy_structural_for_boundary(k, zw_sums);
+                let structural = collect_xy_leaves(k, struct_nodes, struct_root);
+
+                assert_eq!(
+                    structural, raw_filtered,
+                    "structural XY must exactly match raw XY filtered by product law for k={k}, zw_sums={zw_sums:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn structural_xy_leaves_satisfy_semantic_invariants() {
+        let k = 4;
+        for zw_sums in &distinct_zw_sums(k) {
+            let (struct_nodes, struct_root) = build_xy_structural_for_boundary(k, zw_sums);
+            let mdd = boundary_mdd(k, struct_nodes);
+            mdd.enumerate_xy(struct_root, |x_bits, y_bits| {
+                assert!(xy_product_law_holds(x_bits, y_bits, k));
+                assert!(canonical_xy_rules_hold(x_bits, y_bits, k));
+                assert_eq!(
+                    compute_xy_sums(k, x_bits, y_bits),
+                    zw_sums.iter().map(|&s| -s).collect::<Vec<_>>()
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn derive_y_from_x_u_half_round_trips_structural_leaves() {
+        let k = 4;
+        let full = ZwFirstMdd::build(k);
+        let mut sample = None;
+        full.enumerate_zw(|z_bits, w_bits, _| {
+            if sample.is_none() {
+                let zw_sums = compute_zw_sums(k, z_bits, w_bits);
+                let (_, root) = build_xy_structural_for_boundary(k, &zw_sums);
+                if root != DEAD {
+                    sample = Some(zw_sums);
+                }
+            }
+        });
+        if sample.is_none() {
+            full.enumerate_zw(|z_bits, w_bits, _| {
+                if sample.is_none() {
+                    let zw_sums = compute_zw_sums(k, z_bits, w_bits);
+                    if build_xy_for_boundary_raw(k, &zw_sums).1 != DEAD {
+                        sample = Some(zw_sums);
+                    }
+                }
+            });
+        }
+        let zw_sums = sample.expect("expected at least one live structural boundary");
+        let (nodes, root) = build_xy_structural_for_boundary(k, &zw_sums);
+        let mdd = ZwFirstMdd {
+            nodes,
+            root: 1,
+            k,
+            total_depth: 4 * k,
+            zw_depth: 2 * k,
+            zw_pos_order: (0..k).flat_map(|t| [t, 2 * k - 1 - t]).collect(),
+            xy_pos_order: (0..k).flat_map(|t| [t, 2 * k - 1 - t]).collect(),
+        };
+        let mut saw_leaf = false;
+        mdd.enumerate_xy(root, |x_bits, y_bits| {
+            let u_half_bits = u_half_bits_from_xy(x_bits, y_bits, k);
+            assert_eq!(derive_y_bits_from_x_u_half(x_bits, u_half_bits, k), y_bits);
+            saw_leaf = true;
+        });
+        assert!(saw_leaf);
+    }
+
+    #[test]
+    fn build_xy_for_boundary_defaults_to_structural_and_raw_env_falls_back() {
+        let _guard = env_lock().lock().unwrap();
+        let k = 4;
+        let full = ZwFirstMdd::build(k);
+        let mut sample = None;
+        full.enumerate_zw(|z_bits, w_bits, _| {
+            if sample.is_none() {
+                sample = Some(compute_zw_sums(k, z_bits, w_bits));
+            }
+        });
+        let zw_sums = sample.unwrap();
+
+        unsafe {
+            std::env::remove_var("MDD_XY_RAW");
+        }
+        let (default_nodes, default_root) = build_xy_for_boundary(k, &zw_sums);
+        let (struct_nodes, struct_root) = build_xy_structural_for_boundary(k, &zw_sums);
+        assert_eq!(default_root, struct_root);
+        assert_eq!(default_nodes, struct_nodes);
+
+        unsafe {
+            std::env::set_var("MDD_XY_RAW", "1");
+        }
+        let (raw_fallback_nodes, raw_fallback_root) = build_xy_for_boundary(k, &zw_sums);
+        let (raw_nodes, raw_root) = build_xy_for_boundary_raw(k, &zw_sums);
+        assert_eq!(raw_fallback_root, raw_root);
+        assert_eq!(raw_fallback_nodes, raw_nodes);
+        unsafe {
+            std::env::remove_var("MDD_XY_RAW");
+        }
+    }
 }
 
 /// ZW-only extension check for use at stage 0 (Boundary handler).

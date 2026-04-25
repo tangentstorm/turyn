@@ -1,15 +1,18 @@
 /// Generate a ZW-first MDD boundary table and save to file.
-/// Usage: gen_mdd [k] [outfile] [--legacy] [--zw-only]
+/// Usage: gen_mdd [k] [outfile] [--legacy] [--zw-only] [--xy-raw]
 /// Default: k=8, outfile=mdd-{k}.bin
 /// --legacy: use 16-way interleaved build + reorder (slower, more memory)
 /// --zw-only: build ZW half only (no XY sub-MDDs). Much faster, smaller file.
 ///            Use build_xy_for_boundary() at runtime for XY.
+/// --xy-raw: use the legacy raw (X,Y) XY boundary builder instead of the
+///           default structural X+U-half builder.
 /// Default is ZW-first direct builder (faster, 4x less node memory)
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let k: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(8);
     let zw_only = args.iter().any(|s| s == "--zw-only");
+    let xy_raw = args.iter().any(|s| s == "--xy-raw");
     let default_out = if zw_only {
         format!("mdd-{}-zw.bin", k)
     } else {
@@ -33,11 +36,23 @@ fn main() {
             std::env::set_var("MDD_ZW_ONLY", "1");
         }
     }
+    if xy_raw {
+        unsafe {
+            std::env::set_var("MDD_XY_RAW", "1");
+        }
+    } else {
+        turyn::mdd_zw_first::reset_xy_product_prunes();
+    }
 
     eprintln!(
-        "Building MDD for k={}{} (valid for all n >= {})",
+        "Building MDD for k={}{}{} (valid for all n >= {})",
         k,
         if zw_only { " [ZW-only]" } else { "" },
+        if xy_raw {
+            " [XY-raw]"
+        } else {
+            " [XY-structural]"
+        },
         2 * k
     );
 
@@ -102,6 +117,12 @@ fn main() {
         node_count,
         size_bytes as f64 / 1_048_576.0
     );
+    if !xy_raw {
+        eprintln!(
+            "Structural XY mirror-U prunes: {}",
+            turyn::mdd_zw_first::xy_product_prunes()
+        );
+    }
 
     reordered.save(outfile).expect("Failed to write MDD file");
     let file_size = std::fs::metadata(outfile).map(|m| m.len()).unwrap_or(0);
