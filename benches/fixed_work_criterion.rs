@@ -4,22 +4,19 @@
 //! `--bench-cover-log2=X`, so every sample covers approximately the same
 //! raw-equivalent amount of work and SAT hits do not end the run early.
 //!
-//! Environment knobs:
+//! Command-line knobs:
 //!
-//! - `TURYN_CRIT_N` (default `10`)
-//! - `TURYN_CRIT_WZ` (default `cross`)
-//! - `TURYN_CRIT_MDD_K` (optional)
-//! - `TURYN_CRIT_COVER_LOG2` (default `8`)
-//! - `TURYN_CRIT_SAT_SECS` (default `30`)
+//! - `--turyn-n=N` (default `10`)
+//! - `--turyn-wz=cross|apart|together|sync` (default `cross`)
+//! - `--turyn-mdd-k=K` (optional)
+//! - `--turyn-cover-log2=X` (default `8`)
+//! - `--turyn-sat-secs=S` (default `30`)
 //!
 //! Example:
 //!
 //! ```text
-//! $env:TURYN_CRIT_N=26
-//! $env:TURYN_CRIT_WZ="together"
-//! $env:TURYN_CRIT_MDD_K=7
-//! $env:TURYN_CRIT_COVER_LOG2=34
-//! cargo bench --bench fixed_work_criterion
+//! cargo bench --bench fixed_work_criterion -- \
+//!   --turyn-n=26 --turyn-wz=together --turyn-mdd-k=7 --turyn-cover-log2=34
 //! ```
 
 use std::path::PathBuf;
@@ -27,7 +24,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion};
 
 #[derive(Clone, Debug)]
 struct BenchConfig {
@@ -39,14 +36,36 @@ struct BenchConfig {
 }
 
 impl BenchConfig {
-    fn from_env() -> Self {
-        Self {
-            n: env_parse("TURYN_CRIT_N").unwrap_or(10),
-            wz: std::env::var("TURYN_CRIT_WZ").unwrap_or_else(|_| "cross".to_string()),
-            mdd_k: env_parse("TURYN_CRIT_MDD_K"),
-            cover_log2: env_parse("TURYN_CRIT_COVER_LOG2").unwrap_or(8.0),
-            sat_secs: env_parse("TURYN_CRIT_SAT_SECS").unwrap_or(30),
+    fn from_args() -> Self {
+        let mut cfg = Self::default();
+        for arg in std::env::args().skip(1) {
+            if arg == "--turyn-help" {
+                print_usage_and_exit();
+            } else if let Some(v) = arg.strip_prefix("--turyn-n=") {
+                cfg.n = parse_arg("--turyn-n", v);
+            } else if let Some(v) = arg.strip_prefix("--turyn-wz=") {
+                cfg.wz = v.to_string();
+            } else if let Some(v) = arg.strip_prefix("--turyn-mdd-k=") {
+                cfg.mdd_k = Some(parse_arg("--turyn-mdd-k", v));
+            } else if let Some(v) = arg.strip_prefix("--turyn-cover-log2=") {
+                cfg.cover_log2 = parse_arg("--turyn-cover-log2", v);
+            } else if let Some(v) = arg.strip_prefix("--turyn-sat-secs=") {
+                cfg.sat_secs = parse_arg("--turyn-sat-secs", v);
+            }
         }
+        cfg.validate();
+        cfg
+    }
+
+    fn validate(&self) {
+        match self.wz.as_str() {
+            "cross" | "apart" | "together" | "sync" => {}
+            other => panic!("--turyn-wz must be one of cross|apart|together|sync, got {other:?}"),
+        }
+        assert!(
+            self.cover_log2.is_finite() && self.cover_log2 >= 0.0,
+            "--turyn-cover-log2 must be a non-negative finite number"
+        );
     }
 
     fn label(&self) -> String {
@@ -71,8 +90,38 @@ impl BenchConfig {
     }
 }
 
-fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
-    std::env::var(name).ok()?.parse().ok()
+impl Default for BenchConfig {
+    fn default() -> Self {
+        Self {
+            n: 10,
+            wz: "cross".to_string(),
+            mdd_k: None,
+            cover_log2: 8.0,
+            sat_secs: 30,
+        }
+    }
+}
+
+fn parse_arg<T: std::str::FromStr>(name: &str, value: &str) -> T {
+    value
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} has invalid value {value:?}"))
+}
+
+fn print_usage_and_exit() -> ! {
+    eprintln!(
+        "fixed_work_criterion options:\n\
+         \n\
+         --turyn-n=N\n\
+         --turyn-wz=cross|apart|together|sync\n\
+         --turyn-mdd-k=K\n\
+         --turyn-cover-log2=X\n\
+         --turyn-sat-secs=S\n\
+         \n\
+         example:\n\
+         cargo bench --bench fixed_work_criterion -- --turyn-n=26 --turyn-wz=together --turyn-mdd-k=7 --turyn-cover-log2=34"
+    );
+    std::process::exit(0);
 }
 
 fn project_root() -> PathBuf {
@@ -118,7 +167,7 @@ fn run_one(cfg: &BenchConfig) -> Duration {
 }
 
 fn fixed_work_bench(c: &mut Criterion) {
-    let cfg = BenchConfig::from_env();
+    let cfg = BenchConfig::from_args();
     let id = BenchmarkId::new("turyn_fixed_work", cfg.label());
 
     c.bench_with_input(id, &cfg, |b, cfg| {
@@ -132,12 +181,11 @@ fn fixed_work_bench(c: &mut Criterion) {
     });
 }
 
-criterion_group! {
-    name = benches;
-    config = Criterion::default()
+fn main() {
+    let mut criterion = Criterion::default()
         .sample_size(10)
         .measurement_time(Duration::from_secs(30))
         .warm_up_time(Duration::from_secs(3));
-    targets = fixed_work_bench
+    fixed_work_bench(&mut criterion);
+    criterion.final_summary();
 }
-criterion_main!(benches);
