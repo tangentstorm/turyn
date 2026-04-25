@@ -1,143 +1,217 @@
-Your goal is to optimize the "time to cover" metric, so that we can tackle
-searching for longer and longer Turyn-type sequences, and eventually find TT(56), which in turn will let us produce an Hadamard matrix of order 668!
+Your goal is to improve Turyn search performance, measured by fixed-work
+coverage benchmarks and explained through the TTC levers in `docs/TTC.md`.
 
-Start by running gen_mdd for sizes 5, 6, 7, 8... Then run the divan benchmarks to see how the system performs in the current environment.
+The long-term target is TT(56). Do not optimize for a single proxy counter
+unless you can explain why that counter should move TTC.
 
-Next, review the ideas in the IDEAS file, and update it with new ideas as you go along. Always consider the *evidence* you would need to actually measure whether an idea has impact.
+## First Read
 
-Try to select (or brainstorm) 10 possible improvements during this session.
-Document your findings. If none lead to a speedup, try 10 more.
+Before changing code, read:
 
-Ideally try to focus on --wz=sync ... It's not the fastest approach we have at the moment, but I feel like it *should* be. :)
+- `docs/TTC.md`
+- `IDEAS.md`
+- `docs/OPTIMIZATION_LOG.md`
+- the relevant code path for the mode you are touching
 
-## Adding ideas
+For MDD modes, start with:
 
-Add the list of ideas to IDEAS.md. Write each idea as a small change
-you could make in a single commit. For each idea, write a brief but
-explicit annotation:
+- `src/search_framework/engine.rs`
+- `src/search_framework/mode_adapters/mdd_stages.rs`
+- `src/mdd_pipeline.rs`
+- `src/xy_sat.rs`
+- `radical/src/lib.rs` if the idea touches SAT propagation/search
 
-- **TTC mechanism**: which lever does it pull?
-  - *denominator* — shrinks live_zw_paths (MDD pruning, larger k,
-    tighter spectral / sum filters at boundary-gen time) or
-    est_total_xy (cross mode).
-  - *rate* — speeds up any stage (MDD walk, SolveW, SolveZ, SolveXY)
-    so stage_exit[*]/elapsed rises.
-  - *shortfall* — reduces XY SAT timeouts so each walked boundary
-    contributes a full 1.0 to eff instead of a fraction.
-  - *instrumentation* — doesn't change runtime, makes future TTC
-    experiments measurable.
-- **Detection plan**: which counter(s) should move? Pick from
-  stage_exit[0..3], `flow_{w,z,xy}_{decisions,propagations,
-  root_forced,free_sum,solves}, flow_xy_{sat,unsat,timeout,
-  timeout_cov_micro}, extensions_pruned, live_zw_paths`,
-  effective_coverage_metric. If none fit, you may need to add an
-  atomic counter as part of the change.
+For sync mode, start with:
 
-## Working an untested idea
+- `src/search_framework/mode_adapters/sync.rs`
+- `src/sync_walker.rs`
+- `radical/src/lib.rs`
 
-For each untested idea in IDEAS.md:
+## Benchmark Principle
 
-1. **Establish a clean baseline.** Make sure nothing else is using the
-   CPU. Use the benchmark whose lever your idea targets:
-   - **MDD-mode TTC** (preferred for any change inside the unified
-     pipeline):
-     ```
-     target/release/turyn --n=26 --wz=apart --mdd-k=7 --sat-secs=60
-     target/release/turyn --n=56 --wz=apart --mdd-k=10 --sat-secs=30
-     ```
-     Record the Time to cover: line **and** the underlying
-     eff bnd/s, live ZW paths, XY-timeout %, and per-stage
-     pruning block — so the win (or loss) is decomposable.
-   - **Cross-mode TTC**:
-     ```
-     target/release/turyn --n=26 --wz=cross --sat-secs=60
-     ```
-   - **SAT microbench** (only when the idea is purely inside radical
-     and unrelated to the pipeline; rare):
-     ```
-     target/release/turyn --n=22 --wz=apart --mdd-k=5 --sat-secs=60
-     ```
-   - **Generation-side benchmarks** (--benchmark=N exhaustive runs)
-     are *proxies for rate only* — never accept or reject an MDD-mode
-     change on --benchmark numbers alone.
+Use fixed-work coverage as the primary signal, not "found a solution" and not
+one-off wall-clock runs.
 
-2. **Verify the change actually went in.** Don't trust your own
-   description, the docs, or earlier IDEAS.md entries. Confirm with
-   grep / Read against src/main.rs, src/sat_z_middle.rs,
-   src/mdd_zw_first.rs, or radical/src/lib.rs that the new code
-   path is reachable and exercised by the benchmark you ran.
+The benchmark target is:
 
-3. **Run the benchmark again.** Compare TTC and the three levers
-   (denominator / rate / shortfall) line-by-line.
+```text
+covered_log2_work >= X
+```
 
-4. **Iterate while there's headroom.** As long as you can see a way
-   to make the same idea pull harder on its lever, implement and
-   re-benchmark. Re-profile if you've stalled — propagate,
-   recompute_quad_pb, compute_quad_pb_explanation_into,
-   solve_inner are the historical hot spots; if your idea moves a
-   different one, say so.
+This means "cover about `2^X` raw-equivalent configurations." The search should
+print SAT solutions if it finds them, but it must keep going until the fixed
+coverage target is reached.
 
-5. **Decide.**
-   - If TTC dropped clearly and decisively (the change isn't in the
-     noise on the relevant benchmark) AND you understand which
-     lever moved AND the per-lever decomposition agrees with your
-     theory:
-     - move the idea to docs/OPTIMIZATION_LOG.md with TTC
-       before/after, the lever tag, and the moved counters,
-     - report the speedup % and the lever to the user in chat,
-     - commit with TTC delta and implementation notes.
-   - If the change is "within noise" or only moves xy/s / bnd/s
-     without moving TTC: don't commit. Consider whether you missed
-     an optimization within the same idea, and don't be afraid to
-     pull out the profiler. Sometimes an idea needs two or three
-     rounds before it stops fighting itself.
-   - If after iteration there's still no TTC win: move to the
-     "rejected" / "tried" section of IDEAS.md with the measured
-     lever changes (e.g. "+30% rate, –40% denominator, net 0
-     TTC") so future readers know which trade-off killed it.
+Primary harness:
 
-6. **Always note cumulative TTC.** Every commit message should
-   reference the running TTC since the start of the session, not
-   just the local delta.
+```powershell
+cargo bench --bench fixed_work_criterion -- --turyn-n=26 --turyn-wz=together --turyn-mdd-k=7 --turyn-cover-log2=34
+```
 
-## Earn the win
+Useful variants:
 
-Don't commit "in-noise" changes even when they look like wins on a
-single proxy metric. Earn it on TTC. If it wasn't a clear and
-decisive win but you still believe in the idea, re-profile and
-iterate. Several historically-rejected ideas in this repo (E1
-extension check, quad PB, XY dedup) were rejected on bnd/s before
-they were accepted on a deeper metric — so don't give up on the
-first try, but also don't lower the bar.
+```powershell
+cargo bench --bench fixed_work_criterion -- --turyn-n=26 --turyn-wz=apart --turyn-mdd-k=7 --turyn-cover-log2=34
+cargo bench --bench fixed_work_criterion -- --turyn-n=56 --turyn-wz=apart --turyn-mdd-k=10 --turyn-cover-log2=34 --turyn-sat-secs=120
+cargo bench --bench fixed_work_criterion -- --turyn-n=56 --turyn-wz=sync --turyn-cover-log2=34 --turyn-sat-secs=120
+```
 
-## Beware of metric-change opportunities
+Adjust `--turyn-cover-log2` so samples take long enough to measure but short
+enough to repeat. If a sample is sub-second or saturated, increase it. If it
+takes too long to iterate, decrease it.
 
-If you find yourself rejecting an idea because xy/s went down, stop
-and check whether it pulled the *denominator* lever instead — fewer
-solves per boundary is a TTC win even at lower xy/s. The "boundaries/s
-paradigm shift" section in IDEAS.md exists exactly because we kept
-making this mistake.
+## Session Loop
 
-If a benchmark becomes so easy that you can't easily tell whether
-the run improved, increase the difficulty (raise n, raise
---sat-secs, lower --mdd-k). Don't try to extract signal from a
-TTC of "0s" or a saturated-fast pipeline.
+1. Pick one idea from `IDEAS.md`, or add a new small idea if the file lacks a
+   good candidate.
 
-## Debugging discipline
+2. State the expected TTC mechanism:
 
-When debugging:
+   - **denominator**: shrinks the live search space
+   - **rate**: covers the same mass faster
+   - **shortfall**: reduces timeout/partial-credit loss
+   - **instrumentation**: makes future claims measurable
 
-1. **List every assumption you're making**, plus every assumption
-   the code seems to be making (look at the comments and the data-
-   flow, not just function signatures).
-2. **List the evidence you actually have** for each assumption —
-   "the docs say so" is not evidence; "I just read line 3458 of
-   src/main.rs and saw the call" is. Distinguish carefully.
-3. Use the gap between (1) and (2) to decide which assumptions to
-   probe first. The unsupported ones are usually wrong.
-4. Soundness bugs (e.g. the XOR/QuadPB false-UNSAT chain in Feb
-   2026) silently *inflate* TTC by giving full credit to walked-
-   but-not-actually-explored boundaries. If a "speedup" makes TTC
-   improbably good, suspect soundness before celebrating — re-run
-   the known-TT(n) regression tests for the affected n.
+3. Establish a baseline with the fixed-work Criterion harness. Record:
 
+   - benchmark command
+   - median/mean timing from Criterion
+   - `Framework search` summary line if useful
+   - relevant counters from stderr/stdout if the run prints them
+
+4. Implement the smallest code change that tests the idea.
+
+5. Verify the code path is actually exercised. Do not rely on comments or
+   intent. Use grep, direct reads, or targeted assertions/logging.
+
+6. Re-run the same fixed-work benchmark.
+
+7. Decide:
+
+   - Accept only if the change has a statistically credible improvement on the
+     fixed-work benchmark and the moved counters match the stated mechanism.
+   - Treat anything around 1% as real only if repeated/interleaved runs support
+     it. Single-run 1% wins are noise.
+   - Reject or keep iterating if the change only improves a proxy counter but
+     does not improve fixed-work coverage time.
+
+8. Update `IDEAS.md`:
+
+   - If accepted, mark the idea as accepted and summarize the evidence.
+   - If rejected, mark it rejected with the measured reason.
+   - If inconclusive, say exactly what additional measurement is needed.
+
+9. If accepted, update `docs/OPTIMIZATION_LOG.md` with:
+
+   - command(s)
+   - before/after timing
+   - speedup percentage
+   - TTC mechanism
+   - counters that moved
+   - correctness validation
+
+10. Commit only accepted changes. The commit message must include the benchmark
+    delta and the mechanism, for example:
+
+    ```text
+    MDD: cache boundary spectral prep
+
+    fixed-work n=26 together k=7 2^34: -3.2% median
+    mechanism: rate; fewer SolveZ prep allocations
+    ```
+
+## Acceptance Bar
+
+Do not commit "in-noise" changes.
+
+Use this rule of thumb:
+
+- `>= 5%` with matching counters: usually acceptable after a sanity rerun
+- `2-5%`: rerun/interleave before accepting
+- `< 2%`: require strong repeated evidence and very low complexity
+- regression or unclear mechanism: reject or keep investigating
+
+For a real 1% improvement, run enough samples to show the confidence interval
+clears zero. Do not accept it because one run looked faster.
+
+## Idea Format
+
+When adding ideas to `IDEAS.md`, write each as a one-commit experiment:
+
+```markdown
+### Idea: short name
+
+- **Change**: concrete code change.
+- **TTC mechanism**: denominator | rate | shortfall | instrumentation.
+- **Expected counters**: exact counters or measurements that should move.
+- **Benchmark**: exact fixed-work command.
+- **Risk**: soundness, memory, determinism, or complexity risk.
+- **Status**: untested | accepted | rejected | inconclusive.
+```
+
+Counters to consider:
+
+- `stage_exit[0..3]`
+- `flow_{w,z,xy}_{decisions,propagations,root_forced,free_sum,solves}`
+- `flow_xy_{sat,unsat,timeout,timeout_cov_micro}`
+- `flow_w_timeout`
+- `flow_z_timeout`
+- `extensions_pruned`
+- `live_zw_paths`
+- `covered_mass`
+- fixed-work sample time
+
+If no existing counter fits the idea, add instrumentation as part of the
+experiment.
+
+## Correctness Discipline
+
+Soundness matters more than speed. A false-UNSAT bug can make TTC look amazing
+by crediting work that was never validly ruled out.
+
+For SAT/MDD changes, run at least:
+
+```powershell
+cargo test -q -p radical
+cargo build -q --workspace
+```
+
+When the change touches known TT acceptance paths, also run an affected known-TT
+regression or a small search that must find a solution.
+
+If a full workspace test fails for environmental MDD scratch-file reasons,
+record the exact failure and still run the narrow tests relevant to your
+change.
+
+## Debugging Discipline
+
+When stuck:
+
+1. List every assumption you are making.
+2. For each assumption, list the evidence you have from code or measurement.
+3. Probe the unsupported assumptions first.
+4. Re-profile only after you have a reproducible benchmark case.
+
+Historical hot spots include:
+
+- SAT propagation
+- `recompute_quad_pb`
+- `compute_quad_pb_explanation_into`
+- `solve_inner`
+- MDD boundary setup and SolveZ preparation
+
+## Output At The End Of Each Tick
+
+Report:
+
+- idea attempted
+- files changed
+- benchmark command(s)
+- before/after result
+- accepted/rejected/inconclusive
+- validation commands
+- commit hash, if committed
+
+If no idea produced a win, leave the repo cleaner than you found it: revert your
+own failed code changes, keep only useful documentation/instrumentation updates,
+and record the failed experiment in `IDEAS.md`.
