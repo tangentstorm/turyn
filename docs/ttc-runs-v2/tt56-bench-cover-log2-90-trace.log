@@ -1,0 +1,12 @@
+turyn settings: --n=56 --wz=apart --mdd-k=7 --mdd-extend=1 --theta=128 --max-z=200000 --max-w=200000 --conflict-limit=0 --sat-secs=600 --bench-cover-log2=90 --continue-after-sat --quad-pb=true --xor-propagation  (threads=4)
+Loaded MDD from mdd-7.bin (k=7, 14470 nodes, 0.2 MB, 1.04e8 live / 7.21e16 total paths, 1.45e-9 live fraction)
+[framework:apart] seed_boundaries=1465976 (pre-enumerated upfront); weights min=7978723 max=1000000000 total=277911999983664 (skew=125.3x)
+[framework:apart] elapsed=562.7ms covered=0.000/1.000 ttc=None TTC (unconstrained baseline)
+[framework:apart] elapsed=616.1ms covered=0.000/1.000 ttc=Some(9197170.461892888s) TTC (unconstrained baseline)
+Framework search (--wz=apart): covered=0.000/1.000 elapsed=678.1ms ttc=Some(2285667.843765734s) (quality=Hybrid) TTC (unconstrained baseline)
+Framework search (--wz=apart): found_solution=false
+[framework:apart] stage_exit bnd/W/Z/XY = 23731/0/0/0
+[framework:apart] flow W: unsat=0 timeout=0 sol=0 spec_fail=0 spec_pass=0 solves=0
+[framework:apart] flow Z: unsat=0 timeout=0 sol=0 pair_fail=0 spec_fail=0 solves=0
+[framework:apart] flow XY: sat=0 unsat=0 timeout=0 solves=0 zw_bound_rej=0 ext_pruned=0
+[framework:apart] boundaries: abandoned=0 (SAT-timeout-closed, retained partial only)
