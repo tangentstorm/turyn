@@ -994,11 +994,109 @@ pub(crate) fn walk_xy_sub_mdd<F: FnMut(u32, u32)>(
     );
 }
 
-/// Return true iff the XY sub-MDD rooted at `xy_root` has at least one
-/// (x_bits, y_bits) leaf compatible with the tuple's sum constraints.
-/// Early-exits on the first valid candidate. Used to fail-fast SolveZ
-/// items whose boundary can't possibly produce a valid XY completion.
-pub(crate) fn any_valid_xy(
+/// Per-tuple constants used by the multi-tuple `valid_xy_tuple_mask`
+/// walk. Pre-computing these once per `process_boundary` call avoids
+/// re-deriving `tuple.x.abs()` etc. at every MDD leaf.
+#[derive(Clone, Copy)]
+pub(crate) struct TupleLeafCheck {
+    pub(crate) x_abs: i32,
+    pub(crate) y_abs: i32,
+}
+
+impl TupleLeafCheck {
+    pub(crate) fn from_tuple(t: SumTuple) -> Self {
+        Self {
+            x_abs: t.x.abs(),
+            y_abs: t.y.abs(),
+        }
+    }
+}
+
+#[inline(always)]
+fn side_feasible(target: i32, abs: i32, middle_n: i32) -> bool {
+    // For abs == 0 the only candidate sign is 0 (val = -target).
+    // For abs != 0 we test both ±abs, accepting if either passes
+    // `|v| <= middle_n && (v + middle_n) % 2 == 0`.
+    if abs == 0 {
+        let v = -target;
+        v.abs() <= middle_n && (v + middle_n) % 2 == 0
+    } else {
+        let v_pos = abs - target;
+        let v_neg = -abs - target;
+        ((v_pos.abs() <= middle_n) && ((v_pos + middle_n) & 1) == 0)
+            || ((v_neg.abs() <= middle_n) && ((v_neg + middle_n) & 1) == 0)
+    }
+}
+
+/// Walk the XY sub-MDD once and return a bitmask of tuples whose leaf
+/// constraints are satisfied by at least one reachable leaf.  Bit `i`
+/// of the result is set iff at least one (x_bits, y_bits) leaf in the
+/// MDD satisfies `tuples[i]`'s ±|σ_X|, ±|σ_Y| count + parity check.
+/// This batches what used to be a per-tuple walk into a single pass:
+/// the MDD shape is tuple-independent so the recursion structure is
+/// identical, and only the per-leaf check differs.
+///
+/// `wanted_mask` is the set of tuples still in play; the walk skips
+/// already-validated tuples in the leaf check and short-circuits when
+/// every wanted tuple has been validated.  Caller passes
+/// `(1 << tuples.len()) - 1` to start.
+pub(crate) fn valid_xy_tuple_mask(
+    xy_root: u32,
+    xy_depth: usize,
+    pos_order: &[usize],
+    nodes: &[[u32; 4]],
+    max_bnd_sum: i32,
+    middle_n: i32,
+    tuples: &[TupleLeafCheck],
+    wanted_mask: u32,
+) -> u32 {
+    debug_assert!(tuples.len() <= 32);
+    let mut found_mask = 0u32;
+    walk_multi(
+        xy_root,
+        0,
+        xy_depth,
+        0,
+        0,
+        pos_order,
+        nodes,
+        max_bnd_sum,
+        middle_n,
+        tuples,
+        wanted_mask,
+        &mut found_mask,
+    );
+    found_mask
+}
+
+#[inline]
+fn check_leaf_multi(
+    x_acc: u32,
+    y_acc: u32,
+    max_bnd_sum: i32,
+    middle_n: i32,
+    tuples: &[TupleLeafCheck],
+    pending_mask: u32,
+    found_mask: &mut u32,
+) {
+    let x_bnd_sum = 2 * (x_acc.count_ones() as i32) - max_bnd_sum;
+    let y_bnd_sum = 2 * (y_acc.count_ones() as i32) - max_bnd_sum;
+    let mut m = pending_mask;
+    while m != 0 {
+        let bit = m & m.wrapping_neg();
+        let i = bit.trailing_zeros() as usize;
+        m ^= bit;
+        let t = tuples[i];
+        if side_feasible(x_bnd_sum, t.x_abs, middle_n)
+            && side_feasible(y_bnd_sum, t.y_abs, middle_n)
+        {
+            *found_mask |= bit;
+        }
+    }
+}
+
+#[inline]
+fn walk_multi(
     nid: u32,
     level: usize,
     xy_depth: usize,
@@ -1008,43 +1106,52 @@ pub(crate) fn any_valid_xy(
     nodes: &[[u32; 4]],
     max_bnd_sum: i32,
     middle_n: i32,
-    tuple: SumTuple,
-) -> bool {
-    // Magnitude-based feasibility (tries both σ signs, matching walk_xy_sub_mdd).
-    let feasible =
-        |val: i32, middle_n: i32| -> bool { val.abs() <= middle_n && (val + middle_n) % 2 == 0 };
-    let check_leaf = |x_acc: u32, y_acc: u32| -> bool {
-        let x_bnd_sum = 2 * (x_acc.count_ones() as i32) - max_bnd_sum;
-        let y_bnd_sum = 2 * (y_acc.count_ones() as i32) - max_bnd_sum;
-        let x_abs = tuple.x.abs();
-        let y_abs = tuple.y.abs();
-        let x_signs: &[i32] = if x_abs == 0 { &[0] } else { &[1, -1] };
-        let y_signs: &[i32] = if y_abs == 0 { &[0] } else { &[1, -1] };
-        x_signs
-            .iter()
-            .any(|&sx| feasible(sx * x_abs - x_bnd_sum, middle_n))
-            && y_signs
-                .iter()
-                .any(|&sy| feasible(sy * y_abs - y_bnd_sum, middle_n))
-    };
+    tuples: &[TupleLeafCheck],
+    wanted_mask: u32,
+    found_mask: &mut u32,
+) {
     if nid == mdd_reorder::DEAD {
-        return false;
+        return;
     }
-    if level == xy_depth {
-        return check_leaf(x_acc, y_acc);
+    let pending = wanted_mask & !*found_mask;
+    if pending == 0 {
+        return;
     }
     if nid == mdd_reorder::LEAF {
-        return true;
+        // Match the legacy `any_valid_xy` semantics: a LEAF reached
+        // before xy_depth means "remaining (x_bits, y_bits) are
+        // unconstrained" and the legacy code returned true
+        // unconditionally without enumerating leaf extensions.
+        // Mirror that here by marking every still-pending tuple as
+        // valid through this branch.  Walking the unconstrained
+        // subtree would be more precise but a) tighten pruning vs
+        // legacy (denominator change requires its own validation)
+        // and b) cost up to 4^(xy_depth-level) leaf checks.
+        *found_mask |= pending;
+        return;
+    }
+    if level == xy_depth {
+        check_leaf_multi(
+            x_acc,
+            y_acc,
+            max_bnd_sum,
+            middle_n,
+            tuples,
+            pending,
+            found_mask,
+        );
+        return;
     }
     let pos = pos_order[level];
+    let row = &nodes[nid as usize];
     for branch in 0u32..4 {
-        let child = nodes[nid as usize][branch as usize];
+        let child = row[branch as usize];
         if child == mdd_reorder::DEAD {
             continue;
         }
-        let a_val = (branch >> 0) & 1;
+        let a_val = branch & 1;
         let b_val = (branch >> 1) & 1;
-        if any_valid_xy(
+        walk_multi(
             child,
             level + 1,
             xy_depth,
@@ -1054,12 +1161,14 @@ pub(crate) fn any_valid_xy(
             nodes,
             max_bnd_sum,
             middle_n,
-            tuple,
-        ) {
-            return true;
+            tuples,
+            wanted_mask,
+            found_mask,
+        );
+        if (wanted_mask & !*found_mask) == 0 {
+            return;
         }
     }
-    false
 }
 
 pub(crate) struct LagFilter {

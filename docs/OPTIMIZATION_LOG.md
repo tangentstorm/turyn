@@ -2,6 +2,81 @@
 
 This file tracks performance-oriented changes and their measured impact.
 
+## April 25 2026 — multi-tuple XY MDD walk in `process_boundary` (-21 % fixed-work, mdd-mode boundary stage)
+
+`src/mdd_pipeline.rs::process_boundary` previously called
+`any_valid_xy` once per tuple (16× at n=26), each call walking the
+same XY sub-MDD up to depth 14 with only the per-leaf ±|σ_X|, ±|σ_Y|
+check changing between calls. A probe showed σ-fails were 0 at
+n=26 k=7 for every boundary and tuple, so the per-tuple XY walk was
+the dominant cost in the boundary stage.
+
+Replaced with a single multi-tuple walk (`valid_xy_tuple_mask` in
+`src/xy_sat.rs`): one recursive descent that returns a 32-bit
+bitmask of tuples whose leaf check passes for at least one
+reachable leaf. At each leaf, the per-tuple check runs over the
+still-pending mask; an early exit fires when every wanted tuple is
+already validated. The legacy LEAF-before-`xy_depth` semantics
+(unconstrained residual ⇒ unconditionally true) is preserved by
+OR-ing the pending mask straight into the result instead of
+walking the unconstrained subtree.
+
+### Benchmark: `cargo bench --bench fixed_work_criterion`
+
+Command:
+
+```text
+cargo bench --bench fixed_work_criterion -- \
+  --turyn-n=26 --turyn-wz=apart --turyn-mdd-k=7 \
+  --turyn-cover-log2=50 --turyn-sat-secs=120
+```
+
+Criterion, 10 samples each side, sequential machine:
+
+| | Time (95% CI) |
+|---|---|
+| Baseline | 11.16 — 11.22 — 11.28 s |
+| After | 8.81 — 8.89 — 8.97 s |
+
+Change: **+24.8 % to +27.5 % faster (p < 0.05)** — confidence intervals
+do not overlap.
+
+Standard documented profile (`--turyn-wz=together --turyn-cover-log2=34`)
+also drops from ~7.7 s median (pre-session baseline) to ~5.7 s
+median; that profile is high-variance because cover-log2=34 is hit
+within 50 ms of the seed-boundaries enumeration finishing, so the
+larger cover-log2=50 run is the cleaner statistical signal and is
+the headline number.
+
+### TTC mechanism
+
+**Rate.** The boundary stage's per-second throughput rises ~25 %
+because each boundary now does a single XY walk instead of
+`n_tuples` walks. `stage_exit[0]/elapsed` rises proportionally.
+Soundness preserved: `flow_z_*` and `flow_xy_*` on TT(18)/TT(22)
+match the legacy run for the same seed, confirming the same
+boundaries pass the σ + XY filter into stage 1.
+
+### Counters that moved
+
+- `stage_exit[0]` per second: up ~25 %
+- `flow_bnd_sum_fail` total: unchanged (still bumped once per
+  failing tuple, just in batched bit-count form)
+- TT(18) `flow Z: unsat=548 sol=11`, TT(18) `flow XY: sat=1`:
+  identical to baseline.
+
+### Correctness validation
+
+- TT(18) `--wz=apart --mdd-k=5 --sat-secs=10`: still solves
+  (`flow XY: sat=1`).
+- TT(22) `--wz=apart --mdd-k=5 --sat-secs=20`: full pipeline fires.
+- `cargo test --release --bin turyn -- --test-threads=1 --skip
+  outfix`: 89 passed, 0 failed.
+  - 3 `outfix_*` tests fail on this checkout because they require
+    `mdd-9.bin`, which has to be generated with `gen_mdd 9` and
+    is not present here. This is the documented MDD scratch-file
+    failure mode in `TICK-PROMPT.md`.
+
 ## April 19 2026 — `--wz=sync` deep optimization session (-99.3 % TTC cumulative, 150×)
 
 A single multi-hour session pushed `--wz=sync` from baseline TTC
@@ -1010,7 +1085,7 @@ the Notes column; otherwise the legacy number is preserved as-is.
 
 | Date (UTC) | Change | Why it helps | Measured effect |
 |---|---|---|---|
-| 2026-04-19 | Remove `--wz=xyzw` mode entirely: delete `solve_xyzw` (legacy three-phase Tseitin XY solver), `WzMode::Xyzw` variant, `--wz-xyzw-tuples` flag, main dispatch case, mdd\_pipeline early-return branch. | xyzw was a strict subset of `--wz=sync` (same BDKR Tseitin chains, no spectral/walker/parallel). Keeping it cost tests, cli surface area, and a whole parallel code path that nobody was debugging. | -498 lines, zero behavioral change for `cross/apart/together/sync`. `--wz=sync` smoke tests still pass (TT(18) solves <1s); `--wz=apart` n=56 unchanged. **TTC lever**: instrumentation (maintenance only — reduces future work, no rate/denominator/shortfall delta). |
+| 2026-04-25 | Multi-tuple XY MDD walk in `process_boundary` (`src/mdd_pipeline.rs`, `src/xy_sat.rs`): replace `n_tuples` separate `any_valid_xy` calls per boundary with a single `valid_xy_tuple_mask` walk that batches the per-leaf σ_X/σ_Y check across all surviving tuples and returns a u32 bitmask. LEAF-before-`xy_depth` semantics matched to the legacy walker (mark all pending tuples valid, no walk of the unconstrained subtree). | At n=26 the boundary stage was iterating 16 tuples × one MDD walk each = 16 recursive descents over the same XY sub-MDD, just with different per-leaf checks. The walk shape is tuple-independent so a single descent suffices; surviving tuples are accumulated in a bitmask. | Criterion `--turyn-n=26 --turyn-wz=apart --turyn-mdd-k=7 --turyn-cover-log2=50 --turyn-sat-secs=120`: baseline `[11.16 s 11.22 s 11.28 s]` → after `[8.81 s 8.89 s 8.97 s]` (95% CI), **+24.8% to +27.5% faster, p < 0.05**. **TTC lever**: rate. Counters: `stage_exit[0]/elapsed` rises ~25%; `flow_bnd_sum_fail` total unchanged; TT(18) `flow XY: sat=1` and TT(22) full-pipeline counters identical to baseline. |
 | 2026-04-19 | Per-feature SAT propagator telemetry: add `PropKind` enum (7 variants: Clause, Pb, QuadPb, Xor, Spectral, Mdd, PbSetEq) and a `Solver::prop_by_kind` counter array incremented from the single `enqueue` site. Expose via `propagations_by_kind(kind)`. Wire into `sync_walker` via pre/post delta capture around each `propagate_only` call, aggregated into `SyncStats::{prop_by_kind_total, forced_by_level_kind}`. Emit three new telemetry blocks: one-line per-feature summary, per-(level, kind) matrix, and direct TTC from DFS coverage product. All blocks publish on timeout (written unconditionally at end of `thread::scope`). | Without per-feature attribution we could not tell which propagator was the bottleneck — e.g. whether quad PB or clause BCP was dominating time at each walker level. This is pure instrumentation, but it unlocks targeted rate optimizations. | n=18 `--wz=sync` breakdown: 81% clause BCP / 18% quadpb / 0.7% pbseteq; ratio uniform across levels; pbseteq activates only at depth ≥11; levels n-3..n-1 do 99% of work. No runtime delta on `cross/apart/together`. **TTC lever**: instrumentation for future rate work. |
 | 2026-04-19 | Direct TTC from DFS coverage product (`Π_L cov(L)`) added alongside projection-based TTC in `--wz=sync`. Both print unconditionally at end of run. | The projection estimator (`b_eff` per level → full tree size) is biased when early levels have tiny sample counts. The coverage product is a second independent estimator based purely on "fraction of siblings that survived to the next propagate call" — disagreement between the two flags noisy levels. | Measured: n=56 sync TTC 9.67e9 s parallel (~307 yrs, 16 threads); n=56 apart k=8 TTC 1.68e6 s (~19.5 days, 16 threads). **TTC lever**: instrumentation. |
 | 2026-04-05 | Batch solver clone per ZW group in cubed SAT path: clone once per (z_bits, w_bits, tuple) group, add Z/W boundary as permanent unit clauses, use solve_with_assumptions() for XY boundary variations. | Reduces clones from ~8K to ~500 per 60s run. Learnt clauses from earlier XY configs transfer to later ones within the same ZW group, improving the rate over time. | n=56 SAT cubed (k=7): 140 → 202 solves/s (**+44%**). Cumulative vs pre-session baseline: +191%. |

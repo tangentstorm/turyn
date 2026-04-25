@@ -3184,6 +3184,63 @@ post-harvest rebuild. Measured at n=26 60s 5-run mean 5.97e7s
 also adds backbone detection which takes TTC to 4.40e6s. See
 `docs/OPTIMIZATION_LOG.md` for the full chain.
 
+### T26. Multi-tuple XY MDD walk in `process_boundary` — **ACCEPTED**
+
+The boundary stage (`process_boundary` in `src/mdd_pipeline.rs`) was
+calling `any_valid_xy(xy_root, …, tuple)` once per `ctx.tuples` entry
+— at n=26 that meant a recursive XY-MDD walk of up to depth 14 done
+**16 times per boundary**, all over the *same* MDD shape. The σ-feas
+check ahead of it is essentially free (probe showed 0 σ-fails per
+boundary at n=26 k=7), so the per-tuple `any_valid_xy` calls were
+the real cost of the boundary stage.
+
+Replaced with a single MDD walk (`valid_xy_tuple_mask` in
+`src/xy_sat.rs`) that batches all surviving tuples into one pass and
+returns a 32-bit "valid" bitmask. At each leaf the per-tuple
+±|σ_X|, ±|σ_Y| feasibility check runs over the still-pending tuple
+mask; an early-exit triggers when every wanted tuple has been
+validated. Recursion structure is identical to the original walk,
+only the leaf check differs.
+
+Also matched the legacy LEAF-before-`xy_depth` semantics: when the
+walk hits a `LEAF` node before depth, mark every still-pending tuple
+as valid (mirroring the legacy `return true`) rather than walking
+the unconstrained subtree — the latter would tighten pruning, which
+is a denominator change requiring its own validation.
+
+- **Change**: `src/xy_sat.rs` adds `TupleLeafCheck`,
+  `valid_xy_tuple_mask`, and the inner `walk_multi`/`check_leaf_multi`
+  helpers; removes the unused `any_valid_xy`. `src/mdd_pipeline.rs`
+  rewrites the tuple loop in `process_boundary` to: (1) build a σ-pass
+  bitmask from the existing per-tuple sigma check, (2) call
+  `valid_xy_tuple_mask` once with that mask, (3) materialise
+  `candidate_tuples` from the survivors. `flow_bnd_sum_fail` is bumped
+  in batched fashion using bit-counts.
+- **TTC mechanism**: rate — boundary stage drops from `n_tuples ×
+  walk` to `1 × walk` per boundary.
+- **Benchmark**: `cargo bench --bench fixed_work_criterion --
+  --turyn-n=26 --turyn-wz=apart --turyn-mdd-k=7 --turyn-cover-log2=50
+  --turyn-sat-secs=120` — Criterion 10 samples each:
+  - baseline: 11.16 — 11.22 — 11.28 s (95% CI)
+  - after:     8.81 —  8.89 —  8.97 s (95% CI)
+  - **change: +24.8 % to +27.5 % faster, p < 0.05**.
+- **Counters that moved**:
+  - `stage_exit[0]` per second up by ~25 %
+  - `flow_bnd_sum_fail` total unchanged (same boundaries pruned;
+    it's bumped once per failing tuple in both versions)
+  - downstream `flow_w_*`, `flow_z_*`, `flow_xy_*` counters at small
+    `n` (TT(18), TT(22)) match baseline run-for-run — same boundaries
+    reach later stages, soundness preserved.
+- **Risk verified**:
+  - TT(18) `--wz=apart --mdd-k=5 --sat-secs=10`: still solves
+    (`flow XY: sat=1`, identical Z stage counters to baseline).
+  - TT(22) `--wz=apart --mdd-k=5 --sat-secs=20`: full pipeline
+    fires, stage counters consistent with baseline.
+  - `cargo test --release --bin turyn -- --test-threads=1 --skip
+    outfix`: 89 passed, 0 failed (3 outfix tests skipped because
+    they require `mdd-9.bin` not present in this env).
+- **Status**: landed.
+
 ### T25. Drop dead post-SolveWZ `compute_spectrum(w_vals)` — **ACCEPTED**
 
 `src/mdd_pipeline.rs` (pre-cleanup) executed a full 256-point real

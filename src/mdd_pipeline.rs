@@ -588,40 +588,67 @@ pub(crate) fn process_boundary(
     let (xy_root, xy_nodes) = resolve_xy_graph(&xy_graph, &ctx.mdd.nodes);
 
     let mut candidate_tuples: Vec<SumTuple> = Vec::with_capacity(ctx.tuples.len());
-    for &tuple in &ctx.tuples {
-        // Both ±|σ_W|, ±|σ_Z| allowed — feasible if AT LEAST ONE sign
-        // of each is in range and parity.
+    // Phase 1: cheap σ-feasibility filter per tuple.  Builds a bitmask
+    // `sigma_pass_mask` of tuples that survive both the σ_Z and σ_W
+    // count checks.  Phase 2 then walks the XY sub-MDD ONCE for the
+    // surviving set instead of once per tuple — at n=26 the σ check
+    // is essentially always true, so the multi-tuple XY walk is the
+    // real win.
+    debug_assert!(
+        ctx.tuples.len() <= 32,
+        "valid_xy_tuple_mask uses a u32 bitmask",
+    );
+    let mut sigma_pass_mask = 0u32;
+    let mut sigma_fail_count = 0u64;
+    for (i, &tuple) in ctx.tuples.iter().enumerate() {
         let z_feas = [tuple.z.abs(), -tuple.z.abs()]
             .iter()
             .any(|&s| crate::spectrum::sigma_full_to_cnt(s, z_bnd_sum, ctx.middle_n).is_some());
         let w_feas = [tuple.w.abs(), -tuple.w.abs()]
             .iter()
             .any(|&s| crate::spectrum::sigma_full_to_cnt(s, w_bnd_sum, ctx.middle_m).is_some());
-        if !z_feas || !w_feas {
-            metrics
-                .flow_bnd_sum_fail
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            continue;
+        if z_feas && w_feas {
+            sigma_pass_mask |= 1u32 << i;
+        } else {
+            sigma_fail_count += 1;
         }
-        // MDD-guided fail-fast on XY sub-tree compatibility.
-        if !crate::xy_sat::any_valid_xy(
+    }
+    if sigma_fail_count != 0 {
+        metrics
+            .flow_bnd_sum_fail
+            .fetch_add(sigma_fail_count, AtomicOrdering::Relaxed);
+    }
+    if sigma_pass_mask != 0 {
+        // Phase 2: single XY-MDD walk for all σ-surviving tuples.
+        let leaf_checks: Vec<crate::xy_sat::TupleLeafCheck> = ctx
+            .tuples
+            .iter()
+            .map(|t| crate::xy_sat::TupleLeafCheck::from_tuple(*t))
+            .collect();
+        let valid_mask = crate::xy_sat::valid_xy_tuple_mask(
             xy_root,
-            0,
             ctx.xy_zw_depth,
-            0,
-            0,
             &ctx.xy_pos_order,
             xy_nodes,
             ctx.max_bnd_sum,
             ctx.middle_n as i32,
-            tuple,
-        ) {
+            &leaf_checks,
+            sigma_pass_mask,
+        );
+        let xy_fail_mask = sigma_pass_mask & !valid_mask;
+        let xy_fail_count = xy_fail_mask.count_ones() as u64;
+        if xy_fail_count != 0 {
             metrics
                 .flow_bnd_sum_fail
-                .fetch_add(1, AtomicOrdering::Relaxed);
-            continue;
+                .fetch_add(xy_fail_count, AtomicOrdering::Relaxed);
         }
-        candidate_tuples.push(tuple);
+        let mut m = valid_mask;
+        while m != 0 {
+            let bit = m & m.wrapping_neg();
+            let i = bit.trailing_zeros() as usize;
+            m ^= bit;
+            candidate_tuples.push(ctx.tuples[i]);
+        }
     }
     if candidate_tuples.is_empty() {
         metrics.stage_exit[0].fetch_add(1, AtomicOrdering::Relaxed);
