@@ -2,6 +2,26 @@
 
 This file tracks performance-oriented changes and their measured impact.
 
+## April 25 2026 — Criterion harness: configurable sample size / measurement time (instrumentation)
+
+Added `--turyn-sample-size=N` and `--turyn-measurement-secs=S` to
+`benches/fixed_work_criterion.rs`. The harness used to hardcode
+`sample_size(10)` + `measurement_time(30s)`, so CLI overrides via
+`-- --sample-size 30` were silently ignored. Lifting both knobs to
+the `BenchConfig` lets future ticks chase sub-5 % wins by raising
+sample count when the noise floor matters.
+
+- **Command**: `cargo bench --bench fixed_work_criterion --
+  --turyn-n=26 --turyn-wz=together --turyn-mdd-k=7
+  --turyn-cover-log2=36 --turyn-sample-size=30
+  --turyn-measurement-secs=180`.
+- **Effect**: at n=26 wz=together cover-log2=36 the 30-sample CI
+  tightens to roughly ±3 % (3.51 s [3.39, 3.63]) vs ±6 % at the
+  default 10 samples (4.29 s [4.03, 4.57]).
+- **TTC lever**: instrumentation only; no rate / denominator /
+  shortfall change. Required prerequisite for accepting small
+  optimizations going forward.
+
 ## April 19 2026 — `--wz=sync` deep optimization session (-99.3 % TTC cumulative, 150×)
 
 A single multi-hour session pushed `--wz=sync` from baseline TTC

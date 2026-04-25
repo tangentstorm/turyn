@@ -11,6 +11,12 @@
 //! - `--turyn-mdd-k=K` (optional)
 //! - `--turyn-cover-log2=X` (default `8`)
 //! - `--turyn-sat-secs=S` (default `30`)
+//! - `--turyn-sample-size=N` (default `10`) — number of Criterion
+//!   samples; more samples tighten the confidence interval at the
+//!   cost of a longer run. Use 30+ when chasing sub-5% effects.
+//! - `--turyn-measurement-secs=S` (default `30`) — Criterion's
+//!   per-sample budget; raise above the per-iteration wall-clock
+//!   so Criterion doesn't have to extend automatically.
 //!
 //! Example:
 //!
@@ -33,6 +39,8 @@ struct BenchConfig {
     mdd_k: Option<usize>,
     cover_log2: f64,
     sat_secs: u64,
+    sample_size: usize,
+    measurement_secs: u64,
 }
 
 impl BenchConfig {
@@ -51,6 +59,10 @@ impl BenchConfig {
                 cfg.cover_log2 = parse_arg("--turyn-cover-log2", v);
             } else if let Some(v) = arg.strip_prefix("--turyn-sat-secs=") {
                 cfg.sat_secs = parse_arg("--turyn-sat-secs", v);
+            } else if let Some(v) = arg.strip_prefix("--turyn-sample-size=") {
+                cfg.sample_size = parse_arg("--turyn-sample-size", v);
+            } else if let Some(v) = arg.strip_prefix("--turyn-measurement-secs=") {
+                cfg.measurement_secs = parse_arg("--turyn-measurement-secs", v);
             }
         }
         cfg.validate();
@@ -98,6 +110,8 @@ impl Default for BenchConfig {
             mdd_k: None,
             cover_log2: 8.0,
             sat_secs: 30,
+            sample_size: 10,
+            measurement_secs: 30,
         }
     }
 }
@@ -117,6 +131,8 @@ fn print_usage_and_exit() -> ! {
          --turyn-mdd-k=K\n\
          --turyn-cover-log2=X\n\
          --turyn-sat-secs=S\n\
+         --turyn-sample-size=N      (default 10; >=10 for Criterion)\n\
+         --turyn-measurement-secs=S (default 30)\n\
          \n\
          example:\n\
          cargo bench --bench fixed_work_criterion -- --turyn-n=26 --turyn-wz=together --turyn-mdd-k=7 --turyn-cover-log2=34"
@@ -182,9 +198,10 @@ fn fixed_work_bench(c: &mut Criterion) {
 }
 
 fn main() {
+    let cfg = BenchConfig::from_args();
     let mut criterion = Criterion::default()
-        .sample_size(10)
-        .measurement_time(Duration::from_secs(30))
+        .sample_size(cfg.sample_size.max(10))
+        .measurement_time(Duration::from_secs(cfg.measurement_secs.max(1)))
         .warm_up_time(Duration::from_secs(3));
     fixed_work_bench(&mut criterion);
     criterion.final_summary();

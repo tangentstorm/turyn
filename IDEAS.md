@@ -3211,6 +3211,50 @@ post-hoc spectrum. Removed the FFT call and the now-unused
   `let _ = &w_spectrum; // used by pair_power below` comment that
   outlived the pair_power check it documented.
 
+### B2. Skip the upfront `Vec::with_capacity(16)` allocation in `process_boundary` when zero tuples survive — *tested, null*
+
+- **Change**: at `src/mdd_pipeline.rs:582`, replace
+  `let mut candidate_tuples: Vec<SumTuple> = Vec::with_capacity(ctx.tuples.len())`
+  + per-tuple `flow_bnd_sum_fail.fetch_add(1)` with a two-pass
+  scheme: first pass tracks survivors in a stack-resident
+  `survivor_mask: u64` and accumulates `sum_fails` locally, then
+  emits a single batched `flow_bnd_sum_fail.fetch_add(sum_fails)`
+  and returns `Vec::new()` early if no tuple survived; only on
+  the rare success case does it allocate
+  `Vec::with_capacity(survivor_count)` and refill from `ctx.tuples`.
+- **TTC mechanism**: rate. At the boundary-dominated profile
+  ~99.97 % of boundaries reject every tuple, so the upfront 256-byte
+  alloc plus 16 atomic fetch-adds per boundary are pure overhead
+  — saving them at the rate of ~3500 boundaries/s amounts to a
+  small but real per-iteration delta.
+- **Bench**:
+  `cargo bench --bench fixed_work_criterion -- --turyn-n=26
+  --turyn-wz=together --turyn-mdd-k=7 --turyn-cover-log2=36
+  --turyn-sat-secs=120 --turyn-sample-size=30
+  --turyn-measurement-secs=180` (TURYN_THREADS=1).
+- **Baseline (30 samples)**: 3.5054 s [3.3904 s, 3.6320 s]
+  (CI ±3.5 %).
+- **After (30 samples)**: 3.5195 s [3.4250 s, 3.6137 s]
+  (CI ±3.0 %).
+- **Change**: +0.40 % [-3.80 %, +4.72 %] at p=0.86 — confidence
+  interval clearly straddles zero. **No change detected.**
+- **Soundness**: TT(18) `--wz=apart --mdd-k=5 --sat-secs=10` still
+  finds a solution in 148 ms; tuple-pass set unchanged.
+- **Why null at this profile**: at `cover-log2=36`, `~1466` boundaries
+  must close cleanly to trigger the stop, so per-sample boundary
+  work is `~250 ms` (out of `~3.5 s` total). The change saves
+  perhaps `60 ms / sample` (256 B alloc × 1466 + 16 atomics × 1466),
+  i.e. ~1.7 % — below the ~3 % noise floor of a 30-sample
+  Criterion run. Setup (load MDD + pre-enumerate 1.4 M boundaries)
+  dominates the wall-clock.
+- **Status**: rejected at `cover-log2=36`. Code reverted; bench
+  harness improvements (`--turyn-sample-size` /
+  `--turyn-measurement-secs`) kept. Worth retrying with either:
+  1. A boundary-dominated benchmark profile (e.g. `cover-log2 ≥
+     40` where boundary work is `≥50 %` of the run).
+  2. Stacking it with another small per-boundary optimization so
+     the cumulative effect clears the noise floor.
+
 ### B1. Cache `any_valid_xy` per-tuple result on `XyRuntimeGraph` — *tested, inconclusive*
 
 - **Change**: in `xy_graph_for_boundary` (`src/mdd_pipeline.rs:522`),
