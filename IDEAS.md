@@ -3210,3 +3210,59 @@ post-hoc spectrum. Removed the FFT call and the now-unused
   the default (no-tuple) benchmark. Commit removes a stale
   `let _ = &w_spectrum; // used by pair_power below` comment that
   outlived the pair_power check it documented.
+
+### B1. Cache `any_valid_xy` per-tuple result on `XyRuntimeGraph` — *tested, inconclusive*
+
+- **Change**: in `xy_graph_for_boundary` (`src/mdd_pipeline.rs:522`),
+  pre-compute a `valid_tuple_mask: u64` (bit `i` = result of
+  `any_valid_xy(root, ctx.tuples[i])`) at cache-miss time. The
+  per-boundary loop in `process_boundary` then short-circuits the
+  recursive DFS on cache hits by checking `(mask >> ti) & 1`.
+- **TTC mechanism**: rate. Per-tuple DFS verdict depends only on
+  `(zw_sums, tuple_idx)` — `xy_root` is a function of `zw_sums`
+  and `max_bnd_sum / middle_n / pos_order / xy_zw_depth` are
+  problem constants. So one verdict per unique `zw_sums` × tuple,
+  amortised over all boundaries that share that `zw_sums`.
+- **Expected counters**: `any_valid_xy` calls drop ~140×; `stage_exit[0]`
+  per second rises proportionally.
+- **Measurement (n=26 apart k=7)**: instrumented `xy_graph_for_boundary`
+  showed **99.3 % cache hit rate** (35341 hits / 248 misses across
+  ~36 k boundaries in 2.5 s) and **569 k `any_valid_xy` calls** —
+  consistent with ~16 DFS invocations per boundary. So the fail-fast
+  DFS is the dominant per-boundary work and is structurally cacheable.
+- **Bench**:
+  `cargo bench --bench fixed_work_criterion -- --turyn-n=26
+  --turyn-wz=apart --turyn-mdd-k=7 --turyn-cover-log2=34
+  --turyn-sat-secs=120` (TURYN_THREADS=1).
+- **Result**: *regression* — baseline median **1.756 s**
+  [1.65 s, 1.85 s] → cache median **1.930 s** [1.80 s, 2.07 s]
+  (~+10 %). 5-run wall-clock self-times (`--bench-cover-log2=99
+  --sat-secs=15`) showed huge variance in `stage_exit[1]` (45–4 k
+  W exits across runs at the same flags), so single-run wall-clock
+  comparisons are inconclusive.
+- **Why it likely regressed at this profile**: the
+  `cover-log2=34` benchmark stops after roughly one boundary closes
+  cleanly (need `covered ≥ 2^-22`, total = 1.4 M, so ~0.3
+  closures), leaving the measurement dominated by the
+  fixed setup cost (load MDD + pre-enumerate 1.4 M
+  seed boundaries). My change adds eager DFS on cache miss for
+  *every* tuple (including ones the bnd-sum filter would have
+  rejected anyway in the lazy path), so misses get more expensive
+  in exchange for cheap hits — but the benchmark stops before
+  enough hits accumulate to amortise.
+- **Soundness check**: `TURYN_VERIFY_MASK=1` showed zero
+  cached-vs-direct-DFS mismatches across the test run; TT(18)
+  found in 135 ms (matches baseline).
+- **Status**: rejected at `cover-log2=34`. The mechanism is real
+  (99.3 % hit, 569 k DFS calls/run), but the standard MDD
+  benchmark does not isolate the boundary stage. Worth retrying
+  with either:
+  1. **Lazy mask fill** — populate `valid_tuple_mask` bits only on
+     first read in `process_boundary`, so cache misses don't
+     pre-pay tuples the bnd-sum filter would have rejected.
+  2. **A boundary-stage-dominated benchmark profile** — e.g.
+     `--turyn-cover-log2=46` for n=26 apart, or a wall-clock
+     profile that runs long enough for hits to dominate.
+  3. **Skip caching when `nodes` not Some** — already in place;
+     the `loaded_xy_graph` path doesn't share sub-MDDs across
+     boundaries, so the mask never helps there.
