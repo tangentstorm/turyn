@@ -34,6 +34,10 @@ pub struct EngineConfig {
     /// calls `run_mdd_sat_search`, itself multi-threaded) should keep
     /// it at 1 to avoid oversubscription.
     pub worker_count: usize,
+    /// Fixed-work benchmark target. If set, the coordinator stops
+    /// once normalized covered mass corresponds to at least `2^x`
+    /// configurations according to the adapter's `total_log2_work`.
+    pub bench_stop_log2_work: Option<f64>,
 }
 
 impl Default for EngineConfig {
@@ -41,6 +45,7 @@ impl Default for EngineConfig {
         Self {
             progress_interval: Duration::from_secs(1),
             worker_count: 1,
+            bench_stop_log2_work: None,
         }
     }
 }
@@ -289,6 +294,17 @@ impl<T: Send + 'static> SearchEngine<T> {
                         );
                         in_flight.fetch_sub(1, Ordering::AcqRel);
                         handled_count += 1;
+                        if self.cfg.bench_stop_log2_work.is_some() {
+                            poll_mass(&*mass_model, &mut mass, &mut high_total);
+                            if bench_target_reached(
+                                &*mass_model,
+                                &mass,
+                                self.cfg.bench_stop_log2_work,
+                            ) {
+                                self.cancelled.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
                     }
                     Err(RecvTimeoutError::Timeout) => { /* progress tick below */ }
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -297,6 +313,10 @@ impl<T: Send + 'static> SearchEngine<T> {
                 if last_progress.elapsed() >= self.cfg.progress_interval {
                     last_progress = Instant::now();
                     poll_mass(&*mass_model, &mut mass, &mut high_total);
+                    if bench_target_reached(&*mass_model, &mass, self.cfg.bench_stop_log2_work) {
+                        self.cancelled.store(true, Ordering::Relaxed);
+                        break;
+                    }
                     on_event(SearchEvent::Progress(build_snapshot(
                         start.elapsed(),
                         &mass,
@@ -366,6 +386,24 @@ impl<T: Send + 'static> SearchEngine<T> {
             handled_count,
         )));
     }
+}
+
+fn bench_target_reached(
+    model: &dyn SearchMassModel,
+    mass: &MassSnapshot,
+    target_log2: Option<f64>,
+) -> bool {
+    let Some(target_log2) = target_log2 else {
+        return false;
+    };
+    let Some(total_log2) = model.total_log2_work() else {
+        return false;
+    };
+    let covered = mass.covered().0;
+    if covered <= 0.0 {
+        return false;
+    }
+    total_log2 + covered.log2() >= target_log2
 }
 
 type SharedScheduler<T> = Arc<(Mutex<Box<dyn SchedulerPolicy<T>>>, Condvar)>;
@@ -754,6 +792,7 @@ mod tests {
         let cfg = EngineConfig {
             progress_interval: Duration::from_millis(50),
             worker_count,
+            bench_stop_log2_work: None,
         };
         let mut engine = SearchEngine::<u64>::new(cfg, Box::new(GoldThenWork::new(4)));
 
@@ -950,6 +989,7 @@ mod tests {
         let cfg = EngineConfig {
             progress_interval: Duration::from_millis(50),
             worker_count: 1,
+            bench_stop_log2_work: None,
         };
         let mut engine = SearchEngine::<T>::new(cfg, Box::new(GoldThenWork::new(4)));
         let mut final_snap: Option<ProgressSnapshot> = None;
@@ -1468,6 +1508,7 @@ mod tests {
         let cfg = EngineConfig {
             progress_interval: Duration::from_millis(10),
             worker_count: 1,
+            bench_stop_log2_work: None,
         };
         let mut engine = SearchEngine::<u64>::new(cfg, Box::new(GoldThenWork::new(4)));
         let observed = Arc::new(std::sync::Mutex::new(Vec::<(f64, MassSnapshot)>::new()));

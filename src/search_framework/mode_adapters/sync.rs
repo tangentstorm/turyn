@@ -84,6 +84,7 @@ impl StageHandler<SyncPayload> for SyncWalkStage {
 
 pub struct SyncWalkMassModel {
     projected_fraction_ppm: Arc<AtomicU64>,
+    problem_n: usize,
 }
 
 impl SearchMassModel for SyncWalkMassModel {
@@ -101,6 +102,9 @@ impl SearchMassModel for SyncWalkMassModel {
         // `Projected`. Consumers should pair it with the walker's
         // own per-level telemetry for authoritative analysis.
         CoverageQuality::Projected
+    }
+    fn total_log2_work(&self) -> Option<f64> {
+        Some(2.0 * self.problem_n as f64)
     }
 }
 
@@ -180,6 +184,7 @@ impl SearchModeAdapter<SyncPayload> for SyncAdapter {
     fn mass_model(&self) -> Box<dyn SearchMassModel> {
         Box::new(SyncWalkMassModel {
             projected_fraction_ppm: Arc::clone(&self.projected_fraction_ppm),
+            problem_n: self.problem.n,
         })
     }
 }
@@ -194,6 +199,7 @@ mod tests {
     fn sync_mass_model_is_projected() {
         let model = SyncWalkMassModel {
             projected_fraction_ppm: Arc::new(AtomicU64::new(0)),
+            problem_n: 26,
         };
         assert_eq!(
             model.quality(),

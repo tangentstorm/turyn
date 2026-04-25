@@ -37,6 +37,42 @@ Equivalent form:
 If `coverage_rate <= 0`, TTC MUST be reported as unavailable rather than as
 an arbitrary sentinel.
 
+## 1.1 Fixed-work benchmark stop
+
+The normalized TTC fraction is the authoritative progress unit, but it is not
+always a practical benchmark stop condition. At large `n`, a fixed percentage
+of the full space can be far too large to sample repeatedly. Implementations
+MAY therefore expose a separate benchmark-only denominator:
+
+- `total_log2_work = log2(total raw-equivalent configurations)`
+
+When present, consumers MAY compute:
+
+- `covered_log2_work = total_log2_work + log2(covered_mass)`
+
+and stop a benchmark run once:
+
+- `covered_log2_work >= x`
+
+This means "stop after covering approximately `2^x` raw-equivalent
+configurations." It MUST NOT replace the normalized TTC fields and MUST NOT
+change the invariants on `covered_exact`, `covered_partial`, or
+`covered_mass`.
+
+For the full unconstrained raw Turyn search space, the default raw-equivalent
+denominator is:
+
+- `total_log2_work = log2(4^n) = 2n`
+
+Adapters MAY use a more precise denominator only if it is documented and refers
+to the same logical space as their normalized `covered_mass`.
+
+When a fixed-work benchmark target is active, SAT hits MUST be reported but
+MUST NOT terminate the run. The run stops only when the fixed covered-work
+target, an explicit wall-clock limit, cancellation, or ordinary exhaustion
+occurs. UNSAT regions, pruned regions, and valid partial-credit regions SHOULD
+all contribute through the same `covered_mass` path used by TTC.
+
 ## 2. Required semantic meaning
 
 Each adapter MUST define:

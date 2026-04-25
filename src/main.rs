@@ -111,6 +111,9 @@ fn print_help() {
     eprintln!("  --conflict-limit=<N>     Max CDCL conflicts per SAT call before giving up on");
     eprintln!("                           that candidate; 0 = unlimited (default: 0)");
     eprintln!("  --sat-secs=<N>           Time limit in seconds for the search; 0 = unlimited");
+    eprintln!("  --bench-cover-log2=<X>   Benchmark stop: cover about 2^X raw-equivalent");
+    eprintln!("                           configurations, report SAT hits, and keep searching");
+    eprintln!("  --continue-after-sat     Print/report SAT hits without stopping the search");
     eprintln!();
     eprintln!("SAT SOLVER TUNING:");
     eprintln!("  --no-xor                 Disable GF(2) XOR propagation in SAT solver");
@@ -152,6 +155,8 @@ fn print_help() {
     eprintln!("BENCHMARKING:");
     eprintln!("  --benchmark              Run the search 5 times and report timing");
     eprintln!("  --benchmark=<N>          Run the search N times and report timing");
+    eprintln!("  --bench-cover-log2=<X>   Fixed-work benchmark target, usually paired with");
+    eprintln!("                           repeated external timing or Criterion");
     eprintln!();
     eprintln!("  -h, --help               Show this help message");
     eprintln!();
@@ -218,6 +223,17 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
             cfg.conflict_limit = v.parse().unwrap_or(0);
         } else if let Some(v) = arg.strip_prefix("--sat-secs=") {
             cfg.sat_secs = v.parse().unwrap_or(0);
+        } else if let Some(v) = arg.strip_prefix("--bench-cover-log2=") {
+            cfg.bench_cover_log2 = match v.parse::<f64>() {
+                Ok(x) if x.is_finite() && x >= 0.0 => Some(x),
+                _ => {
+                    eprintln!("error: --bench-cover-log2 requires a non-negative finite number");
+                    std::process::exit(1);
+                }
+            };
+            cfg.continue_after_sat = true;
+        } else if arg == "--continue-after-sat" {
+            cfg.continue_after_sat = true;
         } else if arg == "--ema-restarts" {
             cfg.sat_config.ema_restarts = true;
         } else if arg == "--probing" {
@@ -369,8 +385,18 @@ fn run_framework_mdd_mode(
     let start = std::time::Instant::now();
     // Construct the engine up front so we can pull its live cancel
     // flag *before* the adapter does any expensive setup.
-    let mut engine =
-        SearchEngine::<MddPayload>::new(EngineConfig::default(), Box::new(GoldThenWork::new(32)));
+    let mut engine = SearchEngine::<MddPayload>::new(
+        EngineConfig {
+            progress_interval: if cfg.bench_cover_log2.is_some() {
+                std::time::Duration::from_millis(50)
+            } else {
+                EngineConfig::default().progress_interval
+            },
+            bench_stop_log2_work: cfg.bench_cover_log2,
+            ..EngineConfig::default()
+        },
+        Box::new(GoldThenWork::new(32)),
+    );
     let engine_cancel = engine.cancel_flag();
     let watchdog_handle =
         spawn_sat_secs_watchdog(cfg.sat_secs, std::sync::Arc::clone(&engine_cancel));
@@ -382,6 +408,7 @@ fn run_framework_mdd_mode(
     let progress_handle = std::sync::Arc::clone(&adapter.progress);
 
     let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
+    let continue_after_sat = cfg.continue_after_sat || cfg.bench_cover_log2.is_some();
     // Drain-thread: polls the solution channel; on first hit sets
     // the context's `found` flag *and* the engine's cancel flag so
     // in-flight handlers exit fast and the coordinator stops
@@ -389,8 +416,18 @@ fn run_framework_mdd_mode(
     let drain_handle = std::thread::spawn(move || {
         let mut solutions = Vec::new();
         while let Ok(sol) = result_rx.recv() {
-            found_ctx.store(true, std::sync::atomic::Ordering::Relaxed);
-            cancel_for_drain.store(true, std::sync::atomic::Ordering::Relaxed);
+            if !continue_after_sat {
+                found_ctx.store(true, std::sync::atomic::Ordering::Relaxed);
+                cancel_for_drain.store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                print_solution(
+                    "Framework search: SAT solution",
+                    &sol.0,
+                    &sol.1,
+                    &sol.2,
+                    &sol.3,
+                );
+            }
             solutions.push(sol);
         }
         solutions
@@ -562,16 +599,37 @@ fn run_framework_cross_mode(
     // includes the setup phase the `--sat-secs` watchdog covers.
     let start = std::time::Instant::now();
     let (adapter, result_rx) = CrossAdapter::build(problem, tuples, cfg.clone(), verbose, k);
-    let mut engine =
-        SearchEngine::<CrossPayload>::new(EngineConfig::default(), Box::new(GoldThenWork::new(32)));
+    let mut engine = SearchEngine::<CrossPayload>::new(
+        EngineConfig {
+            progress_interval: if cfg.bench_cover_log2.is_some() {
+                std::time::Duration::from_millis(50)
+            } else {
+                EngineConfig::default().progress_interval
+            },
+            bench_stop_log2_work: cfg.bench_cover_log2,
+            ..EngineConfig::default()
+        },
+        Box::new(GoldThenWork::new(32)),
+    );
     let engine_cancel = engine.cancel_flag();
     let found_flag = std::sync::Arc::clone(&adapter.found);
     let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
+    let continue_after_sat = cfg.continue_after_sat || cfg.bench_cover_log2.is_some();
     let drain = std::thread::spawn(move || {
         let mut solutions = Vec::new();
         while let Ok(sol) = result_rx.recv() {
-            found_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            cancel_for_drain.store(true, std::sync::atomic::Ordering::Relaxed);
+            if !continue_after_sat {
+                found_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                cancel_for_drain.store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                print_solution(
+                    "Framework search: SAT solution",
+                    &sol.0,
+                    &sol.1,
+                    &sol.2,
+                    &sol.3,
+                );
+            }
             solutions.push(sol);
         }
         solutions
@@ -614,8 +672,18 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
     // enumeration) but we still clock from here so Finished
     // `elapsed` is comparable across modes.
     let start = std::time::Instant::now();
-    let mut engine =
-        SearchEngine::<SyncPayload>::new(EngineConfig::default(), Box::new(GoldThenWork::new(32)));
+    let mut engine = SearchEngine::<SyncPayload>::new(
+        EngineConfig {
+            progress_interval: if cfg.bench_cover_log2.is_some() {
+                std::time::Duration::from_millis(50)
+            } else {
+                EngineConfig::default().progress_interval
+            },
+            bench_stop_log2_work: cfg.bench_cover_log2,
+            ..EngineConfig::default()
+        },
+        Box::new(GoldThenWork::new(32)),
+    );
     let engine_cancel = engine.cancel_flag();
     // Forward the same cancel flag into the walker so its internal
     // parallel DFS (which runs inside a single StageHandler call)
@@ -633,10 +701,21 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
     };
     let (adapter, result_rx) = SyncAdapter::build(problem, sync_cfg, verbose);
     let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
+    let continue_after_sat = cfg.continue_after_sat || cfg.bench_cover_log2.is_some();
     let drain_handle = std::thread::spawn(move || {
         let mut solutions = Vec::new();
         while let Ok(sol) = result_rx.recv() {
-            cancel_for_drain.store(true, std::sync::atomic::Ordering::Relaxed);
+            if !continue_after_sat {
+                cancel_for_drain.store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                print_solution(
+                    "Framework search: SAT solution",
+                    &sol.0,
+                    &sol.1,
+                    &sol.2,
+                    &sol.3,
+                );
+            }
             solutions.push(sol);
         }
         solutions
@@ -1483,6 +1562,8 @@ mod tests {
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
             sat_secs: 0,
+            bench_cover_log2: None,
+            continue_after_sat: false,
             quad_pb: true,
             mdd_k: 1,
             mdd_extend: 0,

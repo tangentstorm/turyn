@@ -79,6 +79,7 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
         let cfg = &*self.cfg;
         let tuples = &self.tuples;
         let found = &*self.found;
+        let continue_after_sat = cfg.continue_after_sat || cfg.bench_cover_log2.is_some();
         let spectral_z = SpectralFilter::new(problem.n, cfg.theta_samples);
         let spectral_w = SpectralFilter::new(problem.n, cfg.theta_samples);
         let mut stats = SearchStats::default();
@@ -120,7 +121,7 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
         let mut template_cache: HashMap<Vec<(i32, i32, i32, i32)>, SatXYTemplate> = HashMap::new();
 
         for (tuple_idx, tuple) in tuples.iter().copied().enumerate() {
-            if found.load(Ordering::Relaxed) || ctx.is_cancelled() {
+            if (!continue_after_sat && found.load(Ordering::Relaxed)) || ctx.is_cancelled() {
                 break;
             }
             if !w_cache.contains_key(&tuple.w) {
@@ -137,7 +138,7 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                 w_cache.insert(tuple.w, (w_candidates, w_index));
             }
             let (w_candidates, w_index) = w_cache.get(&tuple.w).unwrap();
-            if found.load(Ordering::Relaxed) || ctx.is_cancelled() {
+            if (!continue_after_sat && found.load(Ordering::Relaxed)) || ctx.is_cancelled() {
                 break;
             }
             // Tuple about to be processed. `tuples_done` reports
@@ -155,7 +156,8 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                 found,
                 ctx.cancelled,
                 |z_seq, w_seq, zw, _z_spec, _w_spec| {
-                    if found.load(Ordering::Relaxed) || ctx.is_cancelled() {
+                    if (!continue_after_sat && found.load(Ordering::Relaxed)) || ctx.is_cancelled()
+                    {
                         return false;
                     }
                     if !seen_zw.insert(zw.clone()) {
@@ -219,7 +221,9 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                             // loop can span billions of XY attempts
                             // and must be interruptible without a
                             // dispatch-time snapshot.
-                            if found.load(Ordering::Relaxed) || ctx.is_cancelled() {
+                            if (!continue_after_sat && found.load(Ordering::Relaxed))
+                                || ctx.is_cancelled()
+                            {
                                 break;
                             }
                             let x_bits = (code & ((1u64 << boundary_bits) - 1)) as u32;
@@ -240,14 +244,18 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                             }
                             if let XyTryResult::Sat(x, y) = result {
                                 if verify_tt(problem, &x, &y, &z_seq_clone, &w_seq_clone) {
-                                    found.store(true, Ordering::Relaxed);
+                                    if !continue_after_sat {
+                                        found.store(true, Ordering::Relaxed);
+                                    }
                                     let _ = self.result_tx.send((
                                         x,
                                         y,
                                         z_seq_clone.clone(),
                                         w_seq_clone.clone(),
                                     ));
-                                    break;
+                                    if !continue_after_sat {
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -263,7 +271,7 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                             &xy_plk0,
                         ));
                     }
-                    !found.load(Ordering::Relaxed)
+                    continue_after_sat || !found.load(Ordering::Relaxed)
                 },
             );
             // Tuple (tuple_idx) fully processed. Publish
@@ -320,6 +328,7 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
 /// in-flight accumulator so per-attempt timeouts are never
 /// double-credited alongside the tuple's exact weight.
 pub struct CrossMassModel {
+    problem_n: usize,
     tuples_done: Arc<AtomicUsize>,
     tuples_total: usize,
     /// Shared with the stage; sum of `cover_micro` for XY
@@ -351,6 +360,9 @@ impl SearchMassModel for CrossMassModel {
         let micros = self.in_flight_cov_micro.load(Ordering::Relaxed) as f64;
         let denom = self.tuples_total as f64 * self.xy_per_tuple as f64 * 1_000_000.0;
         MassValue((micros / denom).clamp(0.0, 1.0))
+    }
+    fn total_log2_work(&self) -> Option<f64> {
+        Some(2.0 * self.problem_n as f64)
     }
     /// Hybrid: tuple-count numerator is direct but the mapping
     /// to XY-search fraction is projected (uniform tuple
@@ -468,6 +480,7 @@ impl SearchModeAdapter<CrossPayload> for CrossAdapter {
         // shift is ≤ 32 and stays inside a `u64`.
         let xy_per_tuple: u64 = if k_eff == 0 { 1 } else { 1u64 << (4 * k_eff) };
         Box::new(CrossMassModel {
+            problem_n: self.problem.n,
             tuples_done: Arc::clone(&self.tuples_done),
             tuples_total: self.tuples.len(),
             in_flight_cov_micro: Arc::clone(&self.in_flight_cov_micro),
@@ -487,6 +500,7 @@ mod tests {
     #[test]
     fn cross_mass_model_is_non_direct() {
         let model = CrossMassModel {
+            problem_n: 26,
             tuples_done: Arc::new(AtomicUsize::new(0)),
             tuples_total: 3,
             in_flight_cov_micro: Arc::new(AtomicU64::new(0)),
@@ -509,6 +523,7 @@ mod tests {
     fn cross_partial_mass_reflects_in_flight_xy_timeouts() {
         let cov = Arc::new(AtomicU64::new(0));
         let model = CrossMassModel {
+            problem_n: 26,
             tuples_done: Arc::new(AtomicUsize::new(0)),
             tuples_total: 4,
             in_flight_cov_micro: Arc::clone(&cov),
@@ -526,6 +541,7 @@ mod tests {
     fn cross_partial_mass_clamps_to_one() {
         let cov = Arc::new(AtomicU64::new(u64::MAX));
         let model = CrossMassModel {
+            problem_n: 26,
             tuples_done: Arc::new(AtomicUsize::new(0)),
             tuples_total: 4,
             in_flight_cov_micro: cov,

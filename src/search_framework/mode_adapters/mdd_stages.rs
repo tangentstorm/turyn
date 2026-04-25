@@ -712,6 +712,7 @@ impl StageHandler<MddPayload> for SolveZStage {
 /// without emitting.
 pub struct McddFractionMassModel {
     progress: Arc<BoundaryProgress>,
+    total_log2_work: f64,
 }
 
 impl SearchMassModel for McddFractionMassModel {
@@ -720,6 +721,9 @@ impl SearchMassModel for McddFractionMassModel {
     }
     fn covered_partial_mass(&self) -> MassValue {
         MassValue(self.progress.partial_fraction())
+    }
+    fn total_log2_work(&self) -> Option<f64> {
+        Some(self.total_log2_work)
     }
     fn quality(&self) -> CoverageQuality {
         // Per the two approximation sources called out in the
@@ -996,6 +1000,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
     fn mass_model(&self) -> Box<dyn SearchMassModel> {
         Box::new(McddFractionMassModel {
             progress: Arc::clone(&self.progress),
+            total_log2_work: 2.0 * self.ctx.problem.n as f64,
         })
     }
 }
@@ -1311,7 +1316,10 @@ mod tests {
     #[test]
     fn mdd_mass_model_quality_is_hybrid() {
         let progress = Arc::new(BoundaryProgress::new(1));
-        let model = McddFractionMassModel { progress };
+        let model = McddFractionMassModel {
+            progress,
+            total_log2_work: 8.0,
+        };
         assert_eq!(
             model.quality(),
             CoverageQuality::Hybrid,
@@ -1330,6 +1338,7 @@ mod tests {
         progress.add_partial_cov_micro(1, 2_000_000); // 2× overflow
         let model = McddFractionMassModel {
             progress: Arc::clone(&progress),
+            total_log2_work: 8.0,
         };
         assert!(
             model.covered_partial_mass().0 <= 1.0,
@@ -1374,6 +1383,7 @@ mod tests {
             EngineConfig {
                 progress_interval: Duration::from_millis(20),
                 worker_count: 1,
+                bench_stop_log2_work: None,
             },
             Box::new(GoldThenWork::new(4)),
         );
@@ -1459,6 +1469,7 @@ mod tests {
             EngineConfig {
                 progress_interval: Duration::from_millis(20),
                 worker_count: 1,
+                bench_stop_log2_work: None,
             },
             Box::new(GoldThenWork::new(4)),
         );
@@ -1535,6 +1546,7 @@ mod tests {
                 // are likely to fire during the small n=6 run.
                 progress_interval: Duration::from_millis(5),
                 worker_count: 1,
+                bench_stop_log2_work: None,
             },
             Box::new(GoldThenWork::new(4)),
         );

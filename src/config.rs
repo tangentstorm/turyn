@@ -291,6 +291,15 @@ pub(crate) struct SearchConfig {
     pub(crate) sat_config: radical::SolverConfig,
     /// Time limit in seconds for the hybrid / MDD search (0 = unlimited).
     pub(crate) sat_secs: u64,
+    /// Benchmark stop budget: stop framework search after the published
+    /// coverage reaches roughly `2^x` raw-equivalent configurations.
+    /// This is an absolute covered-work target, unlike TTC's normalized
+    /// fraction, and is intended for fixed-work performance samples.
+    pub(crate) bench_cover_log2: Option<f64>,
+    /// Report SAT solutions but keep searching. Implied by
+    /// `bench_cover_log2`, because fixed-work benchmarks must not end
+    /// early just because they encounter a solution-dense region.
+    pub(crate) continue_after_sat: bool,
     /// Use quad PB encoding instead of totalizer.
     pub(crate) quad_pb: bool,
     /// MDD boundary width (default: 8).
@@ -378,6 +387,8 @@ impl Default for SearchConfig {
             dump_dimacs: None,
             sat_config: radical::SolverConfig::default(),
             sat_secs: 0,
+            bench_cover_log2: None,
+            continue_after_sat: false,
             quad_pb: true,
             mdd_k: 8,
             mdd_extend: 0,
@@ -459,6 +470,12 @@ impl SearchConfig {
         parts.push(format!("--conflict-limit={}", self.conflict_limit));
         if self.sat_secs > 0 {
             parts.push(format!("--sat-secs={}", self.sat_secs));
+        }
+        if let Some(x) = self.bench_cover_log2 {
+            parts.push(format!("--bench-cover-log2={x}"));
+        }
+        if self.continue_after_sat {
+            parts.push("--continue-after-sat".into());
         }
         parts.push(format!("--quad-pb={}", self.quad_pb));
         if self.sat_config.ema_restarts {

@@ -357,6 +357,10 @@ pub(crate) struct PhaseBContext {
     /// pre-filter per (x_bits, y_bits). See
     /// conjectures/zw-u-bound-tight.md.
     pub(crate) conj_zw_bound: bool,
+    /// Benchmark mode: report solutions but do not let a SAT hit
+    /// terminate producer loops. The engine will stop on its fixed
+    /// covered-work target instead.
+    pub(crate) continue_after_sat: bool,
     /// Prototype: replace the per-leaf walk_xy_sub_mdd fan-out with a
     /// single `try_candidate_via_mdd` call that uses radical's native
     /// `MddConstraint` propagator. Gated by env `XY_MDD=1`. Only the
@@ -749,7 +753,7 @@ pub(crate) fn process_solve_w(
                 false,
                 200_000,
                 |w_mid| {
-                    if ctx.found.load(AtomicOrdering::Relaxed) {
+                    if !ctx.continue_after_sat && ctx.found.load(AtomicOrdering::Relaxed) {
                         return false;
                     }
                     if !ctx.outfix_w_mid_pins.is_empty() {
@@ -882,7 +886,7 @@ pub(crate) fn process_solve_w(
             .unwrap_or(5000);
         let mut w_iter_count: usize = 0;
         loop {
-            if ctx.found.load(AtomicOrdering::Relaxed) {
+            if !ctx.continue_after_sat && ctx.found.load(AtomicOrdering::Relaxed) {
                 break;
             }
             if w_iter_count >= max_w_per_boundary {
@@ -1247,7 +1251,7 @@ pub(crate) fn process_solve_z(
         .and_then(|s| s.parse().ok())
         .unwrap_or(5000);
     loop {
-        if ctx.found.load(AtomicOrdering::Relaxed) {
+        if !ctx.continue_after_sat && ctx.found.load(AtomicOrdering::Relaxed) {
             break;
         }
         if z_count >= ctx.max_z {
@@ -1400,7 +1404,9 @@ pub(crate) fn process_solve_z(
                 Some((x, y)) => {
                     metrics.flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed);
                     if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
-                        ctx.found.store(true, AtomicOrdering::Relaxed);
+                        if !ctx.continue_after_sat {
+                            ctx.found.store(true, AtomicOrdering::Relaxed);
+                        }
                         let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
                     }
                 }
@@ -1443,7 +1449,7 @@ pub(crate) fn process_solve_z(
                 ctx.middle_n as i32,
                 &sz.candidate_tuples,
                 &mut |x_bits, y_bits| {
-                    if ctx.found.load(AtomicOrdering::Relaxed) {
+                    if !ctx.continue_after_sat && ctx.found.load(AtomicOrdering::Relaxed) {
                         return;
                     }
                     if let Some((fx, fy)) = ctx.outfix_xy {
@@ -1521,7 +1527,9 @@ pub(crate) fn process_solve_z(
                     }
                     if let XyTryResult::Sat(x, y) = result {
                         if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
-                            ctx.found.store(true, AtomicOrdering::Relaxed);
+                            if !ctx.continue_after_sat {
+                                ctx.found.store(true, AtomicOrdering::Relaxed);
+                            }
                             let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
                         }
                     }
@@ -1993,7 +2001,7 @@ pub(crate) fn process_solve_wz(
     // next attempt skips already-found (W, Z) pairs.
     let mut new_blocks: Vec<Vec<i32>> = Vec::new();
     loop {
-        if ctx.found.load(AtomicOrdering::Relaxed) {
+        if !ctx.continue_after_sat && ctx.found.load(AtomicOrdering::Relaxed) {
             break;
         }
         if wz_count >= ctx.max_z {
@@ -2146,7 +2154,7 @@ pub(crate) fn process_solve_wz(
                 ctx.middle_n as i32,
                 &swz.candidate_tuples,
                 &mut |x_bits, y_bits| {
-                    if ctx.found.load(AtomicOrdering::Relaxed) {
+                    if !ctx.continue_after_sat && ctx.found.load(AtomicOrdering::Relaxed) {
                         return;
                     }
                     if let Some((fx, fy)) = ctx.outfix_xy {
@@ -2257,7 +2265,9 @@ pub(crate) fn process_solve_wz(
                     if result == Some(true) {
                         let (x, y) = template.extract_xy(&xy_solver);
                         if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
-                            ctx.found.store(true, AtomicOrdering::Relaxed);
+                            if !ctx.continue_after_sat {
+                                ctx.found.store(true, AtomicOrdering::Relaxed);
+                            }
                             let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
                         }
                     }
@@ -2321,7 +2331,7 @@ pub(crate) fn process_solve_wz(
     // abandon them.  The per-attempt budget doubles each
     // retry (see conflict_budget above) so every boundary
     // eventually gets enough effort for SAT/UNSAT.
-    if more_possible && !ctx.found.load(AtomicOrdering::Relaxed) {
+    if more_possible && (ctx.continue_after_sat || !ctx.found.load(AtomicOrdering::Relaxed)) {
         // Priority: re-queued SolveWZ items must sit
         // BELOW stage 0 (fresh MDD boundaries, priority
         // 0.0) so fresh boundaries are always preferred
@@ -2445,6 +2455,7 @@ pub(crate) fn build_phase_b_context(
         mdd_extend: cfg.mdd_extend,
         conj_xy_product: cfg.conj_xy_product,
         conj_zw_bound: cfg.conj_zw_bound,
+        continue_after_sat: cfg.continue_after_sat || cfg.bench_cover_log2.is_some(),
         xy_mdd_mode: std::env::var("XY_MDD").ok().as_deref() == Some("1"),
         structural_xy_runtime: std::env::var("MDD_XY_RAW").ok().as_deref() != Some("1"),
         structural_xy_cache: Arc::new(Mutex::new(HashMap::default())),

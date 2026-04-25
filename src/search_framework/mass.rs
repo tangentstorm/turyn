@@ -155,6 +155,18 @@ pub trait SearchMassModel: Send + Sync {
     fn covered_partial_mass(&self) -> MassValue {
         MassValue::ZERO
     }
+    /// Optional absolute denominator for fixed-work benchmarks.
+    /// When present, `total_log2_work = log2(total configurations)`
+    /// lets the engine convert normalized coverage to an absolute
+    /// covered-work estimate:
+    ///
+    /// `covered_log2_work = total_log2_work + log2(covered_mass)`.
+    ///
+    /// This does not change TTC accounting; it is only a stop-control
+    /// hook for benchmark runs that should cover `2^x` configurations.
+    fn total_log2_work(&self) -> Option<f64> {
+        None
+    }
     fn quality(&self) -> CoverageQuality;
 }
 
