@@ -1,0 +1,20 @@
+turyn settings: --n=18 --wz=apart --mdd-k=5 --mdd-extend=1 --theta=128 --max-z=200000 --max-w=200000 --conflict-limit=0 --sat-secs=120 --quad-pb=true --xor-propagation  (threads=4)
+No mdd-5.bin file; building in-memory MDD via BFS (one-shot)...
+BFS Pass 1: enumerating ZW states (k=5, depth=10)...
+  Level 1/10: 1 → 1 states (87.8µs)     Level 2/10: 1 → 4 states (108.9µs)     Level 3/10: 4 → 16 states (131.6µs)     Level 4/10: 16 → 48 states (154.8µs)     Level 5/10: 48 → 192 states (212.5µs)     Level 6/10: 192 → 720 states (353.4µs)     Level 7/10: 720 → 2160 states (684.8µs)     Level 8/10: 2160 → 4384 states (1.4ms)     Level 9/10: 4384 → 2584 states (2.2ms)     Level 10/10: 2584 → 1504 states (2.5ms)   
+  Pass 1 done in 2.5ms: max 4384, total 11614 states
+Building XY sub-MDDs for 1504 boundary states...
+  384 distinct zw_sums from 1504 boundary states
+  XY builds done: 384 sub-MDDs in 1.7ms, 1248 total nodes
+BFS Pass 2: building ZW nodes bottom-up...
+  Level 9/10: 2584 states → 1352 nodes total (65.9µs)     Level 8/10: 4384 states → 1480 nodes total (143.9µs)     Level 7/10: 2160 states → 1728 nodes total (205.7µs)     Level 6/10: 720 states → 1884 nodes total (237.1µs)     Level 5/10: 192 states → 2048 nodes total (258.5µs)     Level 4/10: 48 states → 2096 nodes total (275.3µs)     Level 3/10: 16 states → 2112 nodes total (289.1µs)     Level 2/10: 4 states → 2116 nodes total (301.6µs)     Level 1/10: 1 states → 2117 nodes total (314.2µs)     Level 0/10: 1 states → 2118 nodes total (326.7µs)   
+BFS MDD k=5: 2118 nodes, 0.0 MB, total 4.6ms
+[framework:apart] seed_boundaries=66416 (pre-enumerated upfront)
+Framework search (--wz=apart): covered=0.075/1.000 elapsed=203.3ms ttc=Some(2.523842199s) (quality=Hybrid) TTC (unconstrained baseline)
+Framework search (--wz=apart): found_solution=true (1 solution(s))
+[framework:apart] stage_exit bnd/W/Z/XY = 4954/430/563/82
+[framework:apart] flow W: unsat=1 timeout=0 sol=45080 spec_fail=26529 spec_pass=12867 solves=0
+[framework:apart] flow Z: unsat=548 timeout=0 sol=11 pair_fail=0 spec_fail=0 solves=563
+[framework:apart] flow XY: sat=1 unsat=81 timeout=0 solves=32 zw_bound_rej=0 ext_pruned=48
+[framework:apart] boundaries: abandoned=0 (SAT-timeout-closed, retained partial only)
+WALL_SEC=0.307 EXIT=0
