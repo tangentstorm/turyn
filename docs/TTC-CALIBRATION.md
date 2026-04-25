@@ -11,8 +11,9 @@ benchmark configuration.
 |----|-------|-------------------------------------|------|-----------:|-------:|--------------------------------------|
 | 16 | apart | conj-tuple, THREADS=1, weighted     | 5    | 3.3–3.4 s  | 3%     | within **4%** of ground truth        |
 | 16 | apart | conj-tuple, THREADS=1, uniform      | 5    | 3.3–3.4 s  | 3%     | within **4%** of ground truth        |
-| 18 | apart | conj-tuple, THREADS=1, weighted     | 3    | 17.9–18.0  | 0.6%   | within **7%** of ground truth        |
-| 18 | apart | conj-tuple, THREADS=1, uniform      | 3    | 17.7–18.2  | 3%     | within **7%** of ground truth        |
+| 18 | apart | conj-tuple, THREADS=1, weighted     | 3    | 17.9–18.0 s | 0.6%  | within **7%** of ground truth        |
+| 18 | apart | conj-tuple, THREADS=1, uniform      | 3    | 17.7–18.2 s | 3%    | within **7%** of ground truth        |
+| 22 | apart | conj-tuple, **4 threads**, weighted | 1    | **1528 s = 25.5 min** | n/a | TTC at 80% covered: within **5%** |
 
 For comparison, the same runs with default 4 threads, default early-exit-on-
 first-solution, and no flags showed 1–10x run-to-run TTC variance and
@@ -62,6 +63,31 @@ Mid-run prediction is excellent. The end-of-run overestimate is
 because the priority queue hands out cheap boundaries first, leaving
 expensive ones for the tail — so the rate slows in the last third
 and the metric assumes the slow rate continues to the end.
+
+## Ground truth at n=22 (apart, conj-tuple, weighted, 4 threads)
+
+The largest case we've run to `covered=1.0` so far. **Total: 1528.2 s
+(25.47 min)** for one tuple shell of n=22; 53 SAT solutions found.
+60s probe TTC predicted 1141 s remaining (1201 s total) — **off by
+27%** because at 5% covered the metric was still converging. Once
+mid-run the prediction settles within ~5%:
+
+```
+elapsed= 60s  covered=0.055  ttc=1037s → predicts 1097s  (-28%)
+elapsed=180s  covered=0.137  ttc=1140s → predicts 1320s  (-14%)
+elapsed=300s  covered=0.211  ttc=1120s → predicts 1420s  ( -7%)
+elapsed=600s  covered=0.392  ttc= 935s → predicts 1535s  ( +0.5%) ← perfect
+elapsed=900s  covered=0.571  ttc= 677s → predicts 1577s  ( +3%)
+elapsed=1200s covered=0.687  ttc= 499s → predicts 1699s  (+11%)
+elapsed=1500s covered=0.962  ttc=  60s → predicts 1560s  ( +2%)
+finished at 1528.2 s (covered 1.000)        ground truth = 1528 s
+```
+
+The same pattern as n=16/n=18: early predictions undershoot (rate is
+high because cheap boundaries are draining), peak prediction is ~10%
+high near 60% covered, late prediction is essentially correct. Good
+news: from 30% covered onward, every prediction is within ±15% of
+truth.
 
 ## Ground truth at n=18 (apart, conj-tuple, weighted, THREADS=1)
 
