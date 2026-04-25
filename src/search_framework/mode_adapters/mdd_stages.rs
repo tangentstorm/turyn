@@ -50,22 +50,23 @@ pub const STAGE_SOLVE_Z: StageId = "mdd.solve_z";
 ///
 /// Coverage streams exposed to the mass model:
 ///
-/// * `covered_fraction() = completed / total` — the "exact"
-///   fraction, additive over disjoint boundaries. A boundary
-///   bumps `completed` ONLY when it closes cleanly (UNSAT or
-///   enumerated-to-exhaustion descendant search). Boundaries
-///   whose descendant search was cut off by a W or Z SAT
-///   conflict-budget timeout are marked abandoned and EXCLUDED
-///   from this counter — TTC §4.1 compliance.
-/// * `partial_fraction() = live_partial_cov_micro / (total *
-///   1_000_000)` — XY-timeout shortfall credit. Each XY timeout
-///   reports a `cover_micro ∈ [0, 1_000_000]` reflecting how
-///   much of that sub-cube the SAT solver ruled out before
-///   budget exhaustion. Contributions from a root are subsumed
-///   into exact on clean closure (drained from the aggregate)
-///   and retained indefinitely on abandoned closure (the
-///   boundary never exact-credits, so partial is its only
-///   honest crediting channel).
+/// * `covered_fraction() = completed_weight / total_weight` —
+///   the "exact" fraction, additive over disjoint boundaries. A
+///   boundary contributes its `weights[i]` share ONLY when it
+///   closes cleanly (UNSAT or enumerated-to-exhaustion descendant
+///   search). Boundaries whose descendant search was cut off by
+///   a W or Z SAT conflict-budget timeout are marked abandoned
+///   and EXCLUDED from this counter — TTC §4.1 compliance.
+/// * `partial_fraction() = live_partial_weight / total_weight` —
+///   XY-timeout shortfall credit, weighted by per-boundary mass.
+///   Each XY timeout reports a `cover_micro ∈ [0, 1_000_000]`
+///   reflecting how much of that sub-cube the SAT solver ruled
+///   out; the boundary's contribution to the live aggregate is
+///   `cover_micro * weights[i] / 1_000_000`. Contributions from a
+///   root are subsumed into exact on clean closure (drained from
+///   the aggregate) and retained indefinitely on abandoned
+///   closure (the boundary never exact-credits, so partial is
+///   its only honest crediting channel).
 ///
 /// Algorithm: each stage handler calls `note_handled(root_id,
 /// emitted)` after processing its item, and optionally
@@ -90,8 +91,9 @@ pub struct BoundaryProgress {
     /// §4.1: exact coverage requires no residual work remains).
     pending: Mutex<HashMap<u64, BoundaryState>>,
     /// Count of boundaries closed with clean exact credit. Published
-    /// as `covered_exact` via `covered_fraction()`. Excludes
-    /// abandoned boundaries.
+    /// for telemetry (stage_exit). Mass-credit math reads
+    /// `completed_weight` instead so non-uniform boundary weights
+    /// are respected.
     completed: AtomicU64,
     /// Count of boundaries closed with an abandoned taint (SAT
     /// timeout cut off W/Z enumeration). Contributes only to
@@ -99,12 +101,31 @@ pub struct BoundaryProgress {
     /// to `covered_exact`. Surfaced via `abandoned_count()` for
     /// diagnostics.
     abandoned: AtomicU64,
-    /// Sum of `in_flight_cov_micro` across currently live PLUS
-    /// abandoned-but-not-yet-subsumed roots. Clean-closed
-    /// boundaries drain their contribution; abandoned ones
-    /// retain it (their residual really was eliminated, even
-    /// though the boundary as a whole is incomplete).
-    live_partial_cov_micro: AtomicU64,
+    /// Weighted partial credit, in the same `weights[i]` unit as
+    /// `completed_weight`. For an in-flight boundary `i` with
+    /// `in_flight_cov_micro = m`, its contribution is `m *
+    /// weights[i] / 1_000_000`. Clean-closed boundaries drain
+    /// their contribution (it's subsumed into `completed_weight`);
+    /// abandoned ones retain it.
+    live_partial_weight: AtomicU64,
+    /// Sum of `weights[i]` for boundaries that have closed cleanly.
+    /// Divided by `total_weight` to publish `covered_fraction`.
+    completed_weight: AtomicU64,
+    /// Per-boundary descendant-mass weights, indexed by
+    /// `fanout_root_id`. The TTC denominator is `total_weight =
+    /// sum(weights)`, so `weights[i] / total_weight` is boundary
+    /// `i`'s share of the search. Uniform weighting (every entry
+    /// equal) is the legacy behavior; the MDD modes now seed
+    /// these from each boundary's live XY-path count so finishing
+    /// a 100×-bigger boundary credits 100× the mass.
+    weights: Vec<u64>,
+    /// `sum(weights)`. Used as the denominator in both
+    /// `covered_fraction` and `partial_fraction`. Cached so
+    /// publish-side reads don't have to re-sum the vector.
+    total_weight: u64,
+    /// Count of boundaries (uniform-weight legacy denominator).
+    /// Retained for diagnostics that report progress as "done /
+    /// total" rather than "covered fraction".
     total: u64,
 }
 
@@ -124,14 +145,65 @@ struct BoundaryState {
 }
 
 impl BoundaryProgress {
+    /// Uniform-weight constructor — every boundary contributes
+    /// `1/total` of the search mass. Kept as the default and used
+    /// by tests; the MDD adapters now call `new_weighted` instead
+    /// to weight each boundary by its actual descendant XY-path
+    /// count (see `BoundaryWork::xy_path_count`).
     pub fn new(total: u64) -> Self {
+        // Pick a per-boundary weight that gives non-trivial
+        // dynamic range for the partial-credit math while keeping
+        // every product `weight[i] * cov_micro` (≤ 1e6) safely
+        // inside u64. With weight = `Self::WEIGHT_UNIT = 1e9`,
+        // `weight * cov_micro` peaks at 1e15 — well below u64 max.
+        let weights = vec![Self::WEIGHT_UNIT; total as usize];
+        Self::new_weighted_with_total(weights, total)
+    }
+
+    /// Weighted constructor. `weights[i]` is boundary `i`'s share
+    /// of the total search mass; the unit is arbitrary because
+    /// every fraction is divided by `total_weight = sum(weights)`.
+    /// Pass values proportional to a real descendant-mass measure
+    /// (e.g. live XY path counts) and the published TTC stops
+    /// drifting as cheap and expensive boundaries retire in
+    /// arbitrary order.
+    pub fn new_weighted(weights: Vec<u64>) -> Self {
+        let total = weights.len() as u64;
+        Self::new_weighted_with_total(weights, total)
+    }
+
+    fn new_weighted_with_total(weights: Vec<u64>, total: u64) -> Self {
+        let total_weight: u64 = weights.iter().copied().sum();
         Self {
             pending: Mutex::new(HashMap::new()),
             completed: AtomicU64::new(0),
             abandoned: AtomicU64::new(0),
-            live_partial_cov_micro: AtomicU64::new(0),
+            live_partial_weight: AtomicU64::new(0),
+            completed_weight: AtomicU64::new(0),
+            weights,
+            total_weight,
             total,
         }
+    }
+
+    /// Reference unit for the legacy uniform-weight constructor —
+    /// large enough that integer divisions don't quantize away
+    /// most of the partial-credit precision, small enough that
+    /// `weight × cov_micro (≤ 1e6)` stays well inside u64.
+    const WEIGHT_UNIT: u64 = 1_000_000_000;
+
+    fn weight_for(&self, fanout_root_id: u64) -> u64 {
+        self.weights
+            .get(fanout_root_id as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// `cov_micro * weight / 1_000_000`, in the same unit as
+    /// `weights[i]`. Uses u128 intermediates so the multiplication
+    /// can't overflow even with WEIGHT_UNIT pushed up to 1e12+.
+    fn weighted_partial(weight: u64, cov_micro: u64) -> u64 {
+        ((cov_micro as u128) * (weight as u128) / 1_000_000) as u64
     }
 
     /// Mark a root as "abandoned" — its descendant search was cut
@@ -164,6 +236,7 @@ impl BoundaryProgress {
     /// in_flight cov_micro live (it's retained partial credit),
     /// bump `abandoned`, do NOT bump `completed`.
     pub fn note_handled(&self, fanout_root_id: u64, emitted: u64) -> bool {
+        let weight = self.weight_for(fanout_root_id);
         let mut guard = self.pending.lock().unwrap();
         let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
             pending: 1,
@@ -181,14 +254,18 @@ impl BoundaryProgress {
                 self.abandoned.fetch_add(1, Ordering::Relaxed);
                 false
             } else {
-                // Clean closure: subsume in_flight cov_micro into
-                // exact credit.
-                let subsumed = std::mem::take(&mut entry.in_flight_cov_micro);
-                if subsumed > 0 {
-                    self.live_partial_cov_micro
-                        .fetch_sub(subsumed, Ordering::Relaxed);
+                // Clean closure: subsume the weighted partial
+                // credit into exact credit. The boundary's full
+                // weight goes into `completed_weight` regardless
+                // of how much partial it had accumulated.
+                let subsumed_cov_micro = std::mem::take(&mut entry.in_flight_cov_micro);
+                let subsumed_weight = Self::weighted_partial(weight, subsumed_cov_micro);
+                if subsumed_weight > 0 {
+                    self.live_partial_weight
+                        .fetch_sub(subsumed_weight, Ordering::Relaxed);
                 }
                 self.completed.fetch_add(1, Ordering::Relaxed);
+                self.completed_weight.fetch_add(weight, Ordering::Relaxed);
                 true
             }
         } else {
@@ -223,6 +300,7 @@ impl BoundaryProgress {
         if cov_micro == 0 {
             return;
         }
+        let weight = self.weight_for(fanout_root_id);
         let mut guard = self.pending.lock().unwrap();
         let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
             pending: 1,
@@ -237,9 +315,9 @@ impl BoundaryProgress {
             // Further partial-credit calls are no-ops.
             return;
         }
-        // Clamp to the per-root cap before updating either the
-        // entry or the live aggregate, so both stay consistent
-        // with the §4.2 invariant.
+        // Clamp cov_micro to the per-root cap before any weighted
+        // accounting, so a single boundary can never claim more
+        // partial credit than its own weight (TTC §4.2 rule 2).
         let before = entry.in_flight_cov_micro;
         let proposed = before.saturating_add(cov_micro);
         let after = proposed.min(Self::PER_ROOT_COV_MICRO_CAP);
@@ -248,8 +326,11 @@ impl BoundaryProgress {
             return;
         }
         entry.in_flight_cov_micro = after;
-        self.live_partial_cov_micro
-            .fetch_add(actual_delta, Ordering::Relaxed);
+        let weighted_delta = Self::weighted_partial(weight, actual_delta);
+        if weighted_delta > 0 {
+            self.live_partial_weight
+                .fetch_add(weighted_delta, Ordering::Relaxed);
+        }
     }
 
     /// Fraction of the search space *fully* covered — i.e.
@@ -258,11 +339,11 @@ impl BoundaryProgress {
     /// the descendant search). Additive over disjoint boundaries.
     /// Abandoned boundaries do NOT contribute — TTC §4.1.
     pub fn covered_fraction(&self) -> f64 {
-        if self.total == 0 {
+        if self.total_weight == 0 {
             0.0
         } else {
-            let done = self.completed.load(Ordering::Relaxed);
-            (done as f64 / self.total as f64).clamp(0.0, 1.0)
+            let done = self.completed_weight.load(Ordering::Relaxed);
+            (done as f64 / self.total_weight as f64).clamp(0.0, 1.0)
         }
     }
 
@@ -283,11 +364,11 @@ impl BoundaryProgress {
     /// fully-credited timeout is worth `1 / total` — same unit as
     /// a fully-completed boundary.
     pub fn partial_fraction(&self) -> f64 {
-        if self.total == 0 {
+        if self.total_weight == 0 {
             0.0
         } else {
-            let sum = self.live_partial_cov_micro.load(Ordering::Relaxed);
-            (sum as f64 / (self.total as f64 * 1_000_000.0)).clamp(0.0, 1.0)
+            let sum = self.live_partial_weight.load(Ordering::Relaxed);
+            (sum as f64 / self.total_weight as f64).clamp(0.0, 1.0)
         }
     }
 }
@@ -693,11 +774,11 @@ impl StageHandler<MddPayload> for SolveZStage {
 ///   boundaries are marked "abandoned" (see
 ///   `BoundaryProgress::mark_abandoned`) and contribute ONLY to
 ///   partial credit via retained `in_flight_cov_micro`.
-/// - `covered_partial = live_partial_cov_micro / (total * 1M)`.
-///   Sum of per-XY-timeout `cover_micro` across live AND
-///   abandoned boundaries; each clean closure subsumes its
-///   root's contribution into exact, each abandoned closure
-///   retains it.
+/// - `covered_partial = live_partial_weight / total_weight`.
+///   Per-XY-timeout `cover_micro` weighted by each boundary's
+///   `weights[i] / 1_000_000`, summed across live AND abandoned
+///   boundaries; each clean closure subsumes its root's
+///   contribution into exact, each abandoned closure retains it.
 ///
 /// `Hybrid` label per TTC §6.3 because `covered_partial` is a
 /// projected estimate of XY sub-cube elimination, not a direct
@@ -827,11 +908,19 @@ impl MddStagesAdapter {
                 z_bits,
                 w_bits,
             ) {
-                Some(xy_root) => vec![BoundaryWork {
-                    z_bits,
-                    w_bits,
-                    xy_graph: loaded_xy_graph(xy_root),
-                }],
+                Some(xy_root) => {
+                    // --outfix pins exactly one boundary; its
+                    // weight is the entire search by definition.
+                    let mut cache = std::collections::HashMap::new();
+                    let xy_path_count =
+                        ctx.mdd.count_paths_from(xy_root, ctx.zw_depth, &mut cache);
+                    vec![BoundaryWork {
+                        z_bits,
+                        w_bits,
+                        xy_graph: loaded_xy_graph(xy_root),
+                        xy_path_count,
+                    }]
+                }
                 None => {
                     eprintln!(
                         "[framework:{}] --outfix boundary (z_bits={:#x}, w_bits={:#x}) is not live in the MDD (pruned during gen); cannot search.",
@@ -843,18 +932,56 @@ impl MddStagesAdapter {
         } else {
             enumerate_live_boundaries(&ctx, cancel)
         };
+        // Per-boundary weights from real XY descendant path counts.
+        // We rescale `xy_path_count` (an f64 in `[1, 4^(2k)]`) to
+        // u64 so the boundary's product `weight * cov_micro (≤
+        // 1e6)` stays inside u64 with margin: scale every count
+        // so the maximum weight is `WEIGHT_MAX = 1e9`. Boundaries
+        // whose count rounds to zero get a floor of 1 so they
+        // still close (zero-weight boundaries would publish
+        // covered_fraction=0 even when fully retired, masking
+        // their completion in TTC).
+        const WEIGHT_MAX: f64 = 1.0e9;
+        let max_count = seed_boundaries
+            .iter()
+            .map(|b| b.xy_path_count)
+            .fold(0.0_f64, f64::max);
+        let weights: Vec<u64> = if max_count > 0.0 {
+            seed_boundaries
+                .iter()
+                .map(|b| {
+                    let scaled = (b.xy_path_count / max_count) * WEIGHT_MAX;
+                    scaled.round().max(1.0) as u64
+                })
+                .collect()
+        } else {
+            // Pathological (all zero) — fall back to uniform.
+            vec![1; seed_boundaries.len()]
+        };
+        let total_weight: u64 = weights.iter().copied().sum();
         if verbose {
+            let max_w = weights.iter().copied().max().unwrap_or(0);
+            let min_w = weights.iter().copied().min().unwrap_or(0);
             eprintln!(
-                "[framework:{}] seed_boundaries={} (pre-enumerated upfront)",
+                "[framework:{}] seed_boundaries={} (pre-enumerated upfront); \
+                 weights min={} max={} total={} (skew={:.1}x)",
                 mode_name,
-                seed_boundaries.len()
+                seed_boundaries.len(),
+                min_w,
+                max_w,
+                total_weight,
+                if min_w == 0 {
+                    f64::INFINITY
+                } else {
+                    max_w as f64 / min_w as f64
+                },
             );
         }
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         // Seed boundaries use `item_id = 0..N`; start the counter
         // past that so child items never collide with a seed id.
         let item_ids = Arc::new(AtomicU64::new(seed_boundaries.len() as u64));
-        let progress = Arc::new(BoundaryProgress::new(seed_boundaries.len() as u64));
+        let progress = Arc::new(BoundaryProgress::new_weighted(weights));
         let adapter = MddStagesAdapter {
             ctx,
             metrics: new_pipeline_metrics(),
@@ -891,12 +1018,26 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
             {
                 break;
             }
+            // `mass_hint` is the boundary's share of total
+            // search mass. We expose the raw weight here (in the
+            // same unit as `BoundaryProgress::weights`) so the
+            // scheduler's cost-aware ordering and any external
+            // consumer of the hint see the same shape as the TTC
+            // ledger. Falls back to 1.0 if the weight isn't found
+            // (shouldn't happen for any seed item).
+            let weight_hint = self
+                .progress
+                .weights
+                .get(i)
+                .copied()
+                .map(|w| w as f64)
+                .unwrap_or(1.0);
             seed_items.push(WorkItem {
                 stage_id: STAGE_BOUNDARY,
                 priority: 0,
                 cost_hint: 1,
                 replay_key: i as u64,
-                mass_hint: Some(1.0),
+                mass_hint: Some(weight_hint),
                 meta: WorkItemMeta {
                     item_id: i as u64,
                     parent_item_id: None,
@@ -908,6 +1049,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                     z_bits: b.z_bits,
                     w_bits: b.w_bits,
                     xy_graph: b.xy_graph.clone(),
+                    xy_path_count: b.xy_path_count,
                 }),
             });
         }
@@ -1201,37 +1343,110 @@ mod tests {
         assert_eq!(p.abandoned_count(), 1);
     }
 
+    /// Per-boundary weight: a boundary that holds 90% of the
+    /// total descendant search mass MUST credit 90% of the
+    /// covered_fraction on completion (not 1/N like uniform).
+    /// This is the whole point of the weighted constructor — it
+    /// stops covered_fraction from drifting wildly when cheap
+    /// and expensive boundaries retire in arbitrary order.
+    #[test]
+    fn weighted_boundary_credits_match_share_of_total_mass() {
+        // 4 boundaries with very skewed weights: one boundary
+        // holds 90% of the search, the other three split 10%.
+        let weights = vec![900_000_000, 33_333_333, 33_333_333, 33_333_333];
+        let total_w: u64 = weights.iter().sum();
+        let p = BoundaryProgress::new_weighted(weights);
+        // Retiring the small boundaries first credits ~10%, NOT
+        // 75%. This is the property uniform weighting gets wrong.
+        p.note_handled(1, 0);
+        p.note_handled(2, 0);
+        p.note_handled(3, 0);
+        let small_share = 99_999_999.0 / total_w as f64;
+        assert!(
+            (p.covered_fraction() - small_share).abs() < 1e-6,
+            "3 small boundaries should credit ~10% of total mass; got {}",
+            p.covered_fraction()
+        );
+        // Retiring the heavy boundary brings us to ~100%.
+        p.note_handled(0, 0);
+        assert!(
+            (p.covered_fraction() - 1.0).abs() < 1e-6,
+            "all boundaries retired ⇒ covered_fraction must be 1.0; got {}",
+            p.covered_fraction()
+        );
+    }
+
+    /// Weighted partial credit: a 50%-eliminated cov_micro on a
+    /// boundary that holds 90% of the search must contribute 45%
+    /// to partial_fraction, not the uniform-weight 12.5%.
+    #[test]
+    fn weighted_partial_credit_scales_with_per_boundary_weight() {
+        let weights = vec![900_000_000, 33_333_333, 33_333_333, 33_333_333];
+        let p = BoundaryProgress::new_weighted(weights);
+        // 50% eliminated on the heavy boundary.
+        p.add_partial_cov_micro(0, 500_000);
+        let frac = p.partial_fraction();
+        // Heavy weight ≈ 0.9 of total; 50% of that ≈ 0.45.
+        assert!(
+            (frac - 0.45).abs() < 1e-3,
+            "50% partial on a 90%-weight boundary should be ~0.45; got {}",
+            frac
+        );
+        // Same 50% partial on a small boundary: ~0.05/2 = 0.025.
+        let p2 = BoundaryProgress::new_weighted(vec![
+            900_000_000,
+            33_333_333,
+            33_333_333,
+            33_333_333,
+        ]);
+        p2.add_partial_cov_micro(1, 500_000);
+        let frac2 = p2.partial_fraction();
+        assert!(
+            (frac2 - 0.0167).abs() < 1e-3,
+            "50% partial on a 3.3%-weight boundary should be ~0.017; got {}",
+            frac2
+        );
+    }
+
     /// Clean boundaries and abandoned boundaries coexist across
     /// a run. The covered_fraction sums only clean closures; the
     /// abandoned_count tracks the other population separately.
     #[test]
     fn clean_and_abandoned_closures_are_separately_counted() {
+        // Real adapter assigns root_ids 0..N (matches `weights`
+        // index range). The legacy version of this test used
+        // 1..=4 with new(4); rebased to 0..=3 so the weight
+        // lookups land on the seeded entries.
         let p = BoundaryProgress::new(4);
-        // Root 1: clean closure.
+        // Root 0: clean closure.
+        p.note_handled(0, 0);
+        // Root 1: abandoned.
+        p.mark_abandoned(1);
         p.note_handled(1, 0);
-        // Root 2: abandoned.
-        p.mark_abandoned(2);
+        // Root 2: clean.
         p.note_handled(2, 0);
-        // Root 3: clean.
+        // Root 3: abandoned with partial credit.
+        p.add_partial_cov_micro(3, 500_000);
+        p.mark_abandoned(3);
         p.note_handled(3, 0);
-        // Root 4: abandoned with partial credit.
-        p.add_partial_cov_micro(4, 500_000);
-        p.mark_abandoned(4);
-        p.note_handled(4, 0);
 
         assert_eq!(p.covered_fraction(), 0.5, "2/4 clean");
         assert_eq!(p.abandoned_count(), 2);
-        // Root 4 retained its 500_000 cov_micro.
-        // Denom = 4 * 1_000_000; 500_000 / 4_000_000 = 0.125.
+        // Root 3 retained its 500_000 cov_micro. Uniform weights
+        // ⇒ each boundary's full weight is 1/4 of the search;
+        // half a boundary's worth of partial credit is 1/8.
         assert!((p.partial_fraction() - 0.125).abs() < 1e-9);
     }
 
     #[test]
     fn note_handled_does_not_double_credit_on_stale_root_reentry() {
         let p = BoundaryProgress::new(2);
+        // Use root_ids in 0..N so the weight table lookups hit
+        // the seeded entries (the real adapter always assigns
+        // root_ids 0..seed_boundaries.len()).
         // First call: fresh root, pending 1 -> 0, bump completed.
         assert!(
-            p.note_handled(7, 0),
+            p.note_handled(0, 0),
             "first zero-transition MUST return true"
         );
         assert!(
@@ -1241,14 +1456,14 @@ mod tests {
         // Stale call: same root arrives again. It would normally
         // re-insert (1, false) and drop to zero again; without the
         // guard we'd double-credit.
-        assert!(!p.note_handled(7, 0), "stale re-entry MUST NOT re-credit");
+        assert!(!p.note_handled(0, 0), "stale re-entry MUST NOT re-credit");
         assert!(
             (p.covered_fraction() - 0.5).abs() < 1e-9,
             "covered_fraction MUST stay at 0.5 after stale re-entry; got {}",
             p.covered_fraction()
         );
         // A different root completing increments normally.
-        assert!(p.note_handled(8, 0));
+        assert!(p.note_handled(1, 0));
         assert!((p.covered_fraction() - 1.0).abs() < 1e-9);
     }
 

@@ -1839,9 +1839,9 @@ mod tests {
     }
 
     #[test]
-    // Same as hybrid_finds_tt4: the Cross-mode spectral pair filter is
-    // too tight to recover the rule-(i) canonical TT(6) at small n, so
-    // we exercise the MDD-walker (Apart) pipeline here.
+    // Same as hybrid_finds_tt4: Cross mode does not recover the
+    // rule-(i) canonical TT(6) at this small n. Root cause has not
+    // been identified, so we exercise the MDD-walker (Apart) pipeline.
     fn hybrid_finds_tt6() {
         let cfg = SearchConfig {
             problem: Problem::new(6),
@@ -2173,13 +2173,10 @@ mod tests {
         );
     }
 
-    // At n=4 the Cross-mode spectral pair filter is too tight to recover
-    // the rule-(i) canonical TT(4) (X=[+,+,+,+], Y=[+,-,+,+], Z=[+,+,-,-],
-    // W=[+,-,+]) — the only pair that passes all Phase A/B sees
-    // |Z(ω)|²+|W(ω)|² above the 3n-1=11 bound at one of the ω samples.
-    // The MDD-walker path (WzMode::Apart) does not use the same pair
-    // filter and recovers the canonical solution cleanly, so we test
-    // that pipeline here instead.
+    // At n=4 Cross mode does not recover the rule-(i) canonical TT(4)
+    // (X=[+,+,+,+], Y=[+,-,+,+], Z=[+,+,-,-], W=[+,-,+]). Root cause
+    // has not been identified. The MDD-walker path (WzMode::Apart)
+    // recovers the canonical solution cleanly, so we test it here.
     #[test]
     fn hybrid_finds_tt4() {
         let cfg = SearchConfig {

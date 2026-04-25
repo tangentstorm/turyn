@@ -1,0 +1,17 @@
+turyn settings: --n=24 --wz=apart --mdd-k=7 --mdd-extend=1 --theta=128 --max-z=200000 --max-w=200000 --conflict-limit=0 --sat-secs=180 --quad-pb=true --xor-propagation  (threads=4)
+Loaded MDD from mdd-7.bin (k=7, 14470 nodes, 0.2 MB, 1.04e8 live / 7.21e16 total paths, 1.45e-9 live fraction)
+[framework:apart] seed_boundaries=1465976 (pre-enumerated upfront)
+[framework:apart] elapsed=1.0s covered=0.000/1.000 ttc=Some(4199.584798292s) TTC (unconstrained baseline)
+[framework:apart] elapsed=2.0s covered=0.001/1.000 ttc=Some(2532.863616914s) TTC (unconstrained baseline)
+[framework:apart] elapsed=3.0s covered=0.001/1.000 ttc=Some(3659.936590518s) TTC (unconstrained baseline)
+[framework:apart] elapsed=4.0s covered=0.001/1.000 ttc=Some(4791.848174489s) TTC (unconstrained baseline)
+[framework:apart] elapsed=5.0s covered=0.001/1.000 ttc=Some(5879.459770076s) TTC (unconstrained baseline)
+[framework:apart] elapsed=6.0s covered=0.001/1.000 ttc=Some(6971.187680044s) TTC (unconstrained baseline)
+Framework search (--wz=apart): covered=0.001/1.000 elapsed=6.4s ttc=Some(7402.233682057s) (quality=Hybrid) TTC (unconstrained baseline)
+Framework search (--wz=apart): found_solution=true (1 solution(s))
+[framework:apart] stage_exit bnd/W/Z/XY = 2332/623/14171/1956
+[framework:apart] flow W: unsat=74 timeout=0 sol=310702 spec_fail=215198 spec_pass=51528 solves=0
+[framework:apart] flow Z: unsat=14028 timeout=0 sol=157 pair_fail=32 spec_fail=0 solves=14171
+[framework:apart] flow XY: sat=1 unsat=1955 timeout=0 solves=1090 zw_bound_rej=0 ext_pruned=610
+[framework:apart] boundaries: abandoned=0 (SAT-timeout-closed, retained partial only)
+WALL_SEC=6.565 EXIT=0

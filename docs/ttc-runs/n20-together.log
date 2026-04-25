@@ -1,0 +1,12 @@
+turyn settings: --n=20 --wz=together --mdd-k=7 --mdd-extend=1 --theta=128 --max-z=200000 --max-w=200000 --conflict-limit=0 --sat-secs=180 --quad-pb=true --xor-propagation  (threads=4)
+Loaded MDD from mdd-7.bin (k=7, 14470 nodes, 0.2 MB, 1.04e8 live / 7.21e16 total paths, 1.45e-9 live fraction)
+[framework:together] seed_boundaries=1465976 (pre-enumerated upfront)
+[framework:together] elapsed=1.0s covered=0.001/1.000 ttc=Some(787.365615563s) TTC (unconstrained baseline)
+Framework search (--wz=together): covered=0.003/1.000 elapsed=1.4s ttc=Some(524.059155621s) (quality=Hybrid) TTC (unconstrained baseline)
+Framework search (--wz=together): found_solution=true (1 solution(s))
+[framework:together] stage_exit bnd/W/Z/XY = 12600/3853/0/1324
+[framework:together] flow W: unsat=0 timeout=0 sol=0 spec_fail=0 spec_pass=0 solves=1398
+[framework:together] flow Z: unsat=0 timeout=0 sol=31 pair_fail=0 spec_fail=0 solves=1398
+[framework:together] flow XY: sat=1 unsat=1323 timeout=0 solves=1324 zw_bound_rej=0 ext_pruned=0
+[framework:together] boundaries: abandoned=0 (SAT-timeout-closed, retained partial only)
+WALL_SEC=1.538 EXIT=0

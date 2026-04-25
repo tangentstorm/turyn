@@ -1,0 +1,29 @@
+turyn settings: --n=22 --wz=apart --mdd-k=7 --mdd-extend=1 --theta=128 --max-z=200000 --max-w=200000 --conflict-limit=0 --sat-secs=300 --quad-pb=true --xor-propagation  (threads=4)
+Loaded MDD from mdd-7.bin (k=7, 14470 nodes, 0.2 MB, 1.04e8 live / 7.21e16 total paths, 1.45e-9 live fraction)
+[framework:apart] seed_boundaries=1465976 (pre-enumerated upfront)
+[framework:apart] elapsed=1.0s covered=0.000/1.000 ttc=Some(2602.936926041s) TTC (unconstrained baseline)
+[framework:apart] elapsed=2.0s covered=0.001/1.000 ttc=Some(1968.516045848s) TTC (unconstrained baseline)
+[framework:apart] elapsed=3.0s covered=0.002/1.000 ttc=Some(1545.692699716s) TTC (unconstrained baseline)
+[framework:apart] elapsed=4.0s covered=0.002/1.000 ttc=Some(1959.288215736s) TTC (unconstrained baseline)
+[framework:apart] elapsed=5.0s covered=0.002/1.000 ttc=Some(2298.696631843s) TTC (unconstrained baseline)
+[framework:apart] elapsed=6.0s covered=0.002/1.000 ttc=Some(2663.634446999s) TTC (unconstrained baseline)
+[framework:apart] elapsed=7.0s covered=0.002/1.000 ttc=Some(2883.863960744s) TTC (unconstrained baseline)
+[framework:apart] elapsed=8.0s covered=0.003/1.000 ttc=Some(3122.973613419s) TTC (unconstrained baseline)
+[framework:apart] elapsed=9.0s covered=0.003/1.000 ttc=Some(3150.661952676s) TTC (unconstrained baseline)
+[framework:apart] elapsed=10.0s covered=0.003/1.000 ttc=Some(3403.483134413s) TTC (unconstrained baseline)
+[framework:apart] elapsed=11.0s covered=0.003/1.000 ttc=Some(3379.161898305s) TTC (unconstrained baseline)
+[framework:apart] elapsed=12.0s covered=0.004/1.000 ttc=Some(3411.438134338s) TTC (unconstrained baseline)
+[framework:apart] elapsed=13.0s covered=0.004/1.000 ttc=Some(3536.859719647s) TTC (unconstrained baseline)
+[framework:apart] elapsed=14.0s covered=0.004/1.000 ttc=Some(3737.674118162s) TTC (unconstrained baseline)
+[framework:apart] elapsed=15.0s covered=0.004/1.000 ttc=Some(3995.855223428s) TTC (unconstrained baseline)
+[framework:apart] elapsed=16.0s covered=0.004/1.000 ttc=Some(4174.359884301s) TTC (unconstrained baseline)
+[framework:apart] elapsed=17.0s covered=0.004/1.000 ttc=Some(4313.961908493s) TTC (unconstrained baseline)
+[framework:apart] elapsed=18.0s covered=0.004/1.000 ttc=Some(4539.224296996s) TTC (unconstrained baseline)
+Framework search (--wz=apart): covered=0.004/1.000 elapsed=18.6s ttc=Some(4664.491731665s) (quality=Hybrid) TTC (unconstrained baseline)
+Framework search (--wz=apart): found_solution=true (1 solution(s))
+[framework:apart] stage_exit bnd/W/Z/XY = 7789/4551/71365/68058
+[framework:apart] flow W: unsat=141 timeout=0 sol=564959 spec_fail=403996 spec_pass=132851 solves=0
+[framework:apart] flow Z: unsat=70293 timeout=0 sol=1177 pair_fail=201 spec_fail=0 solves=71365
+[framework:apart] flow XY: sat=1 unsat=68057 timeout=0 solves=40377 zw_bound_rej=0 ext_pruned=9649
+[framework:apart] boundaries: abandoned=0 (SAT-timeout-closed, retained partial only)
+WALL_SEC=18.781 EXIT=0

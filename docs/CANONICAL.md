@@ -126,11 +126,11 @@ on canonical-orbit data:
   the test body (a[i] ↦ (-1)^i·a[i] on all four sequences) so
   `x[35]=y[35]=+1` in the canonical orbit.
 - `hybrid_finds_tt4`, `benchmark_profile_n4_finds_solution_fast`,
-  `hybrid_finds_tt6`: switched from Cross mode to Apart mode.
-  The Cross-mode spectral pair filter is tight enough at n=4, 6 to
-  reject the one canonical `(Z,W)` pair that satisfies rule (i);
-  the Apart (MDD-walker) path uses per-lag SAT constraints and
-  recovers the canonical TT cleanly.
+  `hybrid_finds_tt6`: switched from Cross mode to Apart mode because
+  Cross mode does not recover the rule-(i) canonical solution at
+  these small n. Root cause has not been identified — the comment
+  that previously claimed "spectral pair filter too tight" was a
+  guess unsupported by evidence.
 
 ### Fixed bugs
 
