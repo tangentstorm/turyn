@@ -15,6 +15,25 @@ benchmark configuration.
 | 18 | apart | conj-tuple, THREADS=1, uniform      | 3    | 17.7–18.2 s | 3%    | within **7%** of ground truth        |
 | 22 | apart | conj-tuple, **4 threads**, weighted | 1    | **1528 s = 25.5 min** | n/a | TTC at 80% covered: within **5%** |
 
+## Per-mode validation status
+
+The calibration above only tests `--wz=apart`. A quick sanity check
+across all four `--wz` modes at `n=14 --conj-tuple --continue-after-sat`
+shows they are **not** equivalent:
+
+| `--wz` | wall (n=14 conj-tuple) | covered@end | solutions | quality | useable for ground truth? |
+|--------|----------------------:|-------------|-----------|---------|---------------------------|
+| `apart`     | 0.5 s   | 1.000 | 6 | Hybrid     | **yes — calibrated up to n=22** |
+| `together`  | 1.2 s   | 1.000 | 3 | Hybrid     | yes (same MDD machinery; not separately stress-tested) |
+| `cross`     | 40.8 s  | 1.000 | **0** | Hybrid | **NO — finds zero solutions on the same problem apart finds 6 on**; semantic divergence, separate bug |
+| `sync`      | 1.5 s   | 0.016 | 1 | Projected  | NO — exits early at sub-1% covered; the published TTC is `Projected` per `TTC.md` §7.3 and is documented as estimate-only |
+
+So when this doc says "TTC is calibrated within ~10%," it strictly
+means the `--wz=apart` (and by code-sharing, `--wz=together`) flow
+through `MddStagesAdapter`. `cross` and `sync` have NOT been verified
+against ground truth at any scale and remain `Hybrid`/`Projected`
+quality without empirical accuracy bounds.
+
 For comparison, the same runs with default 4 threads, default early-exit-on-
 first-solution, and no flags showed 1–10x run-to-run TTC variance and
 no path to ground truth. **The metric isn't broken; the benchmark
