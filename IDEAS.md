@@ -3210,3 +3210,337 @@ post-hoc spectrum. Removed the FFT call and the now-unused
   the default (no-tuple) benchmark. Commit removes a stale
   `let _ = &w_spectrum; // used by pair_power below` comment that
   outlived the pair_power check it documented.
+
+## Z-series: April 25 2026 sync optimization round (Claude)
+
+Baseline at session start (n=26 `--wz=sync --sat-secs=60`, 16 threads,
+this hardware): direct TTC 1.01–1.03e7s parallel (1.6e8s serial),
+~21k nodes/s aggregate, sat_unsat ~5500, peer_imports ~128.
+Per-feature forcings clause 85.0% / quadpb 3.6% / pbseteq 11.0%.
+
+The published 4.40e6s result from April 19 used different hardware;
+on the current host the same code is ~2× slower in absolute terms.
+We measure deltas, not absolutes.
+
+Per-level coverage table read of the baseline:
+
+- Levels 0–1: 100% (every worker re-walks the deterministic prefix)
+- Levels 2–12: 10–80% per-level coverage; workers' randomized
+  sibling orderings overlap rather than partition
+- Levels 13–25: 90–100% coverage; level 22–24 dominate forcings
+  (clause BCP at 85%)
+
+Two structural inefficiencies stand out:
+
+1. **Top-level overlap**: 16 workers all visit the deterministic root,
+   then re-walk the same first-branching prefix in shuffled order.
+   Coverage product collapses from level-2 fractional coverages.
+2. **Per-frame allocation churn**: `dfs_body` does
+   `state.bits.clone()` (4n bytes) + `state.sums.clone()` (~2n bytes)
+   per entry, plus `spec_parent_sums = state.sums.clone()` per
+   sibling-loop entry. ~6n bytes × 1.3M frames ≈ ~250 MB/s churn.
+
+### Z1. Replace `state.bits.clone()` / `state.sums.clone()` with reusable scratch
+
+Currently `dfs_body` allocates two `Vec<u8>`/`Vec<i16>` snapshots
+per entry. Move them to per-thread scratch on a stack passed
+through recursion so we re-use one buffer per recursion depth.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: `nodes_visited / elapsed` rises;
+  `perf record` shows `Vec::clone` falls out of the hot list.
+- **Risk**: minor — recursion depth is bounded by `n` so the
+  stack of scratch buffers is small (n×4n bytes ≈ 5 KB at n=26).
+
+### Z2. Skip `harvest_forced` when no new walker bit was forced — *tested, rejected (in noise)*
+
+After `push_assume_frame` returns SAT, we always run `harvest_forced`
+(O(4n) loop) and conditionally `rebuild_sums` if `n_harvested > 0`.
+But harvest re-scans every kind/pos to find newly-set vars — at
+shallow levels with no propagation pressure this is wasted work.
+
+Implementation: gate `harvest_forced` on the existing `delta` value
+(the count of new walker vars forced by this push). When `delta == 0`,
+harvest_forced is a no-op by definition — the delta IS the count of
+positions harvest would set. Skipping is information-preserving;
+contrast with the rejected R8d which skipped harvest unconditionally.
+
+Measurement (n=26 sync 60s, 16 workers, 3 sequential trials):
+
+| metric        | baseline       | Z2 (skip on delta==0) |
+|---------------|----------------|------------------------|
+| direct TTC    | 1.022e7 s mean | 1.033e7 s mean        |
+| nodes_visited | 1.27 M         | 1.27 M (unchanged)    |
+
+In noise (+1% TTC, ≈ noise floor). The harvest_forced loop is too
+cheap to matter: 4n=104 single-array-access reads × 1.3M frames ≈
+135 M loads, contributing < 100 ms over a 60 s run. Reverted.
+
+- **TTC mechanism attempted**: rate.
+- **Lesson**: harvest_forced is not a measurable hotspot. Don't
+  spend further cycles on it.
+
+### Z3. Skip `harvest_forced` re-scan of already-set positions
+
+`harvest_forced` iterates every (kind, pos) and skips bits already
+set. The skip cost is one memory load per position. At deep levels
+where most bits are already set the loop is mostly skips — but
+still touches 4n cache lines. Maintain a per-state count of unset
+positions and a sparse free-list to iterate only the unset ones.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: cumulative time in `harvest_forced` drops
+  at deep levels; nodes/s up.
+- **Risk**: bookkeeping correctness on rollback.
+
+### Z4. Workers atomically claim siblings at the first branching level
+
+S4 (rejected) used static stride partitioning at a fixed level and
+regressed because per-frame `processed_count / candidates.len()`
+collapsed to ≤1/N. The fix: at one chosen level (L*, the first
+level with ≥N siblings), each worker `fetch_add`s a counter to
+claim the next unprocessed sibling index.
+
+When a worker claims index `i`, it processes only `candidates[i]`
+at this frame; we record `children_processed_by_level[L*] +=
+n_workers` once per frame (not per worker) since across all
+workers we're collectively processing the full sibling list, just
+once each.
+
+Above L*: deterministic walk (or random — doesn't matter, only one
+worker's path runs the prefix work).
+
+Below L*: each worker's claimed sibling defines a disjoint subtree;
+LCG random ordering as today.
+
+- **TTC mechanism**: rate (massive — eliminates 16× redundant
+  level-2..L* exploration) + correct denominator coverage.
+- **Detection plan**: per-level coverage at L* jumps to 100%;
+  nodes/s drops (workers do more work per node) but
+  cumulative-coverage product rises proportionally; direct TTC
+  drops by the inverse of the previous coverage product
+  shortfall.
+- **Risk**: above L*, only one worker walks the prefix — no peer
+  clauses learned there. But level 0..L* propagation is heavy on
+  initial backbone-fixed lits; nothing new to learn.
+
+### Z5. Combined-level walking: place 2 positions per push frame
+
+Currently each push pins ≤4 lits at one bouncing-order position.
+Combining two adjacent levels (`pos_order[L]` and `pos_order[L+1]`)
+pins ≤8 lits in one frame, halving push overhead and giving the
+solver a wider initial trail per propagate.
+
+Implementation: extend `Cand::new_assums` to 8 lits, double the
+candidate enumeration to 256 = 16² choices (most pruned by
+capacity/tuple/rule before push). Pruning denominator can grow
+faster: the joint capacity check sees both placements at once.
+
+- **TTC mechanism**: rate (fewer pushes, fewer harvest_forced
+  scans, more lits propagated together) + denominator (joint
+  capacity check rejects more pre-push).
+- **Detection plan**: nodes/s drops (each "node" does 2× the
+  work) but per-frame coverage rises; direct TTC drops if
+  `coverage_per_node / time_per_node` improves.
+- **Risk**: significant refactor; per-level telemetry rewires.
+
+### Z6. Cache `tuple_reachable` answer per (sigma, free) signature
+
+`tuple_reachable` iterates valid_tuples (~30–200 entries) per
+candidate. After harvest, σ and free counts may move only
+slightly between sibling candidates that all bypass the
+walker-placed bit count. A small FxHashMap memo keyed on
+`(sx,sy,sz,sw,fx,fy,fz,fw)` caches reachability.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: `tuple_rejects` unchanged; nodes/s rises
+  by whatever fraction of `tuple_reachable` calls hit cache.
+- **Risk**: hash overhead may exceed iteration cost at small
+  valid_tuples sizes; needs measurement.
+
+### Z7. Skip score+sort path when ≤1 viable candidate
+
+`candidates.sort_by_key(|c| c.score)` and the LCG shuffle each
+have non-trivial constants. When `candidates.len() ≤ 1` the sort
+is a no-op but the code still computes the per-candidate score
+(with `i64::MAX` for invalid). Adding an early-out when
+`candidates.is_empty() || candidates.len() == 1` after pruning
+drops the sort/shuffle path on roots with single viable child.
+
+- **TTC mechanism**: rate (micro).
+- **Detection plan**: cumulative time in sort/hash steps drops;
+  nodes/s rises slightly at shallow levels.
+
+### Z8. Reuse per-thread `last_learnt_clause` allocation
+
+`take_last_learnt_clause()` consumes `Option<Vec<Lit>>`; on
+publish, the `Vec` is pushed onto the exchange Mutex. Each UNSAT
+allocates a fresh `Vec`. With MAX_SHARED_LEN=2 nearly every
+clause is 1–2 lits. Wrap the publish path in a per-worker
+`SmallVec<[Lit; 2]>` pool and recycle the allocation across
+publishes.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: alloc count in `perf record -e
+  syscalls:sys_enter_brk` drops; cumulative `nogood publish`
+  cost in `perf` drops.
+
+### Z9. Avoid full `state.bits.copy_from_slice(&saved_all_bits)` per sibling
+
+The sibling loop copies 4n bytes back into state.bits at the top
+of every iteration. Most siblings differ from the saved state in
+≤4 positions (the placed bits) plus whatever harvest set last
+iteration. Track those diffs explicitly and restore only them.
+
+- **TTC mechanism**: rate.
+- **Detection plan**: nodes/s up; `memcpy` body time drops in
+  `perf`. Since 4n is small (~104 bytes), gain may be marginal.
+
+### Z10. Conflict-driven sibling pruning
+
+When `push_assume_frame` returns UNSAT and the learnt nogood is
+≤4 lits AND every literal in it comes from the just-pushed
+frame, that nogood directly forbids any sibling that satisfies
+the same combination. Pre-filter remaining candidates against
+this nogood without calling the solver.
+
+- **TTC mechanism**: rate (skip propagate calls for siblings the
+  conflict already invalidates).
+- **Detection plan**: `sat_unsat` drops per frame at deep levels;
+  nodes/s rises.
+- **Risk**: subsumption logic complexity.
+
+### Ranking by expected payoff
+
+1. **Z4** (work-stealing at L*): biggest theoretical win — addresses
+   structural overlap. Medium complexity.
+2. **Z5** (combined-level walking): big rate + denominator win.
+   Significant refactor.
+3. **Z1** (scratch buffers): solid rate win, low complexity.
+4. **Z2** (skip harvest on no-delta): low complexity, modest gain.
+5. **Z6** (tuple_reachable memo): low complexity, may be neutral.
+6. **Z7** (skip sort on ≤1): trivial, marginal gain.
+7. **Z3, Z8, Z9, Z10**: micro-opts or risky.
+
+Plan: validate baseline noise floor first (3+ sequential 60s runs),
+then attempt Z1 (cheap, validates pipeline), then Z4 (biggest swing).
+
+### Z11. Attach mdd-k.bin's first 2k ZW levels as native MDD propagator on sync's solver
+
+**The big architectural denominator win.** Apart's pipeline reports
+1.46M live (Z, W) boundary tuples out of 4^14 = 268 M for n=26 k=7
+— a 184× pruning. Sync's walker enumerates the 4^14 boundary
+unconstrained.
+
+The radical solver already has a 4-way 2-var-per-level
+`MddConstraint` propagator (used in `--wz=together`). Loading the
+existing global mdd-k.bin's first 2k levels (the ZW prefix
+section) and attaching it via `solver.add_mdd_constraint(...)`
+with `level_x_var = Z[pos_order[L]]`, `level_y_var = W[pos_order[L]]`
+would constrain sync's walker to live ZW boundaries.
+
+- **TTC mechanism**: denominator (huge — 184× theoretical
+  reduction in boundary search space). Some rate cost
+  (propagator overhead per push) but should be net positive.
+- **Detection plan**: `cap_rejects` drops (boundary positions
+  pre-pruned by MDD); `tuple_rejects` drops; `nodes_visited`
+  drops at first 14 levels; per-level coverage at boundary
+  levels jumps to 100%.
+
+**Implementation challenges encountered (deferred)**:
+
+- Mdd4 has depth 4k with alternating ZW (levels 0..2k-1) and XY
+  (levels 2k..4k-1) sections. Need to extract the ZW-only sub-
+  MDD: for each level 2k-1 node, its 4 children point into XY
+  sub-MDDs; collapse non-DEAD children to LEAF for a sound ZW-
+  only MDD.
+- W[n-1] doesn't exist (W has length m = n-1). At packed bit
+  2k-1 the actual position is n-1, where W has no variable.
+  The MDD must encode this somehow — either the level branches
+  on Z only with redundant (DEAD/LEAF) children for the
+  non-existent W choices, or there's an internal canonicalization.
+  Need to inspect the gen_mdd output to determine.
+- The existing W[m-1] "tail bit" propagator in build_solver
+  references W[n-2], not W[n-1]. If MDD's level 2k-1 actually
+  branches on (Z[n-1], W[n-2]) due to the boundary mapping
+  oddity, our level_y_var would need to be W[n-2] there.
+
+**Estimated effort**: 1-2 sessions if the MDD W[n-1] handling
+turns out to be straightforward; 3+ if it requires modifying the
+MDD propagator. **Highest priority for the next session.**
+
+### Z12. LBD-based peer-clause sharing (length-agnostic)
+
+Currently `MAX_SHARED_LEN = 2` in `src/sync_walker.rs:2494` —
+peer sharing accepts only ≤2-lit clauses. The IDEAS file (S5,
+R6) shows raising this length-based threshold regresses TTC
+because longer shared clauses bloat watch lists.
+
+But LBD ≤ 2 clauses (high-quality "glue" nogoods) can be longer
+than 2 lits while still being highly prunable. Filter by LBD,
+not length.
+
+Implementation: expose `last_learnt_lbd()` on `radical::Solver`
+(currently LBD is computed in `add_learnt_clause_inner` but
+not surfaced); replace the length filter with LBD ≤ 2.
+
+- **TTC mechanism**: rate (better cross-worker pruning).
+- **Detection plan**: `peer_imports` rises 5-50× from the
+  ~128/60s baseline; nodes/s should stay stable or drop
+  slightly; `sat_unsat` drops in aggregate.
+- **Risk**: long shared clauses still bloat 2WL. Cap by length
+  too (e.g. `lbd ≤ 2 AND len ≤ 16`) to be safe.
+
+### Z-series session outcomes (April 25 2026)
+
+Baseline noise floor on this hardware: TTC mean = 1.022e7s
+(range 1.007–1.032e7, σ ≈ 1.3%, 3 sequential 60s runs).
+
+| Attempt | Result | Notes |
+|---|---|---|
+| Z2 (skip harvest on delta==0) | in noise (+1%) | harvest_forced loop too cheap to matter; reverted |
+| K3 vivification on (config flag) | in noise (0%) | mean 1.022e7 vs baseline 1.022e7; vivification path runs ≤ 50× per worker per 60s — too rare to move the needle on this short benchmark |
+| rephasing + ema_restarts on | in noise (-0.8%) | mean 1.014e7 vs baseline 1.022e7; directionally favorable but ≪ noise floor |
+| Z11 (attach MDD to sync) | deferred | complex W[n-1] handling; needs separate session |
+| Divan benchmarks | blocked | network/DNS errors fetching divan from crates.io |
+
+**Reflection on this session**: every cheap-rate optimization I
+tried landed inside the 1.3% noise floor. The October-April
+multi-session series (R1, R2, R8, R8c, backbone, etc.) already
+captured the cumulative −99.3 % rate-side wins, leaving the
+remaining sync TTC dominated by intrinsic SAT propagation +
+unconstrained walker denominator. Future progress on
+`--wz=sync` requires architectural work:
+
+1. **Z11**: attach mdd-k.bin's first 2k ZW levels as a native
+   propagator on sync's persistent solver. Theoretical 184×
+   denominator reduction at n=26 k=7 (1.46 M live ZW out of
+   268 M total). Requires understanding the MDD's W[n-1]
+   handling (W has only m = n-1 positions; the boundary
+   includes packed bit 2k-1 → actual position n-1 where W
+   doesn't exist).
+2. **Z4 with corrected metrics**: work-stealing at the first
+   branching level via shared atomic counter, plus
+   restructured `children_by_level` accounting so
+   `processed/children` reflects unique-subtree coverage
+   rather than per-frame fragmentation.
+3. **Z5**: combined-level walking — pin 2 boundary positions
+   per `push_assume_frame` for halved push overhead.
+
+These are each multi-session efforts. None of them are
+amenable to the "iterate on a benchmark within an hour"
+methodology that worked for the rate-series wins.
+
+The hardware here is ~2× slower in absolute terms than the
+April 19 host (where backbone-detected baseline was 4.40e6s).
+We measure relative deltas; the documented backbone result is
+already landed and active in `build_solver`.
+
+**Conclusion**: getting decisive wins in a single 60s benchmark
+on this hardware requires ≥5% TTC delta. Small rate
+optimizations are dominated by the ~1.3% noise floor. The
+remaining wins on `--wz=sync` are architectural (Z11 MDD
+attachment, Z4 work-stealing with corrected metrics, Z5
+combined-level walking) — each needing dedicated session
+effort to land.
+
