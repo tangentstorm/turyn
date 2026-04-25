@@ -1,0 +1,36 @@
+[framework:apart] seed_boundaries=66416 (pre-enumerated upfront); weights min=66666667 max=1000000000 total=33291733341520 (skew=15.0x)
+[framework:apart] elapsed=1.0s covered=0.092/1.000 ttc=Some(9.863302674s) TTC (conjecture-constrained)
+[framework:apart] elapsed=2.0s covered=0.132/1.000 ttc=Some(13.137101821s) TTC (conjecture-constrained)
+[framework:apart] elapsed=3.0s covered=0.187/1.000 ttc=Some(13.087454838s) TTC (conjecture-constrained)
+[framework:apart] elapsed=4.0s covered=0.200/1.000 ttc=Some(15.994550365s) TTC (conjecture-constrained)
+Framework search: SAT solution
+[framework:apart] elapsed=5.0s covered=0.217/1.000 ttc=Some(18.093212398s) TTC (conjecture-constrained)
+[framework:apart] elapsed=6.0s covered=0.224/1.000 ttc=Some(20.821925851s) TTC (conjecture-constrained)
+[framework:apart] elapsed=7.0s covered=0.232/1.000 ttc=Some(23.218622223s) TTC (conjecture-constrained)
+Framework search: SAT solution
+[framework:apart] elapsed=8.0s covered=0.239/1.000 ttc=Some(25.494209391s) TTC (conjecture-constrained)
+Framework search: SAT solution
+Framework search: SAT solution
+Framework search: SAT solution
+[framework:apart] elapsed=9.0s covered=0.250/1.000 ttc=Some(27.076329734s) TTC (conjecture-constrained)
+Framework search: SAT solution
+Framework search: SAT solution
+[framework:apart] elapsed=10.0s covered=0.560/1.000 ttc=Some(7.856188954s) TTC (conjecture-constrained)
+Framework search: SAT solution
+[framework:apart] elapsed=11.0s covered=0.572/1.000 ttc=Some(8.242077392s) TTC (conjecture-constrained)
+Framework search: SAT solution
+[framework:apart] elapsed=12.0s covered=0.665/1.000 ttc=Some(6.056844033s) TTC (conjecture-constrained)
+[framework:apart] elapsed=13.0s covered=0.677/1.000 ttc=Some(6.210930803s) TTC (conjecture-constrained)
+Framework search: SAT solution
+[framework:apart] elapsed=14.0s covered=0.684/1.000 ttc=Some(6.473667828s) TTC (conjecture-constrained)
+Framework search: SAT solution
+[framework:apart] elapsed=15.0s covered=0.691/1.000 ttc=Some(6.717893117s) TTC (conjecture-constrained)
+Framework search: SAT solution
+Framework search: SAT solution
+[framework:apart] elapsed=16.0s covered=0.704/1.000 ttc=Some(6.718826945s) TTC (conjecture-constrained)
+Framework search: SAT solution
+[framework:apart] elapsed=17.0s covered=0.730/1.000 ttc=Some(6.285863466s) TTC (conjecture-constrained)
+Framework search: SAT solution
+Framework search: SAT solution
+Framework search (--wz=apart): covered=1.000/1.000 elapsed=17.9s ttc=Some(0ns) (quality=Hybrid) TTC (conjecture-constrained)
+Framework search (--wz=apart): found_solution=true (16 solution(s))
