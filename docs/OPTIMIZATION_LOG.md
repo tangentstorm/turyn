@@ -246,10 +246,9 @@ Correctness notes:
     hardcoded Kharaghani–Tayfeh-Rezaie TT(36) with T3 so X[35]=Y[35]=+1.
   - `hybrid_finds_tt4`, `benchmark_profile_n4_finds_solution_fast`,
     `hybrid_finds_tt6`: switched from Cross mode to Apart mode
-    (MDD-walker path).  Cross mode's spectral pair filter is too
-    tight at n=4,6 to pass the one canonical (Z,W) pair; Apart mode
-    uses per-lag SAT constraints and recovers the canonical TT
-    cleanly.
+    (MDD-walker path) because Cross does not recover the rule-(i)
+    canonical solution at these small n. Root cause has not been
+    identified.
 - The n=18 smoke test finds a TT(18) whose X and Y both end in +1,
   confirming rule (i) is satisfied on the primary benchmark path.
 

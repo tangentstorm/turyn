@@ -19,20 +19,30 @@ benchmark configuration.
 
 The calibration above only tests `--wz=apart`. A quick sanity check
 across all four `--wz` modes at `n=14 --conj-tuple --continue-after-sat`
-shows they are **not** equivalent:
+shows they disagree on solution count for the same problem:
 
-| `--wz` | wall (n=14 conj-tuple) | covered@end | solutions | quality | useable for ground truth? |
-|--------|----------------------:|-------------|-----------|---------|---------------------------|
-| `apart`     | 0.5 s   | 1.000 | 6 | Hybrid     | **yes — calibrated up to n=22** |
-| `together`  | 1.2 s   | 1.000 | 3 | Hybrid     | yes (same MDD machinery; not separately stress-tested) |
-| `cross`     | 40.8 s  | 1.000 | **0** | Hybrid | **NO — finds zero solutions on the same problem apart finds 6 on**; semantic divergence, separate bug |
-| `sync`      | 1.5 s   | 0.016 | 1 | Projected  | NO — exits early at sub-1% covered; the published TTC is `Projected` per `TTC.md` §7.3 and is documented as estimate-only |
+| `--wz` | wall (n=14 conj-tuple) | covered@end | solutions found | quality |
+|--------|----------------------:|-------------|-----------|---------|
+| `apart`    | 0.5 s   | 1.000 | 6  | Hybrid     |
+| `together` | 1.2 s   | 1.000 | 3  | Hybrid     |
+| `cross`    | 40.8 s  | 1.000 | 0  | Hybrid     |
+| `sync`     | 1.5 s   | 0.016 | 1  | Projected  |
 
-So when this doc says "TTC is calibrated within ~10%," it strictly
-means the `--wz=apart` (and by code-sharing, `--wz=together`) flow
-through `MddStagesAdapter`. `cross` and `sync` have NOT been verified
-against ground truth at any scale and remain `Hybrid`/`Projected`
-quality without empirical accuracy bounds.
+For comparison, BDKR reports **186 equivalence classes** for TT(14).
+None of these mode counts directly equals 186 because the runs were
+restricted to a single auto-selected sum-tuple (`--conj-tuple`), but
+no mode is finding anywhere near the expected number; **all four
+modes are likely under-counting**. Root cause is unknown — apart vs
+cross (6 vs 0) is a real discrepancy on the same input, and apart vs
+together (6 vs 3) is also a discrepancy. These are separate from the
+TTC question and need their own investigation before any of these
+modes can be trusted as a ground-truth oracle.
+
+So when this doc says "TTC is calibrated within ~10%" it means: TTC
+predictions track wall-clock to within ~10% on `--wz=apart` runs to
+`covered=1.0`. It does NOT claim apart's count of solutions equals
+the true count of TT(n) solutions in the search space — that's a
+separate (and currently failing) check.
 
 For comparison, the same runs with default 4 threads, default early-exit-on-
 first-solution, and no flags showed 1–10x run-to-run TTC variance and
