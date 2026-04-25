@@ -26,7 +26,13 @@ impl Mdd4 {
         self.count_paths_from(self.root, 0, &mut cache)
     }
 
-    fn count_paths_from(
+    /// Count live paths from `nid` at depth `level` to a leaf.
+    /// `cache` is keyed by `nid`; the layered MDD construction
+    /// guarantees each non-LEAF node sits at a fixed level so
+    /// caching by id alone is sound. Public so framework adapters
+    /// can compute per-boundary descendant XY-path counts and
+    /// weight TTC mass credit by them.
+    pub fn count_paths_from(
         &self,
         nid: u32,
         level: usize,

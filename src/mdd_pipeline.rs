@@ -267,6 +267,14 @@ pub(crate) struct BoundaryWork {
     pub(crate) z_bits: u32,
     pub(crate) w_bits: u32,
     pub(crate) xy_graph: XyRuntimeGraph,
+    /// Number of live XY 4-tuple paths under this boundary in the
+    /// MDD. Used by `BoundaryProgress` to weight per-boundary mass
+    /// credit by descendant search size, so completing a boundary
+    /// with 100× the live paths credits 100× the mass. Computed
+    /// once during `enumerate_live_boundaries` via the same
+    /// memoized DFS that `Mdd4::count_live_paths` uses; <1% of
+    /// enumeration time at n=26 k=7.
+    pub(crate) xy_path_count: f64,
 }
 
 pub(crate) struct SolveWZWork {
@@ -2547,15 +2555,22 @@ pub(crate) fn enumerate_live_boundaries(
     let zw_depth = ctx.zw_depth;
     let xy_pos_order = &ctx.xy_pos_order;
     let mut out: Vec<BoundaryWork> = Vec::new();
+    // Memoize XY-descendant path counts by MDD node id. The same
+    // `nid` is reached by many ZW paths (the MDD is a deduped DAG),
+    // so this cache is reused across every boundary push and the
+    // total cost is O(#nodes), not O(#boundaries).
+    let mut path_cache: std::collections::HashMap<u32, f64> =
+        std::collections::HashMap::with_capacity(mdd.nodes.len());
 
     fn walk(
+        mdd: &mdd_reorder::Mdd4,
+        path_cache: &mut std::collections::HashMap<u32, f64>,
         nid: u32,
         level: usize,
         z_bits: u32,
         w_bits: u32,
         depth: usize,
         order: &[usize],
-        nodes: &[[u32; 4]],
         out: &mut Vec<BoundaryWork>,
         cancelled: &AtomicBool,
     ) {
@@ -2572,10 +2587,12 @@ pub(crate) fn enumerate_live_boundaries(
             return;
         }
         if level == depth {
+            let xy_path_count = mdd.count_paths_from(nid, depth, path_cache);
             out.push(BoundaryWork {
                 z_bits,
                 w_bits,
                 xy_graph: loaded_xy_graph(nid),
+                xy_path_count,
             });
             return;
         }
@@ -2588,13 +2605,14 @@ pub(crate) fn enumerate_live_boundaries(
                 let z = b & 1;
                 let w = (b >> 1) & 1;
                 walk(
+                    mdd,
+                    path_cache,
                     mdd_reorder::LEAF,
                     level + 1,
                     z_bits | (z << pos),
                     w_bits | (w << pos),
                     depth,
                     order,
-                    nodes,
                     out,
                     cancelled,
                 );
@@ -2603,20 +2621,21 @@ pub(crate) fn enumerate_live_boundaries(
         }
         let pos = order[level];
         for b in 0..4u32 {
-            let child = nodes[nid as usize][b as usize];
+            let child = mdd.nodes[nid as usize][b as usize];
             if child == mdd_reorder::DEAD {
                 continue;
             }
             let z = b & 1;
             let w = (b >> 1) & 1;
             walk(
+                mdd,
+                path_cache,
                 child,
                 level + 1,
                 z_bits | (z << pos),
                 w_bits | (w << pos),
                 depth,
                 order,
-                nodes,
                 out,
                 cancelled,
             );
@@ -2624,13 +2643,14 @@ pub(crate) fn enumerate_live_boundaries(
     }
 
     walk(
+        mdd,
+        &mut path_cache,
         mdd.root,
         0,
         0,
         0,
         zw_depth,
         xy_pos_order,
-        &mdd.nodes,
         &mut out,
         cancelled,
     );
