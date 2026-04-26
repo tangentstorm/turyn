@@ -129,9 +129,22 @@ below as `R*` entries.
 
 ## TTC: the universal metric
 
+Current contract: `docs/TTC.md` is authoritative. Normalized TTC is
+
+```text
+covered_mass = covered_exact + covered_partial
+coverage_rate = covered_mass / elapsed
+TTC = (1.0 - covered_mass) / coverage_rate
+```
+
+Older entries below sometimes mention legacy counters such as
+`live_zw_paths`, `eff`, `est_total_xy`, or `xy_done_eff`. Those are
+historical adapter-specific proxies for denominator, rate, or
+shortfall effects; they are not the universal TTC contract.
+
 Every entry in this log is framed against **Time to Cover (TTC)** —
 the wall-clock time to exhaustively cover the live search space under
-the current pipeline. Defined in `src/main.rs`:
+the current pipeline. Historical pre-normalization wording:
 
 ```
 MDD modes: TTC = (live_zw_paths - eff) / (eff / elapsed)

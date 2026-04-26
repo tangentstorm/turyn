@@ -18,10 +18,11 @@ Target date for first implementation slice: **April–May 2026**.
   `engine.rs` rewritten as a coordinator + worker pool. See the
   decisions in §13 entries 1–4 and the April 2026 commits on
   `claude/universal-search-review-xBQEw`.
-- Open: split the apart/together adapter into four real stage
-  handlers, add cross/sync/stochastic adapter modules, delete the
-  legacy mode-specific dispatch in `main.rs`, drop the
-  `--engine=legacy` flag.
+- This document is historical architecture context. The current
+  top-level invariants are in `../SPEC.md`; the authoritative TTC
+  and telemetry contracts are `TTC.md` and `TELEMETRY.md`.
+- Open items below should be read as design notes, not as permission
+  to override the current root spec.
 
 ---
 
@@ -132,14 +133,14 @@ Single TTC interface:
 - `total_mass()`
 - `covered_mass()`
 - `remaining_mass()`
-- `coverage_quality()` (`Exact | Estimated | LowerBound | Hybrid`)
+- `quality()` (`Direct | Projected | Hybrid`)
 
 The engine computes:
 
 - `coverage_rate = covered_mass / elapsed`
 - `ttc = remaining_mass / coverage_rate`
 
-and labels TTC quality from `coverage_quality()`.
+and labels TTC quality from `quality()`.
 
 ## `SchedulerPolicy`
 
@@ -157,7 +158,28 @@ Additional policies can be introduced without changing worker code.
 
 ## 4) TTC contract (framework-wide)
 
-**One mass unit across all modes: search-space bits.** Mass is measured
+**Current contract:** `docs/TTC.md` is authoritative. The live framework
+uses normalized additive fractions, not summed log-sized work:
+
+- `total_mass = 1.0`
+- `covered_exact`
+- `covered_partial`
+- `covered_mass = covered_exact + covered_partial`
+- `remaining_mass = max(total_mass - covered_mass, 0)`
+- `coverage_rate = covered_mass / elapsed`
+- `TTC = remaining_mass / coverage_rate`
+
+All mass values are fractions in `[0, 1]`. Disjoint completed regions
+add; `log2(|cube|)` values do not add and MUST NOT be used as the
+universal TTC mass ledger. Absolute `log2` work may appear only as a
+benchmark stop-control denominator through `total_log2_work`.
+
+### 4.0 Superseded historical model
+
+The following bits-based model is retained only as historical context.
+It is not the live contract and must not guide future implementation.
+
+**Superseded:** One mass unit across all modes: search-space bits. Mass is measured
 in `log2(|cube|)` — the log-size of the sub-cube the value represents.
 `total` is `log2` of the fully-free enumeration size for the current
 problem; `covered` is the sum of `log2(|sub-cube eliminated|)` over
@@ -588,7 +610,11 @@ Deliverable: faithful TTC comparability improvements and clearer uncertainty.
 
 ---
 
-## 12) Immediate next coding tasks
+## 12) Historical next coding tasks
+
+The original immediate task list below has mostly been overtaken by the
+current framework implementation. Do not use this list as a current roadmap;
+use `../SPEC.md`, `TTC.md`, and the live code instead.
 
 1. Add `search_framework` module skeleton and feature-gate it.
 2. Implement `MassValue`, `CoverageQuality`, `MassDelta` and TTC unit tests.
@@ -596,12 +622,15 @@ Deliverable: faithful TTC comparability improvements and clearer uncertainty.
    behavior change.
 4. Create `ApartAdapter` and `TogetherAdapter` wrappers around current stage
    code paths.
-5. Add `--engine=new|legacy` hidden flag for A/B verification during migration,
-   then remove once parity is proven.
 
 ---
 
 ## 13) Decision log (this proposal)
+
+Current correction: the original coverage-bits decision below is
+superseded. The live TTC mass unit is the normalized additive fraction
+specified in `TTC.md`; `log2(|cube|)` is only a fixed-work benchmark
+denominator, not the universal coverage ledger.
 
 1. **One universal mass unit — search-space bits (`log2(|cube|)`).**
    Superseded the earlier "one unit per mode run" policy after the
@@ -628,4 +657,3 @@ Deliverable: faithful TTC comparability improvements and clearer uncertainty.
    preserved while enabling future alternatives.
 7. Preserve existing solver kernels and pruning semantics in
    initial refactor.
-

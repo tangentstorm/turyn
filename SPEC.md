@@ -23,7 +23,11 @@ file, the refactor is wrong unless this file is deliberately updated first.
 
 | n | 18 | 20 | 22 | 24 | 26 | 28 | 30 | 32 |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| classes | 675 | 913 | 3105 | 3523 | 3753 | 4161 | 4500 | 6226 |
+| classes | 675 | 913 | 3105 | 3523 | 3753 | 4161 | 4500 | 6292 |
+
+The `TT(32)` count uses the complete local catalogue
+`data/turyn-type-32`, including the 66 London additions noted in
+`data/README.md`. The pre-addition original file has 6226 entries.
 
 ## Work And Scheduling
 
