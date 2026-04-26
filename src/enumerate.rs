@@ -471,9 +471,21 @@ pub(crate) fn for_each_zw_pair(
     let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
     let mut fft_buf = FftScratch::new(spectral_z);
     let mut idx_buf = Vec::new();
-    generate_sequences_permuted(problem.n, z_sum, true, true, cfg.max_z, |values| {
+    // BDKR canonical form: Z[0] = +1 (rule i) and Z[n-1] = -1
+    // (derived consequence of rule iv; see docs/CANONICAL.md). The
+    // `generate_sequences_permuted` helper only supports forcing the
+    // tail to +1, so generate with a free tail and reject Z[n-1] = +1
+    // in the visit closure. This 2x's enumeration vs an exact tail-
+    // negative generator but keeps cross searching the canonical
+    // half of Z space — without this filter, cross misses every TT(n)
+    // whose canonical Z ends in -1, which at small n means it finds
+    // zero canonical solutions.
+    generate_sequences_permuted(problem.n, z_sum, true, false, cfg.max_z, |values| {
         if found.load(AtomicOrdering::Relaxed) || cancelled.load(AtomicOrdering::Relaxed) {
             return false;
+        }
+        if values[problem.n - 1] != -1 {
+            return true;
         }
         stats.z_generated += 1;
         let Some(z_spectrum) = spectrum_if_ok(values, spectral_z, individual_bound, &mut fft_buf)

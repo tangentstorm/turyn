@@ -39,6 +39,41 @@ use crate::types::{PackedSeq, Problem, SumTuple, verify_tt};
 use crate::xy_sat::{SatXYTemplate, SolveXyPerCandidate, XyTryResult};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+/// BDKR rule (iv): least 1-indexed `i` with `Z[i]==Z[n+1-i]` must
+/// have `Z[i]=+1`. In 0-indexed terms: scan pairs `(j, n-1-j)` for
+/// `j = 0..(n-1)/2`; the first pair with `Z[j]==Z[n-1-j]` must have
+/// `Z[j]=+1`. If no such pair exists, the rule is vacuously satisfied.
+fn z_passes_rule_iv(z: &PackedSeq) -> bool {
+    let n = z.len();
+    let last_j = (n - 1) / 2;
+    for j in 0..=last_j {
+        if z.get(j) == z.get(n - 1 - j) {
+            return z.get(j) == 1;
+        }
+    }
+    true
+}
+
+/// BDKR rule (v): least 1-indexed `i` with `W[i]·W[m-i] ≠ W[m-1]`
+/// must have `W[i]=+1`. In 0-indexed terms (length-m W): scan pairs
+/// `(p, m-1-p)` for `p = 0..(m-1)/2`; the first pair where the
+/// product disagrees with `W[m-1]` must have `W[p]=+1`.
+fn w_passes_rule_v(w: &PackedSeq) -> bool {
+    let m = w.len();
+    if m < 3 {
+        return true;
+    }
+    let tail = w.get(m - 1) as i32;
+    let last_p = (m - 1) / 2;
+    for p in 0..=last_p {
+        let prod = (w.get(p) as i32) * (w.get(m - 1 - p) as i32);
+        if prod != tail {
+            return w.get(p) == 1;
+        }
+    }
+    true
+}
+
 pub const STAGE_CROSS: StageId = "cross.enumerate";
 
 #[derive(Clone, Debug, Default)]
@@ -92,7 +127,12 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
         // Per-|σ_W| cache: W candidate arrays + `SpectralIndex`
         // reused across tuples that share a `|σ_W|`.
         let mut w_cache: HashMap<i32, (Vec<SeqWithSpectrum>, SpectralIndex)> = HashMap::new();
-        let mut seen_zw: std::collections::HashSet<Vec<i32>> = std::collections::HashSet::new();
+        // Dedup (Z, W) within a single tuple iteration: distinct
+        // sum-tuples may legitimately reach the same (Z, W) pair
+        // and need separate XY-SAT calls (different (σ_X, σ_Y)
+        // constraints), so the set is cleared per tuple.
+        let mut seen_zw: std::collections::HashSet<(PackedSeq, PackedSeq)> =
+            std::collections::HashSet::new();
 
         // XY stage state. Each surviving (Z, W) pair clones a
         // template matching its tuple and brute-forces the
@@ -124,20 +164,34 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
             if (!continue_after_sat && found.load(Ordering::Relaxed)) || ctx.is_cancelled() {
                 break;
             }
-            if !w_cache.contains_key(&tuple.w) {
-                let w_candidates = build_w_candidates(
-                    problem,
-                    tuple.w,
-                    cfg,
-                    &spectral_w,
-                    &mut stats,
-                    found,
-                    ctx.cancelled,
-                );
+            // Phase A normalizes tuples to abs values (σ_W ≥ 0,
+            // σ_Z ≥ 0). The canonical orbit can have either sign of
+            // any individual σ — the MDD-backed paths walk both
+            // signs of W and Z (see SolveWZ's signs loop in
+            // mdd_pipeline.rs). Cross must do the same: enumerate
+            // W candidates for ±tuple.w and Z sequences for
+            // ±tuple.z, otherwise canonical solutions whose σ_W or
+            // σ_Z is negative are silently missed.
+            let abs_w = tuple.w.abs();
+            if !w_cache.contains_key(&abs_w) {
+                let mut w_candidates: Vec<SeqWithSpectrum> = Vec::new();
+                let w_signs: &[i32] = if abs_w == 0 { &[0] } else { &[1, -1] };
+                for &sg in w_signs {
+                    let mut part = build_w_candidates(
+                        problem,
+                        sg * abs_w,
+                        cfg,
+                        &spectral_w,
+                        &mut stats,
+                        found,
+                        ctx.cancelled,
+                    );
+                    w_candidates.append(&mut part);
+                }
                 let w_index = SpectralIndex::build(&w_candidates);
-                w_cache.insert(tuple.w, (w_candidates, w_index));
+                w_cache.insert(abs_w, (w_candidates, w_index));
             }
-            let (w_candidates, w_index) = w_cache.get(&tuple.w).unwrap();
+            let (w_candidates, w_index) = w_cache.get(&abs_w).unwrap();
             if (!continue_after_sat && found.load(Ordering::Relaxed)) || ctx.is_cancelled() {
                 break;
             }
@@ -145,22 +199,41 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
             // the number of *completed* tuples; publish the count
             // only after this tuple's `for_each_zw_pair` returns
             // below so the live fraction isn't one tuple behind.
-            for_each_zw_pair(
-                problem,
-                tuple.z,
-                w_candidates,
-                w_index,
-                cfg,
-                &spectral_z,
-                &mut stats,
-                found,
-                ctx.cancelled,
-                |z_seq, w_seq, zw, _z_spec, _w_spec| {
+            seen_zw.clear();
+            let abs_z = tuple.z.abs();
+            let z_signs: &[i32] = if abs_z == 0 { &[0] } else { &[1, -1] };
+            for &z_sign in z_signs {
+                let z_sum = z_sign * abs_z;
+                for_each_zw_pair(
+                    problem,
+                    z_sum,
+                    w_candidates,
+                    w_index,
+                    cfg,
+                    &spectral_z,
+                    &mut stats,
+                    found,
+                    ctx.cancelled,
+                    |z_seq, w_seq, zw, _z_spec, _w_spec| {
                     if (!continue_after_sat && found.load(Ordering::Relaxed)) || ctx.is_cancelled()
                     {
                         return false;
                     }
-                    if !seen_zw.insert(zw.clone()) {
+                    // BDKR rule (iv) on Z and rule (v) on W: cross's
+                    // brute-force producer doesn't pre-filter these
+                    // (the MDD-backed paths get them via the MDD's
+                    // canonical encoding), and XY SAT only enforces
+                    // rules (i,ii,iii,vi). Without this filter cross
+                    // emits non-canonical (X,Y,Z,W) tuples that
+                    // verify_tt accepts but inflate the canonical
+                    // count above the BDKR target.
+                    if !z_passes_rule_iv(z_seq) {
+                        return true;
+                    }
+                    if !w_passes_rule_v(w_seq) {
+                        return true;
+                    }
+                    if !seen_zw.insert((z_seq.clone(), w_seq.clone())) {
                         return true;
                     }
                     // Brute-force XY: iterate every `(x_bits, y_bits)`
@@ -274,6 +347,7 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                     continue_after_sat || !found.load(Ordering::Relaxed)
                 },
             );
+            }
             // Tuple (tuple_idx) fully processed. Publish
             // `tuple_idx + 1` tuples done, but reset the
             // in-flight cov_micro FIRST. If we did the stores
