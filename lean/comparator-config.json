@@ -1,0 +1,11 @@
+{
+    "challenge_module": "Results",
+    "solution_module": "Proofs",
+    "theorem_names": [
+        "Turyn.Result.tt_to_hadamard",
+        "Turyn.Result.canonical_form_exists",
+        "Turyn.Result.xy_product_law"
+    ],
+    "permitted_axioms": ["propext", "Quot.sound", "Classical.choice"],
+    "enable_nanoda": false
+}

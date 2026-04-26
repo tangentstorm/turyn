@@ -9,6 +9,16 @@ autoImplicit = false
 name = "Turyn"
 roots = ["Turyn"]
 
+# Comparator challenge module: theorem statements with `sorry`.
+[[lean_lib]]
+name = "Results"
+roots = ["Results"]
+
+# Comparator solution module: imports the proof files under `Proofs/`.
+[[lean_lib]]
+name = "Proofs"
+roots = ["Proofs"]
+
 [[require]]
 name = "mathlib"
 git = "https://github.com/leanprover-community/mathlib4.git"
