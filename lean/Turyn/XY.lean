@@ -488,7 +488,7 @@ private lemma last_summand_eq {n : Nat} (S : TurynTypeSeq n) (k : Nat)
 /-! ### Main XY product-law theorem -/
 
 /-
-**XY product law** (Best–Đoković–Kharaghani–Ramp).
+**XY product law** (discovered by codex).
 For a canonical Turyn sequence of length `n ≥ 4`,
 `uAt S (n+1−k) = −uAt S k` for all `2 ≤ k ≤ n−1`.
 -/

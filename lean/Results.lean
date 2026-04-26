@@ -49,7 +49,7 @@ trusted base:
 3. `xy_interior_antipalindrome` — for a canonical Turyn sequence of length
    `n ≥ 4`, the U = X·Y interior is an anti-palindrome:
    `uAt S (n + 1 − k) = − uAt S k` for every `2 ≤ k ≤ n − 1`. This is the
-   "XY product law" of Best–Đoković–Kharaghani–Ramp.
+   "XY product law" (discovered by codex).
 -/
 
 namespace Turyn.Result
@@ -74,7 +74,7 @@ theorem canonical_form_exists
     ∃ T : TurynTypeSeq n, Equivalent n S T ∧ Canonical n T := by
   sorry
 
-/-- **XY interior anti-palindrome** ("XY product law", BDKR).
+/-- **XY interior anti-palindrome** ("XY product law", discovered by codex).
 For a canonical Turyn sequence of length `n ≥ 4`, the U-sequence
 (`U = X · Y` coordinatewise) is an anti-palindrome on its interior:
 `uAt S (n + 1 − k) = − uAt S k` for every `2 ≤ k ≤ n − 1`. -/

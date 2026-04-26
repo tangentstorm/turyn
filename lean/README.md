@@ -138,7 +138,7 @@ The headline names live in the `Turyn.Result` namespace and are:
   yet formalized).
 - `Turyn.Result.xy_interior_antipalindrome` —
   for a canonical TT(n) of length `n ≥ 4`, `uAt S (n + 1 − k) = − uAt S k`
-  for every `2 ≤ k ≤ n − 1` (the BDKR XY product law).
+  for every `2 ≤ k ≤ n − 1` (the XY product law, discovered by codex).
 
 Run comparator from the `lean/` directory after installing `landrun` and
 `lean4export` (see the comparator README) with:
