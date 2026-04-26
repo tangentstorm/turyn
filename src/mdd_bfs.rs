@@ -13,6 +13,7 @@ use crate::mdd_zw_first::{
 /// Memory: O(max_states_per_level * 24 bytes) for state keys.
 /// Disk: O(total_states * 24 bytes) for level files.
 use rustc_hash::FxHashMap as HashMap;
+use std::path::Path;
 
 fn unpack_sums(packed: u128, k: usize) -> Vec<i8> {
     (0..k).map(|i| ((packed >> (i * 8)) & 0xFF) as i8).collect()
@@ -24,8 +25,9 @@ fn unpack_active(packed: u64, n: usize) -> Vec<u8> {
 }
 
 /// Write state keys to a flat binary file. Each key is 24 bytes (u128 + u64).
-fn write_keys(path: &str, keys: &[StateKey]) -> std::io::Result<()> {
+fn write_keys(path: impl AsRef<Path>, keys: &[StateKey]) -> std::io::Result<()> {
     use std::io::Write;
+    let path = path.as_ref();
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     for &(sums, active) in keys {
         f.write_all(&sums.to_le_bytes())?;
@@ -36,8 +38,9 @@ fn write_keys(path: &str, keys: &[StateKey]) -> std::io::Result<()> {
 }
 
 /// Read state keys from a flat binary file.
-fn read_keys(path: &str) -> std::io::Result<Vec<StateKey>> {
+fn read_keys(path: impl AsRef<Path>) -> std::io::Result<Vec<StateKey>> {
     use std::io::Read;
+    let path = path.as_ref();
     let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
     let file_len = std::fs::metadata(path)?.len() as usize;
     let n_keys = file_len / 24;
@@ -278,8 +281,9 @@ impl BfsCtx {
 
 /// Write child indices to disk. Each parent has [u32; 4] child indices.
 /// u32::MAX means DEAD/no child.
-fn write_children(path: &str, children: &[[u32; 4]]) -> std::io::Result<()> {
+fn write_children(path: impl AsRef<Path>, children: &[[u32; 4]]) -> std::io::Result<()> {
     use std::io::Write;
+    let path = path.as_ref();
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     for ch in children {
         for &c in ch {
@@ -290,8 +294,9 @@ fn write_children(path: &str, children: &[[u32; 4]]) -> std::io::Result<()> {
     Ok(())
 }
 
-fn read_children(path: &str) -> std::io::Result<Vec<[u32; 4]>> {
+fn read_children(path: impl AsRef<Path>) -> std::io::Result<Vec<[u32; 4]>> {
     use std::io::Read;
+    let path = path.as_ref();
     let file_len = std::fs::metadata(path)?.len() as usize;
     let n = file_len / 16;
     let mut f = std::io::BufReader::new(std::fs::File::open(path)?);
@@ -322,8 +327,8 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
     let ctx = BfsCtx::new(k);
     let start = std::time::Instant::now();
 
-    let tmp_dir = format!("/tmp/mdd_bfs_k{}", k);
-    let _ = std::fs::create_dir_all(&tmp_dir);
+    let tmp_dir = std::env::temp_dir().join(format!("mdd_bfs_k{}", k));
+    std::fs::create_dir_all(&tmp_dir).expect("Failed to create MDD BFS temp directory");
 
     // ===== Pass 1: BFS top-down, enumerate states + store children =====
     eprintln!(
@@ -345,7 +350,7 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
         let (next_keys, parent_children) = if use_sorted {
             // Two-pass sorted dedup: lower peak memory for large levels.
             // Write parent keys to disk so we can free them during child collection.
-            let parent_path = format!("{}/parent_keys_{}.bin", tmp_dir, level);
+            let parent_path = tmp_dir.join(format!("parent_keys_{}.bin", level));
             write_keys(&parent_path, &current_keys).expect("write parent keys");
 
             // Pass 1: Chunked expansion + sort + merge to control peak memory.
@@ -440,7 +445,7 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
         };
 
         // Write parent children to disk (for pass 2)
-        let path = format!("{}/children_{}.bin", tmp_dir, level);
+        let path = tmp_dir.join(format!("children_{}.bin", level));
         write_children(&path, &parent_children).expect("Failed to write children");
 
         let count = next_keys.len();
@@ -565,7 +570,7 @@ pub fn build_bfs_mdd(k: usize) -> Mdd4 {
     let mut child_nids: Vec<u32> = boundary_nids;
 
     for level in (0..zw_depth).rev() {
-        let path = format!("{}/children_{}.bin", tmp_dir, level);
+        let path = tmp_dir.join(format!("children_{}.bin", level));
         let parent_children = read_children(&path).expect("Failed to read children");
         let _ = std::fs::remove_file(&path); // cleanup as we go
 
