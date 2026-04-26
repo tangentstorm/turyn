@@ -113,6 +113,40 @@ a Hadamard matrix of order 4(3n − 1). For TT(36), this gives order 428.
   and Goethals-Seidel). These represent standard results from combinatorial
   design theory.
 
+## Comparator-checkable headline results
+
+The three headline theorems are exposed in a layout consumable by
+[`leanprover/comparator`](https://github.com/leanprover/comparator):
+
+```
+Results.lean              -- challenge module: theorem statements with `sorry`
+Proofs.lean               -- solution module: imports the proof files below
+Proofs/
+  TtToHadamard.lean       -- TT → Hadamard pipeline
+  CanonicalForm.lean      -- canonical representative exists
+  XyProductLaw.lean       -- XY product law
+comparator-config.json    -- comparator configuration
+```
+
+The headline names live in the `Turyn.Result` namespace and are:
+
+- `Turyn.Result.tt_implies_hadamard` —
+  if a TT(n) exists, a Hadamard matrix of order `4 (3 n − 1)` exists.
+- `Turyn.Result.canonical_form_exists` —
+  every TT(n) is equivalent to a representative in canonical form
+  (existence half of the BDKR result; uniqueness within the orbit is not
+  yet formalized).
+- `Turyn.Result.xy_interior_antipalindrome` —
+  for a canonical TT(n) of length `n ≥ 4`, `uAt S (n + 1 − k) = − uAt S k`
+  for every `2 ≤ k ≤ n − 1` (the BDKR XY product law).
+
+Run comparator from the `lean/` directory after installing `landrun` and
+`lean4export` (see the comparator README) with:
+
+```bash
+lake env <path-to-comparator-binary> comparator-config.json
+```
+
 ## References
 
 - Kharaghani & Tayfeh-Rezaie (2005). A Hadamard matrix of order 428.
