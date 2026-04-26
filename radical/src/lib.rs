@@ -4163,8 +4163,10 @@ impl Solver {
             let la = t.lit_a;
             let lb = t.lit_b;
             let propagated_lit;
+            let is_upper;
             if c > slack_up {
                 propagated_lit = if !a_undef { lb } else { la };
+                is_upper = false;
             } else if c > slack_down && (!a_undef || !b_undef) {
                 if !a_undef && b_undef {
                     propagated_lit = negate(lb);
@@ -4173,12 +4175,12 @@ impl Solver {
                 } else {
                     continue;
                 }
+                is_upper = true;
             } else {
                 continue;
             }
 
             // Lazy explanation: encode is_upper in bit 31 of qi, defer building to analyze time.
-            let is_upper = c > slack_down;
             let reason_qi = qi | if is_upper { 1u32 << 31 } else { 0 };
             self.enqueue(propagated_lit, Reason::QuadPb(reason_qi));
             return None;
