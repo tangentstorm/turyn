@@ -2898,6 +2898,7 @@ pub(crate) fn run_mdd_sat_search(
             exchange: None,
             projected_fraction_ppm: None,
             live_sink: None,
+            all: cfg.continue_after_sat || cfg.bench_cover_log2.is_some(),
         };
         let _ = tuples;
         let (adapter, result_rx) = SyncAdapter::build(problem, sync_cfg, verbose);

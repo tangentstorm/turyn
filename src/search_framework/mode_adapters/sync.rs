@@ -50,7 +50,7 @@ impl StageHandler<SyncPayload> for SyncWalkStage {
         _ctx: &StageContext<'_>,
     ) -> StageOutcome<SyncPayload> {
         let (found, stats, _elapsed) = search_sync(self.problem, &self.cfg, self.verbose);
-        if let Some(sol) = found {
+        for sol in found {
             let _ = self.result_tx.send(sol);
         }
         // No `mass_delta` credit here. The walker's projected-

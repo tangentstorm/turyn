@@ -78,6 +78,10 @@ pub(crate) struct SyncConfig {
     /// read real mid-run progress, not just the worker's final
     /// `stats_agg` merge.
     pub live_sink: Option<Arc<std::sync::Mutex<LiveSyncStats>>>,
+    /// When true, keep walking past every leaf rather than stopping
+    /// at the first solution. The shared cancel flag is not tripped
+    /// on first hit; each worker collects every leaf it reaches.
+    pub all: bool,
 }
 
 /// Flush the live sink every this many visited DFS nodes. 1024 is
@@ -129,6 +133,9 @@ struct Ctx {
     /// [`LIVE_FLUSH_STRIDE`]). The monitor thread aggregates
     /// across all worker sinks for mid-run progress.
     live_sink: Option<Arc<std::sync::Mutex<LiveSyncStats>>>,
+    /// When true, every leaf is recorded and the DFS keeps walking.
+    /// Workers do not flip the shared cancel flag on first hit.
+    all: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -223,10 +230,12 @@ fn build_ctx_seeded(
     exchange: Option<Arc<ClauseExchange>>,
     live_sink: Option<Arc<std::sync::Mutex<LiveSyncStats>>>,
     start: Instant,
+    all: bool,
 ) -> Ctx {
     let mut ctx = build_ctx(problem);
     ctx.seed = seed;
     ctx.cancel = cancel;
+    ctx.all = all;
     ctx.exchange = exchange;
     ctx.live_sink = live_sink;
     ctx.start = start;
@@ -351,6 +360,7 @@ fn build_ctx(problem: Problem) -> Ctx {
         valid_tuples,
         exchange: None,
         live_sink: None,
+        all: false,
     }
 }
 
@@ -1099,7 +1109,7 @@ pub(crate) fn search_sync(
     cfg: &SyncConfig,
     verbose: bool,
 ) -> (
-    Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+    Vec<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
     SyncStats,
     std::time::Duration,
 ) {
@@ -1139,7 +1149,7 @@ fn search_sync_parallel(
     n_workers: usize,
     start: Instant,
 ) -> (
-    Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+    Vec<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
     SyncStats,
     std::time::Duration,
 ) {
@@ -1147,8 +1157,8 @@ fn search_sync_parallel(
     use std::thread;
 
     let cancel = Arc::new(AtomicBool::new(false));
-    let result: Arc<Mutex<Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>>> =
-        Arc::new(Mutex::new(None));
+    let result: Arc<Mutex<Vec<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let stats_agg: Arc<Mutex<SyncStats>> = Arc::new(Mutex::new(SyncStats {
         nodes_visited: 0,
         memo_hits: 0,
@@ -1383,10 +1393,15 @@ fn search_sync_parallel(
                     }
                 }
                 drop(agg);
-                if let Some(s) = sol {
+                if !sol.is_empty() {
                     let mut r = result.lock().unwrap();
-                    if r.is_none() {
-                        *r = Some(s);
+                    let was_empty = r.is_empty();
+                    r.extend(sol);
+                    // Under `cfg.all`, every worker keeps walking;
+                    // never trip the shared cancel. Under !all, the
+                    // first worker to land a solution flips cancel
+                    // so peer workers exit promptly.
+                    if !cfg.all && was_empty {
                         cancel.store(true, AtomicOrdering::Release);
                     }
                 }
@@ -1865,7 +1880,7 @@ fn search_sync_serial(
     verbose: bool,
     start: Instant,
 ) -> (
-    Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+    Vec<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
     SyncStats,
     std::time::Duration,
 ) {
@@ -1877,6 +1892,7 @@ fn search_sync_serial(
         cfg.exchange.clone(),
         cfg.live_sink.clone(),
         start,
+        cfg.all,
     );
     let mut solver = build_solver(problem, &cfg.sat_config);
     if cfg.conflict_limit > 0 {
@@ -1889,7 +1905,7 @@ fn search_sync_serial(
     if solver.propagate_only(&[]) != Some(true) {
         eprintln!("sync_walker: base solver UNSAT — canonical constraints inconsistent");
         return (
-            None,
+            Vec::new(),
             SyncStats {
                 nodes_visited: 0,
                 memo_hits: 0,
@@ -1958,7 +1974,7 @@ fn search_sync_serial(
         None
     };
 
-    let mut found: Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)> = None;
+    let mut found: Vec<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)> = Vec::new();
     dfs(
         &mut solver,
         &mut state,
@@ -1994,7 +2010,7 @@ fn dfs(
     ctx: &Ctx,
     stats: &mut SyncStats,
     deadline: Option<Instant>,
-    found: &mut Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+    found: &mut Vec<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
 ) -> bool {
     let entry_level = state.level;
     let t_enter = Instant::now();
@@ -2007,16 +2023,19 @@ fn dfs(
 }
 
 /// Actual DFS body — see `dfs` for the timing wrapper.
-/// Returns true if a solution was found (short-circuits up the stack).
+/// Returns true if a solution was found and the walker should
+/// short-circuit up the stack. Under `ctx.all` the walker never
+/// short-circuits — it records every leaf and returns false so
+/// sibling iteration continues.
 fn dfs_body(
     solver: &mut radical::Solver,
     state: &mut State,
     ctx: &Ctx,
     stats: &mut SyncStats,
     deadline: Option<Instant>,
-    found: &mut Option<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
+    found: &mut Vec<(PackedSeq, PackedSeq, PackedSeq, PackedSeq)>,
 ) -> bool {
-    if found.is_some() {
+    if !ctx.all && !found.is_empty() {
         return true;
     }
     if let Some(d) = deadline {
@@ -2123,8 +2142,11 @@ fn dfs_body(
         let sat = solver.solve_with_assumptions(&state.assumptions);
         if sat == Some(true) {
             let sol = extract_solution(solver, ctx);
-            *found = Some(sol);
-            return true;
+            found.push(sol);
+            // Under `ctx.all`, return false so sibling iteration
+            // continues past this leaf. Otherwise short-circuit up
+            // the stack as before.
+            return !ctx.all;
         }
         return false;
     }
@@ -2353,7 +2375,7 @@ fn dfs_body(
     let mut result_override: Option<bool> = None;
 
     for cand in candidates {
-        if found.is_some() {
+        if !ctx.all && !found.is_empty() {
             result_override = Some(true);
             break;
         }
