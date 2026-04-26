@@ -1918,7 +1918,7 @@ pub(crate) fn process_solve_wz(
 
     // Combined WZ spectral: 2|W(ω)|² + 2|Z(ω)|² ≤ pair_bound.
     // Uses two-sequence SpectralConstraint with separate DFT tracking.
-    {
+    if std::env::var("TURYN_ENABLE_WZ_SPECTRAL").is_ok() {
         let nf = SPECTRAL_FREQS;
         let total_mid = ctx.middle_m + ctx.middle_n;
         let mut cos_table = vec![0.0f32; total_mid * nf];
