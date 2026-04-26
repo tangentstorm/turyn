@@ -113,7 +113,7 @@ fn print_help() {
     eprintln!("  --sat-secs=<N>           Time limit in seconds for the search; 0 = unlimited");
     eprintln!("  --bench-cover-log2=<X>   Benchmark stop: cover about 2^X raw-equivalent");
     eprintln!("                           configurations, report SAT hits, and keep searching");
-    eprintln!("  --continue-after-sat     Print/report SAT hits without stopping the search");
+    eprintln!("  --all                    Print/report SAT hits without stopping the search");
     eprintln!();
     eprintln!("SAT SOLVER TUNING:");
     eprintln!("  --no-xor                 Disable GF(2) XOR propagation in SAT solver");
@@ -232,7 +232,7 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
                 }
             };
             cfg.continue_after_sat = true;
-        } else if arg == "--continue-after-sat" {
+        } else if arg == "--all" || arg == "--continue-after-sat" {
             cfg.continue_after_sat = true;
         } else if arg == "--ema-restarts" {
             cfg.sat_config.ema_restarts = true;

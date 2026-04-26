@@ -475,7 +475,7 @@ impl SearchConfig {
             parts.push(format!("--bench-cover-log2={x}"));
         }
         if self.continue_after_sat {
-            parts.push("--continue-after-sat".into());
+            parts.push("--all".into());
         }
         parts.push(format!("--quad-pb={}", self.quad_pb));
         if self.sat_config.ema_restarts {
