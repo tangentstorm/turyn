@@ -1,356 +1,352 @@
-# Pipeline overview
+# Pipeline Overview
 
-A Turyn-type quadruple `TT(n)` is four `±1` sequences — `X`, `Y`, `Z` of
-length `n` and `W` of length `n-1` — satisfying the aperiodic
-autocorrelation identity
+This document is the current high-level map of the Turyn search pipeline.
+It merges the old operational pipeline notes with the useful framework
+architecture that used to live in the unified framework proposal.
 
-    N_X(s) + N_Y(s) + 2·N_Z(s) + 2·N_W(s) = 0    for every s ≥ 1
+Authoritative contracts:
 
-together with the sum-squared invariant
+- `../SPEC.md` - top-level invariants future refactors must preserve
+- `TTC.md` - normalized TTC accounting contract
+- `TELEMETRY.md` - progress/forcing/fan-out telemetry contract
+- `CANONICAL.md` - BDKR canonicalization rules and correctness notes
 
-    σ_X² + σ_Y² + 2σ_Z² + 2σ_W² = 6n - 2.
+The old unified framework proposal has been folded into this document.
+Its superseded `log2(|cube|)` TTC ledger must not be revived.
 
-Taking the DTFT of the autocorrelation identity gives the equivalent
-spectral form
+## 1. Mathematical Problem
 
-    |X(ω)|² + |Y(ω)|² + 2|Z(ω)|² + 2|W(ω)|²  =  6n - 2  ∀ ω
+A Turyn-type quadruple `TT(n)` is four `+/-1` sequences:
 
-and therefore the pair bound `|Z(ω)|² + |W(ω)|² ≤ 3n-1` for every
-frequency.  Almost every decision in the search is there to enforce
-some discrete sample of this continuous condition.
+- `X`, `Y`, `Z` of length `n`
+- `W` of length `n - 1`
 
-## Entry points
+They satisfy the aperiodic autocorrelation identity
 
-`main()` dispatches into one of several modes (with a handful of
-early-return subcommands for verification, DIMACS dumps, etc.):
-
-```
-main():
-    cfg = parse_args()
-
-    # Early returns (not searches)
-    if --verify-seqs:      verify_tt(...); exit
-    if --test-zw:          try every tuple against given Z,W via SAT XY; exit
-    if --phase-a:          enumerate sum tuples and print; exit
-    if --phase-b:          stats-only run through Phase B; exit
-    if --dump-dimacs:      write SAT instance for the first tuple; exit
-    if --benchmark=N:      time N repeats; exit
-
-    # Search modes
-    elif --stochastic:     stochastic_search()           # SA / local search
-    else:
-        match cfg.effective_wz_mode():
-            WzMode::Cross    => run_hybrid_search()              # DEFAULT
-            WzMode::Apart    => run_mdd_sat_search(wz_together=false)
-            WzMode::Together => run_mdd_sat_search(wz_together=true)
-            WzMode::Sync     => sync_walker::search_sync()       # no MDD file
+```text
+N_X(s) + N_Y(s) + 2*N_Z(s) + 2*N_W(s) = 0    for every s >= 1
 ```
 
-The producer is chosen by `--wz=cross|apart|together|sync`.
-`--wz-together` still works as a short alias for `--wz=together`, and
-`--mdd-k=N` / `--mdd-extend=N` imply `--wz=apart` when no explicit
-`--wz` is given. Explicit `--wz` always wins.
+and the sum-squared invariant
 
-`--wz=sync` is the newest mode and differs structurally from the other
-three: it does **not** load `mdd-<k>.bin`, does **not** enumerate sum
-tuples up-front, and does **not** split the search into `(Z, W)`
-producer → XY consumer. Instead, one persistent CDCL solver holds every
-constraint and a single DFS walker over all four sequences feeds it
-assumptions. See [`--wz=sync`](#wzsync--sync_walkersearch_sync) below.
-
-**The `cross`, `apart`, and `together` modes all load the same MDD**
-(`mdd-<k>.bin`) — the name "MDD pipeline" for `--wz=apart|together`
-is a historical artefact. Every search layer in those three modes
-uses the MDD as its XY boundary enumerator; they differ only in how
-they generate the `(Z, W)` candidate pairs before handing each pair
-off to the shared `SolveXyPerCandidate::try_candidate` XY SAT path.
-
-`--wz=sync` is different: no MDD file is loaded and there is no
-separate XY stage. A single CDCL solver encodes the whole problem and
-a unified 4-sequence walker drives it to a leaf.
-
-The flat `xy-table-k*.bin` format was retired once we proved (test:
-`table_vs_mdd_same_k_agree`, now removed) that at the same `k` the
-MDD sub-tree walker returned identical `(x_bits, y_bits)` sets.
-
-## The three (Z, W) producers (Cross / Apart / Together)
-
-The `cross`, `apart`, and `together` modes ultimately feed the same
-XY SAT consumer (`SolveXyPerCandidate::try_candidate`). They differ
-in how they *generate* the candidate `(Z, W)` pairs that get handed
-to that consumer. (`--wz=sync` is a separate architecture and is
-described in its own section below.)
-
-### `--wz=cross` — `run_hybrid_search` (default)
-
-Brute-force full `Z` and `W` sequences, spectral-filter them, bucket
-by boundary signature, then dispatch to XY SAT:
-
-```
-tuples = phase_a_tuples(problem)
-mdd    = load "mdd-7.bin"            # XY candidate enumerator
-for each tuple (heuristic order):
-    w_candidates = brute_force_w_middles + individual spectral filter
-    stream_zw_candidates_to_channel():
-        for each z_candidate (brute-force length-n with sum constraint):
-            individual spectral filter on Z
-            for each matching w_candidate:
-                spectral pair check  (|Z(ω)|² + |W(ω)|² ≤ 3n-1 on FFT grid)
-                if passes → emit SatWorkItem { z: Fixed, w: Fixed, tuple }
-
-# Worker pool (run_parallel_search):
-for each SatWorkItem in priority queue:
-    solve_work_item → solve_xy_via_source(mdd-rooted xy sub-tree)
-        build per-(Z,W) filter state (GJ equalities, lag filters, term-
-        state template), clone the solver template once, then walk the
-        XY sub-MDD and SAT-solve each (x_bits, y_bits) candidate that
-        survives the bitwise pre-filters.
+```text
+sigma_X^2 + sigma_Y^2 + 2*sigma_Z^2 + 2*sigma_W^2 = 6n - 2
 ```
 
-This is the path that found `TT(26)` on main (commit 88aae1a) in
-~161 s at 16 threads.
+The spectral form gives the necessary pair bound
 
-### `--wz=apart` / `--wz=together` — `run_mdd_sat_search`
-
-Start from the MDD boundaries directly: navigate to a `(z_bits,
-w_bits)` boundary, then SAT-solve the Z and W middles inline. The
-`apart` variant runs SolveW → SolveZ as two separate SAT stages; the
-`together` variant collapses them into a single combined W+Z SAT call.
-
-```
-monitor thread:
-    while queue low:
-        idx = path_counter++
-        path = LCG_scramble(idx)
-        walk MDD along path → (z_bits, w_bits, xy_root)
-        push Boundary item
-
-N workers, identical loop:
-    pop highest-priority item from dual priority queue:
-
-    Boundary(z_bits, w_bits, xy_root):
-        for each tuple:
-            sum feasibility check
-            any_valid_xy(xy_root, tuple) fail-fast
-            push SolveW            (--wz=apart)
-            or   SolveWZ           (--wz=together)
-
-    SolveW(tuple, z_bits, w_bits, xy_root):        # --wz=apart
-        enumerate W middles (brute-force if middle_m ≤ 20, else SAT)
-        for each passing W: push SolveZ
-
-    SolveWZ(tuple, z_bits, w_bits, xy_root):       # --wz=together
-        single combined W+Z SAT call
-        for each (W, Z) pair: solve XY inline
-
-    SolveZ(tuple, z_bits, w_bits, w_vals, w_spectrum, xy_root):
-        build Z SAT solver with cached ZBoundaryPrep
-        attach SpectralConstraint with per-freq bound
-            pair_bound - |W(ω_SAT)|² at the SAT's 167-freq grid
-        up to max_z solves:
-            SAT-solve for a Z middle
-            compute Z spectrum (realfft), post-hoc pair check
-            if passes:
-                SolveXyPerCandidate::new(problem, (Z,W), template)
-                walk XY sub-MDD from xy_root → (x_bits, y_bits)
-                for each: try_candidate(x_bits, y_bits)  → SAT
+```text
+|Z(w)|^2 + |W(w)|^2 <= 3n - 1
 ```
 
-`SolveXyPerCandidate::try_candidate` is the same per-candidate fast
-path that `solve_xy_via_source` uses for `--wz=cross`, so all three
-producers share identical XY SAT behaviour once they reach that
-stage. They differ only in how they *get* to the point of having a
-`(Z, W, xy_root)` triple.
+for every frequency. Most pruning in the solver enforces either the
+autocorrelation identity, BDKR canonicalization, sum feasibility, or
+this spectral bound.
 
-### `--wz=sync` — `sync_walker::search_sync`
+## 2. Runtime Shape
 
-One persistent CDCL solver, one DFS walker, all four sequences
-assigned together. No MDD file, no tuple pre-enumeration, no
-separate `(Z, W)` → XY handoff.
+The search binary routes all current search modes through the shared
+framework runtime:
 
-```
-search_sync(problem, cfg):
-    solver = radical::Solver::new_with_config(cfg.sat_config)
-    encode_all_variables(solver):              # X, Y, Z boundary + middle
-        length-n {±1} vars for X, Y, Z; length-(n-1) for W
-        BDKR canonicalization rules (i..vi) as Tseitin clauses
-        per-lag Turyn identity as native quad-PB constraints
-        (spectral / MDD constraints are NOT attached in sync mode)
-
-    # Bouncing-order position schedule: pin end-points first, work inwards.
-    # depth = n for even n; at each level we pin all four sequences at one p.
-    pos_order = [0, n-1, 1, n-2, 2, n-3, ..., n/2-1, n/2]
-
-    # Parallel workers (N = available_parallelism or $TURYN_THREADS):
-    # worker 0 explores siblings in score order (best-first); workers 1..
-    # use a per-worker-seeded random permutation so each starts in a
-    # different region of the tree. A shared ClauseExchange relays
-    # learnt nogoods across workers.
-    for worker in 0..N in thread::scope:
-        state = DFS state; assumptions = [];
-        dfs(state):
-            if cancelled or timed out: return
-            if level == depth: found leaf → verify → publish
-            p = pos_order[state.level]
-            for each (x,y,z,w) sibling at position p:
-                extend assumptions with the 4 (or 3 when p == n-1) unit lits
-                capacity check: |S(s)| ≤ max_remaining[level][s]  (walker-side)
-                solver.propagate_only(&assumptions)                (SAT-side)
-                    → learn nogood on conflict (persists for the whole walk)
-                if sat: record forcings, recurse; else: backtrack
+```text
+main
+  parse SearchConfig
+  enumerate or select sum tuples when needed
+  choose effective WzMode
+  build one SearchModeAdapter
+  run SearchEngine with LaneByPriority scheduler
 ```
 
-Key structural differences vs. the three MDD-backed producers:
+The shared framework is in `src/search_framework/`:
 
-- **No upfront MDD**: boundary sub-cubes are implicitly enumerated by
-  the DFS. No `mdd-<k>.bin` dependency.
-- **No tuple split**: the sum identity `σ_X² + σ_Y² + 2σ_Z² + 2σ_W² =
-  6n-2` is a derived consequence of the per-lag constraints and is
-  not used to pre-filter search regions.
-- **Propagation-only**: the SAT solver is used exclusively via
-  `propagate_only(&assumptions)` — no CDCL decisions, no full solve.
-  It answers "can the current 4-sequence prefix be extended?" as
-  cheaply as possible, and learns a nogood on failure.
-- **Persistent solver**: there is no clone-per-candidate. Every
-  walker node hits the same solver instance, so CDCL nogoods learnt
-  early in the walk prune every later sub-cube they apply to.
-- **Per-worker clause exchange**: parallel workers swap learnt
-  clauses through a lock-free-ish `ClauseExchange` buffer. This is
-  the only cross-worker communication besides the cancel flag.
-- **Rich telemetry**: sync mode emits a per-level table, a
-  per-propagator-feature summary, a per-(level, feature) matrix,
-  and a direct TTC computed from the DFS coverage product. See
-  [docs/TELEMETRY.md](TELEMETRY.md) for the output format.
+- `engine.rs` - coordinator thread, worker pool, progress snapshots
+- `queue.rs` - priority/gold-lane scheduler policy
+- `stage.rs` - `WorkItem`, `StageHandler`, `StageOutcome`, continuations
+- `mass.rs` - normalized TTC mass model
+- `events.rs` - progress, edge-flow, fan-out, forcing rollups
+- `mode_adapters/` - per-mode adapters
 
-`--wz=sync` is currently the only mode that exposes per-feature
-SAT-propagator attribution. The `cross`/`apart`/`together` pipelines
-use clones and per-candidate solves; their propagation counters are
-reset per-clone and the total is not aggregated anywhere.
+The coordinator owns global accounting. Worker threads are
+interchangeable and pull work from scheduler lanes.
 
-### Measured TTC at `n=26` (4 threads)
+## 3. Search Modes
 
-| Mode | TTC | Notes |
-|---|---|---|
-| `--wz=cross` | ~1 h (extrapolated) | SpectralIndex cross-matching prunes aggressively |
-| `--wz=apart` | ~7.7 h | direct MDD path walk, ~371 paths/s |
-| `--wz=together` | ~7.7 h | same walk, combined W+Z SAT changes per-stage accounting |
+### 3.1 `--wz=apart` and `--wz=together`
 
-The ~7–8× gap between `cross` and the MDD producers is the `(Z, W)`
-enumeration strategy difference, not the XY SAT stage — Commit A
-(`SolveXyPerCandidate`) unified the XY stage and closed a ~24 %
-per-solve gap at `n=22`, but at `n=26` the bottleneck is upstream of
-XY for both MDD producers.
+Adapter: `MddStagesAdapter`
 
-### Measured TTC at `n=56` (16 threads, April 2026)
+These are the MDD-backed exhaustive modes. They enumerate live MDD
+boundaries and then solve the missing middle pieces.
 
-| Mode | TTC (parallel) | In human units | Notes |
-|---|---|---|---|
-| `--wz=sync` | 9.67 × 10⁹ s | ~307 years | direct coverage-product TTC from sync telemetry |
-| `--wz=apart --mdd-k=8` | 1.68 × 10⁶ s | ~19.5 days | MDD pre-prunes to 1.6×10⁻¹⁰ of naive space |
+Pipeline:
 
-The ~5700× gap is entirely the MDD denominator — `--wz=apart` walks
-a pre-pruned boundary DAG, `--wz=sync` walks the raw bouncing-order
-DFS with SAT-side pruning only. Both use the same `radical` solver
-and the same quad-PB identity; the difference is up-front search
-space reduction.
+```text
+Boundary
+  -> SolveW -> SolveZ -> inline XY solves       (--wz=apart)
+  -> SolveWZ -> inline XY solves                (--wz=together)
+```
 
-At `n=18` `--wz=sync` solves in ~13.5 s wall-clock (16 threads) with
-a reported TTC of ~6.7 × 10⁴ s (direct coverage, 16 threads) — the
-leaf was hit early but residual tree coverage dominates the TTC
-projection. This is the smoke-test correctness anchor for sync mode.
+The boundary stage starts from a `(z_bits, w_bits, xy_root)` MDD
+boundary. It checks tuple feasibility and whether the XY subspace has
+any compatible boundary candidate.
 
-## Known-good anchor points
+`apart` solves W middles first, then solves Z middles against each W.
+`together` uses one combined W+Z SAT call. Both eventually use the
+same XY SAT fast path through `SolveXyPerCandidate`.
 
-For sanity-checking correctness anywhere in the pipeline:
+TTC quality is currently `Hybrid`: exact boundary completion is a real
+additive fraction, while timeout partial credit is approximate and must
+stay bounded/non-duplicated.
+
+### 3.2 `--wz=cross`
+
+Adapter: `CrossAdapter`
+
+Cross mode is a brute-force Z/W producer wrapped as a framework stage.
+It enumerates full Z and W candidates for each tuple, filters them by
+individual and pair spectral constraints, deduplicates by ZW
+autocorrelation, then brute-forces XY boundary codes for each surviving
+pair.
+
+Current shape:
+
+```text
+cross.enumerate
+  for each tuple
+    build/reuse W candidates by |sigma_W|
+    enumerate Z candidates
+    spectral pair check
+    brute-force XY boundary codes up to the cross k cap
+    try XY SAT candidate
+```
+
+Cross mode uses uniform tuple weighting today, so its TTC label remains
+`Hybrid` rather than `Direct`.
+
+### 3.3 `--wz=sync`
+
+Adapter: `SyncAdapter`
+
+Sync mode wraps the synchronized four-sequence walker inside the shared
+framework so universal snapshots are emitted consistently. It does not
+use a prebuilt MDD file or a separate Z/W-to-XY handoff. One persistent
+SAT solver encodes all four sequences and the DFS walker feeds it
+assumptions in bouncing position order.
+
+Key properties:
+
+- no tuple pre-enumeration
+- no MDD boundary file
+- persistent CDCL solver
+- propagate-only walker calls
+- learned clauses persist across the walk
+- rich mode-specific sync telemetry remains authoritative
+
+The universal TTC label is `Projected` for sync. Its mode-specific
+coverage-product and branching-factor estimates are useful diagnostics,
+but they are not a `Direct` normalized TTC claim.
+
+### 3.4 `--stochastic`
+
+Adapter: `StochasticAdapter`
+
+Stochastic mode is non-exhaustive guess/search infrastructure. It runs
+through the framework for consistent lifecycle and output shape, but it
+must be treated as estimate-only/non-complete unless explicitly proven
+otherwise.
+
+## 4. Scheduler And Work Semantics
+
+All ordinary workers pull `WorkItem`s from the shared scheduler.
+
+Each item carries:
+
+- `stage_id`
+- `priority`
+- `gold`
+- `cost_hint`
+- `replay_key`
+- optional `mass_hint`
+- lineage metadata (`item_id`, `parent_item_id`, `fanout_root_id`,
+  `depth_from_root`, `spawn_seq`)
+
+Priority encodes pipeline depth. Later stages have higher priority so
+the system drains downstream work before producing more upstream work.
+This is intentional throughput behavior: avoid work in progress sitting
+around when it can retire search mass.
+
+The `gold` flag is an explicit experimental promotion lane. It may bias
+order, but it must not change completeness or accounting.
+
+Work may be split, resumed, deferred, or left incomplete by cancellation.
+In an exhaustive run, work must not be abandoned. A timeout is not UNSAT
+and is not exact coverage.
+
+## 5. TTC And Telemetry
+
+`docs/TTC.md` is authoritative. The universal TTC ledger is normalized:
+
+```text
+total_mass = 1.0
+covered_mass = covered_exact + covered_partial
+coverage_rate = covered_mass / elapsed
+TTC = (1.0 - covered_mass) / coverage_rate
+```
+
+Mass values are fractions in `[0, 1]`. Exact and partial credit must
+refer to the same denominator, and completed regions must not be
+credited twice.
+
+Every progress snapshot includes:
+
+- elapsed time
+- throughput per second
+- covered, total, and remaining mass
+- TTC
+- quality label: `Direct`, `Hybrid`, or `Projected`
+- edge-flow counters
+- fan-out root counters
+- forcing rollups
+
+Forcing telemetry has two coordinator-owned rollups:
+
+- `[stage, level]`
+- `[stage, feature]`
+
+The solver also owns `[feature, level]` through its propagation counters.
+
+## 6. Threading Model
+
+The framework runtime has one coordinator and `N` worker threads:
+
+1. The coordinator seeds initial work from the selected adapter.
+2. Workers wait on the shared scheduler.
+3. A worker pops one item, runs the matching `StageHandler`, and sends
+   a report back to the coordinator.
+4. The coordinator applies mass, forcings, edge-flow, fan-out updates,
+   and pushes emitted or continued work back into the scheduler.
+5. The coordinator emits periodic progress snapshots and one final
+   finished snapshot.
+
+The scheduler is protected by a mutex/condition variable. Workers do not
+own stage-specific queues. This preserves load balancing and lets every
+thread run the deepest available work.
+
+Cancellation is a live atomic flag visible in `StageContext`. Long
+handlers must poll it inside inner loops.
+
+Deferral contract:
+
+- A budget-exhausted handler returns the mass it actually covered.
+- The uncovered residual must be represented as `Continuation::Split`,
+  `Continuation::Resume`, or an explicitly incomplete/cancelled run.
+- Residual work must not be counted both as covered and still-live full
+  work.
+
+## 7. Data Model And API
+
+Current framework interfaces, simplified:
+
+```text
+trait SearchModeAdapter<T> {
+  fn name(&self) -> &'static str;
+  fn init(&self) -> AdapterInit<T>;
+  fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<T>>>;
+  fn mass_model(&self) -> Box<dyn SearchMassModel>;
+}
+
+trait StageHandler<T> {
+  fn id(&self) -> StageId;
+  fn handle(&self, item: WorkItem<T>, ctx: &StageContext) -> StageOutcome<T>;
+}
+
+struct WorkItem<T> {
+  stage_id: StageId,
+  priority: i32,
+  gold: bool,
+  cost_hint: u32,
+  replay_key: u64,
+  mass_hint: Option<f64>,
+  meta: WorkItemMeta,
+  payload: T,
+}
+
+struct StageOutcome<T> {
+  emitted: Vec<WorkItem<T>>,
+  continuation: Continuation<T>,
+  mass_delta: MassDelta,
+  fanout_delta: FanoutDelta,
+  diagnostics: Vec<DiagEvent>,
+  forcings: ForcingDelta,
+}
+
+enum Continuation<T> {
+  None,
+  Split(Vec<WorkItem<T>>),
+  Resume(WorkItem<T>),
+}
+
+trait SearchMassModel {
+  fn total_mass(&self) -> MassValue;        // default 1.0
+  fn covered_mass(&self) -> MassValue;      // exact fraction
+  fn covered_partial_mass(&self) -> MassValue;
+  fn total_log2_work(&self) -> Option<f64>; // benchmark stop only
+  fn quality(&self) -> TtcQuality;
+}
+```
+
+`edge_flow.spawned` is the populated edge-flow lifecycle field today.
+`fanout_roots.live_descendants` tracks currently outstanding descendants
+per root.
+
+## 8. Known-Good Anchors
+
+For correctness checks, prefer catalogue-backed anchors and known
+solutions rather than performance-only counters.
 
 ### Known `TT(26)`
 
+```text
+X = ++--+--+++++++-+-++--+-++-
+Y = +++++-++++++-++-+---+-++--
+Z = +++-+--++++++--++---+-+--+
+W = ++++-+---+--+++--++++-+-+
 ```
-X =: '++--+--+++++++-+-++--+-++-'   σ_X = 6
-Y =: '+++-+-++++++-++-+---+-++--'   σ_Y = 6
-Z =: '+++-+--++++++--++---+-+--+'   σ_Z = 4
-W =: '++++-+---+--+++--++++-+-+'    σ_W = 5
-```
 
-- Sum tuple `(6, 6, 4, 5)`, `σ_X² + σ_Y² + 2σ_Z² + 2σ_W² = 154 = 6n-2`.
-- Dense spectral sweep: `max(|Z(ω)|² + |W(ω)|²) ≈ 72.7 < 77 = 3n-1`.
-  Roughly 6 % slack on both the SAT and FFT grids, so the real
-  solution comfortably passes both spectral filters.
-- At `k = 7`, the `(z_bits, w_bits) = (9495, 11183)` boundary is live
-  in the MDD, and its XY sub-tree contains 1388 valid `(x_bits,
-  y_bits)` candidates — `(6675, 3415)` among them — that match the
-  tuple's sum constraints.
+Properties:
 
-The `known_tt26_verifies` unit test runs `verify_tt` on this
-quadruple.
+- sum tuple `(6, 6, 4, 5)`
+- `sigma_X^2 + sigma_Y^2 + 2*sigma_Z^2 + 2*sigma_W^2 = 154 = 6n - 2`
+- at `k = 7`, the canonical boundary is live in the MDD
+- the `known_tt26_verifies` unit test verifies the tuple
 
-## The two spectral filters
+The full catalogue counts through `n=32` are listed in `../SPEC.md`.
 
-The pair bound `|Z(ω)|² + |W(ω)|² ≤ 3n-1` is enforced at two
-different discrete frequency grids:
+## 9. Offline Artifacts
 
-1. **Inside the Z SAT solver**, via `radical::SpectralConstraint` at
-   the SAT's 167-point grid `ω_fi = (fi+1)/168 · π`. During CDCL
-   propagation it uses a triangle-inequality lower bound on `|Z(ω)|`
-   (soundness preserved; at full assignment the check is tight). The
-   `per_freq_bound[fi]` is set to `pair_bound - |Ŵ(ω_fi)|²` computed
-   once per `(Z-boundary, W)` pair.
+The main offline artifact is the MDD:
 
-2. **Post-hoc** after Z SAT returns, via `compute_spectrum_into` +
-   `spectral_pair_ok` at the realfft 129-point grid `ω_k = πk/128`.
-   Catches violations the SAT's grid missed.
+- `gen_mdd K` -> `mdd-K.bin`
+- `gen_mdd_bfs K` -> alternative BFS builder for large `K`
 
-Both checks are sound necessary conditions and they apply to
-essentially disjoint frequency grids (they share only the 8 points
-`ω = mπ/8` for `m = 1..8`).  At small `k` the filter chain rejects
-roughly 99.996 % of Z solutions — that's not a bug, it's the real
-density of valid `(Z, W)` pairs at the bound.
+Flat `xy-table-k*.bin` tables are retired for the current primary
+pipeline. Historical docs and logs may still mention `gen_table`, but
+future work should treat the MDD and framework adapters as the current
+path unless deliberately reviving a table experiment.
 
-## Why MDD is the sole XY enumerator
+## 10. Reading Old Logs
 
-Before the consolidation there were two XY candidate enumerators:
+Older logs use old names and counters:
 
-- `XYBoundaryTable` — a ~1.9 GB on-disk flat table keyed by `(z_bits,
-  w_bits, x_bnd_sum, y_bnd_sum)`, built by `gen_table`.
-- `walk_xy_sub_mdd` — a runtime DFS through the MDD's XY sub-tree
-  rooted at `xy_root`.
+- `run_hybrid_search` roughly maps to current cross-mode adapter work.
+- `run_mdd_sat_search` roughly maps to current MDD staged adapter work.
+- `DualQueue` roughly maps to the current priority/gold-lane scheduler.
+- `xy/s`, `paths/s`, `live_zw_paths`, and `eff` are historical proxies
+  for denominator, rate, or shortfall effects.
 
-Both enforce exactly the Turyn identity at the `k` "exact" lags (the
-lags where every pair is boundary-to-boundary). The `table_vs_mdd_
-same_k_agree` test confirmed identical candidate sets at `k = 7`.
-Hybrid-path throughput at `n = 26` on 4 threads matched within 2 %
-between the two backends. The MDD's ~2000× memory advantage (1 MB
-vs 1.9 GB) made the decision trivial — the flat table and `gen_table`
-are gone.
+When in doubt, the current interpretation rule is:
 
-## Shared building blocks
-
-- `Problem { n }` with `m = n-1`, `target_energy = 6n-2`,
-  `spectral_bound = 3n-1`.
-- `phase_a_tuples` — enumerates and normalizes sum tuples `(x,y,z,w)`
-  satisfying `x² + y² + 2z² + 2w² = target_energy`.
-- `SpectralFilter` (rustfft/realfft, FFT frequency grid).
-- `radical::SpectralTables` (SAT frequency grid, 167 pts) and
-  `radical::SpectralConstraint` (inside the SAT solver with per-freq
-  bounds).
-- `sat_z_middle::LagTemplate` — per-lag literal groupings for the Z
-  and W SAT encodings.
-- `sat_z_middle::ZBoundaryPrep` — per-worker cache of the boundary-
-  dependent fill prep (agree_const, lits_a/lits_b, coeffs) keyed by
-  `z_bits`; rebuilt in place on cache miss.
-- `SatXYTemplate` — per-tuple XY SAT template with precomputed lag
-  pairs and Gaussian-elimination prep.
-- `XyOwner` + `solve_xy_via_source` — the shared XY SAT consumer,
-  called by both the hybrid path and `run_mdd_sat_search`.
-- `mdd_zw_first::Mdd4` / `load_best_mdd` — offline-built MDD loaded
-  from `mdd-<k>.bin`.
-- `PackedSeq`, `verify_tt`, `compute_zw_autocorr`.
-
-## Offline artifacts
-
-- `gen_mdd K` → `mdd-K.bin` — used by **all three** `--wz` modes
-  (`--wz=cross` always loads `k = 7` for XY enumeration;
-  `--wz=apart|together` load whatever `--mdd-k` says, defaulting to 8).
-  The only on-disk artifact the search needs.
-- `gen_mdd_bfs K` — an alternative BFS-based MDD builder used for
-  very large `k`.
+1. Did the denominator change?
+2. Did normalized covered mass change?
+3. Did normalized coverage rate change?
+4. Did the quality/completeness label change?

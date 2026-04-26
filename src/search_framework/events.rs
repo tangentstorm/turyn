@@ -84,8 +84,7 @@ pub struct LevelCutAttribution {
 /// Minimal Sankey-flavoured text dump. Today only the `spawned`
 /// column is meaningful — see [`EdgeFlowCounters`]. The full
 /// `in → filtered → queued → started → completed` layout from
-/// `UNIFIED_SEARCH_FRAMEWORK_SPEC.md` §8.1 lands when those fields
-/// get wired.
+/// the pipeline telemetry design lands when those fields get wired.
 pub fn render_sankey_text(edge_flow: &BTreeMap<(String, String), EdgeFlowCounters>) -> String {
     let mut out = String::new();
     out.push_str("edge | spawned\n");
