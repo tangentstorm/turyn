@@ -2070,18 +2070,6 @@ pub(crate) fn process_solve_wz(
     // cancel.
     let conflict_budget: u64 = (5_000u64 << swz.attempt.min(7)).min(1_000_000);
     solver.set_conflict_limit(conflict_budget);
-    // Brute-force middle enumeration when the (W mid, Z mid) bit
-    // space is small. The SAT-blocking enumeration below relies on
-    // CDCL with random phase saving to find every model, but we
-    // observed at TT(10) (n=10, k=4, middle_m=1, middle_n=2) that
-    // CDCL repeatedly settled on the same blocked region of the
-    // multi-tuple model space and reported UNSAT before exhausting
-    // every (W mid, Z mid). Direct enumeration with one
-    // `solve_with_assumptions` per bit pattern provably visits each
-    // pair exactly once. Mirrors apart's `if ctx.middle_m <= 20
-    // { brute-force }` policy in `process_solve_w`.
-    let bf_total: u32 = (ctx.middle_m + ctx.middle_n) as u32;
-    let use_brute_force = bf_total <= 12;
     // Tracks whether the enumeration was cut off with
     // more WZ solutions possibly remaining (None from
     // solve() = conflict limit, or hit max_z cap),
@@ -2092,21 +2080,6 @@ pub(crate) fn process_solve_wz(
     // plus the prior_blocks get passed forward so the
     // next attempt skips already-found (W, Z) pairs.
     let mut new_blocks: Vec<Vec<i32>> = Vec::new();
-    let mut bf_cursor: u64 = 0;
-    let bf_end: u64 = if use_brute_force {
-        1u64 << bf_total
-    } else {
-        0
-    };
-    // Save a checkpoint of the post-setup solver state. The brute-
-    // force path restores to this checkpoint between candidate
-    // assumptions so accumulated learnt clauses from one rejected
-    // (W mid, Z mid) can't poison the next iteration's solve.
-    let bf_checkpoint = if use_brute_force {
-        Some(solver.save_checkpoint())
-    } else {
-        None
-    };
     loop {
         if !ctx.continue_after_sat && ctx.found.load(AtomicOrdering::Relaxed) {
             break;
@@ -2115,145 +2088,95 @@ pub(crate) fn process_solve_wz(
             more_possible = true;
             break;
         }
-        let (w_mid, z_mid) = if use_brute_force {
-            // Brute-force enumeration: walk every (W mid bits, Z mid
-            // bits) combination, validating each via
-            // `solve_with_assumptions`. The blocking-clause path
-            // below relies on CDCL to enumerate, but at small
-            // middle sizes CDCL with random phase saving can settle
-            // into a sub-region of the model space and report
-            // UNSAT before visiting every model. Direct enumeration
-            // is provably complete.
-            let mut found_assignment: Option<(Vec<i8>, Vec<i8>)> = None;
-            while bf_cursor < bf_end {
-                let bits = bf_cursor;
-                bf_cursor += 1;
-                let mut assumptions: Vec<i32> = Vec::with_capacity(total_vars);
-                for i in 0..ctx.middle_m {
-                    let on = (bits >> i) & 1 == 1;
-                    assumptions.push(if on { w_var(i) } else { -w_var(i) });
-                }
-                for i in 0..ctx.middle_n {
-                    let on = (bits >> (ctx.middle_m + i)) & 1 == 1;
-                    assumptions.push(if on { z_var(i) } else { -z_var(i) });
-                }
-                metrics
-                    .flow_wz_sat_calls
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                let res = solver.solve_with_assumptions(&assumptions);
-                if let Some(cp) = bf_checkpoint {
-                    solver.restore_checkpoint(cp);
-                }
-                if res != Some(true) {
-                    continue;
-                }
-                let w_mid: Vec<i8> = (0..ctx.middle_m)
-                    .map(|i| {
-                        let on = (bits >> i) & 1 == 1;
-                        if on { 1 } else { -1 }
-                    })
-                    .collect();
-                let z_mid: Vec<i8> = (0..ctx.middle_n)
-                    .map(|i| {
-                        let on = (bits >> (ctx.middle_m + i)) & 1 == 1;
-                        if on { 1 } else { -1 }
-                    })
-                    .collect();
-                found_assignment = Some((w_mid, z_mid));
-                break;
-            }
-            match found_assignment {
-                Some((w, z)) => {
-                    wz_count += 1;
-                    metrics
-                        .flow_wz_solutions
-                        .fetch_add(1, AtomicOrdering::Relaxed);
-                    (w, z)
-                }
-                None => {
-                    metrics
-                        .flow_wz_exhausted
-                        .fetch_add(1, AtomicOrdering::Relaxed);
-                    if wz_count == 0 {
-                        metrics
-                            .flow_wz_first_unsat
-                            .fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    break;
-                }
-            }
-        } else {
-            // Random phases for both W and Z.  Mix the
-            // attempt number into the RNG so re-queued
-            // items explore a different region of the
-            // phase space than their first attempt.
-            let mut attempt_rng = *rng ^ (swz.attempt as u64).wrapping_mul(0x9e3779b97f4a7c15);
-            let phases: Vec<bool> = (0..total_vars)
-                .map(|_| {
-                    attempt_rng ^= attempt_rng << 13;
-                    attempt_rng ^= attempt_rng >> 7;
-                    attempt_rng ^= attempt_rng << 17;
-                    attempt_rng & 1 == 1
-                })
-                .collect();
-            *rng = attempt_rng;
-            solver.set_phase(&phases);
+        // Random phases for both W and Z.  Mix the
+        // attempt number into the RNG so re-queued
+        // items explore a different region of the
+        // phase space than their first attempt.
+        let mut attempt_rng = *rng ^ (swz.attempt as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        let phases: Vec<bool> = (0..total_vars)
+            .map(|_| {
+                attempt_rng ^= attempt_rng << 13;
+                attempt_rng ^= attempt_rng >> 7;
+                attempt_rng ^= attempt_rng << 17;
+                attempt_rng & 1 == 1
+            })
+            .collect();
+        *rng = attempt_rng;
+        solver.set_phase(&phases);
+        metrics
+            .flow_wz_sat_calls
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        let sat_res = solver.solve();
+        if sat_res == None {
+            // Conflict limit hit — more solutions may exist.
+            more_possible = true;
             metrics
-                .flow_wz_sat_calls
+                .flow_wz_budget_hit
                 .fetch_add(1, AtomicOrdering::Relaxed);
-            let sat_res = solver.solve();
-            if sat_res == None {
-                // Conflict limit hit — more solutions may exist.
-                more_possible = true;
-                metrics
-                    .flow_wz_budget_hit
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                break;
-            }
-            if sat_res == Some(false) {
-                // Fully enumerated: every assignment has been
-                // blocked.  No point re-queuing.
-                metrics
-                    .flow_wz_exhausted
-                    .fetch_add(1, AtomicOrdering::Relaxed);
-                if wz_count == 0 {
-                    metrics
-                        .flow_wz_first_unsat
-                        .fetch_add(1, AtomicOrdering::Relaxed);
-                }
-                break;
-            }
-            wz_count += 1;
+            // Don't bump flow_wz_first_unsat here: the field name
+            // means "first iteration reported UNSAT", and a
+            // conflict-budget timeout is not UNSAT. Mirrors the
+            // round-28 fix for the analogous flow_w_unsat /
+            // flow_w_timeout mutual exclusion.
+            break;
+        }
+        if sat_res == Some(false) {
+            // Fully enumerated: every assignment has been
+            // blocked.  No point re-queuing.
             metrics
-                .flow_wz_solutions
+                .flow_wz_exhausted
                 .fetch_add(1, AtomicOrdering::Relaxed);
+            if wz_count == 0 {
+                metrics
+                    .flow_wz_first_unsat
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            break;
+        }
+        wz_count += 1;
+        metrics
+            .flow_wz_solutions
+            .fetch_add(1, AtomicOrdering::Relaxed);
 
-            let w_mid: Vec<i8> = (0..ctx.middle_m)
-                .map(|i| if solver.value(w_var(i)).unwrap() { 1 } else { -1 })
-                .collect();
-            let z_mid: Vec<i8> = (0..ctx.middle_n)
-                .map(|i| if solver.value(z_var(i)).unwrap() { 1 } else { -1 })
-                .collect();
-
-            // Block this (W,Z) pair so the next solve avoids it.
-            // Stash in `new_blocks` so a re-queue carries the
-            // dedup forward to the next attempt's fresh solver.
-            let block: Vec<i32> = (0..total_vars as i32 + 1)
-                .skip(1)
-                .map(|v| if solver.value(v) == Some(true) { -v } else { v })
-                .collect();
-            solver.reset();
-            solver.add_clause(block.iter().copied());
-            new_blocks.push(block);
-            (w_mid, z_mid)
-        };
-
+        // Extract W middle
+        let w_mid: Vec<i8> = (0..ctx.middle_m)
+            .map(|i| {
+                if solver.value(w_var(i)).unwrap() {
+                    1
+                } else {
+                    -1
+                }
+            })
+            .collect();
         let mut w_vals = w_boundary.clone();
         w_vals[k..k + ctx.middle_m].copy_from_slice(&w_mid);
+
+        // Extract Z middle
+        let z_mid: Vec<i8> = (0..ctx.middle_n)
+            .map(|i| {
+                if solver.value(z_var(i)).unwrap() {
+                    1
+                } else {
+                    -1
+                }
+            })
+            .collect();
         let mut z_vals = Vec::with_capacity(n);
         z_vals.extend_from_slice(&z_boundary[..k]);
         z_vals.extend_from_slice(&z_mid);
         z_vals.extend_from_slice(&z_boundary[n - k..]);
+
+        // Block this (W,Z) pair.  Also stash the clause
+        // in new_blocks so it survives re-queue: the
+        // next attempt's fresh solver will re-add it
+        // together with swz.prior_blocks.
+        let block: Vec<i32> = (0..total_vars as i32 + 1)
+            .skip(1)
+            .map(|v| if solver.value(v) == Some(true) { -v } else { v })
+            .collect();
+        solver.reset();
+        solver.add_clause(block.iter().copied());
+        new_blocks.push(block);
 
         // Got a valid (W,Z) pair — proceed to XY
         metrics
