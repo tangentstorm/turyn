@@ -130,9 +130,15 @@ comparator-config.json    -- comparator configuration
 
 The headline names live in the `Turyn.Result` namespace and are:
 
-- `Turyn.Result.tt_to_hadamard`
-- `Turyn.Result.canonical_form_exists`
-- `Turyn.Result.xy_product_law`
+- `Turyn.Result.tt_implies_hadamard` —
+  if a TT(n) exists, a Hadamard matrix of order `4 (3 n − 1)` exists.
+- `Turyn.Result.canonical_form_exists` —
+  every TT(n) is equivalent to a representative in canonical form
+  (existence half of the BDKR result; uniqueness within the orbit is not
+  yet formalized).
+- `Turyn.Result.xy_interior_antipalindrome` —
+  for a canonical TT(n) of length `n ≥ 4`, `uAt S (n + 1 − k) = − uAt S k`
+  for every `2 ≤ k ≤ n − 1` (the BDKR XY product law).
 
 Run comparator from the `lean/` directory after installing `landrun` and
 `lean4export` (see the comparator README) with:

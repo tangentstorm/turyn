@@ -1,18 +1,19 @@
 import Turyn.Hadamard
 
 /-!
-# Proof: TT → Hadamard pipeline
+# Proof: TT(n) ⇒ Hadamard
 
-`Turyn.Result.tt_to_hadamard` is `Turyn.turynToHadamardMatrix_isHadamard`,
-the existing Lean proof from `Turyn/Hadamard.lean`. This file re-exposes it
-under the `Turyn.Result` namespace so that comparator can compare it against
+`Turyn.Result.tt_implies_hadamard` packages the constructive
+`ofIsTurynTypeMatrix` / `ofIsTurynTypeMatrix_isHadamard` pair from
+`Turyn/Hadamard.lean` into the existence form expected by
 `Results.lean`.
 -/
 
 namespace Turyn.Result
 
-theorem tt_to_hadamard {n : Nat} (T : TurynType n) :
-    IsHadamardMat (turynToHadamardMatrix T) :=
-  Turyn.turynToHadamardMatrix_isHadamard T
+theorem tt_implies_hadamard {n : Nat} {x y z w : PmSeq}
+    (h : IsTurynType n x y z w) :
+    ∃ H : IntMat (4 * (3 * n - 1)), IsHadamardMat H :=
+  ⟨Turyn.ofIsTurynTypeMatrix h, Turyn.ofIsTurynTypeMatrix_isHadamard h⟩
 
 end Turyn.Result
