@@ -5,6 +5,30 @@ The long-term target is TT(56) — finding it would let us construct a
 Hadamard matrix of order 668. Do not optimize for a single proxy counter
 unless you can explain why that counter should move TTC.
 
+## TL;DR for the next agent
+
+The acceptance bar is **0.2 % real movement**.  How to detect it:
+
+1. Build before / after binaries side-by-side.
+2. Run both at `--threads=1 --seed=0` with a small `--bench-cover-log2`
+   (e.g. `38` for n=26 wz=together mdd-k=7) so the run completes on
+   cover target, not on `--sat-secs`.
+3. Diff the relevant counters (`flow_xy_solves`, `flow_xy_decisions`,
+   `flow_xy_root_forced`, `flow_z_propagations`, ...).  Counter
+   totals are **bit-exact** across reruns of one binary, so any
+   non-zero delta between binaries is real signal.
+4. **Accept if the predicted counter moved ≥ 0.2 %** in the predicted
+   direction.
+
+`--sat-secs=N` is just a safety cap; it doesn't fire when the cover
+target is reached first, and you can omit it (default 0 = unlimited).
+Pass it only if you want a wall-clock ceiling.
+
+The full Acceptance Bar section below covers fallbacks for changes
+whose mechanism isn't a counter movement (regime B = paired
+wall-clock, ~1 % floor), and multi-thread TTC (regime C, ~2 %
+floor due to cancel-race).
+
 ## First Read
 
 Before changing code, read:
@@ -53,34 +77,50 @@ This means "cover about `2^X` raw-equivalent configurations." The search
 should print SAT solutions if it finds them, but it must keep going
 until the fixed coverage target is reached.
 
-### Primary harness: Criterion fixed-work
+### Primary workflow: counter mode at --threads=1 --seed=0
+
+This is the recommended workflow for >95 % of changes — see the
+Acceptance Bar section below for why it dominates the older Criterion
+flow.  Single-binary canonical command:
+
+```text
+target/release/turyn search --n=26 --wz=together --mdd-k=7 \
+  --bench-cover-log2=38 --seed=0 --threads=1
+```
+
+For paired before/after comparison, build both binaries side-by-side
+and diff the counter totals from a `grep -E "stage_exit|flow XY|flow Z"`
+of each.  Counter totals are bit-exact across reruns of the same binary.
+
+Pick `--bench-cover-log2` small enough that the run completes on cover
+target, not on `--sat-secs`.  Rough guidance for n=26 wz=together
+mdd-k=7 single-thread: `38` is ~1 minute, `40` is ~4 minutes,
+`42`+ runs into the wall-clock cap (`--sat-secs`).  Smaller for
+sync mode and apart mode where the per-XY cost is lower.
+
+### Secondary harness: Criterion fixed-work (legacy)
 
 ```text
 cargo bench --bench fixed_work_criterion -- --turyn-n=26 --turyn-wz=together --turyn-mdd-k=7 --turyn-cover-log2=34
 ```
 
-Useful variants:
+Criterion gives wall-clock confidence intervals out of the box, but
+its sample CV on a typical 4-CPU shared rig is **~5–10 %**, so it
+cannot detect 0.2 % effects on its own.  Keep this harness for
+cross-checking large effects (`≥ 5 %`) or for measuring parallel
+scaling at `--threads>1`.  For everything else, prefer counter mode.
 
-```text
-cargo bench --bench fixed_work_criterion -- --turyn-n=26 --turyn-wz=apart --turyn-mdd-k=7 --turyn-cover-log2=34
-cargo bench --bench fixed_work_criterion -- --turyn-n=56 --turyn-wz=apart --turyn-mdd-k=10 --turyn-cover-log2=34 --turyn-sat-secs=120
-cargo bench --bench fixed_work_criterion -- --turyn-n=56 --turyn-wz=sync --turyn-cover-log2=34 --turyn-sat-secs=120
-```
+### Tuning `--bench-cover-log2`
 
-Criterion gives confidence intervals out of the box. The acceptance bar
-below requires CIs that clear zero; do not try to substitute "5-run mean"
-arithmetic on a divan run.
+Adjust so samples cover the predicted code path but don't cap on
+`--sat-secs`.
 
-#### Tuning `--turyn-cover-log2`
-
-Adjust so samples take long enough to measure but short enough to repeat.
-
-- If a sample is sub-second or saturated (no signal), **raise**
-  `cover-log2` by 4 and rerun.
-- If samples take too long to iterate, **lower** `cover-log2` by 2.
-- If Criterion still reports a CI wider than ±20 % of the median after
-  `cover-log2 ≥ 38`, raise `n` (n=26 → n=56) or lower `mdd-k` instead —
-  the bench is saturating early and there's no signal to extract.
+- For counter mode (regime A, primary): the smallest cover-log2 that
+  exercises the code path you care about is best.  Smaller =
+  faster sample = faster iteration.
+- For wall-clock paired (regime B, fallback): raise cover-log2 until
+  per-sample wall-clock is 30+ s, so cold-start overhead is < 5 % of
+  the sample.
 
 ### Secondary harnesses (rate proxies — never decide on these alone)
 
@@ -129,21 +169,15 @@ solves per boundary is a TTC win even at lower xy/s, and the legacy
 
 6. **Re-run the same fixed-work benchmark.**
 
-7. **Decide:**
-
-   - Accept only if the change has a statistically credible
-     improvement on the fixed-work benchmark **and** the moved
-     counters match the stated mechanism. CIs should not overlap.
-   - Treat anything around 1 % as real only if repeated/interleaved
-     runs support it. Single-run 1 % wins are noise.
-   - Reject or keep iterating if the change only improves a proxy
-     counter but does not improve fixed-work coverage time.
-   - **Beware of metric-change traps.** If you find yourself
-     rejecting because xy/s went down, stop and check whether it
-     pulled the *denominator* lever instead — fewer solves per
-     boundary is a TTC win at lower xy/s. The "boundaries/s
-     paradigm shift" notes in `IDEAS.md` exist because we kept
-     making this mistake.
+7. **Decide using the Acceptance Bar below.**  The headline target
+   is 0.2 % real movement.  Run the change in regime A (counter
+   mode at `--threads=1 --seed=0`) first — that's the cheapest path
+   to a verdict for almost every change.  Only fall back to regime
+   B (paired wall-clock) for changes that genuinely cannot move a
+   counter.  The "Beware of metric-change traps" bullet still
+   applies: if you find yourself rejecting because xy/s went down,
+   stop and check whether the change pulled the *denominator* lever
+   instead — fewer solves per boundary is a TTC win at lower xy/s.
 
 8. **Update `IDEAS.md`:**
 
@@ -242,8 +276,6 @@ a fixed-work boundary.  Compare per-node *ratios*
 
 When evaluating a change, report at least one of:
 
-When evaluating a change, report at least one of:
-
 - a counter ratio that the change is supposed to move
   (e.g. `flow_xy_decisions / flow_xy_solves`,
   `flow_xy_root_forced / flow_xy_solves`,
@@ -251,8 +283,8 @@ When evaluating a change, report at least one of:
 - a counter total at fixed-work coverage stop (e.g. `flow_xy_solves`
   at `bench-cover-log2 = 40`).
 
-Both should be measured at `--seed=0` (or any other fixed seed) on
-both the before and after binaries.
+Both should be measured at `--seed=0 --threads=1` on both the before
+and after binaries.
 
 ### Counter mode (preferred — uses --threads=1 --seed=0)
 
