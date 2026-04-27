@@ -9,28 +9,28 @@ main theorem in this file proves that these base sequences satisfy the required
 combined aperiodic autocorrelation identity.
 -/
 
-/-- A typed Turyn quadruple TT(n). -/
+/-- A typed Turyn quadruple TT(n).  Field names follow BDKR (X, Y, Z, W). -/
 structure TurynType (n : Nat) where
-  x : PmSeq n
-  y : PmSeq n
-  z : PmSeq n
-  w : PmSeq (n - 1)
+  X : PmSeq n
+  Y : PmSeq n
+  Z : PmSeq n
+  W : PmSeq (n - 1)
   vanishing : ∀ s : Nat, 1 ≤ s → s < n →
-    combinedAutocorr x.data y.data z.data w.data s = 0
+    combinedAutocorr X.data Y.data Z.data W.data s = 0
 
 /-- Convert an existing propositional TT witness into the typed wrapper. -/
 def IsTurynTypeProp.toTyped {n : Nat} {x y z w : List Int}
     (h : IsTurynTypeProp n x y z w) : TurynType n :=
-  { x := ⟨x, h.x_len, h.x_pm⟩
-    y := ⟨y, h.y_len, h.y_pm⟩
-    z := ⟨z, h.z_len, h.z_pm⟩
-    w := ⟨w, h.w_len, h.w_pm⟩
+  { X := ⟨x, h.x_len, h.x_pm⟩
+    Y := ⟨y, h.y_len, h.y_pm⟩
+    Z := ⟨z, h.z_len, h.z_pm⟩
+    W := ⟨w, h.w_len, h.w_pm⟩
     vanishing := h.vanishing }
 
 /-- Convert a typed `IsTurynType` certificate into the bundled `TurynType`. -/
 def IsTurynType.toTyped {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
     (h : IsTurynType X Y Z W) : TurynType n :=
-  { x := X, y := Y, z := Z, w := W, vanishing := h.vanishing }
+  { X := X, Y := Y, Z := Z, W := W, vanishing := h.vanishing }
 
 /-- Negate every entry in a sequence. -/
 def negSeq (a : List Int) : List Int := a.map (fun x => -x)
@@ -210,14 +210,14 @@ theorem base_seq_vanishing_prop {n : Nat} {x y z w : List Int}
 
 /-- Step 1 interface: every typed Turyn quadruple yields typed base sequences. -/
 def step1 {n : Nat} (T : TurynType n) : BaseSeqData n :=
-  { a := ⟨T.z.data ++ T.w.data,
-         by simp [T.z.len, T.w.len]; omega,
-         AllPmOne_append T.z.pm T.w.pm⟩
-    b := ⟨T.z.data ++ negSeq T.w.data,
-         by simp [negSeq_length_eq, T.z.len, T.w.len]; omega,
-         AllPmOne_append T.z.pm (AllPmOne_negSeq T.w.pm)⟩
-    c := T.x
-    d := T.y
+  { a := ⟨T.Z.data ++ T.W.data,
+         by simp [T.Z.len, T.W.len]; omega,
+         AllPmOne_append T.Z.pm T.W.pm⟩
+    b := ⟨T.Z.data ++ negSeq T.W.data,
+         by simp [negSeq_length_eq, T.Z.len, T.W.len]; omega,
+         AllPmOne_append T.Z.pm (AllPmOne_negSeq T.W.pm)⟩
+    c := T.X
+    d := T.Y
     vanishing := by
       intro s hs
       rw [concat_neg_autocorr_sum]
@@ -226,8 +226,8 @@ def step1 {n : Nat} (T : TurynType n) : BaseSeqData n :=
         unfold combinedAutocorr at this
         linarith
       · simp only [not_lt] at hsn
-        rw [aperiodicAutocorr_zero_of_ge' T.z.data s (by rw [T.z.len]; omega),
-            aperiodicAutocorr_zero_of_ge' T.w.data s (by rw [T.w.len]; omega),
-            aperiodicAutocorr_zero_of_ge' T.x.data s (by rw [T.x.len]; omega),
-            aperiodicAutocorr_zero_of_ge' T.y.data s (by rw [T.y.len]; omega)]
+        rw [aperiodicAutocorr_zero_of_ge' T.Z.data s (by rw [T.Z.len]; omega),
+            aperiodicAutocorr_zero_of_ge' T.W.data s (by rw [T.W.len]; omega),
+            aperiodicAutocorr_zero_of_ge' T.X.data s (by rw [T.X.len]; omega),
+            aperiodicAutocorr_zero_of_ge' T.Y.data s (by rw [T.Y.len]; omega)]
         ring }
