@@ -2,6 +2,167 @@
 
 This file tracks performance-oriented changes and their measured impact.
 
+## April 27 2026 — U1b: O(1) `propagations_by_kind_totals` via running column-sum cache (-67 % TTC on `--wz=sync`)
+
+Follow-up to the U1 entry below. The batched
+`propagations_by_kind_totals()` still iterated the full
+`prop_by_kind_level` matrix on every call. Backbone preprocessing
+(`Solver::backbone_scan`) creates many decision levels at startup,
+and each `new_decision_level()` pushes a row that's never popped
+— so after backbone + a deep walker descent
+`prop_by_kind_level.len()` is in the hundreds. Sync calls
+`propagations_by_kind_totals()` twice per accepted candidate
+(~12 k accepted/s/worker), so the per-call O(rows × COUNT) cost
+was still substantial.
+
+Add a `prop_by_kind_total_cache: [u64; PropKind::COUNT]` field to
+`Solver`, incremented in the existing `enqueue` propagator-counter
+path. `propagations_by_kind_totals()` now returns the cache by
+value (`#[derive(Copy)]`-style): O(1). Backtrack does not modify
+the cache, which matches the existing "counts accumulate across
+backtracks" contract on `prop_by_kind_level`.
+
+### Benchmark: `--wz=sync` n=22 sat-secs=30 on 4 workers
+
+5 sequential runs each side, idle box, no other CPU contention.
+
+| Metric                          | Post-U1 (5-run mean) | Post-U1b (5-run mean) | Δ |
+|---------------------------------|----------------------|-----------------------|---|
+| nodes (aggregate, 30 s)         | 357 k                | **7.39 M**            | **+1970 % (≈21×)** |
+| per-feature forcing total       | 84 k                 | 1.33 M                | +1480 % |
+| coverage product `∏ cov(L)`     | 6.16e-5              | **1.50e-4**           | **+143 %** |
+| direct TTC parallel             | 4.87e5 s             | **2.0e5 s**           | **−59 %** |
+| TTC_parallel projection         | 3.0e6 s              | 9.0e5 s               | −70 % |
+
+Cumulative session delta (from pre-U1 baseline 6.13e5 s direct
+TTC parallel): **−67 %**.
+
+### TT(18) wall-clock smoke test (4 workers, 3 runs each)
+
+| Stage    | mean time-to-first-leaf | spread |
+|----------|--------------------------|--------|
+| Pre-U1   | ~73 s (single sample)    | —     |
+| Post-U1  | 73.3 s (3 runs)          | 70.4 – 77.4 s |
+| Post-U1b | **1.91 s (3 runs)**      | 1.84 – 2.06 s |
+
+A 38× speedup at TT(18) means the walker is now fast enough for
+small-n correctness sweeps in seconds, not minutes.
+
+### TTC mechanism
+
+**Rate.** No counter that gates pruning moved — `cap_rejects /
+node`, `tuple_rejects / node`, and `sat_unsat / node` all stay at
+the post-U1 ratios. The walker simply does the same per-node
+work in less time because the per-frame telemetry is now O(1)
+per accepted candidate instead of O(decision_levels × COUNT).
+
+### Counters that moved
+
+- `nodes_visited` and `nodes/s`: ≈21×
+- coverage_product `∏ cov(L)`: +143 %
+- direct TTC = elapsed / coverage_product: −59 % vs U1
+- per-level pruning ratios (`cap_rejects/node`, etc.): flat
+
+### Correctness validation
+
+- TT(18) `--wz=sync --sat-secs=30` (3 runs): solves at 1.84 / 1.83
+  / 2.06 s with `leaves=1`, `max_lvl=18`. Matches the leaf the
+  pre-U1b walker found, just much faster.
+- `cargo test --release --bin turyn -- --skip outfix --skip
+  mdd_live_run --skip mdd_together_live_run`: 92/92 (3 mdd-9-
+  dependent + 3 framework live tests skipped per
+  TICK-PROMPT.md).
+- `cargo test --release -p radical`: 0/0.
+
+### Cumulative TTC trajectory (this session, 4-worker box)
+
+| Stage                  | direct TTC parallel | Δ vs session baseline |
+|------------------------|---------------------|-----------------------|
+| Session baseline       | 6.13e5 s            | —                     |
+| + U1                   | 4.87e5 s            | −20.4 %               |
+| + U1b                  | **2.0e5 s**         | **−67.4 %**           |
+
+This entry is the second in the U-series. The April-19 R-series
+got n=26 sync to 4.40e6 s (parallel) on a 16-thread machine; on
+this 4-thread box, n=26 sync now sits at ~9.2e6 s direct TTC
+post-U1b — within ~2× of the 16-thread baseline despite running
+on a quarter of the cores.
+
+## April 27 2026 — U1: batched `propagations_by_kind_totals` for sync per-frame telemetry (-20 % TTC on `--wz=sync`)
+
+`src/sync_walker.rs::dfs_body`, around the `push_assume_frame` call,
+captured per-feature SAT-propagation deltas by calling
+`solver.propagations_by_kind(kind)` once per `PropKind` variant
+(7 kinds), both before and after the push — i.e. **14 calls per
+accepted candidate, each iterating the full `prop_by_kind_level`
+matrix to sum a single column**. With the matrix growing to
+~22 rows at deep walker frames, the telemetry alone cost
+`14 × 22 × 7 ≈ 2150 reads per accepted candidate`, ~6×
+amplification of useful per-candidate work that lives downstream
+of those reads.
+
+Replaced with a new `Solver::propagations_by_kind_totals() ->
+[u64; PropKind::COUNT]` API that does **one pass** over the matrix
+and returns every column sum. Sync's pre/post telemetry now reads
+all kinds in 2 batched calls rather than 14 column-loop calls.
+
+### Benchmark: `--wz=sync` n=22 sat-secs=30 on 4 workers
+
+Three sequential runs each side, idle box, no other CPU contention.
+
+| Metric                            | Baseline (3-run mean) | After U1 (3-run mean) | Δ |
+|-----------------------------------|-----------------------|-----------------------|---|
+| nodes (aggregate, 30 s)           | 208 k                 | 357 k                 | **+71 %** |
+| nodes/s (aggregate)               | 6 950                 | 11 855                | **+71 %** |
+| `cumulative root-coverage (∏ cov)` | 4.90e-5              | 6.16e-5               | +25.7 % |
+| direct TTC (= elapsed / coverage) | 6.13e5 s (parallel)   | **4.87e5 s (parallel)** | **−20.4 %** |
+
+Per-feature forcing breakdown matches the baseline shape (clause
+~84 %, quadpb ~14 %, pbseteq ~2 %), so the batched API agrees
+with the per-kind one (sanity).
+
+### TTC mechanism
+
+**Rate.** No counter that gates pruning moved — `cap_rejects /
+node`, `tuple_rejects / node`, and `sat_unsat / node` all stay at
+their baseline ratios. The walker simply does the same per-node
+work in less time because the telemetry stopped re-summing the
+matrix six times per kind. With more nodes/s, the per-level
+coverage product compounds further (level 18 went from 9.99 to
+10.10 b_eff; same shape, just more samples).
+
+### Counters that moved
+
+- `nodes_visited` and `nodes/s`: +71 %
+- `coverage_product = ∏ cov(L)`: +25.7 %
+- `direct TTC = elapsed / coverage_product`: −20.4 %
+- `cap_rejects / node`, `tuple_rejects / node`, `sat_unsat / node`:
+  flat (within 0.5 %)
+- per-level `b_eff` shape: identical (random-shuffle ordering
+  unchanged)
+
+### Correctness validation
+
+- TT(18) `--wz=sync --sat-secs=120`: solves at 79.6 s
+  (`found_solution=true`, `leaves=1`, `max_lvl=18`). Baseline
+  on this 4-CPU box is also above the 60 s smoke window, so this
+  is parity not regression.
+- `cargo test --release --bin turyn -- --skip outfix --skip
+  mdd_live_run --skip mdd_together_live_run`: 92 passed, 0 failed
+  (3 mdd-9-dependent tests skipped, see TICK-PROMPT.md).
+- `cargo test --release -p radical`: 0 tests, 0 failures.
+
+### Cumulative TTC trajectory at sync n=22 (4 workers, this box)
+
+| Stage                  | direct TTC parallel | Δ vs session baseline |
+|------------------------|---------------------|-----------------------|
+| Session baseline       | 6.13e5 s            | —                     |
+| + U1                   | **4.87e5 s**        | **−20.4 %**           |
+
+(The April-19 session's headline of −99.3 % was measured on a
+16-thread machine at n=26; not directly comparable. Within this
+session: the U1 commit is the first measured win.)
+
 ## April 25 2026 — multi-tuple XY MDD walk in `process_boundary` (-21 % fixed-work, mdd-mode boundary stage)
 
 `src/mdd_pipeline.rs::process_boundary` previously called

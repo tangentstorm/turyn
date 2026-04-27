@@ -826,6 +826,13 @@ pub struct Solver {
     /// Accumulates across backtracks — counts are "total propagations
     /// that ever happened at level L by kind K" over the solver's lifetime.
     prop_by_kind_level: Vec<[u64; PropKind::COUNT]>,
+    /// U1b: running column sums of `prop_by_kind_level`, kept up to
+    /// date in `enqueue`. `propagations_by_kind_totals` reads this
+    /// directly instead of summing the 2-D matrix on every call.
+    /// Same lifetime semantics as `prop_by_kind_level`: write-only
+    /// across backtracks (the per-level matrix isn't decremented
+    /// either, so column sums stay valid).
+    prop_by_kind_total_cache: [u64; PropKind::COUNT],
 
     // propagate_only stats
     last_nogood_len: usize,
@@ -928,6 +935,7 @@ impl Solver {
             decisions: 0,
             propagations: 0,
             prop_by_kind_level: vec![[0; PropKind::COUNT]],
+            prop_by_kind_total_cache: [0; PropKind::COUNT],
             last_nogood_len: 0,
             last_full_nogood_len: 0,
             last_learnt_clause: None,
@@ -2443,6 +2451,19 @@ impl Solver {
         let k = kind as usize;
         self.prop_by_kind_level.iter().map(|row| row[k]).sum()
     }
+    /// Per-propagator forced-variable counts as a single batched read,
+    /// returning every column sum in one pass over `prop_by_kind_level`.
+    /// Equivalent to calling `propagations_by_kind` for every variant of
+    /// `PropKind` but iterates the 2-D matrix exactly once instead of
+    /// `COUNT` times — useful for the sync walker's per-frame telemetry
+    /// hot path which reads pre/post deltas across all kinds.
+    pub fn propagations_by_kind_totals(&self) -> [u64; PropKind::COUNT] {
+        // U1b: O(1) read of the running column-sum cache maintained
+        // by `enqueue`. Equivalent to summing every row of
+        // `prop_by_kind_level`, which the previous implementation
+        // had to do on every call.
+        self.prop_by_kind_total_cache
+    }
     /// Per-`[decision_level][PropKind]` forced-variable counts.
     /// `result[L][K]` is the total number of times propagator `K` forced
     /// a literal while the solver was at decision level `L`. Reading
@@ -3640,6 +3661,8 @@ impl Solver {
             self.propagations += 1;
             let lvl = self.decision_level() as usize;
             self.prop_by_kind_level[lvl][kind as usize] += 1;
+            // U1b: keep the column-sum cache in sync with the matrix.
+            self.prop_by_kind_total_cache[kind as usize] += 1;
         }
     }
 

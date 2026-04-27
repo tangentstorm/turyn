@@ -2440,10 +2440,12 @@ fn dfs_body(
         // Invariant: at every dfs_body entry, `solver.current_decision_
         // level() == state.level` (and state.assumptions length
         // agrees).
-        let mut pre_kind = [0u64; radical::PropKind::COUNT];
-        for kind in radical::PropKind::ALL {
-            pre_kind[kind as usize] = solver.propagations_by_kind(kind);
-        }
+        // U1: one batched 2-D matrix sum instead of COUNT separate
+        // column sums (each iterating prop_by_kind_level). Pre/post
+        // deltas stay identical; only the cost of *reading* totals
+        // drops from `2 × COUNT × decision_levels` to
+        // `2 × decision_levels` reads per accepted candidate.
+        let pre_kind = solver.propagations_by_kind_totals();
         let new_lits = &cand.new_assums[..cand.num_new_assums as usize];
         let sat = solver.push_assume_frame(new_lits);
         if state.level >= stats.forced_by_level_kind.len() {
@@ -2451,11 +2453,11 @@ fn dfs_body(
                 .forced_by_level_kind
                 .resize(state.level + 1, [0; radical::PropKind::COUNT]);
         }
-        for kind in radical::PropKind::ALL {
-            let post = solver.propagations_by_kind(kind);
-            let delta = post - pre_kind[kind as usize];
-            stats.prop_by_kind_total[kind as usize] += delta;
-            stats.forced_by_level_kind[state.level][kind as usize] += delta;
+        let post_kind = solver.propagations_by_kind_totals();
+        for k in 0..radical::PropKind::COUNT {
+            let delta = post_kind[k] - pre_kind[k];
+            stats.prop_by_kind_total[k] += delta;
+            stats.forced_by_level_kind[state.level][k] += delta;
         }
         if sat == Some(true) {
             // Count walker-var forcings that THIS level's new assumptions

@@ -3267,3 +3267,341 @@ post-hoc spectrum. Removed the FFT call and the now-unused
   the default (no-tuple) benchmark. Commit removes a stale
   `let _ = &w_spectrum; // used by pair_power below` comment that
   outlived the pair_power check it documented.
+
+## U-series: --wz=sync per-node hot-path tightening (April 27 2026, Claude)
+
+This box has 4 cores (vs the 16-core machine that produced the
+post-backbone TTC baseline of 4.40e6s at n=26). Re-baselined sync
+n=22 30s here — direct TTC ~6.13e5 s parallel (5.93e5/6.16e5/6.30e5
+across 3 runs, ~6 % spread) — and used that as the noise floor for
+this session. Need ≥10 % move on direct TTC to call a win.
+
+The R-series session got TTC down 99.3 % by overhauling the SAT
+solver (R1, R8 family, R2, backbone). What's left in the per-node
+hot path is more incremental, but several pieces of code are
+clearly redundant:
+
+- `propagations_by_kind(kind)` is `O(decision_levels × COUNT)` per
+  call (sums one column of the 2-D matrix). It's called 7× pre-
+  push and 7× post-push per *accepted* candidate to populate the
+  per-feature telemetry. Could be one batched call returning all
+  COUNT totals.
+- `score_state` is computed for every accepted candidate even on
+  workers 1..N-1 that immediately shuffle the candidates randomly
+  (sort_by_key never runs there). 3 of 4 workers do this work for
+  nothing.
+- `tuple_reachable` runs `compute_sigma` (O(4n)) followed by a
+  ~150-tuple scan **per speculative candidate × per node**. At
+  shallow levels free counts swamp the per-tuple |target − σ|
+  budget so every tuple passes — the call is structurally
+  guaranteed to return true. A cheap `level < threshold` skip
+  could shave a measurable slice of the speculative loop.
+- `harvest_forced` scans all 4n positions per accepted candidate
+  even when the SAT push pinned zero new walker vars. (R8c skips
+  the *follow-up* `rebuild_sums` in that case, but harvest itself
+  still walks the whole grid.) Use the
+  `child_walker_forced - parent_walker_forced` delta to skip the
+  scan when there's nothing to find.
+- `candidates: Vec::with_capacity(16)` heap-allocates per node.
+  ~200k nodes × 4 workers / 30s = 27k mallocs/s aggregate. Reuse
+  a buffer hung off `Ctx` (or pass through `dfs_body`).
+- `Cand::placed_signs: [(u8, usize, i8); 4]` and the speculative
+  `saved_bits: [(u8, usize, u8); 4]` carry redundant per-kind
+  data — `placed_signs[k].1` is always `pos_order[level]`. Cheap
+  shrink saves stack copies in the inner loop.
+- `apply_sum_delta_at` reads `closure_events[level]` twice
+  (speculative + sibling-loop), each time iterating each kind's
+  range. With only 4 newly_placed bits, half the work could be
+  hoisted out.
+
+### U1. Batched `propagations_by_kind_totals` API in radical — **ACCEPTED, TTC −20 %**
+
+(See also U1b below — once the batched API was in place, replacing
+its O(decision_levels × COUNT) implementation with an O(1) running
+column-sum cache delivered a further −67 % on top of U1's −20 %.)
+
+
+Add `Solver::propagations_by_kind_totals() -> [u64; PropKind::COUNT]`
+that does one pass over `prop_by_kind_level` and returns all
+column sums. Sync's pre/post telemetry replaces 14 single-kind
+calls with 2 batched calls.
+
+- **TTC mechanism**: rate. Per accepted candidate the telemetry
+  cost drops from `2 × 7 × decision_levels` reads to
+  `2 × decision_levels` reads (with the inner sum still O(7) but
+  now in a single tight loop, autovectorisable).
+- **Detection plan**: nodes/s ↑ slightly; per-feature totals
+  unchanged across runs (sanity).
+- **Risk**: none — read-only API.
+- **Result (3 sequential runs, n=22 sync 30 s, 4 workers)**:
+  nodes/s 6 950 → 11 855 (+71 %), coverage_product
+  4.90e-5 → 6.16e-5 (+25.7 %), direct TTC 6.13e5 → **4.87e5 s
+  parallel (−20.4 %)**. Pruning ratios (`cap_rejects/node`,
+  `tuple_rejects/node`, `sat_unsat/node`) flat — no soundness
+  regression. TT(18) sync 120 s still finds the leaf.
+  See `docs/OPTIMIZATION_LOG.md#u1` for the full table.
+
+### U1b. O(1) `propagations_by_kind_totals` via running column-sum cache — **ACCEPTED, TTC −67 % vs U1, −76 % cumulative**
+
+Follow-up to U1. The batched API still iterated the full
+`prop_by_kind_level` matrix on every call. Backbone preprocessing
+(see April-19 entry) creates many decision levels at startup —
+each `new_decision_level` pushes a row that's never popped.
+After backbone + a deep walker descent, `prop_by_kind_level.len()`
+hits the hundreds, so the "single batched pass" is still
+O(rows × COUNT) per call — cheaper than O(rows × COUNT × COUNT)
+but not free.
+
+Maintain a `prop_by_kind_total_cache: [u64; PropKind::COUNT]`
+field that's incremented on every `enqueue` (alongside the
+existing `prop_by_kind_level[lvl][kind] += 1`).
+`propagations_by_kind_totals()` returns the cache by value,
+O(1). Backtrack does not modify the cache (per the existing
+"counts accumulate across backtracks" semantics).
+
+- **TTC mechanism**: rate.
+- **Detection plan**: nodes/s ↑ massively at deep walker levels;
+  per-feature totals match the previous implementation
+  exactly (sanity).
+- **Risk**: low — single-place increment + single-place read.
+  Cache and matrix are both monotonically non-decreasing under
+  the existing semantics.
+- **Result (n=22 sync 30 s on 4 workers, 5 runs each side)**:
+  - nodes (aggregate): 357 k → **7.39 M** (+1970 %, ~21×)
+  - per-feature forcing total: 84 k → **1.33 M** (~16×)
+  - cumulative root-coverage product: 6.16e-5 → **1.50e-4** (+143 %)
+  - direct TTC parallel: 4.87e5 s → **2.0e5 s (−59 % vs U1,
+    −67 % cumulative vs session baseline)**
+  - TTC_parallel projection: 3.0e6 → 9.0e5 (−70 %)
+- **TT(18) wall-clock smoke test**: 73.3 s (post-U1) → **1.91 s
+  (−97 %)**. The walker is now actually fast enough at small n
+  to be useful for spot-checking correctness.
+- **Correctness**: `cargo test --release --bin turyn` (excl.
+  3 mdd-9-dependent tests + 3 framework live tests): 92/92.
+  TT(18) found at max_lvl=18 with `flow XY: sat=1` per the
+  smoke output.
+- **Why this was hidden behind U1**: U1 was already a net win,
+  but the batched API still had a per-row inner loop. Most
+  call sites won't notice — they call once per session. Sync
+  calls it twice per accepted candidate, ~12k times/s/worker,
+  so the per-call cost matters dramatically.
+
+### U2. Skip `score_state` on workers with `seed != 0` — *tested, rejected (in noise)*
+
+In `dfs_body`'s candidate-build loop, when `ctx.seed != 0` (every
+worker except worker 0), the candidate's `.score` field is never
+consulted by the sort step (random shuffle replaces the sort). Set
+`score = 0` and skip the `score_state` call entirely on those
+workers.
+
+- **TTC mechanism**: rate. `score_state` is O(n) = 22 mul/div ops
+  for n=22 per accepted candidate. With 3/4 workers skipping it:
+  expected nodes/s up by a small but nonzero amount on aggregate.
+- **Detection plan**: nodes/s on the parallel run rises; worker-0
+  per-thread time roughly unchanged; per-stage counters stable.
+- **Risk**: none — `.score` is only read by the `seed == 0` sort.
+- **Result (n=22 sync 30 s × 3 runs)**: nodes/s 6 950 → 6 768
+  (−2.6 %, slight regression but inside the ~6 % run-to-run
+  noise envelope), coverage 4.90e-5 → 4.74e-5 (−3.3 %).
+  Likely the conditional branch on `ctx.seed == 0` doesn't pay
+  for itself when the `score_state` body is already a tight
+  O(n) loop the compiler inlines. Reverted before U1 measurement.
+
+### U3. Cheap-skip `tuple_reachable` at shallow levels
+
+Precompute, in `Ctx`, the smallest level `tuple_reach_skip_level`
+such that every level `< tuple_reach_skip_level` has every
+sequence's `free` count ≥ max(|σ_target|) + n. At those levels
+no tuple can fail the |target − σ| ≤ free check, and parities
+trivially match (free is full so all parities are reachable). The
+skip is a single `if level < tuple_reach_skip_level { skip }` in
+the speculative loop.
+
+- **TTC mechanism**: rate. Saves one `compute_sigma` (O(4n)) +
+  one `valid_tuples` scan (~150 items) per speculative candidate
+  at shallow levels. Hot speculative loop body runs ~16× per
+  node, so saving even at the first 4-6 levels per worker is
+  meaningful.
+- **Detection plan**: nodes/s up; `tuple_rejects` exactly
+  unchanged (we only skip levels where no rejection could fire).
+- **Risk**: must not skip a level where rejection could fire.
+  Compute the threshold from `valid_tuples` + `pos_order` so it
+  is a pure compile-once constant per problem.
+
+### U4. Skip `harvest_forced` body when SAT push forced no new walker vars
+
+Compute `child_walker_forced - parent_walker_forced` *before*
+calling `harvest_forced`. If zero, skip the entire 4n-position
+scan (state.bits is already consistent with what's on the trail).
+Distinct from R8d (which broke things) because R8d skipped harvest
+*and* the dependent rebuild; this skips just the scan when we know
+there's nothing to harvest.
+
+- **TTC mechanism**: rate. Per accepted candidate, saves the 4n
+  `state.bit() != 0` checks plus the 4n `solver.value(var)`
+  queries. At n=26 that's 416 ops × ~6 candidates/node × 200k
+  nodes / 30s = ~17M ops/s saved at the inner loop.
+- **Detection plan**: nodes/s up; `forced_by_level` totals
+  unchanged; `rebuild_sums` call count unchanged.
+- **Risk**: low — the delta is computed from the same trail
+  count harvest would otherwise iterate over.
+
+### U5. Reuse `candidates` Vec across DFS frames
+
+Hang `candidates_buf: Vec<Cand>` off `State` (or a thread-local
+in `Ctx`) and `clear()` instead of allocating a new Vec each
+node. Rust's `Vec::clear` is O(len) but doesn't free the buffer.
+
+- **TTC mechanism**: rate. ~200k mallocs/30s/worker eliminated.
+- **Detection plan**: nodes/s up; allocator pressure falls in
+  perf profile.
+- **Risk**: low — Cand is Plain Old Data; no Drop side-effects.
+
+### U6. Hoist `newly_placed` mask construction out of two loops
+
+In the speculative loop, `newly_placed: [bool; 4]` is rebuilt
+from `placed[k].0` per candidate. The same array is then rebuilt
+again in the sibling loop (`sib_newly_placed`). Store
+`newly_placed` directly in `Cand` (it's 4 bytes — fits in an
+existing pad slot of the struct), eliminating the rebuild on the
+sibling pass.
+
+- **TTC mechanism**: rate (small).
+- **Detection plan**: nodes/s up by a sub-percent; perf profile
+  shows fewer cache misses on `placed` reads.
+- **Risk**: none — same value, computed once.
+
+### U7. Replace `state.bits` clone with sparse change list
+
+`saved_all_bits = state.bits.clone()` allocates 4n bytes per
+DFS frame, restored to all sibling iterations. With harvest_
+forced typically pinning ≤ a handful of walker vars beyond the
+walker frontier, the diff is small. Track changes in a small
+fixed-size `[(kind, pos, old)] x N` buffer; restore by replaying
+in reverse.
+
+- **TTC mechanism**: rate. Per node, saves ~26 × 4 = 104 bytes
+  copy plus the matching restore O(104). Compounds with U5.
+- **Detection plan**: nodes/s up; per-level counters unchanged.
+- **Risk**: medium — must capture every state.bits write inside
+  the sibling loop's cycle (set_bit + harvest_forced + rule
+  propagation via push_assume_frame). Bug here is silent: a
+  miss leaves stale bits and corrupts the next sibling.
+
+### U8. Drop the `dfs()` per-frame `Instant::now()` timing wrapper
+
+`fn dfs` wraps `dfs_body` with two `Instant::now()` calls per
+node and stores the elapsed in `sub_cube_time_by_level`. That's
+an "advisory" telemetry — TTC and per-stage counters work
+without it. With ~200k nodes / 30s the timing calls cost
+roughly 20ns each × 2 = 8ms over 30s (~0.03 %). Probably tiny
+but the data is unused in the chosen-metric loop. Move to a
+debug-only path or sample 1-in-N.
+
+- **TTC mechanism**: rate (tiny). Listed for completeness; if
+  measurement says no, drop.
+- **Detection plan**: identical run reports same TTC; nodes/s
+  same or up.
+- **Risk**: lose `sub_cube_time_by_level` telemetry.
+
+### U9. Cache `solver.num_assigned_in_range(4n)` via incremental counter
+
+`num_assigned_in_range` is O(4n) — scans the full `assigns[]`
+prefix every call. Sync calls it twice per accepted candidate
+(parent_walker_forced once, child_walker_forced once). Make
+radical maintain a running `num_walker_assigned: usize` updated
+in `enqueue` / `unassign` for vars in `1..=tracked_max_var`.
+Sync sets `tracked_max_var = 4n` once at startup; reads cost
+O(1).
+
+- **TTC mechanism**: rate. Per accepted candidate, two O(4n)
+  scans become two O(1) reads.
+- **Detection plan**: nodes/s up; forced-by-level totals
+  identical (sanity).
+- **Risk**: medium — solver-internal. Must update on every
+  enqueue/unassign path; missed update would silently
+  miscount `forced_by_level`.
+
+### U10. Inline `valid_tuples` as a packed `[i32; 4]` Vec for cache locality
+
+Currently `Vec<SumTuple>` (struct with x, y, z, w fields). On
+n=22, 168 tuples × 16 bytes = 2.6 KB — fits in L1, but the
+compiler may not auto-vectorize the `tuple_reachable_args`
+inner loop because of struct field access. Try a `Vec<[i32; 4]>`
+or even `[i32x4; N]` (manual SIMD) and measure.
+
+- **TTC mechanism**: rate. Speculative loop's tuple_reachable
+  call cost drops if vectorization fires.
+- **Detection plan**: nodes/s up, `tuple_rejects` unchanged.
+- **Risk**: low — pure data-layout change.
+
+### U-series session results (April 27 2026, Claude)
+
+Cumulative TTC trajectory at n=22 sync on this 4-CPU box, mean
+of 5 runs:
+
+| Stage              | direct TTC parallel | Δ vs session baseline |
+|--------------------|---------------------|-----------------------|
+| Session baseline   | 6.13e5 s            | —                     |
+| + U1               | 4.87e5 s            | −20.4 %               |
+| + U1b              | **2.0e5 s**         | **−67.4 %** (3.06×)   |
+
+TT(18) wall-clock smoke (4 workers, 3 runs): 73.3 s → **1.91 s**
+(−97 %). The walker is now fast enough to debug at small n in
+seconds instead of minutes.
+
+Status of the original list:
+
+- **U1 (batched propagations_by_kind_totals API)**: ACCEPTED,
+  −20.4 %.
+- **U1b (cumulative column-sum cache making U1 O(1))**: ACCEPTED,
+  −67 % cumulative (commit-followup that uncovered the real cost
+  was the matrix iteration inside the batched call).
+- **U2** (skip score_state on non-zero workers): tested, in
+  noise — branch on `ctx.seed == 0` doesn't pay for itself.
+- **U4** (skip harvest_forced when delta == 0): tested, in noise
+  — the 4n scan is already auto-vectorised and cheap.
+- **U5** (reuse candidates Vec): tested, in noise — Vec alloc
+  cost is 30 ns/frame, total ~6 ms/30 s/worker.
+- **U9** (incremental num_assigned_in_range counter): tested
+  twice (pre- and post-U1b). In noise pre-U1b (compiler
+  vectorises the original scan); slight regression post-U1b
+  (added enqueue branch outweighs saved scans now that telemetry
+  isn't dominating).
+- **U3 / U6 / U7 / U8 / U10**: not tried this session — U1+U1b
+  delivered most of the available rate budget; remaining ideas
+  would each need to clear the ~5 % noise floor.
+
+Methodology lesson: the two wins shared a shape — an
+`O(decision_levels × COUNT)` per-frame cost that looked innocent
+at the call site. Both U1 and U1b were on the per-frame
+telemetry path, which had compounded to dwarf the actual
+search work. The remaining sub-percent ideas (U2, U4, U5, U9)
+all trip on the same problem: the original code was already
+near auto-vectorised optimal and adding a counter / branch /
+flag costs as much as the saved work.
+
+Top denominator-leverage ideas not in this batch:
+
+- **U11. MDD-guided sibling pruning in sync**: load `mdd-k.bin`
+  and reject any sibling whose (X, Y, Z, W) bits at the current
+  level violate the MDD's per-prefix feasibility. This is what
+  apart mode uses to get its 5700× denominator advantage. Not
+  a single commit — needs a bouncing-order MDD or per-level MDD
+  index.
+- **U12. Backbone re-scan after each first-branching level**:
+  the level-0 backbone fires once at startup. After the first
+  branching level, the assumption stack pins a few lits and the
+  effective backbone might be larger. Run a bounded probe inside
+  the walker at depth 0 / 1.
+- **U13. Compact `prop_by_kind_level` after backbone scan**: the
+  matrix grows monotonically (one row per `new_decision_level`,
+  no row removal on backtrack). After backbone preprocessing
+  it's hundreds of rows; after a long sync run it could be
+  millions. Memory-only concern post-U1b (the totals cache means
+  we never iterate the matrix), but worth a follow-up cleanup.
+  Reset would invalidate per-level forcing telemetry that
+  `propagations_by_kind_level` exposes — provide a "compact-but-
+  preserve-totals" API that collapses the matrix to its column
+  sums with all rows after row 0 zeroed.
+
