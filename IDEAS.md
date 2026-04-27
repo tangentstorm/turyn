@@ -3316,6 +3316,11 @@ clearly redundant:
 
 ### U1. Batched `propagations_by_kind_totals` API in radical — **ACCEPTED, TTC −20 %**
 
+(See also U1b below — once the batched API was in place, replacing
+its O(decision_levels × COUNT) implementation with an O(1) running
+column-sum cache delivered a further −67 % on top of U1's −20 %.)
+
+
 Add `Solver::propagations_by_kind_totals() -> [u64; PropKind::COUNT]`
 that does one pass over `prop_by_kind_level` and returns all
 column sums. Sync's pre/post telemetry replaces 14 single-kind
@@ -3335,6 +3340,51 @@ calls with 2 batched calls.
   `tuple_rejects/node`, `sat_unsat/node`) flat — no soundness
   regression. TT(18) sync 120 s still finds the leaf.
   See `docs/OPTIMIZATION_LOG.md#u1` for the full table.
+
+### U1b. O(1) `propagations_by_kind_totals` via running column-sum cache — **ACCEPTED, TTC −67 % vs U1, −76 % cumulative**
+
+Follow-up to U1. The batched API still iterated the full
+`prop_by_kind_level` matrix on every call. Backbone preprocessing
+(see April-19 entry) creates many decision levels at startup —
+each `new_decision_level` pushes a row that's never popped.
+After backbone + a deep walker descent, `prop_by_kind_level.len()`
+hits the hundreds, so the "single batched pass" is still
+O(rows × COUNT) per call — cheaper than O(rows × COUNT × COUNT)
+but not free.
+
+Maintain a `prop_by_kind_total_cache: [u64; PropKind::COUNT]`
+field that's incremented on every `enqueue` (alongside the
+existing `prop_by_kind_level[lvl][kind] += 1`).
+`propagations_by_kind_totals()` returns the cache by value,
+O(1). Backtrack does not modify the cache (per the existing
+"counts accumulate across backtracks" semantics).
+
+- **TTC mechanism**: rate.
+- **Detection plan**: nodes/s ↑ massively at deep walker levels;
+  per-feature totals match the previous implementation
+  exactly (sanity).
+- **Risk**: low — single-place increment + single-place read.
+  Cache and matrix are both monotonically non-decreasing under
+  the existing semantics.
+- **Result (n=22 sync 30 s on 4 workers, 5 runs each side)**:
+  - nodes (aggregate): 357 k → **7.39 M** (+1970 %, ~21×)
+  - per-feature forcing total: 84 k → **1.33 M** (~16×)
+  - cumulative root-coverage product: 6.16e-5 → **1.50e-4** (+143 %)
+  - direct TTC parallel: 4.87e5 s → **2.0e5 s (−59 % vs U1,
+    −67 % cumulative vs session baseline)**
+  - TTC_parallel projection: 3.0e6 → 9.0e5 (−70 %)
+- **TT(18) wall-clock smoke test**: 73.3 s (post-U1) → **1.91 s
+  (−97 %)**. The walker is now actually fast enough at small n
+  to be useful for spot-checking correctness.
+- **Correctness**: `cargo test --release --bin turyn` (excl.
+  3 mdd-9-dependent tests + 3 framework live tests): 92/92.
+  TT(18) found at max_lvl=18 with `flow XY: sat=1` per the
+  smoke output.
+- **Why this was hidden behind U1**: U1 was already a net win,
+  but the batched API still had a per-row inner loop. Most
+  call sites won't notice — they call once per session. Sync
+  calls it twice per accepted candidate, ~12k times/s/worker,
+  so the per-call cost matters dramatically.
 
 ### U2. Skip `score_state` on workers with `seed != 0` — *tested, rejected (in noise)*
 
