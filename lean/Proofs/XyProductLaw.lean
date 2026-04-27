@@ -12,7 +12,7 @@ for `2 ≤ k ≤ n − 1`, `uAt S (n + 1 − k) = − uAt S k`.
 
 namespace Turyn.Result
 
-theorem xy_interior_antipalindrome {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
+theorem xy_interior_antipalindrome {n : Nat} (S : TurynType n) (hn : 4 ≤ n)
     (hc : Canonical1 n S) :
     ∀ k, 2 ≤ k → k ≤ n - 1 → uAt S (n + 1 - k) = -(uAt S k) :=
   Turyn.xy_product_law S hn hc

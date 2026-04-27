@@ -4,10 +4,10 @@ import Turyn.PmSum
 namespace Turyn
 
 /-- Product of A and B entries at 1-indexed position `i`. -/
-def uAt {n : Nat} (S : TurynTypeSeq n) (i : Nat) : Int := xAt S i * yAt S i
+def uAt {n : Nat} (S : TurynType n) (i : Nat) : Int := xAt S i * yAt S i
 
 /-- `uAt S i` is ±1 for valid indices. -/
-lemma uAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
+lemma uAt_pm {n : Nat} (S : TurynType n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
     uAt S i = 1 ∨ uAt S i = -1 := by
   unfold uAt xAt yAt
   have hAlen := S.X.len
@@ -20,7 +20,7 @@ lemma uAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i �
     · rw [ha, hb]; decide
 
 /-- Under `Canonical1`, the first entry of `u` is 1. -/
-lemma uAt_one_of_canonical1_head {n : Nat} {S : TurynTypeSeq n}
+lemma uAt_one_of_canonical1_head {n : Nat} {S : TurynType n}
     (hc : Canonical1 n S) : uAt S 1 = 1 := by
   unfold uAt
   have ha1 := hc.1
@@ -28,7 +28,7 @@ lemma uAt_one_of_canonical1_head {n : Nat} {S : TurynTypeSeq n}
   rw [ha1, hb1]; ring
 
 /-- Under `Canonical1`, the last entry of `u` is 1. -/
-lemma uAt_one_of_canonical1_tail {n : Nat} {S : TurynTypeSeq n}
+lemma uAt_one_of_canonical1_tail {n : Nat} {S : TurynType n}
     (_hn : 1 ≤ n) (hc : Canonical1 n S) : uAt S n = 1 := by
   unfold uAt
   have han := hc.2.1
@@ -36,12 +36,12 @@ lemma uAt_one_of_canonical1_tail {n : Nat} {S : TurynTypeSeq n}
   rw [han, hbn]; ring
 
 /-- `uAt S i` squares to 1 for valid indices. -/
-lemma uAt_sq {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
+lemma uAt_sq {n : Nat} (S : TurynType n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
     uAt S i * uAt S i = 1 := by
   have h := uAt_pm S i hi1 hi2
   rcases h with h | h <;> rw [h] <;> ring
 
-theorem aperiodicAutocorr_A_via_xAt {n : Nat} (S : TurynTypeSeq n) (s : Nat) (hs : s < n) :
+theorem aperiodicAutocorr_A_via_xAt {n : Nat} (S : TurynType n) (s : Nat) (hs : s < n) :
     aperiodicAutocorr S.X.data s = ∑ i ∈ Finset.range (n - s), xAt S (i + 1) * xAt S (i + 1 + s) := by
   unfold aperiodicAutocorr
   rw [if_neg (by rw [S.X.len]; omega)]
@@ -51,7 +51,7 @@ theorem aperiodicAutocorr_A_via_xAt {n : Nat} (S : TurynTypeSeq n) (s : Nat) (hs
   unfold xAt
   simp
 
-theorem aperiodicAutocorr_B_via_xAt {n : Nat} (S : TurynTypeSeq n) (s : Nat) (hs : s < n) :
+theorem aperiodicAutocorr_B_via_xAt {n : Nat} (S : TurynType n) (s : Nat) (hs : s < n) :
     aperiodicAutocorr S.Y.data s = ∑ i ∈ Finset.range (n - s), yAt S (i + 1) * yAt S (i + 1 + s) := by
   unfold aperiodicAutocorr
   rw [if_neg (by rw [S.Y.len]; omega)]
@@ -61,7 +61,7 @@ theorem aperiodicAutocorr_B_via_xAt {n : Nat} (S : TurynTypeSeq n) (s : Nat) (hs
   unfold yAt
   simp
 
-lemma xAt_sq {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
+lemma xAt_sq {n : Nat} (S : TurynType n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
     xAt S i * xAt S i = 1 := by
       -- Apply the lemma that states the product of a number with itself is 1 if the number is either 1 or -1.
       have h_sq : xAt S i = 1 ∨ xAt S i = -1 := by
@@ -69,13 +69,13 @@ lemma xAt_sq {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i �
         rw [ S.X.len ] ; omega)
       exact h_sq.elim (fun h => by rw [h]; norm_num) (fun h => by rw [h]; norm_num)
 
-lemma yAt_eq_xAt_mul_uAt {n : Nat} (S : TurynTypeSeq n) (i : Nat)
+lemma yAt_eq_xAt_mul_uAt {n : Nat} (S : TurynType n) (i : Nat)
     (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
     yAt S i = xAt S i * uAt S i := by
       unfold uAt;
       rw [ ← mul_assoc, xAt_sq S i hi1 hi2, one_mul ]
 
-private lemma summand_identity {n : Nat} (S : TurynTypeSeq n) (i : Nat)
+private lemma summand_identity {n : Nat} (S : TurynType n) (i : Nat)
     (hi1 : 1 ≤ i) (hi2 : i ≤ n) (j : Nat) (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
     xAt S i * xAt S j + yAt S i * yAt S j =
     xAt S i * xAt S j * (1 + uAt S i * uAt S j) := by
@@ -89,7 +89,7 @@ private lemma summand_identity {n : Nat} (S : TurynTypeSeq n) (i : Nat)
         · linarith;
       rw [ h_lhs_rewrite, xAt_sq S i hi1 hi2 ] ; ring
 
-theorem T_k_as_U_sum {n : Nat} (S : TurynTypeSeq n) (k : Nat) (hk : 2 ≤ k) (hkn : k ≤ n - 1) :
+theorem T_k_as_U_sum {n : Nat} (S : TurynType n) (k : Nat) (hk : 2 ≤ k) (hkn : k ≤ n - 1) :
     aperiodicAutocorr S.X.data (n - k) + aperiodicAutocorr S.Y.data (n - k) =
     ∑ i ∈ Finset.range k,
       xAt S (i + 1) * xAt S (i + 1 + (n - k)) * (1 + uAt S (i + 1) * uAt S (i + 1 + (n - k))) := by
@@ -139,7 +139,7 @@ lemma autocorr_mod_two {X : List Int} (hpm : AllPmOne X) {s : Nat} (hs : s < X.l
 /-
 From the vanishing condition: N_A(s) + N_B(s) = −2·(N_C(s) + N_D(s)).
 -/
-lemma AB_eq_neg2_CD {n : Nat} (S : TurynTypeSeq n) {s : Nat}
+lemma AB_eq_neg2_CD {n : Nat} (S : TurynType n) {s : Nat}
     (hs1 : 1 ≤ s) (hsn : s < n) :
     aperiodicAutocorr S.X.data s + aperiodicAutocorr S.Y.data s =
     -2 * (aperiodicAutocorr S.Z.data s + aperiodicAutocorr S.W.data s) := by
@@ -149,7 +149,7 @@ lemma AB_eq_neg2_CD {n : Nat} (S : TurynTypeSeq n) {s : Nat}
 /-
 The sum N_C(s) + N_D(s) is odd for 1 ≤ s ≤ n − 2.
 -/
-lemma autocorr_CD_sum_odd {n : Nat} (S : TurynTypeSeq n) {s : Nat}
+lemma autocorr_CD_sum_odd {n : Nat} (S : TurynType n) {s : Nat}
     (hs1 : 1 ≤ s) (hsn : s ≤ n - 2) :
     (aperiodicAutocorr S.Z.data s + aperiodicAutocorr S.W.data s) % 2 = 1 := by
   -- Since $s \leq n - 2$, we have $s < n$.
@@ -177,7 +177,7 @@ lemma neg2_mul_odd_mod4 (m : Int) (hm : m % 2 = 1) : (-2 * m) % 4 = 2 := by
 **Parity hammer**: the sum N_A(n−k) + N_B(n−k) is congruent to 2 modulo 4
     for 2 ≤ k ≤ n − 1.  (Best–Đoković–Kharaghani–Ramp, arXiv:1206.4107)
 -/
-theorem parity_hammer {n : Nat} (S : TurynTypeSeq n) (k : Nat) (hk : 2 ≤ k) (hkn : k ≤ n - 1) :
+theorem parity_hammer {n : Nat} (S : TurynType n) (k : Nat) (hk : 2 ≤ k) (hkn : k ≤ n - 1) :
     (aperiodicAutocorr S.X.data (n - k) + aperiodicAutocorr S.Y.data (n - k)) % 4 = 2 := by
   -- Use AB_eq_neg2_CD S hs1 hsn to rewrite LHS as (-2 * (autocorr C s + autocorr D s)) % 4.
   have h_sum : (aperiodicAutocorr S.X.data (n - k) + aperiodicAutocorr S.Y.data (n - k)) = -2 * (aperiodicAutocorr S.Z.data (n - k) + aperiodicAutocorr S.W.data (n - k)) := by
@@ -190,7 +190,7 @@ theorem parity_hammer {n : Nat} (S : TurynTypeSeq n) (k : Nat) (hk : 2 ≤ k) (h
   omega
 
 /-- xAt S i is ±1 for valid indices. -/
-lemma xAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
+lemma xAt_pm {n : Nat} (S : TurynType n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
     xAt S i = 1 ∨ xAt S i = -1 := by
   exact pm_entry_of_getD S.X.pm (by rw [S.X.len]; omega)
 
@@ -206,7 +206,7 @@ private lemma xy_base_common (a₁ a₂ u₁ u₂ : Int)
   rcases ha1 with rfl | rfl <;> rcases ha2 with rfl | rfl <;>
     rcases hu1 with rfl | rfl <;> rcases hu2 with rfl | rfl <;> omega
 
-theorem xy_base_k2 {n : Nat} (S : TurynTypeSeq n) (hn : 3 ≤ n)
+theorem xy_base_k2 {n : Nat} (S : TurynType n) (hn : 3 ≤ n)
     (hc : Canonical1 n S) : uAt S (n - 1) = -(uAt S 2) := by
   apply xy_base_common (xAt S (n - 1)) (xAt S 2) (uAt S (n - 1)) (uAt S 2)
     (xAt_pm S (n - 1) (by omega) (by omega))
@@ -225,7 +225,7 @@ theorem xy_base_k2 {n : Nat} (S : TurynTypeSeq n) (hn : 3 ≤ n)
   rw [hc.1, hc.2.1, uAt_one_of_canonical1_head hc, uAt_one_of_canonical1_tail (by omega) hc] at hph
   convert hph using 2 ; ring
 
-theorem xy_base_k3 {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
+theorem xy_base_k3 {n : Nat} (S : TurynType n) (hn : 4 ≤ n)
     (hc : Canonical1 n S) : uAt S (n - 2) = -(uAt S 3) := by
       -- Apply xy_base_common with the given conditions.
       apply xy_base_common (xAt S (n - 2)) (xAt S 3) (uAt S (n - 2)) (uAt S 3) (xAt_pm S (n - 2) (by omega) (by omega)) (xAt_pm S 3 (by omega) (by omega)) (uAt_pm S (n - 2) (by omega) (by omega)) (uAt_pm S 3 (by omega) (by omega));
@@ -253,7 +253,7 @@ private lemma endpoint_pair_mod4_pure (a_p a_q u_p u_q : Int)
   rcases ha_p with rfl | rfl <;> rcases ha_q with rfl | rfl <;>
     rcases hu_p with rfl | rfl <;> rcases hu_q with rfl | rfl <;> decide
 
-lemma endpoint_pair_mod4 {n : Nat} (S : TurynTypeSeq n) (k : Nat)
+lemma endpoint_pair_mod4 {n : Nat} (S : TurynType n) (k : Nat)
     (hk : 2 ≤ k) (hkn : k ≤ n - 1) (_hc : Canonical1 n S) :
     (xAt S (n + 1 - k) * (1 + uAt S (n + 1 - k)) + xAt S k * (1 + uAt S k)) % 4 = 2 ↔
       uAt S (n + 1 - k) = -(uAt S k) := by
@@ -293,7 +293,7 @@ divisible by 4.
 The proof rewrites the two "far" `uAt` values via `IH`, then closes by an
 explicit 64-case split on the ±1 values.
 -/
-lemma interior_pair_mod4 {n : Nat} (S : TurynTypeSeq n) (k : Nat)
+lemma interior_pair_mod4 {n : Nat} (S : TurynType n) (k : Nat)
     (hk : 4 ≤ k) (hkn : k ≤ n - 1)
     (IH : ∀ j, 2 ≤ j → j < k → uAt S (n + 1 - j) = -(uAt S j))
     {m : Nat} (hm1 : 2 ≤ m) (hm2 : 2 * m ≤ k) (hm3 : m < k + 1 - m) :
@@ -328,7 +328,7 @@ lemma interior_pair_mod4 {n : Nat} (S : TurynTypeSeq n) (k : Nat)
     (uAt_pm S m (by omega) (by omega))
     (uAt_pm S (k + 1 - m) (by omega) (by omega))
 
-lemma middle_term_zero {n : Nat} (S : TurynTypeSeq n) (k : Nat)
+lemma middle_term_zero {n : Nat} (S : TurynType n) (k : Nat)
     (hk : 4 ≤ k) (hkn : k ≤ n - 1) (hk_odd : k % 2 = 1)
     (IH : ∀ j, 2 ≤ j → j < k → uAt S (n + 1 - j) = -(uAt S j)) :
     xAt S ((k + 1) / 2) * xAt S ((k + 1) / 2 + (n - k)) *
@@ -400,7 +400,7 @@ private lemma sum_paired_with_middle_mod4 : ∀ (m : Nat) (f : Nat → Int),
 The interior sum (indices `1` to `k−2` in the `T_k` expansion) is
 divisible by 4, given the induction hypothesis on smaller indices.
 -/
-private lemma interior_sum_mod4_zero {n : Nat} (S : TurynTypeSeq n) (k : Nat)
+private lemma interior_sum_mod4_zero {n : Nat} (S : TurynType n) (k : Nat)
     (hk : 4 ≤ k) (hkn : k ≤ n - 1) (_hc : Canonical1 n S)
     (IH : ∀ j, 2 ≤ j → j < k → uAt S (n + 1 - j) = -(uAt S j)) :
     (∑ i ∈ Finset.Ico 1 (k - 1),
@@ -458,7 +458,7 @@ private lemma interior_sum_mod4_zero {n : Nat} (S : TurynTypeSeq n) (k : Nat)
 /-
 The first summand (i = 0) simplifies under `Canonical1`.
 -/
-private lemma first_summand_eq {n : Nat} (S : TurynTypeSeq n) (k : Nat)
+private lemma first_summand_eq {n : Nat} (S : TurynType n) (k : Nat)
     (hk : 2 ≤ k) (hkn : k ≤ n - 1) (hc : Canonical1 n S) :
     xAt S (0 + 1) * xAt S (0 + 1 + (n - k)) *
       (1 + uAt S (0 + 1) * uAt S (0 + 1 + (n - k))) =
@@ -469,7 +469,7 @@ private lemma first_summand_eq {n : Nat} (S : TurynTypeSeq n) (k : Nat)
 /-
 The last summand (i = k − 1) simplifies under `Canonical1`.
 -/
-private lemma last_summand_eq {n : Nat} (S : TurynTypeSeq n) (k : Nat)
+private lemma last_summand_eq {n : Nat} (S : TurynType n) (k : Nat)
     (hk : 2 ≤ k) (hkn : k ≤ n - 1) (hc : Canonical1 n S) :
     xAt S (k - 1 + 1) * xAt S (k - 1 + 1 + (n - k)) *
       (1 + uAt S (k - 1 + 1) * uAt S (k - 1 + 1 + (n - k))) =
@@ -492,7 +492,7 @@ private lemma last_summand_eq {n : Nat} (S : TurynTypeSeq n) (k : Nat)
 For a canonical Turyn sequence of length `n ≥ 4`,
 `uAt S (n+1−k) = −uAt S k` for all `2 ≤ k ≤ n−1`.
 -/
-theorem xy_product_law {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
+theorem xy_product_law {n : Nat} (S : TurynType n) (hn : 4 ≤ n)
     (hc : Canonical1 n S) :
     ∀ k, 2 ≤ k → k ≤ n - 1 → uAt S (n + 1 - k) = -(uAt S k) := by
   intros k hk2 hkn
@@ -551,7 +551,7 @@ theorem xy_product_law {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
 **Corollary**: The product of `xAt S k * yAt S k` and
 `xAt S (n+1−k) * yAt S (n+1−k)` equals `−1` for `2 ≤ k ≤ n−1`.
 -/
-theorem xy_product_eq_neg_one {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
+theorem xy_product_eq_neg_one {n : Nat} (S : TurynType n) (hn : 4 ≤ n)
     (hc : Canonical1 n S) :
     ∀ k, 2 ≤ k → k ≤ n - 1 →
       xAt S k * yAt S k * xAt S (n + 1 - k) * yAt S (n + 1 - k) = -1 := by

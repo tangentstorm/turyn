@@ -12,7 +12,7 @@ by the headline statements:
 
 - `PmSeq n`, `SignSeq n`, `IsTurynType` (from `Turyn.TurynType`)
 - `Turyn.IntMat`, `Turyn.IsHadamardMat` (from `Turyn.MatrixTyped`)
-- `Turyn.TurynTypeSeq`, `Turyn.Equivalent`, `Turyn.Canonical`,
+- `Turyn.TurynType`, `Turyn.Equivalent`, `Turyn.Canonical`,
   `Turyn.Canonical1` (from `Turyn.Equivalence`)
 - `Turyn.uAt` (from `Turyn.XY`)
 

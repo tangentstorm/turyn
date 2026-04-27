@@ -11,8 +11,8 @@ for comparator.
 namespace Turyn.Result
 
 theorem canonical_form_exists
-    (n : Nat) (hn_even : n % 2 = 0) (hn : 2 ≤ n) (S : TurynTypeSeq n) :
-    ∃ T : TurynTypeSeq n, Equivalent n S T ∧ Canonical n T :=
+    (n : Nat) (hn_even : n % 2 = 0) (hn : 2 ≤ n) (S : TurynType n) :
+    ∃ T : TurynType n, Equivalent n S T ∧ Canonical n T :=
   Turyn.canonical_representative_exists n hn_even hn S
 
 end Turyn.Result
