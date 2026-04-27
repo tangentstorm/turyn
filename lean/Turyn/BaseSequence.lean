@@ -9,29 +9,6 @@ main theorem in this file proves that these base sequences satisfy the required
 combined aperiodic autocorrelation identity.
 -/
 
-/-- A typed Turyn quadruple TT(n).  Field names follow BDKR (X, Y, Z, W). -/
-structure TurynType (n : Nat) where
-  X : PmSeq n
-  Y : PmSeq n
-  Z : PmSeq n
-  W : PmSeq (n - 1)
-  vanishing : ∀ s : Nat, 1 ≤ s → s < n →
-    combinedAutocorr X.data Y.data Z.data W.data s = 0
-
-/-- Convert an existing propositional TT witness into the typed wrapper. -/
-def IsTurynTypeProp.toTyped {n : Nat} {x y z w : List Int}
-    (h : IsTurynTypeProp n x y z w) : TurynType n :=
-  { X := ⟨x, h.x_len, h.x_pm⟩
-    Y := ⟨y, h.y_len, h.y_pm⟩
-    Z := ⟨z, h.z_len, h.z_pm⟩
-    W := ⟨w, h.w_len, h.w_pm⟩
-    vanishing := h.vanishing }
-
-/-- Convert a typed `IsTurynType` certificate into the bundled `TurynType`. -/
-def IsTurynType.toTyped {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
-    (h : IsTurynType X Y Z W) : TurynType n :=
-  { X := X, Y := Y, Z := Z, W := W, vanishing := h.vanishing }
-
 /-- Negate every entry in a sequence. -/
 def negSeq (a : List Int) : List Int := a.map (fun x => -x)
 
@@ -189,24 +166,6 @@ lemma concat_neg_autocorr_sum (z w : List Int) (s : Nat) :
     aperiodicAutocorr (z ++ w) s + aperiodicAutocorr (z ++ negSeq w) s =
     2 * aperiodicAutocorr z s + 2 * aperiodicAutocorr w s :=
   concat_neg_autocorr_sum' z w s
-
-/-- Base-sequence theorem (KTR2005, Theorem 1). -/
-theorem base_seq_vanishing_prop {n : Nat} {x y z w : List Int}
-    (htt : IsTurynTypeProp n x y z w) (_hn : n ≥ 1)
-    {s : Nat} (hs1 : 1 ≤ s) :
-    aperiodicAutocorr (z ++ w) s + aperiodicAutocorr (z ++ negSeq w) s +
-    aperiodicAutocorr x s + aperiodicAutocorr y s = 0 := by
-  rw [concat_neg_autocorr_sum]
-  by_cases hsn : s < n
-  · have hvan := htt.vanishing s hs1 hsn
-    unfold combinedAutocorr at hvan
-    linarith
-  · simp only [not_lt] at hsn
-    rw [aperiodicAutocorr_zero_of_ge' z s (by rw [htt.z_len]; omega),
-        aperiodicAutocorr_zero_of_ge' w s (by rw [htt.w_len]; omega),
-        aperiodicAutocorr_zero_of_ge' x s (by rw [htt.x_len]; omega),
-        aperiodicAutocorr_zero_of_ge' y s (by rw [htt.y_len]; omega)]
-    ring
 
 /-- Step 1 interface: every typed Turyn quadruple yields typed base sequences. -/
 def step1 {n : Nat} (T : TurynType n) : BaseSeqData n :=

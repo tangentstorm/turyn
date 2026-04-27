@@ -53,11 +53,10 @@ def weightedTotalAutocorr (x y z w : List Int) (n : Nat) : Int :=
 
 This is a direct consequence of the TT vanishing condition:
 each shift's combined autocorrelation is zero, so their sum is zero. -/
-theorem turyn_vanishing_total {n : Nat} {x y z w : List Int}
-    (h : IsTurynTypeProp n x y z w) :
-    weightedTotalAutocorr x y z w n = 0 := by
+theorem turyn_vanishing_total {n : Nat} (T : TurynType n) :
+    weightedTotalAutocorr T.X.data T.Y.data T.Z.data T.W.data n = 0 := by
   unfold weightedTotalAutocorr
-  exact sum_eq_zero (fun i hi => h.vanishing (i + 1) (by omega) (by rw [mem_range] at hi; omega))
+  exact sum_eq_zero (fun i hi => T.vanishing (i + 1) (by omega) (by rw [mem_range] at hi; omega))
 
 /-! ### Sum-autocorrelation identity
 
@@ -198,31 +197,25 @@ theorem sum_sq_eq_len_add_two_totalAutocorr (a : List Int) (h : AllPmOne a) :
 
 /-- **Energy identity:** For any TT(n), the sums satisfy
     x² + y² + 2z² + 2w² = 6n − 2. -/
-theorem energy_identity {n : Nat} {x y z w : List Int}
-    (htt : IsTurynTypeProp n x y z w) (hn : n ≥ 1) :
-    (seqSum x) ^ 2 + (seqSum y) ^ 2 +
-    2 * (seqSum z) ^ 2 + 2 * (seqSum w) ^ 2 =
+theorem energy_identity {n : Nat} (T : TurynType n) (hn : n ≥ 1) :
+    (seqSum T.X.data) ^ 2 + (seqSum T.Y.data) ^ 2 +
+    2 * (seqSum T.Z.data) ^ 2 + 2 * (seqSum T.W.data) ^ 2 =
     6 * (n : Int) - 2 := by
-  -- Apply the sum-autocorrelation identity to each sequence
-  rw [sum_sq_eq_len_add_two_totalAutocorr x htt.x_pm,
-      sum_sq_eq_len_add_two_totalAutocorr y htt.y_pm,
-      sum_sq_eq_len_add_two_totalAutocorr z htt.z_pm,
-      sum_sq_eq_len_add_two_totalAutocorr w htt.w_pm]
-  -- Substitute lengths
-  rw [htt.x_len, htt.y_len, htt.z_len, htt.w_len]
-  -- The autocorrelation sum vanishes by the TT condition
-  have htotal : totalAutocorr x + totalAutocorr y +
-         2 * totalAutocorr z + 2 * totalAutocorr w = 0 := by
-    rw [← weightedTotalAutocorr_decompose htt.x_len htt.y_len htt.z_len htt.w_len]
-    exact turyn_vanishing_total htt
-  -- Convert Nat subtraction cast: ↑(n-1) = ↑n - 1 (valid since n ≥ 1)
+  rw [sum_sq_eq_len_add_two_totalAutocorr T.X.data T.X.pm,
+      sum_sq_eq_len_add_two_totalAutocorr T.Y.data T.Y.pm,
+      sum_sq_eq_len_add_two_totalAutocorr T.Z.data T.Z.pm,
+      sum_sq_eq_len_add_two_totalAutocorr T.W.data T.W.pm]
+  rw [T.X.len, T.Y.len, T.Z.len, T.W.len]
+  have htotal : totalAutocorr T.X.data + totalAutocorr T.Y.data +
+         2 * totalAutocorr T.Z.data + 2 * totalAutocorr T.W.data = 0 := by
+    rw [← weightedTotalAutocorr_decompose T.X.len T.Y.len T.Z.len T.W.len]
+    exact turyn_vanishing_total T
   have hcast : (↑(n - 1) : Int) = (↑n : Int) - 1 := by omega
   rw [hcast]
-  -- Distribute 2 * (sum + product) terms so omega sees linear arithmetic
-  have hd1 : 2 * ((↑n : Int) + 2 * totalAutocorr z) =
-    2 * ↑n + 2 * (2 * totalAutocorr z) := Int.mul_add _ _ _
-  have hd2 : 2 * ((↑n : Int) - 1 + 2 * totalAutocorr w) =
-    2 * (↑n - 1) + 2 * (2 * totalAutocorr w) := Int.mul_add _ _ _
+  have hd1 : 2 * ((↑n : Int) + 2 * totalAutocorr T.Z.data) =
+    2 * ↑n + 2 * (2 * totalAutocorr T.Z.data) := Int.mul_add _ _ _
+  have hd2 : 2 * ((↑n : Int) - 1 + 2 * totalAutocorr T.W.data) =
+    2 * (↑n - 1) + 2 * (2 * totalAutocorr T.W.data) := Int.mul_add _ _ _
   rw [hd1, hd2]
   omega
 

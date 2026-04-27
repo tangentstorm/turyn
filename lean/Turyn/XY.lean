@@ -10,12 +10,12 @@ def uAt {n : Nat} (S : TurynTypeSeq n) (i : Nat) : Int := xAt S i * yAt S i
 lemma uAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
     uAt S i = 1 ∨ uAt S i = -1 := by
   unfold uAt xAt yAt
-  have hAlen := S.isTuryn.x_len
-  have hBlen := S.isTuryn.y_len
+  have hAlen := S.X.len
+  have hBlen := S.Y.len
   have hiA : i - 1 < S.X.data.length := by omega
   have hiB : i - 1 < S.Y.data.length := by omega
-  have ha := pm_entry_of_getD S.isTuryn.x_pm hiA
-  have hb := pm_entry_of_getD S.isTuryn.y_pm hiB
+  have ha := pm_entry_of_getD S.X.pm hiA
+  have hb := pm_entry_of_getD S.Y.pm hiB
   rcases ha with ha | ha <;> rcases hb with hb | hb <;>
     · rw [ha, hb]; decide
 
@@ -44,8 +44,8 @@ lemma uAt_sq {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i �
 theorem aperiodicAutocorr_A_via_xAt {n : Nat} (S : TurynTypeSeq n) (s : Nat) (hs : s < n) :
     aperiodicAutocorr S.X.data s = ∑ i ∈ Finset.range (n - s), xAt S (i + 1) * xAt S (i + 1 + s) := by
   unfold aperiodicAutocorr
-  rw [if_neg (by rw [S.isTuryn.x_len]; omega)]
-  rw [show S.X.data.length - s = n - s from by rw [S.isTuryn.x_len]]
+  rw [if_neg (by rw [S.X.len]; omega)]
+  rw [show S.X.data.length - s = n - s from by rw [S.X.len]]
   apply Finset.sum_congr rfl
   intro i _
   unfold xAt
@@ -54,8 +54,8 @@ theorem aperiodicAutocorr_A_via_xAt {n : Nat} (S : TurynTypeSeq n) (s : Nat) (hs
 theorem aperiodicAutocorr_B_via_xAt {n : Nat} (S : TurynTypeSeq n) (s : Nat) (hs : s < n) :
     aperiodicAutocorr S.Y.data s = ∑ i ∈ Finset.range (n - s), yAt S (i + 1) * yAt S (i + 1 + s) := by
   unfold aperiodicAutocorr
-  rw [if_neg (by rw [S.isTuryn.y_len]; omega)]
-  rw [show S.Y.data.length - s = n - s from by rw [S.isTuryn.y_len]]
+  rw [if_neg (by rw [S.Y.len]; omega)]
+  rw [show S.Y.data.length - s = n - s from by rw [S.Y.len]]
   apply Finset.sum_congr rfl
   intro i _
   unfold yAt
@@ -65,8 +65,8 @@ lemma xAt_sq {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i �
     xAt S i * xAt S i = 1 := by
       -- Apply the lemma that states the product of a number with itself is 1 if the number is either 1 or -1.
       have h_sq : xAt S i = 1 ∨ xAt S i = -1 := by
-        apply pm_entry_of_getD; exact S.isTuryn.x_pm; exact (by
-        rw [ S.isTuryn.x_len ] ; omega)
+        apply pm_entry_of_getD; exact S.X.pm; exact (by
+        rw [ S.X.len ] ; omega)
       exact h_sq.elim (fun h => by rw [h]; norm_num) (fun h => by rw [h]; norm_num)
 
 lemma yAt_eq_xAt_mul_uAt {n : Nat} (S : TurynTypeSeq n) (i : Nat)
@@ -143,7 +143,7 @@ lemma AB_eq_neg2_CD {n : Nat} (S : TurynTypeSeq n) {s : Nat}
     (hs1 : 1 ≤ s) (hsn : s < n) :
     aperiodicAutocorr S.X.data s + aperiodicAutocorr S.Y.data s =
     -2 * (aperiodicAutocorr S.Z.data s + aperiodicAutocorr S.W.data s) := by
-  have := S.isTuryn.vanishing s hs1 hsn;
+  have := S.vanishing s hs1 hsn;
   unfold combinedAutocorr at this; linarith;
 
 /-
@@ -158,14 +158,14 @@ lemma autocorr_CD_sum_odd {n : Nat} (S : TurynTypeSeq n) {s : Nat}
   -- Apply the autocorr_mod_two lemma to C and D.
   have hC : aperiodicAutocorr S.Z.data s % 2 = ((S.Z.data.length - s : Nat) : Int) % 2 := by
     apply autocorr_mod_two;
-    · exact S.isTuryn.z_pm;
-    · exact hs_lt_n.trans_le ( by linarith [ S.isTuryn.z_len ] )
+    · exact S.Z.pm;
+    · exact hs_lt_n.trans_le ( by linarith [ S.Z.len ] )
   have hD : aperiodicAutocorr S.W.data s % 2 = ((S.W.data.length - s : Nat) : Int) % 2 := by
     apply autocorr_mod_two;
-    · exact S.isTuryn.w_pm;
-    · have := S.isTuryn.w_len; omega;
+    · exact S.W.pm;
+    · have := S.W.len; omega;
   norm_num [ Int.add_emod, hC, hD ];
-  rw [ S.isTuryn.z_len, S.isTuryn.w_len ] ; omega;
+  rw [ S.Z.len, S.W.len ] ; omega;
 
 /-
 −2 times an odd integer is congruent to 2 modulo 4.
@@ -192,7 +192,7 @@ theorem parity_hammer {n : Nat} (S : TurynTypeSeq n) (k : Nat) (hk : 2 ≤ k) (h
 /-- xAt S i is ±1 for valid indices. -/
 lemma xAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
     xAt S i = 1 ∨ xAt S i = -1 := by
-  exact pm_entry_of_getD S.isTuryn.x_pm (by rw [S.isTuryn.x_len]; omega)
+  exact pm_entry_of_getD S.X.pm (by rw [S.X.len]; omega)
 
 /-
 Pure integer case analysis: if a₁, a₂, u₁, u₂ are all ±1 and

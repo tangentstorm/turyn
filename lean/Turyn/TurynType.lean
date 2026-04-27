@@ -150,39 +150,21 @@ theorem IsTurynType.vanishing {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
   rw [heq] at hk
   exact eq_of_beq hk
 
-/-! ### Raw-list propositional form
+/-! ### Bundled Turyn-type quadruple -/
 
-`IsTurynTypeProp` keeps the explicit length/pm fields for the proofs in
-`Turyn.Equivalence`, which thread the raw list components through the
-`TurynTypeSeq` machinery.  Bridges in both directions are provided below.
--/
+/-- A typed Turyn quadruple TT(n).  Field names follow BDKR (X, Y, Z, W). -/
+structure TurynType (n : Nat) where
+  X : PmSeq n
+  Y : PmSeq n
+  Z : PmSeq n
+  W : PmSeq (n - 1)
+  vanishing : ∀ s : Nat, 1 ≤ s → s < n →
+    combinedAutocorr X.data Y.data Z.data W.data s = 0
 
-/-- Propositional Turyn-type predicate on raw `List Int` quadruples,
-    with length and ±1-ness as explicit hypotheses. -/
-structure IsTurynTypeProp (n : Nat) (x y z w : List Int) : Prop where
-  x_len : x.length = n
-  y_len : y.length = n
-  z_len : z.length = n
-  w_len : w.length = n - 1
-  x_pm : AllPmOne x
-  y_pm : AllPmOne y
-  z_pm : AllPmOne z
-  w_pm : AllPmOne w
-  vanishing : ∀ s : Nat, 1 ≤ s → s < n → combinedAutocorr x y z w s = 0
-
-/-- A typed `IsTurynType` witness implies the raw-list propositional form. -/
-theorem IsTurynType.toProp {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
-    (h : IsTurynType X Y Z W) :
-    IsTurynTypeProp n X.data Y.data Z.data W.data where
-  x_len := X.len
-  y_len := Y.len
-  z_len := Z.len
-  w_len := W.len
-  x_pm := X.pm
-  y_pm := Y.pm
-  z_pm := Z.pm
-  w_pm := W.pm
-  vanishing := h.vanishing
+/-- Convert a typed `IsTurynType` certificate into the bundled `TurynType`. -/
+def IsTurynType.toTyped {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
+    (h : IsTurynType X Y Z W) : TurynType n :=
+  { X := X, Y := Y, Z := Z, W := W, vanishing := h.vanishing }
 
 /-! ### Sum of a sequence -/
 

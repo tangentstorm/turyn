@@ -153,153 +153,102 @@ lemma aperiodicAutocorr_alt (a : List Int) (s : Nat) :
           (a.getD i 0 * a.getD (i + s) 0) from by ring]
       rw [sign_product_eq]
 
-/-! ### IsTurynTypeProp preservation under each elementary transformation -/
+/-! ### Vanishing preservation under each elementary transformation
 
-lemma turynProp_negA {n : Nat} {A B C D : List Int}
-    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n (negSeq A) B C D where
-  x_len := by simp [negSeq, h.x_len]
-  y_len := h.y_len
-  z_len := h.z_len
-  w_len := h.w_len
-  x_pm := AllPmOne_neg h.x_pm
-  y_pm := h.y_pm
-  z_pm := h.z_pm
-  w_pm := h.w_pm
-  vanishing := fun s hs1 hs2 => by
-    have := h.vanishing s hs1 hs2
-    unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_neg]; exact this
+These lemmas operate directly on `TurynType n`: the carrier-level
+length/pm proofs come for free with `PmSeq`, leaving only the
+combined-autocorrelation vanishing identity to re-derive. -/
 
-lemma turynProp_negB {n : Nat} {A B C D : List Int}
-    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A (negSeq B) C D where
-  x_len := h.x_len
-  y_len := by simp [negSeq, h.y_len]
-  z_len := h.z_len
-  w_len := h.w_len
-  x_pm := h.x_pm
-  y_pm := AllPmOne_neg h.y_pm
-  z_pm := h.z_pm
-  w_pm := h.w_pm
-  vanishing := fun s hs1 hs2 => by
-    have := h.vanishing s hs1 hs2
-    unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_neg]; exact this
+namespace Turyn
 
-lemma turynProp_negC {n : Nat} {A B C D : List Int}
-    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B (negSeq C) D where
-  x_len := h.x_len
-  y_len := h.y_len
-  z_len := by simp [negSeq, h.z_len]
-  w_len := h.w_len
-  x_pm := h.x_pm
-  y_pm := h.y_pm
-  z_pm := AllPmOne_neg h.z_pm
-  w_pm := h.w_pm
-  vanishing := fun s hs1 hs2 => by
-    have := h.vanishing s hs1 hs2
-    unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_neg]; exact this
+/-- Negating one sequence preserves vanishing (autocorrelation is invariant
+under sign flip). -/
+lemma vanishing_negX {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr (negSeq T.X.data) T.Y.data T.Z.data T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [aperiodicAutocorr_neg]; exact hv
 
-lemma turynProp_negD {n : Nat} {A B C D : List Int}
-    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B C (negSeq D) where
-  x_len := h.x_len
-  y_len := h.y_len
-  z_len := h.z_len
-  w_len := by simp [negSeq, h.w_len]
-  x_pm := h.x_pm
-  y_pm := h.y_pm
-  z_pm := h.z_pm
-  w_pm := AllPmOne_neg h.w_pm
-  vanishing := fun s hs1 hs2 => by
-    have := h.vanishing s hs1 hs2
-    unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_neg]; exact this
+lemma vanishing_negY {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.X.data (negSeq T.Y.data) T.Z.data T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [aperiodicAutocorr_neg]; exact hv
 
-lemma turynProp_revA {n : Nat} {A B C D : List Int}
-    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A.reverse B C D where
-  x_len := by simp [h.x_len]
-  y_len := h.y_len
-  z_len := h.z_len
-  w_len := h.w_len
-  x_pm := AllPmOne_reverse h.x_pm
-  y_pm := h.y_pm
-  z_pm := h.z_pm
-  w_pm := h.w_pm
-  vanishing := fun s hs1 hs2 => by
-    have := h.vanishing s hs1 hs2
-    unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_rev]; exact this
+lemma vanishing_negZ {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.X.data T.Y.data (negSeq T.Z.data) T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [aperiodicAutocorr_neg]; exact hv
 
-lemma turynProp_revB {n : Nat} {A B C D : List Int}
-    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B.reverse C D where
-  x_len := h.x_len
-  y_len := by simp [h.y_len]
-  z_len := h.z_len
-  w_len := h.w_len
-  x_pm := h.x_pm
-  y_pm := AllPmOne_reverse h.y_pm
-  z_pm := h.z_pm
-  w_pm := h.w_pm
-  vanishing := fun s hs1 hs2 => by
-    have := h.vanishing s hs1 hs2
-    unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_rev]; exact this
+lemma vanishing_negW {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.X.data T.Y.data T.Z.data (negSeq T.W.data) s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [aperiodicAutocorr_neg]; exact hv
 
-lemma turynProp_revC {n : Nat} {A B C D : List Int}
-    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B C.reverse D where
-  x_len := h.x_len
-  y_len := h.y_len
-  z_len := by simp [h.z_len]
-  w_len := h.w_len
-  x_pm := h.x_pm
-  y_pm := h.y_pm
-  z_pm := AllPmOne_reverse h.z_pm
-  w_pm := h.w_pm
-  vanishing := fun s hs1 hs2 => by
-    have := h.vanishing s hs1 hs2
-    unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_rev]; exact this
+/-- Reversing one sequence preserves vanishing. -/
+lemma vanishing_revX {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.X.data.reverse T.Y.data T.Z.data T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [aperiodicAutocorr_rev]; exact hv
 
-lemma turynProp_revD {n : Nat} {A B C D : List Int}
-    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B C D.reverse where
-  x_len := h.x_len
-  y_len := h.y_len
-  z_len := h.z_len
-  w_len := by simp [h.w_len]
-  x_pm := h.x_pm
-  y_pm := h.y_pm
-  z_pm := h.z_pm
-  w_pm := AllPmOne_reverse h.w_pm
-  vanishing := fun s hs1 hs2 => by
-    have := h.vanishing s hs1 hs2
-    unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_rev]; exact this
+lemma vanishing_revY {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.X.data T.Y.data.reverse T.Z.data T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [aperiodicAutocorr_rev]; exact hv
 
-lemma turynProp_altAll {n : Nat} {A B C D : List Int}
-    (h : IsTurynTypeProp n A B C D) :
-    IsTurynTypeProp n (Turyn.altSeq A) (Turyn.altSeq B) (Turyn.altSeq C) (Turyn.altSeq D) where
-  x_len := by simp [Turyn.altSeq, h.x_len]
-  y_len := by simp [Turyn.altSeq, h.y_len]
-  z_len := by simp [Turyn.altSeq, h.z_len]
-  w_len := by simp [Turyn.altSeq, h.w_len]
-  x_pm := AllPmOne_alt h.x_pm
-  y_pm := AllPmOne_alt h.y_pm
-  z_pm := AllPmOne_alt h.z_pm
-  w_pm := AllPmOne_alt h.w_pm
-  vanishing := fun s hs1 hs2 => by
-    have hv := h.vanishing s hs1 hs2
+lemma vanishing_revZ {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.X.data T.Y.data T.Z.data.reverse T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [aperiodicAutocorr_rev]; exact hv
+
+lemma vanishing_revW {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.X.data T.Y.data T.Z.data T.W.data.reverse s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [aperiodicAutocorr_rev]; exact hv
+
+/-- Alternating all four sequences preserves vanishing (combined sum scales
+by `(-1)^s` which is zero times zero). -/
+lemma vanishing_altAll {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr (Turyn.altSeq T.X.data) (Turyn.altSeq T.Y.data)
+        (Turyn.altSeq T.Z.data) (Turyn.altSeq T.W.data) s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
     unfold combinedAutocorr at hv ⊢
     rw [aperiodicAutocorr_alt, aperiodicAutocorr_alt, aperiodicAutocorr_alt, aperiodicAutocorr_alt]
-    have factored : (-1 : Int) ^ s * aperiodicAutocorr A s + (-1 : Int) ^ s * aperiodicAutocorr B s +
-        2 * ((-1 : Int) ^ s * aperiodicAutocorr C s) + 2 * ((-1 : Int) ^ s * aperiodicAutocorr D s) =
-        (-1 : Int) ^ s * (aperiodicAutocorr A s + aperiodicAutocorr B s +
-        2 * aperiodicAutocorr C s + 2 * aperiodicAutocorr D s) := by ring
+    have factored :
+        (-1 : Int) ^ s * aperiodicAutocorr T.X.data s +
+          (-1 : Int) ^ s * aperiodicAutocorr T.Y.data s +
+          2 * ((-1 : Int) ^ s * aperiodicAutocorr T.Z.data s) +
+          2 * ((-1 : Int) ^ s * aperiodicAutocorr T.W.data s) =
+        (-1 : Int) ^ s * (aperiodicAutocorr T.X.data s + aperiodicAutocorr T.Y.data s +
+          2 * aperiodicAutocorr T.Z.data s + 2 * aperiodicAutocorr T.W.data s) := by ring
     rw [factored, hv, mul_zero]
 
-lemma turynProp_swapAB {n : Nat} {A B C D : List Int}
-    (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n B A C D where
-  x_len := h.y_len
-  y_len := h.x_len
-  z_len := h.z_len
-  w_len := h.w_len
-  x_pm := h.y_pm
-  y_pm := h.x_pm
-  z_pm := h.z_pm
-  w_pm := h.w_pm
-  vanishing := fun s hs1 hs2 => by
-    have := h.vanishing s hs1 hs2; unfold combinedAutocorr at this ⊢; linarith
+/-- Swapping `X` and `Y` preserves vanishing (their roles in the combined sum
+are symmetric). -/
+lemma vanishing_swapXY {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.Y.data T.X.data T.Z.data T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; linarith
+
+end Turyn
 
 namespace Turyn
 
@@ -322,21 +271,6 @@ def _root_.PmSeq.alt {n : Nat} (s : PmSeq n) : PmSeq n :=
 /-- Legacy alias; `TurynType` (in `Turyn.BaseSequence`) is the canonical name. -/
 @[reducible] def TurynTypeSeq (n : Nat) : Type := TurynType n
 
-/-- Backward-compat accessor: lift the carrier-level length/pm proofs and
-the vanishing field into the raw-list `IsTurynTypeProp` form used by the
-existing step lemmas. -/
-def TurynTypeSeq.isTuryn {n : Nat} (S : TurynTypeSeq n) :
-    IsTurynTypeProp n S.X.data S.Y.data S.Z.data S.W.data where
-  x_len := S.X.len
-  y_len := S.Y.len
-  z_len := S.Z.len
-  w_len := S.W.len
-  x_pm := S.X.pm
-  y_pm := S.Y.pm
-  z_pm := S.Z.pm
-  w_pm := S.W.pm
-  vanishing := S.vanishing
-
 /-- Entry accessor for `X` (1-indexed). -/
 def xAt {n : Nat} (S : TurynTypeSeq n) (i : Nat) : Int := S.X.data.getD (i - 1) 0
 /-- Entry accessor for `Y` (1-indexed). -/
@@ -349,34 +283,34 @@ def wAt {n : Nat} (S : TurynTypeSeq n) (i : Nat) : Int := S.W.data.getD (i - 1) 
 /-! ### TurynTypeSeq transformations -/
 
 def TurynTypeSeq.doNegA {n : Nat} (S : TurynTypeSeq n) : TurynTypeSeq n :=
-  ⟨S.X.neg, S.Y, S.Z, S.W, (turynProp_negA S.isTuryn).vanishing⟩
+  ⟨S.X.neg, S.Y, S.Z, S.W, vanishing_negX S⟩
 
 def TurynTypeSeq.doNegB {n : Nat} (S : TurynTypeSeq n) : TurynTypeSeq n :=
-  ⟨S.X, S.Y.neg, S.Z, S.W, (turynProp_negB S.isTuryn).vanishing⟩
+  ⟨S.X, S.Y.neg, S.Z, S.W, vanishing_negY S⟩
 
 def TurynTypeSeq.doNegC {n : Nat} (S : TurynTypeSeq n) : TurynTypeSeq n :=
-  ⟨S.X, S.Y, S.Z.neg, S.W, (turynProp_negC S.isTuryn).vanishing⟩
+  ⟨S.X, S.Y, S.Z.neg, S.W, vanishing_negZ S⟩
 
 def TurynTypeSeq.doNegD {n : Nat} (S : TurynTypeSeq n) : TurynTypeSeq n :=
-  ⟨S.X, S.Y, S.Z, S.W.neg, (turynProp_negD S.isTuryn).vanishing⟩
+  ⟨S.X, S.Y, S.Z, S.W.neg, vanishing_negW S⟩
 
 def TurynTypeSeq.doRevA {n : Nat} (S : TurynTypeSeq n) : TurynTypeSeq n :=
-  ⟨S.X.reverse, S.Y, S.Z, S.W, (turynProp_revA S.isTuryn).vanishing⟩
+  ⟨S.X.reverse, S.Y, S.Z, S.W, vanishing_revX S⟩
 
 def TurynTypeSeq.doRevB {n : Nat} (S : TurynTypeSeq n) : TurynTypeSeq n :=
-  ⟨S.X, S.Y.reverse, S.Z, S.W, (turynProp_revB S.isTuryn).vanishing⟩
+  ⟨S.X, S.Y.reverse, S.Z, S.W, vanishing_revY S⟩
 
 def TurynTypeSeq.doRevC {n : Nat} (S : TurynTypeSeq n) : TurynTypeSeq n :=
-  ⟨S.X, S.Y, S.Z.reverse, S.W, (turynProp_revC S.isTuryn).vanishing⟩
+  ⟨S.X, S.Y, S.Z.reverse, S.W, vanishing_revZ S⟩
 
 def TurynTypeSeq.doRevD {n : Nat} (S : TurynTypeSeq n) : TurynTypeSeq n :=
-  ⟨S.X, S.Y, S.Z, S.W.reverse, (turynProp_revD S.isTuryn).vanishing⟩
+  ⟨S.X, S.Y, S.Z, S.W.reverse, vanishing_revW S⟩
 
 def TurynTypeSeq.doAltAll {n : Nat} (S : TurynTypeSeq n) : TurynTypeSeq n :=
-  ⟨S.X.alt, S.Y.alt, S.Z.alt, S.W.alt, (turynProp_altAll S.isTuryn).vanishing⟩
+  ⟨S.X.alt, S.Y.alt, S.Z.alt, S.W.alt, vanishing_altAll S⟩
 
 def TurynTypeSeq.doSwap {n : Nat} (S : TurynTypeSeq n) : TurynTypeSeq n :=
-  ⟨S.Y, S.X, S.Z, S.W, (turynProp_swapAB S.isTuryn).vanishing⟩
+  ⟨S.Y, S.X, S.Z, S.W, vanishing_swapXY S⟩
 
 /-! ### Bridge to typed TurynType (identity now that `TurynTypeSeq = TurynType`) -/
 
@@ -479,11 +413,11 @@ lemma aperiodicAutocorr_last {n : Nat} {a : List Int} (ha : a.length = n) (hn : 
 
 lemma endpoint_relation {n : Nat} (hn : 1 < n) (S : TurynTypeSeq n) :
     xAt S 1 * xAt S n + yAt S 1 * yAt S n + 2 * (zAt S 1 * zAt S n) = 0 := by
-      convert S.isTuryn.vanishing ( n - 1 ) ( Nat.sub_pos_of_lt hn ) ( Nat.sub_lt ( by linarith ) zero_lt_one ) using 1;
+      convert S.vanishing ( n - 1 ) ( Nat.sub_pos_of_lt hn ) ( Nat.sub_lt ( by linarith ) zero_lt_one ) using 1;
       unfold combinedAutocorr;
       unfold xAt yAt zAt; simp +arith +decide [ * ] ;
-      rw [ aperiodicAutocorr_last, aperiodicAutocorr_last, aperiodicAutocorr_last ] <;> norm_num [ S.isTuryn.x_len, S.isTuryn.y_len, S.isTuryn.z_len, S.isTuryn.w_len ];
-      · unfold aperiodicAutocorr; simp +decide [ S.isTuryn.w_len ] ;
+      rw [ aperiodicAutocorr_last, aperiodicAutocorr_last, aperiodicAutocorr_last ] <;> norm_num [ S.X.len, S.Y.len, S.Z.len, S.W.len ];
+      · unfold aperiodicAutocorr; simp +decide [ S.W.len ] ;
         ring;
       · linarith;
       · linarith;
@@ -555,28 +489,28 @@ private lemma step1_wAt_doNegD {n : Nat} (S : TurynTypeSeq n) (i : Nat) :
 private lemma step1_xAt_doAltAll_first {n : Nat} (S : TurynTypeSeq n) (hn : 1 ≤ n) :
     xAt S.doAltAll 1 = xAt S 1 := by
   unfold xAt TurynTypeSeq.doAltAll PmSeq.alt
-  exact altSeq_getD_zero S.X.data (by rw [S.isTuryn.x_len]; omega)
+  exact altSeq_getD_zero S.X.data (by rw [S.X.len]; omega)
 
 private lemma step1_yAt_doAltAll_first {n : Nat} (S : TurynTypeSeq n) (hn : 1 ≤ n) :
     yAt S.doAltAll 1 = yAt S 1 := by
   unfold yAt TurynTypeSeq.doAltAll PmSeq.alt
-  exact altSeq_getD_zero S.Y.data (by rw [S.isTuryn.y_len]; omega)
+  exact altSeq_getD_zero S.Y.data (by rw [S.Y.len]; omega)
 
 private lemma step1_zAt_doAltAll_first {n : Nat} (S : TurynTypeSeq n) (hn : 1 ≤ n) :
     zAt S.doAltAll 1 = zAt S 1 := by
   unfold zAt TurynTypeSeq.doAltAll PmSeq.alt
-  exact altSeq_getD_zero S.Z.data (by rw [S.isTuryn.z_len]; omega)
+  exact altSeq_getD_zero S.Z.data (by rw [S.Z.len]; omega)
 
 private lemma step1_wAt_doAltAll_first {n : Nat} (S : TurynTypeSeq n) (hn : 2 ≤ n) :
     wAt S.doAltAll 1 = wAt S 1 := by
   unfold wAt TurynTypeSeq.doAltAll PmSeq.alt
-  exact altSeq_getD_zero S.W.data (by rw [S.isTuryn.w_len]; omega)
+  exact altSeq_getD_zero S.W.data (by rw [S.W.len]; omega)
 
 private lemma step1_xAt_doAltAll_last {n : Nat} (S : TurynTypeSeq n)
     (hn_even : n % 2 = 0) (hn : 2 ≤ n) :
     xAt S.doAltAll n = -(xAt S n) := by
   unfold xAt TurynTypeSeq.doAltAll PmSeq.alt
-  have hlen := S.isTuryn.x_len
+  have hlen := S.X.len
   have h := altSeq_getD_last S.X.data (by rw [hlen]; exact hn_even) (by rw [hlen]; exact hn)
   rw [hlen] at h; exact h
 
@@ -584,7 +518,7 @@ private lemma step1_yAt_doAltAll_last {n : Nat} (S : TurynTypeSeq n)
     (hn_even : n % 2 = 0) (hn : 2 ≤ n) :
     yAt S.doAltAll n = -(yAt S n) := by
   unfold yAt TurynTypeSeq.doAltAll PmSeq.alt
-  have hlen := S.isTuryn.y_len
+  have hlen := S.Y.len
   have h := altSeq_getD_last S.Y.data (by rw [hlen]; exact hn_even) (by rw [hlen]; exact hn)
   rw [hlen] at h; exact h
 
@@ -595,7 +529,7 @@ theorem step1_condition1
   -- Phase 1: Normalize first entries of A, B, C, D to +1 by optional negations.
   -- Step 1a: Normalize xAt 1 to +1.
   have ha_pm : xAt S 1 = 1 ∨ xAt S 1 = -1 :=
-    pm_entry_of_getD S.isTuryn.x_pm (by rw [S.isTuryn.x_len]; omega)
+    pm_entry_of_getD S.X.pm (by rw [S.X.len]; omega)
   obtain ⟨Sa, hSa_eq, hSa_a1⟩ : ∃ Sa : TurynTypeSeq n,
       Equivalent n S Sa ∧ xAt Sa 1 = 1 := by
     rcases ha_pm with ha1 | ha1
@@ -604,7 +538,7 @@ theorem step1_condition1
         by rw [step1_xAt_doNegA, ha1]; norm_num⟩
   -- Step 1b: Normalize yAt 1 to +1 (doNegB preserves A).
   have hb_pm : yAt Sa 1 = 1 ∨ yAt Sa 1 = -1 :=
-    pm_entry_of_getD Sa.isTuryn.y_pm (by rw [Sa.isTuryn.y_len]; omega)
+    pm_entry_of_getD Sa.Y.pm (by rw [Sa.Y.len]; omega)
   obtain ⟨Sb, hSb_eq, hSb_a1, hSb_b1⟩ : ∃ Sb : TurynTypeSeq n,
       Equivalent n Sa Sb ∧ xAt Sb 1 = 1 ∧ yAt Sb 1 = 1 := by
     rcases hb_pm with hb1 | hb1
@@ -614,7 +548,7 @@ theorem step1_condition1
         by rw [step1_yAt_doNegB, hb1]; norm_num⟩
   -- Step 1c: Normalize zAt 1 to +1 (doNegC preserves A, B).
   have hc_pm : zAt Sb 1 = 1 ∨ zAt Sb 1 = -1 :=
-    pm_entry_of_getD Sb.isTuryn.z_pm (by rw [Sb.isTuryn.z_len]; omega)
+    pm_entry_of_getD Sb.Z.pm (by rw [Sb.Z.len]; omega)
   obtain ⟨Sc, hSc_eq, hSc_a1, hSc_b1, hSc_c1⟩ : ∃ Sc : TurynTypeSeq n,
       Equivalent n Sb Sc ∧ xAt Sc 1 = 1 ∧ yAt Sc 1 = 1 ∧ zAt Sc 1 = 1 := by
     rcases hc_pm with hc1 | hc1
@@ -625,7 +559,7 @@ theorem step1_condition1
         by rw [step1_zAt_doNegC, hc1]; norm_num⟩
   -- Step 1d: Normalize wAt 1 to +1 (doNegD preserves A, B, C).
   have hd_pm : wAt Sc 1 = 1 ∨ wAt Sc 1 = -1 :=
-    pm_entry_of_getD Sc.isTuryn.w_pm (by rw [Sc.isTuryn.w_len]; omega)
+    pm_entry_of_getD Sc.W.pm (by rw [Sc.W.len]; omega)
   obtain ⟨Sd, hSd_eq, hSd_a1, hSd_b1, hSd_c1, hSd_d1⟩ : ∃ Sd : TurynTypeSeq n,
       Equivalent n Sc Sd ∧ xAt Sd 1 = 1 ∧ yAt Sd 1 = 1 ∧ zAt Sd 1 = 1 ∧ wAt Sd 1 = 1 := by
     rcases hd_pm with hd1 | hd1
@@ -639,11 +573,11 @@ theorem step1_condition1
   -- Phase 2: Handle last entries xAt n and yAt n.
   -- Obtain ±1 witnesses for positions n.
   have ha_n_pm : xAt Sd n = 1 ∨ xAt Sd n = -1 :=
-    pm_entry_of_getD Sd.isTuryn.x_pm (by rw [Sd.isTuryn.x_len]; omega)
+    pm_entry_of_getD Sd.X.pm (by rw [Sd.X.len]; omega)
   have hb_n_pm : yAt Sd n = 1 ∨ yAt Sd n = -1 :=
-    pm_entry_of_getD Sd.isTuryn.y_pm (by rw [Sd.isTuryn.y_len]; omega)
+    pm_entry_of_getD Sd.Y.pm (by rw [Sd.Y.len]; omega)
   have hc_n_pm : zAt Sd n = 1 ∨ zAt Sd n = -1 :=
-    pm_entry_of_getD Sd.isTuryn.z_pm (by rw [Sd.isTuryn.z_len]; omega)
+    pm_entry_of_getD Sd.Z.pm (by rw [Sd.Z.len]; omega)
   -- Endpoint relation with known first entries substituted.
   have h_ep_raw := endpoint_relation (show 1 < n by omega) Sd
   rw [hSd_a1, hSd_b1, hSd_c1] at h_ep_raw
@@ -694,11 +628,11 @@ theorem step1_condition1
 
 private lemma revA_getD_eq {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
     S.X.reverse.data.getD (j - 1) 0 = S.X.data.getD (n - j) 0 := by
-  have hlt : j - 1 < S.X.data.length := by rw [S.isTuryn.x_len]; omega
+  have hlt : j - 1 < S.X.data.length := by rw [S.X.len]; omega
   show S.X.data.reverse.getD (j - 1) 0 = S.X.data.getD (n - j) 0
   unfold List.getD
   rw [List.getElem?_reverse hlt]
-  have : S.X.data.length - 1 - (j - 1) = n - j := by rw [S.isTuryn.x_len]; omega
+  have : S.X.data.length - 1 - (j - 1) = n - j := by rw [S.X.len]; omega
   rw [this]
 
 private lemma xAt_revA_eq {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
@@ -746,7 +680,7 @@ private lemma canonical1_doRevA {n : Nat} (hn : 2 ≤ n) (S : TurynTypeSeq n)
 private lemma xAt_pm_A {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
     xAt S j = 1 ∨ xAt S j = -1 := by
   unfold xAt
-  exact pm_entry_of_getD S.isTuryn.x_pm (by rw [S.isTuryn.x_len]; omega)
+  exact pm_entry_of_getD S.X.pm (by rw [S.X.len]; omega)
 
 /-- Step 2: enforce condition (2) by optional reversal of `A`. -/
 theorem step2_condition2
@@ -813,11 +747,11 @@ satisfies wAt(j) = old wAt(n-j) for 1 ≤ j ≤ n-1.
 lemma wAt_doRevD {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n - 1) :
     wAt S.doRevD j = wAt S (n - j) := by
       convert revD_getD _ using 2;
-      · rw [ S.isTuryn.w_len ];
+      · rw [ S.W.len ];
         rw [ show n - 1 - 1 - ( j - 1 ) = n - j - 1 by omega ];
         rfl;
       · convert Nat.lt_of_lt_of_le ( Nat.sub_lt hj1 zero_lt_one ) hj2 using 1;
-        exact S.isTuryn.w_len
+        exact S.W.len
 
 /-
 After reversing and negating D, the 1-indexed accessor
@@ -836,9 +770,9 @@ lemma xAt_doRevA_at {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj
   unfold xAt TurynTypeSeq.doRevA PmSeq.reverse
   simp only
   convert revD_getD (D := S.X.data) _ using 2
-  · rw [S.isTuryn.x_len]; omega
+  · rw [S.X.len]; omega
   · convert Nat.lt_of_lt_of_le (Nat.sub_lt hj1 zero_lt_one) hj2 using 1
-    exact S.isTuryn.x_len
+    exact S.X.len
 
 lemma xAt_doRevA_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
     xAt S.doRevA (n + 1 - j) = xAt S j := by
@@ -851,9 +785,9 @@ lemma yAt_doRevB_at {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj
   unfold yAt TurynTypeSeq.doRevB PmSeq.reverse
   simp only
   convert revD_getD (D := S.Y.data) _ using 2
-  · rw [S.isTuryn.y_len]; omega
+  · rw [S.Y.len]; omega
   · convert Nat.lt_of_lt_of_le (Nat.sub_lt hj1 zero_lt_one) hj2 using 1
-    exact S.isTuryn.y_len
+    exact S.Y.len
 
 lemma yAt_doRevB_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
     yAt S.doRevB (n + 1 - j) = yAt S j := by
@@ -866,9 +800,9 @@ lemma zAt_doRevC_at {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj
   unfold zAt TurynTypeSeq.doRevC PmSeq.reverse
   simp only
   convert revD_getD (D := S.Z.data) _ using 2
-  · rw [S.isTuryn.z_len]; omega
+  · rw [S.Z.len]; omega
   · convert Nat.lt_of_lt_of_le (Nat.sub_lt hj1 zero_lt_one) hj2 using 1
-    exact S.isTuryn.z_len
+    exact S.Z.len
 
 lemma zAt_doRevC_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat} (hj1 : 1 ≤ j) (hj2 : j ≤ n) :
     zAt S.doRevC (n + 1 - j) = zAt S j := by
@@ -960,12 +894,12 @@ theorem step3_condition3
         exact hj4 (by rw [hrev_j, hrev_mirror]; exact heq.symm)
       -- yAt S (n + 1 - j) is ±1.
       have hpm : yAt S (n + 1 - j) = 1 ∨ yAt S (n + 1 - j) = -1 := by
-        have hpm_B : AllPmOne S.Y.data := S.isTuryn.y_pm
-        exact pm_entry_of_getD hpm_B (by rw [S.isTuryn.y_len]; omega)
+        have hpm_B : AllPmOne S.Y.data := S.Y.pm
+        exact pm_entry_of_getD hpm_B (by rw [S.Y.len]; omega)
       -- yAt S j is ±1.
       have hpm_j : yAt S j = 1 ∨ yAt S j = -1 := by
-        have hpm_B : AllPmOne S.Y.data := S.isTuryn.y_pm
-        exact pm_entry_of_getD hpm_B (by rw [S.isTuryn.y_len]; omega)
+        have hpm_B : AllPmOne S.Y.data := S.Y.pm
+        exact pm_entry_of_getD hpm_B (by rw [S.Y.len]; omega)
       -- Since yAt S j ≠ yAt S (n+1-j) and both are ±1, they are opposite.
       -- We need yAt S.doRevB j = yAt S (n+1-j) = 1.
       rw [hrev_j]
@@ -989,7 +923,7 @@ theorem step3_condition3
     intro i hi1 hi2 hi3 hi4
     -- yAt S i is ±1.
     have hpm : yAt S i = 1 ∨ yAt S i = -1 := by
-      exact pm_entry_of_getD S.isTuryn.y_pm (by rw [S.isTuryn.y_len]; omega)
+      exact pm_entry_of_getD S.Y.pm (by rw [S.Y.len]; omega)
     -- If yAt S i = -1, then hB would be satisfied, contradiction.
     rcases hpm with h_one | h_neg
     · exact h_one
@@ -1006,8 +940,8 @@ private lemma zAt_doNegRevC {n : Nat} (S : TurynTypeSeq n)
   unfold zAt TurynTypeSeq.doNegC TurynTypeSeq.doRevC PmSeq.neg PmSeq.reverse
   simp only [negSeq_getD]; congr 1
   rw [List.getD_eq_getElem?_getD, List.getD_eq_getElem?_getD]; congr 1
-  rw [List.getElem?_reverse (by rw [S.isTuryn.z_len]; omega)]
-  congr 1; rw [S.isTuryn.z_len]; omega
+  rw [List.getElem?_reverse (by rw [S.Z.len]; omega)]
+  congr 1; rw [S.Z.len]; omega
 
 /-- Step 4: enforce condition (4) by optional `−C*`. -/
 theorem step4_condition4
@@ -1034,8 +968,8 @@ theorem step4_condition4
       unfold zAt TurynTypeSeq.doNegC TurynTypeSeq.doRevC PmSeq.neg PmSeq.reverse
       simp only [negSeq_getD]
       rw [List.getD_eq_getElem?_getD]
-      rw [List.getElem?_reverse (by rw [S.isTuryn.z_len]; omega)]
-      rw [S.isTuryn.z_len]
+      rw [List.getElem?_reverse (by rw [S.Z.len]; omega)]
+      rw [S.Z.len]
       unfold zAt at hcn; rw [List.getD_eq_getElem?_getD] at hcn
       have h0 : n - 1 - 0 = n - 1 := by omega
       rw [h0]; linarith
@@ -1068,8 +1002,8 @@ theorem step4_condition4
   · -- Negative case: S itself already satisfies Canonical4
     refine ⟨S, Relation.ReflTransGen.refl, h123.1, h123.2.1, h123.2.2, ?_⟩
     intro i hi1 hi2 hi3 hi4
-    rcases pm_entry_of_getD S.isTuryn.z_pm
-      (show i - 1 < S.Z.data.length by rw [S.isTuryn.z_len]; omega) with h | h
+    rcases pm_entry_of_getD S.Z.pm
+      (show i - 1 < S.Z.data.length by rw [S.Z.len]; omega) with h | h
     · exact h
     · exfalso; exact h_exists ⟨i, hi1, hi2, hi3, hi4, h⟩
 private lemma wAt_doNegRevD_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat}
@@ -1084,7 +1018,7 @@ private lemma wAt_doNegRevD_mirror {n : Nat} (S : TurynTypeSeq n) {j : Nat}
 private lemma wAt_pm' {n : Nat} (S : TurynTypeSeq n) {i : Nat}
     (hi1 : 1 ≤ i) (hi2 : i ≤ n - 1) :
     wAt S i = 1 ∨ wAt S i = -1 :=
-  pm_entry_of_getD S.isTuryn.w_pm (by rw [S.isTuryn.w_len]; omega)
+  pm_entry_of_getD S.W.pm (by rw [S.W.len]; omega)
 
 private lemma wAt_doRevD_n1 {n : Nat} (S : TurynTypeSeq n) (hn : 2 ≤ n) :
     wAt S.doRevD (n - 1) = wAt S 1 := by
@@ -1326,19 +1260,19 @@ private lemma canonical5_doSwap {n : Nat} {S : TurynTypeSeq n}
 
 private lemma step6_xAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi : i - 1 < n) :
     xAt S i = 1 ∨ xAt S i = -1 := by
-  exact pm_entry_of_getD S.isTuryn.x_pm (by rw [S.isTuryn.x_len]; exact hi)
+  exact pm_entry_of_getD S.X.pm (by rw [S.X.len]; exact hi)
 
 private lemma step6_yAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi : i - 1 < n) :
     yAt S i = 1 ∨ yAt S i = -1 := by
-  exact pm_entry_of_getD S.isTuryn.y_pm (by rw [S.isTuryn.y_len]; exact hi)
+  exact pm_entry_of_getD S.Y.pm (by rw [S.Y.len]; exact hi)
 
 private lemma step6_zAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi : i - 1 < n) :
     zAt S i = 1 ∨ zAt S i = -1 := by
-  exact pm_entry_of_getD S.isTuryn.z_pm (by rw [S.isTuryn.z_len]; exact hi)
+  exact pm_entry_of_getD S.Z.pm (by rw [S.Z.len]; exact hi)
 
 private lemma step6_wAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi : i - 1 < n - 1) :
     wAt S i = 1 ∨ wAt S i = -1 := by
-  exact pm_entry_of_getD S.isTuryn.w_pm (by rw [S.isTuryn.w_len]; exact hi)
+  exact pm_entry_of_getD S.W.pm (by rw [S.W.len]; exact hi)
 
 /-
 Autocorrelation of a length-(m+2) sequence at lag m has exactly 2 terms.
@@ -1376,13 +1310,13 @@ private lemma step6_autocorr_lag_n_sub_2
     2 * (zAt S (n - 1) + zAt S 2 * zAt S n) +
     2 * wAt S (n - 1) = 0 := by
   -- Get vanishing at lag n-2
-  have hv := S.isTuryn.vanishing (n - 2) (by omega) (by omega)
+  have hv := S.vanishing (n - 2) (by omega) (by omega)
   unfold combinedAutocorr at hv
   -- Expand each aperiodicAutocorr
-  rw [autocorr_two_terms S.X.data (n - 2) (by rw [S.isTuryn.x_len]; omega),
-      autocorr_two_terms S.Y.data (n - 2) (by rw [S.isTuryn.y_len]; omega),
-      autocorr_two_terms S.Z.data (n - 2) (by rw [S.isTuryn.z_len]; omega),
-      autocorr_one_term S.W.data (n - 2) (by rw [S.isTuryn.w_len]; omega)] at hv
+  rw [autocorr_two_terms S.X.data (n - 2) (by rw [S.X.len]; omega),
+      autocorr_two_terms S.Y.data (n - 2) (by rw [S.Y.len]; omega),
+      autocorr_two_terms S.Z.data (n - 2) (by rw [S.Z.len]; omega),
+      autocorr_one_term S.W.data (n - 2) (by rw [S.W.len]; omega)] at hv
   -- Express xAt/yAt/zAt/wAt as getD
   have eqa_n1 : xAt S (n - 1) = S.X.data.getD (n - 2) 0 := by
     show S.X.data.getD (n - 1 - 1) 0 = S.X.data.getD (n - 2) 0; congr 1
