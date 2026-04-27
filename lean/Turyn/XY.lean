@@ -12,8 +12,8 @@ lemma uAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i �
   unfold uAt aAt bAt
   have hAlen := S.isTuryn.x_len
   have hBlen := S.isTuryn.y_len
-  have hiA : i - 1 < S.A.length := by omega
-  have hiB : i - 1 < S.B.length := by omega
+  have hiA : i - 1 < S.A.data.length := by omega
+  have hiB : i - 1 < S.B.data.length := by omega
   have ha := pm_entry_of_getD S.isTuryn.x_pm hiA
   have hb := pm_entry_of_getD S.isTuryn.y_pm hiB
   rcases ha with ha | ha <;> rcases hb with hb | hb <;>
@@ -42,20 +42,20 @@ lemma uAt_sq {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i �
   rcases h with h | h <;> rw [h] <;> ring
 
 theorem aperiodicAutocorr_A_via_aAt {n : Nat} (S : TurynTypeSeq n) (s : Nat) (hs : s < n) :
-    aperiodicAutocorr S.A s = ∑ i ∈ Finset.range (n - s), aAt S (i + 1) * aAt S (i + 1 + s) := by
+    aperiodicAutocorr S.A.data s = ∑ i ∈ Finset.range (n - s), aAt S (i + 1) * aAt S (i + 1 + s) := by
   unfold aperiodicAutocorr
   rw [if_neg (by rw [S.isTuryn.x_len]; omega)]
-  rw [show S.A.length - s = n - s from by rw [S.isTuryn.x_len]]
+  rw [show S.A.data.length - s = n - s from by rw [S.isTuryn.x_len]]
   apply Finset.sum_congr rfl
   intro i _
   unfold aAt
   simp
 
 theorem aperiodicAutocorr_B_via_aAt {n : Nat} (S : TurynTypeSeq n) (s : Nat) (hs : s < n) :
-    aperiodicAutocorr S.B s = ∑ i ∈ Finset.range (n - s), bAt S (i + 1) * bAt S (i + 1 + s) := by
+    aperiodicAutocorr S.B.data s = ∑ i ∈ Finset.range (n - s), bAt S (i + 1) * bAt S (i + 1 + s) := by
   unfold aperiodicAutocorr
   rw [if_neg (by rw [S.isTuryn.y_len]; omega)]
-  rw [show S.B.length - s = n - s from by rw [S.isTuryn.y_len]]
+  rw [show S.B.data.length - s = n - s from by rw [S.isTuryn.y_len]]
   apply Finset.sum_congr rfl
   intro i _
   unfold bAt
@@ -90,14 +90,14 @@ private lemma summand_identity {n : Nat} (S : TurynTypeSeq n) (i : Nat)
       rw [ h_lhs_rewrite, aAt_sq S i hi1 hi2 ] ; ring
 
 theorem T_k_as_U_sum {n : Nat} (S : TurynTypeSeq n) (k : Nat) (hk : 2 ≤ k) (hkn : k ≤ n - 1) :
-    aperiodicAutocorr S.A (n - k) + aperiodicAutocorr S.B (n - k) =
+    aperiodicAutocorr S.A.data (n - k) + aperiodicAutocorr S.B.data (n - k) =
     ∑ i ∈ Finset.range k,
       aAt S (i + 1) * aAt S (i + 1 + (n - k)) * (1 + uAt S (i + 1) * uAt S (i + 1 + (n - k))) := by
-        have h1 : aperiodicAutocorr S.A (n - k) = ∑ i ∈ Finset.range k, aAt S (i + 1) * aAt S (i + 1 + (n - k)) := by
+        have h1 : aperiodicAutocorr S.A.data (n - k) = ∑ i ∈ Finset.range k, aAt S (i + 1) * aAt S (i + 1 + (n - k)) := by
           convert aperiodicAutocorr_A_via_aAt S ( n - k ) _ using 1;
           · rw [ Nat.sub_sub_self ( by omega ) ];
           · omega
-        have h2 : aperiodicAutocorr S.B (n - k) = ∑ i ∈ Finset.range k, bAt S (i + 1) * bAt S (i + 1 + (n - k)) := by
+        have h2 : aperiodicAutocorr S.B.data (n - k) = ∑ i ∈ Finset.range k, bAt S (i + 1) * bAt S (i + 1 + (n - k)) := by
           convert aperiodicAutocorr_B_via_aAt S ( n - k ) _ using 1;
           · rw [ Nat.sub_sub_self ( by omega ) ];
           · omega;
@@ -141,8 +141,8 @@ From the vanishing condition: N_A(s) + N_B(s) = −2·(N_C(s) + N_D(s)).
 -/
 lemma AB_eq_neg2_CD {n : Nat} (S : TurynTypeSeq n) {s : Nat}
     (hs1 : 1 ≤ s) (hsn : s < n) :
-    aperiodicAutocorr S.A s + aperiodicAutocorr S.B s =
-    -2 * (aperiodicAutocorr S.C s + aperiodicAutocorr S.D s) := by
+    aperiodicAutocorr S.A.data s + aperiodicAutocorr S.B.data s =
+    -2 * (aperiodicAutocorr S.C.data s + aperiodicAutocorr S.D.data s) := by
   have := S.isTuryn.vanishing s hs1 hsn;
   unfold combinedAutocorr at this; linarith;
 
@@ -151,16 +151,16 @@ The sum N_C(s) + N_D(s) is odd for 1 ≤ s ≤ n − 2.
 -/
 lemma autocorr_CD_sum_odd {n : Nat} (S : TurynTypeSeq n) {s : Nat}
     (hs1 : 1 ≤ s) (hsn : s ≤ n - 2) :
-    (aperiodicAutocorr S.C s + aperiodicAutocorr S.D s) % 2 = 1 := by
+    (aperiodicAutocorr S.C.data s + aperiodicAutocorr S.D.data s) % 2 = 1 := by
   -- Since $s \leq n - 2$, we have $s < n$.
   have hs_lt_n : s < n := by
     omega;
   -- Apply the autocorr_mod_two lemma to C and D.
-  have hC : aperiodicAutocorr S.C s % 2 = ((S.C.length - s : Nat) : Int) % 2 := by
+  have hC : aperiodicAutocorr S.C.data s % 2 = ((S.C.data.length - s : Nat) : Int) % 2 := by
     apply autocorr_mod_two;
     · exact S.isTuryn.z_pm;
     · exact hs_lt_n.trans_le ( by linarith [ S.isTuryn.z_len ] )
-  have hD : aperiodicAutocorr S.D s % 2 = ((S.D.length - s : Nat) : Int) % 2 := by
+  have hD : aperiodicAutocorr S.D.data s % 2 = ((S.D.data.length - s : Nat) : Int) % 2 := by
     apply autocorr_mod_two;
     · exact S.isTuryn.w_pm;
     · have := S.isTuryn.w_len; omega;
@@ -178,12 +178,12 @@ lemma neg2_mul_odd_mod4 (m : Int) (hm : m % 2 = 1) : (-2 * m) % 4 = 2 := by
     for 2 ≤ k ≤ n − 1.  (Best–Đoković–Kharaghani–Ramp, arXiv:1206.4107)
 -/
 theorem parity_hammer {n : Nat} (S : TurynTypeSeq n) (k : Nat) (hk : 2 ≤ k) (hkn : k ≤ n - 1) :
-    (aperiodicAutocorr S.A (n - k) + aperiodicAutocorr S.B (n - k)) % 4 = 2 := by
+    (aperiodicAutocorr S.A.data (n - k) + aperiodicAutocorr S.B.data (n - k)) % 4 = 2 := by
   -- Use AB_eq_neg2_CD S hs1 hsn to rewrite LHS as (-2 * (autocorr C s + autocorr D s)) % 4.
-  have h_sum : (aperiodicAutocorr S.A (n - k) + aperiodicAutocorr S.B (n - k)) = -2 * (aperiodicAutocorr S.C (n - k) + aperiodicAutocorr S.D (n - k)) := by
+  have h_sum : (aperiodicAutocorr S.A.data (n - k) + aperiodicAutocorr S.B.data (n - k)) = -2 * (aperiodicAutocorr S.C.data (n - k) + aperiodicAutocorr S.D.data (n - k)) := by
     exact AB_eq_neg2_CD S ( Nat.sub_pos_of_lt ( by omega ) ) ( Nat.sub_lt ( by omega ) ( by omega ) );
   -- Use autocorr_CD_sum_odd S hs1 hsn2 to get (autocorr C s + autocorr D s) % 2 = 1.
-  have h_odd : (aperiodicAutocorr S.C (n - k) + aperiodicAutocorr S.D (n - k)) % 2 = 1 := by
+  have h_odd : (aperiodicAutocorr S.C.data (n - k) + aperiodicAutocorr S.D.data (n - k)) % 2 = 1 := by
     apply autocorr_CD_sum_odd;
     · omega;
     · omega;
@@ -229,7 +229,7 @@ theorem xy_base_k3 {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
     (hc : Canonical1 n S) : uAt S (n - 2) = -(uAt S 3) := by
       -- Apply xy_base_common with the given conditions.
       apply xy_base_common (aAt S (n - 2)) (aAt S 3) (uAt S (n - 2)) (uAt S 3) (aAt_pm S (n - 2) (by omega) (by omega)) (aAt_pm S 3 (by omega) (by omega)) (uAt_pm S (n - 2) (by omega) (by omega)) (uAt_pm S 3 (by omega) (by omega));
-      have hT3_mod4 : (aperiodicAutocorr S.A (n - 3) + aperiodicAutocorr S.B (n - 3)) % 4 = 2 := by
+      have hT3_mod4 : (aperiodicAutocorr S.A.data (n - 3) + aperiodicAutocorr S.B.data (n - 3)) % 4 = 2 := by
         apply parity_hammer S 3 (by omega) (by omega);
       convert hT3_mod4 using 1;
       rw [ Turyn.T_k_as_U_sum S 3 ( by omega ) ( by omega ) ] ; norm_num [ Finset.sum_range_succ ] ; ring_nf;
@@ -529,7 +529,7 @@ theorem xy_product_law {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
       first_summand_eq S k hk2 hkn hc
     have hfk : f (k - 1) = aAt S k * (1 + uAt S k) :=
       last_summand_eq S k hk2 hkn hc
-    have hTsum : aperiodicAutocorr S.A (n - k) + aperiodicAutocorr S.B (n - k) =
+    have hTsum : aperiodicAutocorr S.A.data (n - k) + aperiodicAutocorr S.B.data (n - k) =
       (aAt S (n + 1 - k) * (1 + uAt S (n + 1 - k)) + aAt S k * (1 + uAt S k)) +
       (∑ i ∈ Finset.Ico 1 (k - 1),
         aAt S (i + 1) * aAt S (i + 1 + (n - k)) *
@@ -541,7 +541,7 @@ theorem xy_product_law {n : Nat} (S : TurynTypeSeq n) (hn : 4 ≤ n)
           (1 + uAt S (i + 1) * uAt S (i + 1 + (n - k)))) % 4 = 0 := by
             apply interior_sum_mod4_zero S k (by linarith) (by linarith) hc (fun j hj1 hj2 => ih j (by linarith) hj1 (by omega));
     -- By the parity hammer, the total sum is congruent to 2 modulo 4.
-    have h_total : (aperiodicAutocorr S.A (n - k) + aperiodicAutocorr S.B (n - k)) % 4 = 2 := by
+    have h_total : (aperiodicAutocorr S.A.data (n - k) + aperiodicAutocorr S.B.data (n - k)) % 4 = 2 := by
       apply parity_hammer S k hk2 hkn;
     -- By the endpoint pair modulo 4 lemma, if the endpoint sum is congruent to 2 modulo 4, then the uAt values must be negatives of each other.
     apply (endpoint_pair_mod4 S k hk2 hkn hc).mp;
