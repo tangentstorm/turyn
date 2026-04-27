@@ -2443,6 +2443,21 @@ impl Solver {
         let k = kind as usize;
         self.prop_by_kind_level.iter().map(|row| row[k]).sum()
     }
+    /// Per-propagator forced-variable counts as a single batched read,
+    /// returning every column sum in one pass over `prop_by_kind_level`.
+    /// Equivalent to calling `propagations_by_kind` for every variant of
+    /// `PropKind` but iterates the 2-D matrix exactly once instead of
+    /// `COUNT` times — useful for the sync walker's per-frame telemetry
+    /// hot path which reads pre/post deltas across all kinds.
+    pub fn propagations_by_kind_totals(&self) -> [u64; PropKind::COUNT] {
+        let mut totals = [0u64; PropKind::COUNT];
+        for row in &self.prop_by_kind_level {
+            for k in 0..PropKind::COUNT {
+                totals[k] += row[k];
+            }
+        }
+        totals
+    }
     /// Per-`[decision_level][PropKind]` forced-variable counts.
     /// `result[L][K]` is the total number of times propagator `K` forced
     /// a literal while the solver was at decision level `L`. Reading
