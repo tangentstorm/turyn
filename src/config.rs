@@ -338,6 +338,25 @@ pub(crate) struct SearchConfig {
     /// is a no-op. Enabled via `--conj-tuple` (see
     /// conjectures/positive-tuple.md).
     pub(crate) conj_tuple: bool,
+    /// Master RNG seed.  Every per-stage xorshift state, sync-walker
+    /// shuffle seed, and stochastic-mode seed is derived from this
+    /// single value via fixed multiplication by a distinct odd
+    /// constant.  Default `0` means deterministic-by-default: the
+    /// same `--seed=0` invocation produces the same boundary visit
+    /// order and the same per-feature counter totals at fixed-work
+    /// stop, modulo unavoidable cross-thread dispatch jitter.
+    /// Override via `--seed=N` on the command line.
+    pub(crate) seed: u64,
+    /// Worker thread count override.  `None` (default) means
+    /// auto-detect via `available_parallelism()` for sync, and the
+    /// MDD framework engine's built-in `worker_count = 1` for
+    /// apart/together/cross.  `Some(N)` forces both to `N`.
+    /// `--threads=1` is the canonical "deterministic counter mode"
+    /// — combined with `--seed=N` it guarantees bit-exact counter
+    /// totals across reruns of the same binary, which is what
+    /// makes sub-1 % effects detectable via counter ratios rather
+    /// than wall-clock noise.
+    pub(crate) threads: Option<usize>,
 }
 
 /// Which (Z, W) candidate producer feeds the shared XY SAT stage.
@@ -397,6 +416,8 @@ impl Default for SearchConfig {
             conj_xy_product: false,
             conj_zw_bound: false,
             conj_tuple: false,
+            seed: 0,
+            threads: None,
         }
     }
 }
@@ -474,6 +495,12 @@ impl SearchConfig {
         if let Some(x) = self.bench_cover_log2 {
             parts.push(format!("--bench-cover-log2={x}"));
         }
+        if self.seed != 0 {
+            parts.push(format!("--seed={}", self.seed));
+        }
+        if let Some(t) = self.threads {
+            parts.push(format!("--threads={t}"));
+        }
         if self.continue_after_sat {
             parts.push("--all".into());
         }
@@ -508,10 +535,12 @@ impl SearchConfig {
         if let Some(d) = self.dump_dimacs.as_ref() {
             parts.push(format!("--dump-dimacs={d}"));
         }
-        let threads = std::env::var("TURYN_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or_else(num_cpus_or_one);
+        let threads = self.threads.unwrap_or_else(|| {
+            std::env::var("TURYN_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or_else(num_cpus_or_one)
+        });
         format!("turyn settings: {}  (threads={threads})", parts.join(" "))
     }
 }

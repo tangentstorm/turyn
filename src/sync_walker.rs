@@ -82,6 +82,12 @@ pub(crate) struct SyncConfig {
     /// at the first solution. The shared cancel flag is not tripped
     /// on first hit; each worker collects every leaf it reaches.
     pub all: bool,
+    /// Override worker thread count.  `None` means auto-detect via
+    /// `TURYN_THREADS` / `RAYON_NUM_THREADS` / `available_parallelism`
+    /// (legacy default).  Set to `Some(1)` for deterministic
+    /// single-thread counter measurement.  Wired from
+    /// `SearchConfig.threads` (`--threads=N`).
+    pub workers: Option<usize>,
 }
 
 /// Flush the live sink every this many visited DFS nodes. 1024 is
@@ -1122,12 +1128,17 @@ pub(crate) fn search_sync(
     // pruning. First worker to find a solution cancels the others
     // via a shared AtomicBool.
     //
-    // Respect `TURYN_THREADS` (and `RAYON_NUM_THREADS`) so users can
-    // pin the parallelism for bench reproducibility — matches the MDD
-    // pipeline's behaviour documented in CLAUDE.md.
-    let n_workers = std::env::var("TURYN_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    // Worker count precedence: explicit `cfg.workers` (set by
+    // `--threads=N` from the SearchConfig path) > `TURYN_THREADS` env
+    // var > `RAYON_NUM_THREADS` env var > `available_parallelism()`.
+    // `--threads=1` is the canonical deterministic counter mode.
+    let n_workers = cfg
+        .workers
+        .or_else(|| {
+            std::env::var("TURYN_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+        })
         .or_else(|| {
             std::env::var("RAYON_NUM_THREADS")
                 .ok()
@@ -1287,11 +1298,21 @@ fn search_sync_parallel(
             let live_sink = Arc::clone(&live_sinks[worker_id]);
             let live_sink_for_flush = Arc::clone(&live_sink);
             s.spawn(move || {
-                // Worker 0: seed=0 → score-sorted best-first siblings.
-                // Worker k>0: seed=k → randomised ordering distinct
-                // from every other worker.
+                // Each worker derives its sibling-shuffle seed by
+                // mixing the inherited master seed with its
+                // `worker_id`.  When the master seed is `0` (default)
+                // the result still reduces to the historical
+                // worker-0 = score-sorted, worker-k = LCG-shuffled
+                // pattern, but a non-zero `--seed=N` shifts every
+                // worker's stream so paired before/after runs that
+                // change the master seed don't depend on a hidden
+                // constant.
+                let master = cfg.random_seed.unwrap_or(0);
+                let worker_seed = master
+                    .wrapping_mul(0x9e3779b97f4a7c15)
+                    .wrapping_add(worker_id as u64);
                 let worker_cfg = SyncConfig {
-                    random_seed: Some(worker_id as u64),
+                    random_seed: Some(worker_seed),
                     cancel: Some(Arc::clone(&cancel)),
                     exchange: Some(Arc::clone(&exchange)),
                     live_sink: Some(live_sink),

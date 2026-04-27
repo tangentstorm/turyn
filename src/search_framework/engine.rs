@@ -219,6 +219,19 @@ impl<T: Send + 'static> SearchEngine<T> {
                                 if shutdown.load(Ordering::Acquire) {
                                     break None;
                                 }
+                                // Cancellation cuts new work too, not just
+                                // shutdown.  Without this the worker pops
+                                // and runs ONE more item after the
+                                // coordinator set `cancelled` for a
+                                // bench-target hit, bumping counters
+                                // beyond the deterministic stop point.
+                                // That extra item is the source of the
+                                // counter-variance at `--bench-cover-log2
+                                // --threads=1 --seed=0` mode; preventing
+                                // it makes the regime bit-exact.
+                                if cancelled.load(Ordering::Relaxed) {
+                                    break None;
+                                }
                                 if let Some(item) = guard.pop() {
                                     // Increment while still holding the lock
                                     // so the coordinator's "is the queue
@@ -313,10 +326,17 @@ impl<T: Send + 'static> SearchEngine<T> {
                 if last_progress.elapsed() >= self.cfg.progress_interval {
                     last_progress = Instant::now();
                     poll_mass(&*mass_model, &mut mass, &mut high_total);
-                    if bench_target_reached(&*mass_model, &mass, self.cfg.bench_stop_log2_work) {
-                        self.cancelled.store(true, Ordering::Relaxed);
-                        break;
-                    }
+                    // Bench-target cancellation is only fired from the
+                    // event-driven branch above (every WorkerReport
+                    // checks the target), NOT from this wall-clock
+                    // progress tick.  Otherwise, the exact item count
+                    // at which `bench-cover-log2` cancels would depend
+                    // on whether a 50 ms timer expired before or after
+                    // the last item finished — which is wall-clock-
+                    // dependent and therefore non-deterministic.  The
+                    // event-driven check is sufficient: as soon as
+                    // covered_mass crosses the target, the next
+                    // worker report fires the cancel.
                     on_event(SearchEvent::Progress(build_snapshot(
                         start.elapsed(),
                         &mass,

@@ -2816,12 +2816,13 @@ pub(crate) fn run_mdd_sat_search(
             sat_secs: cfg.sat_secs,
             sat_config: cfg.sat_config.clone(),
             conflict_limit: cfg.conflict_limit,
-            random_seed: None,
+            random_seed: Some(cfg.seed),
             cancel: None,
             exchange: None,
             projected_fraction_ppm: None,
             live_sink: None,
             all: cfg.continue_after_sat || cfg.bench_cover_log2.is_some(),
+            workers: cfg.threads,
         };
         let _ = tuples;
         let (adapter, result_rx) = SyncAdapter::build(problem, sync_cfg, verbose);
@@ -2869,8 +2870,13 @@ pub(crate) fn run_mdd_sat_search(
         WzMode::Together => "together",
         WzMode::Sync => unreachable!("sync branched above"),
     };
-    let mut engine =
-        SearchEngine::<MddPayload>::new(EngineConfig::default(), Box::new(LaneByPriority::new()));
+    let mut engine = SearchEngine::<MddPayload>::new(
+        EngineConfig {
+            worker_count: cfg.threads.unwrap_or_else(num_cpus_or_one),
+            ..EngineConfig::default()
+        },
+        Box::new(LaneByPriority::new()),
+    );
     let cancel_flag = engine.cancel_flag();
     let (adapter, result_rx) = MddStagesAdapter::build(
         problem,
