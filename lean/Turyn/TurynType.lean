@@ -165,6 +165,54 @@ def seqSum {n : Nat} (a : Fin n → Int) : Int := ∑ i : Fin n, a i
 /-- Sum of all entries in a `List Int` sequence. -/
 def seqSumList (a : List Int) : Int := ∑ i ∈ range a.length, a.getD i 0
 
+/-! ### List view of a function-typed sequence
+
+For backwards compatibility with list-based proof scripts: a function on
+`Fin n` extends to a `List Int` via `List.ofFn`, and we provide simp lemmas
+relating the two views. -/
+
+/-- The list view of a function-typed sequence. -/
+def PmSeq.toList {n : Nat} (s : PmSeq n) : List Int := List.ofFn s.data
+
+/-- The list view of a sign sequence. -/
+def SignSeq.toList {n : Nat} (s : SignSeq n) : List Int := List.ofFn s.data
+
+@[simp] lemma PmSeq.toList_length {n : Nat} (s : PmSeq n) : s.toList.length = n := by
+  simp [PmSeq.toList]
+
+@[simp] lemma SignSeq.toList_length {n : Nat} (s : SignSeq n) : s.toList.length = n := by
+  simp [SignSeq.toList]
+
+lemma PmSeq.toList_getD {n : Nat} (s : PmSeq n) (i : Nat) :
+    s.toList.getD i 0 = lookupNat s.data i := by
+  unfold lookupNat PmSeq.toList
+  by_cases h : i < n
+  · rw [List.getD_eq_getElem _ _ (by simp [h])]
+    simp [List.getElem_ofFn, h]
+  · rw [List.getD_eq_default _ _ (by simp; omega)]
+    simp [h]
+
+lemma SignSeq.toList_getD {n : Nat} (s : SignSeq n) (i : Nat) :
+    s.toList.getD i 0 = lookupNat s.data i := by
+  unfold lookupNat SignSeq.toList
+  by_cases h : i < n
+  · rw [List.getD_eq_getElem _ _ (by simp [h])]
+    simp [List.getElem_ofFn, h]
+  · rw [List.getD_eq_default _ _ (by simp; omega)]
+    simp [h]
+
+lemma PmSeq.toList_AllPmOne {n : Nat} (s : PmSeq n) : AllPmOneList s.toList := by
+  intro v hv
+  simp [PmSeq.toList, List.mem_ofFn] at hv
+  obtain ⟨i, rfl⟩ := hv
+  exact s.pm i
+
+lemma SignSeq.toList_AllSignOne {n : Nat} (s : SignSeq n) : AllSignOneList s.toList := by
+  intro v hv
+  simp [SignSeq.toList, List.mem_ofFn] at hv
+  obtain ⟨i, rfl⟩ := hv
+  exact s.sign i
+
 /-! ### ±1 lemmas -/
 
 theorem pmone_sq (a : Int) (h : a = 1 ∨ a = -1) : a * a = 1 := by
