@@ -1,5 +1,7 @@
 import Turyn.BaseSequence
-import Mathlib
+import Mathlib.Algebra.BigOperators.Group.Finset.Basic
+import Mathlib.Data.List.GetD
+import Mathlib.Tactic
 
 open Finset
 open BigOperators
@@ -48,21 +50,20 @@ def tSequences (x y z w : List Int) :
 /-- The Hadamard order produced by the Turyn pipeline. -/
 def hadamardOrder (n : Nat) : Nat := 4 * (3 * n - 1)
 
-/-- Honest Step 2 output: a typed T-sequence object of length `m`. -/
+/-- Honest Step 2 output: a typed T-sequence object of length `m`.
+    Each component is a `SignSeq m` ({0, ±1} entries with carrier-level
+    length proof). -/
 structure TSequence (m : Nat) where
-  a : List Int
-  b : List Int
-  c : List Int
-  d : List Int
-  a_len : a.length = m
-  b_len : b.length = m
-  c_len : c.length = m
-  d_len : d.length = m
+  a : SignSeq m
+  b : SignSeq m
+  c : SignSeq m
+  d : SignSeq m
   support : ∀ i, i < m →
-    Int.natAbs (a.getD i 0) + Int.natAbs (b.getD i 0) +
-      Int.natAbs (c.getD i 0) + Int.natAbs (d.getD i 0) = 1
+    Int.natAbs (a.data.getD i 0) + Int.natAbs (b.data.getD i 0) +
+      Int.natAbs (c.data.getD i 0) + Int.natAbs (d.data.getD i 0) = 1
   periodic_vanishing :
-    ∀ s, 1 ≤ s → s < m → combinedPeriodicAutocorr a b c d s = 0
+    ∀ s, 1 ≤ s → s < m →
+      combinedPeriodicAutocorr a.data b.data c.data d.data s = 0
 
 /-- The four raw list components used by Step 2. -/
 def step2a {n : Nat} (T : TurynType n) : List Int :=
@@ -473,27 +474,62 @@ theorem step2_periodic {n : Nat} (T : TurynType n) :
   have h2 := step2_aperiodic_vanishing T (m - s) (by omega)
   linarith
 
+/-- An integer with `natAbs ≤ 1` is `0`, `1`, or `−1`. -/
+private lemma int_natAbs_le_one_cases (v : Int) (hv : Int.natAbs v ≤ 1) :
+    v = 0 ∨ v = 1 ∨ v = -1 := by
+  have h1 : -1 ≤ v := by
+    rcases Int.natAbs_eq v with heq | heq <;> rw [heq] <;> omega
+  have h2 : v ≤ 1 := by
+    rcases Int.natAbs_eq v with heq | heq <;> rw [heq] <;> omega
+  omega
+
+/-- The four step-2 outputs are pointwise in `{0, ±1}`: each entry comes
+    either from a `±1` source (`T.z`, `T.w`, half-sum of `T.x±T.y`) or from
+    a zero-pad. -/
+private lemma step2_allSignOne_of_support {a b c d : List Int} {m : Nat}
+    (ha_len : a.length = m) (hb_len : b.length = m)
+    (hc_len : c.length = m) (hd_len : d.length = m)
+    (hsupp : ∀ i, i < m →
+      Int.natAbs (a.getD i 0) + Int.natAbs (b.getD i 0) +
+        Int.natAbs (c.getD i 0) + Int.natAbs (d.getD i 0) = 1) :
+    AllSignOne a ∧ AllSignOne b ∧ AllSignOne c ∧ AllSignOne d := by
+  have helper : ∀ (xs : List Int), xs.length = m →
+      (∀ i, i < m → Int.natAbs (xs.getD i 0) ≤ 1) → AllSignOne xs := by
+    intro xs hxs h v hv
+    obtain ⟨i, hi, hget⟩ := List.mem_iff_getElem.mp hv
+    have hi' : i < m := by rw [hxs] at hi; exact hi
+    have hgetD : xs.getD i 0 = v := by
+      rw [List.getD_eq_getElem _ _ hi]; exact hget
+    have hnat : Int.natAbs v ≤ 1 := by rw [← hgetD]; exact h i hi'
+    exact int_natAbs_le_one_cases v hnat
+  refine ⟨helper a ha_len ?_, helper b hb_len ?_, helper c hc_len ?_, helper d hd_len ?_⟩ <;>
+    intro i hi <;>
+    have := hsupp i hi <;>
+    omega
+
 /-- Step 2 as a typed function from Turyn data to a certified T-sequence. -/
 def step2 {n : Nat} (T : TurynType n) : TSequence (3 * n - 1) :=
-  { a := step2a T
-    b := step2b T
-    c := step2c T
-    d := step2d T
-    a_len := by
-      simp [step2a, zeroSeq, T.z.len]
-      omega
-    b_len := by
-      simp [step2b, zeroSeq, T.w.len]
-      omega
-    c_len := by
-      simp [step2c, zeroSeq, seqSumHalf, List.length_zipWith, T.x.len, T.y.len]
-      omega
-    d_len := by
-      simp [step2d, zeroSeq, seqDiffHalf, List.length_zipWith, T.x.len, T.y.len]
-      omega
-    support := by
-      intro i hi
-      exact step2_support T i hi
-    periodic_vanishing := by
-      intro s hs1 hs2
-      exact step2_periodic T s hs1 hs2 }
+  let a := step2a T
+  let b := step2b T
+  let c := step2c T
+  let d := step2d T
+  have ha_len : a.length = 3 * n - 1 := by
+    simp [a, step2a, zeroSeq, T.z.len]; omega
+  have hb_len : b.length = 3 * n - 1 := by
+    simp [b, step2b, zeroSeq, T.w.len]; omega
+  have hc_len : c.length = 3 * n - 1 := by
+    simp [c, step2c, zeroSeq, seqSumHalf, List.length_zipWith, T.x.len, T.y.len]; omega
+  have hd_len : d.length = 3 * n - 1 := by
+    simp [d, step2d, zeroSeq, seqDiffHalf, List.length_zipWith, T.x.len, T.y.len]; omega
+  have hsupp : ∀ i, i < 3 * n - 1 →
+      Int.natAbs (a.getD i 0) + Int.natAbs (b.getD i 0) +
+        Int.natAbs (c.getD i 0) + Int.natAbs (d.getD i 0) = 1 :=
+    fun i hi => step2_support T i hi
+  let ⟨ha_sign, hb_sign, hc_sign, hd_sign⟩ :=
+    step2_allSignOne_of_support ha_len hb_len hc_len hd_len hsupp
+  { a := ⟨a, ha_len, ha_sign⟩
+    b := ⟨b, hb_len, hb_sign⟩
+    c := ⟨c, hc_len, hc_sign⟩
+    d := ⟨d, hd_len, hd_sign⟩
+    support := by intro i hi; exact step2_support T i hi
+    periodic_vanishing := by intro s hs1 hs2; exact step2_periodic T s hs1 hs2 }

@@ -1,5 +1,7 @@
-import Mathlib
+import Mathlib.Algebra.BigOperators.Group.Finset.Basic
 import Mathlib.Algebra.BigOperators.Intervals
+import Mathlib.Data.List.GetD
+import Mathlib.Tactic
 
 open Finset
 open BigOperators

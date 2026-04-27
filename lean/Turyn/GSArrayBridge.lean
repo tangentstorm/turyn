@@ -23,22 +23,22 @@ def listToIntVec {n : Nat} (xs : List Int) : IntVec n :=
 /-- First GS combination extracted from a T-sequence. -/
 def tseqCombine1 {m : Nat} (T : TSequence m) : List Int :=
   (List.range m).map fun j =>
-    T.a.getD j 0 + T.b.getD j 0 + T.c.getD j 0 + T.d.getD j 0
+    T.a.data.getD j 0 + T.b.data.getD j 0 + T.c.data.getD j 0 + T.d.data.getD j 0
 
 /-- Second GS combination extracted from a T-sequence. -/
 def tseqCombine2 {m : Nat} (T : TSequence m) : List Int :=
   (List.range m).map fun j =>
-    T.a.getD j 0 + T.b.getD j 0 - T.c.getD j 0 - T.d.getD j 0
+    T.a.data.getD j 0 + T.b.data.getD j 0 - T.c.data.getD j 0 - T.d.data.getD j 0
 
 /-- Third GS combination extracted from a T-sequence. -/
 def tseqCombine3 {m : Nat} (T : TSequence m) : List Int :=
   (List.range m).map fun j =>
-    T.a.getD j 0 - T.b.getD j 0 + T.c.getD j 0 - T.d.getD j 0
+    T.a.data.getD j 0 - T.b.data.getD j 0 + T.c.data.getD j 0 - T.d.data.getD j 0
 
 /-- Fourth GS combination extracted from a T-sequence. -/
 def tseqCombine4 {m : Nat} (T : TSequence m) : List Int :=
   (List.range m).map fun j =>
-    T.a.getD j 0 - T.b.getD j 0 - T.c.getD j 0 + T.d.getD j 0
+    T.a.data.getD j 0 - T.b.data.getD j 0 - T.c.data.getD j 0 + T.d.data.getD j 0
 
 /-- Length of `tseqCombine1`. -/
 @[simp] lemma tseqCombine1_length {m : Nat} (T : TSequence m) :
@@ -59,28 +59,28 @@ def tseqCombine4 {m : Nat} (T : TSequence m) : List Int :=
 /-- Indexing into `tseqCombine1`. -/
 @[simp] lemma tseqCombine1_getD {m : Nat} (T : TSequence m) {j : Nat} (hj : j < m) :
     (tseqCombine1 T).getD j 0 =
-      T.a.getD j 0 + T.b.getD j 0 + T.c.getD j 0 + T.d.getD j 0 := by
+      T.a.data.getD j 0 + T.b.data.getD j 0 + T.c.data.getD j 0 + T.d.data.getD j 0 := by
   rw [List.getD_eq_getElem _ _ (by simpa [tseqCombine1] using hj)]
   simp [tseqCombine1]
 
 /-- Indexing into `tseqCombine2`. -/
 @[simp] lemma tseqCombine2_getD {m : Nat} (T : TSequence m) {j : Nat} (hj : j < m) :
     (tseqCombine2 T).getD j 0 =
-      T.a.getD j 0 + T.b.getD j 0 - T.c.getD j 0 - T.d.getD j 0 := by
+      T.a.data.getD j 0 + T.b.data.getD j 0 - T.c.data.getD j 0 - T.d.data.getD j 0 := by
   rw [List.getD_eq_getElem _ _ (by simpa [tseqCombine2] using hj)]
   simp [tseqCombine2]
 
 /-- Indexing into `tseqCombine3`. -/
 @[simp] lemma tseqCombine3_getD {m : Nat} (T : TSequence m) {j : Nat} (hj : j < m) :
     (tseqCombine3 T).getD j 0 =
-      T.a.getD j 0 - T.b.getD j 0 + T.c.getD j 0 - T.d.getD j 0 := by
+      T.a.data.getD j 0 - T.b.data.getD j 0 + T.c.data.getD j 0 - T.d.data.getD j 0 := by
   rw [List.getD_eq_getElem _ _ (by simpa [tseqCombine3] using hj)]
   simp [tseqCombine3]
 
 /-- Indexing into `tseqCombine4`. -/
 @[simp] lemma tseqCombine4_getD {m : Nat} (T : TSequence m) {j : Nat} (hj : j < m) :
     (tseqCombine4 T).getD j 0 =
-      T.a.getD j 0 - T.b.getD j 0 - T.c.getD j 0 + T.d.getD j 0 := by
+      T.a.data.getD j 0 - T.b.data.getD j 0 - T.c.data.getD j 0 + T.d.data.getD j 0 := by
   rw [List.getD_eq_getElem _ _ (by simpa [tseqCombine4] using hj)]
   simp [tseqCombine4]
 
@@ -98,8 +98,8 @@ lemma tseqCombine1_pmOne {m : Nat} (T : TSequence m) :
   intro j hj
   rw [tseqCombine1_getD T hj]
   have h_support := T.support j hj
-  have : T.a.getD j 0 + 1 * T.b.getD j 0 + 1 * T.c.getD j 0 + 1 * T.d.getD j 0 =
-      T.a.getD j 0 + T.b.getD j 0 + T.c.getD j 0 + T.d.getD j 0 := by ring
+  have : T.a.data.getD j 0 + 1 * T.b.data.getD j 0 + 1 * T.c.data.getD j 0 + 1 * T.d.data.getD j 0 =
+      T.a.data.getD j 0 + T.b.data.getD j 0 + T.c.data.getD j 0 + T.d.data.getD j 0 := by ring
   rw [← this]
   exact natAbs_four_sum_eq_one_pmOne _ _ _ _ 1 1 1 (Or.inl rfl) (Or.inl rfl) (Or.inl rfl) h_support
 
@@ -109,8 +109,8 @@ lemma tseqCombine2_pmOne {m : Nat} (T : TSequence m) :
   intro j hj
   rw [tseqCombine2_getD T hj]
   have h_support := T.support j hj
-  have : T.a.getD j 0 + 1 * T.b.getD j 0 + (-1) * T.c.getD j 0 + (-1) * T.d.getD j 0 =
-      T.a.getD j 0 + T.b.getD j 0 - T.c.getD j 0 - T.d.getD j 0 := by ring
+  have : T.a.data.getD j 0 + 1 * T.b.data.getD j 0 + (-1) * T.c.data.getD j 0 + (-1) * T.d.data.getD j 0 =
+      T.a.data.getD j 0 + T.b.data.getD j 0 - T.c.data.getD j 0 - T.d.data.getD j 0 := by ring
   rw [← this]
   exact natAbs_four_sum_eq_one_pmOne _ _ _ _ 1 (-1) (-1) (Or.inl rfl) (Or.inr rfl) (Or.inr rfl) h_support
 
@@ -120,8 +120,8 @@ lemma tseqCombine3_pmOne {m : Nat} (T : TSequence m) :
   intro j hj
   rw [tseqCombine3_getD T hj]
   have h_support := T.support j hj
-  have : T.a.getD j 0 + (-1) * T.b.getD j 0 + 1 * T.c.getD j 0 + (-1) * T.d.getD j 0 =
-      T.a.getD j 0 - T.b.getD j 0 + T.c.getD j 0 - T.d.getD j 0 := by ring
+  have : T.a.data.getD j 0 + (-1) * T.b.data.getD j 0 + 1 * T.c.data.getD j 0 + (-1) * T.d.data.getD j 0 =
+      T.a.data.getD j 0 - T.b.data.getD j 0 + T.c.data.getD j 0 - T.d.data.getD j 0 := by ring
   rw [← this]
   exact natAbs_four_sum_eq_one_pmOne _ _ _ _ (-1) 1 (-1) (Or.inr rfl) (Or.inl rfl) (Or.inr rfl) h_support
 
@@ -131,23 +131,23 @@ lemma tseqCombine4_pmOne {m : Nat} (T : TSequence m) :
   intro j hj
   rw [tseqCombine4_getD T hj]
   have h_support := T.support j hj
-  have : T.a.getD j 0 + (-1) * T.b.getD j 0 + (-1) * T.c.getD j 0 + 1 * T.d.getD j 0 =
-      T.a.getD j 0 - T.b.getD j 0 - T.c.getD j 0 + T.d.getD j 0 := by ring
+  have : T.a.data.getD j 0 + (-1) * T.b.data.getD j 0 + (-1) * T.c.data.getD j 0 + 1 * T.d.data.getD j 0 =
+      T.a.data.getD j 0 - T.b.data.getD j 0 - T.c.data.getD j 0 + T.d.data.getD j 0 := by ring
   rw [← this]
   exact natAbs_four_sum_eq_one_pmOne _ _ _ _ (-1) (-1) 1 (Or.inr rfl) (Or.inr rfl) (Or.inl rfl) h_support
 
 /-- Summand-level GS identity for a single coordinate pair. -/
 lemma tseqCombine_summand_identity {m : Nat} (T : TSequence m) (i j : Nat) :
-    (T.a.getD i 0 + T.b.getD i 0 + T.c.getD i 0 + T.d.getD i 0) *
-        (T.a.getD j 0 + T.b.getD j 0 + T.c.getD j 0 + T.d.getD j 0) +
-      (T.a.getD i 0 + T.b.getD i 0 - T.c.getD i 0 - T.d.getD i 0) *
-        (T.a.getD j 0 + T.b.getD j 0 - T.c.getD j 0 - T.d.getD j 0) +
-      (T.a.getD i 0 - T.b.getD i 0 + T.c.getD i 0 - T.d.getD i 0) *
-        (T.a.getD j 0 - T.b.getD j 0 + T.c.getD j 0 - T.d.getD j 0) +
-      (T.a.getD i 0 - T.b.getD i 0 - T.c.getD i 0 + T.d.getD i 0) *
-        (T.a.getD j 0 - T.b.getD j 0 - T.c.getD j 0 + T.d.getD j 0) =
-      4 * (T.a.getD i 0 * T.a.getD j 0 + T.b.getD i 0 * T.b.getD j 0 +
-        T.c.getD i 0 * T.c.getD j 0 + T.d.getD i 0 * T.d.getD j 0) := by
+    (T.a.data.getD i 0 + T.b.data.getD i 0 + T.c.data.getD i 0 + T.d.data.getD i 0) *
+        (T.a.data.getD j 0 + T.b.data.getD j 0 + T.c.data.getD j 0 + T.d.data.getD j 0) +
+      (T.a.data.getD i 0 + T.b.data.getD i 0 - T.c.data.getD i 0 - T.d.data.getD i 0) *
+        (T.a.data.getD j 0 + T.b.data.getD j 0 - T.c.data.getD j 0 - T.d.data.getD j 0) +
+      (T.a.data.getD i 0 - T.b.data.getD i 0 + T.c.data.getD i 0 - T.d.data.getD i 0) *
+        (T.a.data.getD j 0 - T.b.data.getD j 0 + T.c.data.getD j 0 - T.d.data.getD j 0) +
+      (T.a.data.getD i 0 - T.b.data.getD i 0 - T.c.data.getD i 0 + T.d.data.getD i 0) *
+        (T.a.data.getD j 0 - T.b.data.getD j 0 - T.c.data.getD j 0 + T.d.data.getD j 0) =
+      4 * (T.a.data.getD i 0 * T.a.data.getD j 0 + T.b.data.getD i 0 * T.b.data.getD j 0 +
+        T.c.data.getD i 0 * T.c.data.getD j 0 + T.d.data.getD i 0 * T.d.data.getD j 0) := by
   ring
 
 /-- Periodic summand identity for GS combinations at a single index. -/
@@ -156,10 +156,10 @@ lemma tseqCombine_periodic_summand_identity {m : Nat} (T : TSequence m) (s i : N
       (tseqCombine2 T).getD i 0 * (tseqCombine2 T).getD ((i + s) % m) 0 +
       (tseqCombine3 T).getD i 0 * (tseqCombine3 T).getD ((i + s) % m) 0 +
       (tseqCombine4 T).getD i 0 * (tseqCombine4 T).getD ((i + s) % m) 0 =
-      4 * (T.a.getD i 0 * T.a.getD ((i + s) % m) 0 +
-        T.b.getD i 0 * T.b.getD ((i + s) % m) 0 +
-        T.c.getD i 0 * T.c.getD ((i + s) % m) 0 +
-        T.d.getD i 0 * T.d.getD ((i + s) % m) 0) := by
+      4 * (T.a.data.getD i 0 * T.a.data.getD ((i + s) % m) 0 +
+        T.b.data.getD i 0 * T.b.data.getD ((i + s) % m) 0 +
+        T.c.data.getD i 0 * T.c.data.getD ((i + s) % m) 0 +
+        T.d.data.getD i 0 * T.d.data.getD ((i + s) % m) 0) := by
   by_cases hi : i < m
   · have hmod : (i + s) % m < m := by
       by_cases hm : m = 0
@@ -170,14 +170,14 @@ lemma tseqCombine_periodic_summand_identity {m : Nat} (T : TSequence m) (s i : N
     rw [tseqCombine1_getD T hmod, tseqCombine2_getD T hmod, tseqCombine3_getD T hmod, tseqCombine4_getD T hmod]
     exact tseqCombine_summand_identity T i ((i + s) % m)
   · have hm : m ≤ i := by omega
-    have ha : T.a.getD i 0 = 0 := by
-      exact List.getD_eq_default _ _ (by simpa [T.a_len] using hm)
-    have hb : T.b.getD i 0 = 0 := by
-      exact List.getD_eq_default _ _ (by simpa [T.b_len] using hm)
-    have hc : T.c.getD i 0 = 0 := by
-      exact List.getD_eq_default _ _ (by simpa [T.c_len] using hm)
-    have hd : T.d.getD i 0 = 0 := by
-      exact List.getD_eq_default _ _ (by simpa [T.d_len] using hm)
+    have ha : T.a.data.getD i 0 = 0 := by
+      exact List.getD_eq_default _ _ (by simpa [T.a.len] using hm)
+    have hb : T.b.data.getD i 0 = 0 := by
+      exact List.getD_eq_default _ _ (by simpa [T.b.len] using hm)
+    have hc : T.c.data.getD i 0 = 0 := by
+      exact List.getD_eq_default _ _ (by simpa [T.c.len] using hm)
+    have hd : T.d.data.getD i 0 = 0 := by
+      exact List.getD_eq_default _ _ (by simpa [T.d.len] using hm)
     have h1 : (tseqCombine1 T).getD i 0 = 0 := by
       exact List.getD_eq_default _ _ (by simpa [tseqCombine1_length T] using hm)
     have h2 : (tseqCombine2 T).getD i 0 = 0 := by
@@ -197,10 +197,10 @@ lemma tseqCombine_periodic_sum_identity {m : Nat} (T : TSequence m) (s : Nat) :
         (tseqCombine3 T).getD i 0 * (tseqCombine3 T).getD ((i + s) % m) 0 +
         (tseqCombine4 T).getD i 0 * (tseqCombine4 T).getD ((i + s) % m) 0) =
       ∑ i ∈ Finset.range m,
-        4 * (T.a.getD i 0 * T.a.getD ((i + s) % m) 0 +
-          T.b.getD i 0 * T.b.getD ((i + s) % m) 0 +
-          T.c.getD i 0 * T.c.getD ((i + s) % m) 0 +
-          T.d.getD i 0 * T.d.getD ((i + s) % m) 0) := by
+        4 * (T.a.data.getD i 0 * T.a.data.getD ((i + s) % m) 0 +
+          T.b.data.getD i 0 * T.b.data.getD ((i + s) % m) 0 +
+          T.c.data.getD i 0 * T.c.data.getD ((i + s) % m) 0 +
+          T.d.data.getD i 0 * T.d.data.getD ((i + s) % m) 0) := by
   apply Finset.sum_congr rfl
   intro i hi
   exact tseqCombine_periodic_summand_identity T s i
@@ -209,19 +209,19 @@ lemma tseqCombine_periodic_sum_identity {m : Nat} (T : TSequence m) (s : Nat) :
 theorem tseqCombine_periodic_identity {m : Nat} (T : TSequence m) :
     ∀ s, combinedPeriodicAutocorr (tseqCombine1 T) (tseqCombine2 T)
       (tseqCombine3 T) (tseqCombine4 T) s =
-      4 * combinedPeriodicAutocorr T.a T.b T.c T.d s := by
+      4 * combinedPeriodicAutocorr T.a.data T.b.data T.c.data T.d.data s := by
   intro s
   by_cases hm : m = 0
   · subst hm
-    have ha : T.a = [] := List.eq_nil_of_length_eq_zero T.a_len
-    have hb : T.b = [] := List.eq_nil_of_length_eq_zero T.b_len
-    have hc : T.c = [] := List.eq_nil_of_length_eq_zero T.c_len
-    have hd : T.d = [] := List.eq_nil_of_length_eq_zero T.d_len
+    have ha : T.a.data = [] := List.eq_nil_of_length_eq_zero T.a.len
+    have hb : T.b.data = [] := List.eq_nil_of_length_eq_zero T.b.len
+    have hc : T.c.data = [] := List.eq_nil_of_length_eq_zero T.c.len
+    have hd : T.d.data = [] := List.eq_nil_of_length_eq_zero T.d.len
     simp [_root_.periodicAutocorr, ha, hb, hc, hd, combinedPeriodicAutocorr, tseqCombine1,
       tseqCombine2, tseqCombine3, tseqCombine4]
   · unfold combinedPeriodicAutocorr _root_.periodicAutocorr
     simp [tseqCombine1_length T, tseqCombine2_length T, tseqCombine3_length T, tseqCombine4_length T,
-      T.a_len, T.b_len, T.c_len, T.d_len, hm]
+      T.a.len, T.b.len, T.c.len, T.d.len, hm]
     rw [← Finset.sum_add_distrib, ← Finset.sum_add_distrib, ← Finset.sum_add_distrib]
     calc
       ∑ x ∈ Finset.range m,
@@ -230,22 +230,22 @@ theorem tseqCombine_periodic_identity {m : Nat} (T : TSequence m) :
               (tseqCombine3 T)[x]?.getD 0 * (tseqCombine3 T)[(x + s) % m]?.getD 0 +
             (tseqCombine4 T)[x]?.getD 0 * (tseqCombine4 T)[(x + s) % m]?.getD 0)
         = ∑ x ∈ Finset.range m,
-            4 * (T.a[x]?.getD 0 * T.a[(x + s) % m]?.getD 0 +
-              T.b[x]?.getD 0 * T.b[(x + s) % m]?.getD 0 +
-              T.c[x]?.getD 0 * T.c[(x + s) % m]?.getD 0 +
-              T.d[x]?.getD 0 * T.d[(x + s) % m]?.getD 0) := by
+            4 * (T.a.data[x]?.getD 0 * T.a.data[(x + s) % m]?.getD 0 +
+              T.b.data[x]?.getD 0 * T.b.data[(x + s) % m]?.getD 0 +
+              T.c.data[x]?.getD 0 * T.c.data[(x + s) % m]?.getD 0 +
+              T.d.data[x]?.getD 0 * T.d.data[(x + s) % m]?.getD 0) := by
               simpa [List.getD_eq_getElem?_getD] using tseqCombine_periodic_sum_identity T s
       _ = 4 * ∑ x ∈ Finset.range m,
-            (T.a[x]?.getD 0 * T.a[(x + s) % m]?.getD 0 +
-              T.b[x]?.getD 0 * T.b[(x + s) % m]?.getD 0 +
-              T.c[x]?.getD 0 * T.c[(x + s) % m]?.getD 0 +
-              T.d[x]?.getD 0 * T.d[(x + s) % m]?.getD 0) := by
+            (T.a.data[x]?.getD 0 * T.a.data[(x + s) % m]?.getD 0 +
+              T.b.data[x]?.getD 0 * T.b.data[(x + s) % m]?.getD 0 +
+              T.c.data[x]?.getD 0 * T.c.data[(x + s) % m]?.getD 0 +
+              T.d.data[x]?.getD 0 * T.d.data[(x + s) % m]?.getD 0) := by
               rw [← Finset.mul_sum]
       _ = 4 *
-            (∑ x ∈ Finset.range m, T.a[x]?.getD 0 * T.a[(x + s) % m]?.getD 0 +
-                  ∑ x ∈ Finset.range m, T.b[x]?.getD 0 * T.b[(x + s) % m]?.getD 0 +
-                ∑ x ∈ Finset.range m, T.c[x]?.getD 0 * T.c[(x + s) % m]?.getD 0 +
-              ∑ x ∈ Finset.range m, T.d[x]?.getD 0 * T.d[(x + s) % m]?.getD 0) := by
+            (∑ x ∈ Finset.range m, T.a.data[x]?.getD 0 * T.a.data[(x + s) % m]?.getD 0 +
+                  ∑ x ∈ Finset.range m, T.b.data[x]?.getD 0 * T.b.data[(x + s) % m]?.getD 0 +
+                ∑ x ∈ Finset.range m, T.c.data[x]?.getD 0 * T.c.data[(x + s) % m]?.getD 0 +
+              ∑ x ∈ Finset.range m, T.d.data[x]?.getD 0 * T.d.data[(x + s) % m]?.getD 0) := by
               congr 1
               rw [Finset.sum_add_distrib, Finset.sum_add_distrib, Finset.sum_add_distrib]
 

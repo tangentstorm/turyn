@@ -1,4 +1,6 @@
-import Mathlib
+import Mathlib.Data.Matrix.Basic
+import Mathlib.Algebra.BigOperators.Group.Finset.Basic
+import Mathlib.Tactic
 
 open Matrix
 open BigOperators

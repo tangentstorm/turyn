@@ -1,4 +1,5 @@
-import Mathlib
+import Mathlib.Algebra.BigOperators.Group.Finset.Basic
+import Mathlib.Tactic
 
 open Finset BigOperators
 

@@ -1,6 +1,8 @@
 import Turyn.TurynType
 import Turyn.BaseSequence
-import Mathlib
+import Mathlib.Logic.Relation
+import Mathlib.Algebra.BigOperators.Group.Finset.Basic
+import Mathlib.Tactic
 
 /-!
 # Equivalence and canonical representatives for Turyn-type sequences
