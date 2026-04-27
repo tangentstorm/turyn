@@ -118,12 +118,8 @@ The three headline theorems are exposed in a layout consumable by
 [`leanprover/comparator`](https://github.com/leanprover/comparator):
 
 ```
-Results.lean              -- challenge module: theorem statements with `sorry`
-Proofs.lean               -- solution module: imports the proof files below
-Proofs/
-  TtToHadamard.lean       -- TT → Hadamard pipeline
-  CanonicalForm.lean      -- canonical representative exists
-  XyProductLaw.lean       -- XY product law
+Challenge.lean            -- challenge module: theorem statements with `sorry`
+Results.lean              -- solution module: the three headline-theorem proofs
 comparator-config.json    -- comparator configuration
 ```
 

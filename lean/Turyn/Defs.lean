@@ -8,7 +8,7 @@ open BigOperators
 /-!
 # Turyn.Defs
 
-The trusted definitions named in `Results.lean`'s headline statements:
+The trusted definitions named in `Challenge.lean`'s headline statements:
 
 - `AllPmOne`, `AllSignOne` — entry-set predicates on `List Int`.
 - `aperiodicAutocorr`, `combinedAutocorr` — autocorrelation primitives.

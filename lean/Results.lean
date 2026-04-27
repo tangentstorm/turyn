@@ -1,77 +1,48 @@
-import Turyn.MatUtils
+import Turyn.Hadamard
+import Turyn.Equivalence
 import Turyn.XY
 
 /-!
-# Results: Headline Theorems for Comparator
+# Results: Comparator Solution Module
 
-This is the trusted **challenge module** for `leanprover/comparator`.
-It states the headline results of the Turyn library with `sorry` placeholders.
-The matching proofs live in `Proofs.lean`, which comparator builds
-independently and verifies against this file.
+This is the **solution module** for `leanprover/comparator`, paired with
+`Challenge.lean`.  Each headline theorem under the `Turyn.Result`
+namespace is re-exposed below as a thin wrapper around the
+corresponding result in `Turyn.*`.
 
-The headline names live in the `Turyn.Result` namespace to avoid colliding
-with the underlying lemmas of the same name in `Turyn.Equivalence` and
-`Turyn.XY`.
+Run comparator with:
 
-## Definitions referenced
-
-The headline statements use the following definitions:
-
-- `PmSeq n`, `TurynType n`, `aperiodicAutocorr`, `combinedAutocorr`
-  (`Turyn/Defs.lean`): the foundational sequence and quadruple types.
-- `IsTurynType X Y Z W` (`Turyn/TurynType.lean`):
-    typed Turyn-type predicate.
-- `Turyn.IntMat`, `Turyn.IsHadamardMat` (`Turyn/MatUtils.lean`):
-    the matrix layer.
-- `Equivalent n S T`, `Canonical n S`, `Canonical1 n S`
-  (`Turyn/Equivalence.lean`): the canonical-form relations.
-- `Turyn.uAt` (`Turyn/XY.lean`): the U = X · Y product accessor.
-
-## Headline theorems (this file)
-
-1. `tt_implies_hadamard` — *if a TT(n) exists, a Hadamard matrix of order
-   `4 (3 n − 1)` exists*. The witness is the constructive base-sequence →
-   T-sequence → Goethals–Seidel pipeline.
-2. `canonical_form_exists` — every Turyn-type sequence (`TurynType n`,
-   even `n ≥ 2`) is equivalent to one in canonical form.
-   *Note:* this is the existence half. The full BDKR result also says the
-   canonical representative is unique within the equivalence class (orbit
-   size dividing 1024); that uniqueness is not yet formalized here.
-3. `xy_interior_antipalindrome` — for a canonical Turyn sequence of length
-   `n ≥ 4`, the U = X·Y interior is an anti-palindrome:
-   `uAt S (n + 1 − k) = − uAt S k` for every `2 ≤ k ≤ n − 1`. This is the
-   "XY product law" (discovered by codex).
+```
+lake env <path-to-comparator> comparator-config.json
+```
 -/
 
 namespace Turyn.Result
 
-/-- **TT(n) ⇒ Hadamard.** If a Turyn-type sequence of length `n` exists,
-then a Hadamard matrix of order `4 (3 n − 1)` exists. The witness is the
-constructive Goethals–Seidel pipeline applied to the TT(n) certificate. -/
+/-- **TT(n) ⇒ Hadamard.**  Packages the constructive
+`ofIsTurynTypeMatrix` / `ofIsTurynTypeMatrix_isHadamard` pair from
+`Turyn/Hadamard.lean` into the existence form expected by `Challenge.lean`. -/
 theorem tt_implies_hadamard {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
     (h : IsTurynType X Y Z W) :
-    ∃ H : IntMat (4 * (3 * n - 1)), IsHadamardMat H := by
-  sorry
+    ∃ H : IntMat (4 * (3 * n - 1)), IsHadamardMat H :=
+  ⟨Turyn.ofIsTurynTypeMatrix h, Turyn.ofIsTurynTypeMatrix_isHadamard h⟩
 
-/-- **Canonical representative exists** (existence half of BDKR §2).
-For even `n ≥ 2`, every Turyn-type sequence is equivalent under T1..T4 to a
-representative satisfying canonical conditions (i)..(vi).
-
-The full BDKR theorem additionally asserts uniqueness of the canonical
-representative within an equivalence class — that part is not yet
-formalized; track it as future work. -/
+/-- **Canonical representative exists.**  Re-exposes
+`Turyn.canonical_representative_exists` (`Turyn/Equivalence.lean`) under
+the `Turyn.Result` namespace. -/
 theorem canonical_form_exists
     (n : Nat) (hn_even : n % 2 = 0) (hn : 2 ≤ n) (S : TurynType n) :
-    ∃ T : TurynType n, Equivalent n S T ∧ Canonical n T := by
-  sorry
+    ∃ T : TurynType n, Equivalent n S T ∧ Canonical n T :=
+  Turyn.canonical_representative_exists n hn_even hn S
 
-/-- **XY interior anti-palindrome** ("XY product law", discovered by codex).
-For a canonical Turyn sequence of length `n ≥ 4`, the U-sequence
-(`U = X · Y` coordinatewise) is an anti-palindrome on its interior:
-`uAt S (n + 1 − k) = − uAt S k` for every `2 ≤ k ≤ n − 1`. -/
+/-- **XY interior anti-palindrome.**  Re-exposes `Turyn.xy_product_law`
+(`Turyn/XY.lean`) under the `Turyn.Result` namespace.  The "XY product
+law" and the "interior anti-palindrome" statement are the same theorem;
+the latter is the readable interpretation: for `2 ≤ k ≤ n − 1`,
+`uAt S (n + 1 − k) = − uAt S k`. -/
 theorem xy_interior_antipalindrome {n : Nat} (S : TurynType n) (hn : 4 ≤ n)
     (hc : Canonical1 n S) :
-    ∀ k, 2 ≤ k → k ≤ n - 1 → uAt S (n + 1 - k) = -(uAt S k) := by
-  sorry
+    ∀ k, 2 ≤ k → k ≤ n - 1 → uAt S (n + 1 - k) = -(uAt S k) :=
+  Turyn.xy_product_law S hn hc
 
 end Turyn.Result
