@@ -1,21 +1,17 @@
-import Mathlib.Algebra.BigOperators.Group.Finset.Basic
-import Mathlib.Algebra.BigOperators.Intervals
-import Mathlib.Data.List.GetD
+import Turyn.Defs
 import Mathlib.Tactic
 
 open Finset
 open BigOperators
 
 /-!
-# Turyn-Type Sequences: Core Definitions
+# Turyn-Type Sequences: Boolean / decidability / parsing layer
 
-Formal definitions for Turyn-type sequences (TT(n)) and decidable verification.
-
-A **Turyn-type sequence** TT(n) is a quadruple (X, Y, Z, W) of {+1, −1} sequences
-with lengths (n, n, n, n−1) whose combined aperiodic autocorrelations vanish at
-every nonzero shift:
-
-  N_X(s) + N_Y(s) + 2·N_Z(s) + 2·N_W(s) = 0    for s = 1, …, n−1
+The core type-level definitions (`PmSeq`, `SignSeq`, `aperiodicAutocorr`,
+`combinedAutocorr`, `TurynType`) live in `Turyn.Defs`.  This file
+adds the Boolean and decidability machinery, the `pm! "..."` string
+literal parser, and the `IsTurynType` predicate / typed bridge used
+throughout the rest of the project.
 -/
 
 /-! ### Sign-character parsing -/
@@ -48,14 +44,11 @@ syntax "pm! " str : term
 macro_rules
   | `(pm! $s:str) => `(pmSeq! $s)
 
-/-! ### Entry-set predicates -/
+/-! ### Boolean / decidable layer for `AllPmOne` and `AllSignOne` -/
 
 /-- Boolean check that every entry of a sequence is ±1. -/
 def allPmOne (a : List Int) : Bool :=
   a.all fun v => v == 1 || v == -1
-
-/-- Propositional version: every entry is `1` or `−1`. -/
-def AllPmOne (a : List Int) : Prop := ∀ v ∈ a, v = 1 ∨ v = -1
 
 theorem allPmOne_iff (a : List Int) : allPmOne a = true ↔ AllPmOne a := by
   simp [allPmOne, AllPmOne, List.all_eq_true, Bool.or_eq_true, beq_iff_eq]
@@ -66,9 +59,6 @@ instance (a : List Int) : Decidable (AllPmOne a) :=
 /-- Boolean check that every entry of a sequence is `0`, `1`, or `−1`. -/
 def allSignOne (a : List Int) : Bool :=
   a.all fun v => v == 0 || v == 1 || v == -1
-
-/-- Propositional version: every entry is `0`, `1`, or `−1`. -/
-def AllSignOne (a : List Int) : Prop := ∀ v ∈ a, v = 0 ∨ v = 1 ∨ v = -1
 
 theorem allSignOne_iff (a : List Int) : allSignOne a = true ↔ AllSignOne a := by
   simp only [allSignOne, AllSignOne, List.all_eq_true, Bool.or_eq_true, beq_iff_eq]
@@ -83,34 +73,7 @@ theorem allSignOne_iff (a : List Int) : allSignOne a = true ↔ AllSignOne a := 
 instance (a : List Int) : Decidable (AllSignOne a) :=
   decidable_of_iff _ (allSignOne_iff a)
 
-/-! ### Aperiodic Autocorrelation -/
-
-/-- Aperiodic autocorrelation of sequence `a` at lag `s`:
-    N_a(s) = Σ_{i=0}^{|a|−1−s} a_i · a_{i+s}
-    Returns `0` when `s ≥ |a|`. -/
-def aperiodicAutocorr (a : List Int) (s : Nat) : Int :=
-  if s ≥ a.length then 0
-  else ∑ i ∈ range (a.length - s), a.getD i 0 * a.getD (i + s) 0
-
-/-- Combined weighted autocorrelation for the Turyn quadruple at lag `s`:
-    C(s) = N_X(s) + N_Y(s) + 2·N_Z(s) + 2·N_W(s) -/
-def combinedAutocorr (x y z w : List Int) (s : Nat) : Int :=
-  aperiodicAutocorr x s + aperiodicAutocorr y s +
-  2 * aperiodicAutocorr z s + 2 * aperiodicAutocorr w s
-
-/-! ### Length-indexed sequence types -/
-
-/-- A length-`n` sequence with entries in `{+1, −1}`. -/
-structure PmSeq (n : Nat) where
-  data : List Int
-  len : data.length = n
-  pm : AllPmOne data
-
-/-- A length-`n` sequence with entries in `{0, +1, −1}`. -/
-structure SignSeq (n : Nat) where
-  data : List Int
-  len : data.length = n
-  sign : AllSignOne data
+/-! ### Cross-sequence lift -/
 
 /-- Every `±1` sequence is also a `{0, ±1}` sequence. -/
 def PmSeq.toSign {n : Nat} (s : PmSeq n) : SignSeq n :=
@@ -149,17 +112,6 @@ theorem IsTurynType.vanishing {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
   have heq : s - 1 + 1 = s := by omega
   rw [heq] at hk
   exact eq_of_beq hk
-
-/-! ### Bundled Turyn-type quadruple -/
-
-/-- A typed Turyn quadruple TT(n).  Field names follow BDKR (X, Y, Z, W). -/
-structure TurynType (n : Nat) where
-  X : PmSeq n
-  Y : PmSeq n
-  Z : PmSeq n
-  W : PmSeq (n - 1)
-  vanishing : ∀ s : Nat, 1 ≤ s → s < n →
-    combinedAutocorr X.data Y.data Z.data W.data s = 0
 
 /-- Convert a typed `IsTurynType` certificate into the bundled `TurynType`. -/
 def IsTurynType.toTyped {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}

@@ -1,37 +1,31 @@
-import Turyn.Defs
+import Turyn.MatUtils
+import Turyn.XY
 
 /-!
 # Results: Headline Theorems for Comparator
 
 This is the trusted **challenge module** for `leanprover/comparator`.
 It states the headline results of the Turyn library with `sorry` placeholders.
-The matching proofs live in `Proofs.lean` (and the modules under `Proofs/`),
-which comparator builds independently and verifies against this file.
+The matching proofs live in `Proofs.lean`, which comparator builds
+independently and verifies against this file.
 
 The headline names live in the `Turyn.Result` namespace to avoid colliding
 with the underlying lemmas of the same name in `Turyn.Equivalence` and
-`Turyn.XY` — this file imports those modules to reuse their definitions
-(`TurynType`, `TurynType`, `Canonical1`, `uAt`, …) for the statements.
+`Turyn.XY`.
 
 ## Definitions referenced
 
-The headline statements use the following definitions, which are imported
-from the trusted `Turyn.*` modules and therefore part of the comparator
-trusted base:
+The headline statements use the following definitions:
 
-- `IsTurynType n x y z w` (`Turyn/TurynType.lean`):
-    Boolean predicate, `(x, y, z, w)` is a TT(n).
-- `TurynType n` (`Turyn/BaseSequence.lean`):
-    bundled length-indexed TT(n) with the vanishing-autocorrelation witness.
-- `IsHadamardMat H` (`Turyn/MatUtils.lean`):
-    Hadamard predicate on a square `IntMat`.
-- `TurynType n` (`Turyn/Equivalence.lean`):
-    bundled TT(n) plus an `IsTurynType` witness, the carrier of the
-    `Equivalent`/`Canonical` relations.
-- `Equivalent n S T` (`Turyn/Equivalence.lean`):
-    reflexive-transitive closure of the T1..T4 elementary moves.
-- `Canonical n S` (`Turyn/Equivalence.lean`):
-    conjunction of the six BDKR canonical conditions (i)..(vi).
+- `PmSeq n`, `TurynType n`, `aperiodicAutocorr`, `combinedAutocorr`
+  (`Turyn/Defs.lean`): the foundational sequence and quadruple types.
+- `IsTurynType X Y Z W` (`Turyn/TurynType.lean`):
+    typed Turyn-type predicate.
+- `Turyn.IntMat`, `Turyn.IsHadamardMat` (`Turyn/MatUtils.lean`):
+    the matrix layer.
+- `Equivalent n S T`, `Canonical n S`, `Canonical1 n S`
+  (`Turyn/Equivalence.lean`): the canonical-form relations.
+- `Turyn.uAt` (`Turyn/XY.lean`): the U = X · Y product accessor.
 
 ## Headline theorems (this file)
 
