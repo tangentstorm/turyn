@@ -3535,17 +3535,51 @@ or even `[i32x4; N]` (manual SIMD) and measure.
 - **Detection plan**: nodes/s up, `tuple_rejects` unchanged.
 - **Risk**: low — pure data-layout change.
 
-### U-series ranking (for this session)
+### U-series session results (April 27 2026, Claude)
 
-Most likely wins, easiest first:
-- **U2** (skip score_state on non-zero workers): 1-line; trivial.
-- **U1** (batched propagations_by_kind_totals): 5-line API + 2
-  call sites.
-- **U5** (reuse candidates Vec): small refactor.
-- **U4** (skip harvest_forced body on zero-delta): one branch
-  on a value already computed.
-- **U3** (cheap-skip tuple_reachable shallow levels): one
-  threshold computed at ctx-build time.
+Cumulative TTC trajectory at n=22 sync on this 4-CPU box, mean
+of 5 runs:
+
+| Stage              | direct TTC parallel | Δ vs session baseline |
+|--------------------|---------------------|-----------------------|
+| Session baseline   | 6.13e5 s            | —                     |
+| + U1               | 4.87e5 s            | −20.4 %               |
+| + U1b              | **2.0e5 s**         | **−67.4 %** (3.06×)   |
+
+TT(18) wall-clock smoke (4 workers, 3 runs): 73.3 s → **1.91 s**
+(−97 %). The walker is now fast enough to debug at small n in
+seconds instead of minutes.
+
+Status of the original list:
+
+- **U1 (batched propagations_by_kind_totals API)**: ACCEPTED,
+  −20.4 %.
+- **U1b (cumulative column-sum cache making U1 O(1))**: ACCEPTED,
+  −67 % cumulative (commit-followup that uncovered the real cost
+  was the matrix iteration inside the batched call).
+- **U2** (skip score_state on non-zero workers): tested, in
+  noise — branch on `ctx.seed == 0` doesn't pay for itself.
+- **U4** (skip harvest_forced when delta == 0): tested, in noise
+  — the 4n scan is already auto-vectorised and cheap.
+- **U5** (reuse candidates Vec): tested, in noise — Vec alloc
+  cost is 30 ns/frame, total ~6 ms/30 s/worker.
+- **U9** (incremental num_assigned_in_range counter): tested
+  twice (pre- and post-U1b). In noise pre-U1b (compiler
+  vectorises the original scan); slight regression post-U1b
+  (added enqueue branch outweighs saved scans now that telemetry
+  isn't dominating).
+- **U3 / U6 / U7 / U8 / U10**: not tried this session — U1+U1b
+  delivered most of the available rate budget; remaining ideas
+  would each need to clear the ~5 % noise floor.
+
+Methodology lesson: the two wins shared a shape — an
+`O(decision_levels × COUNT)` per-frame cost that looked innocent
+at the call site. Both U1 and U1b were on the per-frame
+telemetry path, which had compounded to dwarf the actual
+search work. The remaining sub-percent ideas (U2, U4, U5, U9)
+all trip on the same problem: the original code was already
+near auto-vectorised optimal and adding a counter / branch /
+flag costs as much as the saved work.
 
 Top denominator-leverage ideas not in this batch:
 
@@ -3560,4 +3594,14 @@ Top denominator-leverage ideas not in this batch:
   branching level, the assumption stack pins a few lits and the
   effective backbone might be larger. Run a bounded probe inside
   the walker at depth 0 / 1.
+- **U13. Compact `prop_by_kind_level` after backbone scan**: the
+  matrix grows monotonically (one row per `new_decision_level`,
+  no row removal on backtrack). After backbone preprocessing
+  it's hundreds of rows; after a long sync run it could be
+  millions. Memory-only concern post-U1b (the totals cache means
+  we never iterate the matrix), but worth a follow-up cleanup.
+  Reset would invalidate per-level forcing telemetry that
+  `propagations_by_kind_level` exposes — provide a "compact-but-
+  preserve-totals" API that collapses the matrix to its column
+  sums with all rows after row 0 zeroed.
 
