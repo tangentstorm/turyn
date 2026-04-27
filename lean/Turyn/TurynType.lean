@@ -44,24 +44,30 @@ syntax "pm! " str : term
 macro_rules
   | `(pm! $s:str) => `(pmSeq! $s)
 
-/-! ### Boolean / decidable layer for `AllPmOne` and `AllSignOne` -/
+/-! ### List-based predicates and Boolean / decidable layer -/
 
-/-- Boolean check that every entry of a sequence is ±1. -/
+/-- Propositional check that every entry of a `List Int` is `±1`. -/
+def AllPmOneList (a : List Int) : Prop := ∀ v ∈ a, v = 1 ∨ v = -1
+
+/-- Propositional check that every entry of a `List Int` is `0`, `1`, or `−1`. -/
+def AllSignOneList (a : List Int) : Prop := ∀ v ∈ a, v = 0 ∨ v = 1 ∨ v = -1
+
+/-- Boolean check that every entry of a list is ±1. -/
 def allPmOne (a : List Int) : Bool :=
   a.all fun v => v == 1 || v == -1
 
-theorem allPmOne_iff (a : List Int) : allPmOne a = true ↔ AllPmOne a := by
-  simp [allPmOne, AllPmOne, List.all_eq_true, Bool.or_eq_true, beq_iff_eq]
+theorem allPmOne_iff (a : List Int) : allPmOne a = true ↔ AllPmOneList a := by
+  simp [allPmOne, AllPmOneList, List.all_eq_true, Bool.or_eq_true, beq_iff_eq]
 
-instance (a : List Int) : Decidable (AllPmOne a) :=
+instance (a : List Int) : Decidable (AllPmOneList a) :=
   decidable_of_iff _ (allPmOne_iff a)
 
-/-- Boolean check that every entry of a sequence is `0`, `1`, or `−1`. -/
+/-- Boolean check that every entry of a list is `0`, `1`, or `−1`. -/
 def allSignOne (a : List Int) : Bool :=
   a.all fun v => v == 0 || v == 1 || v == -1
 
-theorem allSignOne_iff (a : List Int) : allSignOne a = true ↔ AllSignOne a := by
-  simp only [allSignOne, AllSignOne, List.all_eq_true, Bool.or_eq_true, beq_iff_eq]
+theorem allSignOne_iff (a : List Int) : allSignOne a = true ↔ AllSignOneList a := by
+  simp only [allSignOne, AllSignOneList, List.all_eq_true, Bool.or_eq_true, beq_iff_eq]
   constructor
   · intro h v hv
     have := h v hv
@@ -70,16 +76,49 @@ theorem allSignOne_iff (a : List Int) : allSignOne a = true ↔ AllSignOne a := 
     have := h v hv
     tauto
 
-instance (a : List Int) : Decidable (AllSignOne a) :=
+instance (a : List Int) : Decidable (AllSignOneList a) :=
   decidable_of_iff _ (allSignOne_iff a)
+
+/-! ### Constructing a `PmSeq` / `SignSeq` from a list -/
+
+/-- Function view of a `List Int` as a `Fin n → Int` (default `0` out of range). -/
+def listToFin (l : List Int) (n : Nat) : Fin n → Int :=
+  fun i => l.getD i.1 0
+
+/-- Construct a `PmSeq n` from a list of length `n` of ±1 values. -/
+def PmSeq.ofList (l : List Int) {n : Nat} (hlen : l.length = n) (hpm : AllPmOneList l) :
+    PmSeq n :=
+  { data := listToFin l n
+    pm := by
+      intro i
+      have hi : i.1 < l.length := by rw [hlen]; exact i.2
+      have hmem : l.getD i.1 0 ∈ l := by
+        rw [List.getD_eq_getElem _ _ hi]
+        exact List.getElem_mem hi
+      exact hpm _ hmem }
+
+/-- Construct a `SignSeq n` from a list of length `n` of `{0,±1}` values. -/
+def SignSeq.ofList (l : List Int) {n : Nat} (hlen : l.length = n) (hsign : AllSignOneList l) :
+    SignSeq n :=
+  { data := listToFin l n
+    sign := by
+      intro i
+      have hi : i.1 < l.length := by rw [hlen]; exact i.2
+      have hmem : l.getD i.1 0 ∈ l := by
+        rw [List.getD_eq_getElem _ _ hi]
+        exact List.getElem_mem hi
+      exact hsign _ hmem }
+
+/-- Decidability instance: a `List Int` is all `±1`, decided by length-based check. -/
+instance {n : Nat} (l : List Int) (h : l.length = n) :
+    Decidable (AllPmOneList l) := by infer_instance
 
 /-! ### Cross-sequence lift -/
 
 /-- Every `±1` sequence is also a `{0, ±1}` sequence. -/
 def PmSeq.toSign {n : Nat} (s : PmSeq n) : SignSeq n :=
   { data := s.data
-    len := s.len
-    sign := fun v hv => Or.inr (s.pm v hv) }
+    sign := fun i => Or.inr (s.pm i) }
 
 /-! ### Turyn-Type Sequences -/
 
@@ -120,8 +159,11 @@ def IsTurynType.toTyped {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
 
 /-! ### Sum of a sequence -/
 
-/-- Sum of all entries in a sequence. -/
-def seqSum (a : List Int) : Int := ∑ i ∈ range a.length, a.getD i 0
+/-- Sum of all entries of a function-typed sequence. -/
+def seqSum {n : Nat} (a : Fin n → Int) : Int := ∑ i : Fin n, a i
+
+/-- Sum of all entries in a `List Int` sequence. -/
+def seqSumList (a : List Int) : Int := ∑ i ∈ range a.length, a.getD i 0
 
 /-! ### ±1 lemmas -/
 

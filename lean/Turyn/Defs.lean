@@ -10,50 +10,60 @@ open BigOperators
 
 The trusted definitions named in `Challenge.lean`'s headline statements:
 
-- `AllPmOne`, `AllSignOne` — entry-set predicates on `List Int`.
+- `AllPmOne`, `AllSignOne` — entry-set predicates on `Fin n → Int`.
 - `aperiodicAutocorr`, `combinedAutocorr` — autocorrelation primitives.
-- `PmSeq n`, `SignSeq n` — length-indexed ±1 / {0, ±1} sequences.
+- `PmSeq n`, `SignSeq n` — length-indexed ±1 / {0, ±1} sequences
+  carried as `Fin n → Int`.
 - `TurynType n` — bundled TT(n) quadruple plus the vanishing identity.
 - `xAt/yAt/zAt/wAt`, `uAt` — 1-indexed entry accessors.
 - `Canonical1..6`, `Canonical` — BDKR canonical-form predicates.
-
-`Equivalent` is *not* here — its body pulls in the elementary moves and
-their vanishing-preservation infrastructure.  It lives in
-`Turyn.Equivalence` and is reached via the standard import chain.
 
 Boolean checks, decidability, parsers, and the `IsTurynType` predicate
 sit on top of these definitions in `Turyn.TurynType`.
 -/
 
-/-- Propositional version: every entry is `1` or `−1`. -/
-def AllPmOne (a : List Int) : Prop := ∀ v ∈ a, v = 1 ∨ v = -1
+/-! ### Function-typed entry predicates -/
+
+/-- Propositional version: every entry of `a : Fin n → Int` is `1` or `−1`. -/
+def AllPmOne {n : Nat} (a : Fin n → Int) : Prop := ∀ i : Fin n, a i = 1 ∨ a i = -1
 
 /-- Propositional version: every entry is `0`, `1`, or `−1`. -/
-def AllSignOne (a : List Int) : Prop := ∀ v ∈ a, v = 0 ∨ v = 1 ∨ v = -1
+def AllSignOne {n : Nat} (a : Fin n → Int) : Prop :=
+  ∀ i : Fin n, a i = 0 ∨ a i = 1 ∨ a i = -1
 
-/-- Aperiodic autocorrelation of sequence `a` at lag `s`:
-    N_a(s) = Σ_{i=0}^{|a|−1−s} a_i · a_{i+s}
-    Returns `0` when `s ≥ |a|`. -/
-def aperiodicAutocorr (a : List Int) (s : Nat) : Int :=
-  if s ≥ a.length then 0
-  else ∑ i ∈ range (a.length - s), a.getD i 0 * a.getD (i + s) 0
+/-! ### Aperiodic autocorrelation on function-typed sequences
+
+For `a : Fin n → Int` and shift `s : Nat`,
+`aperiodicAutocorr a s = Σ_{i = 0}^{n − 1 − s} a_i · a_{i+s}`.
+Returns `0` when `s ≥ n`.  We keep `s` a `Nat` so that the
+combined-autocorrelation predicate quantifies over `Nat`. -/
+
+/-- Look up `a : Fin n → Int` at 0-indexed `Nat` position `i`, returning `0`
+if out of range.  Defined here (instead of inside `namespace Turyn`)
+because `aperiodicAutocorr` uses it in the sum body. -/
+def lookupNat {n : Nat} (a : Fin n → Int) (i : Nat) : Int :=
+  if h : i < n then a ⟨i, h⟩ else 0
+
+def aperiodicAutocorr {n : Nat} (a : Fin n → Int) (s : Nat) : Int :=
+  if s ≥ n then 0
+  else ∑ i ∈ range (n - s), lookupNat a i * lookupNat a (i + s)
 
 /-- Combined weighted autocorrelation for the Turyn quadruple at lag `s`:
     C(s) = N_X(s) + N_Y(s) + 2·N_Z(s) + 2·N_W(s) -/
-def combinedAutocorr (x y z w : List Int) (s : Nat) : Int :=
+def combinedAutocorr {n m : Nat} (x y z : Fin n → Int) (w : Fin m → Int) (s : Nat) : Int :=
   aperiodicAutocorr x s + aperiodicAutocorr y s +
   2 * aperiodicAutocorr z s + 2 * aperiodicAutocorr w s
 
+/-! ### Length-indexed sequence carriers -/
+
 /-- A length-`n` sequence with entries in `{+1, −1}`. -/
 structure PmSeq (n : Nat) where
-  data : List Int
-  len : data.length = n
+  data : Fin n → Int
   pm : AllPmOne data
 
 /-- A length-`n` sequence with entries in `{0, +1, −1}`. -/
 structure SignSeq (n : Nat) where
-  data : List Int
-  len : data.length = n
+  data : Fin n → Int
   sign : AllSignOne data
 
 /-- A typed Turyn quadruple TT(n).  Field names follow BDKR (X, Y, Z, W). -/
@@ -67,16 +77,19 @@ structure TurynType (n : Nat) where
 
 namespace Turyn
 
-/-! ### 1-indexed entry accessors -/
+/-! ### 1-indexed entry accessors
+
+These use `Nat` indexing for source-fidelity with the BDKR paper
+and return `0` when `i` is out of range. -/
 
 /-- Entry accessor for `X` (1-indexed). -/
-def xAt {n : Nat} (S : TurynType n) (i : Nat) : Int := S.X.data.getD (i - 1) 0
+def xAt {n : Nat} (S : TurynType n) (i : Nat) : Int := lookupNat S.X.data (i - 1)
 /-- Entry accessor for `Y` (1-indexed). -/
-def yAt {n : Nat} (S : TurynType n) (i : Nat) : Int := S.Y.data.getD (i - 1) 0
+def yAt {n : Nat} (S : TurynType n) (i : Nat) : Int := lookupNat S.Y.data (i - 1)
 /-- Entry accessor for `Z` (1-indexed). -/
-def zAt {n : Nat} (S : TurynType n) (i : Nat) : Int := S.Z.data.getD (i - 1) 0
+def zAt {n : Nat} (S : TurynType n) (i : Nat) : Int := lookupNat S.Z.data (i - 1)
 /-- Entry accessor for `W` (1-indexed). -/
-def wAt {n : Nat} (S : TurynType n) (i : Nat) : Int := S.W.data.getD (i - 1) 0
+def wAt {n : Nat} (S : TurynType n) (i : Nat) : Int := lookupNat S.W.data (i - 1)
 
 /-- Pointwise X·Y product at 1-indexed position `i`. -/
 def uAt {n : Nat} (S : TurynType n) (i : Nat) : Int := xAt S i * yAt S i
