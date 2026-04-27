@@ -323,31 +323,107 @@ long enough that even shared-machine noise drops below 5 % CV.
 
 ## Acceptance Bar
 
-Do not commit "in-noise" changes.
+**Target: 0.2 % real movement across the board.**  Whether 0.2 % is
+*detectable* depends on which regime applies:
 
-- `>= 5 %` with matching counters and non-overlapping CIs:
-  acceptable after a sanity rerun.
-- `2-5 %`: rerun/interleave before accepting; need overlapping
-  evidence from at least 2 independent benchmark profiles **or** a
-  paired-interleaved run with the per-pair delta CI clear of zero.
-- `< 2 %`: not acceptable on wall-clock alone.  Require either
-  a deterministic counter movement of the predicted shape **or** a
-  paired-interleaved run of `≥ 30` pairs with the per-pair delta
-  CI clear of zero.
-  A 1 % real win needs enough samples that the CI clears zero —
-  don't accept it because one run looked faster.
-- regression or unclear mechanism: reject or keep investigating.
+### Regime A — counter-driven (preferred): 0.2 % is trivial
 
-### Counter-driven acceptance (preferred for sub-2 % wins)
+If the change is supposed to move a deterministic solver counter
+(`flow_xy_decisions / flow_xy_solves`, `flow_xy_root_forced /
+flow_xy_solves`, `flow_z_propagations / flow_z_solves`, etc.), run
+both before and after binaries at `--threads=1 --seed=0` with a
+`--bench-cover-log2` small enough that the run completes on cover
+target (not on `--sat-secs` cap).  Counter totals are bit-exact
+across reruns of the same binary (verified: 9/9 reruns at n=26
+wz=together mdd-k=7 cover-log2=38 give identical
+`flow_xy_solves = 28593`, `flow_z_solves = 190`, etc.), so any
+non-zero delta between before and after binaries is real.
 
-State the predicted counter movement *before* implementing the
-change.  After implementing, run with `--seed=0` and confirm the
-predicted counter moved by the predicted amount in the predicted
-direction.  If it did and wall-clock is in noise, the win is real
-but small; record both the counter delta and the wall-clock-noise
-verdict.  Compounding several "real but small" wins is one of the
-ways the search has historically improved at sizes where each
-individual lever was sub-percent.
+`0.2 %` of `flow_xy_solves = 28,593` is `~57` solves — easily
+visible.  `0.2 %` of `flow_xy_propagations` ≈ 10⁷ is `~20,000`
+propagations — far above the bit-exact baseline of 0.
+
+**Acceptance under regime A**: counter movement ≥ 0.2 % in the
+predicted direction → accept.  Smaller deltas (≥ 0.01 %) are also
+acceptable but make sure the predicted counter actually matches
+the proposed mechanism — a 0.05 % shift in the wrong counter is
+"the change moved something but not what you said it would" and
+deserves a rethink, not acceptance.
+
+### Regime B — wall-clock at counter mode: 1-2 % on this rig
+
+Some changes don't move counters — e.g. SIMD-vectorising a
+propagator does the same propagation faster.  Then we're back to
+wall-clock.  Even at `--threads=1 --seed=0` (same instructions
+each run), per-sample CV on a typical 4-CPU shared box is **~5 %**
+(measured: 9-sample mean 57.15 s, sd 2.94 s, CV 5.14 % at n=26
+wz=together mdd-k=7 cover-log2=38).  Paired-interleaved cuts that
+to ~2-3 % per-pair SD via correlated-noise cancellation.
+
+To detect 0.2 % wall-clock with 95 % CI clearing zero requires
+roughly:
+
+```
+N_pairs ≈ (1.96 × paired_sd / target_pct)²
+       ≈ (1.96 × 2.3   / 0.2)²
+       ≈ 510 paired samples
+       ≈ 17 hours of bench time at 60 s/sample × 2
+```
+
+That's not feasible per session.  Realistic options for
+wall-clock-only changes on this rig:
+
+- **1 % detection**: ~20 paired samples (~40 min).  Use this as
+  the wall-clock fallback bar.
+- **0.2 % detection**: requires either a quieter rig (CV ≤ 1 %)
+  or a new instrumentation counter that exposes the rate change
+  as a counter movement (preferred — adds permanent value).
+
+**Acceptance under regime B**: paired wall-clock delta ≥ 1 % with
+30+ pair CI clear of zero, *or* author adds a rate-instrumentation
+counter and uses regime A.  Single 5-run wall-clock comparisons
+do not clear regime B.
+
+### Regime C — multi-thread TTC: 1-2 % bounded by cancel-race
+
+`--threads>1` keeps per-call rng deterministic (boundaries / W /
+Z stage totals stay bit-exact) but `flow_xy_solves` varies ~1-2 %
+across reruns because `bench-cover-log2` cancellation races
+between workers — they each finish their current item after the
+target is hit, so the exact set of items completed differs.
+
+This is a stop-condition limitation, not solvable by the rng.
+Until a `--bench-stop-items=N` (deterministic stop) lands,
+multi-thread runs are bounded by that variance.  For multi-thread
+TTC measurements the bar is ~2 % via paired interleaved.
+
+### Summary
+
+| regime              | can detect    | sample cost (this rig) |
+|---------------------|---------------|------------------------|
+| A: counter (mechanism) | **0.2 %** (or smaller) | 1 sample each side, bit-exact |
+| B: wall-clock at counter mode | 1 %       | ~20 paired samples (~40 min) |
+| B: wall-clock at counter mode | 0.2 %     | ~500 paired samples (~17 hr) — usually impractical |
+| C: multi-thread TTC | 2 %           | ~30 paired samples           |
+
+### How to apply the bar
+
+1. **Predict the counter the change should move.**  Write it down in
+   the IDEAS entry *before* implementing.
+2. **Implement.**  Build before / after binaries side-by-side.
+3. **Run regime A first.**  Counter totals at
+   `--threads=1 --seed=0 --bench-cover-log2=<small enough>` —
+   confirm bit-exact baseline (5+ reruns of one binary all
+   identical), then compare predicted counter between before /
+   after.
+4. **If the predicted counter moved ≥ 0.2 %**: accept.
+5. **If the predicted counter did not move**: the proposed
+   mechanism is wrong.  Either rethink the change, instrument it
+   so the rate change *does* show up as a counter, or fall back
+   to regime B (paired wall-clock at higher cost).
+6. **If fallback to regime B**: budget ~20 paired samples for a
+   1 % verdict, or write a `--bench-stop-items=N` patch first so
+   regime A becomes available for the change.
 
 ### Suspicious wins: improbably-good TTC suggests a soundness bug
 
