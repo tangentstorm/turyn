@@ -249,15 +249,49 @@ target/release/turyn search --n=26 --wz=together --mdd-k=7 \
   --seed=0 --threads=1
 ```
 
-Under this configuration, the MDD-mode counter totals (`stage_exit`,
-`flow_w_*`, `flow_z_*`, `flow_xy_*`) are **bit-exact** across reruns
-of the same binary.  A 0.2 % movement is then real signal, not
-noise.
+Under this configuration, MDD-mode counter totals are **mostly
+deterministic but not yet fully bit-exact**.  Roughly 5/7 reruns at
+n=26 wz=together mdd-k=7 cover-log2=38 give identical totals
+(modal `flow_xy_solves = 28593`, `flow_z_solves = 190`); the rest
+land 10-20 % higher because the bench-target cancel fired inside a
+SolveWZ stage handler's inner XY loop and the rest of that inner
+loop ran before the cancel was noticed.
 
-Verified at the time `--threads=1` landed: 3 reruns at n=26 wz=together
-mdd-k=7 cover-log2=38 produced identical
-`bnd/W/Z/XY = 1465976/718/3024/28593` and
-`flow_z_solves = 190` (bit-for-bit).
+In practice this means:
+
+- **Multi-percent effects** (e.g. `--rephasing` and `--probing`,
+  both 3-5× regressions) are unambiguous in 1-2 reruns.
+- **Sub-percent effects** require running ≥ 5 times per side and
+  comparing the **modal counter total** (or run-min, since the
+  race only adds mass, never removes it).  A counter-ratio that is
+  also bit-exact within a single run (e.g. `flow_xy_decisions /
+  flow_xy_solves` for whichever runs landed on the same
+  flow_xy_solves) is a cleaner signal than wall-clock.
+
+Truly bit-exact mode would require threading `ctx.cancelled`
+through `walk_xy_sub_mdd` so the inner loop also halts mid-
+iteration on cancel — deferred to a later session.
+
+### Knob-sweep caveat
+
+Knob sweeps (`--max-z=N`, `--mdd-extend=N`, `--conflict-limit=N`,
+etc.) at `--bench-cover-log2 --threads=1 --seed=0` are **not
+reliably resolvable on this rig** for sub-30 % differences.  The
+TTC value depends on the exact `covered_mass` at cancel-fire,
+which varies up to 5× across reruns at small cover targets
+(elapsed=1.2 s up to 30 s for the same flags).  The `max_z`
+sweep this session showed 80,857 s vs 32,734 s median TTCs that
+*looked* like a −36 % win in a single run but reversed across 5
+runs — pure variance.  Until a deterministic stop condition
+lands (`--bench-stop-items=N` was a frequent suggestion), knob
+sweeps are out of scope for fine-grained tuning.
+
+The reliable signals on this rig today are:
+
+1. **Large effects** (≥ 30 %, e.g. `--rephasing` 3× slowdown).
+2. **Counter ratios within a single run** that the change is
+   predicted to move, where the ratio is independent of the
+   exact stop point.
 
 `--threads>1` keeps per-call rng deterministic but total counter
 values vary ≈ 1-2 % because `--bench-cover-log2` cancellation races
