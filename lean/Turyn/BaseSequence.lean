@@ -9,23 +9,17 @@ main theorem in this file proves that these base sequences satisfy the required
 combined aperiodic autocorrelation identity.
 -/
 
-/-- A length-indexed `±1` sequence. -/
-structure SignedSeq (n : Nat) where
-  data : List Int
-  len : data.length = n
-  pm : AllPmOne data
-
 /-- A typed Turyn quadruple TT(n). -/
 structure TurynType (n : Nat) where
-  x : SignedSeq n
-  y : SignedSeq n
-  z : SignedSeq n
-  w : SignedSeq (n - 1)
+  x : PmSeq n
+  y : PmSeq n
+  z : PmSeq n
+  w : PmSeq (n - 1)
   vanishing : ∀ s : Nat, 1 ≤ s → s < n →
     combinedAutocorr x.data y.data z.data w.data s = 0
 
 /-- Convert an existing propositional TT witness into the typed wrapper. -/
-def IsTurynTypeProp.toTyped {n : Nat} {x y z w : PmSeq}
+def IsTurynTypeProp.toTyped {n : Nat} {x y z w : List Int}
     (h : IsTurynTypeProp n x y z w) : TurynType n :=
   { x := ⟨x, h.x_len, h.x_pm⟩
     y := ⟨y, h.y_len, h.y_pm⟩
@@ -33,26 +27,26 @@ def IsTurynTypeProp.toTyped {n : Nat} {x y z w : PmSeq}
     w := ⟨w, h.w_len, h.w_pm⟩
     vanishing := h.vanishing }
 
-/-- Convert a Boolean-style TT certificate into the typed wrapper. -/
-def IsTurynType.toTyped {n : Nat} {x y z w : PmSeq}
-    (h : IsTurynType n x y z w) : TurynType n :=
-  (IsTurynType.toProp h).toTyped
+/-- Convert a typed `IsTurynType` certificate into the bundled `TurynType`. -/
+def IsTurynType.toTyped {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
+    (h : IsTurynType X Y Z W) : TurynType n :=
+  { x := X, y := Y, z := Z, w := W, vanishing := h.vanishing }
 
 /-- Negate every entry in a sequence. -/
 def negSeq (a : List Int) : List Int := a.map (fun x => -x)
 
 /-- Base sequences from TT(n) = (X, Y, Z, W):
     A = Z ++ W, B = Z ++ (-W), C = X, D = Y. -/
-def baseSequences (x y z w : PmSeq) :
-    PmSeq × PmSeq × PmSeq × PmSeq :=
+def baseSequences (x y z w : List Int) :
+    List Int × List Int × List Int × List Int :=
   (z ++ w, z ++ negSeq w, x, y)
 
 /-- Typed base-sequence data for Step 1. -/
 structure BaseSeqData (n : Nat) where
-  a : SignedSeq (2 * n - 1)
-  b : SignedSeq (2 * n - 1)
-  c : SignedSeq n
-  d : SignedSeq n
+  a : PmSeq (2 * n - 1)
+  b : PmSeq (2 * n - 1)
+  c : PmSeq n
+  d : PmSeq n
   vanishing : ∀ s : Nat, 1 ≤ s →
     aperiodicAutocorr a.data s + aperiodicAutocorr b.data s +
     aperiodicAutocorr c.data s + aperiodicAutocorr d.data s = 0
@@ -191,13 +185,13 @@ lemma concat_neg_autocorr_sum' (z w : List Int) (s : Nat) :
 
 /-- Cross-term cancellation:
     `N_{Z++W}(s) + N_{Z++(-W)}(s) = 2·N_Z(s) + 2·N_W(s)`. -/
-lemma concat_neg_autocorr_sum (z w : PmSeq) (s : Nat) :
+lemma concat_neg_autocorr_sum (z w : List Int) (s : Nat) :
     aperiodicAutocorr (z ++ w) s + aperiodicAutocorr (z ++ negSeq w) s =
     2 * aperiodicAutocorr z s + 2 * aperiodicAutocorr w s :=
   concat_neg_autocorr_sum' z w s
 
 /-- Base-sequence theorem (KTR2005, Theorem 1). -/
-theorem base_seq_vanishing_prop {n : Nat} {x y z w : PmSeq}
+theorem base_seq_vanishing_prop {n : Nat} {x y z w : List Int}
     (htt : IsTurynTypeProp n x y z w) (_hn : n ≥ 1)
     {s : Nat} (hs1 : 1 ≤ s) :
     aperiodicAutocorr (z ++ w) s + aperiodicAutocorr (z ++ negSeq w) s +

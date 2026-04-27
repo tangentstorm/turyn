@@ -36,7 +36,7 @@ def combinedPeriodicAutocorr (a b c d : List Int) (s : Nat) : Int :=
   periodicAutocorr c s + periodicAutocorr d s
 
 /-- Construct the four T-sequences from TT(n) = (X, Y, Z, W). -/
-def tSequences (x y z w : PmSeq) :
+def tSequences (x y z w : List Int) :
     List Int × List Int × List Int × List Int :=
   let (bsA, bsB, bsC, bsD) := baseSequences x y z w
   let n := x.length
@@ -91,15 +91,15 @@ def step2d {n : Nat} (T : TurynType n) : List Int :=
   split <;> simp
 
 /-- Valid entries of a signed sequence are `±1`. -/
-lemma signedSeq_getD_pmOne {n : Nat} (s : SignedSeq n) {i : Nat} (hi : i < n) :
+lemma pmSeq_getD_pmOne {n : Nat} (s : PmSeq n) {i : Nat} (hi : i < n) :
     s.data.getD i 0 = 1 ∨ s.data.getD i 0 = -1 := by
   rw [List.getD_eq_getElem _ _ (by simpa [s.len] using hi)]
   exact s.pm _ (List.getElem_mem (by simpa [s.len] using hi))
 
 /-- Valid entries of a signed sequence have absolute value `1`. -/
-lemma signedSeq_natAbs_getD {n : Nat} (s : SignedSeq n) {i : Nat} (hi : i < n) :
+lemma pmSeq_natAbs_getD {n : Nat} (s : PmSeq n) {i : Nat} (hi : i < n) :
     Int.natAbs (s.data.getD i 0) = 1 := by
-  rcases signedSeq_getD_pmOne s hi with h | h <;> rw [h] <;> decide
+  rcases pmSeq_getD_pmOne s hi with h | h <;> rw [h] <;> decide
 
 /-- Equal-length half-sum accessor. -/
 lemma seqSumHalf_getD {a b : List Int} {i : Nat}
@@ -153,7 +153,7 @@ theorem step2_support {n : Nat} (T : TurynType n) :
       exact zeroSeq_getD (2 * n - 1) i
     rw [ht1, ht2, ht3, ht4]
     simp
-    exact signedSeq_natAbs_getD T.z h1
+    exact pmSeq_natAbs_getD T.z h1
   · by_cases h2 : i < 2 * n - 1
     · have hn : n ≤ i := by omega
       have ht1 : (step2a T).getD i 0 = 0 := by
@@ -179,7 +179,7 @@ theorem step2_support {n : Nat} (T : TurynType n) :
       rw [ht1, ht2, ht3, ht4]
       simp
       have hwn : i - n < n - 1 := by omega
-      simpa [T.w.len] using signedSeq_natAbs_getD T.w hwn
+      simpa [T.w.len] using pmSeq_natAbs_getD T.w hwn
     · have h3 : 2 * n - 1 ≤ i := by omega
       have hx : i - (2 * n - 1) < T.x.data.length := by
         simpa [T.x.len] using (show i - (2 * n - 1) < n by omega)
@@ -218,8 +218,8 @@ theorem step2_support {n : Nat} (T : TurynType n) :
       exact natAbs_halfSum_add_natAbs_halfDiff_eq_one
         (T.x.data.getD (i - (2 * n - 1)) 0)
         (T.y.data.getD (i - (2 * n - 1)) 0)
-        (signedSeq_getD_pmOne T.x (by simpa [T.x.len] using hx))
-        (signedSeq_getD_pmOne T.y (by simpa [T.y.len] using hy))
+        (pmSeq_getD_pmOne T.x (by simpa [T.x.len] using hx))
+        (pmSeq_getD_pmOne T.y (by simpa [T.y.len] using hy))
 
 /-! ### Helper lemmas for periodic autocorrelation -/
 

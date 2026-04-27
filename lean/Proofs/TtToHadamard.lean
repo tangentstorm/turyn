@@ -11,8 +11,8 @@ import Turyn.Hadamard
 
 namespace Turyn.Result
 
-theorem tt_implies_hadamard {n : Nat} {x y z w : PmSeq}
-    (h : IsTurynType n x y z w) :
+theorem tt_implies_hadamard {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
+    (h : IsTurynType X Y Z W) :
     ∃ H : IntMat (4 * (3 * n - 1)), IsHadamardMat H :=
   ⟨Turyn.ofIsTurynTypeMatrix h, Turyn.ofIsTurynTypeMatrix_isHadamard h⟩
 

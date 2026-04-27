@@ -54,8 +54,8 @@ namespace Turyn.Result
 /-- **TT(n) ⇒ Hadamard.** If a Turyn-type sequence of length `n` exists,
 then a Hadamard matrix of order `4 (3 n − 1)` exists. The witness is the
 constructive Goethals–Seidel pipeline applied to the TT(n) certificate. -/
-theorem tt_implies_hadamard {n : Nat} {x y z w : PmSeq}
-    (h : IsTurynType n x y z w) :
+theorem tt_implies_hadamard {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
+    (h : IsTurynType X Y Z W) :
     ∃ H : IntMat (4 * (3 * n - 1)), IsHadamardMat H := by
   sorry
 

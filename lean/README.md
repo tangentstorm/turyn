@@ -60,18 +60,17 @@ import Turyn.TurynType
 import Turyn.Energy
 import Turyn.Hadamard
 
-def myX : PmSeq := [1, -1, ...]
-def myY : PmSeq := [1, 1, ...]
-def myZ : PmSeq := [-1, 1, ...]
-def myW : PmSeq := [1, -1, ...]
+def myX : PmSeq N       := ⟨pm! "...", by decide, by decide⟩
+def myY : PmSeq N       := ⟨pm! "...", by decide, by decide⟩
+def myZ : PmSeq N       := ⟨pm! "...", by decide, by decide⟩
+def myW : PmSeq (N - 1) := ⟨pm! "...", by decide, by decide⟩
 
 -- Lean verifies at compile time (takes seconds)
-theorem my_tt_valid : IsTurynType N myX myY myZ myW := by native_decide
-theorem my_energy : checkEnergy N myX myY myZ myW = true := by native_decide
+theorem my_tt_valid : IsTurynType myX myY myZ myW := by native_decide
 
 theorem my_hadamard_exists :
-    ∃ (x y z w : PmSeq),
-      IsTurynType N x y z w ∧ hadamardOrder N = ORDER :=
+    ∃ (X Y Z : PmSeq N) (W : PmSeq (N - 1)),
+      IsTurynType X Y Z W ∧ hadamardOrder N = ORDER :=
   ⟨myX, myY, myZ, myW, my_tt_valid, by native_decide⟩
 ```
 

@@ -16,10 +16,7 @@ every nonzero shift:
   N_X(s) + N_Y(s) + 2·N_Z(s) + 2·N_W(s) = 0    for s = 1, …, n−1
 -/
 
-/-! ### Sequences -/
-
-/-- A ±1 sequence, represented as a `List Int` with entries restricted to {1, −1}. -/
-abbrev PmSeq := List Int
+/-! ### Sign-character parsing -/
 
 /-- Convert a sign character into the corresponding `±1` value. -/
 def charToPm? (c : Char) : Option Int :=
@@ -27,8 +24,8 @@ def charToPm? (c : Char) : Option Int :=
   else if c = '-' then some (-1)
   else none
 
-/-- Parse a string of `+` and `-` characters into a `PmSeq`. -/
-def pmSeq? (s : String) : Option PmSeq :=
+/-- Parse a string of `+` and `-` characters into a `List Int`. -/
+def pmSeq? (s : String) : Option (List Int) :=
   s.toList.foldr
     (fun c acc =>
       match charToPm? c, acc with
@@ -36,67 +33,131 @@ def pmSeq? (s : String) : Option PmSeq :=
       | _, _ => none)
     (some [])
 
-/-- Parse a string literal of `+` and `-` characters into a `PmSeq`.
+/-- Parse a string literal of `+` and `-` characters into a `List Int`.
     Invalid characters raise an error when the definition is evaluated. -/
-def pmSeq! (s : String) : PmSeq :=
+def pmSeq! (s : String) : List Int :=
   match pmSeq? s with
   | some xs => xs
-  | none => panic! s!"invalid PmSeq literal: {s}"
+  | none => panic! s!"invalid ±1 literal: {s}"
 
-/-- String literal notation for `PmSeq` values, e.g. `pm! "++--"`. -/
+/-- String literal notation for ±1 sequences, e.g. `pm! "++--"`. -/
 syntax "pm! " str : term
 
 macro_rules
   | `(pm! $s:str) => `(pmSeq! $s)
 
-/-- Check that every entry of a sequence is ±1. -/
-def allPmOne (a : PmSeq) : Bool :=
+/-! ### Entry-set predicates -/
+
+/-- Boolean check that every entry of a sequence is ±1. -/
+def allPmOne (a : List Int) : Bool :=
   a.all fun v => v == 1 || v == -1
 
-/-- Propositional version: every entry is 1 or −1. -/
-def AllPmOne (a : PmSeq) : Prop := ∀ v ∈ a, v = 1 ∨ v = -1
+/-- Propositional version: every entry is `1` or `−1`. -/
+def AllPmOne (a : List Int) : Prop := ∀ v ∈ a, v = 1 ∨ v = -1
+
+theorem allPmOne_iff (a : List Int) : allPmOne a = true ↔ AllPmOne a := by
+  simp [allPmOne, AllPmOne, List.all_eq_true, Bool.or_eq_true, beq_iff_eq]
+
+instance (a : List Int) : Decidable (AllPmOne a) :=
+  decidable_of_iff _ (allPmOne_iff a)
+
+/-- Boolean check that every entry of a sequence is `0`, `1`, or `−1`. -/
+def allSignOne (a : List Int) : Bool :=
+  a.all fun v => v == 0 || v == 1 || v == -1
+
+/-- Propositional version: every entry is `0`, `1`, or `−1`. -/
+def AllSignOne (a : List Int) : Prop := ∀ v ∈ a, v = 0 ∨ v = 1 ∨ v = -1
+
+theorem allSignOne_iff (a : List Int) : allSignOne a = true ↔ AllSignOne a := by
+  simp only [allSignOne, AllSignOne, List.all_eq_true, Bool.or_eq_true, beq_iff_eq]
+  constructor
+  · intro h v hv
+    have := h v hv
+    tauto
+  · intro h v hv
+    have := h v hv
+    tauto
+
+instance (a : List Int) : Decidable (AllSignOne a) :=
+  decidable_of_iff _ (allSignOne_iff a)
 
 /-! ### Aperiodic Autocorrelation -/
 
 /-- Aperiodic autocorrelation of sequence `a` at lag `s`:
     N_a(s) = Σ_{i=0}^{|a|−1−s} a_i · a_{i+s}
-    Returns 0 when `s ≥ |a|`. -/
-def aperiodicAutocorr (a : PmSeq) (s : Nat) : Int :=
+    Returns `0` when `s ≥ |a|`. -/
+def aperiodicAutocorr (a : List Int) (s : Nat) : Int :=
   if s ≥ a.length then 0
   else ∑ i ∈ range (a.length - s), a.getD i 0 * a.getD (i + s) 0
 
 /-- Combined weighted autocorrelation for the Turyn quadruple at lag `s`:
     C(s) = N_X(s) + N_Y(s) + 2·N_Z(s) + 2·N_W(s) -/
-def combinedAutocorr (x y z w : PmSeq) (s : Nat) : Int :=
+def combinedAutocorr (x y z w : List Int) (s : Nat) : Int :=
   aperiodicAutocorr x s + aperiodicAutocorr y s +
   2 * aperiodicAutocorr z s + 2 * aperiodicAutocorr w s
 
-/-! ### Turyn-Type Sequences (Boolean, for native_decide) -/
+/-! ### Length-indexed sequence types -/
 
-/-- Boolean predicate: is (x, y, z, w) a valid TT(n)? -/
-def isTurynTypeBool (n : Nat) (x y z w : PmSeq) : Bool :=
-  x.length == n &&
-  y.length == n &&
-  z.length == n &&
-  w.length == (n - 1) &&
-  allPmOne x &&
-  allPmOne y &&
-  allPmOne z &&
-  allPmOne w &&
+/-- A length-`n` sequence with entries in `{+1, −1}`. -/
+structure PmSeq (n : Nat) where
+  data : List Int
+  len : data.length = n
+  pm : AllPmOne data
+
+/-- A length-`n` sequence with entries in `{0, +1, −1}`. -/
+structure SignSeq (n : Nat) where
+  data : List Int
+  len : data.length = n
+  sign : AllSignOne data
+
+/-- Every `±1` sequence is also a `{0, ±1}` sequence. -/
+def PmSeq.toSign {n : Nat} (s : PmSeq n) : SignSeq n :=
+  { data := s.data
+    len := s.len
+    sign := fun v hv => Or.inr (s.pm v hv) }
+
+/-! ### Turyn-Type Sequences -/
+
+/-- Boolean predicate: are `(X, Y, Z, W)` a valid TT(n)?
+    Lengths and ±1-ness are guaranteed by the typed carriers, so the
+    Boolean check only verifies that combined autocorrelations vanish. -/
+def isTurynTypeBool {n : Nat} (X Y Z : PmSeq n) (W : PmSeq (n - 1)) : Bool :=
   (List.range (n - 1)).all fun i =>
-    combinedAutocorr x y z w (i + 1) == 0
+    combinedAutocorr X.data Y.data Z.data W.data (i + 1) == 0
 
-/-- Propositional predicate (definitionally Bool = true). -/
-def IsTurynType (n : Nat) (x y z w : PmSeq) : Prop :=
-  isTurynTypeBool n x y z w = true
+/-- Propositional Turyn-type predicate on length-indexed `PmSeq` carriers. -/
+def IsTurynType {n : Nat} (X Y Z : PmSeq n) (W : PmSeq (n - 1)) : Prop :=
+  isTurynTypeBool X Y Z W = true
 
-instance (n : Nat) (x y z w : PmSeq) : Decidable (IsTurynType n x y z w) :=
-  inferInstanceAs (Decidable (isTurynTypeBool n x y z w = true))
+instance {n : Nat} (X Y Z : PmSeq n) (W : PmSeq (n - 1)) :
+    Decidable (IsTurynType X Y Z W) :=
+  inferInstanceAs (Decidable (isTurynTypeBool X Y Z W = true))
 
-/-! ### Turyn-Type Sequences (Propositional, for general proofs) -/
+/-- Direct vanishing form: unfolds the boolean check into a quantifier over
+    nonzero shifts.  Useful when consuming an `IsTurynType` proof. -/
+theorem IsTurynType.vanishing {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
+    (h : IsTurynType X Y Z W) :
+    ∀ s : Nat, 1 ≤ s → s < n →
+      combinedAutocorr X.data Y.data Z.data W.data s = 0 := by
+  unfold IsTurynType isTurynTypeBool at h
+  rw [List.all_eq_true] at h
+  intro s hs1 hs2
+  have hmem : s - 1 ∈ List.range (n - 1) := by rw [List.mem_range]; omega
+  have hk := h _ hmem
+  have heq : s - 1 + 1 = s := by omega
+  rw [heq] at hk
+  exact eq_of_beq hk
 
-/-- Propositional Turyn-type predicate with explicit hypotheses. -/
-structure IsTurynTypeProp (n : Nat) (x y z w : PmSeq) : Prop where
+/-! ### Raw-list propositional form
+
+`IsTurynTypeProp` keeps the explicit length/pm fields for the proofs in
+`Turyn.Equivalence`, which thread the raw list components through the
+`TurynTypeSeq` machinery.  Bridges in both directions are provided below.
+-/
+
+/-- Propositional Turyn-type predicate on raw `List Int` quadruples,
+    with length and ±1-ness as explicit hypotheses. -/
+structure IsTurynTypeProp (n : Nat) (x y z w : List Int) : Prop where
   x_len : x.length = n
   y_len : y.length = n
   z_len : z.length = n
@@ -107,76 +168,24 @@ structure IsTurynTypeProp (n : Nat) (x y z w : PmSeq) : Prop where
   w_pm : AllPmOne w
   vanishing : ∀ s : Nat, 1 ≤ s → s < n → combinedAutocorr x y z w s = 0
 
-/-- Extract propositional form from Boolean form. -/
-theorem IsTurynType.toProp {n : Nat} {x y z w : PmSeq}
-    (h : IsTurynType n x y z w) : IsTurynTypeProp n x y z w := by
-  unfold IsTurynType isTurynTypeBool at h
-  simp only [Bool.and_eq_true] at h
-  obtain ⟨⟨⟨⟨⟨⟨⟨⟨hxl, hyl⟩, hzl⟩, hwl⟩, hxpm⟩, hypm⟩, hzpm⟩, hwpm⟩, hall⟩ := h
-  have hxlen := eq_of_beq hxl
-  have hylen := eq_of_beq hyl
-  have hzlen := eq_of_beq hzl
-  have hwlen := eq_of_beq hwl
-  rw [List.all_eq_true] at hall
-  -- Extract AllPmOne from Bool
-  have hxp : AllPmOne x := by
-    intro v hv
-    rw [allPmOne, List.all_eq_true] at hxpm
-    have := hxpm v hv
-    simp [Bool.or_eq_true, beq_iff_eq] at this
-    exact this
-  have hyp : AllPmOne y := by
-    intro v hv
-    rw [allPmOne, List.all_eq_true] at hypm
-    have := hypm v hv
-    simp [Bool.or_eq_true, beq_iff_eq] at this
-    exact this
-  have hzp : AllPmOne z := by
-    intro v hv
-    rw [allPmOne, List.all_eq_true] at hzpm
-    have := hzpm v hv
-    simp [Bool.or_eq_true, beq_iff_eq] at this
-    exact this
-  have hwp : AllPmOne w := by
-    intro v hv
-    rw [allPmOne, List.all_eq_true] at hwpm
-    have := hwpm v hv
-    simp [Bool.or_eq_true, beq_iff_eq] at this
-    exact this
-  exact {
-    x_len := hxlen
-    y_len := hylen
-    z_len := hzlen
-    w_len := hwlen
-    x_pm := hxp
-    y_pm := hyp
-    z_pm := hzp
-    w_pm := hwp
-    vanishing := by
-      intro s hs1 hs2
-      have hmem : s - 1 ∈ List.range (n - 1) := by
-        rw [List.mem_range]; omega
-      have := hall _ hmem
-      have heq : s - 1 + 1 = s := by omega
-      rw [heq] at this
-      exact eq_of_beq this
-  }
+/-- A typed `IsTurynType` witness implies the raw-list propositional form. -/
+theorem IsTurynType.toProp {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
+    (h : IsTurynType X Y Z W) :
+    IsTurynTypeProp n X.data Y.data Z.data W.data where
+  x_len := X.len
+  y_len := Y.len
+  z_len := Z.len
+  w_len := W.len
+  x_pm := X.pm
+  y_pm := Y.pm
+  z_pm := Z.pm
+  w_pm := W.pm
+  vanishing := h.vanishing
 
 /-! ### Sum of a sequence -/
 
 /-- Sum of all entries in a sequence. -/
-def seqSum (a : PmSeq) : Int := ∑ i ∈ range a.length, a.getD i 0
-
-/-! ### Convenience: structured Turyn quadruple with proofs -/
-
-/-- A certified Turyn-type quadruple TT(n), bundling the sequences with
-    a proof of validity. -/
-structure TurynQuad (n : Nat) where
-  x : PmSeq
-  y : PmSeq
-  z : PmSeq
-  w : PmSeq
-  valid : IsTurynType n x y z w
+def seqSum (a : List Int) : Int := ∑ i ∈ range a.length, a.getD i 0
 
 /-! ### ±1 lemmas -/
 

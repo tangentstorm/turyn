@@ -116,7 +116,7 @@ theorem T_k_as_U_sum {n : Nat} (S : TurynTypeSeq n) (k : Nat) (hk : 2 ≤ k) (hk
 /-
 Each term of an autocorrelation of a ±1 sequence is itself ±1.
 -/
-lemma autocorr_term_pm {X : PmSeq} (hpm : AllPmOne X) {s : Nat} (hs : s < X.length)
+lemma autocorr_term_pm {X : List Int} (hpm : AllPmOne X) {s : Nat} (hs : s < X.length)
     {i : Nat} (hi : i < X.length - s) :
     X.getD i 0 * X.getD (i + s) 0 = 1 ∨ X.getD i 0 * X.getD (i + s) 0 = -1 := by
   have hi_lt : i < X.length := by omega
@@ -128,7 +128,7 @@ lemma autocorr_term_pm {X : PmSeq} (hpm : AllPmOne X) {s : Nat} (hs : s < X.leng
 /-
 Autocorrelation of a ±1 sequence mod 2 equals the number of summation terms mod 2.
 -/
-lemma autocorr_mod_two {X : PmSeq} (hpm : AllPmOne X) {s : Nat} (hs : s < X.length) :
+lemma autocorr_mod_two {X : List Int} (hpm : AllPmOne X) {s : Nat} (hs : s < X.length) :
     aperiodicAutocorr X s % 2 = ((X.length - s : Nat) : Int) % 2 := by
   convert sum_of_pm_ones_mod_two (List.length X - s)
     (fun i => X.getD i 0 * X.getD (i + s) 0) _

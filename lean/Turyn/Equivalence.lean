@@ -32,26 +32,26 @@ open Finset BigOperators
 /-! ### Sequence operations -/
 
 /-- Alternation of a sequence: entry at 0-indexed position `i` gets factor `(-1)^i`. -/
-def Turyn.altSeq (X : PmSeq) : PmSeq :=
+def Turyn.altSeq (X : List Int) : List Int :=
   (List.range X.length).map (fun i => ((if i % 2 = 0 then 1 else -1) : Int) * X.getD i 0)
 
 /-! ### Length preservation -/
 
-@[simp] lemma Turyn.altSeq_length (X : PmSeq) : (Turyn.altSeq X).length = X.length := by
+@[simp] lemma Turyn.altSeq_length (X : List Int) : (Turyn.altSeq X).length = X.length := by
   simp [Turyn.altSeq]
 
 /-! ### AllPmOne preservation -/
 
-lemma AllPmOne_neg {X : PmSeq} (h : AllPmOne X) : AllPmOne (negSeq X) := by
+lemma AllPmOne_neg {X : List Int} (h : AllPmOne X) : AllPmOne (negSeq X) := by
   intro v hv
   simp only [negSeq, List.mem_map] at hv
   obtain ⟨u, hu, rfl⟩ := hv
   rcases h u hu with rfl | rfl <;> simp
 
-lemma AllPmOne_reverse {X : PmSeq} (h : AllPmOne X) : AllPmOne X.reverse := by
+lemma AllPmOne_reverse {X : List Int} (h : AllPmOne X) : AllPmOne X.reverse := by
   intro v hv; exact h v (List.mem_reverse.mp hv)
 
-lemma AllPmOne_alt {X : PmSeq} (h : AllPmOne X) : AllPmOne (Turyn.altSeq X) := by
+lemma AllPmOne_alt {X : List Int} (h : AllPmOne X) : AllPmOne (Turyn.altSeq X) := by
   intro x hx
   simp only [Turyn.altSeq, List.mem_map, List.mem_range] at hx
   obtain ⟨i, hi, rfl⟩ := hx
@@ -86,7 +86,7 @@ private lemma sign_product_eq (i s : Nat) :
   rw [ite_mod2_eq_neg_one_pow, ite_mod2_eq_neg_one_pow, ← pow_add]
   rw [show i + (i + s) = 2 * i + s from by ring, pow_add, pow_mul, neg_one_sq, one_pow, one_mul]
 
-private lemma altSeq_getD_aux (X : PmSeq) (i : Nat) (hi : i < X.length) :
+private lemma altSeq_getD_aux (X : List Int) (i : Nat) (hi : i < X.length) :
     (Turyn.altSeq X).getD i 0 = (if i % 2 = 0 then 1 else -1) * X.getD i 0 := by
   unfold Turyn.altSeq
   rw [List.getD_eq_getElem?_getD, List.getElem?_map]
@@ -97,7 +97,7 @@ private lemma altSeq_getD_aux (X : PmSeq) (i : Nat) (hi : i < X.length) :
 /-! ### Autocorrelation preservation -/
 
 /-- Negation preserves aperiodic autocorrelation: `N_{-X}(s) = N_X(s)`. -/
-lemma aperiodicAutocorr_neg (a : PmSeq) (s : Nat) :
+lemma aperiodicAutocorr_neg (a : List Int) (s : Nat) :
     aperiodicAutocorr (negSeq a) s = aperiodicAutocorr a s := by
   unfold aperiodicAutocorr
   rw [negSeq_length_eq]
@@ -106,7 +106,7 @@ lemma aperiodicAutocorr_neg (a : PmSeq) (s : Nat) :
   · exact Finset.sum_congr rfl fun i _ => by rw [negSeq_getD, negSeq_getD, neg_mul_neg]
 
 /-- Reversal preserves aperiodic autocorrelation: `N_{X*}(s) = N_X(s)`. -/
-lemma aperiodicAutocorr_rev (a : PmSeq) (s : Nat) :
+lemma aperiodicAutocorr_rev (a : List Int) (s : Nat) :
     aperiodicAutocorr a.reverse s = aperiodicAutocorr a s := by
   unfold aperiodicAutocorr
   rw [List.length_reverse]
@@ -134,7 +134,7 @@ lemma aperiodicAutocorr_rev (a : PmSeq) (s : Nat) :
       rw [h1, h2, mul_comm]
 
 /-- Alternation scales autocorrelation by `(-1)^s`: `N_{X̂}(s) = (-1)^s · N_X(s)`. -/
-lemma aperiodicAutocorr_alt (a : PmSeq) (s : Nat) :
+lemma aperiodicAutocorr_alt (a : List Int) (s : Nat) :
     aperiodicAutocorr (Turyn.altSeq a) s = (-1 : Int) ^ s * aperiodicAutocorr a s := by
   unfold aperiodicAutocorr
   rw [Turyn.altSeq_length]
@@ -153,7 +153,7 @@ lemma aperiodicAutocorr_alt (a : PmSeq) (s : Nat) :
 
 /-! ### IsTurynTypeProp preservation under each elementary transformation -/
 
-lemma turynProp_negA {n : Nat} {A B C D : PmSeq}
+lemma turynProp_negA {n : Nat} {A B C D : List Int}
     (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n (negSeq A) B C D where
   x_len := by simp [negSeq, h.x_len]
   y_len := h.y_len
@@ -167,7 +167,7 @@ lemma turynProp_negA {n : Nat} {A B C D : PmSeq}
     have := h.vanishing s hs1 hs2
     unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_neg]; exact this
 
-lemma turynProp_negB {n : Nat} {A B C D : PmSeq}
+lemma turynProp_negB {n : Nat} {A B C D : List Int}
     (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A (negSeq B) C D where
   x_len := h.x_len
   y_len := by simp [negSeq, h.y_len]
@@ -181,7 +181,7 @@ lemma turynProp_negB {n : Nat} {A B C D : PmSeq}
     have := h.vanishing s hs1 hs2
     unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_neg]; exact this
 
-lemma turynProp_negC {n : Nat} {A B C D : PmSeq}
+lemma turynProp_negC {n : Nat} {A B C D : List Int}
     (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B (negSeq C) D where
   x_len := h.x_len
   y_len := h.y_len
@@ -195,7 +195,7 @@ lemma turynProp_negC {n : Nat} {A B C D : PmSeq}
     have := h.vanishing s hs1 hs2
     unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_neg]; exact this
 
-lemma turynProp_negD {n : Nat} {A B C D : PmSeq}
+lemma turynProp_negD {n : Nat} {A B C D : List Int}
     (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B C (negSeq D) where
   x_len := h.x_len
   y_len := h.y_len
@@ -209,7 +209,7 @@ lemma turynProp_negD {n : Nat} {A B C D : PmSeq}
     have := h.vanishing s hs1 hs2
     unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_neg]; exact this
 
-lemma turynProp_revA {n : Nat} {A B C D : PmSeq}
+lemma turynProp_revA {n : Nat} {A B C D : List Int}
     (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A.reverse B C D where
   x_len := by simp [h.x_len]
   y_len := h.y_len
@@ -223,7 +223,7 @@ lemma turynProp_revA {n : Nat} {A B C D : PmSeq}
     have := h.vanishing s hs1 hs2
     unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_rev]; exact this
 
-lemma turynProp_revB {n : Nat} {A B C D : PmSeq}
+lemma turynProp_revB {n : Nat} {A B C D : List Int}
     (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B.reverse C D where
   x_len := h.x_len
   y_len := by simp [h.y_len]
@@ -237,7 +237,7 @@ lemma turynProp_revB {n : Nat} {A B C D : PmSeq}
     have := h.vanishing s hs1 hs2
     unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_rev]; exact this
 
-lemma turynProp_revC {n : Nat} {A B C D : PmSeq}
+lemma turynProp_revC {n : Nat} {A B C D : List Int}
     (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B C.reverse D where
   x_len := h.x_len
   y_len := h.y_len
@@ -251,7 +251,7 @@ lemma turynProp_revC {n : Nat} {A B C D : PmSeq}
     have := h.vanishing s hs1 hs2
     unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_rev]; exact this
 
-lemma turynProp_revD {n : Nat} {A B C D : PmSeq}
+lemma turynProp_revD {n : Nat} {A B C D : List Int}
     (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n A B C D.reverse where
   x_len := h.x_len
   y_len := h.y_len
@@ -265,7 +265,7 @@ lemma turynProp_revD {n : Nat} {A B C D : PmSeq}
     have := h.vanishing s hs1 hs2
     unfold combinedAutocorr at this ⊢; rw [aperiodicAutocorr_rev]; exact this
 
-lemma turynProp_altAll {n : Nat} {A B C D : PmSeq}
+lemma turynProp_altAll {n : Nat} {A B C D : List Int}
     (h : IsTurynTypeProp n A B C D) :
     IsTurynTypeProp n (Turyn.altSeq A) (Turyn.altSeq B) (Turyn.altSeq C) (Turyn.altSeq D) where
   x_len := by simp [Turyn.altSeq, h.x_len]
@@ -286,7 +286,7 @@ lemma turynProp_altAll {n : Nat} {A B C D : PmSeq}
         2 * aperiodicAutocorr C s + 2 * aperiodicAutocorr D s) := by ring
     rw [factored, hv, mul_zero]
 
-lemma turynProp_swapAB {n : Nat} {A B C D : PmSeq}
+lemma turynProp_swapAB {n : Nat} {A B C D : List Int}
     (h : IsTurynTypeProp n A B C D) : IsTurynTypeProp n B A C D where
   x_len := h.y_len
   y_len := h.x_len
@@ -306,10 +306,10 @@ namespace Turyn
 /-- A Turyn-type quadruple packaged as a single object, using
 propositional validity from `IsTurynTypeProp`. -/
 structure TurynTypeSeq (n : Nat) where
-  A : PmSeq
-  B : PmSeq
-  C : PmSeq
-  D : PmSeq
+  A : List Int
+  B : List Int
+  C : List Int
+  D : List Int
   isTuryn : IsTurynTypeProp n A B C D
 
 /-- Entry accessor for `A` (1-indexed). -/
@@ -449,14 +449,14 @@ def Canonical (n : Nat) (S : TurynTypeSeq n) : Prop :=
 
 /-! ### Helper: ±1 entries are 1 or -1 -/
 
-lemma pm_entry_of_getD {X : PmSeq} (hpm : AllPmOne X) {i : Nat} (hi : i < X.length) :
+lemma pm_entry_of_getD {X : List Int} (hpm : AllPmOne X) {i : Nat} (hi : i < X.length) :
     X.getD i 0 = 1 ∨ X.getD i 0 = -1 := by
   rw [List.getD_eq_getElem?_getD, List.getElem?_eq_getElem hi]
   exact hpm X[i] (List.getElem_mem hi)
 
 /-! ### Endpoint constraint from vanishing at s = n-1 -/
 
-lemma aperiodicAutocorr_last {n : Nat} {a : PmSeq} (ha : a.length = n) (hn : 1 < n) :
+lemma aperiodicAutocorr_last {n : Nat} {a : List Int} (ha : a.length = n) (hn : 1 < n) :
     aperiodicAutocorr a (n - 1) = a.getD 0 0 * a.getD (n - 1) 0 := by
   unfold aperiodicAutocorr
   rw [if_neg (by rw [ha]; omega)]
@@ -491,14 +491,14 @@ theorem lemma1_endpoint_constraint
 /-
 altSeq multiplies by (-1)^i at each valid index.
 -/
-lemma altSeq_getD (X : PmSeq) (i : Nat) (hi : i < X.length) :
+lemma altSeq_getD (X : List Int) (i : Nat) (hi : i < X.length) :
     (altSeq X).getD i 0 = (if i % 2 = 0 then 1 else -1) * X.getD i 0 :=
   altSeq_getD_aux X i hi
 
 /-
 altSeq preserves position 0 (factor = 1).
 -/
-lemma altSeq_getD_zero (X : PmSeq) (hX : 0 < X.length) :
+lemma altSeq_getD_zero (X : List Int) (hX : 0 < X.length) :
     (altSeq X).getD 0 0 = X.getD 0 0 := by
   rw [altSeq_getD X 0 hX]
   norm_num
@@ -506,7 +506,7 @@ lemma altSeq_getD_zero (X : PmSeq) (hX : 0 < X.length) :
 /-
 For even length ≥ 2, altSeq at position length-1 has factor -1.
 -/
-lemma altSeq_getD_last (X : PmSeq) (hn : X.length % 2 = 0) (hX : 2 ≤ X.length) :
+lemma altSeq_getD_last (X : List Int) (hn : X.length % 2 = 0) (hX : 2 ≤ X.length) :
     (altSeq X).getD (X.length - 1) 0 = -(X.getD (X.length - 1) 0) := by
   rw [altSeq_getD X (X.length - 1) (by omega)]
   have hodd : (X.length - 1) % 2 = 1 := by omega
@@ -785,7 +785,7 @@ theorem step2_condition2
 /-
 Reversal of a list maps index j to (length-1-j).
 -/
-lemma revD_getD {D : PmSeq} {j : Nat} (hj : j < D.length) :
+lemma revD_getD {D : List Int} {j : Nat} (hj : j < D.length) :
     D.reverse.getD j 0 = D.getD (D.length - 1 - j) 0 := by
   have h1 : j < D.reverse.length := by rw [List.length_reverse]; exact hj
   have h2 : D.length - 1 - j < D.length := by omega
@@ -1329,7 +1329,7 @@ private lemma step6_dAt_pm {n : Nat} (S : TurynTypeSeq n) (i : Nat) (hi : i - 1 
 /-
 Autocorrelation of a length-(m+2) sequence at lag m has exactly 2 terms.
 -/
-private lemma autocorr_two_terms (X : PmSeq) (m : Nat) (hlen : X.length = m + 2) :
+private lemma autocorr_two_terms (X : List Int) (m : Nat) (hlen : X.length = m + 2) :
     aperiodicAutocorr X m = X.getD 0 0 * X.getD m 0 + X.getD 1 0 * X.getD (m + 1) 0 := by
   unfold aperiodicAutocorr
   have hge : ¬(m ≥ X.length) := by omega
@@ -1342,7 +1342,7 @@ private lemma autocorr_two_terms (X : PmSeq) (m : Nat) (hlen : X.length = m + 2)
 /-
 Autocorrelation of a length-(m+1) sequence at lag m has exactly 1 term.
 -/
-private lemma autocorr_one_term (X : PmSeq) (m : Nat) (hlen : X.length = m + 1) :
+private lemma autocorr_one_term (X : List Int) (m : Nat) (hlen : X.length = m + 1) :
     aperiodicAutocorr X m = X.getD 0 0 * X.getD m 0 := by
   unfold aperiodicAutocorr
   have hge : ¬(m ≥ X.length) := by omega

@@ -21,14 +21,14 @@ theorem turynToHadamardMatrix_isHadamard {n : Nat} (T : TurynType n) :
   simpa [turynToHadamardMatrix] using typedGsMatrix_isHadamard (step2 T)
 
 /-- Convenience entry point from an existing `IsTurynType` certificate. -/
-def ofIsTurynTypeMatrix {n : Nat} {x y z w : PmSeq}
-    (h : IsTurynType n x y z w) :
+def ofIsTurynTypeMatrix {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
+    (h : IsTurynType X Y Z W) :
     IntMat (4 * (3 * n - 1)) :=
   turynToHadamardMatrix h.toTyped
 
 /-- Correctness theorem for the convenience entry point. -/
-theorem ofIsTurynTypeMatrix_isHadamard {n : Nat} {x y z w : PmSeq}
-    (h : IsTurynType n x y z w) :
+theorem ofIsTurynTypeMatrix_isHadamard {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
+    (h : IsTurynType X Y Z W) :
     IsHadamardMat (ofIsTurynTypeMatrix h) := by
   simpa [ofIsTurynTypeMatrix] using turynToHadamardMatrix_isHadamard h.toTyped
 

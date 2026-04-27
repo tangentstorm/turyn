@@ -14,33 +14,36 @@ check to native code and runs it, producing a kernel-level proof.
 ## How to add your own verified solution
 
 ```lean
-def myX : PmSeq := [1, -1, 1, ...]
-def myY : PmSeq := [1, 1, -1, ...]
-def myZ : PmSeq := [1, -1, -1, ...]
-def myW : PmSeq := [-1, 1, 1, ...]
+def myX : PmSeq n := ⟨pm! "+−+−...", by decide, by decide⟩
+def myY : PmSeq n := ⟨pm! "++−−...", by decide, by decide⟩
+def myZ : PmSeq n := ⟨pm! "+−−+...", by decide, by decide⟩
+def myW : PmSeq (n - 1) := ⟨pm! "−++−...", by decide, by decide⟩
 
-theorem my_solution_is_turyn : IsTurynType n myX myY myZ myW := by
+theorem my_solution_is_turyn : IsTurynType myX myY myZ myW := by
   native_decide
 ```
 -/
 
 /-! ## TT(6): A small example -/
 
-def tt6X : PmSeq := pm! "----+-"
-def tt6Y : PmSeq := pm! "---+--"
-def tt6Z : PmSeq := pm! "--+-++"
-def tt6W : PmSeq := pm! "-+++-"
+def tt6X : PmSeq 6 := ⟨pm! "----+-", by decide, by decide⟩
+def tt6Y : PmSeq 6 := ⟨pm! "---+--", by decide, by decide⟩
+def tt6Z : PmSeq 6 := ⟨pm! "--+-++", by decide, by decide⟩
+def tt6W : PmSeq 5 := ⟨pm! "-+++-", by decide, by decide⟩
 
 /-- TT(6) is a valid Turyn-type sequence.
     Verified by compiling the Boolean check to native code. -/
-theorem tt6_valid : IsTurynType 6 tt6X tt6Y tt6Z tt6W := by native_decide
+theorem tt6_valid : IsTurynType tt6X tt6Y tt6Z tt6W := by native_decide
 
 /-- The energy identity holds for TT(6): (−4)² + (−4)² + 2·0² + 2·1² = 34 = 6·6 − 2. -/
-theorem tt6_energy : checkEnergy 6 tt6X tt6Y tt6Z tt6W = true := by native_decide
+theorem tt6_energy :
+    checkEnergy 6 tt6X.data tt6Y.data tt6Z.data tt6W.data = true := by
+  native_decide
 
 /-- TT(6) sums: x = −4, y = −4, z = 0, w = 1. -/
 theorem tt6_sums :
-    seqSum tt6X = -4 ∧ seqSum tt6Y = -4 ∧ seqSum tt6Z = 0 ∧ seqSum tt6W = 1 := by
+    seqSum tt6X.data = -4 ∧ seqSum tt6Y.data = -4 ∧
+    seqSum tt6Z.data = 0 ∧ seqSum tt6W.data = 1 := by
   native_decide
 
 /-- The constructive pipeline produces a Hadamard matrix of order `68` from TT(6). -/
@@ -60,27 +63,32 @@ the smallest order for which no Hadamard matrix was previously known.
 Reference: Kharaghani, H. & Tayfeh-Rezaie, B. (2005).
 "A Hadamard matrix of order 428." *J. Combin. Des.* 13(6), 435–440. -/
 
-def kh05X : PmSeq := pm! "+++----++-+-+-----++++-++-++++----+-"
-def kh05Y : PmSeq := pm! "+-+++++--+-+--+--++--++++-++++---++-"
-def kh05Z : PmSeq := pm! "+-+++++-+--++++-+++-++--+++-+--+---+"
-def kh05W : PmSeq := pm! "+++-+-----++--+-+++--+-+-+++-++++-+"
+def kh05X : PmSeq 36 :=
+  ⟨pm! "+++----++-+-+-----++++-++-++++----+-", by decide, by decide⟩
+def kh05Y : PmSeq 36 :=
+  ⟨pm! "+-+++++--+-+--+--++--++++-++++---++-", by decide, by decide⟩
+def kh05Z : PmSeq 36 :=
+  ⟨pm! "+-+++++-+--++++-+++-++--+++-+--+---+", by decide, by decide⟩
+def kh05W : PmSeq 35 :=
+  ⟨pm! "+++-+-----++--+-+++--+-+-+++-++++-+", by decide, by decide⟩
 
 /-- **Kharaghani–Tayfeh-Rezaie TT(36) is a valid Turyn-type sequence.**
 
     This is a machine-checked proof: Lean compiles the verification algorithm
     (computing 35 combined autocorrelation values and checking they all vanish)
     to native code and certifies the result. -/
-theorem kharaghani_2005_tt36 : IsTurynType 36 kh05X kh05Y kh05Z kh05W := by
+theorem kharaghani_2005_tt36 : IsTurynType kh05X kh05Y kh05Z kh05W := by
   native_decide
 
 /-- The energy identity for TT(36): 0² + 6² + 2·8² + 2·5² = 214 = 6·36 − 2. -/
-theorem kh05_energy : checkEnergy 36 kh05X kh05Y kh05Z kh05W = true := by
+theorem kh05_energy :
+    checkEnergy 36 kh05X.data kh05Y.data kh05Z.data kh05W.data = true := by
   native_decide
 
 /-- Sequence sums for Kharaghani TT(36). -/
 theorem kh05_sums :
-    seqSum kh05X = 0 ∧ seqSum kh05Y = 6 ∧
-    seqSum kh05Z = 8 ∧ seqSum kh05W = 5 := by
+    seqSum kh05X.data = 0 ∧ seqSum kh05Y.data = 6 ∧
+    seqSum kh05Z.data = 8 ∧ seqSum kh05W.data = 5 := by
   native_decide
 
 /-- The Hadamard order from TT(36) is 428. -/
@@ -90,14 +98,11 @@ theorem kh05_hadamard_order : hadamardOrder 36 = 428 := by native_decide
 
     By the base-sequence → T-sequence → Goethals-Seidel pipeline (KTR2005),
     the verified TT(36) above implies the existence of a Hadamard matrix
-    of order 4(3·36 − 1) = 428.
-
-    The TT(36) verification is fully machine-checked.  The order computation
-    `4 * (3 * 36 - 1) = 428` is recorded by `hadamardOrder`. -/
+    of order 4(3·36 − 1) = 428. -/
 theorem hadamard_428_exists :
-    ∃ (x y z w : PmSeq),
-      IsTurynType 36 x y z w ∧ hadamardOrder 36 = 428 := by
-  exact ⟨kh05X, kh05Y, kh05Z, kh05W, kharaghani_2005_tt36, kh05_hadamard_order⟩
+    ∃ (X Y Z : PmSeq 36) (W : PmSeq 35),
+      IsTurynType X Y Z W ∧ hadamardOrder 36 = 428 :=
+  ⟨kh05X, kh05Y, kh05Z, kh05W, kharaghani_2005_tt36, kh05_hadamard_order⟩
 
 /-! ## Template for publishing your own results
 
@@ -106,18 +111,17 @@ import Turyn.TurynType
 import Turyn.Energy
 import Turyn.TSequence
 
-def myX : PmSeq := [1, -1, ...]
-def myY : PmSeq := [1, 1, ...]
-def myZ : PmSeq := [-1, 1, ...]
-def myW : PmSeq := [1, -1, ...]
+def myX : PmSeq N := ⟨pm! "...", by decide, by decide⟩
+def myY : PmSeq N := ⟨pm! "...", by decide, by decide⟩
+def myZ : PmSeq N := ⟨pm! "...", by decide, by decide⟩
+def myW : PmSeq (N - 1) := ⟨pm! "...", by decide, by decide⟩
 
 -- Lean verifies at compile time
-theorem my_tt_valid : IsTurynType N myX myY myZ myW := by native_decide
-theorem my_energy : checkEnergy N myX myY myZ myW = true := by native_decide
+theorem my_tt_valid : IsTurynType myX myY myZ myW := by native_decide
 
 theorem my_hadamard_exists :
-    ∃ (x y z w : PmSeq),
-      IsTurynType N x y z w ∧ hadamardOrder N = ORDER :=
+    ∃ (X Y Z : PmSeq N) (W : PmSeq (N - 1)),
+      IsTurynType X Y Z W ∧ hadamardOrder N = ORDER :=
   ⟨myX, myY, myZ, myW, my_tt_valid, by native_decide⟩
 ```
 -/

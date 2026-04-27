@@ -40,20 +40,20 @@ Combining:
 /-! ### Total autocorrelation -/
 
 /-- Total autocorrelation: sum of N_a(s) for s = 1, …, k−1. -/
-def totalAutocorr (a : PmSeq) : Int :=
+def totalAutocorr (a : List Int) : Int :=
   ∑ i ∈ range (a.length - 1), aperiodicAutocorr a (i + 1)
 
 /-! ### Weighted total autocorrelation -/
 
 /-- Weighted total autocorrelation for a TT quadruple. -/
-def weightedTotalAutocorr (x y z w : PmSeq) (n : Nat) : Int :=
+def weightedTotalAutocorr (x y z w : List Int) (n : Nat) : Int :=
   ∑ i ∈ range (n - 1), combinedAutocorr x y z w (i + 1)
 
 /-- **Turyn vanishing (total):** The weighted total autocorrelation vanishes.
 
 This is a direct consequence of the TT vanishing condition:
 each shift's combined autocorrelation is zero, so their sum is zero. -/
-theorem turyn_vanishing_total {n : Nat} {x y z w : PmSeq}
+theorem turyn_vanishing_total {n : Nat} {x y z w : List Int}
     (h : IsTurynTypeProp n x y z w) :
     weightedTotalAutocorr x y z w n = 0 := by
   unfold weightedTotalAutocorr
@@ -122,7 +122,7 @@ theorem sum_sq_expand (n : Nat) (a : Nat → Int) :
     rw [h_final]
     ring
 
-theorem sum_w_ext {n : Nat} {w : PmSeq} (hwl : w.length = n - 1) :
+theorem sum_w_ext {n : Nat} {w : List Int} (hwl : w.length = n - 1) :
     ∑ i ∈ range (n - 1), aperiodicAutocorr w (i + 1) =
     ∑ i ∈ range (n - 1 - 1), aperiodicAutocorr w (i + 1) := by
   cases n with
@@ -144,7 +144,7 @@ theorem sum_w_ext {n : Nat} {w : PmSeq} (hwl : w.length = n - 1) :
       rw [heq2, hw]
       omega
 
-theorem weightedTotalAutocorr_decompose {n : Nat} {x y z w : PmSeq}
+theorem weightedTotalAutocorr_decompose {n : Nat} {x y z w : List Int}
     (hxl : x.length = n) (hyl : y.length = n)
     (hzl : z.length = n) (hwl : w.length = n - 1) :
     weightedTotalAutocorr x y z w n =
@@ -156,7 +156,7 @@ theorem weightedTotalAutocorr_decompose {n : Nat} {x y z w : PmSeq}
   rw [hw_ext]
   rw [hwl]
 
-theorem sum_sq_eq_finset (a : PmSeq) (h : AllPmOne a) :
+theorem sum_sq_eq_finset (a : List Int) (h : AllPmOne a) :
     (∑ i ∈ range a.length, a.getD i 0) ^ 2 = (a.length : Int) + 2 * ∑ i ∈ range (a.length - 1), aperiodicAutocorr a (i + 1) := by
   have h_sq : ∀ i ∈ range a.length, (a.getD i 0) ^ 2 = 1 := by
     intro i hi
@@ -191,14 +191,14 @@ theorem sum_sq_eq_finset (a : PmSeq) (h : AllPmOne a) :
       rw [eq_idx]
   rw [sum_congr rfl h_cross]
 
-theorem sum_sq_eq_len_add_two_totalAutocorr (a : PmSeq) (h : AllPmOne a) :
+theorem sum_sq_eq_len_add_two_totalAutocorr (a : List Int) (h : AllPmOne a) :
     (seqSum a) ^ 2 = ↑(a.length) + 2 * totalAutocorr a := by
   rw [seqSum, totalAutocorr]
   exact sum_sq_eq_finset a h
 
 /-- **Energy identity:** For any TT(n), the sums satisfy
     x² + y² + 2z² + 2w² = 6n − 2. -/
-theorem energy_identity {n : Nat} {x y z w : PmSeq}
+theorem energy_identity {n : Nat} {x y z w : List Int}
     (htt : IsTurynTypeProp n x y z w) (hn : n ≥ 1) :
     (seqSum x) ^ 2 + (seqSum y) ^ 2 +
     2 * (seqSum z) ^ 2 + 2 * (seqSum w) ^ 2 =
@@ -229,7 +229,7 @@ theorem energy_identity {n : Nat} {x y z w : PmSeq}
 /-! ### Computational verification of the energy identity -/
 
 /-- Compute x² + y² + 2z² + 2w² for a quadruple. -/
-def energyLHS (x y z w : PmSeq) : Int :=
+def energyLHS (x y z w : List Int) : Int :=
   (seqSum x) ^ 2 + (seqSum y) ^ 2 +
   2 * (seqSum z) ^ 2 + 2 * (seqSum w) ^ 2
 
@@ -237,5 +237,5 @@ def energyLHS (x y z w : PmSeq) : Int :=
 def energyRHS (n : Nat) : Int := 6 * n - 2
 
 /-- Boolean check that the energy identity holds for a given quadruple. -/
-def checkEnergy (n : Nat) (x y z w : PmSeq) : Bool :=
+def checkEnergy (n : Nat) (x y z w : List Int) : Bool :=
   energyLHS x y z w == energyRHS n
