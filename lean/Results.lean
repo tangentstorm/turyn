@@ -23,7 +23,7 @@ trusted base:
     Boolean predicate, `(x, y, z, w)` is a TT(n).
 - `TurynType n` (`Turyn/BaseSequence.lean`):
     bundled length-indexed TT(n) with the vanishing-autocorrelation witness.
-- `IsHadamardMat H` (`Turyn/MatrixTyped.lean`):
+- `IsHadamardMat H` (`Turyn/MatUtils.lean`):
     Hadamard predicate on a square `IntMat`.
 - `TurynType n` (`Turyn/Equivalence.lean`):
     bundled TT(n) plus an `IsTurynType` witness, the carrier of the

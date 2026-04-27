@@ -1,4 +1,4 @@
-import Turyn.MatrixTyped
+import Turyn.MatUtils
 
 open Matrix
 

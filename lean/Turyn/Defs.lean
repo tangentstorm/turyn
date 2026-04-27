@@ -1,5 +1,5 @@
 import Turyn.TurynType
-import Turyn.MatrixTyped
+import Turyn.MatUtils
 import Turyn.Equivalence
 import Turyn.XY
 
@@ -11,7 +11,7 @@ challenge module `Results.lean`. It re-exports the definitions referenced
 by the headline statements:
 
 - `PmSeq n`, `SignSeq n`, `IsTurynType` (from `Turyn.TurynType`)
-- `Turyn.IntMat`, `Turyn.IsHadamardMat` (from `Turyn.MatrixTyped`)
+- `Turyn.IntMat`, `Turyn.IsHadamardMat` (from `Turyn.MatUtils`)
 - `Turyn.TurynType`, `Turyn.Equivalent`, `Turyn.Canonical`,
   `Turyn.Canonical1` (from `Turyn.Equivalence`)
 - `Turyn.uAt` (from `Turyn.XY`)

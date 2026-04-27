@@ -1,7 +1,7 @@
 import Turyn.TurynType
 import Turyn.BaseSequence
 import Turyn.TSequence
-import Turyn.MatrixTyped
+import Turyn.MatUtils
 import Turyn.GoethalsSeidel
 import Turyn.GSArrayBridge
 import Turyn.Hadamard

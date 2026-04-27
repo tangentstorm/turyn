@@ -6,10 +6,11 @@ open Matrix
 open BigOperators
 
 /-!
-# Typed Matrix Infrastructure
+# Matrix Utilities
 
-Typed vectors, matrices, circulants, reversal matrices, and matrix lemmas used
-by the Goethals-Seidel construction.
+`Fin n`-indexed integer vectors and matrices, circulants, the back-diagonal
+reversal matrix, the Hadamard predicate, and small matrix lemmas used by
+the Goethals-Seidel construction.
 -/
 
 namespace Turyn
