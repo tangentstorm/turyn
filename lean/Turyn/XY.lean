@@ -3,9 +3,6 @@ import Turyn.PmSum
 
 namespace Turyn
 
-/-- Product of A and B entries at 1-indexed position `i`. -/
-def uAt {n : Nat} (S : TurynType n) (i : Nat) : Int := xAt S i * yAt S i
-
 /-- `uAt S i` is ±1 for valid indices. -/
 lemma uAt_pm {n : Nat} (S : TurynType n) (i : Nat) (hi1 : 1 ≤ i) (hi2 : i ≤ n) :
     uAt S i = 1 ∨ uAt S i = -1 := by

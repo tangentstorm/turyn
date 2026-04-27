@@ -266,17 +266,6 @@ def _root_.PmSeq.reverse {n : Nat} (s : PmSeq n) : PmSeq n :=
 def _root_.PmSeq.alt {n : Nat} (s : PmSeq n) : PmSeq n :=
   ⟨altSeq s.data, by simp [altSeq_length, s.len], AllPmOne_alt s.pm⟩
 
-/-! ### Turyn-type quadruple -/
-
-/-- Entry accessor for `X` (1-indexed). -/
-def xAt {n : Nat} (S : TurynType n) (i : Nat) : Int := S.X.data.getD (i - 1) 0
-/-- Entry accessor for `Y` (1-indexed). -/
-def yAt {n : Nat} (S : TurynType n) (i : Nat) : Int := S.Y.data.getD (i - 1) 0
-/-- Entry accessor for `Z` (1-indexed). -/
-def zAt {n : Nat} (S : TurynType n) (i : Nat) : Int := S.Z.data.getD (i - 1) 0
-/-- Entry accessor for `W` (1-indexed). -/
-def wAt {n : Nat} (S : TurynType n) (i : Nat) : Int := S.W.data.getD (i - 1) 0
-
 /-! ### TurynType transformations -/
 
 def _root_.TurynType.doNegX {n : Nat} (S : TurynType n) : TurynType n :=
@@ -338,53 +327,6 @@ def Equivalent (n : Nat) (S T : TurynType n) : Prop :=
 lemma Elementary.toEquivalent {n : Nat} {S T : TurynType n}
     (h : Elementary n S T) : Equivalent n S T :=
   Relation.ReflTransGen.single h
-
-/-! ### Canonical conditions -/
-
-/-- Canonical condition (1): endpoint signs. -/
-def Canonical1 (n : Nat) (S : TurynType n) : Prop :=
-  xAt S 1 = 1 ∧ xAt S n = 1 ∧
-  yAt S 1 = 1 ∧ yAt S n = 1 ∧
-  zAt S 1 = 1 ∧ wAt S 1 = 1
-
-/-- Canonical condition (2) for `A`. -/
-def Canonical2 (n : Nat) (S : TurynType n) : Prop :=
-  ∀ i, 1 ≤ i → i ≤ n →
-    (∀ j, 1 ≤ j → j < i → xAt S j = xAt S (n + 1 - j)) →
-    xAt S i ≠ xAt S (n + 1 - i) →
-    xAt S i = 1
-
-/-- Canonical condition (3) for `B`. -/
-def Canonical3 (n : Nat) (S : TurynType n) : Prop :=
-  ∀ i, 1 ≤ i → i ≤ n →
-    (∀ j, 1 ≤ j → j < i → yAt S j = yAt S (n + 1 - j)) →
-    yAt S i ≠ yAt S (n + 1 - i) →
-    yAt S i = 1
-
-/-- Canonical condition (4) for `C`. -/
-def Canonical4 (n : Nat) (S : TurynType n) : Prop :=
-  ∀ i, 1 ≤ i → i ≤ n →
-    (∀ j, 1 ≤ j → j < i → zAt S j ≠ zAt S (n + 1 - j)) →
-    zAt S i = zAt S (n + 1 - i) →
-    zAt S i = 1
-
-/-- Canonical condition (5) for `D`. -/
-def Canonical5 (n : Nat) (S : TurynType n) : Prop :=
-  ∀ i, 1 ≤ i → i ≤ n - 1 →
-    (∀ j, 1 ≤ j → j < i → wAt S j * wAt S (n - j) = wAt S (n - 1)) →
-    wAt S i * wAt S (n - i) ≠ wAt S (n - 1) →
-    wAt S i = 1
-
-/-- Canonical condition (6): tie-breaker between `A` and `B`. -/
-def Canonical6 (n : Nat) (S : TurynType n) : Prop :=
-  n ≤ 2 ∨
-  ((xAt S 2 ≠ yAt S 2 ∧ xAt S 2 = 1) ∨
-   (xAt S 2 = yAt S 2 ∧ xAt S (n - 1) = 1 ∧ yAt S (n - 1) = -1))
-
-/-- Full canonical predicate. -/
-def Canonical (n : Nat) (S : TurynType n) : Prop :=
-  Canonical1 n S ∧ Canonical2 n S ∧ Canonical3 n S ∧
-  Canonical4 n S ∧ Canonical5 n S ∧ Canonical6 n S
 
 /-! ### Helper: ±1 entries are 1 or -1 -/
 

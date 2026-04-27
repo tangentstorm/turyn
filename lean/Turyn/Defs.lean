@@ -6,22 +6,23 @@ open Finset
 open BigOperators
 
 /-!
-# Turyn.Defs: Core sequence and quadruple definitions
+# Turyn.Defs
 
-This file holds the foundational definitions used throughout the Turyn
-library and named in `Results.lean`'s headline statements:
+The trusted definitions named in `Results.lean`'s headline statements:
 
-- `AllPmOne` / `AllSignOne` — propositional ±1 / {0, ±1} predicates on lists.
+- `AllPmOne`, `AllSignOne` — entry-set predicates on `List Int`.
 - `aperiodicAutocorr`, `combinedAutocorr` — autocorrelation primitives.
-- `PmSeq n` — length-`n` sequence with ±1 entries.
-- `SignSeq n` — length-`n` sequence with {0, ±1} entries.
-- `TurynType n` — bundled TT(n) quadruple with the vanishing identity.
+- `PmSeq n`, `SignSeq n` — length-indexed ±1 / {0, ±1} sequences.
+- `TurynType n` — bundled TT(n) quadruple plus the vanishing identity.
+- `xAt/yAt/zAt/wAt`, `uAt` — 1-indexed entry accessors.
+- `Canonical1..6`, `Canonical` — BDKR canonical-form predicates.
 
-These five (plus the two carrier predicates) are defined here so the
-trusted base for the comparator challenge module is concentrated in one
-place.  The Boolean / decidable / parser / bridging machinery built on
-top of these definitions lives in `Turyn.TurynType` (which imports this
-file).
+`Equivalent` is *not* here — its body pulls in the elementary moves and
+their vanishing-preservation infrastructure.  It lives in
+`Turyn.Equivalence` and is reached via the standard import chain.
+
+Boolean checks, decidability, parsers, and the `IsTurynType` predicate
+sit on top of these definitions in `Turyn.TurynType`.
 -/
 
 /-- Propositional version: every entry is `1` or `−1`. -/
@@ -63,3 +64,68 @@ structure TurynType (n : Nat) where
   W : PmSeq (n - 1)
   vanishing : ∀ s : Nat, 1 ≤ s → s < n →
     combinedAutocorr X.data Y.data Z.data W.data s = 0
+
+namespace Turyn
+
+/-! ### 1-indexed entry accessors -/
+
+/-- Entry accessor for `X` (1-indexed). -/
+def xAt {n : Nat} (S : TurynType n) (i : Nat) : Int := S.X.data.getD (i - 1) 0
+/-- Entry accessor for `Y` (1-indexed). -/
+def yAt {n : Nat} (S : TurynType n) (i : Nat) : Int := S.Y.data.getD (i - 1) 0
+/-- Entry accessor for `Z` (1-indexed). -/
+def zAt {n : Nat} (S : TurynType n) (i : Nat) : Int := S.Z.data.getD (i - 1) 0
+/-- Entry accessor for `W` (1-indexed). -/
+def wAt {n : Nat} (S : TurynType n) (i : Nat) : Int := S.W.data.getD (i - 1) 0
+
+/-- Pointwise X·Y product at 1-indexed position `i`. -/
+def uAt {n : Nat} (S : TurynType n) (i : Nat) : Int := xAt S i * yAt S i
+
+/-! ### Canonical conditions (BDKR §2) -/
+
+/-- Canonical condition (1): endpoint signs. -/
+def Canonical1 (n : Nat) (S : TurynType n) : Prop :=
+  xAt S 1 = 1 ∧ xAt S n = 1 ∧
+  yAt S 1 = 1 ∧ yAt S n = 1 ∧
+  zAt S 1 = 1 ∧ wAt S 1 = 1
+
+/-- Canonical condition (2) for `X`. -/
+def Canonical2 (n : Nat) (S : TurynType n) : Prop :=
+  ∀ i, 1 ≤ i → i ≤ n →
+    (∀ j, 1 ≤ j → j < i → xAt S j = xAt S (n + 1 - j)) →
+    xAt S i ≠ xAt S (n + 1 - i) →
+    xAt S i = 1
+
+/-- Canonical condition (3) for `Y`. -/
+def Canonical3 (n : Nat) (S : TurynType n) : Prop :=
+  ∀ i, 1 ≤ i → i ≤ n →
+    (∀ j, 1 ≤ j → j < i → yAt S j = yAt S (n + 1 - j)) →
+    yAt S i ≠ yAt S (n + 1 - i) →
+    yAt S i = 1
+
+/-- Canonical condition (4) for `Z`. -/
+def Canonical4 (n : Nat) (S : TurynType n) : Prop :=
+  ∀ i, 1 ≤ i → i ≤ n →
+    (∀ j, 1 ≤ j → j < i → zAt S j ≠ zAt S (n + 1 - j)) →
+    zAt S i = zAt S (n + 1 - i) →
+    zAt S i = 1
+
+/-- Canonical condition (5) for `W`. -/
+def Canonical5 (n : Nat) (S : TurynType n) : Prop :=
+  ∀ i, 1 ≤ i → i ≤ n - 1 →
+    (∀ j, 1 ≤ j → j < i → wAt S j * wAt S (n - j) = wAt S (n - 1)) →
+    wAt S i * wAt S (n - i) ≠ wAt S (n - 1) →
+    wAt S i = 1
+
+/-- Canonical condition (6): tie-breaker between `X` and `Y`. -/
+def Canonical6 (n : Nat) (S : TurynType n) : Prop :=
+  n ≤ 2 ∨
+  ((xAt S 2 ≠ yAt S 2 ∧ xAt S 2 = 1) ∨
+   (xAt S 2 = yAt S 2 ∧ xAt S (n - 1) = 1 ∧ yAt S (n - 1) = -1))
+
+/-- Full canonical predicate. -/
+def Canonical (n : Nat) (S : TurynType n) : Prop :=
+  Canonical1 n S ∧ Canonical2 n S ∧ Canonical3 n S ∧
+  Canonical4 n S ∧ Canonical5 n S ∧ Canonical6 n S
+
+end Turyn
