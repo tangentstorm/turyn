@@ -3726,6 +3726,73 @@ Still on the carry-over list for apart/together (still in
   loops**: `tuple_key` is rebuilt per Z / WZ solution even though
   `candidate_tuples` is fixed for the call.  Estimated ~300 ns
   saved per iteration, ~16 iterations per call, ≤ 0.5 % rate
-  win.  Below the 2 % threshold per acceptance bar; only worth
-  doing if combined with other micro-wins.
+  win.  Now testable under the counter-mode protocol — a
+  0.5 % rate win shows up as a bit-exact change in
+  `flow_xy_propagations / flow_xy_solves` at `--threads=1
+  --seed=0`.
 
+### V-series part 2 (April 27 2026, Claude): counter-mode protocol + R5 re-test
+
+**Infrastructure** (commit follow-up to the previous V-series
+seed-wiring commit):
+
+- **`--threads=N`** CLI flag (default = `available_parallelism()`)
+  wired to both the framework engine `worker_count` and the sync
+  walker's internal `n_workers`.  Replaces the legacy
+  `TURYN_THREADS` env var (kept as fallback for existing tooling).
+- **Per-call deterministic rng**: `derive_rng_for_item(stage_seed,
+  item_id)` replaces the shared `rng: u64` in
+  `SolveWStage` / `SolveWZStage` / `SolveZStage` scratches.  Same
+  `item_id` always sees the same xorshift state regardless of
+  worker dispatch order.
+
+**Verified bit-exact at `--threads=1 --seed=0`** (n=26 wz=together
+mdd-k=7 cover-log2=38, 3 reruns):
+- `bnd/W/Z/XY = 1465976/718/3024/28593` (identical)
+- `flow_z_solves = 190` (identical)
+
+**Multi-thread behavior** (n=26 wz=together mdd-k=7 cover-log2=38
+`--threads=4`, 3 reruns post per-call rng):
+- `bnd/W/Z = 1465976/718/3024` (identical — upstream stages
+  bit-exact across workers)
+- `flow_xy_solves` = 28614 / 28663 / 28242 (range 421, ~1.5 %
+  variance — driven by `bench-cover-log2` cancel-timing race
+  between workers, NOT rng)
+
+The `--threads>1` cancel-timing variance is a stop-condition
+issue, not solvable by the rng.  Use `--threads=1` for
+counter-based comparison; `--threads>1` only when measuring
+parallel-scaling itself.
+
+### S12 re-test under the counter-mode protocol — VERDICT REVISED
+
+The April-2026 S12 entry above marked `--no-xor` on sync as
+"rejected, +7 % TTC regression" based on a 16-thread n=22 30s
+comparison (4.20M nodes vs 2.80M nodes, sat_unsat 1.41M vs 0.95M).
+
+Re-run under the new protocol (n=22 wz=sync sat-secs=20 `--seed=0
+--threads=1`, 2 trials per side):
+
+| metric              | xor=on (run1) | xor=on (run2) | xor=off (run3) | xor=off (run4) |
+|---------------------|---------------|---------------|----------------|----------------|
+| nodes               | 1,000,856     | 1,006,114     | 999,791        | 1,003,404      |
+| sat_unsat           | 20,273        | 20,401        | 20,261         | 20,313         |
+| cap_rejects / node  | 14.73         | 14.73         | 14.73          | 14.73          |
+| sat_unsat / node    | 0.02025       | 0.02028       | 0.02026        | 0.02024        |
+| nodes / sec         | 49,402        | 49,663        | 49,346         | 49,524         |
+
+Per-node ratios are bit-identical between xor=on and xor=off.
+Throughput (nodes/sec) differs by ~0.16 % (49,533 ± 130 vs 49,435
+± 89 mean) — well inside the ~0.3 % per-side run-to-run variance.
+
+**Verdict**: at single-thread, the two configurations are
+mechanism-equivalent.  The original −7 % TTC at 16-thread is
+suspect — likely thread-contention-induced behaviour, not a real
+solver-side win/loss for XOR propagation.  Worth a 16-thread
+re-test once a deterministic stop condition (`--bench-stop-items=N`,
+say) lands so totals are comparable across runs.
+
+This is the kind of audit the protocol is for: many sub-2 %
+verdicts in this file's earlier sessions probably came from this
+same shape — total-count variation that is wall-clock-induced
+rather than mechanism-induced.

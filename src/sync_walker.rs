@@ -82,6 +82,12 @@ pub(crate) struct SyncConfig {
     /// at the first solution. The shared cancel flag is not tripped
     /// on first hit; each worker collects every leaf it reaches.
     pub all: bool,
+    /// Override worker thread count.  `None` means auto-detect via
+    /// `TURYN_THREADS` / `RAYON_NUM_THREADS` / `available_parallelism`
+    /// (legacy default).  Set to `Some(1)` for deterministic
+    /// single-thread counter measurement.  Wired from
+    /// `SearchConfig.threads` (`--threads=N`).
+    pub workers: Option<usize>,
 }
 
 /// Flush the live sink every this many visited DFS nodes. 1024 is
@@ -1122,12 +1128,17 @@ pub(crate) fn search_sync(
     // pruning. First worker to find a solution cancels the others
     // via a shared AtomicBool.
     //
-    // Respect `TURYN_THREADS` (and `RAYON_NUM_THREADS`) so users can
-    // pin the parallelism for bench reproducibility — matches the MDD
-    // pipeline's behaviour documented in CLAUDE.md.
-    let n_workers = std::env::var("TURYN_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    // Worker count precedence: explicit `cfg.workers` (set by
+    // `--threads=N` from the SearchConfig path) > `TURYN_THREADS` env
+    // var > `RAYON_NUM_THREADS` env var > `available_parallelism()`.
+    // `--threads=1` is the canonical deterministic counter mode.
+    let n_workers = cfg
+        .workers
+        .or_else(|| {
+            std::env::var("TURYN_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+        })
         .or_else(|| {
             std::env::var("RAYON_NUM_THREADS")
                 .ok()

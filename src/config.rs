@@ -347,6 +347,16 @@ pub(crate) struct SearchConfig {
     /// stop, modulo unavoidable cross-thread dispatch jitter.
     /// Override via `--seed=N` on the command line.
     pub(crate) seed: u64,
+    /// Worker thread count override.  `None` (default) means
+    /// auto-detect via `available_parallelism()` for sync, and the
+    /// MDD framework engine's built-in `worker_count = 1` for
+    /// apart/together/cross.  `Some(N)` forces both to `N`.
+    /// `--threads=1` is the canonical "deterministic counter mode"
+    /// — combined with `--seed=N` it guarantees bit-exact counter
+    /// totals across reruns of the same binary, which is what
+    /// makes sub-1 % effects detectable via counter ratios rather
+    /// than wall-clock noise.
+    pub(crate) threads: Option<usize>,
 }
 
 /// Which (Z, W) candidate producer feeds the shared XY SAT stage.
@@ -407,6 +417,7 @@ impl Default for SearchConfig {
             conj_zw_bound: false,
             conj_tuple: false,
             seed: 0,
+            threads: None,
         }
     }
 }
@@ -487,6 +498,9 @@ impl SearchConfig {
         if self.seed != 0 {
             parts.push(format!("--seed={}", self.seed));
         }
+        if let Some(t) = self.threads {
+            parts.push(format!("--threads={t}"));
+        }
         if self.continue_after_sat {
             parts.push("--all".into());
         }
@@ -521,10 +535,12 @@ impl SearchConfig {
         if let Some(d) = self.dump_dimacs.as_ref() {
             parts.push(format!("--dump-dimacs={d}"));
         }
-        let threads = std::env::var("TURYN_THREADS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or_else(num_cpus_or_one);
+        let threads = self.threads.unwrap_or_else(|| {
+            std::env::var("TURYN_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or_else(num_cpus_or_one)
+        });
         format!("turyn settings: {}  (threads={threads})", parts.join(" "))
     }
 }

@@ -51,9 +51,11 @@ pub const STAGE_SOLVE_Z: StageId = "mdd.solve_z";
 ///    the xorshift64 advance is well-defined immediately.
 /// 3. The mapping is pure / deterministic: `(seed, label)` ↦ rng.
 ///
-/// Stage RNGs that consumed hardcoded constants like `0xDEADBEEF…`
-/// before this refactor now route through `derive_rng(self.seed,
-/// b"solve_w")` so a `--seed=N` flag can drive them.
+/// Used to derive a stage-level seed from `cfg.seed`.  The per-call
+/// rng is then derived from `(stage_seed, item_id)` so that two
+/// concurrent workers handling the same `item_id` produce the same
+/// rng stream regardless of which worker landed first — see
+/// `derive_rng_for_item`.
 fn derive_rng(seed: u64, label: &[u8]) -> u64 {
     // FNV-1a on the label.
     let mut h: u64 = 0xcbf29ce484222325;
@@ -69,6 +71,28 @@ fn derive_rng(seed: u64, label: &[u8]) -> u64 {
         ^ h;
     // splitmix64 finalizer to scatter bits.
     let mut z = s;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^= z >> 31;
+    if z == 0 { 0x9e3779b97f4a7c15 } else { z }
+}
+
+/// Per-call rng for a stage handler.  Derives a fresh xorshift64
+/// state from `(stage_seed, item_id)` so that the same
+/// `WorkItem.meta.item_id` always sees the same rng regardless of
+/// which worker handled it or in what order.  This is the key to
+/// bit-exact counter totals at `--threads>1 --seed=N`: without it
+/// two workers racing for a shared `Mutex<rng>` advance the rng in
+/// nondeterministic order, which propagates into different SAT
+/// phases and therefore different counter totals.
+pub(crate) fn derive_rng_for_item(stage_seed: u64, item_id: u64) -> u64 {
+    // Mix stage seed and item_id with golden-ratio multipliers, then
+    // run a splitmix64 finalizer.  Item ids are dense 0..N so we want
+    // to scatter them aggressively or two adjacent items end up with
+    // adjacent xorshift states.
+    let mut z = stage_seed
+        .wrapping_add(item_id.wrapping_mul(0x9e3779b97f4a7c15))
+        .wrapping_add(0xbf58476d1ce4e5b9);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
     z ^= z >> 31;
@@ -529,7 +553,6 @@ impl StageHandler<MddPayload> for BoundaryStage {
 struct SolveWScratch {
     w_bases: HashMap<i32, radical::Solver>,
     fft_buf_w: FftScratch,
-    rng: u64,
 }
 
 pub struct SolveWStage {
@@ -537,6 +560,11 @@ pub struct SolveWStage {
     metrics: PipelineMetrics,
     spectral_w: Arc<SpectralFilter>,
     scratch: Mutex<SolveWScratch>,
+    /// Stage-level seed (`derive_rng(cfg.seed, b"solve_w")`).  Per
+    /// call, `derive_rng_for_item(stage_seed, item_id)` produces a
+    /// fresh xorshift state — same `item_id` always yields the same
+    /// rng so multi-worker dispatch order doesn't perturb counters.
+    stage_seed: u64,
     item_ids: Arc<AtomicU64>,
     progress: Arc<BoundaryProgress>,
 }
@@ -557,11 +585,13 @@ impl StageHandler<MddPayload> for SolveWStage {
         let MddPayload::SolveW(sw) = item.payload else {
             return StageOutcome::default();
         };
+        // Per-call deterministic rng: same item_id → same rng
+        // regardless of worker dispatch order.
+        let mut rng = derive_rng_for_item(self.stage_seed, parent_meta.item_id);
         let mut guard = self.scratch.lock().unwrap();
         let SolveWScratch {
             w_bases,
             fft_buf_w,
-            rng,
         } = &mut *guard;
         let mut forcings: Vec<(u16, u8, u32)> = Vec::new();
         let mut timed_out = false;
@@ -572,7 +602,7 @@ impl StageHandler<MddPayload> for SolveWStage {
             w_bases,
             &self.spectral_w,
             fft_buf_w,
-            rng,
+            &mut rng,
             &mut forcings,
             &mut timed_out,
         );
@@ -599,7 +629,6 @@ impl StageHandler<MddPayload> for SolveWStage {
 
 struct SolveWZScratch {
     template_cache: HashMap<Vec<(i32, i32, i32, i32)>, SatXYTemplate>,
-    rng: u64,
 }
 
 pub struct SolveWZStage {
@@ -613,6 +642,10 @@ pub struct SolveWZStage {
         crate::types::PackedSeq,
     )>,
     scratch: Mutex<SolveWZScratch>,
+    /// Stage-level seed; see `SolveWStage.stage_seed` for the
+    /// invariant that each `item_id` produces the same rng across
+    /// workers.
+    stage_seed: u64,
     item_ids: Arc<AtomicU64>,
     progress: Arc<BoundaryProgress>,
 }
@@ -633,11 +666,10 @@ impl StageHandler<MddPayload> for SolveWZStage {
         let MddPayload::SolveWZ(swz) = item.payload else {
             return StageOutcome::default();
         };
+        // Per-call deterministic rng: same item_id → same rng.
+        let mut rng = derive_rng_for_item(self.stage_seed, parent_meta.item_id);
         let mut guard = self.scratch.lock().unwrap();
-        let SolveWZScratch {
-            template_cache,
-            rng,
-        } = &mut *guard;
+        let SolveWZScratch { template_cache } = &mut *guard;
         // Per-call cov_micro accumulator. Previous code
         // snapshot-diffed the global `flow_xy_timeout_cov_micro`
         // atomic, which double-attributes XY timeouts to
@@ -656,7 +688,7 @@ impl StageHandler<MddPayload> for SolveWZStage {
             template_cache,
             &self.sat_config,
             &self.result_tx,
-            rng,
+            &mut rng,
             &mut forcings,
             &mut cov_micro_delta,
         );
@@ -693,7 +725,6 @@ struct SolveZScratch {
     fft_buf_z: FftScratch,
     template_cache: HashMap<Vec<(i32, i32, i32, i32)>, SatXYTemplate>,
     warm: WarmStartState,
-    rng: u64,
 }
 
 pub struct SolveZStage {
@@ -708,6 +739,8 @@ pub struct SolveZStage {
         crate::types::PackedSeq,
     )>,
     scratch: Mutex<SolveZScratch>,
+    /// Stage-level seed; see `SolveWStage.stage_seed`.
+    stage_seed: u64,
     progress: Arc<BoundaryProgress>,
 }
 
@@ -727,6 +760,8 @@ impl StageHandler<MddPayload> for SolveZStage {
         let MddPayload::SolveZ(sz) = item.payload else {
             return StageOutcome::default();
         };
+        // Per-call deterministic rng: same item_id → same rng.
+        let mut rng = derive_rng_for_item(self.stage_seed, parent_meta.item_id);
         let mut guard = self.scratch.lock().unwrap();
         // Split-borrow: `process_solve_z` needs mutable references
         // to four different `SolveZScratch` fields at once.
@@ -735,7 +770,6 @@ impl StageHandler<MddPayload> for SolveZStage {
             fft_buf_z,
             template_cache,
             warm,
-            rng,
         } = &mut *guard;
         // Snapshot `flow_xy_timeout_cov_micro` before/after so we
         // can attribute the partial-XY credit this SolveZ just
@@ -763,7 +797,7 @@ impl StageHandler<MddPayload> for SolveZStage {
             warm,
             &self.sat_config,
             &self.result_tx,
-            rng,
+            &mut rng,
             &mut forcings,
             &mut cov_micro_delta,
             &mut timed_out,
@@ -1127,12 +1161,10 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                 scratch: Mutex::new(SolveWScratch {
                     w_bases: HashMap::new(),
                     fft_buf_w: FftScratch::new(&spectral_w),
-                    // Stage-specific RNG: zero-seed default still
-                    // gives a non-zero xorshift state because
-                    // `derive_rng` adds a stage constant before
-                    // multiplying by an odd prime.
-                    rng: derive_rng(self.seed, b"solve_w"),
                 }),
+                // Stage-level seed; per-call rng is
+                // `derive_rng_for_item(stage_seed, item_id)`.
+                stage_seed: derive_rng(self.seed, b"solve_w"),
                 item_ids: Arc::clone(&self.item_ids),
                 progress: Arc::clone(&self.progress),
             }),
@@ -1146,8 +1178,8 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                 result_tx: self.result_tx.clone(),
                 scratch: Mutex::new(SolveWZScratch {
                     template_cache: HashMap::new(),
-                    rng: derive_rng(self.seed, b"solve_wz"),
                 }),
+                stage_seed: derive_rng(self.seed, b"solve_wz"),
                 item_ids: Arc::clone(&self.item_ids),
                 progress: Arc::clone(&self.progress),
             }),
@@ -1176,8 +1208,8 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                         phase: None,
                         inject_phase: true,
                     },
-                    rng: derive_rng(self.seed, b"solve_z"),
                 }),
+                stage_seed: derive_rng(self.seed, b"solve_z"),
                 progress: Arc::clone(&self.progress),
             }),
         );

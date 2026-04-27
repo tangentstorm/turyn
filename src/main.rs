@@ -114,6 +114,11 @@ fn print_help() {
     eprintln!("  --seed=<N>               Master RNG seed; 0 = deterministic default. Drives");
     eprintln!("                           every per-stage xorshift, sync-walker shuffle, and");
     eprintln!("                           stochastic mode RNG (default: 0)");
+    eprintln!("  --threads=<N>            Worker thread count override; default = auto-detect");
+    eprintln!("                           via available_parallelism. Use --threads=1 with");
+    eprintln!("                           --seed=N to pin the search to a deterministic");
+    eprintln!("                           single-thread schedule for counter-based benchmark");
+    eprintln!("                           comparisons (bit-exact totals across reruns)");
     eprintln!("  --bench-cover-log2=<X>   Benchmark stop: cover about 2^X raw-equivalent");
     eprintln!("                           configurations, report SAT hits, and keep searching");
     eprintln!("  --all                    Print/report SAT hits without stopping the search");
@@ -231,6 +236,14 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
                 Ok(x) => x,
                 _ => {
                     eprintln!("error: --seed requires a non-negative integer");
+                    std::process::exit(1);
+                }
+            };
+        } else if let Some(v) = arg.strip_prefix("--threads=") {
+            cfg.threads = match v.parse::<usize>() {
+                Ok(x) if x >= 1 => Some(x),
+                _ => {
+                    eprintln!("error: --threads requires a positive integer");
                     std::process::exit(1);
                 }
             };
@@ -404,6 +417,9 @@ fn run_framework_mdd_mode(
                 EngineConfig::default().progress_interval
             },
             bench_stop_log2_work: cfg.bench_cover_log2,
+            worker_count: cfg
+                .threads
+                .unwrap_or_else(crate::config::num_cpus_or_one),
             ..EngineConfig::default()
         },
         Box::new(LaneByPriority::new()),
@@ -631,6 +647,9 @@ fn run_framework_cross_mode(
                 EngineConfig::default().progress_interval
             },
             bench_stop_log2_work: cfg.bench_cover_log2,
+            worker_count: cfg
+                .threads
+                .unwrap_or_else(crate::config::num_cpus_or_one),
             ..EngineConfig::default()
         },
         Box::new(LaneByPriority::new()),
@@ -704,6 +723,9 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
                 EngineConfig::default().progress_interval
             },
             bench_stop_log2_work: cfg.bench_cover_log2,
+            worker_count: cfg
+                .threads
+                .unwrap_or_else(crate::config::num_cpus_or_one),
             ..EngineConfig::default()
         },
         Box::new(LaneByPriority::new()),
@@ -726,6 +748,7 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
         projected_fraction_ppm: None,
         live_sink: None,
         all: cfg.continue_after_sat || cfg.bench_cover_log2.is_some(),
+        workers: cfg.threads,
     };
     let (adapter, result_rx) = SyncAdapter::build(problem, sync_cfg, verbose);
     let cancel_for_drain = std::sync::Arc::clone(&engine_cancel);
@@ -1601,6 +1624,7 @@ mod tests {
             conj_zw_bound: false,
             conj_tuple: false,
             seed: 0,
+            threads: None,
         };
         let tuples = phase_a_tuples(cfg.problem, None);
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, false, cfg.mdd_k);

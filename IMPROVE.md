@@ -203,13 +203,44 @@ on those rigs.  Two principles keep small wins honest:
 
 `--seed=N` (default `0`) feeds every per-stage xorshift state, the
 sync walker's per-worker shuffle seed, and the stochastic-mode RNG.
-With a fixed `--seed`, the order of boundaries dispatched by the
-walker is the same across before/after binaries, so the only
-remaining source of cross-run variation is parallel-dispatch jitter
-(which affects *which worker handled which boundary*, not the
-totals).  Counter ratios at fixed-work coverage stop are then
-stable to within a fraction of a percent across reruns of the
-same binary.
+`--threads=N` (default = `available_parallelism()`) pins the worker
+count for both the MDD framework engine and the sync walker.
+Together with the per-call rng (`derive_rng_for_item(stage_seed,
+item_id)`) — same `item_id` always sees the same rng regardless of
+which worker dispatched it — the canonical *counter mode* is:
+
+```bash
+target/release/turyn search --n=26 --wz=together --mdd-k=7 \
+  --bench-cover-log2=38 --sat-secs=120 \
+  --seed=0 --threads=1
+```
+
+Under this configuration, the MDD-mode counter totals (`stage_exit`,
+`flow_w_*`, `flow_z_*`, `flow_xy_*`) are **bit-exact** across reruns
+of the same binary.  A 0.2 % movement is then real signal, not
+noise.
+
+Verified at the time `--threads=1` landed: 3 reruns at n=26 wz=together
+mdd-k=7 cover-log2=38 produced identical
+`bnd/W/Z/XY = 1465976/718/3024/28593` and
+`flow_z_solves = 190` (bit-for-bit).
+
+`--threads>1` keeps per-call rng deterministic but total counter
+values vary ≈ 1-2 % because `--bench-cover-log2` cancellation races
+between workers — they each finish their current item after the
+target is hit, so the exact set of items completed differs.  Use
+`--threads=1` whenever the goal is counter-based comparison; raise
+`--threads` only when measuring wall-clock throughput where the
+parallel-scaling itself is the question.
+
+For sync mode, `--threads=1 --seed=0` makes per-node behaviour
+deterministic (same ratios across runs) but total counter values
+vary because the walker stops on `--sat-secs` wall-clock rather than
+a fixed-work boundary.  Compare per-node *ratios*
+(`cap_rejects / node`, `sat_unsat / node`, `peer_imports / node`,
+`forced / node`), not totals.
+
+When evaluating a change, report at least one of:
 
 When evaluating a change, report at least one of:
 
@@ -223,10 +254,31 @@ When evaluating a change, report at least one of:
 Both should be measured at `--seed=0` (or any other fixed seed) on
 both the before and after binaries.
 
-### Paired interleaved benchmark
+### Counter mode (preferred — uses --threads=1 --seed=0)
 
-For wall-clock comparisons, build the before and after binaries
-side-by-side and run alternating samples on the same idle box:
+```bash
+target/release/turyn search --n=26 --wz=together --mdd-k=7 \
+  --bench-cover-log2=38 --sat-secs=120 --seed=0 --threads=1 \
+  2>&1 | grep -E "stage_exit|flow XY|flow Z"
+```
+
+Compare counter totals between before/after binaries.  Identical
+totals across two reruns of the same binary confirms the regime is
+deterministic.  Any change in counter totals between before/after
+binaries is real (no noise), so a 0.2 % movement is acceptable
+evidence per the acceptance bar below.
+
+For sync mode, the counter regime gives bit-exact *per-node ratios*
+(`cap_rejects / node`, `sat_unsat / node`, `peer_imports / node`),
+not totals — the sync walker runs to a wall-clock stop, not a
+fixed-work boundary.  Compare ratios.
+
+### Paired interleaved benchmark (when wall-clock matters)
+
+When the change's effect is on per-call cost (e.g. SAT solver
+internals) rather than on counter ratios — i.e. counter totals
+won't move but wall-clock should — build the before and after
+binaries side-by-side and run alternating samples:
 
 ```bash
 cp target/release/turyn /tmp/turyn_after          # after building "after"
