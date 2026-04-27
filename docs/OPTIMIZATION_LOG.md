@@ -71,7 +71,7 @@ per accepted candidate instead of O(decision_levels × COUNT).
 - `cargo test --release --bin turyn -- --skip outfix --skip
   mdd_live_run --skip mdd_together_live_run`: 92/92 (3 mdd-9-
   dependent + 3 framework live tests skipped per
-  TICK-PROMPT.md).
+  IMPROVE.md).
 - `cargo test --release -p radical`: 0/0.
 
 ### Cumulative TTC trajectory (this session, 4-worker box)
@@ -149,7 +149,7 @@ coverage product compounds further (level 18 went from 9.99 to
   is parity not regression.
 - `cargo test --release --bin turyn -- --skip outfix --skip
   mdd_live_run --skip mdd_together_live_run`: 92 passed, 0 failed
-  (3 mdd-9-dependent tests skipped, see TICK-PROMPT.md).
+  (3 mdd-9-dependent tests skipped, see IMPROVE.md).
 - `cargo test --release -p radical`: 0 tests, 0 failures.
 
 ### Cumulative TTC trajectory at sync n=22 (4 workers, this box)
@@ -236,7 +236,7 @@ boundaries pass the σ + XY filter into stage 1.
   - 3 `outfix_*` tests fail on this checkout because they require
     `mdd-9.bin`, which has to be generated with `gen_mdd 9` and
     is not present here. This is the documented MDD scratch-file
-    failure mode in `TICK-PROMPT.md`.
+    failure mode in `IMPROVE.md`.
 
 ## April 19 2026 — `--wz=sync` deep optimization session (-99.3 % TTC cumulative, 150×)
 
