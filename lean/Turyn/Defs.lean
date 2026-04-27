@@ -44,6 +44,17 @@ because `aperiodicAutocorr` uses it in the sum body. -/
 def lookupNat {n : Nat} (a : Fin n → Int) (i : Nat) : Int :=
   if h : i < n then a ⟨i, h⟩ else 0
 
+@[simp] lemma lookupNat_of_lt {n : Nat} (a : Fin n → Int) {i : Nat} (h : i < n) :
+    lookupNat a i = a ⟨i, h⟩ := by
+  unfold lookupNat; simp [h]
+
+@[simp] lemma lookupNat_of_ge {n : Nat} (a : Fin n → Int) {i : Nat} (h : n ≤ i) :
+    lookupNat a i = 0 := by
+  unfold lookupNat; simp [Nat.not_lt.mpr h]
+
+@[simp] lemma lookupNat_eq_apply {n : Nat} (a : Fin n → Int) (i : Fin n) :
+    lookupNat a i.1 = a i := lookupNat_of_lt a i.2
+
 def aperiodicAutocorr {n : Nat} (a : Fin n → Int) (s : Nat) : Int :=
   if s ≥ n then 0
   else ∑ i ∈ range (n - s), lookupNat a i * lookupNat a (i + s)
