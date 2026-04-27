@@ -1,7 +1,4 @@
-import Turyn.TurynType
-import Turyn.Hadamard
-import Turyn.Equivalence
-import Turyn.XY
+import Turyn.Defs
 
 /-!
 # Results: Headline Theorems for Comparator
