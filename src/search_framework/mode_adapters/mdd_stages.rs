@@ -42,6 +42,39 @@ pub const STAGE_SOLVE_W: StageId = "mdd.solve_w";
 pub const STAGE_SOLVE_WZ: StageId = "mdd.solve_wz";
 pub const STAGE_SOLVE_Z: StageId = "mdd.solve_z";
 
+/// Derive a non-zero xorshift seed from the master `cfg.seed` and a
+/// short stage label.  Identity guarantees:
+///
+/// 1. Different stage labels never collide (the FNV-1a digest of the
+///    label is XORed in *before* multiplying by the odd constant).
+/// 2. Master seed `0` (the default) still yields a non-zero state so
+///    the xorshift64 advance is well-defined immediately.
+/// 3. The mapping is pure / deterministic: `(seed, label)` ↦ rng.
+///
+/// Stage RNGs that consumed hardcoded constants like `0xDEADBEEF…`
+/// before this refactor now route through `derive_rng(self.seed,
+/// b"solve_w")` so a `--seed=N` flag can drive them.
+fn derive_rng(seed: u64, label: &[u8]) -> u64 {
+    // FNV-1a on the label.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in label {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    // Mix master seed in.  Add a non-zero anchor so seed=0 doesn't
+    // drop us to zero state.
+    let s = seed
+        .wrapping_add(0x9e3779b97f4a7c15)
+        .wrapping_mul(0xbf58476d1ce4e5b9)
+        ^ h;
+    // splitmix64 finalizer to scatter bits.
+    let mut z = s;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^= z >> 31;
+    if z == 0 { 0x9e3779b97f4a7c15 } else { z }
+}
+
 /// Per-boundary fan-out tracker. One boundary (identified by
 /// `fanout_root_id` = its seed index) may dispatch through multiple
 /// stage handlers: Boundary → SolveW → SolveZ, or Boundary →
@@ -852,6 +885,11 @@ pub struct MddStagesAdapter {
     pub use_wz_mode: bool,
     pub seed_boundaries: Vec<BoundaryWork>,
     pub mode_name: &'static str,
+    /// Master seed inherited from `cfg.seed`; mixed into each stage's
+    /// per-call xorshift state via a stage-specific odd multiplier so
+    /// `--seed=0` (the default) produces deterministic per-stage RNG
+    /// streams.  See `derive_rng` below.
+    pub seed: u64,
     /// Monotonic counter for `WorkItem.meta.item_id`. Every emitted
     /// child fetch-adds to get a unique id, instead of reusing
     /// `parent.item_id + 1` which collides across siblings.
@@ -994,6 +1032,7 @@ impl MddStagesAdapter {
             item_ids,
             progress,
             cancel: Arc::clone(cancel),
+            seed: cfg.seed,
         };
         (adapter, result_rx)
     }
@@ -1088,7 +1127,11 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                 scratch: Mutex::new(SolveWScratch {
                     w_bases: HashMap::new(),
                     fft_buf_w: FftScratch::new(&spectral_w),
-                    rng: 0xDEADBEEF_CAFEBABE,
+                    // Stage-specific RNG: zero-seed default still
+                    // gives a non-zero xorshift state because
+                    // `derive_rng` adds a stage constant before
+                    // multiplying by an odd prime.
+                    rng: derive_rng(self.seed, b"solve_w"),
                 }),
                 item_ids: Arc::clone(&self.item_ids),
                 progress: Arc::clone(&self.progress),
@@ -1103,7 +1146,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                 result_tx: self.result_tx.clone(),
                 scratch: Mutex::new(SolveWZScratch {
                     template_cache: HashMap::new(),
-                    rng: 0xCAFEBABE_DEADBEEF,
+                    rng: derive_rng(self.seed, b"solve_wz"),
                 }),
                 item_ids: Arc::clone(&self.item_ids),
                 progress: Arc::clone(&self.progress),
@@ -1133,7 +1176,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                         phase: None,
                         inject_phase: true,
                     },
-                    rng: 0xFEEDFACE_BAADF00D,
+                    rng: derive_rng(self.seed, b"solve_z"),
                 }),
                 progress: Arc::clone(&self.progress),
             }),

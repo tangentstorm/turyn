@@ -338,6 +338,15 @@ pub(crate) struct SearchConfig {
     /// is a no-op. Enabled via `--conj-tuple` (see
     /// conjectures/positive-tuple.md).
     pub(crate) conj_tuple: bool,
+    /// Master RNG seed.  Every per-stage xorshift state, sync-walker
+    /// shuffle seed, and stochastic-mode seed is derived from this
+    /// single value via fixed multiplication by a distinct odd
+    /// constant.  Default `0` means deterministic-by-default: the
+    /// same `--seed=0` invocation produces the same boundary visit
+    /// order and the same per-feature counter totals at fixed-work
+    /// stop, modulo unavoidable cross-thread dispatch jitter.
+    /// Override via `--seed=N` on the command line.
+    pub(crate) seed: u64,
 }
 
 /// Which (Z, W) candidate producer feeds the shared XY SAT stage.
@@ -397,6 +406,7 @@ impl Default for SearchConfig {
             conj_xy_product: false,
             conj_zw_bound: false,
             conj_tuple: false,
+            seed: 0,
         }
     }
 }
@@ -473,6 +483,9 @@ impl SearchConfig {
         }
         if let Some(x) = self.bench_cover_log2 {
             parts.push(format!("--bench-cover-log2={x}"));
+        }
+        if self.seed != 0 {
+            parts.push(format!("--seed={}", self.seed));
         }
         if self.continue_after_sat {
             parts.push("--all".into());

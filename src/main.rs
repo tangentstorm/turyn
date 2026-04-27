@@ -111,6 +111,9 @@ fn print_help() {
     eprintln!("  --conflict-limit=<N>     Max CDCL conflicts per SAT call before giving up on");
     eprintln!("                           that candidate; 0 = unlimited (default: 0)");
     eprintln!("  --sat-secs=<N>           Time limit in seconds for the search; 0 = unlimited");
+    eprintln!("  --seed=<N>               Master RNG seed; 0 = deterministic default. Drives");
+    eprintln!("                           every per-stage xorshift, sync-walker shuffle, and");
+    eprintln!("                           stochastic mode RNG (default: 0)");
     eprintln!("  --bench-cover-log2=<X>   Benchmark stop: cover about 2^X raw-equivalent");
     eprintln!("                           configurations, report SAT hits, and keep searching");
     eprintln!("  --all                    Print/report SAT hits without stopping the search");
@@ -223,6 +226,14 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
             cfg.conflict_limit = v.parse().unwrap_or(0);
         } else if let Some(v) = arg.strip_prefix("--sat-secs=") {
             cfg.sat_secs = v.parse().unwrap_or(0);
+        } else if let Some(v) = arg.strip_prefix("--seed=") {
+            cfg.seed = match v.parse::<u64>() {
+                Ok(x) => x,
+                _ => {
+                    eprintln!("error: --seed requires a non-negative integer");
+                    std::process::exit(1);
+                }
+            };
         } else if let Some(v) = arg.strip_prefix("--bench-cover-log2=") {
             cfg.bench_cover_log2 = match v.parse::<f64>() {
                 Ok(x) if x.is_finite() && x >= 0.0 => Some(x),
@@ -706,7 +717,10 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
         sat_secs: cfg.sat_secs,
         sat_config: cfg.sat_config.clone(),
         conflict_limit: cfg.conflict_limit,
-        random_seed: None,
+        // Master seed flows in here: the parallel walker mixes this
+        // with `worker_id` to derive each thread's sibling-shuffle
+        // seed.  `--seed=0` (the default) is deterministic.
+        random_seed: Some(cfg.seed),
         cancel: Some(std::sync::Arc::clone(&engine_cancel)),
         exchange: None,
         projected_fraction_ppm: None,
@@ -1586,6 +1600,7 @@ mod tests {
             conj_xy_product: false,
             conj_zw_bound: false,
             conj_tuple: false,
+            seed: 0,
         };
         let tuples = phase_a_tuples(cfg.problem, None);
         let report = run_mdd_sat_search(cfg.problem, &tuples, &cfg, false, cfg.mdd_k);

@@ -3605,3 +3605,127 @@ Top denominator-leverage ideas not in this batch:
   preserve-totals" API that collapses the matrix to its column
   sums with all rows after row 0 zeroed.
 
+## V-series: apart/together SAT preprocessing carry-over (April 27 2026, Claude)
+
+The U-series session ended explicitly noting that none of its
+sync-side wins (R1, R8, R8b, R8c, backbone, R2, ...) had touched
+apart/together.  Item V1 below is the apart-side counterpart of
+sync's `backbone_scan` win — applied to `SatXYTemplate::
+build_multi_opts` so every per-(Z,W) clone inherits the level-0
+facts.  The session also produced two infrastructure changes
+(`--seed=N` master RNG, paired-interleaved acceptance methodology
+in `IMPROVE.md`) that survive regardless of V1's verdict.
+
+### V1. backbone_scan on apart's XY template — *tested, REJECTED*
+
+**Change**: add `solver.backbone_scan(2 * n)` at the end of
+`SatXYTemplate::build_multi_opts` (`src/xy_sat.rs`), so the
+template solver is preprocessed once per unique tuple set; every
+`prepare_candidate_solver` / `SolveXyPerCandidate::new` clone
+inherits the level-0 facts.  Mirrors `sync_walker.rs::build_solver`
+(`src/sync_walker.rs:704`) which uses the same call on its single
+solver.
+
+**TTC mechanism (predicted)**: rate.  Backbone facts persist into
+clones, reducing free-var count and propagation work per
+candidate.  Compounds across all per-(Z,W) clones for a given
+`tuple_key`.
+
+**Expected counters**: `flow_xy_root_forced / flow_xy_solves` ↑
+(more level-0 forced), `flow_xy_decisions / flow_xy_solves` ↓.
+
+**Benchmark**:
+```text
+cargo bench --bench fixed_work_criterion -- \
+  --turyn-n=26 --turyn-wz=together --turyn-mdd-k=7 --turyn-cover-log2=40
+```
+
+**Measurement (paired interleaved, n=15 pairs, --seed=0,
+n=26 wz=together mdd-k=7 cover-log2=40)**:
+
+- before mean: 11.31 s; after mean: 11.66 s
+- per-pair delta: mean = +0.34 s, SE = 0.50 s, t = +0.69
+  (pair 12 was a +6.6 s shared-machine outlier; even excluding it,
+  per-pair delta stays inside ±0.2 s — well within rig CV)
+- 95 % CI on the per-pair delta clearly contains zero.
+
+**Counter check (deterministic, --seed=0, sat-secs=180s wall-clock
+cap)**:
+
+| counter            | NoBackbone   | WithBackbone | Δ      |
+|--------------------|--------------|--------------|--------|
+| TTC (s)            | 53,872       | 53,927       | +0.1 % |
+| flow_xy_solves     | 5,033,293    | 5,119,950    | +1.7 % |
+| flow_z_solves      | 7,680        | 7,718        | +0.5 % |
+| stage_exit[bnd]    | 34,861       | 22,201       | −36 %  |
+
+**Verdict**: backbone *does* find facts that mildly speed up
+per-XY-solve propagation (+1.7 % more solves in the same wall-clock),
+but the per-template setup cost (`backbone_scan` runs once per
+unique tuple-set cache miss) cancels out the saving — boundaries
+are walked 36 % more slowly because each cached template now costs
+more to build the first time.  Net TTC delta is +0.1 %, well
+inside noise.
+
+The XY template is the wrong scope for backbone scan in this
+pipeline.  Sync benefits from it because there's exactly one
+solver and the cost is amortised over an entire run; apart's
+template_cache spreads it across many cache entries with
+relatively short lifetimes.  Reverted.
+
+**Status**: rejected.  The mechanism is real but too small at
+this scope to clear noise; the setup cost dominates.  A future
+variant might amortise backbone across a longer-lived template,
+but that requires a bigger architectural change (single-template
+apart pipeline) — out of scope for this session.
+
+### V-series infrastructure: deterministic-by-default RNGs (--seed=N)
+
+Independent of V1's failure, the session landed a
+single-master-seed RNG plumbing so future paired-tests like the
+one above can reduce noise without changing the search itself:
+
+- **CLI**: `--seed=N` (default `0`) added to `main.rs` arg parsing
+  and `SearchConfig.seed`.
+- **mdd_stages.rs**: replaced the three hardcoded constants
+  (`0xDEADBEEF_CAFEBABE` etc.) with `derive_rng(self.seed,
+  b"solve_w" / b"solve_wz" / b"solve_z")`, an FNV-of-label +
+  splitmix64 finalizer that gives each stage a distinct non-zero
+  state from `seed=0`.
+- **sync_walker.rs**: each worker's `random_seed` now mixes the
+  master seed with its `worker_id` (`master * golden_ratio +
+  worker_id`) instead of using `worker_id` directly, so
+  `--seed=N` actually reaches every per-worker shuffle.
+- **mdd_pipeline.rs / main.rs**: legacy `run_mdd_sat_search` and
+  the framework `SyncAdapter::build` both forward `cfg.seed` into
+  `SyncConfig.random_seed`.
+- **IMPROVE.md**: new "Measurement Discipline" section documents
+  the noise floor on a typical 4-CPU shared rig (~10 % CV per
+  sample), the paired-interleaved benchmark recipe, and the
+  counter-driven acceptance bar for sub-2 % wins.
+
+These pieces are NOT a TTC win on their own.  They make future
+sub-percent claims auditable: a counter-ratio at `--seed=0` that
+the change is supposed to move now has a stable baseline.
+
+### V-series: open ideas (not yet measured)
+
+Still on the carry-over list for apart/together (still in
+`IDEAS.md` § *Carry-over to `--wz=apart` / `--wz=together`*):
+
+- **V2. R1 carry-over**: `push_assume_frame` /
+  `pop_assume_frame` for SolveZ / SolveW / XY per-candidate
+  flows.  Sync's −20 % TTC win came from this; apart's per-(Z,W)
+  clone-and-discard pattern is structurally similar.  Bigger
+  change than V1; needs the stage handler to thread a persistent
+  solver through its candidate iteration.
+- **V3. SCC + BVE on apart's XY template**: same scope question
+  as V1 (per-template-cache-entry setup cost).  Probably
+  identical outcome unless the template lifetime is extended.
+- **V4. Hoist `tuple_key` Vec build out of the SolveZ / SolveWZ
+  loops**: `tuple_key` is rebuilt per Z / WZ solution even though
+  `candidate_tuples` is fixed for the call.  Estimated ~300 ns
+  saved per iteration, ~16 iterations per call, ≤ 0.5 % rate
+  win.  Below the 2 % threshold per acceptance bar; only worth
+  doing if combined with other micro-wins.
+

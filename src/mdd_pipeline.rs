@@ -2816,7 +2816,7 @@ pub(crate) fn run_mdd_sat_search(
             sat_secs: cfg.sat_secs,
             sat_config: cfg.sat_config.clone(),
             conflict_limit: cfg.conflict_limit,
-            random_seed: None,
+            random_seed: Some(cfg.seed),
             cancel: None,
             exchange: None,
             projected_fraction_ppm: None,

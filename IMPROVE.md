@@ -182,6 +182,93 @@ solves per boundary is a TTC win even at lower xy/s, and the legacy
     before being accepted on a deeper metric — don't quit on one
     failed batch, but also don't lower the bar.
 
+## Measurement Discipline
+
+Many "wins" recorded in `IDEAS.md` and `docs/OPTIMIZATION_LOG.md` were
+rendered on shared rigs whose run-to-run wall-clock CV is **8–30 %**.
+A naive 5-run mean cannot distinguish a 1 % effect from thermal jitter
+on those rigs.  Two principles keep small wins honest:
+
+1. **Wall-clock is the sanity check, not the verdict.**  Prefer
+   deterministic counters (see below) as the primary signal.  The
+   verdict is "the counter moved by the right amount in the right
+   direction"; wall-clock is "and the change also did not regress
+   sample time".
+2. **When wall-clock *is* the verdict, use paired interleaved
+   samples**, not independent baselines.  Random noise inside one
+   sample cancels at the pair-level even when each sample's CV is
+   large.
+
+### Deterministic-by-default RNGs
+
+`--seed=N` (default `0`) feeds every per-stage xorshift state, the
+sync walker's per-worker shuffle seed, and the stochastic-mode RNG.
+With a fixed `--seed`, the order of boundaries dispatched by the
+walker is the same across before/after binaries, so the only
+remaining source of cross-run variation is parallel-dispatch jitter
+(which affects *which worker handled which boundary*, not the
+totals).  Counter ratios at fixed-work coverage stop are then
+stable to within a fraction of a percent across reruns of the
+same binary.
+
+When evaluating a change, report at least one of:
+
+- a counter ratio that the change is supposed to move
+  (e.g. `flow_xy_decisions / flow_xy_solves`,
+  `flow_xy_root_forced / flow_xy_solves`,
+  `flow_z_propagations / flow_z_solves`); or
+- a counter total at fixed-work coverage stop (e.g. `flow_xy_solves`
+  at `bench-cover-log2 = 40`).
+
+Both should be measured at `--seed=0` (or any other fixed seed) on
+both the before and after binaries.
+
+### Paired interleaved benchmark
+
+For wall-clock comparisons, build the before and after binaries
+side-by-side and run alternating samples on the same idle box:
+
+```bash
+cp target/release/turyn /tmp/turyn_after          # after building "after"
+git stash && cargo build --release --bin turyn
+cp target/release/turyn /tmp/turyn_before
+git stash pop && cargo build --release --bin turyn
+
+echo "pair,before,after" > /tmp/paired.csv
+for i in $(seq 1 20); do
+  bs=$( { time /tmp/turyn_before search --n=26 --wz=together --mdd-k=7 \
+            --bench-cover-log2=40 --sat-secs=120 --seed=0 > /dev/null 2>&1; } \
+        2>&1 | grep real | awk '{print $2}')
+  as=$( { time /tmp/turyn_after  search --n=26 --wz=together --mdd-k=7 \
+            --bench-cover-log2=40 --sat-secs=120 --seed=0 > /dev/null 2>&1; } \
+        2>&1 | grep real | awk '{print $2}')
+  echo "$i,$bs,$as" | tee -a /tmp/paired.csv
+done
+```
+
+Then evaluate `(after - before)` *per pair*, not the marginal
+medians.  Even on a rig with 10 % marginal CV, 20 paired samples
+typically detect a 1 % effect with 95 % CI clearing zero, because
+inter-pair drift cancels.
+
+A long single-sample wall-clock comparison ("baseline vs after,
+both 5 runs") only stays honest at large effect sizes — `≥ 5 %` if
+the marginal CV is `≈ 10 %`.
+
+### Tuning sample length on a noisy rig
+
+When the marginal CV stays above 10 % even with `cover-log2 = 40`,
+the rig itself is the bottleneck.  Options in rough cost order:
+
+1. Run the bench at a quieter time (no other CPU contention).
+2. Pin the binary to specific cores (`taskset -c 0-3`).
+3. Raise `cover-log2` by 4 (each step roughly doubles the per-sample
+   work, halving the relative noise of fixed cold-start overhead).
+4. Switch from a wall-clock harness to a counter ratio.
+
+`cover-log2 = 44` typically gives one ~60 s sample at n=26, which is
+long enough that even shared-machine noise drops below 5 % CV.
+
 ## Acceptance Bar
 
 Do not commit "in-noise" changes.
@@ -189,11 +276,26 @@ Do not commit "in-noise" changes.
 - `>= 5 %` with matching counters and non-overlapping CIs:
   acceptable after a sanity rerun.
 - `2-5 %`: rerun/interleave before accepting; need overlapping
-  evidence from at least 2 independent benchmark profiles.
-- `< 2 %`: require strong repeated evidence and very low complexity.
+  evidence from at least 2 independent benchmark profiles **or** a
+  paired-interleaved run with the per-pair delta CI clear of zero.
+- `< 2 %`: not acceptable on wall-clock alone.  Require either
+  a deterministic counter movement of the predicted shape **or** a
+  paired-interleaved run of `≥ 30` pairs with the per-pair delta
+  CI clear of zero.
   A 1 % real win needs enough samples that the CI clears zero —
   don't accept it because one run looked faster.
 - regression or unclear mechanism: reject or keep investigating.
+
+### Counter-driven acceptance (preferred for sub-2 % wins)
+
+State the predicted counter movement *before* implementing the
+change.  After implementing, run with `--seed=0` and confirm the
+predicted counter moved by the predicted amount in the predicted
+direction.  If it did and wall-clock is in noise, the win is real
+but small; record both the counter delta and the wall-clock-noise
+verdict.  Compounding several "real but small" wins is one of the
+ways the search has historically improved at sizes where each
+individual lever was sub-percent.
 
 ### Suspicious wins: improbably-good TTC suggests a soundness bug
 
