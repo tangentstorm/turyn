@@ -204,6 +204,22 @@ with a `Fin n → Int` accessor. So `S.data ⟨i, h⟩` reduces to
 `List.range a.length`. The structure is parallel; needs careful
 `Fin.sum_univ_eq_sum_range`-style rewrites.
 
+## In-flight Aristotle delegation
+
+| Project ID | Target | Submitted | Status |
+|---|---|---|---|
+| `b96e2fe9-5496-4eaa-9d25-63bb7b7c5290` | `Turyn/Equivalence.lean` migration to function-typed carriers | this session | check via `mcp__aristotle__list` |
+
+Prompt summary: rewrite `Equivalence.lean` to use the function-typed
+primitives in `BaseSequence.lean` (negSeqFn, reverseFn, altSeqFn,
+vanishing_*, do*, etc.). Preserve the `step1_condition1`..`step6_condition6`
+and `canonical_representative_exists` theorem statements. Don't touch
+`Defs.lean`, `TurynType.lean`, or `BaseSequence.lean`.
+
+When result returns: `mcp__aristotle__result <id>` to extract,
+`mcp__aristotle__diff_result <id> "Turyn/Equivalence.lean"` to inspect,
+then commit with co-author `Aristotle (Harmonic) <aristotle-harmonic@harmonic.fun>`.
+
 ## Recommended next steps
 
 1. **Phase 4 proper (Equivalence.lean rewrite):** All foundations are
