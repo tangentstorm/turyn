@@ -14,10 +14,10 @@ check to native code and runs it, producing a kernel-level proof.
 ## How to add your own verified solution
 
 ```lean
-def myX : PmSeq n := PmSeq.ofList (pm! "+−+−...") (by decide) (by decide)
-def myY : PmSeq n := PmSeq.ofList (pm! "++−−...") (by decide) (by decide)
-def myZ : PmSeq n := PmSeq.ofList (pm! "+−−+...") (by decide) (by decide)
-def myW : PmSeq (n - 1) := PmSeq.ofList (pm! "−++−...") (by decide) (by decide)
+def myX : PmSeq n := pm! "+−+−..."
+def myY : PmSeq n := pm! "++−−..."
+def myZ : PmSeq n := pm! "+−−+..."
+def myW : PmSeq (n - 1) := pm! "−++−..."
 
 theorem my_solution_is_turyn : IsTurynType myX myY myZ myW := by
   native_decide
@@ -26,10 +26,10 @@ theorem my_solution_is_turyn : IsTurynType myX myY myZ myW := by
 
 /-! ## TT(6): A small example -/
 
-def tt6X : PmSeq 6 := PmSeq.ofList (pm! "----+-") (by decide) (by decide)
-def tt6Y : PmSeq 6 := PmSeq.ofList (pm! "---+--") (by decide) (by decide)
-def tt6Z : PmSeq 6 := PmSeq.ofList (pm! "--+-++") (by decide) (by decide)
-def tt6W : PmSeq 5 := PmSeq.ofList (pm! "-+++-") (by decide) (by decide)
+def tt6X : PmSeq 6 := pm! "----+-"
+def tt6Y : PmSeq 6 := pm! "---+--"
+def tt6Z : PmSeq 6 := pm! "--+-++"
+def tt6W : PmSeq 5 := pm! "-+++-"
 
 /-- TT(6) is a valid Turyn-type sequence.
     Verified by compiling the Boolean check to native code. -/
@@ -63,14 +63,10 @@ the smallest order for which no Hadamard matrix was previously known.
 Reference: Kharaghani, H. & Tayfeh-Rezaie, B. (2005).
 "A Hadamard matrix of order 428." *J. Combin. Des.* 13(6), 435–440. -/
 
-def kh05X : PmSeq 36 :=
-  PmSeq.ofList (pm! "+++----++-+-+-----++++-++-++++----+-") (by decide) (by decide)
-def kh05Y : PmSeq 36 :=
-  PmSeq.ofList (pm! "+-+++++--+-+--+--++--++++-++++---++-") (by decide) (by decide)
-def kh05Z : PmSeq 36 :=
-  PmSeq.ofList (pm! "+-+++++-+--++++-+++-++--+++-+--+---+") (by decide) (by decide)
-def kh05W : PmSeq 35 :=
-  PmSeq.ofList (pm! "+++-+-----++--+-+++--+-+-+++-++++-+") (by decide) (by decide)
+def kh05X : PmSeq 36 := pm! "+++----++-+-+-----++++-++-++++----+-"
+def kh05Y : PmSeq 36 := pm! "+-+++++--+-+--+--++--++++-++++---++-"
+def kh05Z : PmSeq 36 := pm! "+-+++++-+--++++-+++-++--+++-+--+---+"
+def kh05W : PmSeq 35 := pm! "+++-+-----++--+-+++--+-+-+++-++++-+"
 
 /-- **Kharaghani–Tayfeh-Rezaie TT(36) is a valid Turyn-type sequence.**
 
@@ -111,10 +107,10 @@ import Turyn.TurynType
 import Turyn.Energy
 import Turyn.TSequence
 
-def myX : PmSeq N := PmSeq.ofList (pm! "...") (by decide) (by decide)
-def myY : PmSeq N := PmSeq.ofList (pm! "...") (by decide) (by decide)
-def myZ : PmSeq N := PmSeq.ofList (pm! "...") (by decide) (by decide)
-def myW : PmSeq (N - 1) := PmSeq.ofList (pm! "...") (by decide) (by decide)
+def myX : PmSeq N := pm! "..."
+def myY : PmSeq N := pm! "..."
+def myZ : PmSeq N := pm! "..."
+def myW : PmSeq (N - 1) := pm! "..."
 
 -- Lean verifies at compile time
 theorem my_tt_valid : IsTurynType myX myY myZ myW := by native_decide

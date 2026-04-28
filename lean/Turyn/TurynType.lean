@@ -38,12 +38,6 @@ def pmSeq! (s : String) : List Int :=
   | some xs => xs
   | none => panic! s!"invalid ±1 literal: {s}"
 
-/-- String literal notation for ±1 sequences, e.g. `pm! "++--"`. -/
-syntax "pm! " str : term
-
-macro_rules
-  | `(pm! $s:str) => `(pmSeq! $s)
-
 /-! ### List-based predicates and Boolean / decidable layer -/
 
 /-- Propositional check that every entry of a `List Int` is `±1`. -/
@@ -96,6 +90,14 @@ def PmSeq.ofList (l : List Int) {n : Nat} (hlen : l.length = n) (hpm : AllPmOneL
         rw [List.getD_eq_getElem _ _ hi]
         exact List.getElem_mem hi
       exact hpm _ hmem }
+
+/-- String literal notation for typed ±1 sequences, e.g. `pm! "++--" : PmSeq 4`.
+    Expands to `PmSeq.ofList` with `decide`-discharged length and ±1 obligations.
+    To get the underlying `List Int` instead, use `pmSeq! "..."`. -/
+syntax "pm! " str : term
+
+macro_rules
+  | `(pm! $s:str) => `(PmSeq.ofList (pmSeq! $s) (by decide) (by decide))
 
 /-- Construct a `SignSeq n` from a list of length `n` of `{0,±1}` values. -/
 def SignSeq.ofList (l : List Int) {n : Nat} (hlen : l.length = n) (hsign : AllSignOneList l) :

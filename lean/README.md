@@ -60,10 +60,10 @@ import Turyn.TurynType
 import Turyn.Energy
 import Turyn.Hadamard
 
-def myX : PmSeq N       := ⟨pm! "...", by decide, by decide⟩
-def myY : PmSeq N       := ⟨pm! "...", by decide, by decide⟩
-def myZ : PmSeq N       := ⟨pm! "...", by decide, by decide⟩
-def myW : PmSeq (N - 1) := ⟨pm! "...", by decide, by decide⟩
+def myX : PmSeq N       := pm! "..."
+def myY : PmSeq N       := pm! "..."
+def myZ : PmSeq N       := pm! "..."
+def myW : PmSeq (N - 1) := pm! "..."
 
 -- Lean verifies at compile time (takes seconds)
 theorem my_tt_valid : IsTurynType myX myY myZ myW := by native_decide
