@@ -11,24 +11,41 @@ Eliminate `Turyn/GSArrayBridge.lean` by changing all sequence carriers
 `Fin n → Int`. After the refactor, the same carrier shape runs end-to-end
 through the GS pipeline.
 
-## Status (this session)
+## Status
 
 | Phase | File | Status | Build |
 |---|---|---|---|
-| 1 | `Turyn/Defs.lean` | DONE | green |
-| 2 | `Turyn/TurynType.lean` | DONE (partial — added `toList`/`ofList` shims) | green |
-| 3 | `Turyn/BaseSequence.lean` | drafted, not yet green — see "Known issues" below |
-| 4 | `Turyn/Equivalence.lean` | not started — biggest single rewrite (1419 lines) |
-| 5 | `Turyn/XY.lean` | not started — 564 lines, mostly mechanical |
-| 6 | `Turyn/TSequence.lean` | not started — 535 lines, redefine `TSequence`, `step2*` |
-| 7 | `Turyn/GSArrayBridge.lean` | not started — to be deleted |
-| 8 | `Turyn/GoethalsSeidel.lean` | not started — absorb survivors |
-| 9 | `Turyn/Hadamard.lean` | not started — should compose if 6+8 are right |
-| 10 | `Turyn/Examples.lean` | not started — `native_decide` regression risk |
-| 11 | `Turyn/Energy.lean` | not started — sums become `Finset.univ : Finset (Fin n)` |
+| 1 | `Turyn/Defs.lean` | DONE — incl. `lookupNat_of_lt/_of_ge/_eq_apply` simp lemmas | green |
+| 2 | `Turyn/TurynType.lean` | DONE (with `toList`/`ofList` shims) | green |
+| 3 | `Turyn/BaseSequence.lean` | DONE | green |
+| 3+ | `Turyn/BaseSequence.lean` (Phase-4 building blocks) | DONE — see "Phase-4 foundations" below | green |
+| 4 | `Turyn/Equivalence.lean` | NOT STARTED — proof rewrites only (foundations are in `BaseSequence.lean`) |
+| 5 | `Turyn/XY.lean` | NOT STARTED — 564 lines, mostly mechanical |
+| 6 | `Turyn/TSequence.lean` | NOT STARTED — 535 lines, redefine `TSequence`, `step2*` |
+| 7 | `Turyn/GSArrayBridge.lean` | NOT STARTED — to be deleted |
+| 8 | `Turyn/GoethalsSeidel.lean` | NOT STARTED — absorb survivors |
+| 9 | `Turyn/Hadamard.lean` | NOT STARTED — should compose if 6+8 are right |
+| 10 | `Turyn/Examples.lean` | NOT STARTED — `native_decide` regression risk |
+| 11 | `Turyn/Energy.lean` | NOT STARTED — sums become `Finset.univ : Finset (Fin n)` |
 
-Approximate work remaining: **~1500 lines of Lean proof scripts** to
-rewrite, with the bulk in phases 4 and 6.
+Approximate proof-script work remaining: **~1200 lines** (Phase 4 step
+proofs are the bulk; Phase 6 redefinition is next-largest).
+
+## Phase-4 foundations (now in `Turyn/BaseSequence.lean`)
+
+All the building blocks the eventual `Turyn.Equivalence` rewrite needs
+to consume are pre-landed in `BaseSequence.lean`:
+
+- **Function-typed primitives:** `negSeqFn`, `appendFn`, `Turyn.altSeqFn`, `reverseFn`
+- **`AllPmOne` preservation:** `negSeqFn_AllPmOne`, `AllPmOne_appendFn`, `AllPmOne_altSeqFn`, `AllPmOne_reverseFn`
+- **Autocorrelation invariance kernel:** `aperiodicAutocorr_negSeqFn`, `aperiodicAutocorr_altSeqFn`, `aperiodicAutocorr_reverseFn`
+- **Vanishing preservation (10 lemmas):** `Turyn.vanishing_negX/Y/Z/W`, `vanishing_revX/Y/Z/W`, `vanishing_altAll`, `vanishing_swapXY`
+- **`PmSeq` operation wrappers:** `PmSeq.neg/.reverse/.alt` + `PmSeq.neg_data/.reverse_data/.alt_data` (simp)
+- **Elementary-move constructors (10):** `TurynType.doNegX/Y/Z/W`, `doRevX/Y/Z/W`, `doAltAll`, `doSwap`
+- **Equivalence machinery:** `Turyn.Elementary` inductive, `Turyn.Equivalent`, `Elementary.toEquivalent`, `equivalent_trans`
+
+Plus utility simp lemmas in `Turyn/Defs.lean`:
+- `lookupNat_of_lt`, `lookupNat_of_ge`, `lookupNat_eq_apply`
 
 ## What was done this session
 
@@ -189,21 +206,30 @@ with a `Fin n → Int` accessor. So `S.data ⟨i, h⟩` reduces to
 
 ## Recommended next steps
 
-1. **Finish Phase 3:** Apply the dite-reduction fix at line 116-118 of
-   `BaseSequence.lean`; build; check for any remaining `concat_neg_autocorr_sum_fn`
-   issues in the analogous case-analysis branches. ~1-2 build iterations.
+1. **Phase 4 proper (Equivalence.lean rewrite):** All foundations are
+   in place. The remaining work is:
+   - Add accessor identity lemmas (`xAt_doNegX`, `xAt_doRevX_at`, etc.)
+     — ~30-40 short lemmas, mostly `unfold + rfl` style for unchanged
+     fields and `simp [PmSeq.neg_data, negSeqFn]` for changed ones.
+   - Add per-condition preservation (`canonical1_doRevX`, etc.)
+   - Rewrite `step1_condition1` through `step6_condition6` —
+     ~600+ lines of step-by-step normalization using the do* family.
+     The original list-based code in `Turyn.Equivalence` is the template;
+     each `S.A.data.length = n` becomes type-level (the field is
+     `S.X : PmSeq n`), `S.A.getD i 0` becomes `lookupNat S.X.data i`
+     (or `xAt S i` after the i is appropriately offset).
+   - Cap with `canonical_representative_exists` and the namespace re-exports.
 
-2. **Phase 4 (Equivalence):** Tackle the autocorrelation invariance
-   lemmas first (`aperiodicAutocorr_neg/rev/alt`). Once those are green,
-   the `vanishing_*` family is mechanical, and the `step*_condition*` proofs
-   are mostly index rewrites that can use `PmSeq.toList_getD` as a bridge
-   to keep list-based proofs working.
+2. **Phase 6 (TSequence):** Redefine `TSequence m` and `step2*` as direct
+   `Fin (3n-1) → Int` functions (no list concatenation). Rewrite
+   `step2_support` and `step2_periodic` against `Turyn.periodicAutocorr`
+   from `Turyn/MatUtils.lean`.
 
-3. **Phase 6 (TSequence):** Define the new `TSequence m` and `step2*`
-   functions; rewrite `step2_support` and `step2_periodic` against
-   `Turyn.periodicAutocorr`.
+3. **Phase 5 (XY):** Mechanical `S.X.data.getD i 0 → lookupNat S.X.data i`
+   substitution; many proofs already use `xAt S i` accessor which is
+   unchanged in interface.
 
-4. **Phases 5, 7-11:** Mostly mechanical once foundations are in place.
+4. **Phases 7-11:** Mostly mechanical once foundations are in place.
 
 ## Strategic suggestion: split the refactor
 
