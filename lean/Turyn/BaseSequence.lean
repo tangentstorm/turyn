@@ -1,5 +1,6 @@
 import Turyn.TurynType
 import Mathlib.Algebra.BigOperators.Group.Finset.Basic
+import Mathlib.Logic.Relation
 import Mathlib.Tactic
 
 set_option linter.unusedSimpArgs false
@@ -296,6 +297,75 @@ lemma vanishing_swapXY {n : Nat} (T : TurynType n) :
   fun s hs1 hs2 => by
     have hv := T.vanishing s hs1 hs2
     unfold combinedAutocorr at hv ⊢; linarith
+
+end Turyn
+
+/-! ### Elementary transformations on `TurynType`
+
+The 10 `do*` constructors apply each elementary move (T1: negate one
+component, T2: reverse one component, T3: alternate all four,
+T4: swap X and Y) to a typed `TurynType n`, with the new vanishing
+field discharged by the corresponding `Turyn.vanishing_*` lemma. -/
+
+def TurynType.doNegX {n : Nat} (S : TurynType n) : TurynType n :=
+  ⟨S.X.neg, S.Y, S.Z, S.W, Turyn.vanishing_negX S⟩
+
+def TurynType.doNegY {n : Nat} (S : TurynType n) : TurynType n :=
+  ⟨S.X, S.Y.neg, S.Z, S.W, Turyn.vanishing_negY S⟩
+
+def TurynType.doNegZ {n : Nat} (S : TurynType n) : TurynType n :=
+  ⟨S.X, S.Y, S.Z.neg, S.W, Turyn.vanishing_negZ S⟩
+
+def TurynType.doNegW {n : Nat} (S : TurynType n) : TurynType n :=
+  ⟨S.X, S.Y, S.Z, S.W.neg, Turyn.vanishing_negW S⟩
+
+def TurynType.doRevX {n : Nat} (S : TurynType n) : TurynType n :=
+  ⟨S.X.reverse, S.Y, S.Z, S.W, Turyn.vanishing_revX S⟩
+
+def TurynType.doRevY {n : Nat} (S : TurynType n) : TurynType n :=
+  ⟨S.X, S.Y.reverse, S.Z, S.W, Turyn.vanishing_revY S⟩
+
+def TurynType.doRevZ {n : Nat} (S : TurynType n) : TurynType n :=
+  ⟨S.X, S.Y, S.Z.reverse, S.W, Turyn.vanishing_revZ S⟩
+
+def TurynType.doRevW {n : Nat} (S : TurynType n) : TurynType n :=
+  ⟨S.X, S.Y, S.Z, S.W.reverse, Turyn.vanishing_revW S⟩
+
+def TurynType.doAltAll {n : Nat} (S : TurynType n) : TurynType n :=
+  ⟨S.X.alt, S.Y.alt, S.Z.alt, S.W.alt, Turyn.vanishing_altAll S⟩
+
+def TurynType.doSwap {n : Nat} (S : TurynType n) : TurynType n :=
+  ⟨S.Y, S.X, S.Z, S.W, Turyn.vanishing_swapXY S⟩
+
+namespace Turyn
+
+/-- Elementary transformations between Turyn-type sequences (T1..T4 from
+Best–Đoković–Kharaghani–Ramp 2013). -/
+inductive Elementary (n : Nat) : TurynType n → TurynType n → Prop where
+  | negX (S : TurynType n) : Elementary n S S.doNegX
+  | negY (S : TurynType n) : Elementary n S S.doNegY
+  | negZ (S : TurynType n) : Elementary n S S.doNegZ
+  | negW (S : TurynType n) : Elementary n S S.doNegW
+  | revX (S : TurynType n) : Elementary n S S.doRevX
+  | revY (S : TurynType n) : Elementary n S S.doRevY
+  | revZ (S : TurynType n) : Elementary n S S.doRevZ
+  | revW (S : TurynType n) : Elementary n S S.doRevW
+  | altAll (S : TurynType n) : Elementary n S S.doAltAll
+  | swap (S : TurynType n) : Elementary n S S.doSwap
+
+/-- Equivalence is the reflexive-transitive closure of elementary transformations. -/
+def Equivalent (n : Nat) (S T : TurynType n) : Prop :=
+  Relation.ReflTransGen (Elementary n) S T
+
+/-- A single elementary step implies equivalence. -/
+lemma Elementary.toEquivalent {n : Nat} {S T : TurynType n}
+    (h : Elementary n S T) : Equivalent n S T :=
+  Relation.ReflTransGen.single h
+
+/-- Transitivity of equivalence (closure composition). -/
+theorem equivalent_trans (n : Nat) {S T U : TurynType n} :
+    Equivalent n S T → Equivalent n T U → Equivalent n S U :=
+  Relation.ReflTransGen.trans
 
 end Turyn
 
