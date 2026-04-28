@@ -1,9 +1,11 @@
 import Mathlib.Algebra.BigOperators.Group.Finset.Basic
 import Mathlib.Algebra.BigOperators.Intervals
 import Mathlib.Data.List.GetD
+import Mathlib.Data.Matrix.Basic
 
 open Finset
 open BigOperators
+open Matrix
 
 /-!
 # Turyn.Defs
@@ -15,11 +17,15 @@ The trusted definitions named in `Challenge.lean`'s headline statements:
 - `PmSeq n`, `SignSeq n` — length-indexed ±1 / {0, ±1} sequences
   carried as `Fin n → Int`.
 - `TurynType n` — bundled TT(n) quadruple plus the vanishing identity.
+- `IsTurynType X Y Z W` — direct vanishing predicate on a `±1` quadruple.
 - `xAt/yAt/zAt/wAt`, `uAt` — 1-indexed entry accessors.
 - `Canonical1..6`, `Canonical` — BDKR canonical-form predicates.
+- `Turyn.IntVec`, `Turyn.IntMat`, `Turyn.IsHadamardMat` — typed integer
+  vector/matrix abbreviations and the matrix-level Hadamard predicate.
 
-Boolean checks, decidability, parsers, and the `IsTurynType` predicate
-sit on top of these definitions in `Turyn.TurynType`.
+Boolean checks, decidability, parsers, and matrix-algebra lemmas
+sit on top of these definitions in `Turyn.TurynType` and
+`Turyn.MatUtils`.
 -/
 
 /-! ### Function-typed entry predicates -/
@@ -84,6 +90,14 @@ structure TurynType (n : Nat) where
   Z : PmSeq n
   W : PmSeq (n - 1)
   vanishing : ∀ s : Nat, 1 ≤ s → s < n →
+    combinedAutocorr X.data Y.data Z.data W.data s = 0
+
+/-- Direct vanishing predicate: the four `±1` carriers form a Turyn-type
+sequence iff every nonzero shift's combined autocorrelation vanishes.
+This is the propositional content of `TurynType n`; see
+`IsTurynType.toTyped` in `Turyn.TurynType` for the bundled form. -/
+def IsTurynType {n : Nat} (X Y Z : PmSeq n) (W : PmSeq (n - 1)) : Prop :=
+  ∀ s : Nat, 1 ≤ s → s < n →
     combinedAutocorr X.data Y.data Z.data W.data s = 0
 
 namespace Turyn
@@ -151,5 +165,18 @@ def Canonical6 (n : Nat) (S : TurynType n) : Prop :=
 def Canonical (n : Nat) (S : TurynType n) : Prop :=
   Canonical1 n S ∧ Canonical2 n S ∧ Canonical3 n S ∧
   Canonical4 n S ∧ Canonical5 n S ∧ Canonical6 n S
+
+/-! ### Matrix carriers and Hadamard predicate -/
+
+/-- Typed integer vectors indexed by `Fin n`. -/
+abbrev IntVec (n : Nat) := Fin n → Int
+
+/-- Typed square integer matrices indexed by `Fin n`. -/
+abbrev IntMat (n : Nat) := Matrix (Fin n) (Fin n) Int
+
+/-- Matrix-level Hadamard predicate: entrywise `±1` and `H · Hᵀ = n · I`. -/
+def IsHadamardMat {n : Nat} (H : IntMat n) : Prop :=
+  (∀ i j, H i j = 1 ∨ H i j = -1) ∧
+  H * Hᵀ = (n : Int) • (1 : IntMat n)
 
 end Turyn

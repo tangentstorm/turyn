@@ -131,33 +131,39 @@ def isTurynTypeBool {n : Nat} (X Y Z : PmSeq n) (W : PmSeq (n - 1)) : Bool :=
   (List.range (n - 1)).all fun i =>
     combinedAutocorr X.data Y.data Z.data W.data (i + 1) == 0
 
-/-- Propositional Turyn-type predicate on length-indexed `PmSeq` carriers. -/
-def IsTurynType {n : Nat} (X Y Z : PmSeq n) (W : PmSeq (n - 1)) : Prop :=
-  isTurynTypeBool X Y Z W = true
+/-- The Boolean check is equivalent to the propositional vanishing predicate. -/
+theorem isTurynTypeBool_iff_IsTurynType {n : Nat} (X Y Z : PmSeq n) (W : PmSeq (n - 1)) :
+    isTurynTypeBool X Y Z W = true ↔ IsTurynType X Y Z W := by
+  unfold isTurynTypeBool IsTurynType
+  rw [List.all_eq_true]
+  constructor
+  · intro h s hs1 hs2
+    have hmem : s - 1 ∈ List.range (n - 1) := by rw [List.mem_range]; omega
+    have hk := h _ hmem
+    have heq : s - 1 + 1 = s := by omega
+    rw [heq] at hk
+    exact eq_of_beq hk
+  · intro h k hk
+    rw [List.mem_range] at hk
+    have := h (k + 1) (by omega) (by omega)
+    simp [this]
 
 instance {n : Nat} (X Y Z : PmSeq n) (W : PmSeq (n - 1)) :
     Decidable (IsTurynType X Y Z W) :=
-  inferInstanceAs (Decidable (isTurynTypeBool X Y Z W = true))
+  decidable_of_iff _ (isTurynTypeBool_iff_IsTurynType X Y Z W)
 
-/-- Direct vanishing form: unfolds the boolean check into a quantifier over
-    nonzero shifts.  Useful when consuming an `IsTurynType` proof. -/
+/-- Direct vanishing form: `IsTurynType` is the vanishing predicate by
+    definition, so this is the identity.  Kept as a `.vanishing` accessor
+    for backward compatibility with downstream proofs. -/
 theorem IsTurynType.vanishing {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
     (h : IsTurynType X Y Z W) :
     ∀ s : Nat, 1 ≤ s → s < n →
-      combinedAutocorr X.data Y.data Z.data W.data s = 0 := by
-  unfold IsTurynType isTurynTypeBool at h
-  rw [List.all_eq_true] at h
-  intro s hs1 hs2
-  have hmem : s - 1 ∈ List.range (n - 1) := by rw [List.mem_range]; omega
-  have hk := h _ hmem
-  have heq : s - 1 + 1 = s := by omega
-  rw [heq] at hk
-  exact eq_of_beq hk
+      combinedAutocorr X.data Y.data Z.data W.data s = 0 := h
 
-/-- Convert a typed `IsTurynType` certificate into the bundled `TurynType`. -/
+/-- Convert an `IsTurynType` certificate into the bundled `TurynType`. -/
 def IsTurynType.toTyped {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
     (h : IsTurynType X Y Z W) : TurynType n :=
-  { X := X, Y := Y, Z := Z, W := W, vanishing := h.vanishing }
+  { X := X, Y := Y, Z := Z, W := W, vanishing := h }
 
 /-! ### Sum of a sequence -/
 

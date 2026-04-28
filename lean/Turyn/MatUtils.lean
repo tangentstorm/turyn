@@ -1,3 +1,4 @@
+import Turyn.Defs
 import Mathlib.Data.Matrix.Basic
 import Mathlib.Algebra.BigOperators.Group.Finset.Basic
 import Mathlib.Tactic
@@ -8,18 +9,12 @@ open BigOperators
 /-!
 # Matrix Utilities
 
-`Fin n`-indexed integer vectors and matrices, circulants, the back-diagonal
-reversal matrix, the Hadamard predicate, and small matrix lemmas used by
-the Goethals-Seidel construction.
+Circulants, the back-diagonal reversal matrix, and small matrix lemmas
+used by the Goethals-Seidel construction.  The `IntVec`, `IntMat`, and
+`IsHadamardMat` definitions live in `Turyn.Defs`.
 -/
 
 namespace Turyn
-
-/-- Typed integer vectors indexed by `Fin n`. -/
-abbrev IntVec (n : Nat) := Fin n → Int
-
-/-- Typed square integer matrices indexed by `Fin n`. -/
-abbrev IntMat (n : Nat) := Matrix (Fin n) (Fin n) Int
 
 /-- Entrywise `±1` condition for typed vectors. -/
 def IsPmOneVec {n : Nat} (x : IntVec n) : Prop :=
@@ -145,10 +140,5 @@ theorem reversal_conjugates_circulant_apply {n : Nat} (x : IntVec n) (i j : Fin 
   rw [mul_reversalMatrix_apply]
   rw [reversalMatrix_mul_apply]
   simp [circulant]
-
-/-- Matrix-level Hadamard predicate. -/
-def IsHadamardMat {n : Nat} (H : IntMat n) : Prop :=
-  (∀ i j, H i j = 1 ∨ H i j = -1) ∧
-  H * Hᵀ = (n : Int) • (1 : IntMat n)
 
 end Turyn
