@@ -78,6 +78,29 @@ lemma AllPmOne_reverseFn {n : Nat} {a : Fin n → Int} (h : AllPmOne a) :
     AllPmOne (reverseFn a) := by
   intro i; unfold reverseFn; exact h _
 
+/-! ### `lookupNat` interaction with the function-typed transformations -/
+
+@[simp] lemma lookupNat_negSeqFn {n : Nat} (a : Fin n → Int) (i : Nat) :
+    lookupNat (negSeqFn a) i = -(lookupNat a i) := by
+  unfold lookupNat
+  by_cases h : i < n
+  · simp [h, negSeqFn]
+  · simp [h]
+
+lemma lookupNat_reverseFn {n : Nat} (a : Fin n → Int) (i : Nat) (hi : i < n) :
+    lookupNat (reverseFn a) i = lookupNat a (n - 1 - i) := by
+  unfold lookupNat reverseFn
+  have hr : n - 1 - i < n := by omega
+  simp [hi, hr]
+
+lemma lookupNat_altSeqFn {n : Nat} (a : Fin n → Int) (i : Nat) :
+    lookupNat (Turyn.altSeqFn a) i =
+      (if i % 2 = 0 then (1 : Int) else -1) * lookupNat a i := by
+  unfold lookupNat
+  by_cases h : i < n
+  · simp only [h, ↓reduceDIte, Turyn.altSeqFn_apply]
+  · simp only [h, ↓reduceDIte, mul_zero]
+
 /-! ### `PmSeq` operations: negation, reversal, alternation
 
 Bundled wrappers around the function-typed primitives, with the
