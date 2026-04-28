@@ -77,6 +77,88 @@ lemma AllPmOne_reverseFn {n : Nat} {a : Fin n → Int} (h : AllPmOne a) :
     AllPmOne (reverseFn a) := by
   intro i; unfold reverseFn; exact h _
 
+/-! ### Sign-pattern helpers for `aperiodicAutocorr_altSeqFn` -/
+
+private lemma ite_mod2_eq_neg_one_pow (k : Nat) :
+    (if k % 2 = 0 then (1 : Int) else -1) = (-1) ^ k := by
+  induction k with
+  | zero => norm_num
+  | succ j ih =>
+    rw [pow_succ]
+    by_cases hj : j % 2 = 0
+    · rw [if_neg (by omega), ← ih, if_pos hj]; ring
+    · rw [if_pos (by omega), ← ih, if_neg hj]; ring
+
+private lemma sign_product_eq (i s : Nat) :
+    ((if i % 2 = 0 then (1 : Int) else -1) *
+      (if (i + s) % 2 = 0 then (1 : Int) else -1)) = (-1 : Int) ^ s := by
+  rw [ite_mod2_eq_neg_one_pow, ite_mod2_eq_neg_one_pow, ← pow_add]
+  rw [show i + (i + s) = 2 * i + s from by ring,
+      pow_add, pow_mul, neg_one_sq, one_pow, one_mul]
+
+/-- Alternation scales aperiodic autocorrelation by `(-1)^s`. -/
+lemma aperiodicAutocorr_altSeqFn {n : Nat} (a : Fin n → Int) (s : Nat) :
+    aperiodicAutocorr (Turyn.altSeqFn a) s = (-1 : Int) ^ s * aperiodicAutocorr a s := by
+  unfold aperiodicAutocorr
+  by_cases h : s ≥ n
+  · simp [h]
+  · simp only [h, ↓reduceIte]
+    rw [Finset.mul_sum]
+    apply Finset.sum_congr rfl
+    intro i hi
+    have hir := Finset.mem_range.mp hi
+    have hi_lt : i < n := by omega
+    have his_lt : i + s < n := by omega
+    rw [lookupNat_of_lt _ hi_lt, lookupNat_of_lt _ his_lt,
+        lookupNat_of_lt _ hi_lt, lookupNat_of_lt _ his_lt]
+    rw [Turyn.altSeqFn_apply, Turyn.altSeqFn_apply]
+    rw [show
+          (if (⟨i, hi_lt⟩ : Fin n).1 % 2 = 0 then (1 : Int) else -1) * a ⟨i, hi_lt⟩ *
+            ((if (⟨i + s, his_lt⟩ : Fin n).1 % 2 = 0 then (1 : Int) else -1) *
+              a ⟨i + s, his_lt⟩) =
+          ((if i % 2 = 0 then (1 : Int) else -1) *
+            (if (i + s) % 2 = 0 then (1 : Int) else -1)) *
+          (a ⟨i, hi_lt⟩ * a ⟨i + s, his_lt⟩) from by ring]
+    rw [sign_product_eq]
+
+/-- Reversal preserves aperiodic autocorrelation. -/
+lemma aperiodicAutocorr_reverseFn {n : Nat} (a : Fin n → Int) (s : Nat) :
+    aperiodicAutocorr (reverseFn a) s = aperiodicAutocorr a s := by
+  unfold aperiodicAutocorr
+  by_cases h : s ≥ n
+  · simp [h]
+  · simp only [h, ↓reduceIte]
+    push_neg at h
+    apply Finset.sum_nbij (fun i => n - 1 - s - i)
+    · intro i hi
+      exact Finset.mem_range.mpr (by rw [Finset.mem_range] at hi; omega)
+    · intro i₁ hi₁ i₂ hi₂ heq
+      rw [Finset.mem_coe, Finset.mem_range] at hi₁ hi₂
+      change n - 1 - s - i₁ = n - 1 - s - i₂ at heq
+      omega
+    · intro j hj
+      rw [Finset.mem_coe, Finset.mem_range] at hj
+      refine ⟨n - 1 - s - j, ?_, ?_⟩
+      · rw [Finset.mem_coe, Finset.mem_range]; omega
+      · show n - 1 - s - (n - 1 - s - j) = j; omega
+    · intro i hi
+      have hir := Finset.mem_range.mp hi
+      have hi_lt : i < n := by omega
+      have his_lt : i + s < n := by omega
+      have hr1 : n - 1 - s - i < n := by omega
+      have hr2 : n - 1 - s - i + s < n := by omega
+      rw [lookupNat_of_lt _ hi_lt, lookupNat_of_lt _ his_lt,
+          lookupNat_of_lt _ hr1, lookupNat_of_lt _ hr2]
+      have e1 : reverseFn a ⟨i, hi_lt⟩ = a ⟨n - 1 - s - i + s, hr2⟩ := by
+        unfold reverseFn
+        congr 1
+        exact Fin.ext (by simp; omega)
+      have e2 : reverseFn a ⟨i + s, his_lt⟩ = a ⟨n - 1 - s - i, hr1⟩ := by
+        unfold reverseFn
+        congr 1
+        exact Fin.ext (by simp; omega)
+      rw [e1, e2, mul_comm]
+
 /-- Typed base-sequence data for Step 1. -/
 structure BaseSeqData (n : Nat) where
   a : PmSeq (2 * n - 1)
