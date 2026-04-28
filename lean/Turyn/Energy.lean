@@ -40,13 +40,13 @@ Combining:
 /-! ### Total autocorrelation -/
 
 /-- Total autocorrelation: sum of N_a(s) for s = 1, …, k−1. -/
-def totalAutocorr (a : List Int) : Int :=
-  ∑ i ∈ range (a.length - 1), aperiodicAutocorr a (i + 1)
+def totalAutocorr {k : Nat} (a : Fin k → Int) : Int :=
+  ∑ i ∈ range (k - 1), aperiodicAutocorr a (i + 1)
 
 /-! ### Weighted total autocorrelation -/
 
 /-- Weighted total autocorrelation for a TT quadruple. -/
-def weightedTotalAutocorr (x y z w : List Int) (n : Nat) : Int :=
+def weightedTotalAutocorr {n : Nat} (x y z : Fin n → Int) (w : Fin (n - 1) → Int) : Int :=
   ∑ i ∈ range (n - 1), combinedAutocorr x y z w (i + 1)
 
 /-- **Turyn vanishing (total):** The weighted total autocorrelation vanishes.
@@ -54,7 +54,7 @@ def weightedTotalAutocorr (x y z w : List Int) (n : Nat) : Int :=
 This is a direct consequence of the TT vanishing condition:
 each shift's combined autocorrelation is zero, so their sum is zero. -/
 theorem turyn_vanishing_total {n : Nat} (T : TurynType n) :
-    weightedTotalAutocorr T.X.data T.Y.data T.Z.data T.W.data n = 0 := by
+    weightedTotalAutocorr T.X.data T.Y.data T.Z.data T.W.data = 0 := by
   unfold weightedTotalAutocorr
   exact sum_eq_zero (fun i hi => T.vanishing (i + 1) (by omega) (by rw [mem_range] at hi; omega))
 
@@ -121,7 +121,7 @@ theorem sum_sq_expand (n : Nat) (a : Nat → Int) :
     rw [h_final]
     ring
 
-theorem sum_w_ext {n : Nat} {w : List Int} (hwl : w.length = n - 1) :
+theorem sum_w_ext {n : Nat} (w : Fin (n - 1) → Int) :
     ∑ i ∈ range (n - 1), aperiodicAutocorr w (i + 1) =
     ∑ i ∈ range (n - 1 - 1), aperiodicAutocorr w (i + 1) := by
   cases n with
@@ -130,59 +130,49 @@ theorem sum_w_ext {n : Nat} {w : List Int} (hwl : w.length = n - 1) :
     cases k with
     | zero => rfl
     | succ j =>
+      -- w : Fin (j + 1) → Int, goal involves range (j + 1) vs range j
+      show ∑ i ∈ range (j + 1), aperiodicAutocorr w (i + 1) =
+           ∑ i ∈ range j, aperiodicAutocorr w (i + 1)
+      rw [sum_range_succ]
       have hw : aperiodicAutocorr w (j + 1) = 0 := by
         unfold aperiodicAutocorr
-        have hlen : j + 1 ≥ w.length := by omega
         split
         · rfl
-        · contradiction
-      have heq1 : j + 1 + 1 - 1 = j + 1 := by omega
-      rw [heq1]
-      rw [sum_range_succ]
-      have heq2 : j + 1 - 1 = j := by omega
-      rw [heq2, hw]
-      omega
+        · omega
+      rw [hw, add_zero]
 
-theorem weightedTotalAutocorr_decompose {n : Nat} {x y z w : List Int}
-    (hxl : x.length = n) (hyl : y.length = n)
-    (hzl : z.length = n) (hwl : w.length = n - 1) :
-    weightedTotalAutocorr x y z w n =
+theorem weightedTotalAutocorr_decompose {n : Nat} (x y z : Fin n → Int) (w : Fin (n - 1) → Int) :
+    weightedTotalAutocorr x y z w =
     totalAutocorr x + totalAutocorr y + 2 * totalAutocorr z + 2 * totalAutocorr w := by
   unfold weightedTotalAutocorr totalAutocorr combinedAutocorr
   simp only [sum_add_distrib, ← mul_sum]
-  rw [hxl, hyl, hzl]
-  have hw_ext := sum_w_ext hwl
-  rw [hw_ext]
-  rw [hwl]
+  have hw_ext := sum_w_ext w
+  linarith
 
-theorem sum_sq_eq_finset (a : List Int) (h : AllPmOne a) :
-    (∑ i ∈ range a.length, a.getD i 0) ^ 2 = (a.length : Int) + 2 * ∑ i ∈ range (a.length - 1), aperiodicAutocorr a (i + 1) := by
-  have h_sq : ∀ i ∈ range a.length, (a.getD i 0) ^ 2 = 1 := by
+theorem sum_sq_eq_finset {n : Nat} (a : Fin n → Int) (h : AllPmOne a) :
+    (∑ i ∈ range n, lookupNat a i) ^ 2 = (n : Int) + 2 * ∑ i ∈ range (n - 1), aperiodicAutocorr a (i + 1) := by
+  have h_sq : ∀ i ∈ range n, (lookupNat a i) ^ 2 = 1 := by
     intro i hi
-    have hi_lt : i < a.length := mem_range.mp hi
-    have eq_get : a.getD i 0 = a[i] := by
-      rw [List.getD_eq_getElem?_getD, List.getElem?_eq_getElem hi_lt]
-      rfl
-    rw [eq_get]
-    have hall := h (a[i]) (List.getElem_mem hi_lt)
+    have hi_lt : i < n := mem_range.mp hi
+    rw [lookupNat_of_lt a hi_lt]
+    have hall := h ⟨i, hi_lt⟩
     rcases hall with h1 | hm1
     · rw [h1]; rfl
     · rw [hm1]; rfl
-  have h_diag : ∑ i ∈ range a.length, (a.getD i 0) ^ 2 = (a.length : Int) := by
+  have h_diag : ∑ i ∈ range n, (lookupNat a i) ^ 2 = (n : Int) := by
     rw [sum_congr rfl h_sq, sum_const, card_range, nsmul_one]
-  rw [sum_sq_expand a.length (fun i => a.getD i 0)]
+  rw [sum_sq_expand n (fun i => lookupNat a i)]
   rw [h_diag]
-  have h_cross : ∀ s ∈ range (a.length - 1),
-      ∑ i ∈ range (a.length - 1 - s), a.getD i 0 * a.getD (i + s + 1) 0 =
+  have h_cross : ∀ s ∈ range (n - 1),
+      ∑ i ∈ range (n - 1 - s), lookupNat a i * lookupNat a (i + s + 1) =
       aperiodicAutocorr a (s + 1) := by
     intro s hs
-    have hs_lt : s < a.length - 1 := mem_range.mp hs
+    have hs_lt : s < n - 1 := mem_range.mp hs
     unfold aperiodicAutocorr
     split
-    · next h_if =>
-      omega
+    · omega
     · next =>
-      have eq_sum : a.length - (s + 1) = a.length - 1 - s := by omega
+      have eq_sum : n - (s + 1) = n - 1 - s := by omega
       rw [eq_sum]
       apply sum_congr rfl
       intro i _
@@ -190,9 +180,17 @@ theorem sum_sq_eq_finset (a : List Int) (h : AllPmOne a) :
       rw [eq_idx]
   rw [sum_congr rfl h_cross]
 
-theorem sum_sq_eq_len_add_two_totalAutocorr (a : List Int) (h : AllPmOne a) :
-    (seqSum a) ^ 2 = ↑(a.length) + 2 * totalAutocorr a := by
-  rw [seqSum, totalAutocorr]
+/-- Bridge between `seqSum` (a Fin n sum) and range-based sum via `lookupNat`. -/
+private lemma seqSum_eq_range_lookupNat {n : Nat} (a : Fin n → Int) :
+    seqSum a = ∑ i ∈ range n, lookupNat a i := by
+  unfold seqSum
+  conv_lhs => rw [show (∑ i : Fin n, a i) = ∑ i : Fin n, lookupNat a ↑i from
+    Finset.sum_congr rfl (fun i _ => (lookupNat_eq_apply a i).symm)]
+  exact Fin.sum_univ_eq_sum_range (fun i => lookupNat a i) n
+
+theorem sum_sq_eq_len_add_two_totalAutocorr {n : Nat} (a : Fin n → Int) (h : AllPmOne a) :
+    (seqSum a) ^ 2 = ↑n + 2 * totalAutocorr a := by
+  rw [seqSum_eq_range_lookupNat, totalAutocorr]
   exact sum_sq_eq_finset a h
 
 /-- **Energy identity:** For any TT(n), the sums satisfy
@@ -205,10 +203,9 @@ theorem energy_identity {n : Nat} (T : TurynType n) (hn : n ≥ 1) :
       sum_sq_eq_len_add_two_totalAutocorr T.Y.data T.Y.pm,
       sum_sq_eq_len_add_two_totalAutocorr T.Z.data T.Z.pm,
       sum_sq_eq_len_add_two_totalAutocorr T.W.data T.W.pm]
-  rw [T.X.len, T.Y.len, T.Z.len, T.W.len]
   have htotal : totalAutocorr T.X.data + totalAutocorr T.Y.data +
          2 * totalAutocorr T.Z.data + 2 * totalAutocorr T.W.data = 0 := by
-    rw [← weightedTotalAutocorr_decompose T.X.len T.Y.len T.Z.len T.W.len]
+    rw [← weightedTotalAutocorr_decompose T.X.data T.Y.data T.Z.data T.W.data]
     exact turyn_vanishing_total T
   have hcast : (↑(n - 1) : Int) = (↑n : Int) - 1 := by omega
   rw [hcast]
@@ -222,7 +219,8 @@ theorem energy_identity {n : Nat} (T : TurynType n) (hn : n ≥ 1) :
 /-! ### Computational verification of the energy identity -/
 
 /-- Compute x² + y² + 2z² + 2w² for a quadruple. -/
-def energyLHS (x y z w : List Int) : Int :=
+def energyLHS {n m : Nat} (x : Fin n → Int) (y : Fin n → Int)
+    (z : Fin n → Int) (w : Fin m → Int) : Int :=
   (seqSum x) ^ 2 + (seqSum y) ^ 2 +
   2 * (seqSum z) ^ 2 + 2 * (seqSum w) ^ 2
 
@@ -230,5 +228,6 @@ def energyLHS (x y z w : List Int) : Int :=
 def energyRHS (n : Nat) : Int := 6 * n - 2
 
 /-- Boolean check that the energy identity holds for a given quadruple. -/
-def checkEnergy (n : Nat) (x y z w : List Int) : Bool :=
+def checkEnergy (n : Nat) (x : Fin n → Int) (y : Fin n → Int)
+    (z : Fin n → Int) (w : Fin (n - 1) → Int) : Bool :=
   energyLHS x y z w == energyRHS n
