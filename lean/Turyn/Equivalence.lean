@@ -7,7 +7,8 @@ import Mathlib
 
 Based on:
 - Best, D.J., Đoković, D.Ž., Kharaghani, H., and Ramp, H.,
-  "Turyn Type Sequences: Status Report," arXiv:1206.4107v1, 2013.
+  "Turyn-type sequences: Classification, Enumeration and Construction,"
+  arXiv:1206.4107v1, 2013.
 
 This file formalizes the canonical normalization proof for Turyn-type sequences.
 Every Turyn-type quadruple (A,B,C,D) of lengths (n,n,n,n−1) can be brought to a
