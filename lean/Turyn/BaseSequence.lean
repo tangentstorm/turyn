@@ -96,6 +96,22 @@ private lemma sign_product_eq (i s : Nat) :
   rw [show i + (i + s) = 2 * i + s from by ring,
       pow_add, pow_mul, neg_one_sq, one_pow, one_mul]
 
+/-- Aperiodic autocorrelation of `negSeqFn a` equals that of `a`. -/
+lemma aperiodicAutocorr_negSeqFn {n : Nat} (a : Fin n → Int) (s : Nat) :
+    aperiodicAutocorr (negSeqFn a) s = aperiodicAutocorr a s := by
+  unfold aperiodicAutocorr
+  by_cases h : s ≥ n
+  · simp [h]
+  · simp only [h, ↓reduceIte]
+    apply Finset.sum_congr rfl
+    intro i _
+    unfold lookupNat
+    by_cases h1 : i < n
+    · by_cases h2 : i + s < n
+      · simp [h1, h2, negSeqFn]
+      · simp [h1, h2, negSeqFn]
+    · simp [h1]
+
 /-- Alternation scales aperiodic autocorrelation by `(-1)^s`. -/
 lemma aperiodicAutocorr_altSeqFn {n : Nat} (a : Fin n → Int) (s : Nat) :
     aperiodicAutocorr (Turyn.altSeqFn a) s = (-1 : Int) ^ s * aperiodicAutocorr a s := by
@@ -159,6 +175,105 @@ lemma aperiodicAutocorr_reverseFn {n : Nat} (a : Fin n → Int) (s : Nat) :
         exact Fin.ext (by simp; omega)
       rw [e1, e2, mul_comm]
 
+/-! ### Vanishing preservation under each elementary transformation
+
+Function-typed analogs of `vanishing_*` from the old `Turyn.Equivalence`,
+operating directly on `TurynType n`.  The carrier-level length/pm proofs
+come for free with `PmSeq`, leaving only the combined-autocorrelation
+vanishing identity to re-derive. -/
+
+namespace Turyn
+
+/-- Negating one sequence preserves vanishing (autocorrelation is invariant
+under sign flip). -/
+lemma vanishing_negX {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr (negSeqFn T.X.data) T.Y.data T.Z.data T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [_root_.aperiodicAutocorr_negSeqFn]; exact hv
+
+lemma vanishing_negY {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.X.data (negSeqFn T.Y.data) T.Z.data T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [_root_.aperiodicAutocorr_negSeqFn]; exact hv
+
+lemma vanishing_negZ {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.X.data T.Y.data (negSeqFn T.Z.data) T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [_root_.aperiodicAutocorr_negSeqFn]; exact hv
+
+lemma vanishing_negW {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.X.data T.Y.data T.Z.data (negSeqFn T.W.data) s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [_root_.aperiodicAutocorr_negSeqFn]; exact hv
+
+/-- Reversing one sequence preserves vanishing. -/
+lemma vanishing_revX {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr (reverseFn T.X.data) T.Y.data T.Z.data T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [_root_.aperiodicAutocorr_reverseFn]; exact hv
+
+lemma vanishing_revY {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.X.data (reverseFn T.Y.data) T.Z.data T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [_root_.aperiodicAutocorr_reverseFn]; exact hv
+
+lemma vanishing_revZ {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.X.data T.Y.data (reverseFn T.Z.data) T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [_root_.aperiodicAutocorr_reverseFn]; exact hv
+
+lemma vanishing_revW {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.X.data T.Y.data T.Z.data (reverseFn T.W.data) s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; rw [_root_.aperiodicAutocorr_reverseFn]; exact hv
+
+/-- Alternating all four sequences preserves vanishing (combined sum scales
+by `(-1)^s` which is zero times zero). -/
+lemma vanishing_altAll {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr (Turyn.altSeqFn T.X.data) (Turyn.altSeqFn T.Y.data)
+        (Turyn.altSeqFn T.Z.data) (Turyn.altSeqFn T.W.data) s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢
+    rw [_root_.aperiodicAutocorr_altSeqFn, _root_.aperiodicAutocorr_altSeqFn,
+        _root_.aperiodicAutocorr_altSeqFn, _root_.aperiodicAutocorr_altSeqFn]
+    have factored :
+        (-1 : Int) ^ s * aperiodicAutocorr T.X.data s +
+          (-1 : Int) ^ s * aperiodicAutocorr T.Y.data s +
+          2 * ((-1 : Int) ^ s * aperiodicAutocorr T.Z.data s) +
+          2 * ((-1 : Int) ^ s * aperiodicAutocorr T.W.data s) =
+        (-1 : Int) ^ s * (aperiodicAutocorr T.X.data s + aperiodicAutocorr T.Y.data s +
+          2 * aperiodicAutocorr T.Z.data s + 2 * aperiodicAutocorr T.W.data s) := by ring
+    rw [factored, hv, mul_zero]
+
+/-- Swapping `X` and `Y` preserves vanishing (their roles in the combined sum
+are symmetric). -/
+lemma vanishing_swapXY {n : Nat} (T : TurynType n) :
+    ∀ s, 1 ≤ s → s < n →
+      combinedAutocorr T.Y.data T.X.data T.Z.data T.W.data s = 0 :=
+  fun s hs1 hs2 => by
+    have hv := T.vanishing s hs1 hs2
+    unfold combinedAutocorr at hv ⊢; linarith
+
+end Turyn
+
 /-- Typed base-sequence data for Step 1. -/
 structure BaseSeqData (n : Nat) where
   a : PmSeq (2 * n - 1)
@@ -175,22 +290,6 @@ structure BaseSeqData (n : Nat) where
 lemma aperiodicAutocorr_zero_of_ge {n : Nat} (a : Fin n → Int) (s : Nat) (h : s ≥ n) :
     aperiodicAutocorr a s = 0 := by
   unfold aperiodicAutocorr; exact if_pos h
-
-/-- Aperiodic autocorrelation of `negSeqFn a` equals that of `a`. -/
-lemma aperiodicAutocorr_negSeqFn {n : Nat} (a : Fin n → Int) (s : Nat) :
-    aperiodicAutocorr (negSeqFn a) s = aperiodicAutocorr a s := by
-  unfold aperiodicAutocorr
-  by_cases h : s ≥ n
-  · simp [h]
-  · simp only [h, ↓reduceIte]
-    apply Finset.sum_congr rfl
-    intro i _
-    unfold lookupNat
-    by_cases h1 : i < n
-    · by_cases h2 : i + s < n
-      · simp [h1, h2, negSeqFn]
-      · simp [h1, h2, negSeqFn]
-    · simp [h1]
 
 /-- Pointwise cross-term cancellation for the `(Z++W) / (Z++(-W))` pair. -/
 private lemma pointwise_cancel_fn {nz nw : Nat} (z : Fin nz → Int) (w : Fin nw → Int)
