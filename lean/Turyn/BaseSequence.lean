@@ -52,6 +52,31 @@ lemma AllPmOne_appendFn {n m : Nat} {a : Fin n → Int} {b : Fin m → Int}
   · simp [h]; exact ha _
   · simp [h]; exact hb _
 
+/-- Alternation: entry at position `i` gets factor `(-1)^i`. -/
+def Turyn.altSeqFn {n : Nat} (a : Fin n → Int) : Fin n → Int :=
+  fun i => (if i.1 % 2 = 0 then (1 : Int) else -1) * a i
+
+@[simp] lemma Turyn.altSeqFn_apply {n : Nat} (a : Fin n → Int) (i : Fin n) :
+    Turyn.altSeqFn a i = (if i.1 % 2 = 0 then (1 : Int) else -1) * a i := rfl
+
+/-- Reversal: entry at position `i` becomes the entry at position `n - 1 - i`. -/
+def reverseFn {n : Nat} (a : Fin n → Int) : Fin n → Int :=
+  fun i => a ⟨n - 1 - i.1, by have := i.2; omega⟩
+
+@[simp] lemma reverseFn_apply {n : Nat} (a : Fin n → Int) (i : Fin n) :
+    reverseFn a i = a ⟨n - 1 - i.1, by have := i.2; omega⟩ := rfl
+
+/-- AllPmOne is preserved under alternation. -/
+lemma AllPmOne_altSeqFn {n : Nat} {a : Fin n → Int} (h : AllPmOne a) :
+    AllPmOne (Turyn.altSeqFn a) := by
+  intro i; unfold Turyn.altSeqFn
+  rcases h i with h1 | h1 <;> rw [h1] <;> split_ifs <;> simp
+
+/-- AllPmOne is preserved under reversal. -/
+lemma AllPmOne_reverseFn {n : Nat} {a : Fin n → Int} (h : AllPmOne a) :
+    AllPmOne (reverseFn a) := by
+  intro i; unfold reverseFn; exact h _
+
 /-- Typed base-sequence data for Step 1. -/
 structure BaseSeqData (n : Nat) where
   a : PmSeq (2 * n - 1)
