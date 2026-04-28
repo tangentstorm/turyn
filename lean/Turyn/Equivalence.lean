@@ -32,6 +32,53 @@ open Finset BigOperators Turyn
 
 namespace Turyn
 
+/-! ### Canonical conditions (BDKR §2)
+
+`Canonical1` (the endpoint-sign condition) lives in `Turyn.Defs`
+because it is referenced by `Challenge.lean`'s headline statements.
+The remaining rules `Canonical2..6` and the bundled `Canonical`
+predicate are defined here: they are only needed by the
+canonicalization theory in this file. -/
+
+/-- Canonical condition (2) for `X`. -/
+def Canonical2 (n : Nat) (S : TurynType n) : Prop :=
+  ∀ i, 1 ≤ i → i ≤ n →
+    (∀ j, 1 ≤ j → j < i → xAt S j = xAt S (n + 1 - j)) →
+    xAt S i ≠ xAt S (n + 1 - i) →
+    xAt S i = 1
+
+/-- Canonical condition (3) for `Y`. -/
+def Canonical3 (n : Nat) (S : TurynType n) : Prop :=
+  ∀ i, 1 ≤ i → i ≤ n →
+    (∀ j, 1 ≤ j → j < i → yAt S j = yAt S (n + 1 - j)) →
+    yAt S i ≠ yAt S (n + 1 - i) →
+    yAt S i = 1
+
+/-- Canonical condition (4) for `Z`. -/
+def Canonical4 (n : Nat) (S : TurynType n) : Prop :=
+  ∀ i, 1 ≤ i → i ≤ n →
+    (∀ j, 1 ≤ j → j < i → zAt S j ≠ zAt S (n + 1 - j)) →
+    zAt S i = zAt S (n + 1 - i) →
+    zAt S i = 1
+
+/-- Canonical condition (5) for `W`. -/
+def Canonical5 (n : Nat) (S : TurynType n) : Prop :=
+  ∀ i, 1 ≤ i → i ≤ n - 1 →
+    (∀ j, 1 ≤ j → j < i → wAt S j * wAt S (n - j) = wAt S (n - 1)) →
+    wAt S i * wAt S (n - i) ≠ wAt S (n - 1) →
+    wAt S i = 1
+
+/-- Canonical condition (6): tie-breaker between `X` and `Y`. -/
+def Canonical6 (n : Nat) (S : TurynType n) : Prop :=
+  n ≤ 2 ∨
+  ((xAt S 2 ≠ yAt S 2 ∧ xAt S 2 = 1) ∨
+   (xAt S 2 = yAt S 2 ∧ xAt S (n - 1) = 1 ∧ yAt S (n - 1) = -1))
+
+/-- Full canonical predicate. -/
+def Canonical (n : Nat) (S : TurynType n) : Prop :=
+  Canonical1 n S ∧ Canonical2 n S ∧ Canonical3 n S ∧
+  Canonical4 n S ∧ Canonical5 n S ∧ Canonical6 n S
+
 /-! ### Helper: ±1 entries via lookupNat -/
 
 lemma pm_lookupNat {n : Nat} {a : Fin n → Int} (hpm : AllPmOne a) {i : Nat} (hi : i < n) :

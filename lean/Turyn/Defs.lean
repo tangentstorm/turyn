@@ -19,7 +19,10 @@ The trusted definitions named in `Challenge.lean`'s headline statements:
 - `TurynType n` — bundled TT(n) quadruple plus the vanishing identity.
 - `IsTurynType X Y Z W` — direct vanishing predicate on a `±1` quadruple.
 - `xAt/yAt/zAt/wAt`, `uAt` — 1-indexed entry accessors.
-- `Canonical1..6`, `Canonical` — BDKR canonical-form predicates.
+- `Canonical1` — BDKR endpoint-sign canonical condition (the only
+  canonical predicate referenced by `Challenge.lean`; the remaining
+  rules `Canonical2..6` and the bundled `Canonical` predicate live in
+  `Turyn.Equivalence`).
 - `Turyn.IntVec`, `Turyn.IntMat`, `Turyn.IsHadamardMat` — typed integer
   vector/matrix abbreviations and the matrix-level Hadamard predicate.
 
@@ -121,50 +124,14 @@ def uAt {n : Nat} (S : TurynType n) (i : Nat) : Int := xAt S i * yAt S i
 
 /-! ### Canonical conditions (BDKR §2) -/
 
-/-- Canonical condition (1): endpoint signs. -/
+/-- Canonical condition (1): endpoint signs.
+The remaining canonical conditions `Canonical2..6` and the bundled
+`Canonical` predicate are defined in `Turyn.Equivalence`; they are not
+needed for the headline results in `Challenge.lean`. -/
 def Canonical1 (n : Nat) (S : TurynType n) : Prop :=
   xAt S 1 = 1 ∧ xAt S n = 1 ∧
   yAt S 1 = 1 ∧ yAt S n = 1 ∧
   zAt S 1 = 1 ∧ wAt S 1 = 1
-
-/-- Canonical condition (2) for `X`. -/
-def Canonical2 (n : Nat) (S : TurynType n) : Prop :=
-  ∀ i, 1 ≤ i → i ≤ n →
-    (∀ j, 1 ≤ j → j < i → xAt S j = xAt S (n + 1 - j)) →
-    xAt S i ≠ xAt S (n + 1 - i) →
-    xAt S i = 1
-
-/-- Canonical condition (3) for `Y`. -/
-def Canonical3 (n : Nat) (S : TurynType n) : Prop :=
-  ∀ i, 1 ≤ i → i ≤ n →
-    (∀ j, 1 ≤ j → j < i → yAt S j = yAt S (n + 1 - j)) →
-    yAt S i ≠ yAt S (n + 1 - i) →
-    yAt S i = 1
-
-/-- Canonical condition (4) for `Z`. -/
-def Canonical4 (n : Nat) (S : TurynType n) : Prop :=
-  ∀ i, 1 ≤ i → i ≤ n →
-    (∀ j, 1 ≤ j → j < i → zAt S j ≠ zAt S (n + 1 - j)) →
-    zAt S i = zAt S (n + 1 - i) →
-    zAt S i = 1
-
-/-- Canonical condition (5) for `W`. -/
-def Canonical5 (n : Nat) (S : TurynType n) : Prop :=
-  ∀ i, 1 ≤ i → i ≤ n - 1 →
-    (∀ j, 1 ≤ j → j < i → wAt S j * wAt S (n - j) = wAt S (n - 1)) →
-    wAt S i * wAt S (n - i) ≠ wAt S (n - 1) →
-    wAt S i = 1
-
-/-- Canonical condition (6): tie-breaker between `X` and `Y`. -/
-def Canonical6 (n : Nat) (S : TurynType n) : Prop :=
-  n ≤ 2 ∨
-  ((xAt S 2 ≠ yAt S 2 ∧ xAt S 2 = 1) ∨
-   (xAt S 2 = yAt S 2 ∧ xAt S (n - 1) = 1 ∧ yAt S (n - 1) = -1))
-
-/-- Full canonical predicate. -/
-def Canonical (n : Nat) (S : TurynType n) : Prop :=
-  Canonical1 n S ∧ Canonical2 n S ∧ Canonical3 n S ∧
-  Canonical4 n S ∧ Canonical5 n S ∧ Canonical6 n S
 
 /-! ### Matrix carriers and Hadamard predicate -/
 
