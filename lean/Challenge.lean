@@ -1,5 +1,4 @@
-import Turyn.MatUtils
-import Turyn.XY
+import Turyn.Defs
 
 /-!
 # Challenge: Headline Theorems for Comparator
@@ -15,29 +14,21 @@ with the underlying lemmas of the same name in `Turyn.Equivalence` and
 
 ## Definitions referenced
 
-The headline statements use the following definitions:
+The headline statements use the following definitions, all in `Turyn/Defs.lean`:
 
-- `PmSeq n`, `TurynType n`, `aperiodicAutocorr`, `combinedAutocorr`
-  (`Turyn/Defs.lean`): the foundational sequence and quadruple types.
-- `IsTurynType X Y Z W` (`Turyn/TurynType.lean`):
-    typed Turyn-type predicate.
-- `Turyn.IntMat`, `Turyn.IsHadamardMat` (`Turyn/MatUtils.lean`):
-    the matrix layer.
-- `Equivalent n S T`, `Canonical n S`, `Canonical1 n S`
-  (`Turyn/Equivalence.lean`): the canonical-form relations.
-- `Turyn.uAt` (`Turyn/XY.lean`): the U = X · Y product accessor.
+- `PmSeq n`, `TurynType n`, `aperiodicAutocorr`, `combinedAutocorr` —
+  the foundational sequence and quadruple types.
+- `IsTurynType X Y Z W` — direct vanishing predicate on a `±1` quadruple.
+- `Turyn.IntMat`, `Turyn.IsHadamardMat` — the matrix layer.
+- `Canonical1 n S` — endpoint-sign canonical condition (BDKR §2 (i)).
+- `Turyn.uAt` — the U = X · Y product accessor.
 
 ## Headline theorems (this file)
 
 1. `tt_implies_hadamard` — *if a TT(n) exists, a Hadamard matrix of order
    `4 (3 n − 1)` exists*. The witness is the constructive base-sequence →
    T-sequence → Goethals–Seidel pipeline.
-2. `canonical_form_exists` — every Turyn-type sequence (`TurynType n`,
-   even `n ≥ 2`) is equivalent to one in canonical form.
-   *Note:* this is the existence half. The full BDKR result also says the
-   canonical representative is unique within the equivalence class (orbit
-   size dividing 1024); that uniqueness is not yet formalized here.
-3. `xy_interior_antipalindrome` — for a canonical Turyn sequence of length
+2. `xy_interior_antipalindrome` — for a canonical Turyn sequence of length
    `n ≥ 4`, the U = X·Y interior is an anti-palindrome:
    `uAt S (n + 1 − k) = − uAt S k` for every `2 ≤ k ≤ n − 1`. This is the
    "XY product law" (discovered by codex).
@@ -51,18 +42,6 @@ constructive Goethals–Seidel pipeline applied to the TT(n) certificate. -/
 theorem tt_implies_hadamard {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
     (h : IsTurynType X Y Z W) :
     ∃ H : IntMat (4 * (3 * n - 1)), IsHadamardMat H := by
-  sorry
-
-/-- **Canonical representative exists** (existence half of BDKR §2).
-For even `n ≥ 2`, every Turyn-type sequence is equivalent under T1..T4 to a
-representative satisfying canonical conditions (i)..(vi).
-
-The full BDKR theorem additionally asserts uniqueness of the canonical
-representative within an equivalence class — that part is not yet
-formalized; track it as future work. -/
-theorem canonical_form_exists
-    (n : Nat) (hn_even : n % 2 = 0) (hn : 2 ≤ n) (S : TurynType n) :
-    ∃ T : TurynType n, Equivalent n S T ∧ Canonical n T := by
   sorry
 
 /-- **XY interior anti-palindrome** ("XY product law", discovered by codex).

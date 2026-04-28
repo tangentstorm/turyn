@@ -1,4 +1,4 @@
-import Turyn.GSArrayBridge
+import Turyn.GoethalsSeidel
 
 /-!
 # Constructive Hadamard Output

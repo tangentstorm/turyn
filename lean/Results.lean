@@ -1,5 +1,4 @@
 import Turyn.Hadamard
-import Turyn.Equivalence
 import Turyn.XY
 
 /-!
@@ -26,14 +25,6 @@ theorem tt_implies_hadamard {n : Nat} {X Y Z : PmSeq n} {W : PmSeq (n - 1)}
     (h : IsTurynType X Y Z W) :
     ∃ H : IntMat (4 * (3 * n - 1)), IsHadamardMat H :=
   ⟨Turyn.ofIsTurynTypeMatrix h, Turyn.ofIsTurynTypeMatrix_isHadamard h⟩
-
-/-- **Canonical representative exists.**  Re-exposes
-`Turyn.canonical_representative_exists` (`Turyn/Equivalence.lean`) under
-the `Turyn.Result` namespace. -/
-theorem canonical_form_exists
-    (n : Nat) (hn_even : n % 2 = 0) (hn : 2 ≤ n) (S : TurynType n) :
-    ∃ T : TurynType n, Equivalent n S T ∧ Canonical n T :=
-  Turyn.canonical_representative_exists n hn_even hn S
 
 /-- **XY interior anti-palindrome.**  Re-exposes `Turyn.xy_product_law`
 (`Turyn/XY.lean`) under the `Turyn.Result` namespace.  The "XY product
