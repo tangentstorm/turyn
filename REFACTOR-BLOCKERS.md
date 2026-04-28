@@ -209,7 +209,8 @@ with a `Fin n → Int` accessor. So `S.data ⟨i, h⟩` reduces to
 | Project ID | Target | Submitted | Status |
 |---|---|---|---|
 | `b96e2fe9-5496-4eaa-9d25-63bb7b7c5290` | `Turyn/Equivalence.lean` migration to function-typed carriers | earlier | **DONE** — landed as `bd8f2d1` (1419 → 784 lines, no sorry) |
-| `1375d5ec-706a-4418-8ff7-81e7e995bc0f` | `Turyn/XY.lean` migration to function-typed carriers | this session | check via `mcp__aristotle__list` |
+| `1375d5ec-706a-4418-8ff7-81e7e995bc0f` | `Turyn/XY.lean` migration to function-typed carriers | earlier | **DONE** — landed as `13c9a2f` (256 → 172 lines, no sorry) |
+| `20f74844-dfff-42b7-9b5d-a9b88c0bc38a` | `Turyn/TSequence.lean` redefinition (step2* as direct `Fin (3n-1) → Int` functions) | this session | check via `mcp__aristotle__list` |
 
 Prompt summary: rewrite `Equivalence.lean` to use the function-typed
 primitives in `BaseSequence.lean` (negSeqFn, reverseFn, altSeqFn,
