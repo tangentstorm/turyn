@@ -77,6 +77,31 @@ lemma AllPmOne_reverseFn {n : Nat} {a : Fin n → Int} (h : AllPmOne a) :
     AllPmOne (reverseFn a) := by
   intro i; unfold reverseFn; exact h _
 
+/-! ### `PmSeq` operations: negation, reversal, alternation
+
+Bundled wrappers around the function-typed primitives, with the
+`AllPmOne` field discharged by the corresponding preservation lemma.
+The `*_data` simp lemmas let downstream `do*` constructors and proofs
+project past the wrapper. -/
+
+def PmSeq.neg {n : Nat} (s : PmSeq n) : PmSeq n :=
+  ⟨negSeqFn s.data, negSeqFn_AllPmOne s.pm⟩
+
+def PmSeq.reverse {n : Nat} (s : PmSeq n) : PmSeq n :=
+  ⟨reverseFn s.data, AllPmOne_reverseFn s.pm⟩
+
+def PmSeq.alt {n : Nat} (s : PmSeq n) : PmSeq n :=
+  ⟨Turyn.altSeqFn s.data, AllPmOne_altSeqFn s.pm⟩
+
+@[simp] lemma PmSeq.neg_data {n : Nat} (s : PmSeq n) :
+    s.neg.data = negSeqFn s.data := rfl
+
+@[simp] lemma PmSeq.reverse_data {n : Nat} (s : PmSeq n) :
+    s.reverse.data = reverseFn s.data := rfl
+
+@[simp] lemma PmSeq.alt_data {n : Nat} (s : PmSeq n) :
+    s.alt.data = Turyn.altSeqFn s.data := rfl
+
 /-! ### Sign-pattern helpers for `aperiodicAutocorr_altSeqFn` -/
 
 private lemma ite_mod2_eq_neg_one_pow (k : Nat) :
