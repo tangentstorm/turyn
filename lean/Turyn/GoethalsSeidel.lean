@@ -1,4 +1,5 @@
 import Turyn.MatUtils
+import Turyn.TSequence
 
 open Matrix
 
@@ -777,5 +778,122 @@ theorem gsMatrix_target {n : Nat} (G : CertifiedGSData n) :
 theorem gsMatrix_isHadamard {n : Nat} (G : CertifiedGSData n) :
     IsHadamardMat (gsMatrix G.toGSData) := by
   exact gsTarget_implies_hadamard G.toGSData (gsMatrix_target G)
+
+/-! ### T-sequence to GS data bridge -/
+
+/-- First GS combination: A + B + C + D. -/
+def tseqCombine1 {m : Nat} (T : TSequence m) : Fin m → Int :=
+  fun i => T.a.data i + T.b.data i + T.c.data i + T.d.data i
+
+/-- Second GS combination: A + B - C - D. -/
+def tseqCombine2 {m : Nat} (T : TSequence m) : Fin m → Int :=
+  fun i => T.a.data i + T.b.data i - T.c.data i - T.d.data i
+
+/-- Third GS combination: A - B + C - D. -/
+def tseqCombine3 {m : Nat} (T : TSequence m) : Fin m → Int :=
+  fun i => T.a.data i - T.b.data i + T.c.data i - T.d.data i
+
+/-- Fourth GS combination: A - B - C + D. -/
+def tseqCombine4 {m : Nat} (T : TSequence m) : Fin m → Int :=
+  fun i => T.a.data i - T.b.data i - T.c.data i + T.d.data i
+
+private lemma natAbs_four_sum_eq_one_pmOne (a b c d : Int)
+    (sb sc sd : Int)
+    (hsb : sb = 1 ∨ sb = -1) (hsc : sc = 1 ∨ sc = -1) (hsd : sd = 1 ∨ sd = -1)
+    (h_support : a.natAbs + b.natAbs + c.natAbs + d.natAbs = 1) :
+    (a + sb * b + sc * c + sd * d) = 1 ∨
+    (a + sb * b + sc * c + sd * d) = -1 := by
+  rcases hsb with rfl | rfl <;> rcases hsc with rfl | rfl <;> rcases hsd with rfl | rfl <;> omega
+
+/-- Entries of `tseqCombine1` are ±1. -/
+lemma tseqCombine1_pmOne {m : Nat} (T : TSequence m) : IsPmOneVec (tseqCombine1 T) := by
+  intro i
+  have h := T.support i
+  show T.a.data i + T.b.data i + T.c.data i + T.d.data i = 1 ∨
+       T.a.data i + T.b.data i + T.c.data i + T.d.data i = -1
+  have : T.a.data i + 1 * T.b.data i + 1 * T.c.data i + 1 * T.d.data i =
+      T.a.data i + T.b.data i + T.c.data i + T.d.data i := by ring
+  rw [← this]
+  exact natAbs_four_sum_eq_one_pmOne _ _ _ _ 1 1 1 (Or.inl rfl) (Or.inl rfl) (Or.inl rfl) h
+
+/-- Entries of `tseqCombine2` are ±1. -/
+lemma tseqCombine2_pmOne {m : Nat} (T : TSequence m) : IsPmOneVec (tseqCombine2 T) := by
+  intro i
+  have h := T.support i
+  show T.a.data i + T.b.data i - T.c.data i - T.d.data i = 1 ∨
+       T.a.data i + T.b.data i - T.c.data i - T.d.data i = -1
+  have : T.a.data i + 1 * T.b.data i + (-1) * T.c.data i + (-1) * T.d.data i =
+      T.a.data i + T.b.data i - T.c.data i - T.d.data i := by ring
+  rw [← this]
+  exact natAbs_four_sum_eq_one_pmOne _ _ _ _ 1 (-1) (-1) (Or.inl rfl) (Or.inr rfl) (Or.inr rfl) h
+
+/-- Entries of `tseqCombine3` are ±1. -/
+lemma tseqCombine3_pmOne {m : Nat} (T : TSequence m) : IsPmOneVec (tseqCombine3 T) := by
+  intro i
+  have h := T.support i
+  show T.a.data i - T.b.data i + T.c.data i - T.d.data i = 1 ∨
+       T.a.data i - T.b.data i + T.c.data i - T.d.data i = -1
+  have : T.a.data i + (-1) * T.b.data i + 1 * T.c.data i + (-1) * T.d.data i =
+      T.a.data i - T.b.data i + T.c.data i - T.d.data i := by ring
+  rw [← this]
+  exact natAbs_four_sum_eq_one_pmOne _ _ _ _ (-1) 1 (-1) (Or.inr rfl) (Or.inl rfl) (Or.inr rfl) h
+
+/-- Entries of `tseqCombine4` are ±1. -/
+lemma tseqCombine4_pmOne {m : Nat} (T : TSequence m) : IsPmOneVec (tseqCombine4 T) := by
+  intro i
+  have h := T.support i
+  show T.a.data i - T.b.data i - T.c.data i + T.d.data i = 1 ∨
+       T.a.data i - T.b.data i - T.c.data i + T.d.data i = -1
+  have : T.a.data i + (-1) * T.b.data i + (-1) * T.c.data i + 1 * T.d.data i =
+      T.a.data i - T.b.data i - T.c.data i + T.d.data i := by ring
+  rw [← this]
+  exact natAbs_four_sum_eq_one_pmOne _ _ _ _ (-1) (-1) 1 (Or.inr rfl) (Or.inr rfl) (Or.inl rfl) h
+
+/-- Summand-level GS identity for a single coordinate pair. -/
+lemma tseqCombine_summand_identity (a1 b1 c1 d1 a2 b2 c2 d2 : Int) :
+    (a1 + b1 + c1 + d1) * (a2 + b2 + c2 + d2) +
+    (a1 + b1 - c1 - d1) * (a2 + b2 - c2 - d2) +
+    (a1 - b1 + c1 - d1) * (a2 - b2 + c2 - d2) +
+    (a1 - b1 - c1 + d1) * (a2 - b2 - c2 + d2) =
+    4 * (a1 * a2 + b1 * b2 + c1 * c2 + d1 * d2) := by ring
+
+/-- Combined periodic autocorrelation of GS combinations equals 4× the original. -/
+theorem tseqCombine_periodic_identity {m : Nat} (T : TSequence m) (s : Fin m) :
+    periodicAutocorr (tseqCombine1 T) s + periodicAutocorr (tseqCombine2 T) s +
+    periodicAutocorr (tseqCombine3 T) s + periodicAutocorr (tseqCombine4 T) s =
+    4 * (periodicAutocorr T.a.data s + periodicAutocorr T.b.data s +
+         periodicAutocorr T.c.data s + periodicAutocorr T.d.data s) := by
+  simp only [periodicAutocorr, tseqCombine1, tseqCombine2, tseqCombine3, tseqCombine4]
+  simp only [← Finset.sum_add_distrib]
+  rw [Finset.mul_sum]
+  congr 1
+  funext i
+  exact tseqCombine_summand_identity _ _ _ _ _ _ _ _
+
+/-- Certified GS data extracted from a T-sequence. -/
+def gsDataOfTSequence {m : Nat} (T : TSequence m) : CertifiedGSData m :=
+  { x1 := tseqCombine1 T
+    x2 := tseqCombine2 T
+    x3 := tseqCombine3 T
+    x4 := tseqCombine4 T
+    x1_pm := tseqCombine1_pmOne T
+    x2_pm := tseqCombine2_pmOne T
+    x3_pm := tseqCombine3_pmOne T
+    x4_pm := tseqCombine4_pmOne T
+    periodic_vanishing := by
+      intro s hs
+      have h := tseqCombine_periodic_identity T s
+      rw [T.periodic_vanishing s hs] at h
+      simp at h
+      exact h }
+
+/-- The typed GS matrix attached to a T-sequence. -/
+def typedGsMatrixOfTSequence {m : Nat} (T : TSequence m) : IntMat (4 * m) :=
+  gsMatrix (gsDataOfTSequence T).toGSData
+
+/-- The typed GS matrix is a Hadamard matrix. -/
+theorem typedGsMatrix_isHadamard {m : Nat} (T : TSequence m) :
+    IsHadamardMat (typedGsMatrixOfTSequence T) := by
+  simpa [typedGsMatrixOfTSequence] using gsMatrix_isHadamard (gsDataOfTSequence T)
 
 end Turyn
