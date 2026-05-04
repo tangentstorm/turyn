@@ -112,13 +112,20 @@ unit tests pass.
 | C3         |   4 |    -0.83% | 1.21% | [-2.74%, +1.09%]       |  -1.47% |        3/1 | hint B faster |
 | C4         |   4 |    -1.23% | 0.53% | [-2.08%, -0.38%]       |  -0.89% |        4/0 | **SIG B faster** |
 | C5         |   4 |    -0.21% | 0.41% | [-0.86%, +0.45%]       |  -0.56% |        2/2 | noise         |
-| C_all      |   ? |    TBD    | TBD   | TBD (running)          |   TBD   |        TBD | TBD           |
+| C_all      |   4 |    +0.45% | 4.11% | [-6.08%, +6.99%]       |  -2.30% |        3/1 | hint compounded* |
 ```
 
 **C4 is the clear win**: 4/4 sign, 95% CI excludes zero, t=-4.61 at
 df=3 (p<0.02). Committed in `8051f3e`. The optimization makes
 `compute_quad_pb_explanation_into` (8.1% of solver runtime) about 15%
 faster, which works out to ~1.2% wall-clock at this workload.
+
+\* C_all's mean (+0.45%) is dominated by one outlier block (block 4
+at +6.5%, contaminated by the parallel C4-confirmation bench I'd
+launched on a sibling core). Excluding block 4: mean = -1.55%, which
+is roughly C4's -1.23% plus small contributions from C1/C3. Δmin and
+the 3/1 sign both correctly point to "compound win" — another data
+point for why min/median should be reported alongside mean.
 
 C2's mean is dominated by one outlier block (+11.6% — an external CPU
 spike during one of the four runs). Discarding the outlier gives mean
