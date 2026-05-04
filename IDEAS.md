@@ -4071,11 +4071,51 @@ W-stage's autocorrelation constraints are most informative.
 
 **Rejected** — chrono_bt is a regression at this workload. Reverted.
 
-### W-extra: ema_restarts flag flip — **TESTING**
+### W-extra: ema_restarts flag flip — **AMBIGUOUS, REJECTED PENDING BETTER METRIC**
 
 Flipped `SolverConfig::ema_restarts` default from false to true
 (Glucose-style adaptive restart policy based on recent LBD vs global
-LBD, instead of Luby). Bench in flight.
+LBD, instead of Luby).
+
+4-block bench at n=56 mdd-k=7 sat-secs=20 with the W-solves metric:
+
+```
+n=4 blocks  mean Δw = +41.6%  sd = 3.9%
+```
+
+That looks like a massive 1.4× win, but spelunking the per-stage
+counters at 30s shows the metric is misleading:
+
+```
+Baseline:  W solves=64  timeout=13  sol=7477  Z solves=370  unsat=32
+EMA:       W solves=104 timeout=97  sol=2802  Z solves=414  unsat=42
+```
+
+EMA has **97/104 W timeouts** (vs baseline 13/64) — most "solves"
+are timeouts. The brute-force W path that produces most of `sol`
+gets ~2.7× fewer sequences (2802 vs 7477) when EMA is on. So
+boundary throughput drops from 11851 → 2485 (-79%). But the Z stage
+shows real improvement: 414 vs 370 solves (+12%) and 42 vs 32 Z
+UNSAT determinations (+31%).
+
+This is the same anti-pattern as chrono_bt: a flag flip where the
+W-solves count goes up because more SAT W calls fire (and time out)
+rather than the path completing more useful work. The Z stage is
+genuinely better with EMA, but the W-solves metric can't see it.
+
+**Rejected pending better metric.** EMA may be a real win on the
+Z-stage / overall TTC, but the bench-pair-n56 W-solves metric
+misclassifies it as a 1.4× speedup when in fact the boundary
+throughput drops 5×. To confirm or refute properly, the metric
+should be one of:
+
+* Z-stage solves/s or Z-UNSAT/s (sat-secs held constant)
+* TTC at fixed Z-coverage (similar to the n=18 protocol)
+* Wall-clock to first solution (when at smaller n where solutions
+  exist within bench budget)
+
+Reverted radical/ default. Re-test on a session where the metric
+can be redesigned for the n=56 stage shape.
 
 ### W-8. Vivification flag flip — **REJECTED (slight regression)**
 
