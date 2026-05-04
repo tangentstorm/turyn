@@ -4050,6 +4050,33 @@ boundary enumerator, which is a significant pipeline rewrite.
 (Note: this is the same issue that rejects k=9 and k=10 with OOM.
 The framework was designed for k≤7 at n=56.)
 
+### W-extra: chrono_bt flag flip — **REJECTED (broken at n=56 W-stage)**
+
+Flipped `SolverConfig::chrono_bt` default from false to true. Result
+is dramatic but a regression in disguise:
+
+* Baseline: W stage `solves=41 timeout=8 sol=4616 spec_pass=1527`
+* chrono_bt: W stage `solves=482 timeout=482 sol=0 spec_pass=0`
+
+12× more "solves" but ALL are timeouts. With chrono_bt enabled the
+SAT W-stage can't reach UNSAT before the conflict_limit, so every
+SAT-based W call times out. The brute-force-W path that produces
+most of the `sol` count gets bypassed when SAT-W is forced to
+timeout. **Net zero useful work** at this workload.
+
+Possible cause: chrono_bt disables learning of asserting clauses on
+the deepest level (it backjumps to current_level - 1 with `add_
+learnt_clause_no_enqueue`), which weakens propagation when the
+W-stage's autocorrelation constraints are most informative.
+
+**Rejected** — chrono_bt is a regression at this workload. Reverted.
+
+### W-extra: ema_restarts flag flip — **TESTING**
+
+Flipped `SolverConfig::ema_restarts` default from false to true
+(Glucose-style adaptive restart policy based on recent LBD vs global
+LBD, instead of Luby). Bench in flight.
+
 ### W-8. Vivification flag flip — **REJECTED (slight regression)**
 
 Flipped `SolverConfig::vivification` default from false to true and
