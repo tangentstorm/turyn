@@ -85,6 +85,7 @@ TURYN_THREADS=8 target/release/turyn --n=56 --wz=apart --mdd-k=10 --sat-secs=30
 
 ## Docs
 
+- `docs/BENCHMARKING.md`: Protocol for detecting small (~0.2%) performance changes — metric selection, nondeterminism pinning, paired/alternating runs, multi-scale replication.
 - `docs/PIPELINE.md`: Current overview of the search modes, shared framework runtime, scheduler, threading model, and data model.
 - `docs/TELEMETRY.md`: Reader's guide to the `--wz=sync` output (per-level table, per-feature forcings, per-(level, kind) matrix, direct/projected TTC).
 - `docs/OPTIMIZATION_LOG.md`: Measured before/after for every optimization.
