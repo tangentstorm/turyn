@@ -8,25 +8,29 @@ benchmarks missed.
 
 **TL;DR**:
 
-* The protocol's paired ABBA design + paired-t analysis **did detect a
-  real ~1.2% wall-clock win (C4)** that had been previously rejected
-  as "within noise". Committed in `8051f3e`.
-* C1 and C3 trended in the right direction but were not significant at
-  4 ABBA blocks; one of them is likely a real ~0.5–0.8% win that
-  needs ≥12 blocks to confirm.
-* C2 (a hypothesized hoist that was actually a slight regression on
-  the hot path) shows up as +0.5% slower with min-of-runs analysis —
-  a useful negative result.
+* **No candidate was confirmed as a real win** after the full
+  protocol (4-block screen → 8/12-block confirmation in clean
+  conditions). C4 looked significant at 4 blocks (mean -1.23%,
+  t=-4.61, 95% CI excludes 0) but the clean 8-block re-run gave
+  +0.59% with 6/2 sign favoring regression — a Type I false
+  positive. Initial commit `8051f3e` was reverted in `c8d2e8d`.
 * The strict 0.2% sensitivity claim from `BENCHMARKING.md` is **not
   achievable on this hardware**. The per-ABBA-block σ on this 4-CPU
-  shared VM is ~0.9% (vs the 0.1–0.5% the doc assumes); reaching
+  shared VM is ~1.0–2.4% (vs the 0.1–0.5% the doc assumed); reaching
   0.2% requires either ~80 blocks per candidate (~90 min) or a
   quieter machine.
-* The protocol's main practical contribution turned out to be the
-  paired-t verdict: an ad-hoc reading of these per-block deltas
-  ("most are negative, must be a win") gave the right answer for C4
-  by accident, but the same eyeballing wrongly endorsed C3 (which
-  was below the significance threshold). Paired-t separates the two.
+* **Most important finding**: 4-block ABBA screens lie. With df=3 the
+  paired-t critical value is 3.18, but the per-block sd estimated
+  from 4 samples (~0.5%) under-counts the true sd seen at 8+ blocks
+  (~1.1%). A "significant" 4-block result with t=-4.6 routinely
+  fails to replicate. **Minimum 8 blocks before declaring any win,
+  with 12+ for anything below 1%.** This is the protocol's most
+  valuable contribution: it caught a false positive that ad-hoc
+  benchmarks would have shipped.
+* All five candidates (C1–C5, plus C_all) sit within ±1% on this
+  hardware. Whether any of them is a real ≤0.5% win is unknown:
+  measuring 0.5% with σ=1% per block needs ~30 blocks (~35 min) per
+  candidate, and 0.2% needs ~80 blocks (~90 min). Future work.
 
 ## Environment characterization
 
@@ -101,57 +105,89 @@ unit tests pass.
 
 ## Results
 
-(All cells: 4 ABBA blocks, n=18, single-thread, taskset core 2.)
+n=18, single-thread, taskset core 2 (`scripts/bench-pair.sh`).
+Initial 4-block screen, plus follow-ups for C4:
 
 ```
-| Candidate  |   n |   mean Δ% |   sd% | 95% CI                 |   Δmin% | sign B</>A | verdict       |
-|------------|----:|----------:|------:|------------------------|--------:|-----------:|---------------|
-| null (A=A) |   4 |    -0.30% | 0.88% | [-1.70%, +1.10%]       |  -1.20% |        2/2 | noise/null    |
-| C1         |   4 |    -0.24% | 0.97% | [-1.78%, +1.30%]       |  -0.32% |        3/1 | hint B faster |
-| C2         |   4 |    +3.27% | 5.60% | [-5.64%, +12.17%]      |  +0.90% |        1/3 | hint B slower |
-| C3         |   4 |    -0.83% | 1.21% | [-2.74%, +1.09%]       |  -1.47% |        3/1 | hint B faster |
-| C4         |   4 |    -1.23% | 0.53% | [-2.08%, -0.38%]       |  -0.89% |        4/0 | **SIG B faster** |
-| C5         |   4 |    -0.21% | 0.41% | [-0.86%, +0.45%]       |  -0.56% |        2/2 | noise         |
-| C_all      |   4 |    +0.45% | 4.11% | [-6.08%, +6.99%]       |  -2.30% |        3/1 | hint compounded* |
+| Candidate     |   n |   mean Δ% |   sd% | 95% CI                 |   Δmin% | sign B</>A | verdict       |
+|---------------|----:|----------:|------:|------------------------|--------:|-----------:|---------------|
+| null (A=A)    |   4 |    -0.30% | 0.88% | [-1.70%, +1.10%]       |  -1.20% |        2/2 | noise         |
+| C1            |   4 |    -0.24% | 0.97% | [-1.78%, +1.30%]       |  -0.32% |        3/1 | noise (hint+) |
+| C2            |   4 |    +3.27% | 5.60% | [-5.64%, +12.17%]      |  +0.90% |        1/3 | noise (hint−) |
+| C3            |   4 |    -0.83% | 1.21% | [-2.74%, +1.09%]       |  -1.47% |        3/1 | noise (hint+) |
+| C4 screen     |   4 |    -1.23% | 0.53% | [-2.08%, -0.38%]       |  -0.89% |        4/0 | "SIG" (false) |
+| C4 confirm-12 |  12 |    -0.53% | 2.38% | [-2.05%, +0.98%]       |  +0.62% |        6/6 | noise         |
+| **C4 clean-8**|   8 |    +0.59% | 1.12% | [-0.35%, +1.53%]       |  -0.60% |        2/6 | noise (hint−) |
+| C5            |   4 |    -0.21% | 0.41% | [-0.86%, +0.45%]       |  -0.56% |        2/2 | noise         |
+| C_all         |   4 |    +0.45% | 4.11% | [-6.08%, +6.99%]       |  -2.30% |        3/1 | noise         |
 ```
 
-**C4 is the clear win**: 4/4 sign, 95% CI excludes zero, t=-4.61 at
-df=3 (p<0.02). Committed in `8051f3e`. The optimization makes
-`compute_quad_pb_explanation_into` (8.1% of solver runtime) about 15%
-faster, which works out to ~1.2% wall-clock at this workload.
+### The C4 saga (the central lesson)
 
-\* C_all's mean (+0.45%) is dominated by one outlier block (block 4
-at +6.5%, contaminated by the parallel C4-confirmation bench I'd
-launched on a sibling core). Excluding block 4: mean = -1.55%, which
-is roughly C4's -1.23% plus small contributions from C1/C3. Δmin and
-the 3/1 sign both correctly point to "compound win" — another data
-point for why min/median should be reported alongside mean.
+The 4-block screen on C4 was the most exciting result of the session:
+4/4 sign, 95% CI excludes zero, t=-4.61 at df=3 (p<0.02). I committed
+it as `8051f3e` and pushed.
 
-C2's mean is dominated by one outlier block (+11.6% — an external CPU
-spike during one of the four runs). Discarding the outlier gives mean
-+0.5% — a small regression direction. The min-of-runs comparison
-(Δmin = +0.90%) is consistent with C2 being a slight regression: the
+Then two follow-up runs disagreed:
+
+* **12-block confirmation** (early blocks contaminated by a parallel
+  bench I'd launched on a sibling core): mean +0.45%, 95% CI
+  [-2.05%, +0.98%], 6/6 sign. Tied.
+* **8-block clean re-run** (no parallel bench, fresh start):
+  **mean +0.59%, 6/2 sign favors regression**. The opposite of the
+  4-block screen.
+
+The 4-block screen was a Type I false positive. **The estimated
+sd from 4 samples (0.53%) was less than half the true sd seen at
+8+ samples (1.12%).** With paired-t at df=3, even a t-stat of -4.6
+isn't enough confidence — the underlying variance is being
+underestimated by random chance.
+
+Reverted in `c8d2e8d`. The candidate is most likely null or a
+slight regression; either way, not worth committing.
+
+### What this means for the rest of the candidates
+
+C1, C3 (both -0.2 to -0.8% at 4 blocks) and C2 (+0.5–3% regression
+at 4 blocks) are all in the same regime as C4: their 4-block
+screens cannot be trusted. Promoting any of them without an 8+
+block clean re-run would risk the same false-positive trap. Given
+the noise floor, the honest summary is "no candidate has a
+demonstrable wall-clock effect at this hardware's measurement
+precision."
+
+C_all's headline +0.45% mean is dominated by one outlier block
+(block 4 at +6.5%, contaminated by the parallel C4-confirmation
+bench I'd launched). Δmin and 3/1 sign both pointed to a possible
+compound win, but given that C4 itself didn't replicate, the C_all
+"compound" interpretation is unreliable — most of C_all's hint was
+coming from C4's now-rejected effect.
+
+C2 is the most plausible directional finding, but only weakly:
 hypothesis (combine two `clause_meta[ci]` loads into one) added a
-load to the common case (blocker-true) for the benefit of the rare
-case (blocker-false), which is the wrong trade-off for SAT BCP.
-
-C1 and C3 both look like hints of ~0.2–0.8% wins but are not
-significant at 4 blocks — exactly the regime the protocol predicts:
-"too small to detect with this many runs." Re-running at 12 blocks
-would resolve them, but at ~14 min each that's a session-budget
-question.
+load to the common case (blocker-true ≈ 95% of clauses) for the
+benefit of the rare case. Direction matches expectation but
+magnitude is below detection at 4 blocks.
 
 ## Cost analysis: how many blocks for what sensitivity
 
-With per-block σ = 0.88% (this VM):
+Updated with the **true** per-block σ measured at 8+ blocks (1.12%
+for C4 clean-8) rather than the optimistic 4-block estimate
+(0.53%, which under-counted by 2×):
 
 | Effect to detect | Required blocks | Wall time |
 |---|---|---|
-| 2.0% | 2 | 2.5 min |
-| 1.0% | 6 | 7 min |
-| 0.5% | 22 | 26 min |
-| 0.3% | 60 | 70 min |
-| 0.2% | 134 | 2.5 hours |
+| 2.0% | 4 | 4.5 min |
+| 1.0% | 12 | 14 min |
+| 0.5% | 47 | 53 min |
+| 0.3% | 130 | 2.5 hours |
+| 0.2% | 290 | 5.5 hours |
+
+This is roughly 2× higher than the 4-block-extrapolated estimates
+in earlier drafts of this doc, because **4-block sd estimates
+under-count true sd by ~2×.** Plan accordingly: a 4-block screen
+is fine for filtering out garbage, but needs an 8+ block follow-
+up before any "win" is committed.
 
 Detection of 0.2% on this hardware with this metric is technically
 possible but takes ~2.5 hours per candidate. For an iteration loop
@@ -165,6 +201,28 @@ that's untenable; the right move is one of:
    stage X` to stderr.
 3. Wrap the search call in `perf stat -e instructions` (when perf is
    available) and use that as the metric instead of wall-clock.
+
+## What this means for `BENCHMARKING.md`
+
+The protocol document needs an update based on this dry-run. Most
+of it is correct; the actionable changes:
+
+1. **Drop the "4 blocks = decisive" framing.** The TL;DR script
+   suggests "30 paired samples" as the default. Replace with:
+   "≥8 blocks for any wall-clock win, ≥12 for sub-1% effects."
+2. **Always confirm with a clean re-run** before committing. Two
+   independent 8-block runs converging on the same direction are
+   far more convincing than one t=-4.6 from 4 blocks.
+3. **Don't run two benches in parallel.** I tried this for time
+   savings; it added 3% per-block σ to both runs. Use one core,
+   one bench at a time, even on a multi-core box.
+4. **Use the per-block sd from past runs, not the current one,
+   for sample-size planning.** If you've never benched on this
+   machine before, do a 12-block A==A null first to estimate σ.
+   The 4-block sd is too noisy to plan against.
+
+Updated `docs/BENCHMARKING.md` ought to reflect these. (See
+todo at end of doc.)
 
 ## Methodological lessons learned
 

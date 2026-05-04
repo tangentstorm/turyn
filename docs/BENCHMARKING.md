@@ -192,6 +192,15 @@ This is the table to keep on your desk. It tells you whether to invest in
 better metrics or in more runs. **Going from a noisy metric to a quiet one
 beats running 10× more samples.**
 
+**Caveat: 4-block screens lie.** A measured dry-run of this protocol
+(see `BENCHMARKING-PROTOCOL-RESULTS.md`) found that **estimating σ from
+4 samples can under-count true σ by 2×**, which inflates t-statistics
+and produces false positives — even ones with t > 4. **Treat any
+4-block "win" as a hypothesis to confirm, not a result to commit.**
+Minimum 8 blocks before declaring any wall-clock win, 12+ for sub-1%
+effects, and ideally a clean re-run on a fresh process to confirm
+direction. The 4-block screen is for filtering, not for shipping.
+
 **Min-of-k.** For wall-clock specifically, also report `min(A_i)` vs
 `min(B_i)`. Wall-clock has a hard physical lower bound (the work the CPU
 must do), and the minimum across runs is the cleanest estimator of it. If
@@ -303,6 +312,17 @@ awk -F'\t' 'NR>1 && $2=="A"{a[$1]=$3} NR>1 && $2=="B"{b[$1]=$3}
   between A and B, the change is not a pure speed optimization — it's also
   a behavior change. Investigate the counter delta before benchmarking
   time.
+* **Committing on a 4-block "significant" result.** Real story from this
+  repo (`BENCHMARKING-PROTOCOL-RESULTS.md`): a 4-block ABBA bench gave
+  t=-4.6 with 4/4 sign and CI excluding 0; the change was committed and
+  pushed; the 8-block clean re-run inverted the sign. The 4-block sd
+  estimate was less than half the true sd seen with more samples. Rule:
+  treat 4-block as a hypothesis filter, run ≥8 (better, two independent
+  sets of 8) before promoting to a commit.
+* **Running two benches in parallel on the same machine.** They share L3
+  cache and memory bandwidth even with `taskset` to disjoint cores;
+  expect ~3% extra per-block σ on both. One bench at a time, even on a
+  4-core box.
 
 ## 10. When 0.2% is below your noise floor and you can't get there
 
