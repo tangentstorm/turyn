@@ -4223,26 +4223,18 @@ impl Solver {
         let qi = (qi_encoded & 0x7FFFFFFF) as usize;
         let pv_pos = self.trail_pos[pv];
 
-        // Hoist slice borrows so the inner loop doesn't reborrow self
-        // for every var lookup; without this, strict aliasing forces
-        // the compiler to reload the Vec base pointer per iteration.
-        let assigns: &[LBool] = &self.assigns;
-        let trail_pos: &[usize] = &self.trail_pos;
-        let level: &[u32] = &self.level;
         let seen = &mut self.quad_pb_seen_buf;
         let terms = &self.quad_pb_constraints[qi].terms;
         for t in terms {
             let va = t.var_a();
             let vb = t.var_b();
-            let aa_raw = assigns[va];
-            let aa = if aa_raw != LBool::Undef && trail_pos[va] < pv_pos {
-                aa_raw
+            let aa = if self.assigns[va] != LBool::Undef && self.trail_pos[va] < pv_pos {
+                self.assigns[va]
             } else {
                 LBool::Undef
             };
-            let ab_raw = assigns[vb];
-            let ab = if ab_raw != LBool::Undef && trail_pos[vb] < pv_pos {
-                ab_raw
+            let ab = if self.assigns[vb] != LBool::Undef && self.trail_pos[vb] < pv_pos {
+                self.assigns[vb]
             } else {
                 LBool::Undef
             };
@@ -4251,16 +4243,16 @@ impl Solver {
 
             if af || bf {
                 let (lit, v) = if af { (t.lit_a, va) } else { (t.lit_b, vb) };
-                if v != pv && !seen[v] && level[v] > 0 {
+                if v != pv && !seen[v] && self.level[v] > 0 {
                     seen[v] = true;
                     out.push(lit);
                 }
             } else if is_upper && aa != LBool::Undef && ab != LBool::Undef {
-                if va != pv && !seen[va] && level[va] > 0 {
+                if va != pv && !seen[va] && self.level[va] > 0 {
                     seen[va] = true;
                     out.push(negate(t.lit_a));
                 }
-                if vb != pv && !seen[vb] && level[vb] > 0 {
+                if vb != pv && !seen[vb] && self.level[vb] > 0 {
                     seen[vb] = true;
                     out.push(negate(t.lit_b));
                 }
