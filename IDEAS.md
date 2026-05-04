@@ -4021,9 +4021,65 @@ Multi-session (impl multi-hour to multi-day):
 * **W-1, W-3, W-5, W-6, W-7**: substantial design + impl
 * **W-4, W-9**: medium effort
 
-Tests below are with the standard n=56 config from CLAUDE.md:
-`--n=56 --wz=apart --mdd-k=10 --sat-secs=30`. Per-run is ~30s,
-ABBA block is ~2 min, 4-block screen is ~8 min. Confirm any "win"
-with 8-block clean re-run (~16 min).
+Bench config note: original plan was `--mdd-k=10` but at n=56 the
+search-framework `MddStagesAdapter::init` pre-enumerates all
+boundaries upfront, which OOMs at 65 GB on a 16 GB box for k=10
+(315M boundaries) and 44 GB for k=9 (211M boundaries). Settled on
+`--mdd-k=7 --sat-secs=20` for the bench (10K boundaries, fits in
+memory, runs in 20 s with 56 W-solves completed). Per-run ~20s,
+ABBA block ~80s, 4-block screen ~5.5 min. Metric: W-solves
+completed in fixed window (more = faster). Per-block sd from A==A
+null test was 1.34% (excluding one outlier block at -9.8%).
+
+### W-2. Cube depth k=8 — **REJECTED (framework architecture)**
+
+Tested k=8 at n=56 with `--sat-secs=30`. 30s budget produced:
+* k=7: 56 W-solves completed, 161 Z-solves
+* k=8: 0 W-solves completed (boundary pre-enumeration alone consumed
+  all budget; 2.18M of 18M boundaries processed without any reaching
+  the W stage)
+
+The framework's `MddStagesAdapter` pre-enumerates the full boundary
+set upfront, which is O(boundaries) memory and time. At k=8 the
+boundary space is too large for this design even though the SAT
+instance per boundary is meaningfully easier. **Rejected** — the
+deeper-cubing throughput win is real in principle but the current
+adapter architecture can't exploit it. Would need a lazy/streaming
+boundary enumerator, which is a significant pipeline rewrite.
+
+(Note: this is the same issue that rejects k=9 and k=10 with OOM.
+The framework was designed for k≤7 at n=56.)
+
+### W-8. Vivification flag flip — **REJECTED (slight regression)**
+
+Flipped `SolverConfig::vivification` default from false to true and
+re-tested at n=56 k=7 sat-secs=20.
+
+```
+n=4 blocks  mean Δw = -1.10% (B slower)  sd = 0.73%
+A==A null   mean Δw = -0.28% (excl outlier)  sd = 1.34%
+```
+
+W-8 is below the null mean and within sd, so direction is hint
+regression rather than improvement. Possible reasons:
+
+1. The radical/ vivification routine runs every 1000 conflicts with
+   a 50-conflict budget. At n=56 W-stage each instance is ~3-10K
+   conflicts so vivify fires ~3-10 times per instance, but the work
+   per call (50 conflicts re-running each candidate clause) is
+   substantial.
+2. Most W-stage clauses are short already (the autocorrelation
+   constraints decompose into pairs/triples), so vivification has
+   little to shorten.
+
+**Rejected** — not a win at this configuration. Could revisit with
+much larger budget per call (CaDiCaL uses 50ms wall-time, not 50
+conflicts), but the per-clause savings would still be small at
+n=56's typical clause length. Reverted (radical/ default unchanged).
+
+Tests below are with the standard n=56 config:
+`--n=56 --wz=apart --mdd-k=7 --sat-secs=20`. Per-run is ~20s,
+ABBA block is ~80s, 4-block screen is ~5.5 min. Confirm any "win"
+with 8-block clean re-run.
 
 rather than mechanism-induced.
