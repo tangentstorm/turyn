@@ -3795,4 +3795,358 @@ say) lands so totals are comparable across runs.
 This is the kind of audit the protocol is for: many sub-2 %
 verdicts in this file's earlier sessions probably came from this
 same shape — total-count variation that is wall-clock-induced
+
+## W-series: high-leverage candidates for n=56 (May 2026, Claude)
+
+After re-testing the rejected pile (R-series, P-series, F-series
+follow-ups, sync-walker U/S series) under the new protocol from
+[`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) — none of those
+showed a confirmed wall-clock effect on this VM at n=18. Most are
+genuinely sub-1% on hardware that can't resolve sub-1.5%.
+
+The user asked for ideas that should genuinely move the needle at
+**n=56**, where the regime is fundamentally different:
+
+* `propagate` is 55% of runtime (vs 12% at smaller n)
+* Each instance is 10K-50K conflicts UNSAT (vs 14 at n=26)
+* <1 solve/sec (vs ~800/sec at n=26)
+* 168 middle vars per instance (vs 56 at n=26)
+
+So the rejected sub-percent ideas don't apply — we want order-of-
+magnitude levers. The 10 below were brainstormed by class:
+
+(A) reduce the number of SAT instances; (B) make each instance
+faster; (C) eliminate fixed costs; (D) better parallelism.
+Expected magnitudes are order-of-effect, not measured.
+
+### W-series ranking by expected effect × ease
+
+| # | Idea | Class | Effect (gut) | Impl cost |
+|---|---|---|---|---|
+| W-1 | Spectral 4-tuple precondition before SAT encoding | A | 3–10× | Hours (math + integration) |
+| W-2 | Cube depth k=8 (currently k=7) | A | 1.5–3× | Half day (gen_table extension + bench) |
+| W-3 | Tuple-conditioned k=7 boundary tables | A | 2–5× | Hours (table-build logic) |
+| W-4 | CHB branching heuristic instead of VSIDS | B | 1.1–1.3× | Day (radical/ refactor) |
+| W-5 | Sparse XOR/GJ on cycle constraints (revisit CMS7) | B | 1.5–3× total (2-5× on `propagate`) | Days (real engineering work) |
+| W-6 | BDKR canonical rules ii–vi as lex-leader clauses | A | 5–20× theoretical (compounding) | Day per rule + risk of branching interactions |
+| W-7 | Per-instance portfolio (2-4 SAT solvers, share units) | D | 2–4× on slowest instances | Day (`crossbeam::scope`) |
+| W-8 | Vivification flag flip + tuning at n=56 | B | 1.05–1.15× | Hour |
+| W-9 | Bounded BVE inprocessing between calls | B | 1.05–1.15× | Hours |
+| W-10 | SIMD popcount for autocorrelation lag | C | 1.05–1.15× | Hour (std::simd or x86_64::__popcnt) |
+
+Status: all 10 are PROPOSED. Implementation, bench, and accept/reject
+follow.
+
+### W-1. Spectral 4-tuple precondition before SAT encoding
+
+The spectral *pair* check (Z×W) currently rejects >99.99% of (Z,W)
+pairs post-hoc. The 4-tuple bound (X²+Y²+Z²+W² spectral envelope)
+computed at the *boundary* level — before any SAT instance is built
+— would do the same filtering one stage earlier. At n=56, most (z,w)
+pairs survive 2-tuple filter but die at 4-tuple, so most current SAT
+instances are pre-doomed: they exist only because we don't check the
+full 4-tuple bound until the SAT solver finds the contradiction itself
+(or times out).
+
+* **Mechanism**: rate. Eliminates SAT instances that would have been
+  proved UNSAT by the 4-tuple spectral envelope alone.
+* **TTC mechanism**: pure work reduction.
+* **Risk**: must compute the 4-tuple envelope quickly (cached cos/sin
+  reused from spectral pair), and must not falsely reject valid
+  (X,Y,Z,W) tuples. The 4-tuple bound is a relaxation of the actual
+  Turyn condition, so by definition no false rejects.
+* **Status**: PROPOSED.
+
+### W-2. Cube depth k=8 (currently k=7)
+
+The k=7 boundary table fixes 14 boundary positions per sequence,
+leaving 168 middle vars at n=56. Going to k=8 fixes 16 positions,
+leaving 152 middle vars. Each individual SAT instance becomes ~2×
+easier (CDCL difficulty scales super-linearly in middle var count).
+The boundary-config space grows 4× (2^16 vs 2^14 per sequence), so
+the table grows ~4× to ~8GB at k=8 — but most rows are filtered out
+at lookup time by spectral pair check.
+
+* **Mechanism**: rate. Trades larger table for smaller instances.
+* **TTC mechanism**: instance-difficulty reduction.
+* **Risk**: 8GB table on a 4-core box may not fit in RAM well; lookup
+  becomes more cache-miss-bound.
+* **Status**: PROPOSED.
+
+### W-3. Tuple-conditioned k=7 boundary tables
+
+Current `xy-table-k7.bin` is shared across all 12 tuples (224K
+signatures). Splitting into 12 per-tuple tables makes each ~12×
+smaller AND filtered at table-build time to only signatures matching
+that tuple's `(x², y², z², w²)`. Each per-tuple table is ~150 MB and
+should be L3-resident on most machines — eliminating most cache
+misses on table lookup.
+
+* **Mechanism**: rate (lookup throughput) and partial coverage (extra
+  filtering at build time).
+* **TTC mechanism**: I/O cost reduction at table-lookup, plus
+  fewer false-positive signatures forwarded to SAT.
+* **Risk**: 12 tables to build (additive build time); current single
+  table assumed by other code paths.
+* **Status**: PROPOSED.
+
+### W-4. CHB branching heuristic instead of VSIDS
+
+CaDiCaL and Kissat use Conflict History-Based (CHB) branching as
+default, having abandoned VSIDS years ago for combinatorial SAT. CHB
+maintains a single "rate of conflict involvement" exponential
+moving average per variable; bumps on conflict involvement; decays
+on participation in non-conflicting decisions. Published benchmarks
+show CHB beating VSIDS by 10–30% on hard combinatorial problems —
+n=56 Turyn is exactly such a problem.
+
+* **Mechanism**: rate. Better decisions → fewer conflicts → less
+  propagation work.
+* **TTC mechanism**: per-instance speedup.
+* **Risk**: drop-in replacement for the variable score field is
+  feasible but requires careful interaction with `phase_save`,
+  `decision_level`, and `decay_activities`.
+* **Status**: PROPOSED.
+
+### W-5. Sparse XOR/GJ on cycle constraints (revisit CMS7)
+
+CMS7 (Gauss-Jordan elimination on XOR cycle constraints) was rejected
+in IDEAS.md as OOM at n=56 (25K XOR constraints × 52K vars naive
+matrix = 1.3 GB minimum). CryptoMiniSat's GJ uses a **sparse**
+representation (compressed-row storage on each XOR row) and gets
+near-linear memory in the number of nonzeros, not the matrix area.
+The autocorrelation constraints at n=56 ARE GF(2) cycles — XOR/GJ is
+the right tool, not pseudo-boolean.
+
+* **Mechanism**: rate. Native GF(2) reasoning catches contradictions
+  PB-watcher-based propagation can't see fast.
+* **TTC mechanism**: per-instance proof-length reduction (often
+  dramatic for cyclic XOR).
+* **Risk**: real engineering work (sparse data structures, GJ
+  pivoting under backtrack). Existing radical XOR module has dense
+  representation.
+* **Status**: PROPOSED.
+
+### W-6. BDKR canonical rules ii–vi as lex-leader clauses
+
+`docs/CANONICAL.md` documents 6 symmetry rules (i–vi) from
+Borwein-Dragojević-Karpushev-Robins 2012. Currently only rule (i)
+is enforced. Each remaining rule is a symmetry that, properly
+broken via lex-leader constraints, cuts the canonical search space
+by a constant 2–4×. Stacked, the symmetry group is potentially
+16–64× redundant work — the search is exploring 16–64× more
+canonically-equivalent assignments than necessary.
+
+* **Mechanism**: search-space reduction.
+* **TTC mechanism**: total work cut by a constant factor.
+* **Risk**: lex-leader clauses can interact poorly with VSIDS
+  (the typical encoding adds many short clauses that bias decision
+  ordering away from problem-natural variables). May need careful
+  ordering of variables to match the lex-leader.
+* **Status**: PROPOSED.
+
+### W-7. Per-instance SAT portfolio
+
+The framework runs 4 worker threads, each on a separate (Z,W)
+candidate. Within each *single* SAT call (which can take minutes at
+n=56), the solver is single-threaded. A per-instance portfolio of
+2–4 SAT solvers with different random seeds, with frequent unit-clause
+sharing, finishes the hardest UNSAT instances in
+`time-to-fastest-finder` rather than `mean(time)`.
+
+* **Mechanism**: tail-cutting. Hardest 5% of instances dominate
+  wall-clock; portfolio finishes them faster.
+* **TTC mechanism**: tail percentile reduction.
+* **Risk**: parallelism complexity (`crossbeam::scope`, work-stealing,
+  inter-solver unit-clause queue). Reduces effective per-thread cycles
+  available for cross-instance parallelism.
+* **Status**: PROPOSED.
+
+### W-8. Vivification flag flip + tuning at n=56
+
+`config.vivification` exists in radical/ but defaults off. CMS4
+(vivification) was rejected as cost > benefit at small n. At n=56
+where each instance is 50K+ conflicts, vivification has plenty to
+amortize over. CaDiCaL runs vivify every restart with a 50ms budget;
+radical does 50 conflicts. Fast win: flip the flag for the n=56 path,
+tune budget if helpful.
+
+* **Mechanism**: per-instance proof shortening.
+* **TTC mechanism**: per-instance speedup; lower learnt-clause-DB
+  bloat → less time in `propagate`.
+* **Risk**: low. If it regresses, just flip back off.
+* **Status**: PROPOSED.
+
+### W-9. Bounded BVE inprocessing between SAT calls
+
+CMS8 (BVE inprocessing) was rejected at n=56 with "9360 vars
+eliminated, net neutral". Suspicion: that was full BVE, which can
+introduce many resolution-product clauses. CaDiCaL ships *bounded*
+BVE: only eliminate variables with ≤4 occurrences (or some small
+limit). The 2026-04-05 measurement was likely with a less-bounded
+elimination. Worth re-trying with a tighter bound.
+
+* **Mechanism**: clause-DB compression between instances.
+* **TTC mechanism**: lower memory pressure, shorter watch lists,
+  faster `propagate`.
+* **Risk**: low if bounded; if too aggressive can blow up clause
+  count via resolution products.
+* **Status**: PROPOSED.
+
+### W-10. SIMD popcount for autocorrelation lag
+
+The lag-s autocorrelation `Σ x[i]·x[i+s]` reduces to
+`n - 2·popcount(x XOR shift(x, s))` for ±1 sequences. AVX-512 has
+hardware popcount on 512-bit lanes (`vpopcntq`). n=56 sequences fit
+in two 64-bit words; `compute_state` (called O(n_constraints×n_terms)
+per propagation) is the obvious target. F13 hinted at this; never
+tried. The fallback for non-AVX-512 CPUs is `u64::count_ones()` which
+is already a single instruction on x86 with `popcnt`.
+
+* **Mechanism**: per-call constant-factor speedup on a hot inner loop.
+* **TTC mechanism**: rate.
+* **Risk**: low. Performance-sensitive but not correctness-sensitive.
+* **Status**: PROPOSED.
+
+### W-series implementation order (this session)
+
+Tractable in one session (impl ≤ 1 hour):
+
+* **W-8** (vivification flag flip): cheapest test
+* **W-10** (SIMD popcount): mechanical change
+* **W-2** (k=8 cubing): mechanical extension if `gen_mdd` supports it
+
+Multi-session (impl multi-hour to multi-day):
+
+* **W-1, W-3, W-5, W-6, W-7**: substantial design + impl
+* **W-4, W-9**: medium effort
+
+Bench config note: original plan was `--mdd-k=10` but at n=56 the
+search-framework `MddStagesAdapter::init` pre-enumerates all
+boundaries upfront, which OOMs at 65 GB on a 16 GB box for k=10
+(315M boundaries) and 44 GB for k=9 (211M boundaries). Settled on
+`--mdd-k=7 --sat-secs=20` for the bench (10K boundaries, fits in
+memory, runs in 20 s with 56 W-solves completed). Per-run ~20s,
+ABBA block ~80s, 4-block screen ~5.5 min. Metric: W-solves
+completed in fixed window (more = faster). Per-block sd from A==A
+null test was 1.34% (excluding one outlier block at -9.8%).
+
+### W-2. Cube depth k=8 — **REJECTED (framework architecture)**
+
+Tested k=8 at n=56 with `--sat-secs=30`. 30s budget produced:
+* k=7: 56 W-solves completed, 161 Z-solves
+* k=8: 0 W-solves completed (boundary pre-enumeration alone consumed
+  all budget; 2.18M of 18M boundaries processed without any reaching
+  the W stage)
+
+The framework's `MddStagesAdapter` pre-enumerates the full boundary
+set upfront, which is O(boundaries) memory and time. At k=8 the
+boundary space is too large for this design even though the SAT
+instance per boundary is meaningfully easier. **Rejected** — the
+deeper-cubing throughput win is real in principle but the current
+adapter architecture can't exploit it. Would need a lazy/streaming
+boundary enumerator, which is a significant pipeline rewrite.
+
+(Note: this is the same issue that rejects k=9 and k=10 with OOM.
+The framework was designed for k≤7 at n=56.)
+
+### W-extra: chrono_bt flag flip — **REJECTED (broken at n=56 W-stage)**
+
+Flipped `SolverConfig::chrono_bt` default from false to true. Result
+is dramatic but a regression in disguise:
+
+* Baseline: W stage `solves=41 timeout=8 sol=4616 spec_pass=1527`
+* chrono_bt: W stage `solves=482 timeout=482 sol=0 spec_pass=0`
+
+12× more "solves" but ALL are timeouts. With chrono_bt enabled the
+SAT W-stage can't reach UNSAT before the conflict_limit, so every
+SAT-based W call times out. The brute-force-W path that produces
+most of the `sol` count gets bypassed when SAT-W is forced to
+timeout. **Net zero useful work** at this workload.
+
+Possible cause: chrono_bt disables learning of asserting clauses on
+the deepest level (it backjumps to current_level - 1 with `add_
+learnt_clause_no_enqueue`), which weakens propagation when the
+W-stage's autocorrelation constraints are most informative.
+
+**Rejected** — chrono_bt is a regression at this workload. Reverted.
+
+### W-extra: ema_restarts flag flip — **AMBIGUOUS, REJECTED PENDING BETTER METRIC**
+
+Flipped `SolverConfig::ema_restarts` default from false to true
+(Glucose-style adaptive restart policy based on recent LBD vs global
+LBD, instead of Luby).
+
+4-block bench at n=56 mdd-k=7 sat-secs=20 with the W-solves metric:
+
+```
+n=4 blocks  mean Δw = +41.6%  sd = 3.9%
+```
+
+That looks like a massive 1.4× win, but spelunking the per-stage
+counters at 30s shows the metric is misleading:
+
+```
+Baseline:  W solves=64  timeout=13  sol=7477  Z solves=370  unsat=32
+EMA:       W solves=104 timeout=97  sol=2802  Z solves=414  unsat=42
+```
+
+EMA has **97/104 W timeouts** (vs baseline 13/64) — most "solves"
+are timeouts. The brute-force W path that produces most of `sol`
+gets ~2.7× fewer sequences (2802 vs 7477) when EMA is on. So
+boundary throughput drops from 11851 → 2485 (-79%). But the Z stage
+shows real improvement: 414 vs 370 solves (+12%) and 42 vs 32 Z
+UNSAT determinations (+31%).
+
+This is the same anti-pattern as chrono_bt: a flag flip where the
+W-solves count goes up because more SAT W calls fire (and time out)
+rather than the path completing more useful work. The Z stage is
+genuinely better with EMA, but the W-solves metric can't see it.
+
+**Rejected pending better metric.** EMA may be a real win on the
+Z-stage / overall TTC, but the bench-pair-n56 W-solves metric
+misclassifies it as a 1.4× speedup when in fact the boundary
+throughput drops 5×. To confirm or refute properly, the metric
+should be one of:
+
+* Z-stage solves/s or Z-UNSAT/s (sat-secs held constant)
+* TTC at fixed Z-coverage (similar to the n=18 protocol)
+* Wall-clock to first solution (when at smaller n where solutions
+  exist within bench budget)
+
+Reverted radical/ default. Re-test on a session where the metric
+can be redesigned for the n=56 stage shape.
+
+### W-8. Vivification flag flip — **REJECTED (slight regression)**
+
+Flipped `SolverConfig::vivification` default from false to true and
+re-tested at n=56 k=7 sat-secs=20.
+
+```
+n=4 blocks  mean Δw = -1.10% (B slower)  sd = 0.73%
+A==A null   mean Δw = -0.28% (excl outlier)  sd = 1.34%
+```
+
+W-8 is below the null mean and within sd, so direction is hint
+regression rather than improvement. Possible reasons:
+
+1. The radical/ vivification routine runs every 1000 conflicts with
+   a 50-conflict budget. At n=56 W-stage each instance is ~3-10K
+   conflicts so vivify fires ~3-10 times per instance, but the work
+   per call (50 conflicts re-running each candidate clause) is
+   substantial.
+2. Most W-stage clauses are short already (the autocorrelation
+   constraints decompose into pairs/triples), so vivification has
+   little to shorten.
+
+**Rejected** — not a win at this configuration. Could revisit with
+much larger budget per call (CaDiCaL uses 50ms wall-time, not 50
+conflicts), but the per-clause savings would still be small at
+n=56's typical clause length. Reverted (radical/ default unchanged).
+
+Tests below are with the standard n=56 config:
+`--n=56 --wz=apart --mdd-k=7 --sat-secs=20`. Per-run is ~20s,
+ABBA block is ~80s, 4-block screen is ~5.5 min. Confirm any "win"
+with 8-block clean re-run.
+
 rather than mechanism-induced.
