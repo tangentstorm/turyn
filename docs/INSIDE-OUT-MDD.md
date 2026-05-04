@@ -306,6 +306,52 @@ The k=7 production case projects to:
   palindrome, etc.).
 * Stop at near-border depth; emit the high-lag target vector.
 
+**STATUS: minimal walker prototyped in `src/bin/inside_out_walk.rs`.**
+
+Key empirical findings from the prototype:
+
+* **The walker is correct at n=10 k=3 and n=14 k=4.** Joint
+  4-sequence DFS, pair-walk from centre outward, mm_sum tracked
+  Turyn-weighted. Known TT(n) leaves are reached and known boundary
+  bits are retrieved from the index at the right key.
+* **Cross-table pre-convolution makes leaf lookup O(1).**
+  `target_to_count[v] = Σ_{a+b=v} |T_xy[a]| · |T_zw[b]|` is
+  precomputed; per-leaf lookup is one hash query. n=14 k=4
+  (16M leaves, 4M candidate boundaries each) walks in 3.1 s.
+* **The very-high-lag-only key is middle-independent.** At lags
+  s ≥ n-k both `mm` and `cross` are exactly zero (no pair structure
+  at that distance involves the middle), so the target is always
+  the all-zeros vector — the index acts as a *middle-independent
+  boundary pre-filter*, pruning ~1000× of boundaries (4M of 4G at
+  k=4) regardless of which middle was placed. **The walker is not
+  yet using middle information to differentiate leaves.**
+* **Per-leaf differentiation needs the cross-term-bearing lag
+  range.** Lags `[n-2k+1..n-k-1]` (length `k-1`) have nonzero `mm`
+  AND nonzero `cross`. Including them in the key gives per-leaf
+  target vectors but couples the lookup to boundary bits via the
+  linear cross term, breaking the simple hash design. Solving this
+  is the open problem for Stage 4.
+
+**Two design conclusions from the prototype:**
+
+1. The **lag-sum decomposition is correct** and the **boundary
+   index works as designed** as a pre-filter. The very-high-lag
+   block alone gives ~1000× pruning at k=4 and projects to ~10⁵×
+   at k=7.
+2. The **inside-out walker** as described needs the cross-term
+   handling to make full use of middle information. Without it,
+   the walker only contributes the mm-feasibility bound (which is
+   itself useful for leaf pruning, but the prototype's bound is
+   too loose to fire). Two ways to tighten the boundary lookup
+   into a per-leaf filter:
+   * **(a) Indexed cross-coefficient**: store boundaries as
+     (`bb-vector`, `cross_coef[s, p]` for each high lag and
+     boundary position). At leaf, compute `target = -mm - Σ_p
+     coef · b[p]` for each candidate; verify match.
+   * **(b) Constraint-propagation lookup**: iterate hash buckets
+     of the bb-vector (B-only); for each candidate, run cheap
+     low-lag checks against the leaf's mm. SAT solver on top.
+
 ### Stage 4: integration (1 day)
 
 * Couple: walk inside-out → query boundary index → forward
