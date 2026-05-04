@@ -196,6 +196,15 @@ that's untenable; the right move is one of:
   bimodal. n=18 with full-coverage runs was the sweet spot for
   signal-to-noise.
 
+* **Don't run two benches in parallel on the same machine.** I
+  launched the 12-block C4 confirmation on core 3 while the C_all
+  4-block bench was running on core 2, hoping for time savings.
+  Both were taskset-pinned, but sharing L3 cache and memory bus
+  added ~3% per-block σ to both. Block 4 of C_all jumped from
+  ~17 s to 19–21 s while the parallel bench was hot. If you need
+  to run multiple candidates, do them strictly sequentially, even
+  on a multi-core box.
+
 * **Pre-screening at 4 blocks then confirming at 12+ is the right
   workflow.** A 4-block screen takes ~5 min and surfaces clearly
   significant candidates (like C4) and clearly null ones; ambiguous
