@@ -111,8 +111,8 @@ unit tests pass.
 | C2         |   4 |    +3.27% | 5.60% | [-5.64%, +12.17%]      |  +0.90% |        1/3 | hint B slower |
 | C3         |   4 |    -0.83% | 1.21% | [-2.74%, +1.09%]       |  -1.47% |        3/1 | hint B faster |
 | C4         |   4 |    -1.23% | 0.53% | [-2.08%, -0.38%]       |  -0.89% |        4/0 | **SIG B faster** |
-| C5         |   ? |    TBD    | TBD   | TBD                    |   TBD   |        TBD | TBD           |
-| C_all      |   ? |    TBD    | TBD   | TBD                    |   TBD   |        TBD | TBD           |
+| C5         |   4 |    -0.21% | 0.41% | [-0.86%, +0.45%]       |  -0.56% |        2/2 | noise         |
+| C_all      |   ? |    TBD    | TBD   | TBD (running)          |   TBD   |        TBD | TBD           |
 ```
 
 **C4 is the clear win**: 4/4 sign, 95% CI excludes zero, t=-4.61 at
