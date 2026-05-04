@@ -36,7 +36,7 @@ authoritative result.
 | C4 / R4-related | hoist `assigns/trail_pos/level` in `compute_quad_pb_explanation_into` | E | **confirmed-null** | +0.59% (8 clean) | [-0.35%, +1.53%] | False-positive at 4 blocks; reverted in `c8d2e8d` |
 | C5 / R-style | hoist `quad_pb_var_watches[v]` in `backtrack` | E | confirmed-null | -0.21% (4) | [-0.86%, +0.45%] | sd 0.41% suggests true effect is small |
 | C_all | C1+C3+C4+C5 stacked | E | hint-positive | (+0.45% w/ outlier; -1.55% excl) | wide | Most signal came from now-rejected C4 |
-| R2 | global stale flag for quad PB constraints | E | pending | — | — | Replace inline scan with one bool |
+| R2 | global stale flag for quad PB constraints | E | inconclusive (system contention) | +1.5% (4) | wide; sd 3.9% | Block 1 -4.2% (clean); blocks 2-4 ran 19-26s under host contention. Δmin -4.2%. Re-test required when host quiet. |
 | R3 | skip term update after recompute | E | known-regression | — | — | -6.5% in original test, not retesting |
 | R10 | sort terms by var index | E | known-regression | — | — | -2.4% in original test, not retesting |
 | R6 (orig) | swap deleted/blocker check order | E | unsafe | — | — | Loses correctness on deleted+blocker-true clauses |
@@ -121,6 +121,33 @@ These all target `--wz=sync`, not our `--wz=apart` workload. They are
   F8/F9/F13/F14/E5/E8/E9/E11 (need substantial work).
 * **Pending re-apply work**: F5, F15, V1, P10. Could be done in
   subsequent sessions.
+
+## Session-environment caveat (May 2026, second half)
+
+After ~17:50 in the dry-run session, the shared-VM host began showing
+sustained contention: baseline runs went from 16.8 s to 20.2 s
+(+20%), CPU MHz reading unchanged at 2100, no high-CPU processes
+visible to us — i.e., another tenant on the same hypervisor pulling
+cycles. This invalidates direct comparisons across the two
+contention regimes. Lessons:
+
+* **Always run an A==A null at the start of each bench session.** If
+  it shows wildly different absolute timing from a previous session,
+  cross-session comparisons are unsafe.
+* **Watch for absolute timing drift mid-session.** Block 1 of R2's
+  bench ran in 17 s; blocks 2–4 ran in 19–26 s. The within-block
+  ABBA design partially compensates, but a 50% per-run timing
+  change makes the variance-of-deltas estimator unreliable.
+* **Min-of-runs is more robust under contention than mean-of-runs.**
+  R2's min Δ was -4.2% (B faster) while mean Δ was +1.5% (B slower)
+  — the contention lifted B's runs more than A's in some blocks,
+  because B happened to fall in the contended period. Min picks
+  the cleanest run pair on each side.
+
+R2's status is left as "inconclusive" pending a re-test on a quiet
+machine. The directional signal from the clean block (block 1) and
+from min-of-runs is consistent with R2 being a small win; we can't
+confirm or refute it in this session.
 
 ## Headline interpretation
 
