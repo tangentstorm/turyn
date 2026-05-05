@@ -366,13 +366,23 @@ mode that runs the full check at every leaf as the walker enumerates.
 
 End-to-end demos:
 
-| (n, k) | leaves | leaves w/ exact TT | total TT 4-tuples | walk time | pre-filter overhead |
-|---|---|---|---|---|---|
-| 8, 2 | 65,536 | 3,456 (5.3%) | **8,192** | 4 s | 24,576× |
-| 10, 3 | 65,536 | 11,392 (17.4%) | **76,288** | 153 s | 105,561× |
+| (n, k) | leaves | canonical TT 4-tuples | walk time |
+|---|---|---|---|
+| 8, 2 | 65,536 | **2,048** (= 8,192 / 4) | 0.97 s |
+| 10, 3 | 65,536 | **19,072** (= 76,288 / 4) | 38 s |
 
-(Walk times reflect bit-packed `verify_full_turyn`, ~4× faster than
-the original `Vec<i32>`-based version.)
+Cumulative speedup chain at n=10 k=3 (Stage 4 → Stage 5 progress):
+
+| Optimisation | Walk time | Speedup |
+|---|---|---|
+| Original `verify_full_turyn` (Vec<i32>) | 650 s | — |
+| Bit-packed (popcount autocorr) | 153 s | 4.25× |
+| + T2 sign canonicalisation (X[0]=+1, Z[0]=+1) | **38 s** | **17×** total |
+
+The total counts drop by 4× under T2 canonicalisation because we
+fix 2 of 4 sign degrees of freedom (X→-X and Z→-Z each give 2×
+orbit reduction; per-leaf candidate set also shrinks 4× as fewer
+boundary tuples populate the index).
 
 The walker correctly enumerates **every** TT(n) 4-tuple at both
 scales (the totals are full symmetry orbits per the BDKR T1–T4
