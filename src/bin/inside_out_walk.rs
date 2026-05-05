@@ -80,6 +80,36 @@ fn make_bd(seq_len: usize, bits: u32, k: usize) -> Vec<i32> {
     s
 }
 
+/// Bit-reverse the low `k` bits of `x`. Bits k..32 are zeroed.
+fn reverse_k_bits(x: u32, k: usize) -> u32 {
+    let mut r = 0u32;
+    for i in 0..k {
+        if (x >> i) & 1 == 1 {
+            r |= 1u32 << (k - 1 - i);
+        }
+    }
+    r
+}
+
+/// Reversal of a 2k-bit boundary representation. The full sequence
+/// reversal `seq[i] -> seq[n-1-i]` corresponds, for the boundary
+/// (low_0..low_{k-1}, high_0..high_{k-1}), to swapping the two
+/// halves AND bit-reversing each.
+fn reverse_bd(bits: u32, k: usize) -> u32 {
+    let mask = (1u32 << k) - 1;
+    let low = bits & mask;
+    let high = (bits >> k) & mask;
+    reverse_k_bits(high, k) | (reverse_k_bits(low, k) << k)
+}
+
+/// True iff this boundary is the canonical (lex-min) representative
+/// under T1 (sequence reversal). Equivalent boundaries `bd` and
+/// `reverse_bd(bd, k)` produce the same bb-vector at every lag, so
+/// dropping the larger-keyed one is a 2× pruning per sequence.
+fn is_t1_canonical(bits: u32, k: usize) -> bool {
+    bits <= reverse_bd(bits, k)
+}
+
 /// "Very-high" lag range: `[n-k, n-1]`. At these lags the cross
 /// term (boundary × middle) is exactly zero, because the only pairs
 /// at lag s ≥ n-k with at least one position in the boundary
@@ -91,60 +121,71 @@ fn vh_lag_range(n: usize, k: usize) -> std::ops::RangeInclusive<usize> {
     (n - k)..=(n - 1)
 }
 
-/// Build boundary index `T_xy[v]` = list of `(X-bd-bits, Y-bd-bits)`
-/// keyed on the very-high-lag bb-vector `bb_X + bb_Y` at lags
-/// `[n-k..n-1]`. Length k.
+/// Build boundary index `T_xy[v]` keyed on very-high-lag
+/// `bb_X + bb_Y` (length k vector). Canonicalises every per-sequence
+/// T1 (reversal) and T2 (sign flip):
+/// - T2: `X[0] = +1`, `Y[0] = +1` (bit 0 set in low half)
+/// - T1: `bd_X ≤ reverse(bd_X)`, `bd_Y ≤ reverse(bd_Y)`
 ///
-/// Canonicalises under BDKR T2 (sequence negation `X → -X`): only
-/// includes `B_X` with bit 0 set (i.e. `X[0] = +1`). The full TT(n)
-/// orbit is recovered by 4-tuple negation symmetry; per-leaf
-/// candidate count is halved without changing the set of canonical
-/// solutions.
+/// Each gives 2× pruning per sequence; 16× total reduction of the
+/// XY-pair index.
 fn build_xy_table(k: usize, n: usize) -> HashMap<Vec<i32>, Vec<(u32, u32)>> {
     let mut t: HashMap<Vec<i32>, Vec<(u32, u32)>> = HashMap::new();
     let bd_count = 1u64 << (2 * k);
     let vh = vh_lag_range(n, k);
     for x_bits in 0..bd_count {
-        // T2 canonicalisation: X[0] = +1, i.e. bit 0 of x_bits set.
+        let xb_u32 = x_bits as u32;
         if (x_bits & 1) == 0 {
             continue;
         }
-        let xb = make_bd(n, x_bits as u32, k);
+        if !is_t1_canonical(xb_u32, k) {
+            continue;
+        }
+        let xb = make_bd(n, xb_u32, k);
         for y_bits in 0..bd_count {
-            let yb = make_bd(n, y_bits as u32, k);
+            let yb_u32 = y_bits as u32;
+            if (y_bits & 1) == 0 {
+                continue;
+            }
+            if !is_t1_canonical(yb_u32, k) {
+                continue;
+            }
+            let yb = make_bd(n, yb_u32, k);
             let key: Vec<i32> = vh
                 .clone()
                 .map(|s| autocorr_bb(&xb, s, k) + autocorr_bb(&yb, s, k))
                 .collect();
-            t.entry(key)
-                .or_default()
-                .push((x_bits as u32, y_bits as u32));
+            t.entry(key).or_default().push((xb_u32, yb_u32));
         }
     }
     t
 }
 
-/// Build boundary index `T_zw[v]` keyed on `2*bb_Z + 2*bb_W` at
-/// the very-high-lag range `[n-k..n-1]`. W has length `m = n-1` and
-/// only contributes for lags `s < m`.
-///
-/// Also canonicalised under T2: only includes `B_Z` with bit 0 set
-/// (`Z[0] = +1`). Combined with the T_xy canonicalisation this is
-/// 4× pruning of the 4-tuple candidate space (each TT orbit member
-/// has a unique canonical sign assignment for two of {X, Y, Z, W};
-/// fixing X[0] and Z[0] fixes 2 of 4 sign degrees of freedom).
+/// Build boundary index `T_zw[v]` keyed on very-high-lag
+/// `2*bb_Z + 2*bb_W`. Canonicalised under T1+T2 for both Z and W.
 fn build_zw_table(k: usize, n: usize) -> HashMap<Vec<i32>, Vec<(u32, u32)>> {
     let mut t: HashMap<Vec<i32>, Vec<(u32, u32)>> = HashMap::new();
     let m = n - 1;
     let bd_count = 1u64 << (2 * k);
     let vh = vh_lag_range(n, k);
     for z_bits in 0..bd_count {
+        let zb_u32 = z_bits as u32;
         if (z_bits & 1) == 0 {
             continue;
         }
-        let zb = make_bd(n, z_bits as u32, k);
+        if !is_t1_canonical(zb_u32, k) {
+            continue;
+        }
+        let zb = make_bd(n, zb_u32, k);
         for w_bits in 0..bd_count {
-            let wb = make_bd(m, w_bits as u32, k);
+            let wb_u32 = w_bits as u32;
+            if (w_bits & 1) == 0 {
+                continue;
+            }
+            if !is_t1_canonical(wb_u32, k) {
+                continue;
+            }
+            let wb = make_bd(m, wb_u32, k);
             let key: Vec<i32> = vh
                 .clone()
                 .map(|s| {
@@ -153,9 +194,7 @@ fn build_zw_table(k: usize, n: usize) -> HashMap<Vec<i32>, Vec<(u32, u32)>> {
                     bz + bw
                 })
                 .collect();
-            t.entry(key)
-                .or_default()
-                .push((z_bits as u32, w_bits as u32));
+            t.entry(key).or_default().push((zb_u32, wb_u32));
         }
     }
     t
