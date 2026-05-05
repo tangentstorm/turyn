@@ -307,9 +307,10 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
                 "together" => WzMode::Together,
                 "apart" => WzMode::Apart,
                 "sync" => WzMode::Sync,
+                "inside" => WzMode::Inside,
                 _ => {
                     eprintln!(
-                        "error: --wz must be one of cross|together|apart|sync (got '{}')\n",
+                        "error: --wz must be one of cross|together|apart|sync|inside (got '{}')\n",
                         v
                     );
                     print_help();
@@ -400,6 +401,7 @@ fn run_framework_mdd_mode(
         WzMode::Apart => "apart",
         WzMode::Together => "together",
         WzMode::Sync => "sync",
+        WzMode::Inside => "inside",
     };
     // Clock starts here — *before* `MddStagesAdapter::build`, which
     // loads the MDD file and enumerates every live boundary
@@ -1535,6 +1537,17 @@ fn main() {
                 run_framework_mdd_mode(cfg.problem, tuples, &cfg, true, mdd_k)
             }
             WzMode::Sync => run_framework_sync_mode(cfg.problem, &cfg, true),
+            WzMode::Inside => {
+                eprintln!(
+                    "error: --wz=inside is the experimental inside-out walker; \
+                     not yet wired into the framework dispatch.\n\
+                     Use the prototype binary instead:\n\
+                     \n    target/release/inside_out_walk <n> <k>\n\n\
+                     and FULL_CHECK=1 for end-to-end Turyn enumeration.\n\
+                     See docs/INSIDE-OUT-MDD.md for the design and Stage status."
+                );
+                std::process::exit(2);
+            }
         }
     }
 }
