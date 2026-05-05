@@ -22,6 +22,7 @@
 //! Tractable scales: n=10 k=3, n=14 k=4 (24-bit middle space, 16M
 //! leaves max), n=18 k=4 only with strong pruning.
 
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
 
@@ -771,22 +772,96 @@ fn main() {
         eprintln!("(FULL_CHECK=1: running full Turyn check at every leaf — slow at larger scales)");
     }
 
-    let mut pruned = 0u64;
-    let mut bufs = LeafBufs::new(n);
+    // Parallelise the level-0 branch fan-out: there are 256 children
+    // at level 0 (one for each 8-bit assignment to the 4 sequences x
+    // 2 positions). Dispatch each as a separate rayon task. Each
+    // task gets its own walker state + buffers + counters; we
+    // sum-reduce at the end. Top-level parallelism only — within
+    // each branch the recursion is sequential.
     let t_walk = std::time::Instant::now();
-    let (visited, matched, matched_exact, cand, exact) = walk(
-        &mut state,
-        n,
-        k,
-        nlev,
-        &target_to_count,
-        &mut pruned,
-        full_check_during_walk,
-        &t_xy,
-        &t_zw,
-        &mut bufs,
-    );
+    let (lo0, hi0) = pair_positions(0, n, k);
+    let n_bits_per_seq_l0 = match (lo0, hi0) {
+        (Some(_), Some(_)) => 2,
+        (Some(_), None) => 1,
+        (None, _) => unreachable!(),
+    };
+    let n_branches_l0 = 1u32 << (4 * n_bits_per_seq_l0);
+
+    let level0_state = state.clone();
+    let aggregate: (u64, u64, u64, u64, u64, u64) = (0..n_branches_l0)
+        .into_par_iter()
+        .map(|branch| {
+            let mut local_state = level0_state.clone();
+            let mut local_pruned = 0u64;
+            let mut local_bufs = LeafBufs::new(n);
+            // Apply this level-0 branch's bits to local_state.
+            for seq_i in 0..4 {
+                let bits = (branch >> (seq_i * n_bits_per_seq_l0))
+                    & ((1u32 << n_bits_per_seq_l0) - 1);
+                let val_lo = if (bits & 1) == 1 { 1i32 } else { -1 };
+                let val_hi = if n_bits_per_seq_l0 > 1 && ((bits >> 1) & 1) == 1 {
+                    1i32
+                } else {
+                    -1i32
+                };
+                let seq_len = if seq_i == 3 { n - 1 } else { n };
+                if let Some(p_lo) = lo0 {
+                    if p_lo < seq_len {
+                        local_state.seqs[seq_i][p_lo] = val_lo;
+                    }
+                }
+                if n_bits_per_seq_l0 > 1 {
+                    if let Some(p_hi) = hi0 {
+                        if p_hi < seq_len {
+                            local_state.seqs[seq_i][p_hi] = val_hi;
+                        }
+                    }
+                }
+            }
+            // Recompute mm_sum from scratch (matches what `walk` does).
+            let mut new_mm = vec![0i32; n - 1];
+            for s in 1..n {
+                for seq_i in 0..4 {
+                    let weight = if seq_i < 2 { 1 } else { 2 };
+                    let seq_len = if seq_i == 3 { n - 1 } else { n };
+                    let mid_lo = k;
+                    let mid_hi = seq_len - k;
+                    if mid_lo + s >= mid_hi {
+                        continue;
+                    }
+                    let mut sum = 0i32;
+                    for i in mid_lo..(mid_hi - s) {
+                        sum += local_state.seqs[seq_i][i] * local_state.seqs[seq_i][i + s];
+                    }
+                    new_mm[s - 1] += weight * sum;
+                }
+            }
+            local_state.mm_sum = new_mm;
+            local_state.level = 1;
+            // Recurse on remaining levels.
+            let (v, lp, le, tp, te) = walk(
+                &mut local_state,
+                n,
+                k,
+                nlev,
+                &target_to_count,
+                &mut local_pruned,
+                full_check_during_walk,
+                &t_xy,
+                &t_zw,
+                &mut local_bufs,
+            );
+            (v, lp, le, tp, te, local_pruned)
+        })
+        .reduce(
+            || (0, 0, 0, 0, 0, 0),
+            |(a1, a2, a3, a4, a5, a6), (b1, b2, b3, b4, b5, b6)| {
+                (a1 + b1, a2 + b2, a3 + b3, a4 + b4, a5 + b5, a6 + b6)
+            },
+        );
+    let (visited, matched, matched_exact, cand, exact, pruned) = aggregate;
     let walk_secs = t_walk.elapsed().as_secs_f64();
+    let _ = state; // suppress unused warning
 
     eprintln!("\n=== Walker results ===");
     eprintln!("leaves visited        = {}", visited);
