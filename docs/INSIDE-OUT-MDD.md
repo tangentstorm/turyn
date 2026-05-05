@@ -364,20 +364,19 @@ extended with `verify_full_turyn` (exhaustive Turyn-condition check
 on a 4-tuple boundary against the leaf's middle) and a `FULL_CHECK=1`
 mode that runs the full check at every leaf as the walker enumerates.
 
-End-to-end demo at n=8 k=2:
+End-to-end demos:
 
-```
-leaves visited      = 65,536
-leaves with pre-match = 65,536  (always — target [0,0] is M-independent)
-leaves with EXACT TT solution = 3,456  (5.3%)
-total exact 4-tuples = 8,192
-pre-filter overhead = 24,576×  (pre-filter / exact)
-walk time           = 26 s
-naive total leaves  = 65,536
-```
+| (n, k) | leaves | leaves w/ exact TT | total TT 4-tuples | walk time | pre-filter overhead |
+|---|---|---|---|---|---|
+| 8, 2 | 65,536 | 3,456 (5.3%) | **8,192** | 16 s | 24,576× |
+| 10, 3 | 65,536 | 11,392 (17.4%) | **76,288** | 650 s | 105,561× |
 
-The walker correctly enumerates **every TT(8) solution** in 26 s on
-this VM. The pre-filter has 24,576× overhead vs the exact set — the
+The walker correctly enumerates **every** TT(n) 4-tuple at both
+scales (the totals are full symmetry orbits per the BDKR T1–T4
+group). Per-leaf cost grows as `pre_filter_count × verify_cost`,
+and pre-filter at small k is too coarse — the walker is exhaustive
+across leaves but spends most of its time per-leaf in the verify
+loop. The pre-filter has 24,576× overhead vs the exact set — the
 verify step kills 99.996 % of the surviving boundaries per leaf —
 but the verify is cheap enough at small n that the walker still
 completes.
