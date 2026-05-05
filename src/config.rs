@@ -384,6 +384,14 @@ pub(crate) enum WzMode {
     /// solver absorbs full BDKR (i)–(vi) + Turyn identity as per-lag
     /// quad PB; learned clauses persist across the walk. See `sync_walker`.
     Sync,
+    /// Inside-out 4-sequence walker that places middle bits centre-
+    /// outward, tracks Turyn-weighted lag-sum vectors (`mm_sum`), and
+    /// queries a precomputed boundary index by the very-high-lag bb
+    /// vector to retrieve compatible 4-tuple boundaries. See
+    /// `docs/INSIDE-OUT-MDD.md` and `src/bin/inside_out_walk.rs`.
+    /// **EXPERIMENTAL — prototype-only as of May 2026; not yet wired
+    /// into the framework dispatch.**
+    Inside,
 }
 
 impl Default for SearchConfig {
@@ -475,6 +483,7 @@ impl SearchConfig {
                 WzMode::Together => "together",
                 WzMode::Apart => "apart",
                 WzMode::Sync => "sync",
+                WzMode::Inside => "inside",
             };
             parts.push(format!("--wz={label}"));
         }

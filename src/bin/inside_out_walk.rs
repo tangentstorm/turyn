@@ -217,6 +217,75 @@ fn mm_bound_static(n: usize, k: usize, s: usize) -> i32 {
     }
 }
 
+/// Count of mm-pairs at lag s that are still UNPLACED in the partial
+/// middle. For each sequence: number of pairs (i, j=i+s) in middle
+/// where at least one of i, j is currently unset (= 0 in `state.seqs`).
+/// Bound: each unplaced pair can contribute ±1 to mm[s] for that
+/// sequence (so ±weight to Turyn-weighted total).
+fn future_mm_bound(state: &WalkerState, n: usize, k: usize, s: usize) -> i32 {
+    let mut bound = 0i32;
+    for seq_i in 0..4 {
+        let weight = if seq_i < 2 { 1 } else { 2 };
+        let seq_len = if seq_i == 3 { n - 1 } else { n };
+        let mid_lo = k;
+        let mid_hi = seq_len - k;
+        if mid_lo + s >= mid_hi {
+            continue;
+        }
+        let mut unplaced = 0i32;
+        for i in mid_lo..(mid_hi - s) {
+            if state.seqs[seq_i][i] == 0 || state.seqs[seq_i][i + s] == 0 {
+                unplaced += 1;
+            }
+        }
+        bound += weight * unplaced;
+    }
+    bound
+}
+
+/// Maximum |bb[s] + cross[s]| achievable across all 4-sequence
+/// boundary tuples at lag `s` (Turyn-weighted). bb pairs are
+/// `(i, j=i+s)` with both endpoints in boundary; cross are pairs
+/// straddling boundary/middle. Each pair contributes ±1; the bound
+/// is the count of pairs times the Turyn weight.
+fn bd_capacity_at_lag(n: usize, k: usize, s: usize) -> i32 {
+    let mut cap = 0i32;
+    for seq_i in 0..4 {
+        let weight = if seq_i < 2 { 1 } else { 2 };
+        let seq_len = if seq_i == 3 { n - 1 } else { n };
+        let mid_lo = k;
+        let mid_hi = seq_len - k;
+        // bb pairs: i in low-bd [0..k), j=i+s in high-bd [seq_len-k..seq_len)
+        let mut bb_pairs = 0i32;
+        for i in 0..k {
+            let j = i + s;
+            if j >= seq_len {
+                break;
+            }
+            if (j >= mid_hi) || (j < k && i < k) {
+                // both in boundary
+                bb_pairs += 1;
+            }
+        }
+        // cross pairs: straddle bd/mid
+        let mut cross_pairs = 0i32;
+        if s < seq_len {
+            for i in 0..(seq_len - s) {
+                let j = i + s;
+                let i_bd = i < k || i >= mid_hi;
+                let i_mid = i >= mid_lo && i < mid_hi;
+                let j_bd = j < k || j >= mid_hi;
+                let j_mid = j >= mid_lo && j < mid_hi;
+                if (i_bd && j_mid) || (i_mid && j_bd) {
+                    cross_pairs += 1;
+                }
+            }
+        }
+        cap += weight * (bb_pairs + cross_pairs);
+    }
+    cap
+}
+
 /// Given the mm_sum at a leaf (full middle placed), compute the
 /// very-high-lag target the boundary's bb must produce:
 /// `bb_vh(s) = -mm_sum(s) - cross_vh(s)`. At very-high lags
@@ -249,8 +318,12 @@ fn build_target_to_count(
 /// Full Turyn check on a 4-tuple `(B_X, B_Y, B_Z, B_W)` boundary
 /// combined with a leaf's middle assignment. Returns true iff
 /// `N_X(s) + N_Y(s) + 2 N_Z(s) + 2 N_W(s) = 0` for all `s in 1..n`.
-/// The middle bits live in `state.seqs` (boundary positions are 0).
-fn verify_full_turyn(
+///
+/// Optimised: writes boundary bits into pre-allocated mutable buffers
+/// (avoiding 4× per-call clones), and short-circuits on first violation
+/// via a single combined-sequence-loop that computes all 4 autocorrelations
+/// at lag s in one pass before testing.
+fn verify_full_turyn_into(
     state: &WalkerState,
     n: usize,
     k: usize,
@@ -258,14 +331,21 @@ fn verify_full_turyn(
     by_bits: u32,
     bz_bits: u32,
     bw_bits: u32,
+    sx: &mut Vec<i32>,
+    sy: &mut Vec<i32>,
+    sz: &mut Vec<i32>,
+    sw: &mut Vec<i32>,
 ) -> bool {
     let m = n - 1;
-    // Materialize the 4 full sequences from middle (in state) +
-    // boundary (from bits).
-    let mut sx = state.seqs[0].clone();
-    let mut sy = state.seqs[1].clone();
-    let mut sz = state.seqs[2].clone();
-    let mut sw = state.seqs[3].clone();
+    // Copy middle bits (everything; boundary slots will be overwritten).
+    sx.clear();
+    sx.extend_from_slice(&state.seqs[0]);
+    sy.clear();
+    sy.extend_from_slice(&state.seqs[1]);
+    sz.clear();
+    sz.extend_from_slice(&state.seqs[2]);
+    sw.clear();
+    sw.extend_from_slice(&state.seqs[3]);
     for i in 0..k {
         sx[i] = if (bx_bits >> i) & 1 == 1 { 1 } else { -1 };
         sx[n - k + i] = if (bx_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
@@ -276,25 +356,23 @@ fn verify_full_turyn(
         sw[i] = if (bw_bits >> i) & 1 == 1 { 1 } else { -1 };
         sw[m - k + i] = if (bw_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
     }
-    // Check: NX(s) + NY(s) + 2 NZ(s) + 2 NW(s) = 0 for s in 1..n
+    // Combined per-lag loop with early exit.
     for s in 1..n {
-        let nx = autocorr_full_seq(&sx, s);
-        let ny = autocorr_full_seq(&sy, s);
-        let nz = autocorr_full_seq(&sz, s);
-        let nw = if s < m { autocorr_full_seq(&sw, s) } else { 0 };
-        if nx + ny + 2 * nz + 2 * nw != 0 {
+        let mut total = 0i32;
+        let nx_lim = n - s;
+        for i in 0..nx_lim {
+            total += sx[i] * sx[i + s] + sy[i] * sy[i + s] + 2 * sz[i] * sz[i + s];
+        }
+        if s < m {
+            for i in 0..(m - s) {
+                total += 2 * sw[i] * sw[i + s];
+            }
+        }
+        if total != 0 {
             return false;
         }
     }
     true
-}
-
-fn autocorr_full_seq(x: &[i32], s: usize) -> i32 {
-    let n = x.len();
-    if s >= n {
-        return 0;
-    }
-    (0..n - s).map(|i| x[i] * x[i + s]).sum()
 }
 
 /// At a leaf, exhaustively check every (B_X, B_Y, B_Z, B_W)
@@ -307,11 +385,10 @@ fn leaf_full_check(
     target: &[i32],
     t_xy: &HashMap<Vec<i32>, Vec<(u32, u32)>>,
     t_zw: &HashMap<Vec<i32>, Vec<(u32, u32)>>,
+    bufs: &mut LeafBufs,
 ) -> (u64, u64) {
     let mut pre_filter = 0u64;
     let mut exact = 0u64;
-    // For each (xy_v, zw_v) pair with xy_v + zw_v = target, enumerate
-    // (X, Y) × (Z, W).
     for (zw_v, zw_pairs) in t_zw {
         let xy_target: Vec<i32> = target.iter().zip(zw_v).map(|(a, b)| a - b).collect();
         let xy_pairs = match t_xy.get(&xy_target) {
@@ -321,13 +398,35 @@ fn leaf_full_check(
         for &(bx, by) in xy_pairs {
             for &(bz, bw) in zw_pairs {
                 pre_filter += 1;
-                if verify_full_turyn(state, n, k, bx, by, bz, bw) {
+                if verify_full_turyn_into(
+                    state, n, k, bx, by, bz, bw,
+                    &mut bufs.sx, &mut bufs.sy, &mut bufs.sz, &mut bufs.sw,
+                ) {
                     exact += 1;
                 }
             }
         }
     }
     (pre_filter, exact)
+}
+
+/// Reusable per-leaf scratch buffers for `verify_full_turyn_into`.
+struct LeafBufs {
+    sx: Vec<i32>,
+    sy: Vec<i32>,
+    sz: Vec<i32>,
+    sw: Vec<i32>,
+}
+
+impl LeafBufs {
+    fn new(n: usize) -> Self {
+        Self {
+            sx: Vec::with_capacity(n),
+            sy: Vec::with_capacity(n),
+            sz: Vec::with_capacity(n),
+            sw: Vec::with_capacity(n),
+        }
+    }
 }
 
 /// Recursive inside-out walk. Returns a tuple of
@@ -342,14 +441,14 @@ fn walk(
     full_check: bool,
     t_xy: &HashMap<Vec<i32>, Vec<(u32, u32)>>,
     t_zw: &HashMap<Vec<i32>, Vec<(u32, u32)>>,
+    bufs: &mut LeafBufs,
 ) -> (u64, u64, u64, u64, u64) {
     // Leaf?
     if state.level >= nlev {
-        // Compute very-high-lag target (exact: cross = 0 here)
         let target = vh_lag_target_from_leaf(state, n, k);
         let total_cand = target_to_count.get(&target).copied().unwrap_or(0);
         let exact = if full_check && total_cand > 0 {
-            leaf_full_check(state, n, k, &target, t_xy, t_zw).1
+            leaf_full_check(state, n, k, &target, t_xy, t_zw, bufs).1
         } else {
             0
         };
@@ -358,23 +457,21 @@ fn walk(
         return (1, leaves_pre, leaves_exact, total_cand, exact);
     }
 
-    // Pruning: can the current mm_sum still satisfy
-    //   mm_sum[s] + cross[s] + bb[s] = 0  for every lag s?
-    // Conservative: |mm_sum[s]| ≤ |bb[s]| + |cross[s]| + (remaining mm contribution).
-    // Static bound: |bb_total[s]| ≤ 8k + ... but easier — use the
-    // global Turyn bound `|sum_all_terms| ≤ 6 * n` and prune anything
-    // already obviously bad.
-    let m = n - 1;
+    // Pruning: can the current mm_sum still land within the
+    // boundary's compensation capacity at every lag?
+    //
+    // Constraint per lag s:  mm[s] + bb[s] + cross[s] = 0  ==>
+    //   mm_total_at_leaf[s]  =  -(bb + cross)
+    //   |mm_total_at_leaf[s]| ≤ bd_capacity[s]
+    //
+    // At the current node (depth d), partial_mm[s] is fixed; future
+    // mm contribution can swing total mm by at most ± future_bound[s].
+    //
+    // Prune if  |partial_mm[s]| - future_bound[s] > bd_capacity[s].
     for s in 1..n {
-        let bound_mm_remaining = mm_bound_static(n, k, s);
-        // If even with best-case cancellation the boundary can't fix
-        // mm_sum[s], prune.
-        // Approximate boundary capability: at most 6*k pair-products
-        // at any single lag (X 2 + Y 2 + Z 2 + W 2 with weights 1,1,2,2 → max 12 pairs at distance s).
-        // So |bb[s]| + |cross[s]| ≤ 12k for typical lag. For high lag s, fewer pairs.
-        let bd_capacity = 12 * (k as i32);
-        let _ = m;
-        if (state.mm_sum[s - 1].abs() - bound_mm_remaining).abs() > bd_capacity * 2 {
+        let future_bound = future_mm_bound(state, n, k, s);
+        let bd_cap = bd_capacity_at_lag(n, k, s);
+        if state.mm_sum[s - 1].abs() - future_bound > bd_cap {
             *pruned_out += 1;
             return (0, 0, 0, 0, 0);
         }
@@ -459,6 +556,7 @@ fn walk(
             full_check,
             t_xy,
             t_zw,
+            bufs,
         );
         total_visited += v;
         total_match += lp;
@@ -554,6 +652,7 @@ fn main() {
     }
 
     let mut pruned = 0u64;
+    let mut bufs = LeafBufs::new(n);
     let t_walk = std::time::Instant::now();
     let (visited, matched, matched_exact, cand, exact) = walk(
         &mut state,
@@ -565,6 +664,7 @@ fn main() {
         full_check_during_walk,
         &t_xy,
         &t_zw,
+        &mut bufs,
     );
     let walk_secs = t_walk.elapsed().as_secs_f64();
 
@@ -647,7 +747,9 @@ fn main() {
         // Turyn check on every pre-filtered candidate and report the
         // exact survivor count.
         let t_full = std::time::Instant::now();
-        let (pre_filter, exact) = leaf_full_check(&known_state, n, k, &target, &t_xy, &t_zw);
+        let mut sanity_bufs = LeafBufs::new(n);
+        let (pre_filter, exact) =
+            leaf_full_check(&known_state, n, k, &target, &t_xy, &t_zw, &mut sanity_bufs);
         eprintln!(
             "Stage-4 full check at known leaf:  {} pre-filter -> {} pass full Turyn  ({:.2}s)",
             pre_filter,

@@ -2869,6 +2869,7 @@ pub(crate) fn run_mdd_sat_search(
         WzMode::Apart => "apart",
         WzMode::Together => "together",
         WzMode::Sync => unreachable!("sync branched above"),
+        WzMode::Inside => unreachable!("inside branched above"),
     };
     let mut engine = SearchEngine::<MddPayload>::new(
         EngineConfig {
