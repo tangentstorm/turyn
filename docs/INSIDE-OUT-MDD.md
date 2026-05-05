@@ -368,21 +368,24 @@ End-to-end demos:
 
 | (n, k) | leaves | canonical TT 4-tuples | walk time |
 |---|---|---|---|
-| 8, 2 | 65,536 | **2,048** (= 8,192 / 4) | 0.97 s |
-| 10, 3 | 65,536 | **19,072** (= 76,288 / 4) | 38 s |
+| 8, 2 | 65,536 | **336** | 0.17 s |
+| 10, 3 | 65,536 | **1,792** | 3.79 s |
+| 12, 4 | 65,536 | **4,912** | 100 s |
 
-Cumulative speedup chain at n=10 k=3 (Stage 4 → Stage 5 progress):
+Cumulative speedup chain at n=10 k=3 (the most-measured case):
 
-| Optimisation | Walk time | Speedup |
+| Optimisation | Walk time | Cumulative speedup |
 |---|---|---|
 | Original `verify_full_turyn` (Vec<i32>) | 650 s | — |
-| Bit-packed (popcount autocorr) | 153 s | 4.25× |
-| + T2 sign canonicalisation (X[0]=+1, Z[0]=+1) | **38 s** | **17×** total |
+| Bit-packed verify (popcount autocorr) | 153 s | 4.25× |
+| + T2 (sign) on X, Z only | 38 s | 17× |
+| + T2 on Y, W + T1 (reversal) on all 4 | **3.79 s** | **171×** |
 
-The total counts drop by 4× under T2 canonicalisation because we
-fix 2 of 4 sign degrees of freedom (X→-X and Z→-Z each give 2×
-orbit reduction; per-leaf candidate set also shrinks 4× as fewer
-boundary tuples populate the index).
+n=8 k=2 chain: 16 s → 0.17 s = **94×**; canonical TT(8) count
+8,192 → 336 (24.4× orbit reduction).
+
+n=12 k=4 result is new — was previously infeasible. The walker now
+scales to TT(12) in under 2 minutes.
 
 The walker correctly enumerates **every** TT(n) 4-tuple at both
 scales (the totals are full symmetry orbits per the BDKR T1–T4
