@@ -22,6 +22,7 @@
 //! Tractable scales: n=10 k=3, n=14 k=4 (24-bit middle space, 16M
 //! leaves max), n=18 k=4 only with strong pruning.
 
+use radical::Solver;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
@@ -497,6 +498,154 @@ impl LeafPacked {
     }
 }
 
+/// SAT-based per-leaf feasibility check: returns true if there
+/// EXISTS some 4-tuple boundary `(B_X, B_Y, B_Z, B_W)` consistent
+/// with this leaf's middle assignment under the full Turyn
+/// condition. Used as an UNSAT prover before per-candidate
+/// enumeration: if no boundary works, skip enumeration entirely.
+///
+/// Encoding (per lag s):
+///   N(s) = N_bb(B,s) + N_cross(B,M,s) + N_mm(M,s)
+///   Σ_seq w_seq * N_seq(s) = 0 (Turyn condition)
+///
+/// In Boolean (b[i]=+1 iff var_i=true), N_bb pair contribution is
+/// `2 * I[b[i]=b[j]] - 1`, encoded as two quad-PB terms (both-true,
+/// both-false). N_cross pair with M[mid]=±1 encodes
+/// `2 * I[b[bd] sign matches M sign] - 1` as one quad-PB term against
+/// a `true_var` literal. mm is constant.
+///
+/// Per lag we add ONE quad-PB EQ constraint summing all
+/// (Turyn-weighted) bb + cross indicator terms with target value
+/// `(K_total - mm_total) / 2` where K_total is the structural pair
+/// count. If `(K_total - mm_total)` is odd, the constraint is
+/// unsatisfiable and we return false immediately.
+fn leaf_sat_feasible(leaf: &LeafPacked, n: usize, k: usize) -> bool {
+    let m = n - 1;
+    // Variable layout: [1..=2k] = X-bd, [2k+1..=4k] = Y-bd,
+    // [4k+1..=6k] = Z-bd, [6k+1..=8k] = W-bd, then [8k+1] = true_var.
+    // Boundary positions: low-k bits at sequence positions [0..k),
+    // high-k bits at sequence positions [seq_len-k..seq_len).
+    // var_for_bd_pos(seq_idx, k_offset, side) returns 1-based var id.
+    let var_off = |seq: usize| 2 * k * seq + 1;
+    let bd_var = |seq: usize, idx: usize| -> i32 {
+        // idx in [0..2k): low-k first, high-k second.
+        (var_off(seq) + idx) as i32
+    };
+    // Map sequence position → boundary var (None if middle).
+    let bd_var_for_pos = |seq: usize, pos: usize, seq_len: usize| -> Option<i32> {
+        if pos < k {
+            Some(bd_var(seq, pos))
+        } else if pos >= seq_len - k {
+            Some(bd_var(seq, k + (pos - (seq_len - k))))
+        } else {
+            None
+        }
+    };
+    let true_var = (8 * k + 1) as i32;
+
+    let mut s = Solver::new();
+    // Force true_var = +1.
+    s.add_clause([true_var]);
+    // Ensure all bd vars exist via tautology clauses.
+    for seq in 0..4 {
+        for idx in 0..(2 * k) {
+            let v = bd_var(seq, idx);
+            s.add_clause([v, -v]);
+        }
+    }
+
+    // Helper: M[pos] for sequence seq, returning ±1 (0 if middle position
+    // and the `seq_len` exceeds n; not expected at leaf).
+    let mid_value = |seq: usize, pos: usize, seq_len: usize, leaf: &LeafPacked| -> i32 {
+        let packed = match seq {
+            0 => leaf.mid_x,
+            1 => leaf.mid_y,
+            2 => leaf.mid_z,
+            3 => leaf.mid_w,
+            _ => unreachable!(),
+        };
+        let _ = seq_len;
+        if (packed >> pos) & 1 == 1 {
+            1
+        } else {
+            -1
+        }
+    };
+
+    // For each lag, build the per-lag quad-PB constraint.
+    for lag in 1..n {
+        let mut lits_a: Vec<i32> = Vec::new();
+        let mut lits_b: Vec<i32> = Vec::new();
+        let mut coeffs: Vec<u32> = Vec::new();
+        let mut k_total: i32 = 0;
+        let mut mm_const: i32 = 0;
+
+        for seq in 0..4 {
+            let weight = if seq < 2 { 1u32 } else { 2u32 };
+            let seq_len = if seq == 3 { m } else { n };
+            if lag >= seq_len {
+                continue;
+            }
+            for i in 0..(seq_len - lag) {
+                let j = i + lag;
+                let v_i = bd_var_for_pos(seq, i, seq_len);
+                let v_j = bd_var_for_pos(seq, j, seq_len);
+                match (v_i, v_j) {
+                    (Some(va), Some(vb)) => {
+                        // bb pair: 2 quad-PB terms (both true, both false)
+                        lits_a.push(va);
+                        lits_b.push(vb);
+                        coeffs.push(weight);
+                        lits_a.push(-va);
+                        lits_b.push(-vb);
+                        coeffs.push(weight);
+                        k_total += weight as i32;
+                    }
+                    (Some(va), None) => {
+                        // cross pair: M[j] is constant
+                        let mv = mid_value(seq, j, seq_len, leaf);
+                        let bd_lit = if mv == 1 { va } else { -va };
+                        lits_a.push(bd_lit);
+                        lits_b.push(true_var);
+                        coeffs.push(weight);
+                        k_total += weight as i32;
+                    }
+                    (None, Some(vb)) => {
+                        let mv = mid_value(seq, i, seq_len, leaf);
+                        let bd_lit = if mv == 1 { vb } else { -vb };
+                        lits_a.push(bd_lit);
+                        lits_b.push(true_var);
+                        coeffs.push(weight);
+                        k_total += weight as i32;
+                    }
+                    (None, None) => {
+                        // mm pair: constant
+                        let mi = mid_value(seq, i, seq_len, leaf);
+                        let mj = mid_value(seq, j, seq_len, leaf);
+                        mm_const += (weight as i32) * mi * mj;
+                    }
+                }
+            }
+        }
+        // The per-lag constraint:
+        //   2*Σ A_indicator - K_total + mm_const = 0
+        // => Σ A_indicator = (K_total - mm_const) / 2
+        let num = k_total - mm_const;
+        if num < 0 || num % 2 != 0 {
+            return false;
+        }
+        let target = (num / 2) as u32;
+        if target as i32 > k_total {
+            return false;
+        }
+        s.add_quad_pb_eq(&lits_a, &lits_b, &coeffs, target);
+    }
+
+    // Solve: SAT means there exists a feasible boundary; UNSAT means
+    // no boundary works for this leaf and we can skip per-candidate.
+    matches!(s.solve(), Some(true))
+}
+
 /// At a leaf, exhaustively check every (B_X, B_Y, B_Z, B_W)
 /// 4-tuple that passes the very-high-lag pre-filter. Returns
 /// (pre_filter_count, exact_solution_count). Uses bit-packed
@@ -568,13 +717,34 @@ fn walk(
     if state.level >= nlev {
         let target = vh_lag_target_from_leaf(state, n, k);
         let total_cand = target_to_count.get(&target).copied().unwrap_or(0);
+        // Stage 5b: SAT pre-check. If gate set, build a per-leaf SAT
+        // instance asking "does ANY 4-tuple boundary work for this M?".
+        // If UNSAT, skip per-candidate enumeration entirely. Soundness:
+        // the SAT instance encodes the EXACT Turyn condition with M
+        // baked in; UNSAT proves no boundary satisfies all lags
+        // simultaneously, so per-candidate would have returned 0.
+        let mut sat_used = 0u64;
+        let mut sat_unsat = 0u64;
         let exact = if full_check && total_cand > 0 {
+            let leaf = LeafPacked::from_state(state, n, k);
+            let do_sat_pre = std::env::var("SAT_PRECHECK").is_ok();
+            if do_sat_pre {
+                sat_used = 1;
+                if !leaf_sat_feasible(&leaf, n, k) {
+                    sat_unsat = 1;
+                    // Track via pruned_out as a synthetic prune count.
+                    *pruned_out += 1;
+                    let leaves_pre = 1; // visited, but we skipped enum
+                    return (1, leaves_pre, 0, total_cand, 0);
+                }
+            }
             leaf_full_check(state, n, k, &target, t_xy, t_zw, bufs).1
         } else {
             0
         };
         let leaves_pre = if total_cand > 0 { 1 } else { 0 };
         let leaves_exact = if exact > 0 { 1 } else { 0 };
+        let _ = (sat_used, sat_unsat);
         return (1, leaves_pre, leaves_exact, total_cand, exact);
     }
 

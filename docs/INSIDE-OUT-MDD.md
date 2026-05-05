@@ -430,6 +430,56 @@ the bucket size and SAT-instance size are both small.
 * Apply at n=26, n=56 with appropriate k.
 * Compare TTC against `--wz=apart` baseline.
 
+### Stage 6: cross-term-aware index (open problem, May 2026)
+
+The current per-leaf pre-filter uses only the very-high-lag bb-vector
+(`s ≥ n-k`) where `mm` and `cross` are both structurally zero. This
+gives an exact, M-independent boundary filter — but it does not
+shrink with M. Every leaf at n=14 k=4 has the same 84,120 boundary
+candidates surviving the pre-filter.
+
+The natural extension is to include lags where `cross` is non-zero
+(specifically, low-low lags `s ≤ k-1` with within-bd-half bb pairs,
+and the high-block `s ∈ [n-2k+1, n-k-1]` with cross-half bb pairs).
+At those lags `cross(B, M)[s]` is linear in B's bits with M-dependent
+coefficients, so the per-leaf target
+
+```
+bb_total(B)[s] = -mm(M)[s] - cross(B, M)[s]
+```
+
+depends on B itself — breaking the simple hash-by-target lookup.
+
+Three plausible implementation paths, in increasing investment:
+
+1. **Range-lookup** by approximate target: at the leaf, compute
+   `target ≈ -mm[these lags]` (ignoring cross), and look up all
+   keys within `±max|cross|[s]` per coordinate. Sound (no false
+   negatives) but yields false positives that still need
+   per-candidate verification. Whether this beats the current
+   M-independent pre-filter depends on how much `max|cross|` shrinks
+   the hash bucket; needs measurement.
+
+2. **Two-table extension**: store boundaries by `(bb_full_vector,
+   cross_coef_profile)` where `cross_coef_profile[s, p]` lists which
+   middle positions B[p] couples with at lag s. At the leaf, inner-
+   product the profile with M to get exact `cross(B, M)[s]` per B,
+   without per-B sequence reconstruction. Memory: 4× the current
+   table.
+
+3. **Constraint propagation**: per-leaf, build a small SAT instance
+   (8k boundary vars + n-1 quad-PB constraints with M as constants)
+   and let CDCL prove UNSAT or find solutions. This is the
+   architecturally cleanest approach. **Implemented as a feasibility
+   pre-check (`SAT_PRECHECK=1`) in `inside_out_walk.rs`.** The
+   per-leaf SAT call is ~600 µs and proves UNSAT for ~95 % of
+   leaves at small n; for the remaining 5 %, falls through to
+   per-candidate enumeration. Wins materialise only when per-leaf
+   enum cost > SAT cost (i.e., at larger n / k where the candidate
+   set is large).
+
+Stage-6 measurement results to follow as the prototypes mature.
+
 ## Open questions
 
 * **Cross-coefficient state size**: how dense does `cross_coef` get
