@@ -368,8 +368,11 @@ End-to-end demos:
 
 | (n, k) | leaves | leaves w/ exact TT | total TT 4-tuples | walk time | pre-filter overhead |
 |---|---|---|---|---|---|
-| 8, 2 | 65,536 | 3,456 (5.3%) | **8,192** | 16 s | 24,576× |
-| 10, 3 | 65,536 | 11,392 (17.4%) | **76,288** | 650 s | 105,561× |
+| 8, 2 | 65,536 | 3,456 (5.3%) | **8,192** | 4 s | 24,576× |
+| 10, 3 | 65,536 | 11,392 (17.4%) | **76,288** | 153 s | 105,561× |
+
+(Walk times reflect bit-packed `verify_full_turyn`, ~4× faster than
+the original `Vec<i32>`-based version.)
 
 The walker correctly enumerates **every** TT(n) 4-tuple at both
 scales (the totals are full symmetry orbits per the BDKR T1–T4
