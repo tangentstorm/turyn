@@ -94,11 +94,21 @@ fn vh_lag_range(n: usize, k: usize) -> std::ops::RangeInclusive<usize> {
 /// Build boundary index `T_xy[v]` = list of `(X-bd-bits, Y-bd-bits)`
 /// keyed on the very-high-lag bb-vector `bb_X + bb_Y` at lags
 /// `[n-k..n-1]`. Length k.
+///
+/// Canonicalises under BDKR T2 (sequence negation `X → -X`): only
+/// includes `B_X` with bit 0 set (i.e. `X[0] = +1`). The full TT(n)
+/// orbit is recovered by 4-tuple negation symmetry; per-leaf
+/// candidate count is halved without changing the set of canonical
+/// solutions.
 fn build_xy_table(k: usize, n: usize) -> HashMap<Vec<i32>, Vec<(u32, u32)>> {
     let mut t: HashMap<Vec<i32>, Vec<(u32, u32)>> = HashMap::new();
     let bd_count = 1u64 << (2 * k);
     let vh = vh_lag_range(n, k);
     for x_bits in 0..bd_count {
+        // T2 canonicalisation: X[0] = +1, i.e. bit 0 of x_bits set.
+        if (x_bits & 1) == 0 {
+            continue;
+        }
         let xb = make_bd(n, x_bits as u32, k);
         for y_bits in 0..bd_count {
             let yb = make_bd(n, y_bits as u32, k);
@@ -117,12 +127,21 @@ fn build_xy_table(k: usize, n: usize) -> HashMap<Vec<i32>, Vec<(u32, u32)>> {
 /// Build boundary index `T_zw[v]` keyed on `2*bb_Z + 2*bb_W` at
 /// the very-high-lag range `[n-k..n-1]`. W has length `m = n-1` and
 /// only contributes for lags `s < m`.
+///
+/// Also canonicalised under T2: only includes `B_Z` with bit 0 set
+/// (`Z[0] = +1`). Combined with the T_xy canonicalisation this is
+/// 4× pruning of the 4-tuple candidate space (each TT orbit member
+/// has a unique canonical sign assignment for two of {X, Y, Z, W};
+/// fixing X[0] and Z[0] fixes 2 of 4 sign degrees of freedom).
 fn build_zw_table(k: usize, n: usize) -> HashMap<Vec<i32>, Vec<(u32, u32)>> {
     let mut t: HashMap<Vec<i32>, Vec<(u32, u32)>> = HashMap::new();
     let m = n - 1;
     let bd_count = 1u64 << (2 * k);
     let vh = vh_lag_range(n, k);
     for z_bits in 0..bd_count {
+        if (z_bits & 1) == 0 {
+            continue;
+        }
         let zb = make_bd(n, z_bits as u32, k);
         for w_bits in 0..bd_count {
             let wb = make_bd(m, w_bits as u32, k);
