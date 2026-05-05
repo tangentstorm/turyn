@@ -315,69 +315,133 @@ fn build_target_to_count(
     counts
 }
 
-/// Full Turyn check on a 4-tuple `(B_X, B_Y, B_Z, B_W)` boundary
-/// combined with a leaf's middle assignment. Returns true iff
-/// `N_X(s) + N_Y(s) + 2 N_Z(s) + 2 N_W(s) = 0` for all `s in 1..n`.
+/// Bit-packed sequence: bit i = 0 means -1, bit i = 1 means +1.
+/// Valid for sequence length ≤ 64.
+type PackedSeq = u64;
+
+/// Convert a `Vec<i32>` of ±1 (and possibly 0 for unset) to a
+/// PackedSeq. Treats 0 as +1 so unset positions don't influence
+/// autocorrelation in a hard-to-debug way; callers should only pass
+/// fully-placed sequences.
+fn pack_seq(seq: &[i32]) -> PackedSeq {
+    debug_assert!(seq.len() <= 64);
+    let mut bits = 0u64;
+    for (i, &v) in seq.iter().enumerate() {
+        if v == 1 {
+            bits |= 1u64 << i;
+        }
+    }
+    bits
+}
+
+/// Bit-packed autocorrelation at lag `s` for sequence of length
+/// `len` packed into low `len` bits of `seq` (bit i = ±1).
 ///
-/// Optimised: writes boundary bits into pre-allocated mutable buffers
-/// (avoiding 4× per-call clones), and short-circuits on first violation
-/// via a single combined-sequence-loop that computes all 4 autocorrelations
-/// at lag s in one pass before testing.
-fn verify_full_turyn_into(
-    state: &WalkerState,
+/// Σ_{i=0..len-s} seq_value(i) · seq_value(i+s)
+///
+/// where seq_value(i) = 2*bit(i) - 1 ∈ {-1, +1}.
+///
+/// The product seq_value(i)·seq_value(i+s) = +1 iff bits agree,
+/// -1 iff disagree. So:
+///   sum = (#agree) - (#disagree)
+///       = (len - s) - 2 * (#disagree)
+///       = (len - s) - 2 * popcount((seq XOR (seq>>s)) & mask)
+///
+/// where mask is the low (len - s) bits.
+#[inline]
+fn autocorr_packed(seq: PackedSeq, len: usize, s: usize) -> i32 {
+    if s >= len {
+        return 0;
+    }
+    let nvalid = len - s;
+    let mask = if nvalid >= 64 { !0u64 } else { (1u64 << nvalid) - 1 };
+    let xor = seq ^ (seq >> s);
+    let diffs = (xor & mask).count_ones() as i32;
+    (nvalid as i32) - 2 * diffs
+}
+
+/// Bit-packed full Turyn check.
+fn verify_full_turyn_packed(
+    state_packed: &LeafPacked,
     n: usize,
     k: usize,
     bx_bits: u32,
     by_bits: u32,
     bz_bits: u32,
     bw_bits: u32,
-    sx: &mut Vec<i32>,
-    sy: &mut Vec<i32>,
-    sz: &mut Vec<i32>,
-    sw: &mut Vec<i32>,
 ) -> bool {
     let m = n - 1;
-    // Copy middle bits (everything; boundary slots will be overwritten).
-    sx.clear();
-    sx.extend_from_slice(&state.seqs[0]);
-    sy.clear();
-    sy.extend_from_slice(&state.seqs[1]);
-    sz.clear();
-    sz.extend_from_slice(&state.seqs[2]);
-    sw.clear();
-    sw.extend_from_slice(&state.seqs[3]);
-    for i in 0..k {
-        sx[i] = if (bx_bits >> i) & 1 == 1 { 1 } else { -1 };
-        sx[n - k + i] = if (bx_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-        sy[i] = if (by_bits >> i) & 1 == 1 { 1 } else { -1 };
-        sy[n - k + i] = if (by_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-        sz[i] = if (bz_bits >> i) & 1 == 1 { 1 } else { -1 };
-        sz[n - k + i] = if (bz_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-        sw[i] = if (bw_bits >> i) & 1 == 1 { 1 } else { -1 };
-        sw[m - k + i] = if (bw_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
-    }
-    // Combined per-lag loop with early exit.
+    // Boundary mask for length-n sequences (bits in [0..k) ∪ [n-k..n)).
+    let bd_mask_n = state_packed.bd_mask_n;
+    let bd_mask_m = state_packed.bd_mask_m;
+
+    // Build full packed seqs: middle (from state_packed) | boundary (from bits).
+    // bx_bits/by_bits/bz_bits has the low-k bits in positions [0..k) and the
+    // high-k bits in positions [k..2k). They map to sequence positions
+    // [0..k) and [n-k..n) respectively.
+    let bx_low = (bx_bits as u64) & ((1u64 << k) - 1);
+    let bx_high = ((bx_bits >> k) as u64) & ((1u64 << k) - 1);
+    let bx_full = bx_low | (bx_high << (n - k));
+    let by_low = (by_bits as u64) & ((1u64 << k) - 1);
+    let by_high = ((by_bits >> k) as u64) & ((1u64 << k) - 1);
+    let by_full = by_low | (by_high << (n - k));
+    let bz_low = (bz_bits as u64) & ((1u64 << k) - 1);
+    let bz_high = ((bz_bits >> k) as u64) & ((1u64 << k) - 1);
+    let bz_full = bz_low | (bz_high << (n - k));
+    let bw_low = (bw_bits as u64) & ((1u64 << k) - 1);
+    let bw_high = ((bw_bits >> k) as u64) & ((1u64 << k) - 1);
+    let bw_full = bw_low | (bw_high << (m - k));
+
+    let sx = (state_packed.mid_x & !bd_mask_n) | bx_full;
+    let sy = (state_packed.mid_y & !bd_mask_n) | by_full;
+    let sz = (state_packed.mid_z & !bd_mask_n) | bz_full;
+    let sw = (state_packed.mid_w & !bd_mask_m) | bw_full;
+
     for s in 1..n {
-        let mut total = 0i32;
-        let nx_lim = n - s;
-        for i in 0..nx_lim {
-            total += sx[i] * sx[i + s] + sy[i] * sy[i + s] + 2 * sz[i] * sz[i + s];
-        }
-        if s < m {
-            for i in 0..(m - s) {
-                total += 2 * sw[i] * sw[i + s];
-            }
-        }
-        if total != 0 {
+        let ax = autocorr_packed(sx, n, s);
+        let ay = autocorr_packed(sy, n, s);
+        let az = autocorr_packed(sz, n, s);
+        let aw = if s < m { autocorr_packed(sw, m, s) } else { 0 };
+        if ax + ay + 2 * az + 2 * aw != 0 {
             return false;
         }
     }
     true
 }
 
+/// Per-leaf packed state, computed once at the leaf and reused across
+/// all candidate boundary tuples.
+struct LeafPacked {
+    mid_x: PackedSeq,
+    mid_y: PackedSeq,
+    mid_z: PackedSeq,
+    mid_w: PackedSeq,
+    bd_mask_n: u64, // low-k + high-k bits set, length-n
+    bd_mask_m: u64, // low-k + high-k bits set, length-m
+}
+
+impl LeafPacked {
+    fn from_state(state: &WalkerState, n: usize, k: usize) -> Self {
+        let m = n - 1;
+        let bd_mask_n =
+            ((1u64 << k) - 1) | (((1u64 << k) - 1) << (n - k));
+        let bd_mask_m =
+            ((1u64 << k) - 1) | (((1u64 << k) - 1) << (m - k));
+        Self {
+            mid_x: pack_seq(&state.seqs[0]),
+            mid_y: pack_seq(&state.seqs[1]),
+            mid_z: pack_seq(&state.seqs[2]),
+            mid_w: pack_seq(&state.seqs[3]),
+            bd_mask_n,
+            bd_mask_m,
+        }
+    }
+}
+
 /// At a leaf, exhaustively check every (B_X, B_Y, B_Z, B_W)
 /// 4-tuple that passes the very-high-lag pre-filter. Returns
-/// (pre_filter_count, exact_solution_count).
+/// (pre_filter_count, exact_solution_count). Uses bit-packed
+/// autocorrelation for speed (n ≤ 64 only).
 fn leaf_full_check(
     state: &WalkerState,
     n: usize,
@@ -385,8 +449,9 @@ fn leaf_full_check(
     target: &[i32],
     t_xy: &HashMap<Vec<i32>, Vec<(u32, u32)>>,
     t_zw: &HashMap<Vec<i32>, Vec<(u32, u32)>>,
-    bufs: &mut LeafBufs,
+    _bufs: &mut LeafBufs,
 ) -> (u64, u64) {
+    let leaf = LeafPacked::from_state(state, n, k);
     let mut pre_filter = 0u64;
     let mut exact = 0u64;
     for (zw_v, zw_pairs) in t_zw {
@@ -398,10 +463,7 @@ fn leaf_full_check(
         for &(bx, by) in xy_pairs {
             for &(bz, bw) in zw_pairs {
                 pre_filter += 1;
-                if verify_full_turyn_into(
-                    state, n, k, bx, by, bz, bw,
-                    &mut bufs.sx, &mut bufs.sy, &mut bufs.sz, &mut bufs.sw,
-                ) {
+                if verify_full_turyn_packed(&leaf, n, k, bx, by, bz, bw) {
                     exact += 1;
                 }
             }
