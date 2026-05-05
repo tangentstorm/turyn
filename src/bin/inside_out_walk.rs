@@ -246,8 +246,92 @@ fn build_target_to_count(
     counts
 }
 
+/// Full Turyn check on a 4-tuple `(B_X, B_Y, B_Z, B_W)` boundary
+/// combined with a leaf's middle assignment. Returns true iff
+/// `N_X(s) + N_Y(s) + 2 N_Z(s) + 2 N_W(s) = 0` for all `s in 1..n`.
+/// The middle bits live in `state.seqs` (boundary positions are 0).
+fn verify_full_turyn(
+    state: &WalkerState,
+    n: usize,
+    k: usize,
+    bx_bits: u32,
+    by_bits: u32,
+    bz_bits: u32,
+    bw_bits: u32,
+) -> bool {
+    let m = n - 1;
+    // Materialize the 4 full sequences from middle (in state) +
+    // boundary (from bits).
+    let mut sx = state.seqs[0].clone();
+    let mut sy = state.seqs[1].clone();
+    let mut sz = state.seqs[2].clone();
+    let mut sw = state.seqs[3].clone();
+    for i in 0..k {
+        sx[i] = if (bx_bits >> i) & 1 == 1 { 1 } else { -1 };
+        sx[n - k + i] = if (bx_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+        sy[i] = if (by_bits >> i) & 1 == 1 { 1 } else { -1 };
+        sy[n - k + i] = if (by_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+        sz[i] = if (bz_bits >> i) & 1 == 1 { 1 } else { -1 };
+        sz[n - k + i] = if (bz_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+        sw[i] = if (bw_bits >> i) & 1 == 1 { 1 } else { -1 };
+        sw[m - k + i] = if (bw_bits >> (k + i)) & 1 == 1 { 1 } else { -1 };
+    }
+    // Check: NX(s) + NY(s) + 2 NZ(s) + 2 NW(s) = 0 for s in 1..n
+    for s in 1..n {
+        let nx = autocorr_full_seq(&sx, s);
+        let ny = autocorr_full_seq(&sy, s);
+        let nz = autocorr_full_seq(&sz, s);
+        let nw = if s < m { autocorr_full_seq(&sw, s) } else { 0 };
+        if nx + ny + 2 * nz + 2 * nw != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn autocorr_full_seq(x: &[i32], s: usize) -> i32 {
+    let n = x.len();
+    if s >= n {
+        return 0;
+    }
+    (0..n - s).map(|i| x[i] * x[i + s]).sum()
+}
+
+/// At a leaf, exhaustively check every (B_X, B_Y, B_Z, B_W)
+/// 4-tuple that passes the very-high-lag pre-filter. Returns
+/// (pre_filter_count, exact_solution_count).
+fn leaf_full_check(
+    state: &WalkerState,
+    n: usize,
+    k: usize,
+    target: &[i32],
+    t_xy: &HashMap<Vec<i32>, Vec<(u32, u32)>>,
+    t_zw: &HashMap<Vec<i32>, Vec<(u32, u32)>>,
+) -> (u64, u64) {
+    let mut pre_filter = 0u64;
+    let mut exact = 0u64;
+    // For each (xy_v, zw_v) pair with xy_v + zw_v = target, enumerate
+    // (X, Y) × (Z, W).
+    for (zw_v, zw_pairs) in t_zw {
+        let xy_target: Vec<i32> = target.iter().zip(zw_v).map(|(a, b)| a - b).collect();
+        let xy_pairs = match t_xy.get(&xy_target) {
+            Some(p) => p,
+            None => continue,
+        };
+        for &(bx, by) in xy_pairs {
+            for &(bz, bw) in zw_pairs {
+                pre_filter += 1;
+                if verify_full_turyn(state, n, k, bx, by, bz, bw) {
+                    exact += 1;
+                }
+            }
+        }
+    }
+    (pre_filter, exact)
+}
+
 /// Recursive inside-out walk. Returns a tuple of
-/// (leaves_visited, leaves_with_match, total_candidates).
+/// (leaves_visited, leaves_with_pre_match, leaves_with_exact_match, total_pre, total_exact).
 fn walk(
     state: &mut WalkerState,
     n: usize,
@@ -255,13 +339,23 @@ fn walk(
     nlev: usize,
     target_to_count: &HashMap<Vec<i32>, u64>,
     pruned_out: &mut u64,
-) -> (u64, u64, u64) {
+    full_check: bool,
+    t_xy: &HashMap<Vec<i32>, Vec<(u32, u32)>>,
+    t_zw: &HashMap<Vec<i32>, Vec<(u32, u32)>>,
+) -> (u64, u64, u64, u64, u64) {
     // Leaf?
     if state.level >= nlev {
         // Compute very-high-lag target (exact: cross = 0 here)
         let target = vh_lag_target_from_leaf(state, n, k);
         let total_cand = target_to_count.get(&target).copied().unwrap_or(0);
-        return (1, if total_cand > 0 { 1 } else { 0 }, total_cand);
+        let exact = if full_check && total_cand > 0 {
+            leaf_full_check(state, n, k, &target, t_xy, t_zw).1
+        } else {
+            0
+        };
+        let leaves_pre = if total_cand > 0 { 1 } else { 0 };
+        let leaves_exact = if exact > 0 { 1 } else { 0 };
+        return (1, leaves_pre, leaves_exact, total_cand, exact);
     }
 
     // Pruning: can the current mm_sum still satisfy
@@ -282,7 +376,7 @@ fn walk(
         let _ = m;
         if (state.mm_sum[s - 1].abs() - bound_mm_remaining).abs() > bd_capacity * 2 {
             *pruned_out += 1;
-            return (0, 0, 0);
+            return (0, 0, 0, 0, 0);
         }
     }
 
@@ -300,7 +394,9 @@ fn walk(
 
     let mut total_visited = 0u64;
     let mut total_match = 0u64;
+    let mut total_match_exact = 0u64;
     let mut total_cand = 0u64;
+    let mut total_exact = 0u64;
 
     for branch in 0..n_branches {
         // Assign bits per sequence
@@ -353,16 +449,28 @@ fn walk(
         let saved_mm = std::mem::replace(&mut state.mm_sum, new_mm);
         state.level += 1;
 
-        let (v, m, c) = walk(state, n, k, nlev, target_to_count, pruned_out);
+        let (v, lp, le, tp, te) = walk(
+            state,
+            n,
+            k,
+            nlev,
+            target_to_count,
+            pruned_out,
+            full_check,
+            t_xy,
+            t_zw,
+        );
         total_visited += v;
-        total_match += m;
-        total_cand += c;
+        total_match += lp;
+        total_match_exact += le;
+        total_cand += tp;
+        total_exact += te;
 
         state.level -= 1;
         state.mm_sum = saved_mm;
     }
 
-    (total_visited, total_match, total_cand)
+    (total_visited, total_match, total_match_exact, total_cand, total_exact)
 }
 
 fn main() {
@@ -438,28 +546,53 @@ fn main() {
         t_conv.elapsed().as_secs_f64()
     );
 
+    // Decide whether to do per-leaf full Turyn check during the walk.
+    // Only feasible at small n (per-leaf cost is O(pre_filter * n)).
+    let full_check_during_walk = std::env::var("FULL_CHECK").is_ok();
+    if full_check_during_walk {
+        eprintln!("(FULL_CHECK=1: running full Turyn check at every leaf — slow at larger scales)");
+    }
+
     let mut pruned = 0u64;
     let t_walk = std::time::Instant::now();
-    let (visited, matched, cand) = walk(&mut state, n, k, nlev, &target_to_count, &mut pruned);
+    let (visited, matched, matched_exact, cand, exact) = walk(
+        &mut state,
+        n,
+        k,
+        nlev,
+        &target_to_count,
+        &mut pruned,
+        full_check_during_walk,
+        &t_xy,
+        &t_zw,
+    );
     let walk_secs = t_walk.elapsed().as_secs_f64();
 
     eprintln!("\n=== Walker results ===");
-    eprintln!("leaves visited     = {}", visited);
-    eprintln!("leaves with match  = {}", matched);
-    eprintln!("total candidates   = {}", cand);
+    eprintln!("leaves visited        = {}", visited);
+    eprintln!("leaves with pre-match = {}", matched);
+    eprintln!("total pre candidates  = {}", cand);
     eprintln!(
-        "avg candidates/leaf = {:.2}",
+        "avg pre candidates/leaf = {:.2}",
         if visited > 0 {
             cand as f64 / visited as f64
         } else {
             0.0
         }
     );
-    eprintln!("subtree prunes     = {}", pruned);
-    eprintln!("walk time          = {:.2}s", walk_secs);
+    if full_check_during_walk {
+        eprintln!("leaves with exact (full Turyn) = {}", matched_exact);
+        eprintln!("total exact survivors = {}", exact);
+        eprintln!(
+            "pre-filter overhead   = {:.0}x (pre / exact)",
+            if exact > 0 { cand as f64 / exact as f64 } else { 0.0 }
+        );
+    }
+    eprintln!("subtree prunes        = {}", pruned);
+    eprintln!("walk time             = {:.2}s", walk_secs);
     eprintln!(
-        "naive  total leaves = {} (16^{})",
-        16u128.pow(nlev as u32),
+        "naive  total leaves   = {} (256^{})",
+        256u128.pow(nlev as u32),
         nlev
     );
 
@@ -508,7 +641,23 @@ fn main() {
         let target = vh_lag_target_from_leaf(&known_state, n, k);
         eprintln!("known leaf very-high-lag target (= -mm_vh) = {:?}", target);
         let hits = target_to_count.get(&target).copied().unwrap_or(0);
-        eprintln!("boundary candidates at known leaf  = {}", hits);
+        eprintln!("boundary candidates at known leaf (vh-bb pre-filter) = {}", hits);
+
+        // Stage 4 demo: at the known leaf, exhaustively run the full
+        // Turyn check on every pre-filtered candidate and report the
+        // exact survivor count.
+        let t_full = std::time::Instant::now();
+        let (pre_filter, exact) = leaf_full_check(&known_state, n, k, &target, &t_xy, &t_zw);
+        eprintln!(
+            "Stage-4 full check at known leaf:  {} pre-filter -> {} pass full Turyn  ({:.2}s)",
+            pre_filter,
+            exact,
+            t_full.elapsed().as_secs_f64()
+        );
+        if exact > 0 {
+            eprintln!("  Filter ratio at known leaf: {:.0}x reduction (vh-bb -> full Turyn)",
+                pre_filter as f64 / exact as f64);
+        }
         // Confirm the known boundary tuple is in there
         let known_x_bits: u32 = (0..k)
             .map(|i| if x[i] == 1 { 1u32 << i } else { 0 })
