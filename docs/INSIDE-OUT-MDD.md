@@ -471,14 +471,38 @@ Three plausible implementation paths, in increasing investment:
    (8k boundary vars + n-1 quad-PB constraints with M as constants)
    and let CDCL prove UNSAT or find solutions. This is the
    architecturally cleanest approach. **Implemented as a feasibility
-   pre-check (`SAT_PRECHECK=1`) in `inside_out_walk.rs`.** The
-   per-leaf SAT call is ~600 µs and proves UNSAT for ~95 % of
-   leaves at small n; for the remaining 5 %, falls through to
-   per-candidate enumeration. Wins materialise only when per-leaf
-   enum cost > SAT cost (i.e., at larger n / k where the candidate
-   set is large).
+   pre-check (`SAT_PRECHECK=1`) in `inside_out_walk.rs`.**
 
-Stage-6 measurement results to follow as the prototypes mature.
+   **Result: net regression at all tested scales.** Soundness was
+   verified at n=8 k=2: same 336 canonical TT(8); 62,080 of 65,536
+   leaves correctly proved UNSAT (94.7% prune rate). But the
+   per-leaf SAT cost is much higher than estimated:
+
+   ```
+   n=8  k=2:  baseline 0.04 s -> with SAT  40.5 s   ( ~1000x slower)
+   n=12 k=4:  baseline 18.4 s -> with SAT  9788 s   (  ~530x slower)
+   n=14 k=4:  baseline 6787 s -> with SAT  not tested
+   ```
+
+   The radical/ solver has substantial per-instance setup cost
+   (allocating internal data structures, building watch lists for
+   ~25 quad-PB constraints with ~30-50 terms each). Per-leaf SAT
+   call is roughly 150 ms at n=12 k=4 vs <1 µs per-candidate enum
+   per leaf — the SAT setup dominates by 5+ orders of magnitude
+   even when 95 % of leaves are correctly UNSAT-pruned.
+
+   For SAT pre-check to win, we'd need the per-leaf SAT cost to
+   come down by ~100× — possibly via:
+   * Solver pooling (reuse one solver across leaves; only update
+     M-dependent constraint constants), OR
+   * A custom propagator specialised to the per-lag quad-PB
+     structure (skipping general-purpose CDCL overhead), OR
+   * Batch many leaves into one larger SAT instance.
+
+   The mechanism is correct; just unworkable at this scale of
+   solver overhead. Path 1 (range-lookup) and path 2 (two-table
+   extension) remain unexplored and likely have better cost
+   characteristics for the same pruning power.
 
 ## Open questions
 
