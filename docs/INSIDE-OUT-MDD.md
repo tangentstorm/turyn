@@ -369,8 +369,9 @@ End-to-end demos:
 | (n, k) | leaves | canonical TT 4-tuples | walk time |
 |---|---|---|---|
 | 8, 2 | 65,536 | **336** | 0.17 s |
-| 10, 3 | 65,536 | **1,792** | 3.79 s |
-| 12, 4 | 65,536 | **4,912** | 100 s |
+| 10, 3 | 65,536 | **1,792** | 1.0 s (parallel) |
+| 12, 4 | 65,536 | **4,912** | 27 s (parallel) |
+| 14, 4 | 16,777,216 | **8,128** | 6,787 s = 1.88 h (parallel) |
 
 Cumulative speedup chain at n=10 k=3 (the most-measured case):
 
