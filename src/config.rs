@@ -315,13 +315,18 @@ pub(crate) struct SearchConfig {
     /// flag and the `--mdd-k=` / `--mdd-extend=` shortcuts also set this
     /// when it's still `None`.
     pub(crate) wz_mode: Option<WzMode>,
-    /// Hypothetical XY canonical-rep constraint: for 1 <= i <= n with
-    /// U_i := x_i * y_i, enforce U_1 = +1, U_n = +1, and
-    /// U_i = -U_{n+1-i} for 2 <= i <= n-1. Endpoint pins already hold
-    /// from rule (i) (x_0=y_0=x_{n-1}=y_{n-1}=+1), so only the middle
-    /// pairwise equalities are added. Enabled via `--conj-xy-product`
-    /// (implies `X · Y = 2`; see conjectures/xy-product.md).
-    pub(crate) conj_xy_product: bool,
+    /// XY product law: for 1 <= i <= n with U_i := x_i * y_i, enforce
+    /// U_1 = +1, U_n = +1, and U_i = -U_{n+1-i} for 2 <= i <= n-1.
+    /// Endpoint pins already hold from rule (i)
+    /// (x_0=y_0=x_{n-1}=y_{n-1}=+1), so only the middle pairwise
+    /// equalities are added. Implies `X . Y = 2`.
+    ///
+    /// This is a **theorem**, not a conjecture: `Turyn.xy_product_law`
+    /// in `lean/Turyn/XY.lean` proves it for every `n >= 4` under
+    /// `Canonical1` (BDKR rule (i)), which every producer enforces. It
+    /// is therefore on by default and does NOT taint the TTC quality
+    /// label. `--no-xy-product` disables it for A/B benchmarking.
+    pub(crate) xy_product_law: bool,
     /// ZW high-lag U-bound tightness conjecture: enforce equality
     /// `|N_Z(s) + N_W(s)| = ((n - s) + N_U(s)) / 2` at s in
     /// {n-1, n-2, n-3}, where `N_U(s) = Σ_i u_i u_{i+s}`,
@@ -421,7 +426,7 @@ impl Default for SearchConfig {
             mdd_extend: 0,
             wz_together: false,
             wz_mode: None,
-            conj_xy_product: false,
+            xy_product_law: true,
             conj_zw_bound: false,
             conj_tuple: false,
             seed: 0,

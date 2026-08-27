@@ -256,7 +256,7 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                             problem,
                             std::slice::from_ref(&tuple),
                             &cfg.sat_config,
-                            cfg.conj_xy_product,
+                            cfg.xy_product_law,
                         )
                         .unwrap()
                     });

@@ -467,14 +467,23 @@ where
     solver.add_clause([-y1, -y_last]); //                             (ii)
 }
 
-/// XY product-law conjecture (`--conj-xy-product`): enforce
-/// `U_i = -U_{n+1-i}` for every 2 <= i <= n-1, where
-/// `U_i := x_i * y_i ∈ {±1}` (1-indexed).  Empirically holds on the
-/// known Turyn corpus; unproven. See `conjectures/xy-product.md`.
+/// XY product law: enforce `U_i = -U_{n+1-i}` for every 2 <= i <= n-1,
+/// where `U_i := x_i * y_i ∈ {±1}` (1-indexed).
 ///
-/// The BDKR rule (i) symmetry-break already pins `U_1 = U_n = +1` via
-/// `x_0 = y_0 = x_{n-1} = y_{n-1} = +1`, so only the pairwise middle
-/// equalities need to be emitted here.
+/// **This is a theorem, not a conjecture.** `Turyn.xy_product_law` in
+/// `lean/Turyn/XY.lean` proves it for every `n >= 4` whose quadruple
+/// satisfies `Canonical1` (BDKR rule (i): `x_1 = x_n = y_1 = y_n =
+/// z_1 = w_1 = +1`).  Every producer here enforces rule (i) -- the MDD
+/// pins boundary positions 0 and 2k-1, the cross-mode Z/W generators
+/// pass `root_one = true`, and the clauses in
+/// `build_sat_xy_clauses_multi_opts` pin all four XY endpoints -- so
+/// the hypothesis always holds and the law removes no valid solution.
+/// Independently falsified against the published corpus:
+/// `analyze_data` checks all 896,896 rule-(i) members of the symmetry
+/// orbits of every catalogued TT(n), n = 4..32, with zero violations.
+///
+/// The rule (i) pins already give `U_1 = U_n = +1`, so only the
+/// pairwise middle equalities need to be emitted here.
 ///
 /// Encoding: `x_j * y_j * x_k * y_k = -1` (where `k = n-1-j`, 0-indexed)
 /// is equivalent to odd parity of `{x_j, y_j, x_k, y_k}`, so each
@@ -482,15 +491,18 @@ where
 /// assignment ruled out).
 ///
 /// Self-paired indices (`j == n-1-j`, only possible for odd `n`) force
-/// `U_i * U_i = -1` which is infeasible; in that case we emit a trivial
-/// empty clause and the solver returns UNSAT.
+/// `U_i * U_i = -1`, which is infeasible -- so the theorem rules out
+/// canonical TT(n) for every odd `n >= 5` outright.  We emit the empty
+/// clause and the solver returns UNSAT.
 pub(crate) fn add_xy_product_law<F, G, S>(solver: &mut S, x_var: F, y_var: G, n: usize)
 where
     F: Fn(usize) -> i32,
     G: Fn(usize) -> i32,
     S: SatSolver,
 {
-    if n < 2 {
+    // `Turyn.xy_product_law` is proved only for `n >= 4`; below that the
+    // law is unavailable and we must not constrain the search.
+    if n < 4 {
         return;
     }
     for j in 1..=((n - 1) / 2) {
@@ -543,7 +555,7 @@ pub(crate) fn build_sat_xy_clauses_multi_opts(
     problem: Problem,
     tuples: &[SumTuple],
     solver: &mut impl SatSolver,
-    conj_xy_product: bool,
+    xy_product_law: bool,
 ) -> Option<(Vec<LagPairs>, usize)> {
     let n = problem.n;
 
@@ -562,10 +574,10 @@ pub(crate) fn build_sat_xy_clauses_multi_opts(
     add_palindromic_break(solver, n, y_var, false, 1, &mut next_var);
     add_swap_break(solver, x_var, y_var, n);
 
-    // Optional XY product-law conjecture (toggle: off by default,
-    // enabled by `--conj-xy-product`). See conjectures/xy-product.md
-    // and `add_xy_product_law` for the encoding.
-    if conj_xy_product {
+    // XY product law (proved; on by default, `--no-xy-product` opts out
+    // for A/B benchmarking). See `add_xy_product_law` for the encoding
+    // and the Lean theorem it discharges.
+    if xy_product_law {
         add_xy_product_law(solver, x_var, y_var, n);
     }
 
@@ -750,12 +762,12 @@ impl SatXYTemplate {
     }
 
     /// Like `build_multi`, but appends the XY product-law conjecture
-    /// when `conj_xy_product = true` (see `add_xy_product_law`).
+    /// when `xy_product_law = true` (see `add_xy_product_law`).
     pub(crate) fn build_multi_opts(
         problem: Problem,
         tuples: &[SumTuple],
         sat_config: &radical::SolverConfig,
-        conj_xy_product: bool,
+        xy_product_law: bool,
     ) -> Option<Self> {
         #[cfg(not(feature = "cadical"))]
         let mut solver: radical::Solver = {
@@ -767,7 +779,7 @@ impl SatXYTemplate {
         let mut solver: cadical::Solver = Default::default();
 
         let (lag_pairs, n) =
-            build_sat_xy_clauses_multi_opts(problem, tuples, &mut solver, conj_xy_product)?;
+            build_sat_xy_clauses_multi_opts(problem, tuples, &mut solver, xy_product_law)?;
         #[cfg(not(feature = "cadical"))]
         solver.reserve_for_search(200);
         Some(Self {
@@ -1636,4 +1648,122 @@ pub(crate) fn try_candidate_via_mdd(
         _ => None,
     };
     (xy, stats)
+}
+
+#[cfg(test)]
+mod xy_product_law_tests {
+    use super::*;
+
+    /// Clause-recording stand-in so we can test the encoding's
+    /// semantics without running CDCL.
+    #[derive(Default)]
+    struct ClauseRecorder {
+        clauses: Vec<Vec<i32>>,
+    }
+
+    impl SatSolver for ClauseRecorder {
+        fn add_clause<I: IntoIterator<Item = i32>>(&mut self, lits: I) {
+            self.clauses.push(lits.into_iter().collect());
+        }
+        fn add_pb_eq(&mut self, _l: &[i32], _c: &[u32], _t: u32) {}
+        fn add_pb_set_eq(&mut self, _l: &[i32], _v: &[u32]) {}
+        fn add_quad_pb_eq(&mut self, _a: &[i32], _b: &[i32], _c: &[u32], _t: u32) {}
+        fn add_xor_constraint(&mut self, _aux: i32, _a: i32, _b: i32) {}
+        fn solve_with_assumptions(&mut self, _a: &[i32]) -> Option<bool> {
+            None
+        }
+        fn value(&self, _v: i32) -> Option<bool> {
+            None
+        }
+        fn reset(&mut self) {}
+        fn set_conflict_limit(&mut self, _l: u64) {}
+    }
+
+    impl ClauseRecorder {
+        /// True when `assign` (var -> bool, 1-indexed by var number)
+        /// satisfies every recorded clause.
+        fn accepts(&self, assign: &dyn Fn(i32) -> bool) -> bool {
+            self.clauses.iter().all(|c| {
+                c.iter()
+                    .any(|&lit| assign(lit.abs()) == (lit > 0))
+            })
+        }
+    }
+
+    fn encode(n: usize) -> ClauseRecorder {
+        let mut rec = ClauseRecorder::default();
+        let x_var = |i: usize| -> i32 { (i + 1) as i32 };
+        let y_var = |i: usize| -> i32 { (n + i + 1) as i32 };
+        add_xy_product_law(&mut rec, x_var, y_var, n);
+        rec
+    }
+
+    /// `U_i = -U_{n+1-i}` for `2 <= i <= n-1` in the Lean theorem's
+    /// 1-indexed form, evaluated on a 0-indexed bit assignment where
+    /// `true` means `+1`.
+    fn law_holds(x: &[bool], y: &[bool], n: usize) -> bool {
+        let u = |i: usize| -> i32 {
+            if x[i] == y[i] {
+                1
+            } else {
+                -1
+            }
+        };
+        (1..=n - 2).all(|j| u(j) * u(n - 1 - j) == -1)
+    }
+
+    /// The encoding must accept **exactly** the assignments the
+    /// theorem permits: no valid quadruple is lost (soundness) and no
+    /// law-violating one survives (that's the pruning we want).
+    #[test]
+    fn encoding_accepts_exactly_the_law_satisfying_assignments() {
+        for n in [4usize, 6, 8] {
+            let rec = encode(n);
+            let mut checked = 0u64;
+            for bits in 0u32..(1 << (2 * n)) {
+                let x: Vec<bool> = (0..n).map(|i| bits >> i & 1 == 1).collect();
+                let y: Vec<bool> = (0..n).map(|i| bits >> (n + i) & 1 == 1).collect();
+                let assign = |v: i32| -> bool {
+                    let v = v as usize;
+                    if v <= n {
+                        x[v - 1]
+                    } else {
+                        y[v - n - 1]
+                    }
+                };
+                assert_eq!(
+                    rec.accepts(&assign),
+                    law_holds(&x, &y, n),
+                    "n={n} bits={bits:b}: encoding disagrees with the law"
+                );
+                checked += 1;
+            }
+            assert!(checked > 0);
+        }
+    }
+
+    /// `Turyn.xy_product_law` needs `n >= 4`, so smaller `n` must be
+    /// left completely unconstrained.
+    #[test]
+    fn no_clauses_below_the_proved_domain() {
+        for n in [0usize, 1, 2, 3] {
+            assert!(
+                encode(n).clauses.is_empty(),
+                "n={n} is outside the theorem's domain and must not be constrained"
+            );
+        }
+    }
+
+    /// For odd `n >= 5` the law pairs the middle index with itself and
+    /// demands `U_i^2 = -1`, so it proves no canonical TT(n) exists.
+    #[test]
+    fn odd_n_is_refuted_by_the_empty_clause() {
+        for n in [5usize, 7, 9] {
+            let rec = encode(n);
+            assert!(
+                rec.clauses.iter().any(|c| c.is_empty()),
+                "n={n} (odd) must be refuted outright"
+            );
+        }
+    }
 }

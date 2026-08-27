@@ -356,9 +356,9 @@ pub(crate) struct PhaseBContext {
     pub(crate) mdd_extend: usize,
     /// Optional XY product-law conjecture (`U_i = -U_{n+1-i}` for
     /// 2 <= i <= n-1, with U_i = x_i*y_i). Plumbed from
-    /// cfg.conj_xy_product; only consulted by stages that build an
+    /// cfg.xy_product_law; only consulted by stages that build an
     /// XY SAT template. See conjectures/xy-product.md.
-    pub(crate) conj_xy_product: bool,
+    pub(crate) xy_product_law: bool,
     /// Optional ZW u-bound tightness conjecture: enforce
     /// `|N_Z(s)+N_W(s)| = ((n-s)+N_U(s))/2` at s in {n-1, n-2, n-3}.
     /// Plumbed from cfg.conj_zw_bound; applied as an XY-stage
@@ -1439,7 +1439,7 @@ pub(crate) fn process_solve_z(
                 ctx.problem,
                 &sz.candidate_tuples,
                 sat_config,
-                ctx.conj_xy_product,
+                ctx.xy_product_law,
             )
             .unwrap()
         });
@@ -2204,7 +2204,7 @@ pub(crate) fn process_solve_wz(
                 ctx.problem,
                 &swz.candidate_tuples,
                 &sat_config,
-                ctx.conj_xy_product,
+                ctx.xy_product_law,
             )
             .unwrap()
         });
@@ -2533,7 +2533,7 @@ pub(crate) fn build_phase_b_context(
         pair_bound: cfg.max_spectral.unwrap_or(problem.spectral_bound()),
         theta: cfg.theta_samples,
         mdd_extend: cfg.mdd_extend,
-        conj_xy_product: cfg.conj_xy_product,
+        xy_product_law: cfg.xy_product_law,
         conj_zw_bound: cfg.conj_zw_bound,
         continue_after_sat: cfg.continue_after_sat || cfg.bench_cover_log2.is_some(),
         xy_mdd_mode: std::env::var("XY_MDD").ok().as_deref() == Some("1"),

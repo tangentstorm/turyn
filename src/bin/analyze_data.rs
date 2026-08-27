@@ -97,6 +97,73 @@ impl Solution {
         true
     }
 
+    /// BDKR rule (i) alone -- the `Canonical1` hypothesis of the Lean
+    /// theorem `Turyn.xy_product_law` (`lean/Turyn/XY.lean`).
+    fn rule_i_ok(&self) -> bool {
+        let n = self.n;
+        self.x[0] == 1
+            && self.x[n - 1] == 1
+            && self.y[0] == 1
+            && self.y[n - 1] == 1
+            && self.z[0] == 1
+            && self.w[0] == 1
+    }
+
+    /// XY product law: with `U_i = x_i * y_i` (1-indexed),
+    /// `U_i = -U_{n+1-i}` for every `2 <= i <= n-1`.  Proved in Lean as
+    /// `Turyn.xy_product_law` under `Canonical1` for `n >= 4`.
+    fn xy_product_law_ok(&self) -> bool {
+        let n = self.n;
+        (1..=n - 2).all(|j| {
+            let k = n - 1 - j;
+            self.x[j] * self.y[j] * self.x[k] * self.y[k] == -1
+        })
+    }
+
+    /// Every image of this solution under the full BDKR symmetry group
+    /// T1 (negate) x T2 (reverse) x T3 (alternate) x T4 (swap X,Y).
+    fn orbit(&self) -> Vec<Solution> {
+        let mut out = Vec::with_capacity(1024);
+        for neg_mask in 0u8..16 {
+            for rev_mask in 0u8..16 {
+                for alt in [false, true] {
+                    for swap in [false, true] {
+                        let mut seqs = [
+                            self.x.clone(),
+                            self.y.clone(),
+                            self.z.clone(),
+                            self.w.clone(),
+                        ];
+                        for (i, seq) in seqs.iter_mut().enumerate() {
+                            if rev_mask & (1 << i) != 0 {
+                                *seq = reverse_seq(seq);
+                            }
+                            if neg_mask & (1 << i) != 0 {
+                                *seq = negate_seq(seq);
+                            }
+                        }
+                        if alt {
+                            for seq in seqs.iter_mut() {
+                                *seq = alternate_seq(seq);
+                            }
+                        }
+                        if swap {
+                            seqs.swap(0, 1);
+                        }
+                        out.push(Solution {
+                            n: self.n,
+                            x: seqs[0].clone(),
+                            y: seqs[1].clone(),
+                            z: seqs[2].clone(),
+                            w: seqs[3].clone(),
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn rule_ii_witness(&self) -> Option<usize> {
         first_non_pal_witness(&self.x)
     }
@@ -548,6 +615,53 @@ fn print_global_summary(all: &BTreeMap<usize, Vec<Solution>>) {
     print_witness_stats("rule v (W)", rule_v.into_iter());
 }
 
+/// Corpus-wide falsification test for the XY product law.
+///
+/// The Lean theorem `Turyn.xy_product_law` assumes only `Canonical1`
+/// (BDKR rule (i)) and `n >= 4`.  So the law must hold not merely on the
+/// canonical representative of each orbit, but on *every* orbit member
+/// that satisfies rule (i).  This walks the full 1024-element symmetry
+/// orbit of every catalogued solution and checks exactly that.
+fn print_product_law_audit(all: &BTreeMap<usize, Vec<Solution>>) {
+    println!("XY product-law audit (hypothesis: BDKR rule (i), n >= 4)");
+    println!("  checks every rule-(i) member of each solution's full symmetry orbit");
+    let mut grand_checked = 0u64;
+    let mut grand_violations = 0u64;
+    for (&n, solutions) in all {
+        if n < 4 {
+            println!("  n={n:<3} skipped (theorem requires n >= 4)");
+            continue;
+        }
+        let mut checked = 0u64;
+        let mut violations = 0u64;
+        for sol in solutions {
+            for img in sol.orbit() {
+                if !img.rule_i_ok() {
+                    continue;
+                }
+                checked += 1;
+                if !img.xy_product_law_ok() {
+                    violations += 1;
+                }
+            }
+        }
+        grand_checked += checked;
+        grand_violations += violations;
+        println!(
+            "  n={n:<3} solutions={:<6} rule-(i) orbit members={checked:<9} violations={violations}",
+            solutions.len()
+        );
+    }
+    println!(
+        "  TOTAL rule-(i) orbit members checked={grand_checked} violations={grand_violations}"
+    );
+    if grand_violations == 0 {
+        println!("  => no counterexample in the published corpus");
+    } else {
+        println!("  => COUNTEREXAMPLE FOUND -- do not enable the law as a search rule");
+    }
+}
+
 fn main() {
     let data_dir = Path::new("data");
     let all = match load_solutions(data_dir) {
@@ -559,6 +673,8 @@ fn main() {
     };
 
     print_global_summary(&all);
+    println!();
+    print_product_law_audit(&all);
     println!();
 
     for (n, solutions) in &all {

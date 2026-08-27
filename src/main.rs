@@ -130,10 +130,16 @@ fn print_help() {
     eprintln!("  --probing                Run failed literal probing before each SAT solve");
     eprintln!("  --rephasing              Periodically reset phase saving heuristic");
     eprintln!();
+    eprintln!("CANONICAL / SYMMETRY RULES (proved; on by default):");
+    eprintln!("  --no-xy-product          Disable the XY product law: with U_i = x_i*y_i,");
+    eprintln!("                           U_1 = U_n = +1 and U_i = -U_{{n+1-i}} (2<=i<=n-1),");
+    eprintln!("                           which implies X·Y=2. Proved for n>=4 under BDKR");
+    eprintln!("                           rule (i) as `Turyn.xy_product_law` in");
+    eprintln!("                           lean/Turyn/XY.lean; enforced by default in the XY");
+    eprintln!("                           SAT encoder and the structural MDD builder. The");
+    eprintln!("                           flag exists for A/B benchmarking, not correctness.");
+    eprintln!();
     eprintln!("SEARCH CONJECTURES (implemented, off by default):");
-    eprintln!("  --conj-xy-product        XY product-law conjecture: U_i = x_i*y_i satisfies");
-    eprintln!("                           U_1 = U_n = +1 and U_i = -U_{{n+1-i}} (2<=i<=n-1).");
-    eprintln!("                           Implies X·Y=2. See conjectures/xy-product.md.");
     eprintln!("  --conj-zw-bound          ZW high-lag U-bound tightness: enforce equality");
     eprintln!("                           |N_Z(s)+N_W(s)| = ((n-s) + N_U(s))/2 at");
     eprintln!(
@@ -331,10 +337,12 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
             }
         } else if let Some(v) = arg.strip_prefix("--dump-dimacs=") {
             cfg.dump_dimacs = Some(v.to_string());
-        } else if arg == "--conj-xy-product" {
-            cfg.conj_xy_product = true;
-        } else if arg == "--no-conj-xy-product" {
-            cfg.conj_xy_product = false;
+        } else if arg == "--xy-product" || arg == "--conj-xy-product" {
+            // `--conj-xy-product` is the pre-proof spelling, kept as a
+            // deprecated alias now that the law is proved and default-on.
+            cfg.xy_product_law = true;
+        } else if arg == "--no-xy-product" || arg == "--no-conj-xy-product" {
+            cfg.xy_product_law = false;
         } else if arg == "--conj-zw-bound" {
             cfg.conj_zw_bound = true;
         } else if arg == "--no-conj-zw-bound" {
@@ -357,7 +365,7 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
 /// labels `TTC (unconstrained baseline)` and
 /// `TTC (conjecture-constrained)` on every user-facing TTC report.
 fn conjecture_ttc_qualifier(cfg: &SearchConfig) -> &'static str {
-    if cfg.conj_xy_product || cfg.conj_zw_bound || cfg.conj_tuple {
+    if cfg.conj_zw_bound || cfg.conj_tuple {
         " TTC (conjecture-constrained)"
     } else {
         " TTC (unconstrained baseline)"
@@ -1633,7 +1641,7 @@ mod tests {
             mdd_extend: 0,
             wz_together: false,
             wz_mode: Some(WzMode::Apart),
-            conj_xy_product: false,
+            xy_product_law: false,
             conj_zw_bound: false,
             conj_tuple: false,
             seed: 0,

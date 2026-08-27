@@ -1,8 +1,36 @@
 # XY Product Law
 
-This note records the current informal proof program for the `XY` product-law conjecture for Turyn-type sequences.
+> **STATUS: PROVED.** This is no longer a conjecture. The law is a
+> machine-checked theorem, `Turyn.xy_product_law` in
+> [`lean/Turyn/XY.lean`](../lean/Turyn/XY.lean), proved for every
+> `n >= 4` under `Canonical1` (BDKR rule (i)) by strong induction on
+> the lag, with no `sorry` and no axioms beyond Lean's three standard
+> ones. It is re-exposed as `Turyn.Result.xy_interior_antipalindrome`
+> in [`lean/Results.lean`](../lean/Results.lean).
+>
+> Consequently the search **enforces the law by default** (see
+> `add_xy_product_law` in `src/xy_sat.rs` and the structural XY MDD
+> builder in `src/mdd_zw_first.rs`). `--no-xy-product` disables it for
+> A/B benchmarking only; it is not a correctness escape hatch, and a
+> run with the law enabled is *not* conjecture-constrained, so it does
+> not carry the `TTC (conjecture-constrained)` qualifier.
+>
+> Independent falsification check: `cargo run --release --bin
+> analyze_data` walks the full 1024-element symmetry orbit of every
+> solution in the published catalogue (`data/`, n = 4..32), keeps the
+> 896,896 members that satisfy rule (i) -- exactly the theorem's
+> hypothesis -- and confirms zero violations.
+>
+> The rest of this note is kept as the historical record of the
+> informal proof program that led to the Lean proof. Read it as
+> motivation, not as an open question.
 
-The conjecture is motivated by the known corpus and by the high-lag parity structure of the Turyn equations. It is not yet fully proved. The goal of this file is to make the current state precise enough that a future proof attempt, Lean formalization, or solver implementation has a stable target.
+This note records the informal proof program that preceded the Lean
+formalization of the `XY` product law for Turyn-type sequences.
+
+The law was originally motivated by the known corpus and by the
+high-lag parity structure of the Turyn equations. The "Parity Hammer"
+section below became `parity_hammer` in the Lean development.
 
 ## Statement
 
@@ -20,7 +48,7 @@ Define the product sequence:
 
 - `U_i := x_i y_i`
 
-The conjectural canonical-form law is:
+The law (now a theorem) is:
 
 - `U_1 = U_n = +1`
 - `U_i = -U_{n+1-i}` for `2 <= i <= n - 1`

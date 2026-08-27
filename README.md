@@ -108,6 +108,17 @@ The `apart|together` modes use a 4-stage pull-based priority queue:
    constraint.
 4. **SolveXY** (stage 3) — XY SAT via `SolveXyPerCandidate`.
 
+### Proved pruning: the XY product law
+
+With `U_i := x_i · y_i` (1-indexed), every `TT(n)` with `n ≥ 4` in BDKR
+rule-(i) form satisfies `U_1 = U_n = +1` and `U_i = -U_{n+1-i}` for
+`2 ≤ i ≤ n-1` — so `⟨X, Y⟩ = 2`, and roughly `n/2 - 1` bits drop out of
+the XY subspace. This is a machine-checked theorem
+(`Turyn.xy_product_law`, `lean/Turyn/XY.lean`), so the search enforces
+it **by default** in both the XY SAT encoder and the structural MDD
+builder. `--no-xy-product` turns it off for A/B benchmarking only.
+See [`docs/CANONICAL.md`](docs/CANONICAL.md#xy-product-law-a-theorem-not-a-canonicalization).
+
 ### radical — pure Rust CDCL SAT solver
 
 The `radical/` subcrate is a custom CDCL SAT solver with three extensions

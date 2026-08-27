@@ -4150,3 +4150,62 @@ ABBA block is ~80s, 4-block screen is ~5.5 min. Confirm any "win"
 with 8-block clean re-run.
 
 rather than mechanism-induced.
+## XY product law: conjecture → theorem (August 2026, Claude)
+
+### Status change, not an optimization
+
+`--conj-xy-product` was carried as an unproven conjecture (off by
+default) even though `Turyn.xy_product_law` in `lean/Turyn/XY.lean`
+proves it — `sorry`-free, axiom-free beyond Lean's three standard
+axioms — for every `n >= 4` under `Canonical1`, i.e. BDKR rule (i),
+which every producer in this pipeline already enforces. The flag is
+now `--no-xy-product` (law on by default) and no longer taints the TTC
+label via `conjecture_ttc_qualifier`. See
+`docs/CANONICAL.md#xy-product-law-a-theorem-not-a-canonicalization`.
+
+Independent falsification run before flipping the default: `analyze_data`
+now walks the full 1024-element symmetry orbit of every catalogued
+solution (`data/`, n = 4..32), keeps the members satisfying rule (i) —
+exactly the theorem's hypothesis — and checks the law on each.
+**896,896 rule-(i) orbit members, 0 violations.**
+
+### Correctness validation
+
+| check | result |
+|---|---|
+| `--wz=cross --n=10 --all` to `covered=1.0`, law on vs off | 43 solutions both ways, **byte-identical solution sets**; 43 = the catalogue count for TT(10) |
+| `--wz=cross --n=12 --all` to `covered=1.0`, law on vs off | 127 solutions both ways, identical sets; 127 = the catalogue count for TT(12) |
+| `xy_product_law_tests` (new, `src/xy_sat.rs`) | encoding accepts *exactly* the law-satisfying assignments by exhaustive enumeration at n=4,6,8; emits nothing for n<4; refutes odd n>=5 |
+| `cargo test --release --bin turyn` | 95/95 |
+
+### Performance: NULL. The pruning was already being captured.
+
+| bench | result |
+|---|---|
+| n=26 `--wz=together --mdd-k=7 --bench-cover-log2=38 --threads=1 --seed=0`, counters | **bit-identical** (28,593 XY solves, 190 W/Z solves, 1,465,976 boundaries) with and without the law |
+| same config, 5-block ABBA paired wall-clock | mean **+0.13 %** (law on slower), sd 3.98 %, 95 % CI **[−4.82 %, +5.07 %]** — null |
+
+Why null, and why that is the *expected* answer: the structural XY MDD
+builder has enforced the same mirror-U law unconditionally at the
+`2k` boundary positions since `d4d7eb4` ("mdd: make structural XY
+boundary builder default") — `gen_mdd 7` reports 503,056 mirror-U
+prunes at build time. So in every MDD mode the law's pruning was
+*already* in `mdd-<k>.bin`; the SAT-side clauses only constrain the
+`n - 2k` middle positions, which at n=26 k=7 is 12 positions ≈ 5 mirror
+pairs. The bit-identical counters confirm the flag changes no stage
+flow at all. In `--wz=cross`, which has no MDD, the law is likewise
+invisible because Z×W enumeration dominates the XY SAT (n=10: 1.90 s
+vs 1.88 s; n=12: 230.9 s vs 229.2 s).
+
+Cautionary note for the next agent: a single unpaired A/B of this
+change read **−7.1 %** (56.4 s vs 60.7 s) and looked like a solid win.
+Five paired ABBA blocks put it at +0.13 % ± 5 %. One unpaired sample at
+this workload is worth nothing; see `docs/BENCHMARKING.md`.
+
+### Where the law is still untapped
+
+`--wz=sync` does not reference `add_xy_product_law` at all — its
+persistent solver enforces BDKR (i)–(vi) but not the product law. Sync
+builds its walker on the fly with no MDD, so unlike the MDD modes it
+has *not* already absorbed the pruning. That is the one place the law
+is expected to be a real win, and it is untried. **Status: PROPOSED.**

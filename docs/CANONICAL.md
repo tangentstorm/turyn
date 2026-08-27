@@ -64,7 +64,50 @@ An additional consequence of the full rule set: **`c[n] = -1` for `n > 1`.**
 | (v)     | MDD pipeline: `SolveW` / `SolveWZ`   | boundary pre-filter + brute-force W full-sequence canonicality check |
 | (vi)    | `build_sat_xy_clauses`, `sat_encode` | 5 clauses encoding the conditional X↔Y swap break |
 | (vi)    | `walk_xy_sub_mdd` pre-filter          | boundary-only check: forbid `(x[1]=-1, y[1]=+1)`; when `x[1]=y[1]`, require `x[n-2]=+1` and `y[n-2]=-1` |
+| XY product law | `xy_sat::add_xy_product_law` | `U_i = -U_{n+1-i}` for `2 <= i <= n-1` (`U_i := x_i*y_i`), as 8 parity clauses per mirror pair. **On by default**; `--no-xy-product` opts out for benchmarking. Not a canonical rule but a *theorem* — see "XY product law" below |
+| XY product law | MDD structural XY builder (`src/mdd_zw_first.rs`) | the same law applied to the `2k` boundary positions at build time, so `mdd-<k>.bin` contains only law-satisfying XY boundaries. `MDD_XY_RAW=1` builds without it |
 | tuple-level | `SumTuple::norm_key`             | identity key `(σ_X, σ_Y, σ_Z, σ_W)` (signed).  Rules (i)–(vi) break every coordinate-level symmetry of the tuple, so dedup by `|·|` is *unsound*: at n=6 it silently misses 2 of the 4 BDKR orbits (whose canonical reps happen to have `σ_W = -1` and `σ_Y = -2`).  See "Tuple-level correctness" below. |
+
+### XY product law (a theorem, not a canonicalization)
+
+Distinct from BDKR (i)–(vi): the rules above pick one representative
+per symmetry orbit, whereas the XY product law is a *property every
+rule-(i) quadruple already has*. With `U_i := x_i · y_i` (1-indexed),
+every `TT(n)` with `n ≥ 4` satisfying rule (i) obeys
+
+```text
+U_1 = U_n = +1        and        U_i = -U_{n+1-i}   for 2 <= i <= n-1
+```
+
+which implies `⟨X, Y⟩ = 2`, and removes about `n/2 - 1` bits from the
+XY subspace when enforced exactly.
+
+It is proved: `Turyn.xy_product_law` in `lean/Turyn/XY.lean`, by
+strong induction on the lag, `sorry`-free and axiom-free beyond Lean's
+three standard axioms. The hypothesis is exactly `Canonical1`, i.e.
+rule (i), which every producer in this pipeline enforces (see the rows
+above), so the law never removes a valid solution here.
+
+Two consequences worth remembering:
+
+* For **odd `n ≥ 5`** the law pairs the middle index with itself and
+  demands `U_i² = -1`, so it proves no canonical `TT(n)` exists at odd
+  `n ≥ 5`. `add_xy_product_law` emits the empty clause in that case.
+  The proof requires `n ≥ 4`, so `n < 4` is left unconstrained.
+* Because it is a theorem and not a hypothesis, a run with the law
+  enabled is **not** conjecture-constrained and must not be labeled
+  `TTC (conjecture-constrained)`.
+
+Empirical falsification check, run by `cargo run --release --bin
+analyze_data`: walk the full 1024-element symmetry orbit of every
+solution in `data/` (n = 4..32), keep the members satisfying rule (i),
+and check the law on each. Result: **896,896 rule-(i) orbit members
+checked, 0 violations.**
+
+Historical note: this was tracked as a conjecture
+(`--conj-xy-product`, off by default) in `conjectures/xy-product.md`
+until the Lean proof landed. The old flag spellings
+`--conj-xy-product` / `--no-conj-xy-product` still parse as aliases.
 
 The palindromic/alternation/swap-break encoding is shared across the
 XY template and the legacy full encoder via `add_palindromic_break`,
