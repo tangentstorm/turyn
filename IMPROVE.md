@@ -5,6 +5,26 @@ The long-term target is TT(56) — finding it would let us construct a
 Hadamard matrix of order 668. Do not optimize for a single proxy counter
 unless you can explain why that counter should move TTC.
 
+## Before you optimize anything: read `docs/TTC-AUDIT.md`
+
+Two findings there change how you should use this file:
+
+1. **`--wz=apart`'s `covered` / TTC is not a measurement of coverage.**
+   Per-boundary W and Z caps close boundaries with full exact credit, so
+   `covered=1.000` has been observed on runs that found 13-71 % of the
+   published catalogue, and the n=56 TTC moves **3.2x** purely by changing
+   `TURYN_MAX_W_PER_BND`. Optimizing against that number can reward
+   skipping work.
+2. **The bit-exactness claim below is mode-dependent.** It holds for
+   `--wz=together` solve counters, and fails for `--wz=apart`: three
+   identical `--threads=1 --seed=0` runs at n=16 gave 79 181 / 79 974 /
+   79 725 XY solves (~1 %) — five times the 0.2 % acceptance bar below.
+   Boundary-derived counters are unstable in both modes except at a
+   cover-log2 deep enough to exhaust the boundary set.
+
+Use `check_coverage` (`docs/TTC-AUDIT.md` §10) to confirm an optimization
+did not change what the search actually covers.
+
 ## TL;DR for the next agent
 
 The acceptance bar is **0.2 % real movement**.  How to detect it:

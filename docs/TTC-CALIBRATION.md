@@ -1,5 +1,15 @@
 # TTC calibration — what works, and how to use it for big-n estimates
 
+> **Read [`TTC-AUDIT.md`](TTC-AUDIT.md) (August 2026) first.**
+> The calibration below is correct as stated — TTC tracks wall-clock to
+> ~10 % on `--wz=apart` runs to `covered=1.0`. But those runs reach
+> `covered=1.0` while missing 29 % of the catalogue at n=16 and 36 % at
+> n=18, because the per-boundary W and Z caps close boundaries with full
+> exact credit. The prediction and the ground truth are computed over the
+> same truncated space, so this document measures self-consistency, not
+> coverage. The mode-disagreement it flagged as "root cause unknown" is
+> exactly that defect.
+
 This is the result of testing whether the TTC metric is **consistent**
 (same answer twice) and **accurate** (matches ground truth) at a scale
 small enough to verify directly. Spoiler: yes, with the right

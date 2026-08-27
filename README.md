@@ -178,6 +178,7 @@ TURYN_THREADS=8 target/release/turyn search --n=56 --wz=apart --mdd-k=10 --sat-s
 
 - `docs/PIPELINE.md` — overview of all four `--wz` modes and shared building blocks.
 - `docs/TELEMETRY.md` — reader's guide to `--wz=sync` output.
+- `docs/TTC-AUDIT.md` — **read before trusting any `covered` or TTC number.** Audit of coverage honesty per mode, with `check_coverage` for verifying a run against the published catalogue.
 - `docs/OPTIMIZATION_LOG.md` — measured before/after for every accepted optimisation.
 - `docs/MDD-OPTIMIZATION-LOG.md` — MDD generation optimisations.
 - `docs/CANONICAL.md` — Turyn symmetry group (T1..T4) and BDKR canonical form.

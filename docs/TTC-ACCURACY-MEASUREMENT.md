@@ -1,5 +1,11 @@
 # TTC accuracy measurement (April 2026)
 
+> **Superseded in part by [`TTC-AUDIT.md`](TTC-AUDIT.md) (August 2026).**
+> This document measured whether TTC *converges*. It did not test whether
+> `covered_mass` is *true*. It is not: `--wz=apart` reports `covered=1.000`
+> on runs that found as little as 13 % of the published catalogue. Read the
+> audit first.
+
 Empirical comparison of TTC ("time to cover") predictions against
 actual wall-clock times across all four `--wz` modes for n in {18, 20,
 22, 24, 26}. Each run uses default settings (4 threads, mdd-k=7 for
