@@ -1683,10 +1683,9 @@ mod xy_product_law_tests {
         /// True when `assign` (var -> bool, 1-indexed by var number)
         /// satisfies every recorded clause.
         fn accepts(&self, assign: &dyn Fn(i32) -> bool) -> bool {
-            self.clauses.iter().all(|c| {
-                c.iter()
-                    .any(|&lit| assign(lit.abs()) == (lit > 0))
-            })
+            self.clauses
+                .iter()
+                .all(|c| c.iter().any(|&lit| assign(lit.abs()) == (lit > 0)))
         }
     }
 
@@ -1702,13 +1701,7 @@ mod xy_product_law_tests {
     /// 1-indexed form, evaluated on a 0-indexed bit assignment where
     /// `true` means `+1`.
     fn law_holds(x: &[bool], y: &[bool], n: usize) -> bool {
-        let u = |i: usize| -> i32 {
-            if x[i] == y[i] {
-                1
-            } else {
-                -1
-            }
-        };
+        let u = |i: usize| -> i32 { if x[i] == y[i] { 1 } else { -1 } };
         (1..=n - 2).all(|j| u(j) * u(n - 1 - j) == -1)
     }
 
@@ -1725,11 +1718,7 @@ mod xy_product_law_tests {
                 let y: Vec<bool> = (0..n).map(|i| bits >> (n + i) & 1 == 1).collect();
                 let assign = |v: i32| -> bool {
                     let v = v as usize;
-                    if v <= n {
-                        x[v - 1]
-                    } else {
-                        y[v - n - 1]
-                    }
+                    if v <= n { x[v - 1] } else { y[v - n - 1] }
                 };
                 assert_eq!(
                     rec.accepts(&assign),
