@@ -1,3 +1,4 @@
+pub mod corpus;
 pub mod mdd;
 pub mod mdd_bfs;
 pub mod mdd_reorder;
