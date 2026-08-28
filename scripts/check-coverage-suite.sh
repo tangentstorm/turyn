@@ -35,18 +35,22 @@ run_case() {
   rm -f "$log"
 }
 
-[ -f mdd-5.bin ] || target/release/gen_mdd 5 >/dev/null 2>&1
-[ -f mdd-6.bin ] || target/release/gen_mdd 6 >/dev/null 2>&1
+for kk in 2 3 4 5; do
+  [ -f "mdd-$kk.bin" ] || target/release/gen_mdd "$kk" >/dev/null 2>&1
+done
 
 # cross has no MDD and reproduces the catalogue exactly.
 run_case "cross n=10" 10 43 --wz=cross
-# apart at a k large enough to be complete at this n (see TTC-AUDIT §12.2:
-# completeness is k-dependent; k=5 loses 2 classes here).
-run_case "apart n=14 k=6" 14 186 --wz=apart --mdd-k=6
+# Small k / large middle is the regime that used to lose solutions
+# (TTC-AUDIT §12.2, §12.2d). Keep the smallest k in the fast set.
+run_case "apart n=12 k=2" 12 127 --wz=apart --mdd-k=2
+run_case "apart n=14 k=5" 14 186 --wz=apart --mdd-k=5
 
 if [ "${1:-}" = "--full" ]; then
   run_case "cross n=12" 12 127 --wz=cross
-  run_case "apart n=16 k=6" 16 739 --wz=apart --mdd-k=6
+  run_case "apart n=14 k=3" 14 186 --wz=apart --mdd-k=3
+  run_case "apart n=16 k=4" 16 739 --wz=apart --mdd-k=4
+  run_case "together n=14 k=5" 14 186 --wz=together --mdd-k=5
 fi
 
 exit $fail

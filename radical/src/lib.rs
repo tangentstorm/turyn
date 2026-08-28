@@ -3657,6 +3657,19 @@ impl Solver {
             level: self.decision_level(),
             reason,
         });
+        // Keep the spectral propagator's mirror of the assignment exactly
+        // in step with the trail. It used to be updated lazily inside the
+        // propagation loop, one literal at a time, so whenever another
+        // propagator enqueued spectral variables the mirror lagged behind:
+        // `check_conflict` then judged a state the solver was not in, and
+        // the conflict clause built from `spec.values` described that same
+        // phantom state. Backtrack already unassigns per popped trail
+        // entry, so mirroring here makes the two exactly inverse.
+        if let Some(ref mut spec) = self.spectral {
+            if v < spec.num_seq_vars && !spec.assigned[v] {
+                spec.assign(v, if lit > 0 { 1 } else { -1 });
+            }
+        }
         if let Some(kind) = reason.prop_kind() {
             self.propagations += 1;
             let lvl = self.decision_level() as usize;
@@ -3797,9 +3810,27 @@ impl Solver {
             if self.spectral.is_some() {
                 let v = var_of(lit);
                 let spec = self.spectral.as_mut().unwrap();
-                if v < spec.num_seq_vars && !spec.assigned[v] {
-                    let val: i8 = if lit > 0 { 1 } else { -1 };
-                    spec.assign(v, val);
+                // `enqueue` already mirrored this assignment; here we only
+                // judge the resulting state. The mirror must equal the
+                // solver's assignment on the spectral variables -- if it
+                // does not, both `check_conflict`'s verdict and the clause
+                // built from `spec.values` describe a state the solver is
+                // not in, and the search silently loses solutions.
+                debug_assert!(
+                    (0..spec.num_seq_vars).all(|sv| {
+                        let solver_on = self.assigns[sv] != LBool::Undef;
+                        spec.assigned[sv] == solver_on
+                            && (!solver_on
+                                || spec.values[sv]
+                                    == if self.assigns[sv] == LBool::True {
+                                        1
+                                    } else {
+                                        -1
+                                    })
+                    }),
+                    "spectral mirror desynced from the trail"
+                );
+                if v < spec.num_seq_vars {
                     if spec.check_conflict().is_some() {
                         // Build conflict clause from all assigned seq vars
                         let num_sv = spec.num_seq_vars;
@@ -3810,6 +3841,53 @@ impl Solver {
                             }
                             let sv_lit = (sv + 1) as Lit;
                             cl.push(if spec.values[sv] > 0 { -sv_lit } else { sv_lit });
+                        }
+                        // `TURYN_AUDIT_SPECTRAL=1`: a conflict clause must be
+                        // falsified by the current assignment, or conflict
+                        // analysis derives nonsense from it. That holds only
+                        // while the propagator's mirror of the assignment
+                        // (`spec.assigned` / `spec.values`) agrees with the
+                        // solver's own.
+                        if std::env::var("TURYN_AUDIT_SPECTRAL").is_ok() {
+                            // The propagator keeps its own mirror of the
+                            // assignment (`assigned` / `values`). If that
+                            // mirror ever disagrees with the solver's trail,
+                            // both the conflict verdict and the clause built
+                            // from it are about a state that does not exist.
+                            for sv in 0..num_sv {
+                                let solver_val = self.assigns[sv];
+                                let mirror_on = spec.assigned[sv];
+                                let solver_on = solver_val != LBool::Undef;
+                                if mirror_on != solver_on {
+                                    eprintln!(
+                                        "SPECTRAL-DESYNC: var {} mirror_assigned={mirror_on} solver_assigned={solver_on}",
+                                        sv + 1
+                                    );
+                                } else if mirror_on {
+                                    let want = if solver_val == LBool::True { 1i8 } else { -1i8 };
+                                    if spec.values[sv] != want {
+                                        eprintln!(
+                                            "SPECTRAL-DESYNC: var {} mirror_value={} solver_value={want}",
+                                            sv + 1,
+                                            spec.values[sv]
+                                        );
+                                    }
+                                }
+                            }
+                            for &l in &cl {
+                                let lv = var_of(l);
+                                let assigned_true = self.assigns[lv] == LBool::True;
+                                let lit_is_false =
+                                    if l > 0 { !assigned_true } else { assigned_true };
+                                let unassigned = self.assigns[lv] == LBool::Undef;
+                                if unassigned || !lit_is_false {
+                                    eprintln!(
+                                        "SPECTRAL-AUDIT: conflict clause literal {l} is NOT false \
+(solver assigns={:?}, spec.values={}) -- the clause is not a conflict",
+                                        self.assigns[lv], spec.values[lv]
+                                    );
+                                }
+                            }
                         }
                         let ci = self.clause_meta.len() as u32;
                         let cs = self.clause_lits.len();
@@ -6911,5 +6989,226 @@ mod tests {
             "PbSetEq + quad_pb + canonical boundary should be SAT — the canonical middle X, Y is a valid completion.  \
              This is the n=18 turyn open-search regression manifesting as a pure radical-level test."
         );
+    }
+}
+
+#[cfg(test)]
+mod spectral_drift_tests {
+    use super::*;
+
+    /// `SpectralConstraint` maintains `re`, `im` and `max_reduction`
+    /// incrementally: `assign` adds a variable's contribution and
+    /// `unassign` subtracts it. A CDCL search assigns and unassigns the
+    /// same variables millions of times, so any floating-point drift in
+    /// that round trip accumulates.
+    ///
+    /// Drift matters because `check_conflict` prunes when
+    /// `mag - max_reduction > sqrt(bound)`: if `max_reduction` drifts
+    /// low the bound becomes too tight and the propagator can reject a
+    /// satisfying assignment, which shows up as a search that returns
+    /// UNSAT with solutions still available.
+    ///
+    /// This pins the round trip: after many assign/unassign cycles the
+    /// incremental state must still match a from-scratch recomputation.
+    #[test]
+    fn assign_unassign_round_trip_does_not_drift() {
+        let seq_len = 18;
+        let k = 5;
+        let boundary: Vec<i8> = (0..seq_len)
+            .map(|p| {
+                if p < k || p >= seq_len - k {
+                    if p % 3 == 0 { 1 } else { -1 }
+                } else {
+                    0
+                }
+            })
+            .collect();
+        let mut sc = SpectralConstraint::new(seq_len, k, &boundary, 53.0, 64);
+        let nv = sc.num_seq_vars;
+        assert!(nv > 0);
+
+        let re0 = sc.re.clone();
+        let im0 = sc.im.clone();
+        let mr0 = sc.max_reduction.clone();
+
+        // Deterministic pseudo-random assign/unassign churn, mimicking
+        // CDCL descent and backtracking.
+        let mut rng: u64 = 0x9E3779B97F4A7C15;
+        let mut stack: Vec<usize> = Vec::new();
+        for _ in 0..200_000 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let descend = (rng & 1) == 0 || stack.is_empty();
+            if descend && stack.len() < nv {
+                let free: Vec<usize> = (0..nv).filter(|v| !sc.assigned[*v]).collect();
+                let v = free[(rng >> 8) as usize % free.len()];
+                sc.assign(v, if (rng >> 16) & 1 == 0 { 1 } else { -1 });
+                stack.push(v);
+            } else if let Some(v) = stack.pop() {
+                sc.unassign(v);
+            }
+        }
+        while let Some(v) = stack.pop() {
+            sc.unassign(v);
+        }
+
+        let worst_re = re0
+            .iter()
+            .zip(&sc.re)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        let worst_im = im0
+            .iter()
+            .zip(&sc.im)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        let worst_mr = mr0
+            .iter()
+            .zip(&sc.max_reduction)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        eprintln!(
+            "drift after 200k cycles: re={worst_re:.3e} im={worst_im:.3e} max_reduction={worst_mr:.3e}"
+        );
+
+        // `check_conflict` compares magnitudes against `sqrt(bound)`, so
+        // drift only matters once it approaches the margins real
+        // instances sit at (~1e-2 in |DFT| units). Anything at 1e-6 is
+        // irrelevant; anything approaching 1e-3 is not.
+        assert!(
+            worst_mr < 1e-6,
+            "max_reduction drifted {worst_mr:.3e} -- the propagator's bound is no longer trustworthy"
+        );
+        assert!(worst_re < 1e-6, "re drifted {worst_re:.3e}");
+        assert!(worst_im < 1e-6, "im drifted {worst_im:.3e}");
+    }
+}
+
+#[cfg(test)]
+mod spectral_soundness_tests {
+    use super::*;
+
+    /// The Z-middle solver enforces the Turyn pair bound per frequency:
+    /// `|Z(ω)|² ≤ (3n−1) − |W(ω)|²`. That is a valid necessary condition,
+    /// so the propagator must never reject a genuine `TT(n)`.
+    ///
+    /// This walks a catalogued `TT(12)` — one `--wz=apart --mdd-k=2` was
+    /// missing — through the propagator exactly as `process_solve_z`
+    /// drives it, asserting no conflict is reported at any prefix of the
+    /// middle assignment.
+    #[test]
+    fn pair_bound_propagator_accepts_a_real_solution() {
+        // ++++++-+-+++ / +++-+------+ / +++---++--+- / ++--+--+-+-
+        let z: Vec<i8> = "+++---++--+-"
+            .chars()
+            .map(|c| if c == '+' { 1i8 } else { -1 })
+            .collect();
+        let w: Vec<i8> = "++--+--+-+-"
+            .chars()
+            .map(|c| if c == '+' { 1i8 } else { -1 })
+            .collect();
+        let n = z.len();
+        let k = 2;
+        let num_freqs = 64;
+        let pair_bound = (6.0 * n as f64 - 2.0) / 2.0; // 3n − 1
+        let tables = SpectralTables::new(n, k, num_freqs);
+
+        // Z boundary only, middle zeroed — same shape process_solve_z uses.
+        let mut z_bnd = vec![0i8; n];
+        for pos in 0..n {
+            if pos < k || pos >= n - k {
+                z_bnd[pos] = z[pos];
+            }
+        }
+        let mut sc = SpectralConstraint::from_tables(&tables, &z_bnd, pair_bound);
+
+        // Per-frequency budget left for Z after W takes its share.
+        let mut pfb = vec![pair_bound; num_freqs];
+        for fi in 0..num_freqs {
+            let (mut wr, mut wi) = (0.0f64, 0.0f64);
+            for (j, &wv) in w.iter().enumerate() {
+                let c = tables.pos_cos[j * num_freqs + fi];
+                let s = tables.pos_sin[j * num_freqs + fi];
+                if wv > 0 {
+                    wr += c;
+                    wi += s;
+                } else {
+                    wr -= c;
+                    wi -= s;
+                }
+            }
+            pfb[fi] = (pair_bound - wr * wr - wi * wi).max(0.0);
+        }
+        sc.per_freq_bound = Some(pfb);
+
+        // Sanity: the completed pair really does satisfy the bound at
+        // every sampled frequency, so any conflict below is the
+        // propagator's fault and not the instance's.
+        for fi in 0..num_freqs {
+            let (mut zr, mut zi) = (0.0f64, 0.0f64);
+            for (p, &zv) in z.iter().enumerate() {
+                let c = tables.pos_cos[p * num_freqs + fi];
+                let s = tables.pos_sin[p * num_freqs + fi];
+                zr += zv as f64 * c;
+                zi += zv as f64 * s;
+            }
+            let zmag2 = zr * zr + zi * zi;
+            let budget = sc.per_freq_bound.as_ref().unwrap()[fi];
+            assert!(
+                zmag2 <= budget + 1e-9,
+                "instance itself violates the bound at fi={fi}: |Z|²={zmag2:.4} > {budget:.4}"
+            );
+        }
+
+        // The solver assigns middle vars in arbitrary order and
+        // backtracks, so soundness means: NO subset of the true
+        // assignment may be reported as a conflict. Check all 2^m.
+        let m = sc.num_seq_vars;
+        for mask in 0u32..(1u32 << m) {
+            for vi in 0..m {
+                if sc.assigned[vi] {
+                    sc.unassign(vi);
+                }
+            }
+            for vi in 0..m {
+                if mask >> vi & 1 == 1 {
+                    sc.assign(vi, z[k + vi]);
+                }
+            }
+            if let Some(fi) = sc.check_conflict() {
+                let budget = sc.per_freq_bound.as_ref().unwrap()[fi];
+                let mag = (sc.re[fi] * sc.re[fi] + sc.im[fi] * sc.im[fi]).sqrt();
+                panic!(
+                    "propagator rejected a PARTIAL assignment of a real TT(12)\n                       assigned mask={mask:#010b} ({} of {m} vars)\n                       fi={fi} mag={mag:.6} max_reduction={:.6} lower_bound={:.6} sqrt(budget)={:.6}",
+                    mask.count_ones(),
+                    sc.max_reduction[fi],
+                    (mag - sc.max_reduction[fi]).max(0.0),
+                    budget.sqrt()
+                );
+            }
+        }
+        for vi in 0..m {
+            if sc.assigned[vi] {
+                sc.unassign(vi);
+            }
+        }
+        // Now assign the middle in order, as the search would.
+        for vi in 0..sc.num_seq_vars {
+            sc.assign(vi, z[k + vi]);
+            if let Some(fi) = sc.check_conflict() {
+                let budget = sc.per_freq_bound.as_ref().unwrap()[fi];
+                let mag = (sc.re[fi] * sc.re[fi] + sc.im[fi] * sc.im[fi]).sqrt();
+                panic!(
+                    "propagator rejected a real TT(12) after assigning {} of {} middle vars:\n  \
+                     fi={fi} mag={mag:.6} max_reduction={:.6} lower_bound={:.6} sqrt(budget)={:.6}",
+                    vi + 1,
+                    sc.num_seq_vars,
+                    sc.max_reduction[fi],
+                    (mag - sc.max_reduction[fi]).max(0.0),
+                    budget.sqrt()
+                );
+            }
+        }
     }
 }

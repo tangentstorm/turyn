@@ -62,10 +62,9 @@ Summary of what each mode's `covered` number is worth:
 
 **After the §12 fixes** every mode's `covered` reflects what was
 searched, and `apart`/`together` reproduce the catalogue exactly at
-n=14/16 (and n=18 at k>=6). One case is still short — `apart` at n=18,
-k=5 finds 427 of 675 — from a distinct cause described in §12.2b, so
-`covered=1.000` should still be checked against `check_coverage` when
-completeness matters, and `--mdd-k >= 6` is the safe choice.
+n=14/16 (and n=18 at k>=6). `apart`/`together` now reproduce the catalogue exactly at every (n, k)
+in `scripts/check-coverage-suite.sh`, including the small-`k` cases that
+used to lose a third of the classes (§12.2b).
 
 ## 1. The mechanism: truncation credited as completion
 
@@ -642,32 +641,79 @@ the same reason.
 | `apart` n=18 k=6 | — | 673 | **675** | 675 |
 | `together` n=14 k=5 | 184 | 184 | **186** | 186 |
 
-### 12.2b Still open: `--wz=apart` at n=18, k=5
+### 12.2b The Z spectral propagator lost the rest — two bugs
 
-`apart --n=18 --mdd-k=5` finds **427 of 675** and is the one case the XY
-fix did not move at all (`flow XY: sat=427` before and after, where n=14
-went +2 and n=16 went +9). So this is a *fourth*, distinct cause, not a
-remnant of the XY multiplicity bug. What is known:
+The remaining hole (n=18 k=5 found 427 of 675) traced to the Z-middle
+solver's native per-frequency propagator, the one enforcing
+`|Z(ω)|² ≤ (3n−1) − |W(ω)|²`. Two separate defects, found with a
+sub-second reproducer: **n=12 --mdd-k=2 finds 96 of 127**, and the
+common factor across every failing case is `middle_n = n − 2k ≥ 8`,
+which is exactly the gate on building the Z spectral tables.
 
-* `k=6` at the same `n` is **complete** (675/675), so it is again a
-  small-`k` / large-middle effect;
-* the missing class `++++++++++-+--++-+ / +-+-+++--+--+++--+ /
-  ++++--+----++-+-+- / +++---++-+---+--+` **is found when its boundary is
-  pinned** with `--outfix=04053...1a17c1`, so the boundary and both
-  middle solvers can reach it;
-* its boundary is live in the MDD and is emitted by
-  `enumerate_live_boundaries` (`TURYN_TRACE_BND=14f,247`);
-* it is **not** the extension pre-filter: with `--mdd-extend=0` now
-  actually honoured (see below) the count is 433, within the section-7
-  run-to-run noise of 427.
+**Bug 1: the propagator's mirror lagged the trail.** `SpectralConstraint`
+keeps its own copy of the assignment (`assigned` / `values`), updated
+lazily inside the propagation loop one literal at a time. Whenever
+another propagator enqueued spectral variables that the loop had not
+reached yet, the mirror fell behind — 14,511 desyncs in a single n=12
+run. Both `check_conflict`'s verdict and the conflict clause built from
+`spec.values` then described a state the solver was not in. Fixed by
+mirroring the assignment in `Solver::enqueue`, which makes it exactly
+inverse to the per-trail-entry `unassign` that `backtrack` already did.
+A `debug_assert` in the propagation path now pins the invariant.
 
-The next step is to run `TURYN_TRACE_BND=14f,247` on the full n=18 run
-and check whether the target `(Z, W)` pair ever reaches the XY stage, and
-if it does, whether the XY walk offers `x_bits=0x2df y_bits=0x275`. The
-tracing hooks for exactly that are in the tree.
+That alone took n=12 k=2 from 96 to 121 of 127.
 
-**Practical guidance until it is found: prefer `--mdd-k >= 6`.** At n=18,
-k=5 finds 63 % of the classes and k=6 finds all of them.
+**Bug 2: something still prunes.** With the mirror provably exact (the
+audit reports 0 desyncs and 0 non-falsified clause literals) the
+propagator still lost ~5 %. The check itself is sound — a test walks a
+catalogued TT(12) through it and asserts no conflict on **any** of the
+2^8 subsets of its middle assignment — and the solver's setup was
+verified to match an independent computation to six decimals
+(`min_pfb=11.085643@fi=46`, identical). The residual is unidentified.
+
+**So the propagator is now off by default** (`TURYN_Z_SPECTRAL=1` opts
+back in). It buys roughly 2.5× throughput and costs solutions, which is
+the wrong trade for a mode whose coverage number is supposed to mean
+something. The post-hoc `spectral_pair_ok` check still filters every
+emitted pair, so enabling it never yields a *wrong* solution — only a
+missing one.
+
+| run | before | after |
+|---|---:|---:|
+| `apart` n=12 k=2 | 96 / 127 | **127 / 127** |
+| `apart` n=14 k=3 | 143 / 186 | **186 / 186** |
+| `apart` n=14 k=5 | 184 / 186 | **186 / 186** |
+| `apart` n=16 k=4 | 611 / 739 | **739 / 739** |
+| `apart` n=16 k=5 | 522 / 739 | **739 / 739** |
+| `apart` n=18 k=5 | 427 / 675 | **675 / 675** |
+| `together` n=14 k=5 | 184 / 186 | **186 / 186** |
+
+n=18 k=5 goes from 164 s to 724 s. That is the price of searching the
+space instead of a subset of it.
+
+**`--mdd-k >= 6` is no longer needed** — small `k` is complete now.
+
+### 12.2z Tooling this needed
+
+Three hooks, all kept:
+
+* `TURYN_TRACE_BND=<zhex>,<whex>` — reports whether a boundary is live in
+  the MDD and whether the enumeration emitted it, and turns on the
+  per-boundary SolveW/SolveZ/XY tracing (which W middles were generated,
+  which (Z, W) pairs reached XY, which XY boundaries were tried and with
+  what verdict, and why each Z enumeration loop exited).
+* `TURYN_AUDIT_SPECTRAL=1` — checks, at every spectral conflict, that the
+  propagator's mirror matches the solver's assignment and that the
+  conflict clause is actually falsified.
+* `TURYN_Z_SPECTRAL=1` / `TURYN_NO_Z_SPECTRAL` — the bisection lever that
+  isolated the propagator in the first place, now the opt-in switch.
+
+The bisection that found it: the missing class's boundary was live and
+emitted; its `(Z, W)` pair reached the XY stage; its XY boundary was
+tried and returned SAT at n=14 — that was the multiplicity bug of §12.2.
+At n=18 the same trail showed the target `Z` and target `W` each
+appearing but **never together**, which put the fault in the Z
+enumeration rather than anywhere downstream.
 
 ### 12.2c `--mdd-extend=0` was silently ignored
 

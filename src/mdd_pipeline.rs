@@ -1360,7 +1360,45 @@ pub(crate) fn process_solve_z(
             pfb[fi] = (ctx.pair_bound - w_re[fi] * w_re[fi] - w_im[fi] * w_im[fi]).max(0.0);
         }
         z_spec.per_freq_bound = Some(pfb);
-        z_solver.spectral = Some(z_spec);
+        // The native per-frequency propagator is OFF by default: it
+        // removes valid solutions. With the mirror desync fixed (see
+        // `Solver::enqueue` in radical) it still loses ~5 % of the
+        // catalogue at n=12/14/16, while the same runs without it
+        // reproduce the catalogue exactly -- `docs/TTC-AUDIT.md` §12.2d.
+        // It buys roughly 2.5x throughput, so it stays available as an
+        // explicit opt-in (`TURYN_Z_SPECTRAL=1`) for runs where speed
+        // matters more than completeness. The post-hoc
+        // `spectral_pair_ok` check still filters every emitted pair
+        // either way, so enabling it never yields a *wrong* solution --
+        // only a missing one.
+        if trace_z {
+            let (mut min_pfb, mut argmin) = (f64::MAX, 0usize);
+            for fi in 0..nf {
+                let b = z_spec.per_freq_bound.as_ref().unwrap()[fi];
+                if b < min_pfb {
+                    min_pfb = b;
+                    argmin = fi;
+                }
+            }
+            eprintln!(
+                "TRACE:   z_spec pair_bound={:.4} nf={} min_pfb={:.6}@fi={} re_bnd[{}]={:.6} im_bnd[{}]={:.6} W={}",
+                ctx.pair_bound,
+                nf,
+                min_pfb,
+                argmin,
+                argmin,
+                z_spec.re[argmin],
+                argmin,
+                z_spec.im[argmin],
+                sz.w_vals
+                    .iter()
+                    .map(|&v| if v == 1 { '+' } else { '-' })
+                    .collect::<String>(),
+            );
+        }
+        if std::env::var("TURYN_Z_SPECTRAL").is_ok() {
+            z_solver.spectral = Some(z_spec);
+        }
     }
 
     sat_z_middle::fill_z_solver_quad_pb(
@@ -1434,6 +1472,9 @@ pub(crate) fn process_solve_z(
         if z_count >= ctx.max_z {
             // Batch full; Z middles may remain. Re-queued below.
             more_z_possible = true;
+            if trace_z {
+                eprintln!("TRACE:   SolveZ exit=BATCH-CAP after {z_count} Z");
+            }
             break;
         }
         let z_phases: Vec<bool> = (0..ctx.middle_n)
@@ -1457,6 +1498,9 @@ pub(crate) fn process_solve_z(
                 if z_count == 0 {
                     metrics.flow_z_unsat.fetch_add(1, AtomicOrdering::Relaxed);
                 }
+                if trace_z {
+                    eprintln!("TRACE:   SolveZ exit=UNSAT after {z_count} Z");
+                }
                 break;
             }
             None => {
@@ -1467,6 +1511,9 @@ pub(crate) fn process_solve_z(
                 // exact.
                 metrics.flow_z_timeout.fetch_add(1, AtomicOrdering::Relaxed);
                 *timed_out = true;
+                if trace_z {
+                    eprintln!("TRACE:   SolveZ exit=CONFLICT-BUDGET after {z_count} Z");
+                }
                 break;
             }
         }
@@ -1689,7 +1736,11 @@ pub(crate) fn process_solve_z(
                     let (result, stats) = state.try_candidate(x_bits, y_bits);
                     if trace_z {
                         eprintln!(
-                            "TRACE:     XY try x_bits={x_bits:#x} y_bits={y_bits:#x} -> {}",
+                            "TRACE:     XY try x_bits={x_bits:#x} y_bits={y_bits:#x} tuples={:?} -> {}",
+                            sz.candidate_tuples
+                                .iter()
+                                .map(|t| (t.x, t.y, t.z, t.w))
+                                .collect::<Vec<_>>(),
                             match &result {
                                 XyTryResult::Sat(_) => "SAT",
                                 XyTryResult::Unsat => "unsat",
