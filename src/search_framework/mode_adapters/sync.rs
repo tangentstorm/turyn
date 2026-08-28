@@ -104,7 +104,7 @@ impl SearchMassModel for SyncWalkMassModel {
         CoverageQuality::Projected
     }
     fn total_log2_work(&self) -> Option<f64> {
-        Some(2.0 * self.problem_n as f64)
+        Some(crate::search_framework::mass::raw_log2_work(self.problem_n))
     }
 }
 

@@ -318,6 +318,19 @@ pub(crate) struct SolveWWork {
     /// each solved W middle decodes to a specific σ_W which narrows this
     /// list for the next stage (SolveZ).
     pub(crate) candidate_tuples: Vec<SumTuple>,
+    /// Re-enumeration attempt counter; 0 = initial.  See
+    /// `SolveWZWork::attempt`.
+    pub(crate) attempt: u32,
+    /// Blocking clauses for W middles already enumerated by earlier
+    /// attempts on this boundary.  The per-boundary W batch cap
+    /// (`TURYN_MAX_W_PER_BND`) stops each attempt after a bounded
+    /// number of middles so one boundary cannot monopolise a worker;
+    /// carrying the blocks forward makes that a *batch size* rather
+    /// than a truncation, so the boundary is eventually driven to a
+    /// genuine `Some(false)` and can be credited honestly.  Literals
+    /// refer to the stable `W[0..middle_m]` middle vars, which have
+    /// the same IDs in every freshly-built solver for this boundary.
+    pub(crate) prior_blocks: Vec<Vec<i32>>,
 }
 
 pub(crate) struct SolveZWork {
@@ -331,6 +344,14 @@ pub(crate) struct SolveZWork {
     /// the W the solver locked in).  The Z SAT is built with a
     /// `PbSetEq` over the union of their ±|σ_Z| counts.
     pub(crate) candidate_tuples: Vec<SumTuple>,
+    /// Re-enumeration attempt counter; 0 = initial.
+    pub(crate) attempt: u32,
+    /// Blocking clauses for Z middles already enumerated by earlier
+    /// attempts on this `(boundary, W)` pair.  Same role as
+    /// `SolveWWork::prior_blocks`: turns the `ctx.max_z` batch cap
+    /// into a batch size rather than a truncation.  Literals refer to
+    /// the stable `Z[0..middle_n]` middle vars.
+    pub(crate) prior_blocks: Vec<Vec<i32>>,
 }
 
 /// Read-only context shared across all workers (via Arc). Populated
@@ -707,6 +728,8 @@ pub(crate) fn process_boundary(
         })
     } else {
         PipelineWork::SolveW(SolveWWork {
+            attempt: 0,
+            prior_blocks: Vec::new(),
             tuple: rep,
             z_bits: bnd.z_bits,
             w_bits: bnd.w_bits,
@@ -747,7 +770,7 @@ pub(crate) fn process_boundary(
 /// - `stage_enter[2]` +1 per emitted SolveZ,
 /// - `stage_exit[1]` +1 on return.
 pub(crate) fn process_solve_w(
-    sw: SolveWWork,
+    mut sw: SolveWWork,
     ctx: &PhaseBContext,
     metrics: &PipelineMetrics,
     _w_bases: &mut HashMap<i32, radical::Solver>,
@@ -760,6 +783,11 @@ pub(crate) fn process_solve_w(
     // marks the boundary abandoned on true so it's never
     // exact-credited (TTC §4.1).
     timed_out: &mut bool,
+    // Set to the re-queue item when the per-boundary W batch cap
+    // stopped this attempt with W middles possibly remaining. The
+    // caller MUST schedule it; dropping it silently truncates the
+    // boundary while still crediting it as complete.
+    deferred_out: &mut Option<PipelineWork>,
 ) -> Vec<PipelineWork> {
     let k = ctx.k;
     let m = ctx.problem.m();
@@ -879,6 +907,8 @@ pub(crate) fn process_solve_w(
                         metrics.stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
                         let rep = narrowed[0];
                         out_batch.push(PipelineWork::SolveZ(SolveZWork {
+                            attempt: 0,
+                            prior_blocks: Vec::new(),
                             tuple: rep,
                             z_bits: sw.z_bits,
                             w_bits: sw.w_bits,
@@ -950,10 +980,22 @@ pub(crate) fn process_solve_w(
         let w_plk0: Vec<[u64; radical::PropKind::COUNT]> =
             w_solver.propagations_by_kind_level().to_vec();
 
+        // Replay the W middles that earlier attempts on this boundary
+        // already enumerated, so this attempt continues the
+        // enumeration rather than repeating it.
+        for block in &sw.prior_blocks {
+            w_solver.add_clause(block.iter().copied());
+        }
+        // Batch size, NOT a truncation: after this many W middles we
+        // stop and re-queue the remainder (see `more_w_possible`), so
+        // no single boundary monopolises a worker and none is
+        // silently cut short.
         let max_w_per_boundary: usize = std::env::var("TURYN_MAX_W_PER_BND")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(128);
+        let mut new_w_blocks: Vec<Vec<i32>> = Vec::new();
+        let mut more_w_possible = false;
         let w_conflict_budget: u64 = std::env::var("TURYN_W_CONFL")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -964,6 +1006,8 @@ pub(crate) fn process_solve_w(
                 break;
             }
             if w_iter_count >= max_w_per_boundary {
+                // Batch full; W middles may remain. Re-queued below.
+                more_w_possible = true;
                 break;
             }
             w_iter_count += 1;
@@ -1019,7 +1063,8 @@ pub(crate) fn process_solve_w(
                 })
                 .collect();
             w_solver.reset();
-            w_solver.add_clause(w_block);
+            w_solver.add_clause(w_block.iter().copied());
+            new_w_blocks.push(w_block);
 
             let w_spectrum = match crate::spectrum::spectrum_if_ok(
                 &w_vals,
@@ -1053,6 +1098,8 @@ pub(crate) fn process_solve_w(
             metrics.stage_enter[2].fetch_add(1, AtomicOrdering::Relaxed);
             let rep = narrowed[0];
             out_batch.push(PipelineWork::SolveZ(SolveZWork {
+                attempt: 0,
+                prior_blocks: Vec::new(),
                 tuple: rep,
                 z_bits: sw.z_bits,
                 w_bits: sw.w_bits,
@@ -1089,6 +1136,24 @@ pub(crate) fn process_solve_w(
         // the solver.
         let _w_cp = w_cp;
         w_solver.spectral = None;
+
+        // TTC §4.1: a full batch is not a completed search. Hand the
+        // remaining W enumeration back to the scheduler carrying the
+        // blocks accumulated so far, so the boundary stays in flight
+        // and is credited only once SAT genuinely proves `Some(false)`.
+        if more_w_possible && (ctx.continue_after_sat || !ctx.found.load(AtomicOrdering::Relaxed)) {
+            let mut blocks = std::mem::take(&mut sw.prior_blocks);
+            blocks.append(&mut new_w_blocks);
+            *deferred_out = Some(PipelineWork::SolveW(SolveWWork {
+                tuple: sw.tuple,
+                z_bits: sw.z_bits,
+                w_bits: sw.w_bits,
+                xy_graph: sw.xy_graph.clone(),
+                candidate_tuples: sw.candidate_tuples.clone(),
+                attempt: sw.attempt + 1,
+                prior_blocks: blocks,
+            }));
+        }
     }
     // Only attribute `flow_w_unsat` to runs where the W enumeration
     // terminated cleanly without finding any candidate. If we
@@ -1120,7 +1185,7 @@ pub(crate) fn process_solve_w(
 /// `sat_config`, `rng`) are passed separately since they're shared
 /// with SolveXY.
 pub(crate) fn process_solve_z(
-    sz: SolveZWork,
+    mut sz: SolveZWork,
     ctx: &PhaseBContext,
     metrics: &PipelineMetrics,
     scratch: &mut ZStageScratch,
@@ -1142,6 +1207,11 @@ pub(crate) fn process_solve_z(
     // conflict-budget timeout (residual Z candidates MAY exist).
     // Caller marks the boundary abandoned on true.
     timed_out: &mut bool,
+    // Set to the re-queue item when the `ctx.max_z` batch cap stopped
+    // this attempt with Z middles possibly remaining. The caller MUST
+    // schedule it; dropping it silently truncates the (boundary, W)
+    // pair while still crediting the boundary as complete.
+    deferred_out: &mut Option<PipelineWork>,
 ) {
     let k = ctx.k;
     let n = ctx.problem.n;
@@ -1325,7 +1395,15 @@ pub(crate) fn process_solve_z(
     let z_l0 = z_solver.num_level0_vars();
     let z_nv = z_solver.num_vars();
 
+    // Replay the Z middles earlier attempts on this (boundary, W)
+    // pair already enumerated, so this attempt continues rather than
+    // repeats.
+    for block in &sz.prior_blocks {
+        z_solver.add_clause(block.iter().copied());
+    }
     let mut z_count = 0usize;
+    let mut new_z_blocks: Vec<Vec<i32>> = Vec::new();
+    let mut more_z_possible = false;
     let z_conflict_budget: u64 = std::env::var("TURYN_Z_CONFL")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1335,6 +1413,8 @@ pub(crate) fn process_solve_z(
             break;
         }
         if z_count >= ctx.max_z {
+            // Batch full; Z middles may remain. Re-queued below.
+            more_z_possible = true;
             break;
         }
         let z_phases: Vec<bool> = (0..ctx.middle_n)
@@ -1383,7 +1463,12 @@ pub(crate) fn process_solve_z(
         z_vals.extend_from_slice(&z_mid);
         z_vals.extend_from_slice(&z_boundary[n - k..]);
 
-        if z_count < ctx.max_z {
+        // Always block the Z just consumed. The previous
+        // `if z_count < ctx.max_z` guard skipped the last one of each
+        // batch, which was only harmless while the remainder was being
+        // discarded; now that the batch is resumed, skipping it would
+        // make the next attempt re-find the same Z forever.
+        {
             let z_block: Vec<i32> = ctx
                 .z_mid_vars
                 .iter()
@@ -1396,7 +1481,8 @@ pub(crate) fn process_solve_z(
                 })
                 .collect();
             z_solver.reset();
-            z_solver.add_clause(z_block);
+            z_solver.add_clause(z_block.iter().copied());
+            new_z_blocks.push(z_block);
         }
 
         crate::spectrum::compute_spectrum_into(
@@ -1669,6 +1755,27 @@ pub(crate) fn process_solve_z(
     let _ = z_cp;
     z_solver.spectral = None;
     let _ = &mut scratch.z_bases;
+
+    // TTC §4.1: a full batch is not a completed search. Hand the
+    // remaining Z enumeration for this (boundary, W) pair back to the
+    // scheduler with the blocks accumulated so far, so the boundary
+    // stays in flight and is credited only once SAT genuinely proves
+    // `Some(false)`.
+    if more_z_possible && (ctx.continue_after_sat || !ctx.found.load(AtomicOrdering::Relaxed)) {
+        let mut blocks = std::mem::take(&mut sz.prior_blocks);
+        blocks.append(&mut new_z_blocks);
+        *deferred_out = Some(PipelineWork::SolveZ(SolveZWork {
+            tuple: sz.tuple,
+            z_bits: sz.z_bits,
+            w_bits: sz.w_bits,
+            w_vals: sz.w_vals.clone(),
+            w_spectrum: sz.w_spectrum.clone(),
+            xy_graph: sz.xy_graph.clone(),
+            candidate_tuples: sz.candidate_tuples.clone(),
+            attempt: sz.attempt + 1,
+            prior_blocks: blocks,
+        }));
+    }
     metrics.stage_exit[2].fetch_add(1, AtomicOrdering::Relaxed);
 }
 

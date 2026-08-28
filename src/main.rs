@@ -359,12 +359,47 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
     }
 }
 
+/// Extrapolation warning for a TTC computed from a very small covered
+/// fraction.
+///
+/// `TTC = elapsed * (1 - covered) / covered`, so at `covered = 1e-6` the
+/// reported number is the observed rate multiplied out by a factor of a
+/// million. Measured behaviour of that extrapolation
+/// (`docs/TTC-AUDIT.md` §4): in the low-coverage regime the prediction
+/// ran 0.31x-0.92x of the eventual truth on runs we could take to
+/// completion, and at n=56 two repeats of the same command differ by 3x.
+/// A bare number there invites the reader to treat a sampling artifact
+/// as an estimate, so say what it is.
+fn ttc_extrapolation_note(covered: f64) -> &'static str {
+    if covered <= 0.0 {
+        ""
+    } else if covered < 1e-4 {
+        " [EXTRAPOLATED >10000x from covered<1e-4: order-of-magnitude only]"
+    } else if covered < 1e-2 {
+        " [EXTRAPOLATED >100x from covered<1e-2: treat as a lower bound]"
+    } else {
+        ""
+    }
+}
+
 /// Qualifier appended to framework-mode TTC lines so the number is
 /// not mistaken between the unconstrained baseline and a
 /// conjecture-restricted run. `docs/TTC.md` §9 requires the exact
 /// labels `TTC (unconstrained baseline)` and
 /// `TTC (conjecture-constrained)` on every user-facing TTC report.
 fn conjecture_ttc_qualifier(cfg: &SearchConfig) -> &'static str {
+    // `--wz=sync` is a heuristic walker, not an exhaustive search: at
+    // n=8 it exhausts its own tree (its per-level `∏ cov` reaches
+    // 1.000) having found 1 of the 6 catalogued classes, and 1 of 43
+    // at n=10. Its `covered` fraction therefore measures progress
+    // through the walker's own tree, NOT the fraction of the TT space
+    // ruled out, and its TTC must never be read as, or compared with,
+    // a time-to-cover from `apart` / `together` / `cross`. SPEC.md
+    // requires modes that are not exhaustive to say so in
+    // user-facing output.
+    if matches!(cfg.wz_mode, Some(WzMode::Sync)) {
+        return " TTC (NON-EXHAUSTIVE walker: covers the walker tree, not the TT space)";
+    }
     if cfg.conj_zw_bound || cfg.conj_tuple {
         " TTC (conjecture-constrained)"
     } else {
@@ -475,15 +510,28 @@ fn run_framework_mdd_mode(
         SearchEvent::Progress(p) => {
             if verbose {
                 eprintln!(
-                    "[framework:{}] elapsed={:.1?} covered={:.3}/{:.3} ttc={:?}{}",
-                    mode_name, p.elapsed, p.covered_mass.0, p.total_mass.0, p.ttc, ttc_tag
+                    "[framework:{}] elapsed={:.1?} covered={:.3e}/{:.3} ttc={:?}{}{}",
+                    mode_name,
+                    p.elapsed,
+                    p.covered_mass.0,
+                    p.total_mass.0,
+                    p.ttc,
+                    ttc_extrapolation_note(p.covered_mass.0),
+                    ttc_tag
                 );
             }
         }
         SearchEvent::Finished(p) => {
             println!(
-                "Framework search (--wz={}): covered={:.3}/{:.3} elapsed={:.1?} ttc={:?} (quality={:?}){}",
-                mode_name, p.covered_mass.0, p.total_mass.0, p.elapsed, p.ttc, p.quality, ttc_tag
+                "Framework search (--wz={}): covered={:.3e}/{:.3} elapsed={:.1?} ttc={:?} (quality={:?}){}{}",
+                mode_name,
+                p.covered_mass.0,
+                p.total_mass.0,
+                p.elapsed,
+                p.ttc,
+                p.quality,
+                ttc_extrapolation_note(p.covered_mass.0),
+                ttc_tag
             );
         }
     });

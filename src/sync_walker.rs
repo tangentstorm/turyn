@@ -1656,7 +1656,9 @@ fn format_per_level_telemetry(stats: &SyncStats) -> String {
         ));
     }
     out.push_str(&format!(
-        "Per-level: cumulative root-coverage (∏ cov) = {:.3e}  →  direct TTC = elapsed / coverage\n",
+        "Per-level: walker-DFS completion (∏ processed/children) = {:.3e}  (fraction of the \
+walker's OWN generated candidates it has processed -- reaches 1.0 when the walk \
+finishes, which is NOT coverage of the TT space; see docs/TTC-AUDIT.md)\n",
         coverage_product,
     ));
     // Cumulative (over the whole run) log2-prune budget and weighted

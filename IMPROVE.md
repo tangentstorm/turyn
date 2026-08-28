@@ -9,12 +9,13 @@ unless you can explain why that counter should move TTC.
 
 Two findings there change how you should use this file:
 
-1. **`--wz=apart`'s `covered` / TTC is not a measurement of coverage.**
-   Per-boundary W and Z caps close boundaries with full exact credit, so
-   `covered=1.000` has been observed on runs that found 13-71 % of the
-   published catalogue, and the n=56 TTC moves **3.2x** purely by changing
-   `TURYN_MAX_W_PER_BND`. Optimizing against that number can reward
-   skipping work.
+1. **`--wz=apart`'s coverage accounting was fixed** (audit §12): the W
+   and Z caps are batch sizes now, re-queued rather than truncating, so
+   `covered` no longer moves with the cap. Two things still hold: at
+   n=56 the TTC is an extrapolation from `covered ≈ 1e-5` with ~3x
+   run-to-run spread, and a residual (non-accounting) completeness bug
+   still loses ~1 % of classes, so `covered=1.000` means "no residual
+   work in the mass model", not "every solution found".
 2. **The bit-exactness claim below is mode-dependent.** It holds for
    `--wz=together` solve counters, and fails for `--wz=apart`: three
    identical `--threads=1 --seed=0` runs at n=16 gave 79 181 / 79 974 /

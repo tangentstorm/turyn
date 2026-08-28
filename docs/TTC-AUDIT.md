@@ -29,6 +29,12 @@ catalogued class, and diffs the sets. A class counts as missing only when
 run's output, so the verdict does not depend on `canonicalize` picking the
 same representative.
 
+> **STATUS: the accounting defects below are FIXED as of the commit that
+> added this banner.** Sections 1-8b describe the metric as it was when
+> audited, and are kept as the evidence trail; **section 12 records what
+> changed and what the numbers look like now.** The `check_coverage`
+> tool and the reproduction steps still work — run them.
+
 ## Headline
 
 **`--wz=apart` reports `covered=1.000` on runs that searched as little as
@@ -540,3 +546,167 @@ target/release/check_coverage 10 /tmp/x10cap.log   # 1 of 43, covered=1.000
 * [`TTC.md`](TTC.md)'s contract is not at fault. §4.1 already requires
   that exact credit means no residual work remains; `apart` violates it.
   The fix is in the adapter, not the spec.
+
+## 12. What was fixed (August 2026)
+
+### 12.1 `--wz=apart`: the W and Z caps are now batch sizes, not truncation
+
+`process_solve_w` and `process_solve_z` gained the `attempt` +
+`prior_blocks` machinery `process_solve_wz` already had. Hitting the
+per-boundary W cap (`TURYN_MAX_W_PER_BND`, 128) or the Z batch cap
+(`ctx.max_z`, 16) now:
+
+* accumulates the blocking clauses for the middles enumerated so far,
+* re-queues the remainder as a fresh `SolveW` / `SolveZ` item at low
+  priority carrying those blocks, so the next attempt continues instead
+  of repeating, and
+* leaves the boundary's pending count above zero, so it cannot be
+  credited as complete.
+
+A boundary is now credited only when SAT genuinely returns `Some(false)`.
+One related bug fixed on the way: the Z loop skipped the blocking clause
+for the last middle of each batch (`if z_count < ctx.max_z`), which was
+harmless only while the remainder was being discarded — with the batch
+resumed it would have made every later attempt re-find the same Z.
+
+**The dose-response from section 2 is now flat.** Same command, same
+knob, run to completion:
+
+| `--max-z` | reported `covered` | classes found | before this fix |
+|---:|---|---:|---:|
+| 2  | 1.000 | **730** / 739 | 99 |
+| 4  | 1.000 | **730** / 739 | 193 |
+| 8  | 1.000 | **730** / 739 | 329 |
+| 16 | 1.000 | **730** / 739 | 526 |
+
+Coverage across `n`, `--wz=apart --mdd-k=5`:
+
+| n | before | after | remaining gap |
+|---:|---:|---:|---:|
+| 14 | 184 / 186 | 184 / 186 | 2 |
+| 16 | 522 / 739 | **730 / 739** | 9 |
+
+The cost is real work that used to be skipped: n=16 goes from 19.4 s to
+~26-28 s. That is the correct direction — the old time was the time to
+finish a truncated search.
+
+### 12.2 A residual completeness bug remains — and `--mdd-k` drives it
+
+The caps were not the only thing losing solutions. With the accounting
+fixed and **no timeouts and no abandoned boundaries** (`flow W/Z
+timeout=0`, `abandoned=0`, so `covered=1.000` is now entirely exact
+credit and every boundary's enumeration really did reach SAT
+`Some(false)`), `--wz=apart` still does not reproduce the catalogue at
+small `k`:
+
+| n | k=4 | k=5 | k=6 | catalogue |
+|---:|---:|---:|---:|---:|
+| 14 | 182 | 184 | **186** | 186 |
+| 18 | — | 427 | **673** | 675 |
+
+At n=18 the default `--mdd-k=5` finds **63 %** of the classes; `k=6`
+finds 99.7 %. This is a *search* bug, not a mass-model one — the mass
+model is now correctly reporting that the search it was given had no
+residual work. But it means:
+
+> **`covered=1.000` from `apart`/`together` means "the mass model has no
+> residual work", not "every solution was found".** Run `check_coverage`
+> against the catalogue whenever that distinction matters, and prefer a
+> larger `--mdd-k` than throughput alone would suggest.
+
+What it is not:
+
+* not the caps — it survives the §12.1 fix, and at n=14 k=5 the Z middle
+  has only `2^4 = 16` values so nothing can be truncated;
+* not the XY product law — an `--xy-raw` MDD plus
+  `MDD_XY_RAW=1 --no-xy-product` reproduces 184/186 exactly;
+* not the spectral filters (`--max-spectral=200`, `--theta=1024` change
+  nothing), not `--mdd-extend` (0/1/2 identical), not the MDD's XY range
+  pruning (`MDD_NO_XY_RANGE=1` at build);
+* not specific to `apart`'s middle solver — `together`, which solves W
+  and Z jointly, also misses 2 at n=14, a *different* 2, so the union
+  across modes is 3 classes.
+
+Shared across both modes and strongly `k`-dependent points upstream of
+the middle solvers, at the MDD boundary layer: `mdd-<k>.bin` is built
+once per `k` and reused at every `n`, so any pruning in the builder that
+is only valid for a particular relationship between `k` and `n` would
+show exactly this signature. That is the first place to look.
+
+`check_coverage` prints the exact missing quadruples; each one verifies
+as a valid `TT(n)`.
+
+### 12.3 `--wz=cross`: space-weighted tuples, pro-rata truncation credit
+
+* `covered_mass` is now `Σ_tuples weight_t · fraction_enumerated_t`, with
+  `weight_t` the tuple's exact binomial shell size normalized to 1,
+  replacing `tuples_done / tuples_total`. At n=26 the largest shell is
+  half the space and was being credited 1/17.
+* `generate_sequences_permuted` now returns `(visited, total)` and is
+  `#[must_use]`, so a `cfg.max_z` / `cfg.max_w` truncation cannot be
+  silently discarded again. `build_w_candidates` and `for_each_zw_pair`
+  thread it through, and a truncated shell is credited pro-rata.
+* A truncated run prints an explicit `WARNING: ... this run is a SAMPLE,
+  not an exhaustive search`.
+
+Verified at n=10: default settings still give `covered=1.000` and
+43/43 classes; `--max-z=10 --max-w=10` now reports **`covered=0.355`**
+plus the warning, where it used to report `covered=1.000` while finding
+1 of 43.
+
+### 12.4 `--wz=sync` is labelled non-exhaustive
+
+Sync exhausts its own walker tree at n=8 having found 1 of the 6
+catalogued classes, and 1 of 43 at n=10. Its TTC line now reads
+`TTC (NON-EXHAUSTIVE walker: covers the walker tree, not the TT space)`,
+and the per-level telemetry line that used to say "cumulative
+root-coverage" now says `walker-DFS completion (∏ processed/children)`
+and states that reaching 1.0 is not coverage of the TT space. The two
+numbers no longer read as competing estimates of the same quantity.
+
+### 12.5 `total_log2_work` and the `--bench-cover-log2` contract
+
+All three exhaustive adapters now use
+`search_framework::mass::raw_log2_work(n) = 4n - 1` instead of `2n`.
+Every run that sets `--bench-cover-log2` prints, before searching:
+
+```text
+[framework:apart] bench stop: total_log2_work=71 target=2^60 => stop at covered >= 4.883e-4
+```
+
+so the target fraction is never ambiguous. **Benchmark targets recorded
+before this change must be raised by `2n - 1`** to select the same
+amount of work (51 at n=26).
+
+### 12.6 Low-coverage extrapolation is now labelled
+
+`covered` prints in scientific notation (it used to round to `0.000`,
+which hid exactly the cases that need care), and a TTC computed from a
+tiny fraction says so:
+
+```text
+covered=6.536e-6/1.000 ttc=Some(6928682s) (quality=Hybrid)
+  [EXTRAPOLATED >10000x from covered<1e-4: order-of-magnitude only]
+```
+
+### 12.7 What is still not trustworthy at n=56
+
+The accounting is honest now, but n=56 remains a hard extrapolation
+problem, and the number moved in the direction the audit predicted:
+`--wz=apart --mdd-k=7 --sat-secs=60` used to report ~2.0e6 s at the
+default cap and now reports 2.6e6-7.7e6 s. Two caveats stand:
+
+* **Run-to-run variance is large.** Two repeats of the identical
+  command at the default cap gave 2.6e6 s and 7.7e6 s (3×). That is the
+  scheduler nondeterminism of section 7, not the mass model.
+* **It still varies with the batch cap** (cap 8: ~5-9e5 s; cap 512:
+  ~7.8e6 s), because at `covered ≈ 6e-6` essentially no boundary has
+  completed and the figure is driven by XY-timeout *partial* credit,
+  whose per-boundary rate depends on how the batches are cut. This is
+  the `Hybrid` label doing its job, and it is why the extrapolation
+  note above exists.
+
+The honest reading of any n=56 TTC today is "order of magnitude, from a
+sample of ~1e-5 of the space, ±3× run to run". Getting a number worth
+more than that needs the section 7 nondeterminism fixed and enough
+budget for boundaries to actually complete — not a change to the metric.

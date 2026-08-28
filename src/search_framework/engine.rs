@@ -150,6 +150,23 @@ impl<T: Send + 'static> SearchEngine<T> {
         let mass_model: Arc<dyn SearchMassModel> = Arc::from(adapter.mass_model());
         let mut mass = MassSnapshot::new(mass_model.total_mass());
 
+        // `--bench-cover-log2=X` stops at `covered >= 2^(X - total_log2)`,
+        // which is easy to misread as "cover 2^X configurations". State
+        // the denominator and the implied fraction up front so a
+        // benchmark target is never ambiguous, and so a target that is
+        // already satisfied (or unreachable) is obvious immediately.
+        if let (Some(target), Some(total_log2)) =
+            (self.cfg.bench_stop_log2_work, mass_model.total_log2_work())
+        {
+            eprintln!(
+                "[framework:{}] bench stop: total_log2_work={:.0} target=2^{} => stop at covered >= {:.3e}",
+                adapter.name(),
+                total_log2,
+                target,
+                (target - total_log2).exp2()
+            );
+        }
+
         let stages_map: BTreeMap<StageId, Arc<dyn StageHandler<T>>> = adapter
             .stages()
             .into_iter()

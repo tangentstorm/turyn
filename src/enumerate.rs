@@ -338,6 +338,16 @@ pub(crate) fn unrank_combination(rank: u128, f: usize, r: usize, out: &mut [i8],
 /// Uses an LCG bijection over [0, C(f, r)) to visit every sequence exactly once
 /// but in a scattered order, so the first `limit` sequences are representative
 /// of the full space rather than clustered lexicographically.
+///
+/// Returns `(visited, total)`. When `limit < total` the enumeration is a
+/// **sample**, not an enumeration: the caller has searched only
+/// `visited / total` of this sum-shell and MUST NOT credit the shell as
+/// fully covered. Silently discarding this return value is how
+/// `--wz=cross` used to report `covered=1.000` on runs that had
+/// enumerated a fraction of the space (see `docs/TTC-AUDIT.md` §5).
+/// Early termination via `visit` returning `false` also shows up here,
+/// as a `visited` below `min(limit, total)`.
+#[must_use = "the (visited, total) return says whether this was a full enumeration or a truncated sample; dropping it silently over-credits coverage"]
 pub(crate) fn generate_sequences_permuted<F: FnMut(&[i8]) -> bool>(
     len: usize,
     target_sum: i32,
@@ -345,7 +355,7 @@ pub(crate) fn generate_sequences_permuted<F: FnMut(&[i8]) -> bool>(
     tail_one: bool,
     limit: usize,
     mut visit: F,
-) {
+) -> (u128, u128) {
     // Determine fixed positions and free count
     let fixed_sum: i32 = (if root_one { 1 } else { 0 }) + (if tail_one { 1 } else { 0 });
     let free_start = if root_one { 1 } else { 0 };
@@ -355,11 +365,11 @@ pub(crate) fn generate_sequences_permuted<F: FnMut(&[i8]) -> bool>(
     // free positions have values in {-1, +1}, sum = 2*ones - f
     // so ones = (free_target + f) / 2
     if (free_target + f as i32) % 2 != 0 {
-        return;
+        return (0, 0);
     }
     let r_signed = (free_target + f as i32) / 2;
     if r_signed < 0 || r_signed > f as i32 {
-        return;
+        return (0, 0);
     }
     let r = r_signed as usize; // number of +1s among free positions
 
@@ -376,8 +386,10 @@ pub(crate) fn generate_sequences_permuted<F: FnMut(&[i8]) -> bool>(
 
     // If the full space fits within the limit, DFS is faster (no unranking overhead).
     if total <= limit as u128 {
+        // Whole shell fits under the limit: DFS enumerates it exactly,
+        // so this is full coverage of the shell.
         generate_sequences_with_sum_visit(len, target_sum, root_one, tail_one, limit, visit);
-        return;
+        return (total, total);
     }
 
     // Bijective scatter: index i -> (a * i + c) mod total
@@ -398,13 +410,16 @@ pub(crate) fn generate_sequences_permuted<F: FnMut(&[i8]) -> bool>(
     };
     let c = 1442695040888963407u128 % m;
 
+    let mut visited: u128 = 0;
     for i in 0..n_visit {
         let rank = (a * i + c) % m;
         unrank_combination(rank, f, r, &mut curr, free_start);
+        visited += 1;
         if !visit(&curr) {
-            return;
+            return (visited, total);
         }
     }
+    (visited, total)
 }
 
 pub(crate) fn gcd128(mut a: u128, mut b: u128) -> u128 {
@@ -418,6 +433,9 @@ pub(crate) fn gcd128(mut a: u128, mut b: u128) -> u128 {
 
 /// Generate all spectrally-valid W sequences for a given sum.
 /// W is the shorter sequence (length n-1) so we materialize it; Z is streamed.
+/// Returns the surviving W candidates together with `(visited, total)`
+/// for the underlying sum-shell enumeration, so the caller can tell a
+/// complete enumeration from a `cfg.max_w`-truncated sample.
 pub(crate) fn build_w_candidates(
     problem: Problem,
     w_sum: i32,
@@ -426,29 +444,32 @@ pub(crate) fn build_w_candidates(
     stats: &mut SearchStats,
     found: &AtomicBool,
     cancelled: &AtomicBool,
-) -> Vec<SeqWithSpectrum> {
+) -> (Vec<SeqWithSpectrum>, u128, u128) {
     let individual_bound = problem.spectral_bound();
     let mut w_candidates: Vec<SeqWithSpectrum> = Vec::new();
     let mut fft_buf = FftScratch::new(spectral_w);
-    generate_sequences_permuted(problem.m(), w_sum, true, false, cfg.max_w, |values| {
-        // Honor both the "solution found" flag and the engine's
-        // live cancel flag — without the latter, `--sat-secs` (a
-        // watchdog that only flips cancel) can't interrupt this
-        // O(enumeration) loop.
-        if found.load(AtomicOrdering::Relaxed) || cancelled.load(AtomicOrdering::Relaxed) {
-            return false;
-        }
-        stats.w_generated += 1;
-        if let Some(spectrum) = spectrum_if_ok(values, spectral_w, individual_bound, &mut fft_buf) {
-            stats.w_spectral_ok += 1;
-            w_candidates.push(SeqWithSpectrum {
-                spectrum,
-                seq: PackedSeq::from_values(values),
-            });
-        }
-        true
-    });
-    w_candidates
+    let (visited, total) =
+        generate_sequences_permuted(problem.m(), w_sum, true, false, cfg.max_w, |values| {
+            // Honor both the "solution found" flag and the engine's
+            // live cancel flag — without the latter, `--sat-secs` (a
+            // watchdog that only flips cancel) can't interrupt this
+            // O(enumeration) loop.
+            if found.load(AtomicOrdering::Relaxed) || cancelled.load(AtomicOrdering::Relaxed) {
+                return false;
+            }
+            stats.w_generated += 1;
+            if let Some(spectrum) =
+                spectrum_if_ok(values, spectral_w, individual_bound, &mut fft_buf)
+            {
+                stats.w_spectral_ok += 1;
+                w_candidates.push(SeqWithSpectrum {
+                    spectrum,
+                    seq: PackedSeq::from_values(values),
+                });
+            }
+            true
+        });
+    (w_candidates, visited, total)
 }
 
 /// Streaming Z×W pairing with spectral index for fast candidate lookup.
@@ -466,7 +487,7 @@ pub(crate) fn for_each_zw_pair(
     found: &AtomicBool,
     cancelled: &AtomicBool,
     mut emit: impl FnMut(&PackedSeq, &PackedSeq, Vec<i32>, &[f64], &[f64]) -> bool,
-) {
+) -> (u128, u128) {
     let individual_bound = problem.spectral_bound();
     let pair_bound = cfg.max_spectral.unwrap_or(problem.spectral_bound());
     let mut fft_buf = FftScratch::new(spectral_z);
@@ -480,6 +501,9 @@ pub(crate) fn for_each_zw_pair(
     // half of Z space — without this filter, cross misses every TT(n)
     // whose canonical Z ends in -1, which at small n means it finds
     // zero canonical solutions.
+    // Returned to the caller: `(visited, total)` for the Z sum-shell.
+    // A `visited < total` means `cfg.max_z` truncated the enumeration
+    // and this shell is only partially searched.
     generate_sequences_permuted(problem.n, z_sum, true, false, cfg.max_z, |values| {
         if found.load(AtomicOrdering::Relaxed) || cancelled.load(AtomicOrdering::Relaxed) {
             return false;
@@ -508,7 +532,7 @@ pub(crate) fn for_each_zw_pair(
             }
         }
         true
-    });
+    })
 }
 
 pub(crate) fn stream_zw_candidates(
@@ -551,7 +575,7 @@ pub(crate) fn build_zw_candidates(
     found: &AtomicBool,
     cancelled: &AtomicBool,
 ) -> Vec<CandidateZW> {
-    let w_candidates =
+    let (w_candidates, _w_visited, _w_total) =
         build_w_candidates(problem, tuple.w, cfg, spectral_w, stats, found, cancelled);
     if found.load(AtomicOrdering::Relaxed) || cancelled.load(AtomicOrdering::Relaxed) {
         return Vec::new();

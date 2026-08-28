@@ -133,6 +133,25 @@ impl MassSnapshot {
     }
 }
 
+/// `log2` of the raw configuration count for `TT(n)`: `X`, `Y`, `Z` are
+/// `n` bits each and `W` is `n - 1`, so the unreduced space is
+/// `2^(4n - 1)`.
+///
+/// This is the denominator [`SearchMassModel::total_log2_work`] is
+/// specified against in `docs/TTC.md` §1.1. Every exhaustive adapter
+/// MUST use this function rather than rolling its own, so
+/// `--bench-cover-log2` means the same thing in every mode.
+///
+/// Historical note: all three adapters previously returned `2n`, which
+/// counted only the `X`/`Y` half. That understated the space by
+/// `2n - 1` bits (2^51 at n=26) and made `--bench-cover-log2` values
+/// incomparable with the documented "cover about 2^x configurations"
+/// reading. Benchmark targets recorded before that fix must be raised
+/// by `2n - 1` to select the same amount of work.
+pub fn raw_log2_work(n: usize) -> f64 {
+    4.0 * n as f64 - 1.0
+}
+
 pub trait SearchMassModel: Send + Sync {
     /// Always `MassValue::ONE` under the current fraction-based
     /// contract. Kept as a method so modes can override for

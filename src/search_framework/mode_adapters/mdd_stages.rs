@@ -595,6 +595,7 @@ impl StageHandler<MddPayload> for SolveWStage {
         } = &mut *guard;
         let mut forcings: Vec<(u16, u8, u32)> = Vec::new();
         let mut timed_out = false;
+        let mut deferred: Option<PipelineWork> = None;
         let emitted_raw = process_solve_w(
             sw,
             &self.ctx,
@@ -605,12 +606,27 @@ impl StageHandler<MddPayload> for SolveWStage {
             &mut rng,
             &mut forcings,
             &mut timed_out,
+            &mut deferred,
         );
         let mut out = StageOutcome::default();
         out.forcings = ForcingDelta {
             by_level_feature: forcings,
         };
         out.emitted = wrap_items(emitted_raw, &parent_meta, &self.item_ids);
+        // The W batch cap stopped this attempt early. Re-queue the
+        // remainder at low priority so fresh boundaries still run
+        // first, and so the boundary's pending count stays above zero
+        // and it cannot be credited as complete (TTC §4.1).
+        if let Some(rest) = deferred {
+            out.emitted.extend(
+                wrap_items(vec![rest], &parent_meta, &self.item_ids)
+                    .into_iter()
+                    .map(|mut w| {
+                        w.priority = 1;
+                        w
+                    }),
+            );
+        }
         // TTC §4.1 compliance: if the W-enumeration exited via SAT
         // conflict-budget timeout, taint this boundary so it
         // NEVER exact-credits even after downstream SolveZ /
@@ -741,6 +757,7 @@ pub struct SolveZStage {
     scratch: Mutex<SolveZScratch>,
     /// Stage-level seed; see `SolveWStage.stage_seed`.
     stage_seed: u64,
+    item_ids: Arc<AtomicU64>,
     progress: Arc<BoundaryProgress>,
 }
 
@@ -786,6 +803,7 @@ impl StageHandler<MddPayload> for SolveZStage {
         let mut forcings: Vec<(u16, u8, u32)> = Vec::new();
         let mut cov_micro_delta: u64 = 0;
         let mut timed_out = false;
+        let mut deferred: Option<PipelineWork> = None;
         process_solve_z(
             sz,
             &self.ctx,
@@ -801,6 +819,7 @@ impl StageHandler<MddPayload> for SolveZStage {
             &mut forcings,
             &mut cov_micro_delta,
             &mut timed_out,
+            &mut deferred,
         );
         // Partial credit MUST be registered BEFORE note_handled.
         // If this is the last in-flight descendant of the
@@ -819,13 +838,28 @@ impl StageHandler<MddPayload> for SolveZStage {
         if timed_out {
             self.progress.mark_abandoned(parent_meta.fanout_root_id);
         }
-        // Mass credit: one more pending descendant of this
-        // boundary is done.
-        self.progress.note_handled(parent_meta.fanout_root_id, 0);
         let mut out = StageOutcome::default();
         out.forcings = ForcingDelta {
             by_level_feature: forcings,
         };
+        // The Z batch cap stopped this attempt early. Re-queue the
+        // remaining Z enumeration for this (boundary, W) pair at low
+        // priority; the boundary's pending count stays above zero, so
+        // it cannot be credited as complete (TTC §4.1).
+        if let Some(rest) = deferred {
+            out.emitted = wrap_items(vec![rest], &parent_meta, &self.item_ids)
+                .into_iter()
+                .map(|mut w| {
+                    w.priority = 1;
+                    w
+                })
+                .collect();
+        }
+        // Mass credit: this descendant is done, and any re-queued
+        // continuation takes its place in the boundary's pending
+        // count.
+        self.progress
+            .note_handled(parent_meta.fanout_root_id, out.emitted.len() as u64);
         out
     }
 }
@@ -1189,6 +1223,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
             Box::new(SolveZStage {
                 ctx: Arc::clone(&self.ctx),
                 metrics: self.metrics.clone(),
+                item_ids: Arc::clone(&self.item_ids),
                 spectral_z: Arc::clone(&spectral_z),
                 sat_config: Arc::clone(&self.sat_config),
                 result_tx: self.result_tx.clone(),
@@ -1219,7 +1254,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
     fn mass_model(&self) -> Box<dyn SearchMassModel> {
         Box::new(McddFractionMassModel {
             progress: Arc::clone(&self.progress),
-            total_log2_work: 2.0 * self.ctx.problem.n as f64,
+            total_log2_work: crate::search_framework::mass::raw_log2_work(self.ctx.problem.n),
         })
     }
 }
