@@ -342,20 +342,24 @@ impl StageHandler<CrossPayload> for CrossEnumerateStage {
                                     self.in_flight_cov_micro
                                         .fetch_add(stats.cover_micro, Ordering::Relaxed);
                                 }
-                                if let XyTryResult::Sat(x, y) = result {
-                                    if verify_tt(problem, &x, &y, &z_seq_clone, &w_seq_clone) {
-                                        if !continue_after_sat {
-                                            found.store(true, Ordering::Relaxed);
+                                if let XyTryResult::Sat(sols) = result {
+                                    let mut stop = false;
+                                    for (x, y) in sols {
+                                        if verify_tt(problem, &x, &y, &z_seq_clone, &w_seq_clone) {
+                                            if !continue_after_sat {
+                                                found.store(true, Ordering::Relaxed);
+                                                stop = true;
+                                            }
+                                            let _ = self.result_tx.send((
+                                                x,
+                                                y,
+                                                z_seq_clone.clone(),
+                                                w_seq_clone.clone(),
+                                            ));
                                         }
-                                        let _ = self.result_tx.send((
-                                            x,
-                                            y,
-                                            z_seq_clone.clone(),
-                                            w_seq_clone.clone(),
-                                        ));
-                                        if !continue_after_sat {
-                                            break;
-                                        }
+                                    }
+                                    if stop {
+                                        break;
                                     }
                                 }
                             }

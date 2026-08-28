@@ -1203,8 +1203,17 @@ pub(crate) enum XyTryResult {
     /// Rejected by the GJ equality or partial-lag autocorrelation filter
     /// — the SAT solver was never invoked.
     Pruned,
-    /// SAT solved successfully; the extracted `(X, Y)` is attached.
-    Sat(PackedSeq, PackedSeq),
+    /// SAT solved successfully. Carries **every** `(X, Y)` satisfying
+    /// this `(Z, W)` and XY boundary, not just the first.
+    ///
+    /// One XY boundary can extend to several distinct XY middles, and
+    /// returning only the first silently dropped the rest: at n=14
+    /// k=5 that lost 2 of the 186 catalogued classes, at n=18 k=5 it
+    /// lost 248 of 675, while the boundary was still credited as fully
+    /// searched. The effect shrinks as `k` grows because the middle
+    /// `n - 2k` shrinks with it, which is why the hole looked
+    /// `--mdd-k`-dependent. See `docs/TTC-AUDIT.md` §12.2.
+    Sat(Vec<(PackedSeq, PackedSeq)>),
     /// SAT proved UNSAT cleanly.
     Unsat,
     /// SAT hit its conflict limit without deciding.
@@ -1523,9 +1532,45 @@ impl SolveXyPerCandidate {
 
         let outcome = match result {
             Some(true) => {
-                let x = extract_seq(&self.solver, x_var, n);
-                let y = extract_seq(&self.solver, y_var, n);
-                XyTryResult::Sat(x, y)
+                // Enumerate EVERY XY middle for this boundary, not just
+                // the first model. Each iteration blocks the full (X, Y)
+                // assignment -- boundary literals included, so the clause
+                // cannot bite on any other boundary -- and re-solves
+                // under the same assumptions until UNSAT.
+                //
+                // This costs one extra solve per solution found, and
+                // solutions are rare (184 SAT out of ~200k solves at
+                // n=14), so there is no cap here: a cap would be exactly
+                // the truncation-credited-as-completion bug this fixes.
+                let mut sols = Vec::new();
+                loop {
+                    let x = extract_seq(&self.solver, x_var, n);
+                    let y = extract_seq(&self.solver, y_var, n);
+                    sols.push((x, y));
+                    let mut block: Vec<i32> = Vec::with_capacity(2 * n);
+                    for i in 0..n {
+                        for v in [x_var(i), y_var(i)] {
+                            block.push(if self.solver.value(v) == Some(true) {
+                                -v
+                            } else {
+                                v
+                            });
+                        }
+                    }
+                    // Backtrack to level 0 before adding the clause.
+                    // `Solver::reset` is `backtrack(0)`; adding a clause
+                    // on a live trail corrupts the watch lists and makes
+                    // later solves report spurious UNSAT. The W and Z
+                    // enumeration loops in `mdd_pipeline.rs` do the same
+                    // `reset(); add_clause(...)` dance for this reason.
+                    self.solver.reset();
+                    self.solver.add_clause(block);
+                    match self.solver.solve_with_assumptions(&assumptions) {
+                        Some(true) => continue,
+                        _ => break,
+                    }
+                }
+                XyTryResult::Sat(sols)
             }
             Some(false) => {
                 self.configs_tested += 1;
@@ -1648,6 +1693,84 @@ pub(crate) fn try_candidate_via_mdd(
         _ => None,
     };
     (xy, stats)
+}
+
+#[cfg(test)]
+mod xy_enumeration_tests {
+    use super::*;
+
+    /// One XY boundary can extend to several distinct XY middles.
+    /// `try_candidate` must return every one of them: returning only the
+    /// first silently dropped catalogued solutions while the boundary
+    /// was still credited as fully searched (`docs/TTC-AUDIT.md` §12.2).
+    ///
+    /// Uses the known TT(14) pair whose (Z, W) admits more than one
+    /// (X, Y): the catalogued class
+    /// `++-+-----+--++ / ++-+---++-++-+` shares its (Z, W) and its XY
+    /// boundary with `++-+-++--+--++ / ++-+------++-+`.
+    #[test]
+    fn try_candidate_returns_every_xy_middle_for_a_boundary() {
+        let problem = Problem::new(14);
+        let k = 5;
+        let pm = |s: &str| -> PackedSeq {
+            PackedSeq::from_values(
+                &s.chars()
+                    .map(|c| if c == '+' { 1i8 } else { -1i8 })
+                    .collect::<Vec<i8>>(),
+            )
+        };
+        let z = pm("++-++++-+-+++-");
+        let w = pm("+++-+----++--");
+        let tuple = SumTuple {
+            x: 2,
+            y: 2,
+            z: 6,
+            w: 1,
+        };
+        let cfg = radical::SolverConfig::default();
+        let mut solver = radical::Solver::new();
+        let Some(_) =
+            build_sat_xy_clauses_multi(problem, std::slice::from_ref(&tuple), &mut solver)
+        else {
+            panic!("tuple must be feasible at n=14");
+        };
+        let template =
+            SatXYTemplate::build_multi_opts(problem, std::slice::from_ref(&tuple), &cfg, true)
+                .expect("template builds");
+        let candidate = CandidateZW {
+            zw_autocorr: compute_zw_autocorr(problem, &z, &w),
+        };
+        let mut state = SolveXyPerCandidate::new(problem, &candidate, &template, k)
+            .expect("candidate prepares");
+
+        // XY boundary of the catalogued class.
+        let x_bits = 0x32b;
+        let y_bits = 0x2cb;
+        let (result, _) = state.try_candidate(x_bits, y_bits);
+        let XyTryResult::Sat(sols) = result else {
+            panic!("this boundary is satisfiable; got a non-Sat result");
+        };
+        assert!(
+            sols.len() >= 2,
+            "this XY boundary has more than one middle; try_candidate returned {}",
+            sols.len()
+        );
+        for (x, y) in &sols {
+            assert!(
+                verify_tt(problem, x, y, &z, &w),
+                "every returned (X, Y) must complete a valid TT(14)"
+            );
+        }
+        let mut seen: Vec<(Vec<i8>, Vec<i8>)> = Vec::new();
+        for (x, y) in &sols {
+            let key = (
+                (0..14).map(|i| x.get(i)).collect::<Vec<i8>>(),
+                (0..14).map(|i| y.get(i)).collect::<Vec<i8>>(),
+            );
+            assert!(!seen.contains(&key), "solutions must be distinct");
+            seen.push(key);
+        }
+    }
 }
 
 #[cfg(test)]

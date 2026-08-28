@@ -332,6 +332,7 @@ fn parse_search_like_options(args: &[String], cfg: &mut SearchConfig) {
             }
         } else if let Some(v) = arg.strip_prefix("--mdd-extend=") {
             cfg.mdd_extend = v.parse().unwrap_or(0);
+            cfg.mdd_extend_set = true;
             if cfg.wz_mode.is_none() {
                 cfg.wz_mode = Some(WzMode::Apart);
             }
@@ -949,7 +950,10 @@ fn parse_args() -> (CliVerb, SearchConfig) {
     }
     // Default: enable extension check for the MDD-walker producers
     // (clear win at n>=26). Doesn't affect --wz=cross.
-    if matches!(cfg.effective_wz_mode(), WzMode::Apart | WzMode::Together) && cfg.mdd_extend == 0 {
+    if matches!(cfg.effective_wz_mode(), WzMode::Apart | WzMode::Together)
+        && cfg.mdd_extend == 0
+        && !cfg.mdd_extend_set
+    {
         cfg.mdd_extend = 1;
     }
     // --conj-tuple: auto-pick the tuple with the smallest search
@@ -1687,6 +1691,7 @@ mod tests {
             quad_pb: true,
             mdd_k: 1,
             mdd_extend: 0,
+            mdd_extend_set: false,
             wz_together: false,
             wz_mode: Some(WzMode::Apart),
             xy_product_law: false,
@@ -3781,7 +3786,11 @@ mod tests {
         }
         let (result, _stats) = state.try_candidate(x_bits, y_bits);
         match result {
-            XyTryResult::Sat(found_x, found_y) => {
+            XyTryResult::Sat(sols) => {
+                let (found_x, found_y) = sols
+                    .first()
+                    .expect("Sat carries at least one (X, Y)")
+                    .clone();
                 let fx: Vec<i8> = (0..n).map(|i| found_x.get(i)).collect();
                 let fy: Vec<i8> = (0..n).map(|i| found_y.get(i)).collect();
                 let pfx = PackedSeq::from_values(&fx);
@@ -4303,7 +4312,11 @@ mod tests {
         }
         let (result, _stats) = state.try_candidate(x_bits, y_bits);
         match result {
-            XyTryResult::Sat(found_x, found_y) => {
+            XyTryResult::Sat(sols) => {
+                let (found_x, found_y) = sols
+                    .first()
+                    .expect("Sat carries at least one (X, Y)")
+                    .clone();
                 for i in 0..n {
                     assert_eq!(found_x.get(i), x[i], "n={n}: X[{i}] mismatch");
                     assert_eq!(found_y.get(i), y[i], "n={n}: Y[{i}] mismatch");

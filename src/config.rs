@@ -306,6 +306,12 @@ pub(crate) struct SearchConfig {
     pub(crate) mdd_k: usize,
     /// Extension filter: prune dead boundaries by checking k+N extensibility (0 = off).
     pub(crate) mdd_extend: usize,
+    /// True once `--mdd-extend=` was given explicitly. Without it the
+    /// apart/together default of 1 was applied unconditionally, so
+    /// `--mdd-extend=0` silently became 1 and the extension pre-filter
+    /// could not be turned off -- which makes bisecting a coverage hole
+    /// impossible. Respect an explicit 0.
+    pub(crate) mdd_extend_set: bool,
     /// In the MDD-walker producers (`--wz=apart|together`), solve W and Z
     /// with a single combined SAT call instead of the default SolveW →
     /// SolveZ two-stage pipeline. Set to `true` by `--wz=together`.
@@ -424,6 +430,7 @@ impl Default for SearchConfig {
             quad_pb: true,
             mdd_k: 8,
             mdd_extend: 0,
+            mdd_extend_set: false,
             wz_together: false,
             wz_mode: None,
             xy_product_law: true,

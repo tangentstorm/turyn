@@ -60,6 +60,13 @@ Summary of what each mode's `covered` number is worth:
 | `sync` | n/a | `Projected` by design; also contradicts its own telemetry by 14× |
 | stochastic | n/a | hard-wired to 0, correctly |
 
+**After the §12 fixes** every mode's `covered` reflects what was
+searched, and `apart`/`together` reproduce the catalogue exactly at
+n=14/16 (and n=18 at k>=6). One case is still short — `apart` at n=18,
+k=5 finds 427 of 675 — from a distinct cause described in §12.2b, so
+`covered=1.000` should still be checked against `check_coverage` when
+completeness matters, and `--mdd-k >= 6` is the safe choice.
+
 ## 1. The mechanism: truncation credited as completion
 
 `MddStagesAdapter` credits a boundary's mass when its descendant search
@@ -590,51 +597,84 @@ The cost is real work that used to be skipped: n=16 goes from 19.4 s to
 ~26-28 s. That is the correct direction — the old time was the time to
 finish a truncated search.
 
-### 12.2 A residual completeness bug remains — and `--mdd-k` drives it
+### 12.2 The XY stage returned one middle per boundary
 
-The caps were not the only thing losing solutions. With the accounting
-fixed and **no timeouts and no abandoned boundaries** (`flow W/Z
-timeout=0`, `abandoned=0`, so `covered=1.000` is now entirely exact
-credit and every boundary's enumeration really did reach SAT
-`Some(false)`), `--wz=apart` still does not reproduce the catalogue at
-small `k`:
+Root cause of the coverage holes, found by bisecting one missing class
+through the pipeline with `--outfix` and `TURYN_TRACE_BND`:
 
-| n | k=4 | k=5 | k=6 | catalogue |
-|---:|---:|---:|---:|---:|
-| 14 | 182 | 184 | **186** | 186 |
-| 18 | — | 427 | **673** | 675 |
+* the boundary was **live in the MDD** and **emitted by
+  `enumerate_live_boundaries`**;
+* the exact target `(Z, W)` pair **reached the XY stage**;
+* the XY solve at the target's XY boundary **returned SAT** — but with a
+  *different* X/Y middle than the catalogued one.
 
-At n=18 the default `--mdd-k=5` finds **63 %** of the classes; `k=6`
-finds 99.7 %. This is a *search* bug, not a mass-model one — the mass
-model is now correctly reporting that the search it was given had no
-residual work. But it means:
+`SolveXyPerCandidate::try_candidate` (and the parallel hand-rolled solve
+in `process_solve_wz`, which `--wz=together` uses) called
+`solve_with_assumptions` once and took the single model. One XY boundary
+can extend to several distinct XY middles, and every one after the first
+was silently dropped while the boundary was still credited as fully
+searched.
 
-> **`covered=1.000` from `apart`/`together` means "the mass model has no
-> residual work", not "every solution was found".** Run `check_coverage`
-> against the catalogue whenever that distinction matters, and prefer a
-> larger `--mdd-k` than throughput alone would suggest.
+That explains every symptom at once: both modes affected (they share the
+XY fast path), immune to the caps, the product law, the spectral filters,
+`--mdd-extend` and the MDD range pruning, and **strongly `k`-dependent** —
+the XY middle is `n - 2k` positions, so a larger `k` leaves fewer middles
+to collide on a shared boundary.
 
-What it is not:
+Both paths now enumerate to UNSAT, blocking the full `(X, Y)` assignment
+each round (boundary literals included, so a clause can never bite on
+another boundary). Cost is one extra solve per solution found, and
+solutions are rare — 184 SAT in ~200k solves at n=14 — so there is no
+cap, which would be the very bug this fixes.
 
-* not the caps — it survives the §12.1 fix, and at n=14 k=5 the Z middle
-  has only `2^4 = 16` values so nothing can be truncated;
-* not the XY product law — an `--xy-raw` MDD plus
-  `MDD_XY_RAW=1 --no-xy-product` reproduces 184/186 exactly;
-* not the spectral filters (`--max-spectral=200`, `--theta=1024` change
-  nothing), not `--mdd-extend` (0/1/2 identical), not the MDD's XY range
-  pruning (`MDD_NO_XY_RANGE=1` at build);
-* not specific to `apart`'s middle solver — `together`, which solves W
-  and Z jointly, also misses 2 at n=14, a *different* 2, so the union
-  across modes is 3 classes.
+One trap worth recording: the blocking clause **must** be added after
+`Solver::reset()` (= `backtrack(0)`). Adding it on a live trail corrupts
+the watch lists and makes later solves report spurious UNSAT; the first
+version of this fix did that and made coverage *worse* (n=14: 184 → 162).
+The W and Z enumeration loops already did `reset(); add_clause(...)` for
+the same reason.
 
-Shared across both modes and strongly `k`-dependent points upstream of
-the middle solvers, at the MDD boundary layer: `mdd-<k>.bin` is built
-once per `k` and reused at every `n`, so any pruning in the builder that
-is only valid for a particular relationship between `k` and `n` would
-show exactly this signature. That is the first place to look.
+| run | before caps fix | after caps fix | after XY fix | catalogue |
+|---|---:|---:|---:|---:|
+| `apart` n=14 k=4 | 182 | 182 | **186** | 186 |
+| `apart` n=14 k=5 | 184 | 184 | **186** | 186 |
+| `apart` n=16 k=5 | 522 | 730 | **739** | 739 |
+| `apart` n=18 k=6 | — | 673 | **675** | 675 |
+| `together` n=14 k=5 | 184 | 184 | **186** | 186 |
 
-`check_coverage` prints the exact missing quadruples; each one verifies
-as a valid `TT(n)`.
+### 12.2b Still open: `--wz=apart` at n=18, k=5
+
+`apart --n=18 --mdd-k=5` finds **427 of 675** and is the one case the XY
+fix did not move at all (`flow XY: sat=427` before and after, where n=14
+went +2 and n=16 went +9). So this is a *fourth*, distinct cause, not a
+remnant of the XY multiplicity bug. What is known:
+
+* `k=6` at the same `n` is **complete** (675/675), so it is again a
+  small-`k` / large-middle effect;
+* the missing class `++++++++++-+--++-+ / +-+-+++--+--+++--+ /
+  ++++--+----++-+-+- / +++---++-+---+--+` **is found when its boundary is
+  pinned** with `--outfix=04053...1a17c1`, so the boundary and both
+  middle solvers can reach it;
+* its boundary is live in the MDD and is emitted by
+  `enumerate_live_boundaries` (`TURYN_TRACE_BND=14f,247`);
+* it is **not** the extension pre-filter: with `--mdd-extend=0` now
+  actually honoured (see below) the count is 433, within the section-7
+  run-to-run noise of 427.
+
+The next step is to run `TURYN_TRACE_BND=14f,247` on the full n=18 run
+and check whether the target `(Z, W)` pair ever reaches the XY stage, and
+if it does, whether the XY walk offers `x_bits=0x2df y_bits=0x275`. The
+tracing hooks for exactly that are in the tree.
+
+**Practical guidance until it is found: prefer `--mdd-k >= 6`.** At n=18,
+k=5 finds 63 % of the classes and k=6 finds all of them.
+
+### 12.2c `--mdd-extend=0` was silently ignored
+
+`main.rs` forced `mdd_extend = 1` for apart/together whenever it was 0,
+so the flag could not turn the extension pre-filter off — which makes
+bisecting a coverage hole impossible. An explicit `--mdd-extend=0` is now
+honoured; the default when the flag is absent is unchanged.
 
 ### 12.3 `--wz=cross`: space-weighted tuples, pro-rata truncation credit
 

@@ -791,7 +791,7 @@ pub(crate) fn process_solve_w(
 ) -> Vec<PipelineWork> {
     let k = ctx.k;
     let m = ctx.problem.m();
-    let trace_w = sw.z_bits == 43 && sw.w_bits == 47 && sw.tuple.z == 8 && sw.tuple.w == 1;
+    let trace_w = traced_boundary() == Some((sw.z_bits, sw.w_bits));
     if trace_w {
         eprintln!("TRACE: SolveW for target boundary, |σ_W|={}", sw.tuple.w);
     }
@@ -848,7 +848,12 @@ pub(crate) fn process_solve_w(
         let mut spec_buf: Vec<f64> = Vec::new();
         for &cnt in &w_counts {
             let mid_sum_iter = 2 * cnt as i32 - ctx.middle_m as i32;
-            crate::enumerate::generate_sequences_permuted(
+            // This branch is guarded by `middle_m <= 20`, so the shell
+            // holds at most C(20, 10) = 184,756 sequences -- under the
+            // 200,000 limit -- and the enumeration is always complete.
+            // Asserted rather than ignored so the guard and the limit
+            // cannot drift apart silently and start truncating.
+            let (visited, total) = crate::enumerate::generate_sequences_permuted(
                 ctx.middle_m,
                 mid_sum_iter,
                 false,
@@ -889,6 +894,14 @@ pub(crate) fn process_solve_w(
                     ) {
                         if trace_w {
                             trace_w_pass += 1;
+                            eprintln!(
+                                "TRACE:   W candidate {}  sigma_W={}",
+                                w_vals
+                                    .iter()
+                                    .map(|&v| if v == 1 { '+' } else { '-' })
+                                    .collect::<String>(),
+                                w_vals.iter().map(|&v| v as i32).sum::<i32>()
+                            );
                         }
                         metrics
                             .flow_w_spec_pass
@@ -925,6 +938,12 @@ pub(crate) fn process_solve_w(
                     true
                 },
             );
+            debug_assert!(
+                visited == total || ctx.found.load(AtomicOrdering::Relaxed),
+                "brute-force W enumeration truncated ({visited} of {total}) -- the \
+                 middle_m <= 20 guard no longer implies total <= 200_000"
+            );
+            let _ = (visited, total);
         }
     } else {
         // SAT-based W generation. Always build a fresh solver per
@@ -1216,7 +1235,7 @@ pub(crate) fn process_solve_z(
     let k = ctx.k;
     let n = ctx.problem.n;
     let m = ctx.problem.m();
-    let trace_z = sz.z_bits == 43 && sz.w_bits == 47 && sz.tuple.z == 8;
+    let trace_z = traced_boundary() == Some((sz.z_bits, sz.w_bits));
 
     let mut z_boundary = vec![0i8; n];
     for i in 0..k {
@@ -1508,7 +1527,20 @@ pub(crate) fn process_solve_z(
             }
         }
         if trace_z {
-            eprintln!("TRACE:   Z solution #{} REACHED XY!", z_count);
+            eprintln!(
+                "TRACE:   Z solution #{} REACHED XY: Z={} sigma_Z={} W={} sigma_W={}",
+                z_count,
+                z_vals
+                    .iter()
+                    .map(|&v| if v == 1 { '+' } else { '-' })
+                    .collect::<String>(),
+                z_vals.iter().map(|&v| v as i32).sum::<i32>(),
+                sz.w_vals
+                    .iter()
+                    .map(|&v| if v == 1 { '+' } else { '-' })
+                    .collect::<String>(),
+                sz.w_vals.iter().map(|&v| v as i32).sum::<i32>()
+            );
         }
 
         let z_seq = PackedSeq::from_values(&z_vals);
@@ -1655,13 +1687,27 @@ pub(crate) fn process_solve_z(
                     }
                     metrics.stage_enter[3].fetch_add(1, AtomicOrdering::Relaxed);
                     let (result, stats) = state.try_candidate(x_bits, y_bits);
+                    if trace_z {
+                        eprintln!(
+                            "TRACE:     XY try x_bits={x_bits:#x} y_bits={y_bits:#x} -> {}",
+                            match &result {
+                                XyTryResult::Sat(_) => "SAT",
+                                XyTryResult::Unsat => "unsat",
+                                _ => "other",
+                            }
+                        );
+                    }
                     metrics
                         .items_completed
                         .fetch_add(1, AtomicOrdering::Relaxed);
                     metrics.stage_exit[3].fetch_add(1, AtomicOrdering::Relaxed);
                     match &result {
-                        XyTryResult::Sat(_, _) => {
-                            metrics.flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed);
+                        XyTryResult::Sat(sols) => {
+                            // One XY boundary can carry several middles;
+                            // count each solution, not each solving call.
+                            metrics
+                                .flow_xy_sat
+                                .fetch_add(sols.len() as u64, AtomicOrdering::Relaxed);
                         }
                         XyTryResult::Unsat | XyTryResult::Pruned => {
                             metrics.flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1691,12 +1737,14 @@ pub(crate) fn process_solve_z(
                             .flow_xy_free_sum
                             .fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
                     }
-                    if let XyTryResult::Sat(x, y) = result {
-                        if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
-                            if !ctx.continue_after_sat {
-                                ctx.found.store(true, AtomicOrdering::Relaxed);
+                    if let XyTryResult::Sat(sols) = result {
+                        for (x, y) in sols {
+                            if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
+                                if !ctx.continue_after_sat {
+                                    ctx.found.store(true, AtomicOrdering::Relaxed);
+                                }
+                                let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
                             }
-                            let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
                         }
                     }
                 },
@@ -2450,12 +2498,42 @@ pub(crate) fn process_solve_wz(
                         }
                     };
                     if result == Some(true) {
-                        let (x, y) = template.extract_xy(&xy_solver);
-                        if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
-                            if !ctx.continue_after_sat {
-                                ctx.found.store(true, AtomicOrdering::Relaxed);
+                        // Enumerate EVERY XY middle for this boundary,
+                        // not just the first model: one boundary can
+                        // extend to several, and taking only the first
+                        // silently drops the rest while the boundary is
+                        // still credited as fully searched. Mirrors
+                        // `SolveXyPerCandidate::try_candidate`; see
+                        // `docs/TTC-AUDIT.md` §12.2.
+                        loop {
+                            let (x, y) = template.extract_xy(&xy_solver);
+                            if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
+                                if !ctx.continue_after_sat {
+                                    ctx.found.store(true, AtomicOrdering::Relaxed);
+                                }
+                                let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
                             }
-                            let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
+                            // Block this full (X, Y) assignment. Must
+                            // backtrack to level 0 first -- adding a
+                            // clause on a live trail corrupts the watch
+                            // lists and makes later solves report
+                            // spurious UNSAT.
+                            let mut block: Vec<i32> = Vec::with_capacity(2 * n);
+                            for i in 0..n {
+                                for v in [x_var(i), y_var(i)] {
+                                    block.push(if xy_solver.value(v) == Some(true) {
+                                        -v
+                                    } else {
+                                        v
+                                    });
+                                }
+                            }
+                            xy_solver.reset();
+                            xy_solver.add_clause(block);
+                            if xy_solver.solve_with_assumptions(&assumptions) != Some(true) {
+                                break;
+                            }
+                            metrics.flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed);
                         }
                     }
                 },
@@ -2718,6 +2796,20 @@ pub(crate) fn mdd_navigate_to_outfix(
     Some(nid)
 }
 
+/// Boundary selected for stage tracing via `TURYN_TRACE_BND=<zhex>,<whex>`.
+/// Returns `(z_bits, w_bits)` when set. Used to follow one boundary
+/// through SolveW / SolveZ when hunting a coverage hole: the same
+/// variable also makes `enumerate_live_boundaries` report whether the
+/// boundary was live and emitted.
+pub(crate) fn traced_boundary() -> Option<(u32, u32)> {
+    let spec = std::env::var("TURYN_TRACE_BND").ok()?;
+    let (zs, ws) = spec.split_once(',')?;
+    Some((
+        u32::from_str_radix(zs.trim().trim_start_matches("0x"), 16).ok()?,
+        u32::from_str_radix(ws.trim().trim_start_matches("0x"), 16).ok()?,
+    ))
+}
+
 /// Enumerate every live boundary path through the first `zw_depth`
 /// levels of the MDD, returning a `BoundaryWork` per path. Used by
 /// the framework `MddStagesAdapter` to seed its queue upfront; the
@@ -2833,6 +2925,24 @@ pub(crate) fn enumerate_live_boundaries(
         &mut out,
         cancelled,
     );
+    // Debug hook for coverage-hole hunting: `TURYN_TRACE_BND=<zhex>,<whex>`
+    // reports whether that specific boundary made it into the seed set,
+    // and whether the MDD considers it live. A boundary that navigates
+    // but is not enumerated is an enumeration bug; one that does not
+    // navigate was pruned at MDD build time.
+    if let Ok(spec) = std::env::var("TURYN_TRACE_BND") {
+        if let Some((zs, ws)) = spec.split_once(',') {
+            let zb = u32::from_str_radix(zs.trim_start_matches("0x"), 16).unwrap_or(u32::MAX);
+            let wb = u32::from_str_radix(ws.trim_start_matches("0x"), 16).unwrap_or(u32::MAX);
+            let emitted = out.iter().any(|b| b.z_bits == zb && b.w_bits == wb);
+            let live = mdd_navigate_to_outfix(mdd.root, zw_depth, xy_pos_order, &mdd.nodes, zb, wb)
+                .is_some();
+            eprintln!(
+                "[trace-bnd] z_bits={zb:#x} w_bits={wb:#x}: live_in_mdd={live} emitted_by_enumeration={emitted} (total emitted={})",
+                out.len()
+            );
+        }
+    }
     out
 }
 
