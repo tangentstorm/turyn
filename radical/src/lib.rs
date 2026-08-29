@@ -331,6 +331,19 @@ struct TrailEntry {
     reason: Reason,
 }
 
+/// Diagnostic switches, read once. These sit on the spectral conflict path,
+/// which runs millions of times per search, so they must not call
+/// `std::env::var` per conflict.
+fn spectral_audit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TURYN_AUDIT_SPECTRAL").is_ok())
+}
+
+fn spectral_verify_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TURYN_SPECTRAL_VERIFY").is_ok())
+}
+
 /// Spectral power constraint: |DFT(sequence)|² ≤ bound at every sampled frequency.
 /// Incrementally tracks DFT sums as variables are assigned.
 /// Variables 1..num_seq_vars represent ±1 sequence positions.
@@ -864,6 +877,12 @@ pub struct Solver {
 
     /// Optional spectral power constraint (for W/Z middle generation).
     pub spectral: Option<SpectralConstraint>,
+    /// Diagnostic: a known-good assignment over variables `1..=len` as
+    /// +1 / -1. When set, `analyze` reports any clause it learns that this
+    /// assignment falsifies -- i.e. a learnt clause that removes a solution
+    /// the search should have found -- together with the conflict it came
+    /// from. Purely a debugging aid; `None` in normal operation.
+    pub audit_target: Option<Vec<i8>>,
 }
 
 impl Solver {
@@ -952,6 +971,7 @@ impl Solver {
             skip_backtrack_quad_pb: false,
             mdd: None,
             spectral: None,
+            audit_target: None,
         }
     }
 
@@ -3278,6 +3298,81 @@ impl Solver {
         self.ok = true;
     }
 
+    /// Diagnostic: every clause whose literals all lie in `1..=vals.len()`
+    /// and which `vals` falsifies. Used to find what excluded a Z middle
+    /// the search should have emitted: if the answer is a clause the
+    /// spectral propagator added, the prune was wrong; if it is a learnt
+    /// clause, conflict analysis derived something unsound.
+    ///
+    /// `vals[i]` is the value of variable `i + 1` as +1 / -1.
+    pub fn clauses_excluding(&self, vals: &[i8]) -> Vec<(u32, bool, Vec<Lit>)> {
+        let nv = vals.len();
+        let mut out = Vec::new();
+        for (ci, cm) in self.clause_meta.iter().enumerate() {
+            if cm.deleted {
+                continue;
+            }
+            let lits = &self.clause_lits[cm.start as usize..cm.start as usize + cm.len as usize];
+            if lits.iter().any(|&l| var_of(l) >= nv) {
+                continue; // mentions a variable outside the middle
+            }
+            let satisfied = lits.iter().any(|&l| {
+                let v = var_of(l);
+                let positive = vals[v] > 0;
+                if l > 0 { positive } else { !positive }
+            });
+            if !satisfied {
+                out.push((ci as u32, cm.learnt, lits.to_vec()));
+            }
+        }
+        out
+    }
+
+    /// Every clause filed in `watches[lit_index(l)]` must have `negate(l)`
+    /// among its first two literals; same for `bin_watches`. `propagate_lit`
+    /// assumes this and, when it does not hold, overwrites a live literal
+    /// with `false_lit` -- silently rewriting the clause into one the
+    /// formula does not imply. Returns a description of each violation.
+    ///
+    /// O(total watch entries); for tests and debugging, not the hot path.
+    pub fn watch_invariant_violations(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let check = |li: usize, ci: u32, kind: &str, out: &mut Vec<String>| {
+            // `watches` is indexed by `lit_index`; recover the literal it
+            // stands for, then the literal the clause is supposed to watch.
+            let v = li / 2;
+            let lit: Lit = if li % 2 == 0 {
+                (v + 1) as Lit
+            } else {
+                -((v + 1) as Lit)
+            };
+            let want = negate(lit);
+            let m = self.clause_meta[ci as usize];
+            if m.deleted {
+                return;
+            }
+            let start = m.start as usize;
+            let len = (m.len as usize).min(2);
+            let lits = &self.clause_lits[start..start + len];
+            if !lits.contains(&want) {
+                out.push(format!(
+                    "{kind}[{lit}] holds clause #{ci} whose watched literals are {lits:?}, missing {want}"
+                ));
+            }
+        };
+        for li in 0..self.watches.len() {
+            for &(ci, _) in &self.watches[li] {
+                check(li, ci, "watches", &mut out);
+            }
+        }
+        for li in 0..self.bin_watches.len() {
+            for &(_, ci) in &self.bin_watches[li] {
+                check(li, ci, "bin_watches", &mut out);
+            }
+        }
+        out
+    }
+
     /// Delete all learnt clauses, backtrack, and rebuild watches.
     /// Keeps original (non-learnt) clauses, PB, quad PB, XOR intact.
     /// Use between solve_with_assumptions calls to prevent learnt clause poisoning.
@@ -3304,12 +3399,17 @@ impl Solver {
             let start = cm.start as usize;
             let l0 = self.clause_lits[start];
             let l1 = self.clause_lits[start + 1];
+            // Same convention as `add_clause` / `rebuild_watches`: a clause
+            // watching L is filed under `negate(L)`. Without the negate every
+            // clause is filed under the literals it does not watch, and
+            // `propagate_lit` then rewrites clause literals in place (see the
+            // spectral attach site for the full mechanism).
             if cm.len == 2 && self.config.bin_watch_fastpath {
-                self.bin_watches[lit_index(l0)].push((l1, ci as u32));
-                self.bin_watches[lit_index(l1)].push((l0, ci as u32));
+                self.bin_watches[lit_index(negate(l0))].push((l1, ci as u32));
+                self.bin_watches[lit_index(negate(l1))].push((l0, ci as u32));
             } else {
-                self.watches[lit_index(l0)].push((ci as u32, l1));
-                self.watches[lit_index(l1)].push((ci as u32, l0));
+                self.watches[lit_index(negate(l0))].push((ci as u32, l1));
+                self.watches[lit_index(negate(l1))].push((ci as u32, l0));
             }
         }
         self.conflicts = 0;
@@ -3848,7 +3948,7 @@ impl Solver {
                         // while the propagator's mirror of the assignment
                         // (`spec.assigned` / `spec.values`) agrees with the
                         // solver's own.
-                        if std::env::var("TURYN_AUDIT_SPECTRAL").is_ok() {
+                        if spectral_audit_enabled() {
                             // The propagator keeps its own mirror of the
                             // assignment (`assigned` / `values`). If that
                             // mirror ever disagrees with the solver's trail,
@@ -3889,6 +3989,95 @@ impl Solver {
                                 }
                             }
                         }
+                        // `TURYN_SPECTRAL_VERIFY=1`: brute-force the verdict.
+                        // The conflict claims NO completion of the unassigned
+                        // middle vars can satisfy the per-frequency bound. At
+                        // small `middle_len` that is directly checkable: if any
+                        // completion does satisfy it, the prune removed real
+                        // solutions and the bound (or the state it is computed
+                        // from) is wrong. Diagnostic only -- O(2^unassigned).
+                        if spectral_verify_enabled() {
+                            let spec = self.spectral.as_ref().unwrap();
+                            let nsv = spec.num_seq_vars;
+                            let nf = spec.num_freqs;
+                            // The incremental `re` / `im` / `max_reduction` are
+                            // the state every verdict is computed from. Recompute
+                            // them from `values` and compare: if they have drifted,
+                            // the conflict check and any brute-force check that
+                            // reads them are both wrong in the same direction.
+                            for fi in 0..nf {
+                                let (mut re, mut im, mut red) =
+                                    (spec.re_boundary[fi], spec.im_boundary[fi], 0.0f64);
+                                for v in 0..nsv {
+                                    if spec.assigned[v] {
+                                        let sgn = spec.values[v] as f64;
+                                        re += sgn * spec.cos_table[v * nf + fi] as f64;
+                                        im += sgn * spec.sin_table[v * nf + fi] as f64;
+                                    } else {
+                                        red += spec.amplitudes[v * nf + fi] as f64;
+                                    }
+                                }
+                                let d_re = (re - spec.re[fi]).abs();
+                                let d_im = (im - spec.im[fi]).abs();
+                                let d_red = (red - spec.max_reduction[fi]).abs();
+                                if d_re > 1e-6 || d_im > 1e-6 || d_red > 1e-6 {
+                                    eprintln!(
+                                        "SPECTRAL-DRIFT: fi={fi} d_re={d_re:.3e} d_im={d_im:.3e} \
+d_max_reduction={d_red:.3e} (stored re={:.6} im={:.6} red={:.6})",
+                                        spec.re[fi], spec.im[fi], spec.max_reduction[fi]
+                                    );
+                                    break;
+                                }
+                            }
+                            let free: Vec<usize> =
+                                (0..nsv).filter(|&v| !spec.assigned[v]).collect();
+                            if free.len() <= 20 {
+                                let mut ok_completion: Option<u64> = None;
+                                'outer: for mask in 0u64..(1u64 << free.len()) {
+                                    for fi in 0..nf {
+                                        let mut re = spec.re[fi];
+                                        let mut im = spec.im[fi];
+                                        for (bit, &v) in free.iter().enumerate() {
+                                            let sgn = if mask >> bit & 1 == 1 { 1.0 } else { -1.0 };
+                                            re += sgn * spec.cos_table[v * nf + fi] as f64;
+                                            im += sgn * spec.sin_table[v * nf + fi] as f64;
+                                        }
+                                        let b = match spec.per_freq_bound {
+                                            Some(ref pfb) => pfb[fi],
+                                            None => spec.bound,
+                                        };
+                                        if re * re + im * im > b + 1e-9 {
+                                            continue 'outer;
+                                        }
+                                    }
+                                    ok_completion = Some(mask);
+                                    break;
+                                }
+                                if let Some(mask) = ok_completion {
+                                    eprintln!(
+                                        "SPECTRAL-UNSOUND: conflict with {} of {nsv} vars assigned, \
+but completion mask={mask:b} over free vars {free:?} satisfies every bound",
+                                        nsv - free.len()
+                                    );
+                                }
+                            }
+                        }
+                        // Did the propagator itself just add a clause that
+                        // excludes the known-good assignment? This distinguishes
+                        // an unsound prune from an unsound resolution.
+                        if let Some(ref target) = self.audit_target {
+                            let nv = target.len();
+                            let excludes = cl.iter().all(|&l| {
+                                let v = var_of(l);
+                                v < nv && (if l > 0 { target[v] < 0 } else { target[v] > 0 })
+                            });
+                            if excludes {
+                                eprintln!(
+                                    "SPECTRAL-CLAUSE-EXCLUDES-TARGET: #{} lits={cl:?}",
+                                    self.clause_meta.len()
+                                );
+                            }
+                        }
                         let ci = self.clause_meta.len() as u32;
                         let cs = self.clause_lits.len();
                         let cn = cl.len();
@@ -3903,12 +4092,29 @@ impl Solver {
                             lbd: cn.min(255) as u8,
                             used: 0,
                         });
+                        // A clause watching literal L lives in
+                        // `watches[lit_index(negate(L))]`, so that traversal
+                        // happens when L becomes false -- see `add_clause` and
+                        // `rebuild_watches`, and `propagate_lit`, which reads
+                        // `watches[lit_index(lit)]` looking for `negate(lit)`
+                        // among the clause's first two literals.
+                        //
+                        // Attaching without the `negate` files the clause under
+                        // the literals it does NOT watch. `propagate_lit` then
+                        // finds a clause whose `false_lit` is at neither
+                        // position 0 nor 1, and its new-watch step
+                        // (`lits[1] = repl; lits[k] = false_lit`) OVERWRITES a
+                        // live literal with `false_lit`, silently rewriting the
+                        // clause into a different one. The rewritten clause is
+                        // not implied by the formula, so conflict analysis
+                        // learns unsound clauses from it and the solve returns
+                        // UNSAT with real solutions left unfound.
                         if cn == 2 && self.config.bin_watch_fastpath {
-                            self.bin_watches[lit_index(cl[0])].push((cl[1], ci));
-                            self.bin_watches[lit_index(cl[1])].push((cl[0], ci));
+                            self.bin_watches[lit_index(negate(cl[0]))].push((cl[1], ci));
+                            self.bin_watches[lit_index(negate(cl[1]))].push((cl[0], ci));
                         } else if cn >= 2 {
-                            self.watches[lit_index(cl[0])].push((ci, cl[1]));
-                            self.watches[lit_index(cl[1])].push((ci, cl[0]));
+                            self.watches[lit_index(negate(cl[0]))].push((ci, cl[1]));
+                            self.watches[lit_index(negate(cl[1]))].push((ci, cl[0]));
                         }
                         return Some(Reason::Clause(ci));
                     }
@@ -4499,7 +4705,41 @@ impl Solver {
     /// 1-UIP conflict analysis with learnt clause minimization.
     /// Returns (learnt clause, backtrack level).
     /// Uses solver-level reusable buffers to eliminate per-conflict allocations.
+    /// Wrapper around 1-UIP analysis that, when `audit_target` is set,
+    /// reports any learnt clause the target assignment falsifies. Learning
+    /// such a clause means the search can no longer reach that solution, so
+    /// it pinpoints the exact conflict whose resolution went wrong.
     fn analyze(&mut self, conflict_reason: Reason) -> (Vec<Lit>, u32) {
+        let (learnt, bt) = self.analyze_inner(conflict_reason);
+        if let Some(ref target) = self.audit_target {
+            let nv = target.len();
+            let falsifies = |lits: &[Lit]| -> bool {
+                lits.iter().all(|&l| {
+                    let v = var_of(l);
+                    v < nv && (if l > 0 { target[v] < 0 } else { target[v] > 0 })
+                })
+            };
+            if !learnt.is_empty() && falsifies(&learnt) {
+                let src = match conflict_reason {
+                    Reason::Clause(ci) => {
+                        let m = self.clause_meta[ci as usize];
+                        let lits =
+                            &self.clause_lits[m.start as usize..m.start as usize + m.len as usize];
+                        format!(
+                            "Clause(#{ci} learnt={} lits={lits:?} excludes_target={})",
+                            m.learnt,
+                            falsifies(lits)
+                        )
+                    }
+                    other => format!("{other:?}"),
+                };
+                eprintln!("LEARN-EXCLUDES-TARGET: learnt={learnt:?} bt={bt} from {src}");
+            }
+        }
+        (learnt, bt)
+    }
+
+    fn analyze_inner(&mut self, conflict_reason: Reason) -> (Vec<Lit>, u32) {
         // Shared logic for processing each reason literal during 1-UIP analysis.
         // Marks the variable as seen, bumps its activity, and either increments
         // the current-level counter or adds the literal to the learnt clause.
@@ -7088,6 +7328,157 @@ mod spectral_drift_tests {
 #[cfg(test)]
 mod spectral_soundness_tests {
     use super::*;
+
+    /// Build the `TT(12)` Z-middle instance `process_solve_z` builds: a
+    /// spectral constraint over the 8 middle variables, with the Z boundary
+    /// folded into the DFT and the per-frequency budget taken from W.
+    fn tt12_z_middle_constraint() -> (SpectralConstraint, Vec<i8>) {
+        let z: Vec<i8> = "+++++-+--++-"
+            .chars()
+            .map(|c| if c == '+' { 1i8 } else { -1 })
+            .collect();
+        let w: Vec<i8> = "++---++-+-+"
+            .chars()
+            .map(|c| if c == '+' { 1i8 } else { -1 })
+            .collect();
+        let n = z.len();
+        let k = 2;
+        let num_freqs = 64;
+        let pair_bound = (6.0 * n as f64 - 2.0) / 2.0;
+        let tables = SpectralTables::new(n, k, num_freqs);
+        let mut z_bnd = vec![0i8; n];
+        for (pos, slot) in z_bnd.iter_mut().enumerate() {
+            if pos < k || pos >= n - k {
+                *slot = z[pos];
+            }
+        }
+        let mut sc = SpectralConstraint::from_tables(&tables, &z_bnd, pair_bound);
+        let mut pfb = vec![pair_bound; num_freqs];
+        for (fi, slot) in pfb.iter_mut().enumerate() {
+            let (mut wr, mut wi) = (0.0f64, 0.0f64);
+            for (j, &wv) in w.iter().enumerate() {
+                let c = tables.pos_cos[j * num_freqs + fi];
+                let s = tables.pos_sin[j * num_freqs + fi];
+                wr += wv as f64 * c;
+                wi += wv as f64 * s;
+            }
+            *slot = (pair_bound - wr * wr - wi * wi).max(0.0);
+        }
+        sc.per_freq_bound = Some(pfb);
+        (sc, z[k..n - k].to_vec())
+    }
+
+    /// Enumerate every satisfying middle by blocking, the way
+    /// `process_solve_z` does.
+    fn enumerate_middles(spectral: bool) -> Vec<Vec<i8>> {
+        let (sc, _) = tt12_z_middle_constraint();
+        let nv = sc.num_seq_vars;
+        let mut solver = Solver::new();
+        for v in 1..=nv {
+            solver.ensure_var(v);
+        }
+        if spectral {
+            solver.spectral = Some(sc);
+        }
+        let mut out = Vec::new();
+        while solver.solve() == Some(true) {
+            let vals: Vec<i8> = (0..nv)
+                .map(|v| {
+                    if solver.value((v + 1) as Lit) == Some(true) {
+                        1i8
+                    } else {
+                        -1
+                    }
+                })
+                .collect();
+            let block: Vec<Lit> = (0..nv)
+                .map(|v| {
+                    let l = (v + 1) as Lit;
+                    if vals[v] > 0 { -l } else { l }
+                })
+                .collect();
+            out.push(vals);
+            solver.reset();
+            solver.add_clause(block);
+        }
+        out
+    }
+
+    /// The propagator may only remove middles that violate the bound. It
+    /// must never remove one that satisfies it.
+    ///
+    /// This failed before the watch-attachment fix: the spectral conflict
+    /// clause was filed in `watches[lit_index(cl[i])]` instead of
+    /// `watches[lit_index(negate(cl[i]))]`, so `propagate_lit` found
+    /// clauses whose `false_lit` sat at neither watched position and
+    /// overwrote a live literal with it. The rewritten clauses are not
+    /// implied by the formula, conflict analysis learned unsound clauses
+    /// from them, and the enumeration stopped early with real middles
+    /// unfound (127 -> 121 catalogue classes at n=12 k=2).
+    #[test]
+    fn spectral_propagator_removes_only_bound_violating_middles() {
+        let (sc, _) = tt12_z_middle_constraint();
+        let with = enumerate_middles(true);
+        let without = enumerate_middles(false);
+
+        let satisfies = |vals: &[i8]| -> bool {
+            let mut probe = sc.clone();
+            for (v, &val) in vals.iter().enumerate() {
+                probe.assign(v, val);
+            }
+            probe.check_conflict().is_none()
+        };
+
+        let expected: Vec<Vec<i8>> = without.into_iter().filter(|m| satisfies(m)).collect();
+        let mut got = with.clone();
+        got.sort();
+        let mut want = expected;
+        want.sort();
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "propagator enumerated {} middles, {} satisfy the bound",
+            got.len(),
+            want.len()
+        );
+        assert_eq!(got, want, "propagator changed WHICH middles are reachable");
+    }
+
+    /// The invariant `propagate_lit` relies on, checked directly against a
+    /// solver that has actually run spectral conflicts.
+    #[test]
+    fn spectral_conflict_clauses_are_filed_under_the_right_literals() {
+        let (sc, _) = tt12_z_middle_constraint();
+        let nv = sc.num_seq_vars;
+        let mut solver = Solver::new();
+        for v in 1..=nv {
+            solver.ensure_var(v);
+        }
+        solver.spectral = Some(sc);
+        let mut rounds = 0;
+        while solver.solve() == Some(true) {
+            let violations = solver.watch_invariant_violations();
+            assert!(
+                violations.is_empty(),
+                "watch invariant broken after {rounds} solves: {violations:#?}"
+            );
+            let block: Vec<Lit> = (0..nv)
+                .map(|v| {
+                    let l = (v + 1) as Lit;
+                    if solver.value(l) == Some(true) { -l } else { l }
+                })
+                .collect();
+            solver.reset();
+            solver.add_clause(block);
+            rounds += 1;
+        }
+        assert!(rounds > 0, "expected the instance to have solutions");
+        let violations = solver.watch_invariant_violations();
+        assert!(
+            violations.is_empty(),
+            "watch invariant broken: {violations:#?}"
+        );
+    }
 
     /// The Z-middle solver enforces the Turyn pair bound per frequency:
     /// `|Z(ω)|² ≤ (3n−1) − |W(ω)|²`. That is a valid necessary condition,

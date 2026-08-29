@@ -14,12 +14,11 @@ Three findings there change how you should use this file:
    `covered` no longer moves with the cap, and every case in
    `scripts/check-coverage-suite.sh --full` now reproduces the
    catalogue exactly (7/7, up to `apart n=16 k=4` at 739/739). Two
-   caveats remain. At n=56 the TTC is still an extrapolation from
-   `covered ≈ 1e-5` with ~3x run-to-run spread. And the completeness
-   result above holds **only with the Z spectral propagator off**,
-   which is now the default: `TURYN_Z_SPECTRAL=1` buys ~2.5x
-   throughput and loses ~5 % of classes for a reason nobody has found
-   (audit §12.2b). Do not turn it on to make a benchmark look good.
+   caveat remains: at n=56 the TTC is still an extrapolation from
+   `covered ≈ 1e-5` with ~3x run-to-run spread. The Z spectral
+   propagator, which used to lose ~5 % of classes, is correct and **on
+   by default** since audit §12.8 — it is worth 3.3x at n=18 k=5 for
+   identical coverage. `TURYN_NO_Z_SPECTRAL=1` disables it.
 2. **The bit-exactness claim below now holds** — it did not when the
    audit was written (~1 % drift on `apart` solve counters, up to 1.54×
    on boundary counts). Fixed by `Lockstep` in the engine plus the

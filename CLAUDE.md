@@ -70,6 +70,18 @@ Should find TT(18) in <1s.
 TURYN_THREADS=8 target/release/turyn --n=56 --wz=apart --mdd-k=10 --sat-secs=30
 ```
 
+### Disable the Z spectral propagator
+```bash
+TURYN_NO_Z_SPECTRAL=1 target/release/turyn --n=18 --wz=apart --mdd-k=5
+```
+On by default. It enforces the per-frequency pair bound
+`|Z(ω)|² ≤ (3n−1) − |W(ω)|²` natively inside the Z SAT solve and is
+worth ~3.3x at n=18 k=5 for identical coverage. Turn it off only to
+bisect a suspected completeness problem — see `docs/TTC-AUDIT.md` §12.8
+for the watch-list bug that made it lose solutions before, and for the
+diagnostic hooks (`TURYN_SPECTRAL_VERIFY`, `TURYN_DUMP_PAIRS`,
+`TURYN_Z_TARGET`) that found it.
+
 ## Key architecture
 
 - `src/main.rs`: MDD pipeline (4-stage priority queue) + legacy three-phase pipeline

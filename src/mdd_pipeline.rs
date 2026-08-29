@@ -1360,17 +1360,17 @@ pub(crate) fn process_solve_z(
             pfb[fi] = (ctx.pair_bound - w_re[fi] * w_re[fi] - w_im[fi] * w_im[fi]).max(0.0);
         }
         z_spec.per_freq_bound = Some(pfb);
-        // The native per-frequency propagator is OFF by default: it
-        // removes valid solutions. With the mirror desync fixed (see
-        // `Solver::enqueue` in radical) it still loses ~5 % of the
-        // catalogue at n=12/14/16, while the same runs without it
-        // reproduce the catalogue exactly -- `docs/TTC-AUDIT.md` §12.2d.
-        // It buys roughly 2.5x throughput, so it stays available as an
-        // explicit opt-in (`TURYN_Z_SPECTRAL=1`) for runs where speed
-        // matters more than completeness. The post-hoc
-        // `spectral_pair_ok` check still filters every emitted pair
-        // either way, so enabling it never yields a *wrong* solution --
-        // only a missing one.
+        // The native per-frequency propagator is ON by default. It used to
+        // lose ~5 % of the catalogue, which is why it spent a while behind
+        // an opt-in: the spectral conflict clause was filed in the watch
+        // lists of the literals it did NOT watch, so `propagate_lit`
+        // rewrote clause literals in place and conflict analysis learned
+        // unsound clauses from the result (`docs/TTC-AUDIT.md` §12.8).
+        // With that fixed it reproduces the catalogue exactly at every
+        // (n, k) in `scripts/check-coverage-suite.sh --full` and at
+        // n=18 k=5, and is ~2.7x faster there. `TURYN_NO_Z_SPECTRAL=1`
+        // turns it off. The post-hoc `spectral_pair_ok` check still
+        // filters every emitted pair either way.
         if trace_z {
             let (mut min_pfb, mut argmin) = (f64::MAX, 0usize);
             for fi in 0..nf {
@@ -1396,11 +1396,28 @@ pub(crate) fn process_solve_z(
                     .collect::<String>(),
             );
         }
-        if std::env::var("TURYN_Z_SPECTRAL").is_ok() {
+        if z_spectral_enabled() {
             z_solver.spectral = Some(z_spec);
         }
     }
 
+    // `TURYN_Z_TARGET=<full Z>,<full W>`: on the (boundary, W) that should
+    // produce this Z, hand the middle to the solver so it reports any learnt
+    // clause that excludes it.
+    if let Some((want_z, want_w)) = z_target() {
+        if want_z.len() == n
+            && &sz.w_vals == want_w
+            && z_boundary[..k] == want_z[..k]
+            && z_boundary[n - k..] == want_z[n - k..]
+        {
+            z_solver.audit_target = Some(want_z[k..n - k].to_vec());
+            eprintln!(
+                "ZTARGET: armed (attempt={}, prior_blocks={})",
+                sz.attempt,
+                sz.prior_blocks.len()
+            );
+        }
+    }
     sat_z_middle::fill_z_solver_quad_pb(
         &mut z_solver,
         &ctx.z_tmpl,
@@ -1495,8 +1512,22 @@ pub(crate) fn process_solve_z(
             Some(false) => {
                 // UNSAT — no more Z candidates exist. Clean
                 // boundary closure.
-                if z_count == 0 {
-                    metrics.flow_z_unsat.fetch_add(1, AtomicOrdering::Relaxed);
+                //
+                // `TURYN_Z_TARGET=<middle>,<W>`: when this exit happens on
+                // the (boundary, W) that should have produced the target Z
+                // middle, report every middle-only clause that excludes it.
+                // A spectral clause means the prune was wrong; a learnt one
+                // means conflict analysis derived something unsound.
+                if z_solver.audit_target.is_some() {
+                    let want_z = z_solver.audit_target.clone().unwrap();
+                    let bad = z_solver.clauses_excluding(&want_z);
+                    eprintln!(
+                        "ZTARGET: UNSAT after {z_count} Z on the target (boundary, W); {} middle-only clause(s) exclude the target middle",
+                        bad.len()
+                    );
+                    for (ci, learnt, lits) in bad.iter().take(6) {
+                        eprintln!("ZTARGET:   clause #{ci} learnt={learnt} lits={lits:?}");
+                    }
                 }
                 if trace_z {
                     eprintln!("TRACE:   SolveZ exit=UNSAT after {z_count} Z");
@@ -1588,6 +1619,17 @@ pub(crate) fn process_solve_z(
                     .collect::<String>(),
                 sz.w_vals.iter().map(|&v| v as i32).sum::<i32>()
             );
+        }
+
+        // `TURYN_DUMP_PAIRS=1`: emit every (Z, W) pair that survives to
+        // the XY stage. Diffing the dumps of two configurations says
+        // exactly which pairs one of them loses, which is the only way to
+        // tell a pruning bug from a scheduling one.
+        if dump_pairs_enabled() {
+            let pm = |vs: &[i8]| -> String {
+                vs.iter().map(|&v| if v == 1 { '+' } else { '-' }).collect()
+            };
+            eprintln!("PAIR z={} w={}", pm(&z_vals), pm(&sz.w_vals));
         }
 
         let z_seq = PackedSeq::from_values(&z_vals);
@@ -2845,6 +2887,39 @@ pub(crate) fn mdd_navigate_to_outfix(
         }
     }
     Some(nid)
+}
+
+/// Whether the Z stage installs the native per-frequency spectral
+/// propagator. On by default; `TURYN_NO_Z_SPECTRAL=1` disables it.
+/// Read once -- this is consulted per `process_solve_z` call.
+pub(crate) fn z_spectral_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TURYN_NO_Z_SPECTRAL").is_err())
+}
+
+/// `TURYN_DUMP_PAIRS=1`: print every (Z, W) pair reaching the XY stage.
+/// Diffing two configurations' dumps says exactly which pairs one loses.
+fn dump_pairs_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TURYN_DUMP_PAIRS").is_ok())
+}
+
+/// `TURYN_Z_TARGET=<full Z>,<full W>`: a known-good quadruple the Z stage
+/// should reach. Parsed once into `(Z, W)` as +1 / -1 values.
+fn z_target() -> Option<&'static (Vec<i8>, Vec<i8>)> {
+    static T: std::sync::OnceLock<Option<(Vec<i8>, Vec<i8>)>> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let spec = std::env::var("TURYN_Z_TARGET").ok()?;
+        let (zt, wt) = spec.split_once(',')?;
+        let pm = |t: &str| -> Vec<i8> {
+            t.trim()
+                .chars()
+                .map(|c| if c == '+' { 1i8 } else { -1 })
+                .collect()
+        };
+        Some((pm(zt), pm(wt)))
+    })
+    .as_ref()
 }
 
 /// Boundary selected for stage tracing via `TURYN_TRACE_BND=<zhex>,<whex>`.

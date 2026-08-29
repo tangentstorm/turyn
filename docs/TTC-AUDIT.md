@@ -63,9 +63,9 @@ Summary of what each mode's `covered` number is worth:
 **After the §12 fixes** every mode's `covered` reflects what was
 searched, and `apart`/`together` reproduce the catalogue exactly at
 every (n, k) in `scripts/check-coverage-suite.sh --full` — including
-the small-`k` cases that used to lose a third of the classes (§12.2b)
-— provided the Z spectral propagator stays off, which is now the
-default.
+the small-`k` cases that used to lose a third of the classes (§12.2b),
+and with the Z spectral propagator on, which is the default again now
+that the watch-list bug behind its losses is fixed (§12.8).
 
 ## 1. The mechanism: truncation credited as completion
 
@@ -473,8 +473,7 @@ Ordered by how much they change the numbers, not by effort.
 
 > **This list is the audit's original recommendations, kept as written
 > for the record. Items 0-8 have all been implemented — see §12 for
-> what each fix actually did and what it measured. Read §12.7 and
-> §12.2b for what is still open; do not treat anything below as
+> what each fix actually did and what it measured. Read §12.7 for what is still open; do not treat anything below as
 > outstanding work.**
 
 0. **Re-check any `--wz=apart` optimization accepted on a sub-2 %
@@ -689,20 +688,12 @@ A `debug_assert` in the propagation path now pins the invariant.
 
 That alone took n=12 k=2 from 96 to 121 of 127.
 
-**Bug 2: something still prunes.** With the mirror provably exact (the
-audit reports 0 desyncs and 0 non-falsified clause literals) the
-propagator still lost ~5 %. The check itself is sound — a test walks a
-catalogued TT(12) through it and asserts no conflict on **any** of the
-2^8 subsets of its middle assignment — and the solver's setup was
-verified to match an independent computation to six decimals
-(`min_pfb=11.085643@fi=46`, identical). The residual is unidentified.
-
-**So the propagator is now off by default** (`TURYN_Z_SPECTRAL=1` opts
-back in). It buys roughly 2.5× throughput and costs solutions, which is
-the wrong trade for a mode whose coverage number is supposed to mean
-something. The post-hoc `spectral_pair_ok` check still filters every
-emitted pair, so enabling it never yields a *wrong* solution — only a
-missing one.
+**Bug 2: the conflict clause was filed in the wrong watch lists.** With
+the mirror provably exact the propagator still lost ~5 %, and the
+propagator itself was not the culprit — see §12.8, which is a plain SAT
+bug that only the propagator's clause volume ever reached. The
+propagator was off by default for as long as that was unexplained; it
+is **on by default now** (`TURYN_NO_Z_SPECTRAL=1` turns it off).
 
 | run | before | after |
 |---|---:|---:|
@@ -721,7 +712,7 @@ space instead of a subset of it.
 
 ### 12.2z Tooling this needed
 
-Three hooks, all kept:
+Six hooks, all kept — the last three were added for §12.8:
 
 * `TURYN_TRACE_BND=<zhex>,<whex>` — reports whether a boundary is live in
   the MDD and whether the enumeration emitted it, and turns on the
@@ -731,8 +722,22 @@ Three hooks, all kept:
 * `TURYN_AUDIT_SPECTRAL=1` — checks, at every spectral conflict, that the
   propagator's mirror matches the solver's assignment and that the
   conflict clause is actually falsified.
-* `TURYN_Z_SPECTRAL=1` / `TURYN_NO_Z_SPECTRAL` — the bisection lever that
-  isolated the propagator in the first place, now the opt-in switch.
+* `TURYN_NO_Z_SPECTRAL=1` — the bisection lever that isolated the
+  propagator in the first place, now the opt-out switch (the propagator
+  is on by default).
+* `TURYN_SPECTRAL_VERIFY=1` — at every spectral conflict, brute-forces
+  all completions of the unassigned middle (skipped above 20 free vars)
+  and reports any conflict that had a satisfying one, and recomputes
+  `re` / `im` / `max_reduction` from `values` to catch state drift.
+  This is what proved the propagator innocent in §12.8.
+* `TURYN_DUMP_PAIRS=1` — prints every (Z, W) pair reaching the XY stage.
+  Diffing two configurations' dumps names exactly which pairs one of
+  them loses; this is the hook that turned "5 % goes missing" into ten
+  specific quadruples.
+* `TURYN_Z_TARGET=<full Z>,<full W>` — arms the Z solver on the
+  (boundary, W) that should produce that Z, so `analyze` reports any
+  clause it learns that excludes it and the UNSAT exit lists every
+  middle-only clause standing in the way (`Solver::clauses_excluding`).
 
 The bisection that found it: the missing class's boundary was live and
 emitted; its `(Z, W)` pair reached the XY stage; its XY boundary was
@@ -822,3 +827,114 @@ The honest reading of any n=56 TTC today is "order of magnitude, from a
 sample of ~1e-5 of the space, ±3× run to run". Getting a number worth
 more than that needs the section 7 nondeterminism fixed and enough
 budget for boundaries to actually complete — not a change to the metric.
+
+### 12.8 The residual ~5 %: a watch-list attachment bug
+
+§12.2b left one thing open — with the mirror provably exact, the Z
+spectral propagator still lost ~5 % of the catalogue. It was not the
+propagator. It was a two-line SAT bug that only the propagator's clause
+volume ever reached.
+
+**Symptom.** `apart n=12 k=2` found 121–125 of 127 with the propagator
+on, 127 with it off, and the count *varied run to run at
+`--threads=1 --seed=0`*. Pinning the process to one core
+(`taskset -c 0`) made it deterministic again at 121, which said the
+variation was a coordinator/worker race, not the arithmetic.
+
+**What was ruled out first.** Each of these is now a permanent check:
+
+* The **bound is sound**. Replaying all 127 catalogued TT(12) through
+  the propagator's own arithmetic — every one of the 2^8 subsets of the
+  middle, at all 64 frequencies — gives 0 conflicts, with a minimum
+  slack of 0.0066 to the conflict threshold. Far above f32 noise, so
+  marginality was excluded too: a `TURYN_SPECTRAL_SLACK` sweep confirmed
+  it, and its *non-monotonicity* (0 → 122, 1e-6 → 121, 0.5 → 126) was
+  the first hard evidence that pruning was not the mechanism at all.
+* The **verdict is sound in situ**. `TURYN_SPECTRAL_VERIFY=1`
+  brute-forces every completion of the unassigned middle at each
+  conflict: across a whole run, 0 conflicts had a satisfying completion.
+* The **state is exact**. The same switch recomputes `re` / `im` /
+  `max_reduction` from `values` at each conflict: 0 drift.
+* The **clause is well-formed**. `TURYN_AUDIT_SPECTRAL=1` reports 0
+  desyncs and 0 non-falsified conflict-clause literals.
+* Not `--quad-pb`, not `--xor-propagation`, not the Z conflict budget
+  (`flow_z_timeout=0`).
+
+**Finding it.** `TURYN_DUMP_PAIRS=1` on both configurations, diffed:
+exactly 10 (Z, W) pairs reached XY without the propagator and not with
+it — one of them the missing solution. `TURYN_Z_TARGET=<Z>,<W>` then
+armed the Z solver for that boundary and W, and reported that the
+enumeration exited UNSAT with the target excluded by *learnt* clauses,
+not by any spectral clause. Logging every clause the propagator added
+gave the contradiction that named the bug:
+
+```
+SPECTRAL-CLAUSE: #90 start=535 lits=[-1, -4, -5, 6, 7, -8]   (added)
+LEARN-...: from Clause(#90 start=535 len=6 lits=[-1, -8, -5, 6, 7, 4])
+```
+
+Same clause, same slot — different literals. The clause was being
+rewritten in place.
+
+**Root cause.** A clause watching literal `L` must be filed in
+`watches[lit_index(negate(L))]`, so the list is traversed when `L`
+becomes false. `add_clause` and `rebuild_watches` do that. The spectral
+conflict clause did not:
+
+```rust
+self.watches[lit_index(cl[0])].push((ci, cl[1]));   // missing negate()
+```
+
+So every spectral clause was filed under the literals it did *not*
+watch. `propagate_lit` then found clauses whose `false_lit` sat at
+neither watched position, and its new-watch step —
+
+```rust
+self.clause_lits[cstart + 1] = repl;
+self.clause_lits[cstart + k] = false_lit;
+```
+
+— which assumes position 1 holds `false_lit`, instead overwrote a live
+literal. In the trace above `false_lit = 4` and `repl = -8` at `k = 5`,
+turning `-4` into `-8` at position 1 and `-8` into `4` at position 5,
+exactly as observed. The rewritten clause is not implied by the
+formula, conflict analysis learned unsound clauses from it, and the Z
+enumeration returned UNSAT with real middles unfound.
+
+`clear_learnt_clauses` had the identical defect in its watch rebuild
+and is fixed with it.
+
+**After.** Both are one-word fixes. The propagator now reproduces the
+catalogue exactly everywhere and is **on by default**
+(`TURYN_NO_Z_SPECTRAL=1` disables it):
+
+| case | propagator off | propagator on (before) | propagator on (after) |
+|---|---:|---:|---:|
+| `apart` n=12 k=2 | 127 / 127 | 121–125 / 127 | **127 / 127** |
+| `apart` n=14 k=3 | 186 / 186 | 143 / 186 | **186 / 186** |
+| `apart` n=16 k=4 | 739 / 739 | 611 / 739 | **739 / 739** |
+| `apart` n=18 k=5 | 675 / 675 | 427 / 675 | **675 / 675** |
+
+and it is now a straight speedup rather than a trade. Paired at
+n=18 k=5, `--threads=1 --seed=0`, both runs 675/675:
+
+| | wall clock |
+|---|---:|
+| `TURYN_NO_Z_SPECTRAL=1` | 880 s |
+| default (propagator on) | **266 s** |
+
+**3.3× faster for identical coverage.** Two regression tests pin it, and
+both fail if the `negate` is removed:
+`spectral_propagator_removes_only_bound_violating_middles` (the
+propagator may only remove middles that violate the bound) and
+`spectral_conflict_clauses_are_filed_under_the_right_literals` (via
+`Solver::watch_invariant_violations`, which checks the invariant
+`propagate_lit` relies on across the whole clause database).
+
+**The lesson for the rest of the solver.** This bug was invisible to
+every check aimed at the propagator, because the propagator was
+correct. It only became findable by comparing *what reached the next
+stage* between two configurations, and then asking what excluded one
+specific known-good solution. `check_coverage` plus `TURYN_DUMP_PAIRS`
+is the general form of that, and it is worth reaching for before
+auditing arithmetic.
