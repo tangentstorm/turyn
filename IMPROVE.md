@@ -16,12 +16,16 @@ Two findings there change how you should use this file:
    run-to-run spread, and a residual (non-accounting) completeness bug
    still loses ~1 % of classes, so `covered=1.000` means "no residual
    work in the mass model", not "every solution found".
-2. **The bit-exactness claim below is mode-dependent.** It holds for
-   `--wz=together` solve counters, and fails for `--wz=apart`: three
-   identical `--threads=1 --seed=0` runs at n=16 gave 79 181 / 79 974 /
-   79 725 XY solves (~1 %) — five times the 0.2 % acceptance bar below.
-   Boundary-derived counters are unstable in both modes except at a
-   cover-log2 deep enough to exhaust the boundary set.
+2. **The bit-exactness claim below now holds** — it did not when the
+   audit was written (~1 % drift on `apart` solve counters, up to 1.54×
+   on boundary counts). Fixed by `Lockstep` in the engine plus the
+   spectral fix; `bench_stop_is_bit_exact_under_a_single_worker` pins it.
+   Still true only for `--threads=1`: multi-worker runs are not
+   reproducible, so use the paired wall-clock protocol in
+   `docs/BENCHMARKING.md` for those.
+3. **`--bench-cover-log2` targets recorded before the `total_log2_work`
+   fix mean something different now** — raise them by `2n - 1` (51 at
+   n=26) to select the same amount of work.
 
 Use `check_coverage` (`docs/TTC-AUDIT.md` §10) to confirm an optimization
 did not change what the search actually covers.

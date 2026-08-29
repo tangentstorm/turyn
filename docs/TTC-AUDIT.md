@@ -322,7 +322,7 @@ Consequences:
   which is why counter-mode A/B comparisons remain sound. That part of
   `IMPROVE.md` is fine.
 
-## 7. Reproducibility: `--threads=1 --seed=0` is only partly deterministic
+## 7. Reproducibility: `--threads=1 --seed=0` — FIXED
 
 [`IMPROVE.md`](../IMPROVE.md) builds its acceptance procedure on this
 claim:
@@ -332,53 +332,72 @@ claim:
 > [...] **Accept if the predicted counter moved >= 0.2 %** in the
 > predicted direction.
 
-It holds in one configuration and fails in others, and the difference is
-not documented.
+It was false in two different ways. Both are now fixed; the claim holds.
 
-**`--wz=together` at n=26.** Three runs per depth, nothing else on the box:
+### 7.1 What was wrong
 
-| `--bench-cover-log2` | boundaries | W solves | XY unsat |
-|---:|---|---|---|
-| 32 | 221 486 / 253 218 / 245 780 | 16 / 16 / 16 | 0 |
-| 34 | 338 828 / 274 693 / 219 716 (**1.54×**) | 33 / 33 / 33 | 0 |
-| 36 | 970 340 / 1 010 960 / 933 209 | 146 / 146 / 149 | 266 / 266 / 266 |
-| 38 (IMPROVE.md's canonical command) | 1 465 976 ×3 | 718 ×3 | 28 593 ×3 |
+**Run-ahead against the bench stop.** The report channel is unbounded, so
+the worker kept popping and handling items while its reports queued up.
+The coordinator only evaluated `bench_target_reached` as it drained them,
+by which point the worker had handled an unbounded number of extra items
+— how many depending purely on thread timing. Measured at n=26
+`--wz=together --mdd-k=7 --bench-cover-log2=34 --threads=1 --seed=0`,
+three runs: boundary count **221 486 / 253 218 / 245 780**, and at a
+deeper stop **338 828 / 274 693 / 219 716** (1.54×), while `covered` and
+the W/Z/XY solve counters were stable.
 
-The *solve* counters are stable, so counter-mode A/B on `flow_xy_*` is
-sound here — that part of the protocol works. The **boundary** counter is
-not stable (up to 1.54× at shallow depth), because the monitor thread
-pumps boundaries into the queue asynchronously and the fixed-work stop
-fires wherever it happens to be. At `X=38` even that converges, but only
-because the run enumerates the *entire* seeded boundary set — the totals
-are pinned by exhaustion, not by determinism.
+**The spectral propagator.** `--wz=apart` was nondeterministic even in
+the solve counters — 79 181 / 79 974 / 79 725 XY solves over three
+identical runs at n=16, ~1 % against a 0.2 % acceptance bar. That was a
+symptom of the mirror desync in §12.2b, not of the engine: the
+propagator's verdict depended on propagation order, so any timing
+variation changed which solutions the search found.
 
-**`--wz=apart` at n=16 is genuinely nondeterministic in the recommended
-counters.** Three back-to-back runs of
-`--n=16 --wz=apart --mdd-k=5 --all --threads=1 --seed=0`:
+### 7.2 The fix
 
-| run | XY solves | XY sat | canonical classes found |
-|---|---:|---:|---:|
-| 1 | 79 181 | 543 | 543 |
-| 2 | 79 974 | 528 | 528 |
-| 3 | 79 725 | 520 | 520 |
+`Lockstep` in `search_framework/engine.rs`: with one worker, the next
+pop waits until the coordinator has fully applied the previous report —
+mass credited, children queued, stop condition evaluated. The run then
+stops on the same item every time. It engages only for
+`worker_count == 1` **with a bench stop configured**, i.e. exactly the
+benchmarking configuration whose purpose is reproducibility; ordinary
+searches and multi-worker runs keep their unsynchronised throughput.
+`TURYN_NO_LOCKSTEP=1` disables it.
 
-~1 % spread on `flow_xy_solves` and 4 % on the solution count, and the
-same with a fixed-work stop (`--bench-cover-log2=30`: 18 116 / 18 082 /
-18 063). Against a **0.2 % acceptance bar**, `apart` counter deltas are
-five times below the noise.
+The §12.2b spectral fix removed the other source.
 
-Practical consequences:
+### 7.3 Measured after
 
-* Counter-mode A/B is valid for `--wz=together` on solve counters. It is
-  **not** valid for `--wz=apart` — the mode used for the n=56 headline
-  benchmark — nor for any boundary-derived counter in either mode.
-* `IMPROVE.md` advises *"the smallest cover-log2 that exercises the code
-  path you care about is best. Smaller = faster sample = faster
-  iteration."* For boundary-driven measurements that advice moves the
-  benchmark out of the only regime where it reproduces.
-* Any `apart` result accepted on a sub-2 % counter delta should be
-  re-measured with paired repeats and a confidence interval, as
-  [`BENCHMARKING.md`](BENCHMARKING.md) already prescribes for wall-clock.
+| config | before | after |
+|---|---|---|
+| n=26 together, cover-log2=85, 3 runs | varied | **33 / 33 / 33** boundaries |
+| n=26 together, cover-log2 shallow, 5 runs | 3666 / 6820 / 12321 | **1 / 1 / 1 / 1 / 1** |
+| n=16 apart, cover-log2=60, 4 runs | — | **13 765 XY solves ×4**, covered 1.251e-1 ×4 |
+| n=16 apart, run to completion, 3 runs | 79 181 / 79 974 / 79 725 | **identical** |
+| n=12 apart k=2, run to completion, 3 runs | varied | **identical** |
+
+Cost: about 17 % per item in the benchmark configuration only. The
+lock-stepped run also does *less* total work, because it stops on the
+target instead of over-running it — at n=16 cover-log2=60 it handles
+13 765 XY solves where the unsynchronised run handled 14 547–15 598 (and
+varied by 7 %).
+
+`bench_stop_is_bit_exact_under_a_single_worker` pins it, and fails with
+`TURYN_NO_LOCKSTEP=1`.
+
+### 7.4 What this means for the protocol
+
+Counter-mode A/B at `--threads=1 --seed=0` is now sound in both modes and
+at any `--bench-cover-log2` depth, so `IMPROVE.md`'s procedure is valid
+as written. Two caveats remain:
+
+* **Multi-worker runs are still not reproducible** and never will be by
+  this route — worker interleaving decides which boundary retires first.
+  Use `--threads=1` for A/B, and `docs/BENCHMARKING.md`'s paired
+  wall-clock protocol for anything measured with threads > 1.
+* **`--bench-cover-log2` values from before the `total_log2_work` fix
+  (§6) mean something different now.** Raise old targets by `2n - 1`
+  (51 at n=26) to select the same work.
 
 ## 8. `--wz=sync` contradicts itself in the same run
 

@@ -213,6 +213,18 @@ impl<T: Send + 'static> SearchEngine<T> {
         }
 
         let in_flight = Arc::new(AtomicUsize::new(0));
+        // Bit-exactness is only at risk when a bench target -- rather than
+        // exhaustion -- decides where the run stops, and only a single
+        // worker can be kept in lock-step without serialising real
+        // parallelism. See `Lockstep`.
+        let lockstep: Option<Arc<Lockstep>> = if self.cfg.worker_count.max(1) == 1
+            && self.cfg.bench_stop_log2_work.is_some()
+            && std::env::var("TURYN_NO_LOCKSTEP").is_err()
+        {
+            Some(Arc::new(Lockstep::new()))
+        } else {
+            None
+        };
         let shutdown = Arc::new(AtomicBool::new(false));
         let worker_count = self.cfg.worker_count.max(1);
         let (event_tx, event_rx) = mpsc::channel::<WorkerReport<T>>();
@@ -227,8 +239,17 @@ impl<T: Send + 'static> SearchEngine<T> {
                 let cancelled = Arc::clone(&self.cancelled);
                 let event_tx = event_tx.clone();
                 let start_clone = start;
+                let lockstep = lockstep.clone();
                 scope.spawn(move || {
+                    let mut sent: u64 = 0;
                     loop {
+                        // Lock-step: do not pop again until the coordinator
+                        // has fully applied the previous report, so the
+                        // item the run stops on is a property of the search
+                        // and not of thread timing.
+                        if let Some(ref ls) = lockstep {
+                            ls.wait_for(sent, &shutdown, &cancelled);
+                        }
                         let next: Option<WorkItem<T>> = {
                             let (lock, cvar) = &*scheduler;
                             let mut guard = lock.lock().unwrap();
@@ -292,6 +313,7 @@ impl<T: Send + 'static> SearchEngine<T> {
                         {
                             return;
                         }
+                        sent += 1;
                     }
                 });
             }
@@ -302,9 +324,15 @@ impl<T: Send + 'static> SearchEngine<T> {
             // Coordinator loop
             loop {
                 if self.cancelled.load(Ordering::Relaxed) {
+                    if let Some(ref ls) = lockstep {
+                        ls.release();
+                    }
                     break;
                 }
                 if is_quiescent(&scheduler, &in_flight) {
+                    if let Some(ref ls) = lockstep {
+                        ls.release();
+                    }
                     break;
                 }
 
@@ -332,12 +360,26 @@ impl<T: Send + 'static> SearchEngine<T> {
                                 self.cfg.bench_stop_log2_work,
                             ) {
                                 self.cancelled.store(true, Ordering::Relaxed);
+                                if let Some(ref ls) = lockstep {
+                                    ls.release();
+                                }
                                 break;
                             }
                         }
+                        // Report fully applied: mass credited, children
+                        // queued, stop condition evaluated. Only now may
+                        // the worker pop again.
+                        if let Some(ref ls) = lockstep {
+                            ls.note_applied();
+                        }
                     }
                     Err(RecvTimeoutError::Timeout) => { /* progress tick below */ }
-                    Err(RecvTimeoutError::Disconnected) => break,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        if let Some(ref ls) = lockstep {
+                            ls.release();
+                        }
+                        break;
+                    }
                 }
 
                 if last_progress.elapsed() >= self.cfg.progress_interval {
@@ -485,6 +527,74 @@ fn poll_mass(model: &dyn SearchMassModel, mass: &mut MassSnapshot, high_total: &
     let derived_partial = (*high_total - mass.covered_exact.0).max(0.0);
     let cap = (mass.total.0 - mass.covered_exact.0).max(0.0);
     mass.covered_partial = MassValue(derived_partial.min(cap));
+}
+
+/// Rendezvous that makes a single-worker run bit-exact.
+///
+/// Workers normally run ahead of the coordinator: the report channel is
+/// unbounded, so a worker keeps popping and handling items while its
+/// reports queue up. When a `--bench-cover-log2` target is what stops the
+/// run, the coordinator only notices after draining reports, by which
+/// time the worker has handled an unbounded number of extra items. How
+/// many depends purely on thread timing, so counters that should be a
+/// property of the search become a property of the machine: at n=26
+/// `--wz=together --bench-cover-log2=34 --threads=1 --seed=0` the
+/// boundary count varied 3666 / 6820 / 12321 across identical runs
+/// (`docs/TTC-AUDIT.md` §7) while every other counter was stable.
+///
+/// With one worker we can close that gap exactly: the worker waits for
+/// the coordinator to *fully apply* its previous report — mass credited,
+/// children queued, stop condition evaluated — before popping again. The
+/// run then stops on the same item every time.
+///
+/// Only engaged for `worker_count == 1` with a bench stop configured,
+/// i.e. precisely the benchmarking configuration whose whole purpose is
+/// reproducibility. Multi-worker runs and ordinary searches keep their
+/// unsynchronised throughput.
+struct Lockstep {
+    /// Reports the coordinator has finished applying.
+    applied: Mutex<u64>,
+    cv: Condvar,
+}
+
+impl Lockstep {
+    fn new() -> Self {
+        Self {
+            applied: Mutex::new(0),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Coordinator: one more report fully applied.
+    fn note_applied(&self) {
+        let mut g = self.applied.lock().unwrap();
+        *g += 1;
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    /// Coordinator is leaving the loop — release any waiting worker so
+    /// it can observe `shutdown` / `cancelled` and exit.
+    fn release(&self) {
+        let mut g = self.applied.lock().unwrap();
+        *g = u64::MAX;
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    /// Worker: block until the coordinator has applied `sent` reports.
+    /// Times out periodically so a coordinator that exits without a
+    /// final `release` can never wedge the worker.
+    fn wait_for(&self, sent: u64, shutdown: &AtomicBool, cancelled: &AtomicBool) {
+        let mut g = self.applied.lock().unwrap();
+        while *g < sent {
+            if shutdown.load(Ordering::Acquire) || cancelled.load(Ordering::Relaxed) {
+                return;
+            }
+            let (next, _) = self.cv.wait_timeout(g, Duration::from_millis(50)).unwrap();
+            g = next;
+        }
+    }
 }
 
 fn is_quiescent<T>(scheduler: &SharedScheduler<T>, in_flight: &AtomicUsize) -> bool {
@@ -1424,6 +1534,161 @@ mod tests {
     /// this end-to-end test exercises that contract against the
     /// real engine coordinator loop, not just the helper in
     /// isolation.
+    /// A `--bench-cover-log2` run at `--threads=1 --seed=0` must handle
+    /// exactly the same items every time.
+    ///
+    /// It did not. The report channel is unbounded, so the worker kept
+    /// popping and handling while its reports queued up; the coordinator
+    /// only evaluated the stop condition as it drained them, by which
+    /// point the worker had handled an unbounded number of extra items.
+    /// How many depended on thread timing, so counters that should be a
+    /// property of the search became a property of the machine — at n=26
+    /// `--wz=together --bench-cover-log2=34` the boundary count varied
+    /// 3666 / 6820 / 12321 across identical runs, and `--wz=apart`
+    /// solve counts moved ~7 %. `IMPROVE.md` meanwhile asks reviewers to
+    /// accept optimizations on 0.2 % counter deltas.
+    ///
+    /// `Lockstep` closes it: with one worker, the next pop waits until
+    /// the coordinator has fully applied the previous report.
+    #[test]
+    fn bench_stop_is_bit_exact_under_a_single_worker() {
+        use std::sync::atomic::AtomicU64 as A64;
+
+        /// Credits a fixed slice of mass per handled item, so the bench
+        /// target lands mid-run rather than at exhaustion.
+        struct StepMass {
+            handled: Arc<A64>,
+        }
+        impl SearchMassModel for StepMass {
+            fn covered_mass(&self) -> MassValue {
+                MassValue((self.handled.load(Ordering::Relaxed) as f64 / 500.0).min(1.0))
+            }
+            fn total_log2_work(&self) -> Option<f64> {
+                Some(10.0)
+            }
+            fn quality(&self) -> CoverageQuality {
+                CoverageQuality::Projected
+            }
+        }
+
+        /// Cheap handler with just enough jitter for a worker to run
+        /// ahead of the coordinator if nothing holds it back.
+        struct StepStage {
+            handled: Arc<A64>,
+        }
+        impl StageHandler<u64> for StepStage {
+            fn id(&self) -> StageId {
+                "step"
+            }
+            fn handle(&self, item: WorkItem<u64>, _ctx: &StageContext<'_>) -> StageOutcome<u64> {
+                let n = self.handled.fetch_add(1, Ordering::Relaxed);
+                // Data-dependent spin: uneven per-item cost is what lets
+                // the run-ahead distance vary between runs.
+                let mut acc = 0u64;
+                for i in 0..(200 + (n % 64) * 40) {
+                    acc = acc.wrapping_add(i).wrapping_mul(2_654_435_761);
+                }
+                std::hint::black_box(acc);
+                let mut out = StageOutcome::default();
+                if item.payload < 4_000 {
+                    out.emitted.push(WorkItem {
+                        stage_id: "step",
+                        priority: 0,
+                        gold: false,
+                        cost_hint: 1,
+                        replay_key: item.payload + 1,
+                        mass_hint: None,
+                        meta: WorkItemMeta {
+                            item_id: item.payload + 1,
+                            parent_item_id: Some(item.meta.item_id),
+                            fanout_root_id: item.meta.fanout_root_id,
+                            depth_from_root: item.meta.depth_from_root + 1,
+                            spawn_seq: 0,
+                        },
+                        payload: item.payload + 1,
+                    });
+                }
+                out
+            }
+        }
+
+        struct StepAdapter {
+            handled: Arc<A64>,
+        }
+        impl SearchModeAdapter<u64> for StepAdapter {
+            fn name(&self) -> &'static str {
+                "step"
+            }
+            fn init(&self) -> AdapterInit<u64> {
+                AdapterInit {
+                    seed_items: (0..8u64)
+                        .map(|i| WorkItem {
+                            stage_id: "step",
+                            priority: 0,
+                            gold: false,
+                            cost_hint: 1,
+                            replay_key: i,
+                            mass_hint: None,
+                            meta: WorkItemMeta {
+                                item_id: i,
+                                parent_item_id: None,
+                                fanout_root_id: i,
+                                depth_from_root: 0,
+                                spawn_seq: 0,
+                            },
+                            payload: 0,
+                        })
+                        .collect(),
+                }
+            }
+            fn stages(&self) -> BTreeMap<StageId, Box<dyn StageHandler<u64>>> {
+                let mut m: BTreeMap<StageId, Box<dyn StageHandler<u64>>> = BTreeMap::new();
+                m.insert(
+                    "step",
+                    Box::new(StepStage {
+                        handled: Arc::clone(&self.handled),
+                    }),
+                );
+                m
+            }
+            fn mass_model(&self) -> Box<dyn SearchMassModel> {
+                Box::new(StepMass {
+                    handled: Arc::clone(&self.handled),
+                })
+            }
+        }
+
+        // Stop once covered >= 2^(9 - 10) = 0.5, i.e. after 250 items.
+        let run_once = || -> u64 {
+            let handled = Arc::new(A64::new(0));
+            let adapter = StepAdapter {
+                handled: Arc::clone(&handled),
+            };
+            let cfg = EngineConfig {
+                progress_interval: Duration::from_millis(50),
+                worker_count: 1,
+                bench_stop_log2_work: Some(9.0),
+            };
+            let mut engine = SearchEngine::<u64>::new(cfg, Box::new(LaneByPriority::new()));
+            engine.run(&adapter, |_| {});
+            handled.load(Ordering::Relaxed)
+        };
+
+        let first = run_once();
+        assert!(
+            first > 0,
+            "the bench target must be reached mid-run, not immediately"
+        );
+        for rep in 1..5 {
+            assert_eq!(
+                run_once(),
+                first,
+                "run {rep} handled a different number of items than the first ({first}); \
+                 a seeded single-worker bench stop must be bit-exact"
+            );
+        }
+    }
+
     #[test]
     fn engine_publishes_monotone_envelope_against_fluctuating_model() {
         use crate::search_framework::mass::MassSnapshot;
