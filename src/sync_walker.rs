@@ -677,9 +677,15 @@ fn build_solver(problem: Problem, sat_config: &radical::SolverConfig) -> radical
 
     // SCC equivalence preprocessing on the binary implication graph.
     // Strongly-connected components in the implication graph are
-    // logically-equivalent literals; substituting them out shrinks
-    // the formula. radical exposes this but neither sync nor any
-    // other entry point currently calls it.
+    // logically-equivalent literals; substituting them out would shrink
+    // the formula.
+    //
+    // This is a no-op here and is kept as documentation of that: the
+    // substitution rewrites clause literals only, and the quad-PB and
+    // pb-set-eq constraints added above carry their own literal arrays,
+    // so `preprocess_scc_equivalences` refuses to run rather than leave
+    // the two disagreeing about which variable is which. It found 0
+    // equivalences in this encoding before that guard existed.
     let _scc_eliminated = solver.preprocess_scc_equivalences();
 
     // BVE preprocessing — eliminate Tseitin aux vars where possible,

@@ -2602,8 +2602,35 @@ impl Solver {
 
     /// Find equivalent literals via SCC on the binary implication graph.
     /// Returns number of equivalences found and applied.
+    ///
+    /// **Clause database only.** The substitution rewrites `clause_lits` and
+    /// rebuilds watches; it does not touch `pb_constraints`,
+    /// `quad_pb_constraints`, `xor_constraints`, `pb_set_eq_constraints`, the
+    /// spectral constraint or the MDD, all of which carry their own literal
+    /// or variable arrays. Renaming a variable in the clauses but not in those
+    /// leaves the two describing different problems, with no error anywhere —
+    /// so this refuses to run when any of them is present, rather than
+    /// silently corrupting the formula. `--wz=sync` builds `quad_pb` and
+    /// `pb_set_eq` constraints before calling this, so today it is a no-op
+    /// there; it found 0 equivalences in that encoding anyway.
+    ///
+    /// Known limitation in the substitution itself, unfixed because the guard
+    /// above makes it unreachable: `repr[w]` is assigned from the first `v < w`
+    /// in the same SCC without union-find compression, so if that `v` is itself
+    /// substituted the mapping is stale and one pass does not reach a fixed
+    /// point. Rewrite it as one pass keyed by `scc_id` (minimum variable of
+    /// each component as representative) before removing the guard.
     pub fn preprocess_scc_equivalences(&mut self) -> usize {
         if !self.ok {
+            return 0;
+        }
+        if !self.pb_constraints.is_empty()
+            || !self.quad_pb_constraints.is_empty()
+            || !self.xor_constraints.is_empty()
+            || !self.pb_set_eq_constraints.is_empty()
+            || self.spectral.is_some()
+            || self.mdd.is_some()
+        {
             return 0;
         }
         // Propagate first
@@ -2828,7 +2855,32 @@ impl Solver {
                 skip_var[v] = true;
             }
         }
-
+        // BVE resolves variables out of the CLAUSE database only. Any
+        // variable a non-clause constraint mentions must therefore survive,
+        // or that constraint is left propagating over a variable the clauses
+        // no longer constrain. `pb_set_eq`, the spectral constraint and the
+        // MDD were missing here: `--wz=sync` was safe only because its caller
+        // happens to pass every walker var in `protected`, which is the
+        // caller remembering rather than the preprocessor guaranteeing.
+        for pc in &self.pb_set_eq_constraints {
+            for &lit in &pc.lits {
+                skip_var[var_of(lit)] = true;
+            }
+        }
+        if let Some(ref spec) = self.spectral {
+            for v in 0..spec.num_seq_vars.min(num_vars) {
+                skip_var[v] = true;
+            }
+        }
+        if let Some(ref mdd) = self.mdd {
+            for level in 0..mdd.depth {
+                for &v in &[mdd.level_x_var[level], mdd.level_y_var[level]] {
+                    if v < num_vars {
+                        skip_var[v] = true;
+                    }
+                }
+            }
+        }
         // Build and maintain occurrence lists
         let mut pos_occs: Vec<Vec<u32>> = vec![Vec::new(); num_vars];
         let mut neg_occs: Vec<Vec<u32>> = vec![Vec::new(); num_vars];
@@ -7374,6 +7426,85 @@ mod spectral_drift_tests {
 #[cfg(test)]
 mod spectral_soundness_tests {
     use super::*;
+
+    /// Preprocessing that rewrites only the clause database must not run when
+    /// a constraint carrying its own literal array is present, or the two end
+    /// up describing different problems with no error raised anywhere.
+    #[test]
+    fn scc_substitution_refuses_to_run_beside_non_clause_constraints() {
+        // x1 <-> x2 via (x1 -> x2) and (x2 -> x1): a genuine equivalence, so
+        // the pass has something to find and a no-op result means the guard
+        // fired rather than the graph being empty.
+        let build = || {
+            let mut s = Solver::new();
+            s.add_clause([-1, 2]);
+            s.add_clause([1, -2]);
+            s.add_clause([1, 2, 3]);
+            s
+        };
+
+        let mut plain = build();
+        let found = plain.preprocess_scc_equivalences();
+        assert!(
+            found > 0,
+            "the bare clause set has an equivalence to substitute"
+        );
+
+        let mut guarded = build();
+        guarded.add_quad_pb_eq(&[1, 2], &[2, 1], &[1, 1], 1);
+        assert_eq!(
+            guarded.preprocess_scc_equivalences(),
+            0,
+            "substitution must decline when a quad-PB constraint is present"
+        );
+
+        let mut guarded2 = build();
+        guarded2.add_pb_set_eq(&[1, 2, 3], &[1, 2]);
+        assert_eq!(
+            guarded2.preprocess_scc_equivalences(),
+            0,
+            "substitution must decline when a pb-set-eq constraint is present"
+        );
+    }
+
+    /// BVE resolves variables out of the clause database only, so every
+    /// variable a non-clause constraint mentions has to survive it -- without
+    /// the caller having to remember to pass it in `protected`.
+    #[test]
+    fn bve_never_eliminates_a_variable_a_pb_set_eq_constraint_uses() {
+        // Var 4 is a clean elimination candidate: one positive and one
+        // negative occurrence, so the single resolvent is cheaper than the
+        // two clauses it replaces.
+        // The constraint must not FORCE its variables, or they survive by
+        // being assigned at level 0 rather than by the guard.
+        let build = || {
+            let mut s = Solver::new();
+            s.add_clause([1, 4]);
+            s.add_clause([2, -4]);
+            s.add_clause([1, 5]);
+            s.add_clause([2, -5]);
+            s.add_clause([1, 2, 3]);
+            s
+        };
+
+        let mut bare = build();
+        let eliminated_bare = bare.preprocess_bve();
+        assert!(
+            eliminated_bare > 0,
+            "expected BVE to want var 4; it eliminated nothing, so this test \
+cannot tell whether the guard works"
+        );
+
+        let mut guarded = build();
+        guarded.add_pb_set_eq(&[4, 5], &[1]); // exactly one true: forces neither
+        assert_eq!(
+            guarded.preprocess_bve(),
+            0,
+            "BVE eliminated a variable that a pb_set_eq constraint still \
+references; that constraint now propagates over a variable the clauses no \
+longer constrain"
+        );
+    }
 
     /// Build the `TT(12)` Z-middle instance `process_solve_z` builds: a
     /// spectral constraint over the 8 middle variables, with the Z boundary

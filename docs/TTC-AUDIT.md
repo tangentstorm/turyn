@@ -1008,3 +1008,56 @@ invariant — every literal of every learnt clause is false under the
 assignment that produced it. It is the cheapest available test of
 conflict-analysis soundness and it caught bug 1 immediately when
 coverage could not.
+
+### 12.10 Preprocessing that rewrites only half the formula
+
+The second suspicion from the §12.9 sweep. Both defects here are **latent** —
+neither corrupts a run today — but both are the kind that fail silently when
+they do fire, so they are now structurally impossible rather than accidentally
+avoided.
+
+`radical` keeps constraints in five places besides the clause database:
+`pb_constraints`, `quad_pb_constraints`, `xor_constraints`,
+`pb_set_eq_constraints`, the spectral constraint and the MDD. Each carries its
+own literal or variable array. Preprocessing that renames or removes variables
+has to touch all of them or none.
+
+**`preprocess_scc_equivalences` rewrote `clause_lits` and stopped.** It
+substitutes equivalent literals and rebuilds watches, leaving every other
+constraint referring to variables that no longer mean what they did. Its only
+caller is `--wz=sync`, which adds `quad_pb` and `pb_set_eq` constraints
+immediately before calling it (`src/sync_walker.rs`) — and the comment above
+that call claimed "neither sync nor any other entry point currently calls it",
+which was false on the next line.
+
+It never fired: the sync encoding's binary implication graph yields
+`equivs = 0`, so the substitution loop was never entered. It now declines
+outright when any non-clause constraint is present. The substitution also has
+a second defect, documented in place rather than fixed because the guard makes
+it unreachable: `repr[w]` takes the first `v < w` in the same SCC with no
+union-find compression, so a chain of equivalences does not reach a fixed point
+in one pass.
+
+**`preprocess_bve` protected three constraint types and missed three.** BVE
+resolves variables out of the clause database, so any variable a non-clause
+constraint mentions must survive. It built its `skip_var` set from
+`pb_constraints`, `quad_pb_constraints` and `xor_constraints` — but not
+`pb_set_eq_constraints`, the spectral constraint or the MDD.
+
+`--wz=sync` uses `pb_set_eq` for its four sequence-sum constraints and was safe
+only because its caller passes every walker variable in `protected` — the
+caller remembering, not the preprocessor guaranteeing. Remove the new
+protection and the regression test fails immediately: BVE does eliminate a
+`pb_set_eq` variable when nothing else is holding it.
+
+Both are pinned by tests that fail with the guard removed:
+`scc_substitution_refuses_to_run_beside_non_clause_constraints` and
+`bve_never_eliminates_a_variable_a_pb_set_eq_constraint_uses`. The second
+needs a constraint that does not *force* its variables (`exactly one of
+{v4, v5}`), or they survive by being assigned at level 0 and the test proves
+nothing — the first two versions of it passed either way.
+
+**Rule this suggests.** Any preprocessing pass in `radical` that renames or
+removes variables must either handle every constraint container or refuse to
+run when one it does not handle is present. There is no third option that
+fails loudly.
