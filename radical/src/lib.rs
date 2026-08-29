@@ -331,6 +331,12 @@ struct TrailEntry {
     reason: Reason,
 }
 
+/// `TURYN_AUDIT_ANALYZE=1`: check the 1-UIP invariant on every learnt clause.
+fn analyze_audit_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TURYN_AUDIT_ANALYZE").is_ok())
+}
+
 /// Diagnostic switches, read once. These sit on the spectral conflict path,
 /// which runs millions of times per search, so they must not call
 /// `std::env::var` per conflict.
@@ -4711,6 +4717,21 @@ but completion mask={mask:b} over free vars {free:?} satisfies every bound",
     /// it pinpoints the exact conflict whose resolution went wrong.
     fn analyze(&mut self, conflict_reason: Reason) -> (Vec<Lit>, u32) {
         let (learnt, bt) = self.analyze_inner(conflict_reason);
+        // 1-UIP invariant: every literal of a learnt clause is FALSE under the
+        // assignment that produced it -- that is what makes the clause
+        // asserting after backtracking. A reason arm that pushes the wrong
+        // polarity produces a clause that is already satisfied, which is not
+        // the resolvent and can exclude assignments the formula allows.
+        if analyze_audit_enabled() {
+            for &l in &learnt {
+                if self.lit_value(l) != LBool::False {
+                    eprintln!(
+                        "LEARNT-NOT-FALSE: literal {l} is {:?} in learnt={learnt:?} from {conflict_reason:?}",
+                        self.lit_value(l)
+                    );
+                }
+            }
+        }
         if let Some(ref target) = self.audit_target {
             let nv = target.len();
             let falsifies = |lits: &[Lit]| -> bool {
@@ -4975,20 +4996,38 @@ but completion mask={mask:b} over free vars {free:?} satisfies every bound",
                     self.analyze_reason_buf = buf;
                 }
                 Reason::Mdd => {
-                    // MDD reason: all assigned boundary variables
+                    // MDD reason: the assigned boundary variables that could
+                    // have implied `p` -- those assigned BEFORE it.
+                    //
+                    // A reason may only contain literals preceding the literal
+                    // it explains; including one assigned later makes the
+                    // implication circular and the resolvent unsound, and
+                    // inflates `counter`, which is what drove analysis into the
+                    // `Reason::Decision` arm below. The `Xor` and `PbSetEq`
+                    // arms filter on `trail_pos` for exactly this reason.
                     let mut buf = std::mem::take(&mut self.analyze_reason_buf);
                     buf.clear();
+                    let pv = if p != 0 { var_of(p) } else { usize::MAX };
+                    let pv_pos = if pv < self.num_vars {
+                        self.trail_pos[pv]
+                    } else {
+                        usize::MAX
+                    };
                     if let Some(ref mdd) = self.mdd {
                         for level in 0..mdd.depth {
                             for &v in &[mdd.level_x_var[level], mdd.level_y_var[level]] {
-                                if self.assigns[v] != LBool::Undef {
-                                    let lit_v = (v + 1) as Lit;
-                                    buf.push(if self.assigns[v] == LBool::True {
-                                        -lit_v
-                                    } else {
-                                        lit_v
-                                    });
+                                if self.assigns[v] == LBool::Undef || v == pv {
+                                    continue;
                                 }
+                                if p != 0 && self.trail_pos[v] >= pv_pos {
+                                    continue;
+                                }
+                                let lit_v = (v + 1) as Lit;
+                                buf.push(if self.assigns[v] == LBool::True {
+                                    -lit_v
+                                } else {
+                                    lit_v
+                                });
                             }
                         }
                     }
@@ -5009,7 +5048,14 @@ but completion mask={mask:b} over free vars {free:?} satisfies every bound",
                         if self.level[v] == self.decision_level() {
                             counter += 1;
                         } else if self.level[v] > 0 {
-                            learnt.push(negate(lit));
+                            // `buf` holds FALSE literals (the negation of each
+                            // variable's current value), exactly like the
+                            // `process_reason_lit!` arms, so the literal goes
+                            // into `learnt` as-is. Pushing `negate(lit)` here
+                            // put TRUE literals in the learnt clause -- 8336 of
+                            // them in one n=14 `XY_MDD=1` run -- which is not
+                            // the resolvent and is not asserting.
+                            learnt.push(lit);
                             if self.level[v] > bt_level {
                                 bt_level = self.level[v];
                             }

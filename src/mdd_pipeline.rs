@@ -1687,18 +1687,19 @@ pub(crate) fn process_solve_z(
             metrics
                 .flow_xy_free_sum
                 .fetch_add(stats.free_vars, AtomicOrdering::Relaxed);
-            match xy_res {
-                Some((x, y)) => {
-                    metrics.flow_xy_sat.fetch_add(1, AtomicOrdering::Relaxed);
+            if xy_res.is_empty() {
+                metrics.flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed);
+            } else {
+                metrics
+                    .flow_xy_sat
+                    .fetch_add(xy_res.len() as u64, AtomicOrdering::Relaxed);
+                for (x, y) in xy_res {
                     if verify_tt(ctx.problem, &x, &y, &z_seq, &w_seq) {
                         if !ctx.continue_after_sat {
                             ctx.found.store(true, AtomicOrdering::Relaxed);
                         }
                         let _ = result_tx.send((x, y, z_seq.clone(), w_seq.clone()));
                     }
-                }
-                None => {
-                    metrics.flow_xy_unsat.fetch_add(1, AtomicOrdering::Relaxed);
                 }
             }
         } else if let Some(mut state) =

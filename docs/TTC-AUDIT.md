@@ -712,7 +712,7 @@ space instead of a subset of it.
 
 ### 12.2z Tooling this needed
 
-Six hooks, all kept — the last three were added for §12.8:
+Seven hooks, all kept — the last four came out of §12.8 and §12.9:
 
 * `TURYN_TRACE_BND=<zhex>,<whex>` — reports whether a boundary is live in
   the MDD and whether the enumeration emitted it, and turns on the
@@ -734,6 +734,10 @@ Six hooks, all kept — the last three were added for §12.8:
   Diffing two configurations' dumps names exactly which pairs one of
   them loses; this is the hook that turned "5 % goes missing" into ten
   specific quadruples.
+* `TURYN_AUDIT_ANALYZE=1` — checks the 1-UIP invariant on every learnt
+  clause: each of its literals must be false under the assignment that
+  produced it. Catches a reason arm with the wrong sign convention or a
+  missing trail-order filter (§12.9), which coverage alone will not.
 * `TURYN_Z_TARGET=<full Z>,<full W>` — arms the Z solver on the
   (boundary, W) that should produce that Z, so `analyze` reports any
   clause it learns that excludes it and the UNSAT exit lists every
@@ -938,3 +942,69 @@ stage* between two configurations, and then asking what excluded one
 specific known-good solution. `check_coverage` plus `TURYN_DUMP_PAIRS`
 is the general form of that, and it is worth reaching for before
 auditing arithmetic.
+
+### 12.9 `XY_MDD=1` lost 30 of 186 classes — three bugs at once
+
+Found by asking whether §12.8 was the only bug of its kind. The
+`Reason::Mdd` arm of `analyze` used the opposite sign convention from
+every other arm, which looked wrong on inspection. It is, and chasing it
+turned up two more in the same opt-in path.
+
+`XY_MDD=1` selects `try_candidate_via_mdd`, which constrains XY with
+radical's native MDD propagator instead of enumerating boundaries. It is
+off by default, so nothing exercised it — it scored **155 / 186** at
+n=14 k=5.
+
+**Bug 1: inverted sign in the MDD reason arm.** Every reason arm builds a
+buffer of literals that are FALSE under the current assignment and pushes
+them into `learnt` as-is; that is what makes the learnt clause asserting
+after backtracking. The `Reason::Mdd` arm built its buffer the same way
+and then pushed `negate(lit)` — a TRUE literal. `TURYN_AUDIT_ANALYZE=1`,
+which checks that invariant on every learnt clause, reports **8336
+violations** in one n=14 run before the fix and **0** after. Note the
+coverage barely moved (155 → 156): a malformed clause is usually
+satisfied and therefore inert. Coverage was the wrong instrument here;
+the invariant was the right one.
+
+**Bug 2: no trail-order filter on the MDD reason.** The arm returned
+*every* assigned boundary variable as the explanation, including ones
+assigned **after** the literal being explained. A reason may only contain
+literals that precede what it explains — otherwise the implication is
+circular and the resolvent is not implied by the formula. It also
+inflates `counter`, which is what kept driving analysis into the
+`Reason::Decision` arm (whose comment, "MDD explanation
+over-approximate", was describing this bug's symptom). The `Xor` and
+`PbSetEq` arms already filtered on `trail_pos`; this one did not. Fixing
+it took 179 → **186 / 186**.
+
+**Bug 3: one XY model per solve.** `try_candidate_via_mdd` ended with
+
+```rust
+let xy = match result { Some(true) => Some((x, y)), _ => None };
+```
+
+This is §12.2 again, in the path that fix did not touch — and it is worse
+here, because one MDD-constrained solve stands for *many* XY boundaries,
+each of which can have several middles. Enumerating all models by
+blocking (with the `solver.reset()` before `add_clause` that §12.2 shows
+is mandatory) took 156 → 179 / 186, and `flow_xy_sat` from 918 to 3002
+over the same 2232 solves.
+
+**After.** `XY_MDD=1` reproduces the catalogue exactly at every case in
+the suite, which now runs two of them under `XY_MDD=1` so this path
+cannot rot unnoticed again. It is **not** currently a speedup — paired,
+`--threads=1 --seed=0`, both 100 % coverage:
+
+| case | XY_MDD off | XY_MDD on |
+|---|---:|---:|
+| n=14 k=5 | 4.19 s | 4.28 s |
+| n=16 k=4 | 23.20 s | 26.94 s |
+
+so it stays off by default. It is now a correct baseline to measure at
+larger `n`, where the MDD prunes more, rather than a broken one.
+
+**New permanent hook:** `TURYN_AUDIT_ANALYZE=1` checks the 1-UIP
+invariant — every literal of every learnt clause is false under the
+assignment that produced it. It is the cheapest available test of
+conflict-analysis soundness and it caught bug 1 immediately when
+coverage could not.

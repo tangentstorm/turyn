@@ -1611,13 +1611,13 @@ pub(crate) fn try_candidate_via_mdd(
     pos_order: &[usize],
     conflict_limit: u64,
     forcings_out: Option<&mut Vec<(u16, u8, u32)>>,
-) -> (Option<(PackedSeq, PackedSeq)>, XyStats) {
+) -> (Vec<(PackedSeq, PackedSeq)>, XyStats) {
     let n = problem.n;
     if !template.is_feasible(candidate) {
-        return (None, XyStats::default());
+        return (Vec::new(), XyStats::default());
     }
     let Some(equalities) = gj_candidate_equalities(n, candidate) else {
-        return (None, XyStats::default());
+        return (Vec::new(), XyStats::default());
     };
 
     // Same template clone as SolveXyPerCandidate::new.
@@ -1684,15 +1684,41 @@ pub(crate) fn try_candidate_via_mdd(
         sink.extend(crate::mdd_pipeline::forcing_delta_triples(&solver, &[]));
     }
 
-    let xy = match result {
-        Some(true) => {
+    // Enumerate EVERY (X, Y) this solve admits, not just the first model.
+    // One MDD-constrained solve stands for many XY boundaries and each
+    // boundary can extend to several middles, so taking one model per solve
+    // silently drops catalogued solutions while the boundary is still
+    // credited as fully searched -- the same defect `try_candidate` had
+    // (`docs/TTC-AUDIT.md` §12.2), which cost 30 of 186 classes at n=14.
+    let mut xys: Vec<(PackedSeq, PackedSeq)> = Vec::new();
+    if result == Some(true) {
+        loop {
             let x = extract_seq(&solver, |i| (i + 1) as i32, n);
             let y = extract_seq(&solver, |i| (n + i + 1) as i32, n);
-            Some((x, y))
+            xys.push((x, y));
+            // Block this model over the XY variables.
+            let mut block: Vec<i32> = Vec::with_capacity(2 * n);
+            for i in 0..n {
+                for v in [(i + 1) as i32, (n + i + 1) as i32] {
+                    block.push(if solver.value(v) == Some(true) { -v } else { v });
+                }
+            }
+            // Backtrack to level 0 before adding the clause: adding it at a
+            // decision level leaves the solver believing a fact it derived
+            // under assumptions. `try_candidate` learned this the hard way --
+            // without the reset, coverage got WORSE, not better.
+            solver.reset();
+            solver.add_clause(block);
+            if conflict_limit > 0 {
+                solver.set_conflict_limit(conflict_limit);
+            }
+            match solver.solve_with_assumptions(&[]) {
+                Some(true) => continue,
+                _ => break,
+            }
         }
-        _ => None,
-    };
-    (xy, stats)
+    }
+    (xys, stats)
 }
 
 #[cfg(test)]

@@ -46,11 +46,19 @@ run_case "cross n=10" 10 43 --wz=cross
 run_case "apart n=12 k=2" 12 127 --wz=apart --mdd-k=2
 run_case "apart n=14 k=5" 14 186 --wz=apart --mdd-k=5
 
+# The XY MDD fast path (XY_MDD=1) is opt-in and off by default, so nothing
+# else exercises it. It carried three coverage bugs at once until
+# TTC-AUDIT §12.9 (a sign inversion and a missing trail-order filter in
+# conflict analysis, plus one XY model per solve). Guard it here or it
+# rots again unnoticed.
+XY_MDD=1 run_case "apart n=14 k=5 [XY_MDD]" 14 186 --wz=apart --mdd-k=5
+
 if [ "${1:-}" = "--full" ]; then
   run_case "cross n=12" 12 127 --wz=cross
   run_case "apart n=14 k=3" 14 186 --wz=apart --mdd-k=3
   run_case "apart n=16 k=4" 16 739 --wz=apart --mdd-k=4
   run_case "together n=14 k=5" 14 186 --wz=together --mdd-k=5
+  XY_MDD=1 run_case "apart n=16 k=4 [XY_MDD]" 16 739 --wz=apart --mdd-k=4
 fi
 
 exit $fail
