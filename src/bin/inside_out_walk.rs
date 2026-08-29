@@ -414,7 +414,11 @@ fn autocorr_packed(seq: PackedSeq, len: usize, s: usize) -> i32 {
         return 0;
     }
     let nvalid = len - s;
-    let mask = if nvalid >= 64 { !0u64 } else { (1u64 << nvalid) - 1 };
+    let mask = if nvalid >= 64 {
+        !0u64
+    } else {
+        (1u64 << nvalid) - 1
+    };
     let xor = seq ^ (seq >> s);
     let diffs = (xor & mask).count_ones() as i32;
     (nvalid as i32) - 2 * diffs
@@ -483,10 +487,8 @@ struct LeafPacked {
 impl LeafPacked {
     fn from_state(state: &WalkerState, n: usize, k: usize) -> Self {
         let m = n - 1;
-        let bd_mask_n =
-            ((1u64 << k) - 1) | (((1u64 << k) - 1) << (n - k));
-        let bd_mask_m =
-            ((1u64 << k) - 1) | (((1u64 << k) - 1) << (m - k));
+        let bd_mask_n = ((1u64 << k) - 1) | (((1u64 << k) - 1) << (n - k));
+        let bd_mask_m = ((1u64 << k) - 1) | (((1u64 << k) - 1) << (m - k));
         Self {
             mid_x: pack_seq(&state.seqs[0]),
             mid_y: pack_seq(&state.seqs[1]),
@@ -565,11 +567,7 @@ fn leaf_sat_feasible(leaf: &LeafPacked, n: usize, k: usize) -> bool {
             _ => unreachable!(),
         };
         let _ = seq_len;
-        if (packed >> pos) & 1 == 1 {
-            1
-        } else {
-            -1
-        }
+        if (packed >> pos) & 1 == 1 { 1 } else { -1 }
     };
 
     // For each lag, build the per-lag quad-PB constraint.
@@ -859,7 +857,13 @@ fn walk(
         state.mm_sum = saved_mm;
     }
 
-    (total_visited, total_match, total_match_exact, total_cand, total_exact)
+    (
+        total_visited,
+        total_match,
+        total_match_exact,
+        total_cand,
+        total_exact,
+    )
 }
 
 fn main() {
@@ -916,12 +920,7 @@ fn main() {
     let mut state = WalkerState {
         mm_sum: vec![0i32; n - 1],
         level: 0,
-        seqs: [
-            vec![0; n],
-            vec![0; n],
-            vec![0; n],
-            vec![0; m],
-        ],
+        seqs: [vec![0; n], vec![0; n], vec![0; n], vec![0; m]],
     };
 
     eprintln!("Pre-convolving T_xy ⊕ T_zw into target_to_count ...");
@@ -966,8 +965,8 @@ fn main() {
             let mut local_bufs = LeafBufs::new(n);
             // Apply this level-0 branch's bits to local_state.
             for seq_i in 0..4 {
-                let bits = (branch >> (seq_i * n_bits_per_seq_l0))
-                    & ((1u32 << n_bits_per_seq_l0) - 1);
+                let bits =
+                    (branch >> (seq_i * n_bits_per_seq_l0)) & ((1u32 << n_bits_per_seq_l0) - 1);
                 let val_lo = if (bits & 1) == 1 { 1i32 } else { -1 };
                 let val_hi = if n_bits_per_seq_l0 > 1 && ((bits >> 1) & 1) == 1 {
                     1i32
@@ -1050,7 +1049,11 @@ fn main() {
         eprintln!("total exact survivors = {}", exact);
         eprintln!(
             "pre-filter overhead   = {:.0}x (pre / exact)",
-            if exact > 0 { cand as f64 / exact as f64 } else { 0.0 }
+            if exact > 0 {
+                cand as f64 / exact as f64
+            } else {
+                0.0
+            }
         );
     }
     eprintln!("subtree prunes        = {}", pruned);
@@ -1099,14 +1102,14 @@ fn main() {
             }
             known_state.mm_sum[s - 1] = total;
         }
-        eprintln!(
-            "known middle mm_sum = {:?}",
-            &known_state.mm_sum[..]
-        );
+        eprintln!("known middle mm_sum = {:?}", &known_state.mm_sum[..]);
         let target = vh_lag_target_from_leaf(&known_state, n, k);
         eprintln!("known leaf very-high-lag target (= -mm_vh) = {:?}", target);
         let hits = target_to_count.get(&target).copied().unwrap_or(0);
-        eprintln!("boundary candidates at known leaf (vh-bb pre-filter) = {}", hits);
+        eprintln!(
+            "boundary candidates at known leaf (vh-bb pre-filter) = {}",
+            hits
+        );
 
         // Stage 4 demo: at the known leaf, exhaustively run the full
         // Turyn check on every pre-filtered candidate and report the
@@ -1122,33 +1125,59 @@ fn main() {
             t_full.elapsed().as_secs_f64()
         );
         if exact > 0 {
-            eprintln!("  Filter ratio at known leaf: {:.0}x reduction (vh-bb -> full Turyn)",
-                pre_filter as f64 / exact as f64);
+            eprintln!(
+                "  Filter ratio at known leaf: {:.0}x reduction (vh-bb -> full Turyn)",
+                pre_filter as f64 / exact as f64
+            );
         }
         // Confirm the known boundary tuple is in there
         let known_x_bits: u32 = (0..k)
             .map(|i| if x[i] == 1 { 1u32 << i } else { 0 })
             .sum::<u32>()
             + (0..k)
-                .map(|i| if x[n - k + i] == 1 { 1u32 << (k + i) } else { 0 })
+                .map(|i| {
+                    if x[n - k + i] == 1 {
+                        1u32 << (k + i)
+                    } else {
+                        0
+                    }
+                })
                 .sum::<u32>();
         let known_y_bits: u32 = (0..k)
             .map(|i| if y[i] == 1 { 1u32 << i } else { 0 })
             .sum::<u32>()
             + (0..k)
-                .map(|i| if y[n - k + i] == 1 { 1u32 << (k + i) } else { 0 })
+                .map(|i| {
+                    if y[n - k + i] == 1 {
+                        1u32 << (k + i)
+                    } else {
+                        0
+                    }
+                })
                 .sum::<u32>();
         let known_z_bits: u32 = (0..k)
             .map(|i| if z[i] == 1 { 1u32 << i } else { 0 })
             .sum::<u32>()
             + (0..k)
-                .map(|i| if z[n - k + i] == 1 { 1u32 << (k + i) } else { 0 })
+                .map(|i| {
+                    if z[n - k + i] == 1 {
+                        1u32 << (k + i)
+                    } else {
+                        0
+                    }
+                })
                 .sum::<u32>();
         let known_w_bits: u32 = (0..k)
             .map(|i| if w[i] == 1 { 1u32 << i } else { 0 })
             .sum::<u32>()
             + (0..k)
-                .map(|i| if w[m - k + i] == 1 { 1u32 << (k + i) } else { 0 })
+                .map(|i| {
+                    if w[m - k + i] == 1 {
+                        1u32 << (k + i)
+                    } else {
+                        0
+                    }
+                })
                 .sum::<u32>();
         // The split of `target` is into `xy_v + zw_v = target`.
         // The known XY contribution at very-high lags is xy_v_known.
@@ -1156,10 +1185,7 @@ fn main() {
             .map(|s| autocorr_bb(&x, s, k) + autocorr_bb(&y, s, k))
             .collect();
         let zw_v_known: Vec<i32> = vh_lag_range(n, k)
-            .map(|s| {
-                2 * autocorr_bb(&z, s, k)
-                    + if s < m { 2 * autocorr_bb(&w, s, k) } else { 0 }
-            })
+            .map(|s| 2 * autocorr_bb(&z, s, k) + if s < m { 2 * autocorr_bb(&w, s, k) } else { 0 })
             .collect();
         let known_pair_in_xy = t_xy
             .get(&xy_v_known)
@@ -1177,7 +1203,11 @@ fn main() {
                 known_pair_in_xy, known_pair_in_zw
             );
         }
-        let sum_check: Vec<i32> = xy_v_known.iter().zip(&zw_v_known).map(|(a, b)| a + b).collect();
+        let sum_check: Vec<i32> = xy_v_known
+            .iter()
+            .zip(&zw_v_known)
+            .map(|(a, b)| a + b)
+            .collect();
         eprintln!(
             "known xy_v + zw_v = {:?}  (target was {:?})  match={}",
             sum_check,

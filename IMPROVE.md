@@ -7,15 +7,19 @@ unless you can explain why that counter should move TTC.
 
 ## Before you optimize anything: read `docs/TTC-AUDIT.md`
 
-Two findings there change how you should use this file:
+Three findings there change how you should use this file:
 
 1. **`--wz=apart`'s coverage accounting was fixed** (audit §12): the W
    and Z caps are batch sizes now, re-queued rather than truncating, so
-   `covered` no longer moves with the cap. Two things still hold: at
-   n=56 the TTC is an extrapolation from `covered ≈ 1e-5` with ~3x
-   run-to-run spread, and a residual (non-accounting) completeness bug
-   still loses ~1 % of classes, so `covered=1.000` means "no residual
-   work in the mass model", not "every solution found".
+   `covered` no longer moves with the cap, and every case in
+   `scripts/check-coverage-suite.sh --full` now reproduces the
+   catalogue exactly (7/7, up to `apart n=16 k=4` at 739/739). Two
+   caveats remain. At n=56 the TTC is still an extrapolation from
+   `covered ≈ 1e-5` with ~3x run-to-run spread. And the completeness
+   result above holds **only with the Z spectral propagator off**,
+   which is now the default: `TURYN_Z_SPECTRAL=1` buys ~2.5x
+   throughput and loses ~5 % of classes for a reason nobody has found
+   (audit §12.2b). Do not turn it on to make a benchmark look good.
 2. **The bit-exactness claim below now holds** — it did not when the
    audit was written (~1 % drift on `apart` solve counters, up to 1.54×
    on boundary counts). Fixed by `Lockstep` in the engine plus the

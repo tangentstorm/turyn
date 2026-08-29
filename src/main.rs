@@ -463,9 +463,7 @@ fn run_framework_mdd_mode(
                 EngineConfig::default().progress_interval
             },
             bench_stop_log2_work: cfg.bench_cover_log2,
-            worker_count: cfg
-                .threads
-                .unwrap_or_else(crate::config::num_cpus_or_one),
+            worker_count: cfg.threads.unwrap_or_else(crate::config::num_cpus_or_one),
             ..EngineConfig::default()
         },
         Box::new(LaneByPriority::new()),
@@ -706,9 +704,7 @@ fn run_framework_cross_mode(
                 EngineConfig::default().progress_interval
             },
             bench_stop_log2_work: cfg.bench_cover_log2,
-            worker_count: cfg
-                .threads
-                .unwrap_or_else(crate::config::num_cpus_or_one),
+            worker_count: cfg.threads.unwrap_or_else(crate::config::num_cpus_or_one),
             ..EngineConfig::default()
         },
         Box::new(LaneByPriority::new()),
@@ -782,9 +778,7 @@ fn run_framework_sync_mode(problem: Problem, cfg: &SearchConfig, verbose: bool) 
                 EngineConfig::default().progress_interval
             },
             bench_stop_log2_work: cfg.bench_cover_log2,
-            worker_count: cfg
-                .threads
-                .unwrap_or_else(crate::config::num_cpus_or_one),
+            worker_count: cfg.threads.unwrap_or_else(crate::config::num_cpus_or_one),
             ..EngineConfig::default()
         },
         Box::new(LaneByPriority::new()),
@@ -1615,6 +1609,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `mdd-<k>.bin` is a build artifact, not a checked-in fixture, so a
+    /// fresh clone does not have one for every `k` the tests exercise.
+    /// Tests that shell out with `--mdd-k=<k>` call this and return early
+    /// when the file is absent, rather than failing and making a missing
+    /// artifact look like a broken build.  Returns false (and says how to
+    /// generate it) when the test cannot run.
+    #[must_use]
+    fn mdd_available(k: usize) -> bool {
+        let path = format!("{}/mdd-{k}.bin", env!("CARGO_MANIFEST_DIR"));
+        if std::path::Path::new(&path).exists() {
+            return true;
+        }
+        eprintln!(
+            "SKIP: mdd-{k}.bin not found - generate it with \
+             `cargo build --release --bin gen_mdd && target/release/gen_mdd {k}`"
+        );
+        false
+    }
 
     #[test]
     fn tuple_equation_holds_for_tt56() {
@@ -3913,6 +3926,9 @@ mod tests {
     #[test]
     fn outfix_extended_finds_canonical_tt28() {
         use std::process::Command;
+        if !mdd_available(9) {
+            return;
+        }
         // Unit tests can't use CARGO_BIN_EXE_*; resolve the release
         // binary from the workspace manifest dir.  `cargo test --release`
         // builds it automatically before running tests.
@@ -3940,6 +3956,9 @@ mod tests {
     #[test]
     fn outfix_extended_finds_canonical_tt16() {
         use std::process::Command;
+        if !mdd_available(4) {
+            return;
+        }
         // Unit tests can't use CARGO_BIN_EXE_*; resolve the release
         // binary from the workspace manifest dir.  `cargo test --release`
         // builds it automatically before running tests.
@@ -3977,6 +3996,9 @@ mod tests {
     #[ignore = "minimal outfix + 16-freq Z pair filter rejects canonical (Z,W)"]
     fn outfix_minimal_boundary_bug_tt28() {
         use std::process::Command;
+        if !mdd_available(9) {
+            return;
+        }
         // Unit tests can't use CARGO_BIN_EXE_*; resolve the release
         // binary from the workspace manifest dir.  `cargo test --release`
         // builds it automatically before running tests.

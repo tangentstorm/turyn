@@ -62,9 +62,10 @@ Summary of what each mode's `covered` number is worth:
 
 **After the §12 fixes** every mode's `covered` reflects what was
 searched, and `apart`/`together` reproduce the catalogue exactly at
-n=14/16 (and n=18 at k>=6). `apart`/`together` now reproduce the catalogue exactly at every (n, k)
-in `scripts/check-coverage-suite.sh`, including the small-`k` cases that
-used to lose a third of the classes (§12.2b).
+every (n, k) in `scripts/check-coverage-suite.sh --full` — including
+the small-`k` cases that used to lose a third of the classes (§12.2b)
+— provided the Z spectral propagator stays off, which is now the
+default.
 
 ## 1. The mechanism: truncation credited as completion
 
@@ -469,6 +470,12 @@ TT(56).
 ## 9. What to do
 
 Ordered by how much they change the numbers, not by effort.
+
+> **This list is the audit's original recommendations, kept as written
+> for the record. Items 0-8 have all been implemented — see §12 for
+> what each fix actually did and what it measured. Read §12.7 and
+> §12.2b for what is still open; do not treat anything below as
+> outstanding work.**
 
 0. **Re-check any `--wz=apart` optimization accepted on a sub-2 %
    counter delta** (section 7). Counter-mode A/B is sound for

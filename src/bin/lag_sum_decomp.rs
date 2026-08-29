@@ -131,12 +131,23 @@ fn main() {
     if x.len() != n || y.len() != n || z.len() != n || w.len() != n - 1 {
         panic!(
             "bad sequence lengths: X={}, Y={}, Z={}, W={} (expected n={}, n, n, n-1={})",
-            x.len(), y.len(), z.len(), w.len(), n, n - 1
+            x.len(),
+            y.len(),
+            z.len(),
+            w.len(),
+            n,
+            n - 1
         );
     }
     let m = n - 1; // W's length
     eprintln!("=== TT({}) decomposition at k={} ===", n, k);
-    eprintln!("X len {}, Y len {}, Z len {}, W len {}", x.len(), y.len(), z.len(), w.len());
+    eprintln!(
+        "X len {}, Y len {}, Z len {}, W len {}",
+        x.len(),
+        y.len(),
+        z.len(),
+        w.len()
+    );
 
     // Verify the four-tuple Turyn condition holds.
     let mut ok = true;
@@ -149,13 +160,21 @@ fn main() {
         if total != 0 {
             eprintln!(
                 "  lag {:2}: NX={} NY={} 2NZ={} 2NW={}  total={} (expected 0)",
-                s, nx, ny, 2 * nz, 2 * nw, total
+                s,
+                nx,
+                ny,
+                2 * nz,
+                2 * nw,
+                total
             );
             ok = false;
         }
     }
     if ok {
-        eprintln!("Turyn condition holds: NX(s)+NY(s)+2*NZ(s)+2*NW(s) = 0 for all s in 1..{}", n);
+        eprintln!(
+            "Turyn condition holds: NX(s)+NY(s)+2*NZ(s)+2*NW(s) = 0 for all s in 1..{}",
+            n
+        );
     } else {
         eprintln!("ERROR: Turyn condition not zero at all lags!");
         std::process::exit(1);
@@ -179,7 +198,9 @@ fn main() {
             );
         }
     }
-    eprintln!("Decomposition verified: A(s) = A_bb(s) + A_mm(s) + A_cross(s) for every (sequence, lag).");
+    eprintln!(
+        "Decomposition verified: A(s) = A_bb(s) + A_mm(s) + A_cross(s) for every (sequence, lag)."
+    );
 
     // Quantify the high-lag/low-lag split.
     let low_hi = n - 2 * k - 1; // last low-lag
@@ -187,7 +208,12 @@ fn main() {
     let high_lo = n - 2 * k + 1; // first high-lag
     eprintln!(
         "\nLag classes: low = 1..{}  ({} lags),   mid = {} (1 lag),   high = {}..{}  ({} lags)",
-        low_hi, low_hi, mid_lag, high_lo, n - 1, n - high_lo
+        low_hi,
+        low_hi,
+        mid_lag,
+        high_lo,
+        n - 1,
+        n - high_lo
     );
 
     eprintln!("\nPer-lag contributions (Turyn-weighted: X+Y+2Z+2W):");
@@ -204,7 +230,11 @@ fn main() {
         let cr = autocorr_cross(&x, s, k)
             + autocorr_cross(&y, s, k)
             + 2 * autocorr_cross(&z, s, k)
-            + if s < m { 2 * autocorr_cross(&w, s, k) } else { 0 };
+            + if s < m {
+                2 * autocorr_cross(&w, s, k)
+            } else {
+                0
+            };
         let class = if s <= low_hi {
             "low"
         } else if s == mid_lag {
@@ -236,7 +266,11 @@ fn main() {
                 + if s < m { 2 * autocorr_bb(&w, s, k) } else { 0 }
         })
         .collect();
-    eprintln!("known boundary's high-lag bb-vector (length {}, Turyn-weighted): {:?}", known_key.len(), known_key);
+    eprintln!(
+        "known boundary's high-lag bb-vector (length {}, Turyn-weighted): {:?}",
+        known_key.len(),
+        known_key
+    );
 
     // Build a SMALL index: enumerate all 4-sequence boundary tuples
     // for the *first* (low-side) k bits only, holding the known
@@ -276,9 +310,7 @@ fn main() {
 
     // Confirm the known solution's X-low-bits is retrievable from the
     // known_key bucket.
-    let known_x_low: u32 = (0..k)
-        .map(|i| if x[i] == 1 { 1u32 << i } else { 0 })
-        .sum();
+    let known_x_low: u32 = (0..k).map(|i| if x[i] == 1 { 1u32 << i } else { 0 }).sum();
     eprintln!(
         "known X low-side bits = {:0width$b}",
         known_x_low,
@@ -346,47 +378,53 @@ fn main() {
         s
     };
 
-    let build_xy_table = |k: usize, n: usize, high_lo: usize, m: usize| -> HashMap<Vec<i32>, Vec<(u32, u32)>> {
-        let mut t = HashMap::new();
-        let bd_count = 1u64 << (2 * k);
-        for x_bits in 0..bd_count {
-            let xb = make_bd(n, x_bits as u32, k);
-            for y_bits in 0..bd_count {
-                let yb = make_bd(n, y_bits as u32, k);
-                let key: Vec<i32> = (high_lo..=n - 1)
-                    .map(|s| {
-                        let bx = autocorr_bb(&xb, s, k);
-                        let by = autocorr_bb(&yb, s, k);
-                        bx + by
-                    })
-                    .collect();
-                t.entry(key).or_insert_with(Vec::new).push((x_bits as u32, y_bits as u32));
+    let build_xy_table =
+        |k: usize, n: usize, high_lo: usize, m: usize| -> HashMap<Vec<i32>, Vec<(u32, u32)>> {
+            let mut t = HashMap::new();
+            let bd_count = 1u64 << (2 * k);
+            for x_bits in 0..bd_count {
+                let xb = make_bd(n, x_bits as u32, k);
+                for y_bits in 0..bd_count {
+                    let yb = make_bd(n, y_bits as u32, k);
+                    let key: Vec<i32> = (high_lo..=n - 1)
+                        .map(|s| {
+                            let bx = autocorr_bb(&xb, s, k);
+                            let by = autocorr_bb(&yb, s, k);
+                            bx + by
+                        })
+                        .collect();
+                    t.entry(key)
+                        .or_insert_with(Vec::new)
+                        .push((x_bits as u32, y_bits as u32));
+                }
+                let _ = m; // unused here but documents that W is length-m sequence
             }
-            let _ = m; // unused here but documents that W is length-m sequence
-        }
-        t
-    };
+            t
+        };
 
-    let build_zw_table = |k: usize, n: usize, high_lo: usize, m: usize| -> HashMap<Vec<i32>, Vec<(u32, u32)>> {
-        let mut t = HashMap::new();
-        let bd_count_z = 1u64 << (2 * k); // Z is length n
-        let bd_count_w = 1u64 << (2 * k); // W is length m=n-1; same number of bd bits
-        for z_bits in 0..bd_count_z {
-            let zb = make_bd(n, z_bits as u32, k);
-            for w_bits in 0..bd_count_w {
-                let wb = make_bd(m, w_bits as u32, k);
-                let key: Vec<i32> = (high_lo..=n - 1)
-                    .map(|s| {
-                        let bz = 2 * autocorr_bb(&zb, s, k);
-                        let bw = if s < m { 2 * autocorr_bb(&wb, s, k) } else { 0 };
-                        bz + bw
-                    })
-                    .collect();
-                t.entry(key).or_insert_with(Vec::new).push((z_bits as u32, w_bits as u32));
+    let build_zw_table =
+        |k: usize, n: usize, high_lo: usize, m: usize| -> HashMap<Vec<i32>, Vec<(u32, u32)>> {
+            let mut t = HashMap::new();
+            let bd_count_z = 1u64 << (2 * k); // Z is length n
+            let bd_count_w = 1u64 << (2 * k); // W is length m=n-1; same number of bd bits
+            for z_bits in 0..bd_count_z {
+                let zb = make_bd(n, z_bits as u32, k);
+                for w_bits in 0..bd_count_w {
+                    let wb = make_bd(m, w_bits as u32, k);
+                    let key: Vec<i32> = (high_lo..=n - 1)
+                        .map(|s| {
+                            let bz = 2 * autocorr_bb(&zb, s, k);
+                            let bw = if s < m { 2 * autocorr_bb(&wb, s, k) } else { 0 };
+                            bz + bw
+                        })
+                        .collect();
+                    t.entry(key)
+                        .or_insert_with(Vec::new)
+                        .push((z_bits as u32, w_bits as u32));
+                }
             }
-        }
-        t
-    };
+            t
+        };
 
     if (1u64 << (4 * k)) > 16_000_000 {
         eprintln!(
@@ -400,7 +438,9 @@ fn main() {
         let t_xy_total: usize = t_xy_built.values().map(|v| v.len()).sum();
         eprintln!(
             "  T_xy: {} distinct keys, {} pair entries (avg {:.1} per key)",
-            t_xy_len, t_xy_total, t_xy_total as f64 / t_xy_len.max(1) as f64
+            t_xy_len,
+            t_xy_total,
+            t_xy_total as f64 / t_xy_len.max(1) as f64
         );
         t_xy = t_xy_built;
         eprintln!("Building T_zw...");
@@ -409,7 +449,9 @@ fn main() {
         let t_zw_total: usize = t_zw_built.values().map(|v| v.len()).sum();
         eprintln!(
             "  T_zw: {} distinct keys, {} pair entries (avg {:.1} per key)",
-            t_zw_len, t_zw_total, t_zw_total as f64 / t_zw_len.max(1) as f64
+            t_zw_len,
+            t_zw_total,
+            t_zw_total as f64 / t_zw_len.max(1) as f64
         );
         t_zw = t_zw_built;
 
@@ -420,51 +462,89 @@ fn main() {
             .map(|i| if x[i] == 1 { 1u32 << i } else { 0 })
             .sum::<u32>()
             + (0..k)
-                .map(|i| if x[n - k + i] == 1 { 1u32 << (k + i) } else { 0 })
+                .map(|i| {
+                    if x[n - k + i] == 1 {
+                        1u32 << (k + i)
+                    } else {
+                        0
+                    }
+                })
                 .sum::<u32>();
         let known_y_bits: u32 = (0..k)
             .map(|i| if y[i] == 1 { 1u32 << i } else { 0 })
             .sum::<u32>()
             + (0..k)
-                .map(|i| if y[n - k + i] == 1 { 1u32 << (k + i) } else { 0 })
+                .map(|i| {
+                    if y[n - k + i] == 1 {
+                        1u32 << (k + i)
+                    } else {
+                        0
+                    }
+                })
                 .sum::<u32>();
         let known_z_bits: u32 = (0..k)
             .map(|i| if z[i] == 1 { 1u32 << i } else { 0 })
             .sum::<u32>()
             + (0..k)
-                .map(|i| if z[n - k + i] == 1 { 1u32 << (k + i) } else { 0 })
+                .map(|i| {
+                    if z[n - k + i] == 1 {
+                        1u32 << (k + i)
+                    } else {
+                        0
+                    }
+                })
                 .sum::<u32>();
         let known_w_bits: u32 = (0..k)
             .map(|i| if w[i] == 1 { 1u32 << i } else { 0 })
             .sum::<u32>()
             + (0..k)
-                .map(|i| if w[m - k + i] == 1 { 1u32 << (k + i) } else { 0 })
+                .map(|i| {
+                    if w[m - k + i] == 1 {
+                        1u32 << (k + i)
+                    } else {
+                        0
+                    }
+                })
                 .sum::<u32>();
         eprintln!(
             "Known boundary bits: X={:0width$b}, Y={:0width$b}, Z={:0width$b}, W={:0width$b} (low|high concatenated)",
-            known_x_bits, known_y_bits, known_z_bits, known_w_bits, width = 2 * k
+            known_x_bits,
+            known_y_bits,
+            known_z_bits,
+            known_w_bits,
+            width = 2 * k
         );
 
         let xy_key: Vec<i32> = (high_lo..=n - 1)
             .map(|s| autocorr_bb(&x, s, k) + autocorr_bb(&y, s, k))
             .collect();
         let zw_key: Vec<i32> = (high_lo..=n - 1)
-            .map(|s| {
-                2 * autocorr_bb(&z, s, k)
-                    + if s < m { 2 * autocorr_bb(&w, s, k) } else { 0 }
-            })
+            .map(|s| 2 * autocorr_bb(&z, s, k) + if s < m { 2 * autocorr_bb(&w, s, k) } else { 0 })
             .collect();
         eprintln!("known XY-bb-vector: {:?}", xy_key);
         eprintln!("known ZW-bb-vector: {:?}", zw_key);
-        eprintln!("sum (should equal known_key)  : {:?}", xy_key.iter().zip(&zw_key).map(|(a, b)| a + b).collect::<Vec<i32>>());
+        eprintln!(
+            "sum (should equal known_key)  : {:?}",
+            xy_key
+                .iter()
+                .zip(&zw_key)
+                .map(|(a, b)| a + b)
+                .collect::<Vec<i32>>()
+        );
         eprintln!("known_key                     : {:?}", known_key);
 
         match t_xy.get(&xy_key) {
             Some(matches) if matches.contains(&(known_x_bits, known_y_bits)) => {
-                eprintln!("PASS: known (X,Y) bits in T_xy[xy_key] (bucket size {})", matches.len());
+                eprintln!(
+                    "PASS: known (X,Y) bits in T_xy[xy_key] (bucket size {})",
+                    matches.len()
+                );
             }
             Some(matches) => {
-                eprintln!("FAIL: known (X,Y) NOT in bucket (bucket has {})", matches.len());
+                eprintln!(
+                    "FAIL: known (X,Y) NOT in bucket (bucket has {})",
+                    matches.len()
+                );
             }
             None => {
                 eprintln!("FAIL: xy_key not present in T_xy");
@@ -472,10 +552,16 @@ fn main() {
         }
         match t_zw.get(&zw_key) {
             Some(matches) if matches.contains(&(known_z_bits, known_w_bits)) => {
-                eprintln!("PASS: known (Z,W) bits in T_zw[zw_key] (bucket size {})", matches.len());
+                eprintln!(
+                    "PASS: known (Z,W) bits in T_zw[zw_key] (bucket size {})",
+                    matches.len()
+                );
             }
             Some(matches) => {
-                eprintln!("FAIL: known (Z,W) NOT in bucket (bucket has {})", matches.len());
+                eprintln!(
+                    "FAIL: known (Z,W) NOT in bucket (bucket has {})",
+                    matches.len()
+                );
             }
             None => {
                 eprintln!("FAIL: zw_key not present in T_zw");

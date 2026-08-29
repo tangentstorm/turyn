@@ -589,10 +589,7 @@ impl StageHandler<MddPayload> for SolveWStage {
         // regardless of worker dispatch order.
         let mut rng = derive_rng_for_item(self.stage_seed, parent_meta.item_id);
         let mut guard = self.scratch.lock().unwrap();
-        let SolveWScratch {
-            w_bases,
-            fft_buf_w,
-        } = &mut *guard;
+        let SolveWScratch { w_bases, fft_buf_w } = &mut *guard;
         let mut forcings: Vec<(u16, u8, u32)> = Vec::new();
         let mut timed_out = false;
         let mut deferred: Option<PipelineWork> = None;
@@ -1019,8 +1016,7 @@ impl MddStagesAdapter {
                     // --outfix pins exactly one boundary; its
                     // weight is the entire search by definition.
                     let mut cache = std::collections::HashMap::new();
-                    let xy_path_count =
-                        ctx.mdd.count_paths_from(xy_root, ctx.zw_depth, &mut cache);
+                    let xy_path_count = ctx.mdd.count_paths_from(xy_root, ctx.zw_depth, &mut cache);
                     vec![BoundaryWork {
                         z_bits,
                         w_bits,
@@ -1505,12 +1501,8 @@ mod tests {
             frac
         );
         // Same 50% partial on a small boundary: ~0.05/2 = 0.025.
-        let p2 = BoundaryProgress::new_weighted(vec![
-            900_000_000,
-            33_333_333,
-            33_333_333,
-            33_333_333,
-        ]);
+        let p2 =
+            BoundaryProgress::new_weighted(vec![900_000_000, 33_333_333, 33_333_333, 33_333_333]);
         p2.add_partial_cov_micro(1, 500_000);
         let frac2 = p2.partial_fraction();
         assert!(
