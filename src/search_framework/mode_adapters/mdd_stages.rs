@@ -1085,9 +1085,41 @@ impl MddStagesAdapter {
         // past that so child items never collide with a seed id.
         let item_ids = Arc::new(AtomicU64::new(seed_boundaries.len() as u64));
         let progress = Arc::new(BoundaryProgress::new_weighted(weights));
+        let metrics = new_pipeline_metrics();
+        // `TURYN_TRACE_FLOW=1`: per-second dump of the stage counters, so a
+        // stalled `covered` can be told apart from a stalled search.
+        if std::env::var("TURYN_TRACE_FLOW").is_ok() {
+            let m = metrics.clone();
+            let started = std::time::Instant::now();
+            std::thread::spawn(move || {
+                use std::sync::atomic::Ordering as O;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    eprintln!(
+                        "FLOW t={:.0}s bnd_in/out={}/{} w_in/out={}/{} z_in/out={}/{} xy_in/out={}/{} xy_solves={} xy_sat={} xy_unsat={} xy_timeout={} z_sol={} w_sol={} items_completed={}",
+                        started.elapsed().as_secs_f64(),
+                        m.stage_enter[0].load(O::Relaxed),
+                        m.stage_exit[0].load(O::Relaxed),
+                        m.stage_enter[1].load(O::Relaxed),
+                        m.stage_exit[1].load(O::Relaxed),
+                        m.stage_enter[2].load(O::Relaxed),
+                        m.stage_exit[2].load(O::Relaxed),
+                        m.stage_enter[3].load(O::Relaxed),
+                        m.stage_exit[3].load(O::Relaxed),
+                        m.flow_xy_solves.load(O::Relaxed),
+                        m.flow_xy_sat.load(O::Relaxed),
+                        m.flow_xy_unsat.load(O::Relaxed),
+                        m.flow_xy_timeout.load(O::Relaxed),
+                        m.flow_z_solutions.load(O::Relaxed),
+                        m.flow_w_solutions.load(O::Relaxed),
+                        m.items_completed.load(O::Relaxed),
+                    );
+                }
+            });
+        }
         let adapter = MddStagesAdapter {
             ctx,
-            metrics: new_pipeline_metrics(),
+            metrics,
             sat_config: Arc::new(cfg.sat_config.clone()),
             result_tx,
             use_wz_mode: cfg.wz_together,

@@ -812,6 +812,11 @@ covered=6.536e-6/1.000 ttc=Some(6928682s) (quality=Hybrid)
 
 ### 12.7 What is still not trustworthy at n=56
 
+> **Superseded by §12.11.** This section treats the n=56 figure as a
+> small-sample extrapolation. It is worse than that: at n=56 the
+> pipeline completes no boundaries and performs no XY solves at all, so
+> there is no sample. Read §12.11 instead.
+
 The accounting is honest now, but n=56 remains a hard extrapolation
 problem, and the number moved in the direction the audit predicted:
 `--wz=apart --mdd-k=7 --sat-secs=60` used to report ~2.0e6 s at the
@@ -1061,3 +1066,81 @@ nothing — the first two versions of it passed either way.
 removes variables must either handle every constraint container or refuse to
 run when one it does not handle is present. There is no third option that
 fails loudly.
+
+### 12.11 The n=56 estimate is not measuring a search
+
+Chasing why identical n=56 runs disagree 3x. The answer is that at n=56
+the pipeline does no search at all, and the TTC is extrapolated from
+partial credit that saturates.
+
+`TURYN_TRACE_FLOW=1` dumps the stage counters once a second. At
+`--n=56 --wz=apart --mdd-k=7 --sat-secs=60`:
+
+```
+t=5s   w_sol=602    z_sol=0  xy_solves=0  items_completed=0
+t=30s  w_sol=8041   z_sol=0  xy_solves=0  items_completed=0
+t=60s  w_sol=10444  z_sol=0  xy_solves=0  items_completed=0
+flow Z:  unsat=0 timeout=963 sol=0 solves=1000
+flow XY: sat=0 unsat=0 solves=0
+```
+
+**Zero Z solutions and zero XY solves for the whole run**, and not one
+boundary completed. `covered` climbs to ~2.3e-5 by t≈30s — that is
+partial credit for boundaries the W stage touched — and then flatlines
+for the remaining 30 s while `ttc = elapsed × (1−covered)/covered` grows
+linearly with the clock. Where a run's TTC lands therefore depends on
+when you stop it and on how far the W stage happened to get, which is
+the whole of the 3x spread. Raising the Z conflict budget
+(`TURYN_Z_CONFL=0`) and doubling the time changes nothing: still 0 Z
+solutions at t=129 s.
+
+**Where the wall is.** `--mdd-k=7`, 30 s, XY solves reached:
+
+| n | Z middle (`n−2k`) | XY solves | Z solutions |
+|---:|---:|---:|---:|
+| 26 | 12 | 2056 | 483 |
+| 32 | 18 | 20 | 54 |
+| 38 | 24 | 2 | 3 |
+| 44 | 30 | 4 | 1 |
+| 50 | 36 | 0 | 0 |
+| 56 | 42 | 0 | 0 |
+
+The Z stage collapses as its middle grows; past n≈44 nothing reaches XY.
+
+**And the documented fix for that does not run.** Shrinking the Z middle
+means raising `k`, but the framework adapter materialises every live
+boundary up front — `MddStagesAdapter::init` calls
+`enumerate_live_boundaries` into a `Vec` — and the boundary count
+explodes with `k`. At n=56:
+
+| `--mdd-k` | seed boundaries | outcome |
+|---:|---:|---|
+| 7 | 1,465,976 | runs; Z never solves (above) |
+| 8 | 18,339,480 | spends the full 60 s enumerating seeds; `covered=0`, 0 boundaries processed |
+| 9 | 211,098,984 | **aborts** — allocation failure |
+| 10 | 280,697,728 | **aborts** — `memory allocation of 67367454720 bytes failed` |
+
+So `--n=56 --wz=apart --mdd-k=10`, the headline benchmark in
+`CLAUDE.md`, `README.md` and `IMPROVE.md`, cannot execute: it dies in
+`init` before the search starts. `k` small enough to seed is too small
+for the Z solve; `k` large enough for the Z solve cannot be seeded.
+
+`CLAUDE.md` describes the intended design — "Monitor thread: navigates
+MDD paths on demand (nanosecond per path, no upfront enumeration)".
+That was the legacy runner. The framework adapter that replaced it
+enumerates upfront, and `WzMode::Apart` has no other dispatch, so there
+is no working path today.
+
+**What this means for every n=56 number in these documents.** They were
+produced by runs that completed no boundaries and performed no XY
+solves. They are not lower bounds, not order-of-magnitude estimates, and
+not "Hybrid" quality in any useful sense — they are the arithmetic of a
+saturating partial-credit number against a wall clock. The §12.7 caveats
+understated this: the problem is not that the sample is small, it is
+that there is no sample.
+
+**Next step**, in order: make seeding lazy so a large `k` can start at
+all (the total path count is known analytically from the MDD, so the
+mass model does not need the materialised list); then re-measure whether
+the Z stage is tractable at the `k` that becomes reachable. Only then is
+an n=56 TTC worth quoting.
