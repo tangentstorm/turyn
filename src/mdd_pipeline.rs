@@ -352,6 +352,19 @@ pub(crate) struct SolveZWork {
     /// into a batch size rather than a truncation.  Literals refer to
     /// the stable `Z[0..middle_n]` middle vars.
     pub(crate) prior_blocks: Vec<Vec<i32>>,
+    /// Middle positions pinned to a fixed value, narrowing this item to a
+    /// sub-cube of the Z space.
+    ///
+    /// A Z solve that exhausts its conflict budget used to `break` and
+    /// mark the boundary abandoned, discarding every clause it had learnt
+    /// -- 4.8 million conflicts of real search thrown away per minute at
+    /// n=56 (`docs/TTC-AUDIT.md` §12.13). The region was neither searched
+    /// nor eliminated, and was never revisited. Instead the solve now
+    /// splits: it branches on one unpinned middle variable and emits two
+    /// children covering the two halves. Each half is strictly smaller, so
+    /// the recursion terminates, and every piece that comes back UNSAT
+    /// genuinely eliminates its section of the space.
+    pub(crate) pins: Vec<(usize, bool)>,
 }
 
 /// Read-only context shared across all workers (via Arc). Populated
@@ -473,6 +486,9 @@ pub(crate) struct PipelineMetrics {
     /// UNSAT-vs-TIMEOUT distinction as `flow_w_timeout`; also
     /// contributes to why MDD quality stays `Hybrid`.
     pub(crate) flow_z_timeout: Arc<std::sync::atomic::AtomicU64>,
+    /// Z solves that exhausted their conflict budget and split into two
+    /// sub-cubes rather than discarding the region.
+    pub(crate) flow_z_split: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_z_solutions: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_z_spec_fail: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_z_pair_fail: Arc<std::sync::atomic::AtomicU64>,
@@ -922,6 +938,7 @@ pub(crate) fn process_solve_w(
                         out_batch.push(PipelineWork::SolveZ(SolveZWork {
                             attempt: 0,
                             prior_blocks: Vec::new(),
+                            pins: Vec::new(),
                             tuple: rep,
                             z_bits: sw.z_bits,
                             w_bits: sw.w_bits,
@@ -1119,6 +1136,7 @@ pub(crate) fn process_solve_w(
             out_batch.push(PipelineWork::SolveZ(SolveZWork {
                 attempt: 0,
                 prior_blocks: Vec::new(),
+                pins: Vec::new(),
                 tuple: rep,
                 z_bits: sw.z_bits,
                 w_bits: sw.w_bits,
@@ -1231,6 +1249,10 @@ pub(crate) fn process_solve_z(
     // schedule it; dropping it silently truncates the (boundary, W)
     // pair while still crediting the boundary as complete.
     deferred_out: &mut Option<PipelineWork>,
+    // Sub-cubes produced when a Z solve ran out of conflict budget and
+    // split instead of abandoning the region. The caller MUST schedule
+    // them; dropping one loses that slice of the Z space.
+    split_out: &mut Vec<PipelineWork>,
 ) {
     let k = ctx.k;
     let n = ctx.problem.n;
@@ -1475,6 +1497,14 @@ pub(crate) fn process_solve_z(
     for block in &sz.prior_blocks {
         z_solver.add_clause(block.iter().copied());
     }
+    // Narrow to this item's sub-cube. Pins come from a parent solve that
+    // ran out of conflict budget and split rather than abandoning.
+    for &(mid, val) in &sz.pins {
+        if mid < ctx.middle_n {
+            let lit = ctx.z_mid_vars[mid];
+            z_solver.add_clause([if val { lit } else { -lit }]);
+        }
+    }
     let mut z_count = 0usize;
     let mut new_z_blocks: Vec<Vec<i32>> = Vec::new();
     let mut more_z_possible = false;
@@ -1535,13 +1565,62 @@ pub(crate) fn process_solve_z(
                 break;
             }
             None => {
-                // Z-search hit its conflict budget. Residual Z
-                // candidates MAY exist. Per TTC §4.1 the caller
-                // marks the boundary abandoned so it retains its
-                // accumulated partial credit but never bumps
-                // exact.
+                // Z-search hit its conflict budget. The sub-cube is
+                // undecided -- but "undecided" is not "abandoned". Split
+                // it: branch on one unpinned middle variable and hand back
+                // two children covering the two halves. Each is strictly
+                // smaller, so the recursion terminates at worst when every
+                // middle variable is pinned and the instance is trivial,
+                // and each half that comes back UNSAT eliminates its
+                // section of the space for real.
+                //
+                // The previous behaviour was to `break` and mark the
+                // boundary abandoned, discarding every clause learnt in
+                // the attempt -- 4.8M conflicts a minute of real search at
+                // n=56, thrown away, leaving the region neither searched
+                // nor eliminated and never revisited.
                 metrics.flow_z_timeout.fetch_add(1, AtomicOrdering::Relaxed);
-                *timed_out = true;
+                // Splitting doubles the item count each level, so it is
+                // capped. Past the cap the region is marked abandoned as
+                // before -- still honest (it never exact-credits), just no
+                // longer subdivided. Without the cap a single stubborn
+                // (boundary, W) grows 2^depth queued items and the process
+                // runs out of memory instead of reporting anything.
+                let split_depth_max = z_split_depth_max();
+                if sz.pins.len() >= split_depth_max {
+                    *timed_out = true;
+                    if trace_z {
+                        eprintln!("TRACE:   SolveZ exit=SPLIT-CAP at depth {}", sz.pins.len());
+                    }
+                    break;
+                }
+                if let Some(branch) =
+                    (0..ctx.middle_n).find(|mid| !sz.pins.iter().any(|&(p, _)| p == *mid))
+                {
+                    for val in [false, true] {
+                        let mut pins = sz.pins.clone();
+                        pins.push((branch, val));
+                        split_out.push(PipelineWork::SolveZ(SolveZWork {
+                            pins,
+                            tuple: sz.tuple,
+                            z_bits: sz.z_bits,
+                            w_bits: sz.w_bits,
+                            w_vals: sz.w_vals.clone(),
+                            w_spectrum: sz.w_spectrum.clone(),
+                            xy_graph: sz.xy_graph.clone(),
+                            candidate_tuples: sz.candidate_tuples.clone(),
+                            attempt: sz.attempt.saturating_add(1),
+                            prior_blocks: new_z_blocks.clone(),
+                        }));
+                    }
+                    metrics.flow_z_split.fetch_add(1, AtomicOrdering::Relaxed);
+                } else {
+                    // Every middle variable is pinned and it still did not
+                    // decide -- that should be impossible, so keep the old
+                    // honest-but-lossy behaviour rather than silently
+                    // dropping the region.
+                    *timed_out = true;
+                }
                 if trace_z {
                     eprintln!("TRACE:   SolveZ exit=CONFLICT-BUDGET after {z_count} Z");
                 }
@@ -1907,6 +1986,7 @@ pub(crate) fn process_solve_z(
         let mut blocks = std::mem::take(&mut sz.prior_blocks);
         blocks.append(&mut new_z_blocks);
         *deferred_out = Some(PipelineWork::SolveZ(SolveZWork {
+            pins: sz.pins.clone(),
             tuple: sz.tuple,
             z_bits: sz.z_bits,
             w_bits: sz.w_bits,
@@ -2898,6 +2978,21 @@ pub(crate) fn z_spectral_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("TURYN_NO_Z_SPECTRAL").is_err())
 }
 
+/// Maximum number of pinned middle variables before a stubborn Z sub-cube
+/// is abandoned rather than split again. Each level doubles the queued
+/// item count, so this is what keeps memory bounded.
+/// `TURYN_Z_SPLIT_MAX=<n>` overrides; 0 disables splitting entirely
+/// (restoring the old discard-on-timeout behaviour).
+fn z_split_depth_max() -> usize {
+    static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *D.get_or_init(|| {
+        std::env::var("TURYN_Z_SPLIT_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12)
+    })
+}
+
 /// `TURYN_DUMP_PAIRS=1`: print every (Z, W) pair reaching the XY stage.
 /// Diffing two configurations' dumps says exactly which pairs one loses.
 fn dump_pairs_enabled() -> bool {
@@ -3226,6 +3321,7 @@ pub(crate) fn new_pipeline_metrics() -> PipelineMetrics {
         flow_xy_free_sum: z(),
         flow_z_unsat: z(),
         flow_z_timeout: z(),
+        flow_z_split: z(),
         flow_z_solutions: z(),
         flow_z_spec_fail: z(),
         flow_z_pair_fail: z(),

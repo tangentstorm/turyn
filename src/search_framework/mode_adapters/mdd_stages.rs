@@ -996,6 +996,7 @@ impl StageHandler<MddPayload> for SolveZStage {
         let mut cov_micro_delta: u64 = 0;
         let mut timed_out = false;
         let mut deferred: Option<PipelineWork> = None;
+        let mut splits: Vec<PipelineWork> = Vec::new();
         process_solve_z(
             sz,
             &self.ctx,
@@ -1012,6 +1013,7 @@ impl StageHandler<MddPayload> for SolveZStage {
             &mut cov_micro_delta,
             &mut timed_out,
             &mut deferred,
+            &mut splits,
         );
         // Partial credit MUST be registered BEFORE note_handled.
         // If this is the last in-flight descendant of the
@@ -1046,6 +1048,24 @@ impl StageHandler<MddPayload> for SolveZStage {
                     w
                 })
                 .collect();
+        }
+        // A Z solve that exhausted its conflict budget split into two
+        // sub-cubes instead of discarding the region. Schedule both: they
+        // are descendants of the same boundary, so its pending count rises
+        // by two and it stays open until every piece is decided. That is
+        // what turns "ran out of budget" from a silently dropped region
+        // into two smaller questions that get answered.
+        if !splits.is_empty() {
+            let children = wrap_items(splits, &parent_meta, &self.item_ids)
+                .into_iter()
+                .map(|mut w| {
+                    // Above the boundary stage so sub-cubes are finished
+                    // before more boundaries are opened; the search stays
+                    // depth-first and the queue stays bounded.
+                    w.priority = 2;
+                    w
+                });
+            out.emitted.extend(children);
         }
         // Mass credit: this descendant is done, and any re-queued
         // continuation takes its place in the boundary's pending
@@ -1311,7 +1331,7 @@ impl MddStagesAdapter {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     eprintln!(
-                        "FLOW t={:.0}s bnd_in/out={}/{} w_in/out={}/{} z_in/out={}/{} xy_in/out={}/{} xy_solves={} xy_sat={} xy_unsat={} xy_timeout={} z_sol={} w_sol={} items_completed={}",
+                        "FLOW t={:.0}s bnd_in/out={}/{} w_in/out={}/{} z_in/out={}/{} xy_in/out={}/{} xy_solves={} xy_sat={} xy_unsat={} xy_timeout={} z_sol={} z_split={} w_sol={} items_completed={}",
                         started.elapsed().as_secs_f64(),
                         m.stage_enter[0].load(O::Relaxed),
                         m.stage_exit[0].load(O::Relaxed),
@@ -1326,6 +1346,7 @@ impl MddStagesAdapter {
                         m.flow_xy_unsat.load(O::Relaxed),
                         m.flow_xy_timeout.load(O::Relaxed),
                         m.flow_z_solutions.load(O::Relaxed),
+                        m.flow_z_split.load(O::Relaxed),
                         m.flow_w_solutions.load(O::Relaxed),
                         m.items_completed.load(O::Relaxed),
                     );

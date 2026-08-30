@@ -610,10 +610,11 @@ fn run_framework_mdd_mode(
         metrics.flow_w_solves.load(Ord::Relaxed),
     );
     eprintln!(
-        "[framework:{}] flow Z: unsat={} timeout={} sol={} pair_fail={} spec_fail={} solves={}",
+        "[framework:{}] flow Z: unsat={} timeout={} split={} sol={} pair_fail={} spec_fail={} solves={}",
         mode_name,
         metrics.flow_z_unsat.load(Ord::Relaxed),
         metrics.flow_z_timeout.load(Ord::Relaxed),
+        metrics.flow_z_split.load(Ord::Relaxed),
         metrics.flow_z_solutions.load(Ord::Relaxed),
         metrics.flow_z_pair_fail.load(Ord::Relaxed),
         metrics.flow_z_spec_fail.load(Ord::Relaxed),

@@ -1203,3 +1203,63 @@ n=56 needs `n − 2k ≤ ~30` to produce anything at all, i.e. `k ≥ 13`, and
 measurable**, and the honest statement remains that no run has yet
 performed a single XY solve at n=56. The next lever has to be the Z
 solve itself, not the plumbing around it.
+
+### 12.13 A timed-out Z solve discarded its work instead of splitting
+
+Prompted by the right question: the Z stage does not have to *solve*
+anything, it has to check or eliminate every possibility in a region.
+It was doing neither.
+
+**What it did.** When a Z solve hit its conflict budget (default 5000,
+`TURYN_Z_CONFL`) the code did this:
+
+```rust
+None => {
+    metrics.flow_z_timeout.fetch_add(1, ...);
+    *timed_out = true;
+    break;          // <- every learnt clause discarded
+}
+```
+
+`break`, and the boundary is marked abandoned. Every clause learnt during
+the attempt is thrown away, the region is neither searched nor eliminated,
+and nothing ever revisits it. Compare the batch-cap exit a few lines up,
+which sets `more_z_possible` and re-queues with `prior_blocks` so the next
+attempt resumes. Only the timeout path threw work away. At n=56 k=7 that
+is 963 timeouts × 5000 conflicts = **4.8 million conflicts of real search
+discarded per minute**.
+
+**What it does now.** On timeout the solve splits: it branches on one
+unpinned middle variable and emits two children (`SolveZWork::pins`)
+covering the two halves. Each is strictly smaller, both are descendants of
+the same boundary so its pending count rises by two and it stays open, and
+every half that comes back decided eliminates its section for real. The
+recursion is capped at 12 pinned variables (`TURYN_Z_SPLIT_MAX`, 0
+restores the old behaviour) because each level doubles the queued items;
+past the cap a region is abandoned as before — still honest, just no
+longer subdivided.
+
+**Measured effect.** At n=44 k=7, 75 s: boundaries abandoned drops from
+**11 to 4**. Fewer regions written off is exactly the point.
+
+**What it does not do.** It does not make n=56 tractable. At k=10 over six
+minutes: 7604 splits, zero regions decided, `items_completed=0`. The split
+tree is being expanded and never bottoms out, because a sub-cube with one
+more variable pinned is still far too hard for a 5000-conflict budget.
+Reaching a middle the solver handles comfortably (≤ 18-24, from the §12.12
+table) means pinning 12-18 of the 36 variables, i.e. 4k-260k sub-cubes per
+`(boundary, W)` at ~5000 conflicts each — against ~10^8 boundaries. The
+arithmetic does not close.
+
+It also costs throughput where the search does work: n=44 k=7 coverage
+after 75 s went from 8.996e-6 to 7.828e-6, because effort goes into
+re-solving sub-cubes instead of opening new boundaries. That trade is
+taken deliberately — this audit's whole theme is not crediting work that
+was not done, and "abandoned" is exactly that — but it is a real cost and
+`TURYN_Z_SPLIT_MAX=0` turns it off.
+
+**A counter to distrust.** `flow_z_unsat` is incremented only when a
+`(boundary, W)` is refuted *before any Z is found* (`if z_count == 0`).
+It is not a count of regions eliminated, and reading `unsat=0` as "nothing
+is being decided" is wrong — I did that here before checking. The honest
+progress signals are `items_completed` and the abandoned count.
