@@ -1263,3 +1263,61 @@ was not done, and "abandoned" is exactly that — but it is a real cost and
 It is not a count of regions eliminated, and reading `unsat=0` as "nothing
 is being decided" is wrong — I did that here before checking. The honest
 progress signals are `items_completed` and the abandoned count.
+
+### 12.14 Measuring the whole space by section — the method, and the first real bound
+
+The right framing, and the one that finally produces a number: the search
+does not have to *solve* n=56. Pin a prefix, drill down, and a small
+enough section is guaranteed to finish. Time one section, count the
+sections, multiply. Simple arithmetic on very large numbers.
+
+**Two tools.** `TURYN_BOUNDARY_LIMIT=N` stops the generator after N
+boundaries, carving a section along the boundary axis. `TURYN_DUMP_OUTFIX=N`
+prints `--outfix` strings selecting live sections, each verified by
+round-tripping it back through `parse_outfix` and comparing boundary bits —
+which immediately caught the generator using the wrong bit layout for the
+last suffix digit (it is 3-bit, so Z sits at bit 0, not bit 1).
+
+**The method validates.** At n=14 k=5, where the full run is knowable:
+2000 of 11,160 boundaries take 0.71 s (0.61 s net of the 0.10 s startup),
+predicting 3.4 s for all of them against an actual 4.5 s. Right order,
+underestimating slightly because later boundaries cost more than earlier
+ones — which is the bias to keep in mind below.
+
+**A trap this exposed.** Timing a single section proves nothing on its
+own: the first boundaries in DFS order do no work at all (`solves=0`) and
+still report `covered=1.000`. Both a `--outfix` section and
+`TURYN_BOUNDARY_LIMIT=1` at n=26 and n=56 "completed" in 0.11 s, which is
+exactly the process startup time. Any section measurement has to check
+that the section did work, not just that it finished.
+
+**The first real bound at n=56** (`--mdd-k=7`, 1,465,976 live boundaries,
+4 threads):
+
+| boundaries | wall clock | outcome |
+|---:|---:|---|
+| 1 | 0.11 s | no work — empty section |
+| 10 | 0.11 s | no work — empty sections |
+| 100 | 57.5 s | **21 left incomplete** |
+| 200 | > 580 s | **hit the wall clock, 38 incomplete** |
+
+Scaling the 200-boundary figure to all 1,465,976 gives **4.3e6 s ≈ 49
+days**, and every part of that is a floor rather than an estimate: the
+200-boundary run did not finish, the boundaries it abandoned are the
+expensive ones, and per-boundary cost rises with depth (the n=14
+validation shows the extrapolation biased low even when everything
+completes). The floor also rose 5x between the 100- and 200-boundary
+measurements, which is the signature of a heavy tail rather than a
+converging mean.
+
+So: **at least ~7 weeks of this 4-core machine, near-certainly much more,
+and the "much more" is not yet bounded.** That is the first n=56 number in
+this project derived from work actually completed rather than from a
+saturating partial-credit ratio. Every previous figure — including the
+"30 days" and "91 days" of §12.11 — came from runs that completed nothing.
+
+**What would sharpen it.** The bound is loose because boundaries abandon
+rather than finish. Push `TURYN_Z_SPLIT_MAX` and the W conflict budget
+until a 200-boundary run reaches `abandoned=0`, then the multiplication
+becomes an estimate rather than a floor. That is a measurement campaign,
+not a code change.

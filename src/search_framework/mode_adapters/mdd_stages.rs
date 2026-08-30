@@ -614,6 +614,8 @@ pub struct GenerateStage {
     /// Scales raw live-path counts into the weight unit; see
     /// `weight_scale_for`.
     weight_scale: f64,
+    /// Boundaries emitted so far, for `TURYN_BOUNDARY_LIMIT`.
+    generated: Arc<AtomicU64>,
 }
 
 impl StageHandler<MddPayload> for GenerateStage {
@@ -631,6 +633,17 @@ impl StageHandler<MddPayload> for GenerateStage {
         let MddPayload::Generate(mut cursor) = item.payload else {
             return StageOutcome::default();
         };
+        // `TURYN_BOUNDARY_LIMIT=N`: stop generating after N boundaries.
+        // This carves out a section of the search space along the boundary
+        // axis -- no XY pinning, so the section is a genuine slice rather
+        // than an over-constrained one -- and lets a run finish so its wall
+        // time can be multiplied by (total boundaries / N).
+        if let Some(limit) = boundary_limit() {
+            let done = self.generated.fetch_add(0, Ordering::Relaxed);
+            if done >= limit {
+                return StageOutcome::default();
+            }
+        }
         let batch = {
             let mut cache = self.path_cache.lock().unwrap();
             cursor.next_chunk(
@@ -645,6 +658,12 @@ impl StageHandler<MddPayload> for GenerateStage {
 
         let mut out = StageOutcome::default();
         for bnd in batch {
+            if let Some(limit) = boundary_limit() {
+                if self.generated.load(Ordering::Relaxed) >= limit {
+                    break;
+                }
+            }
+            self.generated.fetch_add(1, Ordering::Relaxed);
             // Every generated boundary is its own fan-out root, so its
             // descendants credit mass against it exactly as an eagerly
             // seeded boundary's do.
@@ -670,7 +689,9 @@ impl StageHandler<MddPayload> for GenerateStage {
         }
 
         // More tree left: hand the advanced cursor back to the scheduler.
-        if !cursor.exhausted() && !ctx.is_cancelled() {
+        let limit_reached =
+            boundary_limit().is_some_and(|l| self.generated.load(Ordering::Relaxed) >= l);
+        if !cursor.exhausted() && !ctx.is_cancelled() && !limit_reached {
             let item_id = self.item_ids.fetch_add(1, Ordering::Relaxed);
             out.continuation = Continuation::Resume(WorkItem {
                 stage_id: STAGE_GENERATE,
@@ -691,6 +712,16 @@ impl StageHandler<MddPayload> for GenerateStage {
         }
         out
     }
+}
+
+/// `TURYN_BOUNDARY_LIMIT=N`: process only the first N boundaries.
+fn boundary_limit() -> Option<u64> {
+    static L: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *L.get_or_init(|| {
+        std::env::var("TURYN_BOUNDARY_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
 }
 
 /// Live-path counts are used directly as mass weights so the analytic
@@ -1258,6 +1289,71 @@ impl MddStagesAdapter {
             Vec::new() // lazily generated; see `GenerateStage`
         };
         let lazy = cfg.test_outfix.is_none();
+        // `TURYN_DUMP_OUTFIX=<count>`: print `--outfix` strings selecting
+        // live sections of the search space, then exit.
+        //
+        // This is the measurement tool for "how long would the whole space
+        // take": pin a section, time it to completion, multiply by the
+        // number of sections. Each string is verified by round-tripping it
+        // back through `parse_outfix` and checking the boundary bits match,
+        // so a printed string is known-good rather than hand-derived.
+        if let Ok(spec) = std::env::var("TURYN_DUMP_OUTFIX") {
+            let want: usize = spec.parse().unwrap_or(1);
+            let n = problem.n;
+            let mut cursor = BoundaryCursor::new(ctx.mdd.root);
+            let mut cache = std::collections::HashMap::new();
+            let seen = cursor.next_chunk(
+                &ctx.mdd,
+                ctx.zw_depth,
+                &ctx.xy_pos_order,
+                &mut cache,
+                want,
+                cancel,
+            );
+            // BDKR polarity: internal packed bit set == +1 == BDKR bit 0.
+            let bdkr = |bits: u32, idx: usize| -> u32 { 1 - ((bits >> idx) & 1) };
+            for b in &seen {
+                // Prefix digit i (i < k) is packed index i, all four seqs.
+                // X and Y are unconstrained by the MDD, so pin them to +1.
+                let mut pref = String::new();
+                for i in 0..k {
+                    let d = (0 << 3) | (0 << 2) | (bdkr(b.z_bits, i) << 1) | bdkr(b.w_bits, i);
+                    pref.push(std::char::from_digit(d, 16).unwrap());
+                }
+                // Suffix digit i: W from packed index k+i (i <= k-1),
+                // X/Y/Z from packed index k-1+i (i >= 1).
+                let mut suf = String::new();
+                for i in 0..=k {
+                    let wbit = if i <= k - 1 { bdkr(b.w_bits, k + i) } else { 0 };
+                    let zbit = if i >= 1 { bdkr(b.z_bits, k - 1 + i) } else { 0 };
+                    // Digit 0 pins W only; the last digit is 3-bit with
+                    // no W, so Z sits at bit 0 there rather than bit 1.
+                    let d = if i == 0 {
+                        wbit
+                    } else if i == k {
+                        zbit
+                    } else {
+                        (zbit << 1) | wbit
+                    };
+                    suf.push(std::char::from_digit(d, 16).unwrap());
+                }
+                let outfix = format!("{pref}...{suf}");
+                match crate::config::parse_outfix(&outfix, n, k) {
+                    Ok(parsed) if parsed.zw_bits == (b.z_bits, b.w_bits) => {
+                        println!("OUTFIX {outfix}");
+                    }
+                    Ok(parsed) => {
+                        println!(
+                            "OUTFIX-MISMATCH {outfix} parsed z={:#x} w={:#x} | want z={:#x} w={:#x}",
+                            parsed.zw_bits.0, parsed.zw_bits.1, b.z_bits, b.w_bits
+                        );
+                    }
+                    Err(e) => println!("OUTFIX-ERR {outfix}: {e}"),
+                }
+            }
+            std::process::exit(0);
+        }
+
         // Per-boundary weights from real XY descendant path counts.
         // We rescale `xy_path_count` (an f64 in `[1, 4^(2k)]`) to
         // u64 so the boundary's product `weight * cov_micro (≤
@@ -1474,6 +1570,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                 progress: Arc::clone(&self.progress),
                 path_cache: Mutex::new(HashMap::new()),
                 weight_scale: self.weight_scale,
+                generated: Arc::new(AtomicU64::new(0)),
             }),
         );
         m.insert(
