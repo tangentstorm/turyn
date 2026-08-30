@@ -23,15 +23,16 @@ use std::sync::{Arc, Mutex};
 use crate::config::SearchConfig;
 use crate::legacy_search::WarmStartState;
 use crate::mdd_pipeline::{
-    BoundaryWork, PhaseBContext, PipelineMetrics, PipelineWork, SolveWWork, SolveWZWork,
-    SolveZWork, ZStageScratch, build_phase_b_context, enumerate_live_boundaries, loaded_xy_graph,
-    mdd_navigate_to_outfix, new_pipeline_metrics, process_boundary, process_solve_w,
-    process_solve_wz, process_solve_z,
+    BoundaryCursor, BoundaryWork, PhaseBContext, PipelineMetrics, PipelineWork, SolveWWork,
+    SolveWZWork, SolveZWork, ZStageScratch, build_phase_b_context, enumerate_live_boundaries,
+    loaded_xy_graph, mdd_navigate_to_outfix, new_pipeline_metrics, process_boundary,
+    process_solve_w, process_solve_wz, process_solve_z,
 };
 use crate::search_framework::engine::{AdapterInit, SearchModeAdapter};
 use crate::search_framework::mass::{CoverageQuality, MassValue, SearchMassModel};
 use crate::search_framework::stage::{
-    ForcingDelta, StageContext, StageHandler, StageId, StageOutcome, WorkItem, WorkItemMeta,
+    Continuation, ForcingDelta, StageContext, StageHandler, StageId, StageOutcome, WorkItem,
+    WorkItemMeta,
 };
 use crate::spectrum::{FftScratch, SpectralFilter};
 use crate::types::{Problem, SumTuple};
@@ -41,6 +42,9 @@ pub const STAGE_BOUNDARY: StageId = "mdd.boundary";
 pub const STAGE_SOLVE_W: StageId = "mdd.solve_w";
 pub const STAGE_SOLVE_WZ: StageId = "mdd.solve_wz";
 pub const STAGE_SOLVE_Z: StageId = "mdd.solve_z";
+/// Produces boundary items on demand instead of materialising all of them
+/// before the search starts. See `GenerateStage`.
+pub const STAGE_GENERATE: StageId = "mdd.generate";
 
 /// Derive a non-zero xorshift seed from the master `cfg.seed` and a
 /// short stage label.  Identity guarantees:
@@ -189,6 +193,12 @@ pub struct BoundaryProgress {
 #[derive(Default, Clone, Copy)]
 struct BoundaryState {
     pending: u64,
+    /// This boundary's share of the search mass. Registered by the
+    /// generator when the boundary is emitted, so the weight table does
+    /// not have to exist before the boundaries do -- see
+    /// `register_boundary`. Falls back to `weights[id]` for the eager
+    /// seeding path, and to 0 for an id neither route registered.
+    weight: Option<u64>,
     /// Set once the root has been "closed" in either sense —
     /// clean or abandoned. Gates future note_handled calls
     /// against double-credit.
@@ -224,6 +234,24 @@ impl BoundaryProgress {
     /// (e.g. live XY path counts) and the published TTC stops
     /// drifting as cheap and expensive boundaries retire in
     /// arbitrary order.
+    /// Constructor for lazily generated boundaries: the denominator is
+    /// known analytically (the MDD's live-path count) while the
+    /// boundaries themselves are produced on demand. `total` is a
+    /// boundary COUNT used only by "done / total" diagnostics; the mass
+    /// math uses `total_weight`.
+    pub fn new_lazy(total_weight: u64, total: u64) -> Self {
+        Self {
+            pending: Mutex::new(HashMap::new()),
+            completed: AtomicU64::new(0),
+            abandoned: AtomicU64::new(0),
+            live_partial_weight: AtomicU64::new(0),
+            completed_weight: AtomicU64::new(0),
+            weights: Vec::new(),
+            total_weight: total_weight.max(1),
+            total,
+        }
+    }
+
     pub fn new_weighted(weights: Vec<u64>) -> Self {
         let total = weights.len() as u64;
         Self::new_weighted_with_total(weights, total)
@@ -249,7 +277,40 @@ impl BoundaryProgress {
     /// `weight × cov_micro (≤ 1e6)` stays well inside u64.
     const WEIGHT_UNIT: u64 = 1_000_000_000;
 
+    /// Register a lazily generated boundary's mass weight under its
+    /// `fanout_root_id`. Called by the generator stage as it emits each
+    /// boundary, which is strictly before any of that boundary's
+    /// descendant work exists, so every later `weight_for` sees it.
+    ///
+    /// Lazy generation is why this exists: with 280M boundaries at
+    /// n=56 k=10 there is no weight *table*, and `fanout_root_id` comes
+    /// from a monotonic counter rather than a seed index, so it is not a
+    /// `Vec` index either. The denominator is supplied analytically
+    /// instead (`new_lazy`).
+    pub fn register_boundary(&self, fanout_root_id: u64, weight: u64) {
+        let mut guard = self.pending.lock().unwrap();
+        let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
+            pending: 0,
+            weight: None,
+            closed: false,
+            abandoned_taint: false,
+            in_flight_cov_micro: 0,
+        });
+        entry.weight = Some(weight);
+    }
+
+    /// Weight for a root: the registered value when the generator put one
+    /// there, else the eager seed table, else 0.
     fn weight_for(&self, fanout_root_id: u64) -> u64 {
+        if let Some(w) = self
+            .pending
+            .lock()
+            .unwrap()
+            .get(&fanout_root_id)
+            .and_then(|e| e.weight)
+        {
+            return w;
+        }
         self.weights
             .get(fanout_root_id as usize)
             .copied()
@@ -275,6 +336,7 @@ impl BoundaryProgress {
         let mut guard = self.pending.lock().unwrap();
         let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
             pending: 1,
+            weight: None,
             closed: false,
             abandoned_taint: false,
             in_flight_cov_micro: 0,
@@ -297,6 +359,7 @@ impl BoundaryProgress {
         let mut guard = self.pending.lock().unwrap();
         let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
             pending: 1,
+            weight: None,
             closed: false,
             abandoned_taint: false,
             in_flight_cov_micro: 0,
@@ -361,6 +424,7 @@ impl BoundaryProgress {
         let mut guard = self.pending.lock().unwrap();
         let entry = guard.entry(fanout_root_id).or_insert(BoundaryState {
             pending: 1,
+            weight: None,
             closed: false,
             abandoned_taint: false,
             in_flight_cov_micro: 0,
@@ -435,6 +499,9 @@ impl BoundaryProgress {
 /// the queue — `process_solve_z` fires XY solves inline per
 /// `(Z, W)` pair — so there is no `SolveXY` variant here.
 pub enum MddPayload {
+    /// A resumable cursor into the boundary walk. Handling it produces a
+    /// chunk of boundaries and a continuation of itself.
+    Generate(Box<BoundaryCursor>),
     Boundary(BoundaryWork),
     SolveW(SolveWWork),
     SolveWZ(SolveWZWork),
@@ -444,6 +511,7 @@ pub enum MddPayload {
 impl MddPayload {
     fn stage_id(&self) -> StageId {
         match self {
+            MddPayload::Generate(_) => STAGE_GENERATE,
             MddPayload::Boundary(_) => STAGE_BOUNDARY,
             MddPayload::SolveW(_) => STAGE_SOLVE_W,
             MddPayload::SolveWZ(_) => STAGE_SOLVE_WZ,
@@ -505,10 +573,137 @@ fn default_priority_for_stage(stage: StageId) -> i32 {
     // more, so solutions land quickly. Boundary=0, SolveW / SolveWZ=1,
     // SolveZ=2.
     match stage {
+        // Generation runs only when nothing else is runnable. That is what
+        // bounds the queue: boundaries are produced just fast enough to
+        // keep the workers fed, instead of all 280M up front.
+        STAGE_GENERATE => -1,
         STAGE_BOUNDARY => 0,
         STAGE_SOLVE_W | STAGE_SOLVE_WZ => 1,
         STAGE_SOLVE_Z => 2,
         _ => 0,
+    }
+}
+
+/// Number of boundaries one `Generate` item produces before re-queueing
+/// itself. Small enough that the queue never holds a large backlog, big
+/// enough that the per-item overhead is amortised.
+const GENERATE_CHUNK: usize = 512;
+
+/// Produces boundary work items on demand.
+///
+/// The eager path materialised every live boundary in `init` before the
+/// search began — 280,697,728 of them at n=56 k=10, which aborted the
+/// process trying to allocate 67 GB (`docs/TTC-AUDIT.md` §12.11). Since
+/// raising `k` is what shrinks the Z middle enough to be solvable at
+/// n=56, that allocation stood between the search and its only viable
+/// configuration.
+///
+/// This walks the same tree in the same order, a chunk at a time, using
+/// the framework's existing fan-out mechanism: emit the chunk's
+/// boundaries as children, then hand back `Continuation::Resume` carrying
+/// the advanced cursor. At the lowest priority it runs only when workers
+/// would otherwise idle, so the queue stays small however big the tree is.
+pub struct GenerateStage {
+    ctx: Arc<PhaseBContext>,
+    item_ids: Arc<AtomicU64>,
+    progress: Arc<BoundaryProgress>,
+    /// Shared memo for `count_paths_from`, keyed by MDD node id. Held
+    /// across chunks so the path counts cost O(#nodes) for the whole run
+    /// rather than O(#nodes) per chunk.
+    path_cache: Mutex<HashMap<u32, f64>>,
+    /// Scales raw live-path counts into the weight unit; see
+    /// `weight_scale_for`.
+    weight_scale: f64,
+}
+
+impl StageHandler<MddPayload> for GenerateStage {
+    fn id(&self) -> StageId {
+        STAGE_GENERATE
+    }
+    fn handle(
+        &self,
+        item: WorkItem<MddPayload>,
+        ctx: &StageContext<'_>,
+    ) -> StageOutcome<MddPayload> {
+        if ctx.is_cancelled() {
+            return StageOutcome::default();
+        }
+        let MddPayload::Generate(mut cursor) = item.payload else {
+            return StageOutcome::default();
+        };
+        let batch = {
+            let mut cache = self.path_cache.lock().unwrap();
+            cursor.next_chunk(
+                &self.ctx.mdd,
+                self.ctx.zw_depth,
+                &self.ctx.xy_pos_order,
+                &mut cache,
+                GENERATE_CHUNK,
+                ctx.cancelled,
+            )
+        };
+
+        let mut out = StageOutcome::default();
+        for bnd in batch {
+            // Every generated boundary is its own fan-out root, so its
+            // descendants credit mass against it exactly as an eagerly
+            // seeded boundary's do.
+            let item_id = self.item_ids.fetch_add(1, Ordering::Relaxed);
+            let weight = ((bnd.xy_path_count / self.weight_scale).round() as u64).max(1);
+            self.progress.register_boundary(item_id, weight);
+            out.emitted.push(WorkItem {
+                stage_id: STAGE_BOUNDARY,
+                priority: default_priority_for_stage(STAGE_BOUNDARY),
+                gold: false,
+                cost_hint: 1,
+                replay_key: item_id,
+                mass_hint: None,
+                meta: WorkItemMeta {
+                    item_id,
+                    parent_item_id: None,
+                    fanout_root_id: item_id,
+                    depth_from_root: 0,
+                    spawn_seq: 0,
+                },
+                payload: MddPayload::Boundary(bnd),
+            });
+        }
+
+        // More tree left: hand the advanced cursor back to the scheduler.
+        if !cursor.exhausted() && !ctx.is_cancelled() {
+            let item_id = self.item_ids.fetch_add(1, Ordering::Relaxed);
+            out.continuation = Continuation::Resume(WorkItem {
+                stage_id: STAGE_GENERATE,
+                priority: default_priority_for_stage(STAGE_GENERATE),
+                gold: false,
+                cost_hint: 1,
+                replay_key: item_id,
+                mass_hint: None,
+                meta: WorkItemMeta {
+                    item_id,
+                    parent_item_id: None,
+                    fanout_root_id: item_id,
+                    depth_from_root: 0,
+                    spawn_seq: 0,
+                },
+                payload: MddPayload::Generate(cursor),
+            });
+        }
+        out
+    }
+}
+
+/// Live-path counts are used directly as mass weights so the analytic
+/// total (`Mdd4::count_live_paths`) is exactly the denominator — verified
+/// to 12 decimals against the summed per-boundary counts. Counts only get
+/// rescaled when the total would leave too little headroom for the
+/// `weight × cov_micro (≤ 1e6)` products in the partial-credit math.
+fn weight_scale_for(total_live_paths: f64) -> f64 {
+    const WEIGHT_TOTAL_MAX: f64 = 1.0e15;
+    if total_live_paths > WEIGHT_TOTAL_MAX {
+        total_live_paths / WEIGHT_TOTAL_MAX
+    } else {
+        1.0
     }
 }
 
@@ -970,6 +1165,13 @@ pub struct MddStagesAdapter {
     /// materializing `WorkItem`s into the scheduler even after
     /// the deadline has passed.
     pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Generate boundaries on demand rather than materialising them in
+    /// `init`. Always on except under `--outfix`, which pins exactly one
+    /// boundary and so has nothing to generate.
+    pub lazy: bool,
+    /// Divisor turning a boundary's live XY-path count into its mass
+    /// weight; see `weight_scale_for`.
+    pub weight_scale: f64,
 }
 
 impl MddStagesAdapter {
@@ -1033,8 +1235,9 @@ impl MddStagesAdapter {
                 }
             }
         } else {
-            enumerate_live_boundaries(&ctx, cancel)
+            Vec::new() // lazily generated; see `GenerateStage`
         };
+        let lazy = cfg.test_outfix.is_none();
         // Per-boundary weights from real XY descendant path counts.
         // We rescale `xy_path_count` (an f64 in `[1, 4^(2k)]`) to
         // u64 so the boundary's product `weight * cov_micro (≤
@@ -1084,7 +1287,19 @@ impl MddStagesAdapter {
         // Seed boundaries use `item_id = 0..N`; start the counter
         // past that so child items never collide with a seed id.
         let item_ids = Arc::new(AtomicU64::new(seed_boundaries.len() as u64));
-        let progress = Arc::new(BoundaryProgress::new_weighted(weights));
+        // Lazy generation has no weight table and no boundary list, so the
+        // TTC denominator comes from the MDD analytically: the sum of every
+        // boundary's live XY-path count IS `count_live_paths()` (checked
+        // exact to 12 decimals at n=12/14/16/26). That identity is what
+        // lets coverage stay honest without materialising the boundaries.
+        let live_paths = ctx.mdd.count_live_paths();
+        let weight_scale = weight_scale_for(live_paths);
+        let lazy_total_weight = (live_paths / weight_scale).round().max(1.0) as u64;
+        let progress = Arc::new(if lazy {
+            BoundaryProgress::new_lazy(lazy_total_weight, 0)
+        } else {
+            BoundaryProgress::new_weighted(weights)
+        });
         let metrics = new_pipeline_metrics();
         // `TURYN_TRACE_FLOW=1`: per-second dump of the stage counters, so a
         // stalled `covered` can be told apart from a stalled search.
@@ -1129,6 +1344,8 @@ impl MddStagesAdapter {
             progress,
             cancel: Arc::clone(cancel),
             seed: cfg.seed,
+            lazy,
+            weight_scale,
         };
         (adapter, result_rx)
     }
@@ -1140,7 +1357,31 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
     }
 
     fn init(&self) -> AdapterInit<MddPayload> {
-        // Materialize every live boundary into a `WorkItem`. At
+        // Lazy: hand the scheduler a single cursor. Workers pull chunks of
+        // boundaries off it on demand (`GenerateStage`), so a tree with
+        // 280M boundaries starts searching immediately instead of trying
+        // to materialise 67 GB of work items first.
+        if self.lazy {
+            return AdapterInit {
+                seed_items: vec![WorkItem {
+                    stage_id: STAGE_GENERATE,
+                    priority: default_priority_for_stage(STAGE_GENERATE),
+                    gold: false,
+                    cost_hint: 1,
+                    replay_key: 0,
+                    mass_hint: None,
+                    meta: WorkItemMeta {
+                        item_id: 0,
+                        parent_item_id: None,
+                        fanout_root_id: 0,
+                        depth_from_root: 0,
+                        spawn_seq: 0,
+                    },
+                    payload: MddPayload::Generate(Box::new(BoundaryCursor::new(self.ctx.mdd.root))),
+                }],
+            };
+        }
+        // Eager (`--outfix` only): materialize every live boundary. At
         // large k the seed set can be tens of millions of items,
         // so poll the shared cancel flag every 64k entries to let
         // the `--sat-secs` watchdog short-circuit the seeding
@@ -1204,6 +1445,16 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
             .map(|t| t.num_freqs)
             .unwrap_or(0);
 
+        m.insert(
+            STAGE_GENERATE,
+            Box::new(GenerateStage {
+                ctx: Arc::clone(&self.ctx),
+                item_ids: Arc::clone(&self.item_ids),
+                progress: Arc::clone(&self.progress),
+                path_cache: Mutex::new(HashMap::new()),
+                weight_scale: self.weight_scale,
+            }),
+        );
         m.insert(
             STAGE_BOUNDARY,
             Box::new(BoundaryStage {

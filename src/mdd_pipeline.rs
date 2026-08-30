@@ -2937,6 +2937,124 @@ pub(crate) fn traced_boundary() -> Option<(u32, u32)> {
     ))
 }
 
+/// One frame of the boundary DFS: the MDD node, the level it sits at,
+/// the (z, w) bits accumulated on the way in, and which of the four
+/// branches to take next.
+#[derive(Clone, Debug)]
+pub(crate) struct BoundaryFrame {
+    nid: u32,
+    level: usize,
+    z_bits: u32,
+    w_bits: u32,
+    next_branch: u32,
+}
+
+/// Resumable version of the boundary walk.
+///
+/// `enumerate_live_boundaries` materialises every live boundary into a
+/// `Vec`. That is fine at n=26 k=7 (1.5M entries) and fatal at n=56 k=10,
+/// where there are 280,697,728 of them and the `Vec` alone wants 67 GB —
+/// the adapter aborted in `init` before the search started
+/// (`docs/TTC-AUDIT.md` §12.11). Raising `k` is exactly what makes the Z
+/// middle small enough to solve at n=56, so the upfront list was the thing
+/// standing between the search and the only viable configuration.
+///
+/// This walks the same tree in the same order and yields the same
+/// boundaries, a chunk at a time, carrying its whole state in an explicit
+/// stack of at most `zw_depth` frames. That makes it small enough to ride
+/// inside a work item, so a worker can generate the next chunk on demand
+/// and hand it to other workers.
+#[derive(Clone, Debug)]
+pub(crate) struct BoundaryCursor {
+    stack: Vec<BoundaryFrame>,
+    started: bool,
+}
+
+impl BoundaryCursor {
+    pub(crate) fn new(root: u32) -> Self {
+        Self {
+            stack: vec![BoundaryFrame {
+                nid: root,
+                level: 0,
+                z_bits: 0,
+                w_bits: 0,
+                next_branch: 0,
+            }],
+            started: false,
+        }
+    }
+
+    /// True once the whole tree has been walked.
+    pub(crate) fn exhausted(&self) -> bool {
+        self.started && self.stack.is_empty()
+    }
+
+    /// Produce up to `limit` more boundaries. Returns fewer only when the
+    /// walk is finished or `cancelled` fired.
+    pub(crate) fn next_chunk(
+        &mut self,
+        mdd: &mdd_reorder::Mdd4,
+        zw_depth: usize,
+        order: &[usize],
+        path_cache: &mut std::collections::HashMap<u32, f64>,
+        limit: usize,
+        cancelled: &AtomicBool,
+    ) -> Vec<BoundaryWork> {
+        self.started = true;
+        let mut out = Vec::with_capacity(limit.min(1024));
+        while out.len() < limit {
+            if cancelled.load(AtomicOrdering::Relaxed) {
+                break;
+            }
+            let Some(frame) = self.stack.last_mut() else {
+                break;
+            };
+            // A node at `zw_depth` is a boundary; emit and pop.
+            if frame.level == zw_depth {
+                if frame.nid != mdd_reorder::DEAD {
+                    let xy_path_count = mdd.count_paths_from(frame.nid, zw_depth, path_cache);
+                    out.push(BoundaryWork {
+                        z_bits: frame.z_bits,
+                        w_bits: frame.w_bits,
+                        xy_graph: loaded_xy_graph(frame.nid),
+                        xy_path_count,
+                    });
+                }
+                self.stack.pop();
+                continue;
+            }
+            if frame.nid == mdd_reorder::DEAD || frame.next_branch >= 4 {
+                self.stack.pop();
+                continue;
+            }
+            let b = frame.next_branch;
+            frame.next_branch += 1;
+            // A LEAF before `zw_depth` means the remaining levels are
+            // unconstrained, so every branch stays LEAF — matching
+            // `enumerate_live_boundaries`.
+            let child = if frame.nid == mdd_reorder::LEAF {
+                mdd_reorder::LEAF
+            } else {
+                mdd.nodes[frame.nid as usize][b as usize]
+            };
+            if child == mdd_reorder::DEAD {
+                continue;
+            }
+            let pos = order[frame.level];
+            let (z, w) = (b & 1, (b >> 1) & 1);
+            let (level, z_bits, w_bits) = (frame.level, frame.z_bits, frame.w_bits);
+            self.stack.push(BoundaryFrame {
+                nid: child,
+                level: level + 1,
+                z_bits: z_bits | (z << pos),
+                w_bits: w_bits | (w << pos),
+                next_branch: 0,
+            });
+        }
+        out
+    }
+}
+
 /// Enumerate every live boundary path through the first `zw_depth`
 /// levels of the MDD, returning a `BoundaryWork` per path. Used by
 /// the framework `MddStagesAdapter` to seed its queue upfront; the
@@ -3261,5 +3379,94 @@ pub(crate) fn run_mdd_sat_search(
         stats: SearchStats::default(),
         elapsed: start.elapsed(),
         found_solution: found,
+    }
+}
+
+#[cfg(test)]
+mod boundary_cursor_tests {
+    use super::*;
+
+    /// The lazily-generated search has no boundary list, so its TTC
+    /// denominator is the MDD's analytic live-path count. That is only
+    /// legitimate if the per-boundary XY-path counts sum to exactly that
+    /// number. Pin the identity: if it ever drifts, every coverage figure
+    /// from the lazy path silently scales wrong.
+    #[test]
+    fn boundary_weights_sum_to_the_analytic_live_path_count() {
+        for (n, k) in [(12usize, 2usize), (14, 5), (16, 4), (26, 7)] {
+            let path = format!("{}/mdd-{k}.bin", env!("CARGO_MANIFEST_DIR"));
+            if !std::path::Path::new(&path).exists() {
+                eprintln!("SKIP: mdd-{k}.bin not found - run `target/release/gen_mdd {k}`");
+                continue;
+            }
+            let problem = Problem::new(n);
+            let tuples = crate::enumerate_sum_tuples(problem);
+            let cfg = SearchConfig::default();
+            let cancelled = AtomicBool::new(false);
+            let ctx = build_phase_b_context(problem, &tuples, &cfg, false, k);
+            let summed: f64 = enumerate_live_boundaries(&ctx, &cancelled)
+                .iter()
+                .map(|b| b.xy_path_count)
+                .sum();
+            let analytic = ctx.mdd.count_live_paths();
+            assert!(
+                (summed - analytic).abs() <= analytic * 1e-9,
+                "n={n} k={k}: boundary weights sum to {summed:.6e} but the MDD \
+reports {analytic:.6e} live paths"
+            );
+        }
+    }
+
+    /// The chunked cursor must yield exactly the boundaries the eager
+    /// walk yields, in the same order, for any chunk size. Anything else
+    /// silently changes what the search covers.
+    #[test]
+    fn cursor_reproduces_the_eager_walk_at_every_chunk_size() {
+        for (n, k) in [(12usize, 2usize), (14, 5), (16, 4)] {
+            let path = format!("{}/mdd-{k}.bin", env!("CARGO_MANIFEST_DIR"));
+            if !std::path::Path::new(&path).exists() {
+                eprintln!("SKIP: mdd-{k}.bin not found - run `target/release/gen_mdd {k}`");
+                continue;
+            }
+            let problem = Problem::new(n);
+            let tuples = crate::enumerate_sum_tuples(problem);
+            let cfg = SearchConfig::default();
+            let cancelled = AtomicBool::new(false);
+            let ctx = build_phase_b_context(problem, &tuples, &cfg, false, k);
+            let want = enumerate_live_boundaries(&ctx, &cancelled);
+            assert!(!want.is_empty(), "n={n} k={k}: expected some boundaries");
+
+            for chunk in [1usize, 7, 1000, usize::MAX / 2] {
+                let mut cursor = BoundaryCursor::new(ctx.mdd.root);
+                let mut cache = std::collections::HashMap::new();
+                let mut got: Vec<BoundaryWork> = Vec::new();
+                while !cursor.exhausted() {
+                    let batch = cursor.next_chunk(
+                        &ctx.mdd,
+                        ctx.zw_depth,
+                        &ctx.xy_pos_order,
+                        &mut cache,
+                        chunk,
+                        &cancelled,
+                    );
+                    if batch.is_empty() && cursor.exhausted() {
+                        break;
+                    }
+                    got.extend(batch);
+                }
+                assert_eq!(
+                    got.len(),
+                    want.len(),
+                    "n={n} k={k} chunk={chunk}: boundary count differs"
+                );
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert_eq!(
+                        (g.z_bits, g.w_bits, g.xy_path_count),
+                        (w.z_bits, w.w_bits, w.xy_path_count),
+                        "n={n} k={k} chunk={chunk}: boundary {i} differs"
+                    );
+                }
+            }
+        }
     }
 }

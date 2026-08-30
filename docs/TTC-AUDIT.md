@@ -1144,3 +1144,62 @@ all (the total path count is known analytically from the MDD, so the
 mass model does not need the materialised list); then re-measure whether
 the Z stage is tractable at the `k` that becomes reachable. Only then is
 an n=56 TTC worth quoting.
+
+### 12.12 Lazy boundary generation — the memory wall is gone, the Z wall is not
+
+§12.11 found two walls between the search and n=56: the adapter
+materialised every live boundary before starting (fatal at k≥9), and the
+Z solve produced nothing at the small `k` that could be materialised.
+This fixes the first.
+
+**What changed.** `BoundaryCursor` walks the same tree as
+`enumerate_live_boundaries` with an explicit stack instead of recursion,
+so its entire state is a handful of frames that fits inside a work item.
+A new lowest-priority `GenerateStage` pulls a chunk of 512 boundaries,
+emits them as fan-out roots, and hands the advanced cursor back via
+`Continuation::Resume` — the framework's existing mechanism, no engine
+change. Lowest priority is what bounds the queue: generation runs only
+when workers would otherwise idle, so boundaries are produced just fast
+enough to keep them fed.
+
+**The denominator.** With no boundary list there is no weight table, so
+coverage would have nothing to divide by. It does not need one: the sum
+of every boundary's live XY-path count is *exactly*
+`Mdd4::count_live_paths()`, measured identical to 12 decimals at
+n=12/14/16/26. Weights are now the raw path counts, registered per
+boundary as the generator emits them
+(`BoundaryProgress::register_boundary`), and the denominator is the
+analytic total. `boundary_weights_sum_to_the_analytic_live_path_count`
+pins the identity; `cursor_reproduces_the_eager_walk_at_every_chunk_size`
+pins that chunking changes nothing about what is searched, at chunk sizes
+1, 7, 1000 and unbounded.
+
+**Result.** Every `k` at n=56 now starts and searches:
+
+| `--mdd-k` | before | after |
+|---:|---|---|
+| 7 | ran | runs |
+| 8 | 60 s enumerating, `covered=0`, 0 boundaries | searching immediately, 512 boundaries in 30 s |
+| 9 | **abort** | runs |
+| 10 | **abort** (67 GB allocation) | runs |
+
+Small-n behaviour is unchanged: the full coverage suite is 9/9, and
+n=14 k=5 still reaches `covered=1.000` exactly — the analytic
+denominator lands on 1.0, not near it.
+
+**What this did not fix.** The Z stage still returns nothing at n=56.
+At k=10 (Z middle 36), with an unlimited conflict budget and 7 minutes:
+0 Z solutions, 0 XY solves, and the counters frozen with every worker
+inside a Z solve that never returns. The measured shape of the Z stage
+against middle length, at 30 s:
+
+| Z middle | 12 | 18 | 24 | 30 | 36 | 42 |
+|---|---:|---:|---:|---:|---:|---:|
+| Z solutions | 483 | 54 | 3 | 1 | 0 | 0 |
+
+n=56 needs `n − 2k ≤ ~30` to produce anything at all, i.e. `k ≥ 13`, and
+`≤ ~18` to produce it at a useful rate, i.e. `k ≥ 19`. The MDD for those
+`k` is far beyond what `gen_mdd` can build. **So an n=56 TTC is still not
+measurable**, and the honest statement remains that no run has yet
+performed a single XY solve at n=56. The next lever has to be the Z
+solve itself, not the plumbing around it.
