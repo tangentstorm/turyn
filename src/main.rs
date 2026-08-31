@@ -600,10 +600,11 @@ fn run_framework_mdd_mode(
     // have residual work. Zero timeouts means the only source of
     // approximation is XY-timeout shortfall credit.
     eprintln!(
-        "[framework:{}] flow W: unsat={} timeout={} sol={} spec_fail={} spec_pass={} solves={}",
+        "[framework:{}] flow W: unsat={} timeout={} split={} sol={} spec_fail={} spec_pass={} solves={}",
         mode_name,
         metrics.flow_w_unsat.load(Ord::Relaxed),
         metrics.flow_w_timeout.load(Ord::Relaxed),
+        metrics.flow_w_split.load(Ord::Relaxed),
         metrics.flow_w_solutions.load(Ord::Relaxed),
         metrics.flow_w_spec_fail.load(Ord::Relaxed),
         metrics.flow_w_spec_pass.load(Ord::Relaxed),

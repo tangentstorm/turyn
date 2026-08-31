@@ -1321,3 +1321,52 @@ rather than finish. Push `TURYN_Z_SPLIT_MAX` and the W conflict budget
 until a 200-boundary run reaches `abandoned=0`, then the multiplication
 becomes an estimate rather than a floor. That is a measurement campaign,
 not a code change.
+
+### 12.15 Why abandon at all? No reason — W was still doing it
+
+§12.13 gave the Z stage a split so it would stop discarding regions. The
+W stage kept the old behaviour, and W turned out to be the source of
+*every* remaining abandonment: a 200-boundary n=56 run reported
+`abandoned=38` alongside `flow W: timeout=38` and `flow Z: timeout=0`.
+The Z fix had removed Z from the picture entirely and left the real
+culprit untouched.
+
+The code was identical to the one already fixed:
+
+```rust
+None => {                       // W conflict budget exhausted
+    metrics.flow_w_timeout.fetch_add(1, ...);
+    *timed_out = true;
+    break;                      // region written off
+}
+```
+
+W now splits the same way Z does — branch on an unpinned W middle
+variable, emit two children covering the halves, both descendants of the
+same boundary — via `SolveWWork::pins`. Abandonment now happens only at
+the split-depth cap (`TURYN_Z_SPLIT_MAX`, default 12).
+
+**Measured at n=56 k=7, 100 boundaries:**
+
+| | before | after |
+|---|---:|---:|
+| boundaries abandoned | 21 | **0** |
+| W regions refuted (`unsat`) | 0 | **1286** |
+
+Nothing is written off any more, and W is genuinely eliminating regions
+rather than giving up on them.
+
+**It did not make coverage meaningful.** Coverage still saturates with
+`abandoned=0`: over the same 100 boundaries it reads 6.536e-6 at 60 s,
+7.149e-6 at 120 s, and **7.149e-6 at 240 s** — flat — while the reported
+TTC climbs 9.4e6 → 1.7e7 → 3.4e7 s purely with the clock. Mass credit
+only lands when a boundary's whole subtree finishes, and none of the 100
+finished. So the TTC line is still not a number to quote, and the
+section-sampling floor of §12.14 remains the only defensible figure.
+
+**The floor moves up, not down.** Correct behaviour costs time: 100
+boundaries previously "finished" in 57.5 s by writing 21 of them off, and
+now take more than 381 s while completing 80 of them honestly. Scaling
+that to 1,465,976 boundaries gives a floor of **≈5.6e6 s ≈ 65 days**,
+replacing the 49 days of §12.14 — the earlier figure was cheap partly
+because it was skipping work.

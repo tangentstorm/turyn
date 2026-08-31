@@ -321,6 +321,13 @@ pub(crate) struct SolveWWork {
     /// Re-enumeration attempt counter; 0 = initial.  See
     /// `SolveWZWork::attempt`.
     pub(crate) attempt: u32,
+    /// Middle positions pinned to a fixed value, narrowing this item to a
+    /// sub-cube of the W space. Same role as `SolveZWork::pins`: a W
+    /// enumeration that exhausts its conflict budget splits rather than
+    /// abandoning the region. Before this, W was the ONLY remaining source
+    /// of abandonment -- every abandoned boundary in a 200-boundary n=56
+    /// run came from `flow_w_timeout`, not from Z.
+    pub(crate) pins: Vec<(usize, bool)>,
     /// Blocking clauses for W middles already enumerated by earlier
     /// attempts on this boundary.  The per-boundary W batch cap
     /// (`TURYN_MAX_W_PER_BND`) stops each attempt after a bounded
@@ -489,6 +496,8 @@ pub(crate) struct PipelineMetrics {
     /// Z solves that exhausted their conflict budget and split into two
     /// sub-cubes rather than discarding the region.
     pub(crate) flow_z_split: Arc<std::sync::atomic::AtomicU64>,
+    /// Same, for W solves.
+    pub(crate) flow_w_split: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_z_solutions: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_z_spec_fail: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) flow_z_pair_fail: Arc<std::sync::atomic::AtomicU64>,
@@ -746,6 +755,7 @@ pub(crate) fn process_boundary(
         PipelineWork::SolveW(SolveWWork {
             attempt: 0,
             prior_blocks: Vec::new(),
+            pins: Vec::new(),
             tuple: rep,
             z_bits: bnd.z_bits,
             w_bits: bnd.w_bits,
@@ -1022,6 +1032,14 @@ pub(crate) fn process_solve_w(
         for block in &sw.prior_blocks {
             w_solver.add_clause(block.iter().copied());
         }
+        // Narrow to this item's sub-cube. Pins come from a parent W solve
+        // that ran out of conflict budget and split rather than abandoning.
+        for &(mid, val) in &sw.pins {
+            if mid < ctx.middle_m {
+                let lit = ctx.w_mid_vars[mid];
+                w_solver.add_clause([if val { lit } else { -lit }]);
+            }
+        }
         // Batch size, NOT a truncation: after this many W middles we
         // stop and re-queue the remainder (see `more_w_possible`), so
         // no single boundary monopolises a worker and none is
@@ -1067,15 +1085,43 @@ pub(crate) fn process_solve_w(
                     break;
                 }
                 None => {
-                    // Conflict budget exhausted. Residual W
-                    // candidates MAY exist. Per TTC §4.1 the
-                    // boundary MUST NOT be exact-credited — the
-                    // caller reads `*timed_out` and routes the
-                    // boundary through `mark_abandoned` so it
-                    // retains its accumulated partial credit but
-                    // never bumps exact.
+                    // Conflict budget exhausted. Split rather than abandon:
+                    // branch on one unpinned W middle variable and emit two
+                    // children covering the halves, exactly as the Z stage
+                    // does. Both stay descendants of this boundary, so it
+                    // remains open until every piece is decided.
+                    //
+                    // W was the last source of abandonment: every abandoned
+                    // boundary in a 200-boundary n=56 run came from
+                    // `flow_w_timeout`. There is no reason to write a region
+                    // off when it can be halved instead.
                     metrics.flow_w_timeout.fetch_add(1, AtomicOrdering::Relaxed);
-                    *timed_out = true;
+                    let branch =
+                        (0..ctx.middle_m).find(|mid| !sw.pins.iter().any(|&(p, _)| p == *mid));
+                    match branch {
+                        Some(branch) if sw.pins.len() < split_depth_max() => {
+                            for val in [false, true] {
+                                let mut pins = sw.pins.clone();
+                                pins.push((branch, val));
+                                out_batch.push(PipelineWork::SolveW(SolveWWork {
+                                    pins,
+                                    tuple: sw.tuple,
+                                    z_bits: sw.z_bits,
+                                    w_bits: sw.w_bits,
+                                    xy_graph: sw.xy_graph.clone(),
+                                    candidate_tuples: sw.candidate_tuples.clone(),
+                                    attempt: sw.attempt.saturating_add(1),
+                                    prior_blocks: new_w_blocks.clone(),
+                                }));
+                            }
+                            metrics.flow_w_split.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        _ => {
+                            // Cap reached (or nothing left to pin): fall back
+                            // to the old honest-but-lossy closure.
+                            *timed_out = true;
+                        }
+                    }
                     break;
                 }
             }
@@ -1182,6 +1228,7 @@ pub(crate) fn process_solve_w(
             let mut blocks = std::mem::take(&mut sw.prior_blocks);
             blocks.append(&mut new_w_blocks);
             *deferred_out = Some(PipelineWork::SolveW(SolveWWork {
+                pins: sw.pins.clone(),
                 tuple: sw.tuple,
                 z_bits: sw.z_bits,
                 w_bits: sw.w_bits,
@@ -1586,7 +1633,7 @@ pub(crate) fn process_solve_z(
                 // longer subdivided. Without the cap a single stubborn
                 // (boundary, W) grows 2^depth queued items and the process
                 // runs out of memory instead of reporting anything.
-                let split_depth_max = z_split_depth_max();
+                let split_depth_max = split_depth_max();
                 if sz.pins.len() >= split_depth_max {
                     *timed_out = true;
                     if trace_z {
@@ -2983,7 +3030,7 @@ pub(crate) fn z_spectral_enabled() -> bool {
 /// item count, so this is what keeps memory bounded.
 /// `TURYN_Z_SPLIT_MAX=<n>` overrides; 0 disables splitting entirely
 /// (restoring the old discard-on-timeout behaviour).
-fn z_split_depth_max() -> usize {
+fn split_depth_max() -> usize {
     static D: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *D.get_or_init(|| {
         std::env::var("TURYN_Z_SPLIT_MAX")
@@ -3322,6 +3369,7 @@ pub(crate) fn new_pipeline_metrics() -> PipelineMetrics {
         flow_z_unsat: z(),
         flow_z_timeout: z(),
         flow_z_split: z(),
+        flow_w_split: z(),
         flow_z_solutions: z(),
         flow_z_spec_fail: z(),
         flow_z_pair_fail: z(),
