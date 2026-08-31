@@ -1370,3 +1370,59 @@ now take more than 381 s while completing 80 of them honestly. Scaling
 that to 1,465,976 boundaries gives a floor of **≈5.6e6 s ≈ 65 days**,
 replacing the 49 days of §12.14 — the earlier figure was cheap partly
 because it was skipping work.
+
+### 12.16 The answer: ~7 million years, and why the metric could never have said so
+
+Running one boundary to completion, as §12.15 proposed, gives the number.
+It also explains every symptom in §12.11 through §12.15 at once.
+
+**The measurement.** `TURYN_BOUNDARY_SKIP=70 TURYN_BOUNDARY_LIMIT=1`,
+n=56 k=7, no wall-clock cap, nothing abandoned. After 1251 s that single
+boundary had enumerated **632,119 W middles** — steady at ~505/s, with
+its Z sub-problems being decided rather than timed out (`z_split=0`), so
+the pipeline was working exactly as intended.
+
+**The arithmetic that ends it.** The W middle at n=56 k=7 is 41 bits. The
+W stage enumerates middles one at a time through SAT, and the sum
+constraint admits an entire binomial shell of them:
+
+    C(41, 20) = 2.691e11 W middles for ONE boundary
+
+632,119 of 2.691e11 is **0.00023 %** of one boundary, after 21 minutes.
+At the measured rate that boundary alone needs **17 years**. Sampling 150
+boundaries individually shows 30 % do real work (the other 70 % die
+instantly on the tuple and spectral filters), so:
+
+| | |
+|---|---:|
+| W middles per working boundary | 2.691e11 |
+| measured rate (4 threads) | 505 / s |
+| one boundary | 5.3e8 s = **17 years** |
+| working boundaries (30 % of 1,465,976) | 439,793 |
+| **whole n=56 search** | **2.3e14 s ≈ 7.4e6 years** |
+
+Raising `k` does not rescue it — a smaller middle buys fewer W middles per
+boundary but multiplies the boundary count faster. At k=10 the same
+arithmetic gives 7.6e14 s ≈ 2.4e7 years, three times worse.
+
+**Seven million years, against 1.4e10 years for the age of the
+universe.** Not a tuning problem, not a plumbing problem: the `apart`
+algorithm enumerates a 2.7e11-element set per boundary, one SAT model at
+a time, and no amount of throughput fixes an exponent.
+
+**Why every earlier number was wrong in the same direction.** Mass credit
+lands only when a boundary's whole subtree finishes. No boundary can
+finish, so no credit ever lands, so `covered` rises only via partial
+credit and then saturates — at every n, not just 56 (§12.15). Every
+figure this project has published for n=56 (7.5 d, 23.5 d, 30 d, 49 d,
+65 d) was elapsed time divided by a number that had stopped moving. The
+metric was not merely imprecise; it was structurally incapable of
+reporting the true magnitude, because the true magnitude requires
+completing a unit of work the search has never once completed.
+
+**What this does not say.** It bounds *this* algorithm, `--wz=apart` with
+per-boundary SAT enumeration of W. It says nothing about TT(56) being
+findable by a better method — a search that never materialises the W
+shell, or one that exploits structure to skip it, is not addressed here.
+The right next question is not "how do we speed up the W enumeration" but
+"what replaces enumerating C(41,20) candidates one at a time".
