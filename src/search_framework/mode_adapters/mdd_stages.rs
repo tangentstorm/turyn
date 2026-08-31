@@ -616,6 +616,8 @@ pub struct GenerateStage {
     weight_scale: f64,
     /// Boundaries emitted so far, for `TURYN_BOUNDARY_LIMIT`.
     generated: Arc<AtomicU64>,
+    /// Boundaries dropped so far, for `TURYN_BOUNDARY_SKIP`.
+    skipped: Arc<AtomicU64>,
 }
 
 impl StageHandler<MddPayload> for GenerateStage {
@@ -658,6 +660,10 @@ impl StageHandler<MddPayload> for GenerateStage {
 
         let mut out = StageOutcome::default();
         for bnd in batch {
+            if self.skipped.load(Ordering::Relaxed) < boundary_skip() {
+                self.skipped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             if let Some(limit) = boundary_limit() {
                 if self.generated.load(Ordering::Relaxed) >= limit {
                     break;
@@ -714,13 +720,28 @@ impl StageHandler<MddPayload> for GenerateStage {
     }
 }
 
-/// `TURYN_BOUNDARY_LIMIT=N`: process only the first N boundaries.
+/// `TURYN_BOUNDARY_LIMIT=N`: process only N boundaries.
 fn boundary_limit() -> Option<u64> {
     static L: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *L.get_or_init(|| {
         std::env::var("TURYN_BOUNDARY_LIMIT")
             .ok()
             .and_then(|v| v.parse().ok())
+    })
+}
+
+/// `TURYN_BOUNDARY_SKIP=N`: drop the first N boundaries before counting
+/// against the limit. With `LIMIT=1` this isolates one specific boundary,
+/// which is how a single boundary's full cost gets measured -- the first
+/// boundaries in DFS order do no work at all, so `LIMIT=1` alone measures
+/// process startup and nothing else.
+fn boundary_skip() -> u64 {
+    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("TURYN_BOUNDARY_SKIP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
     })
 }
 
@@ -1571,6 +1592,7 @@ impl SearchModeAdapter<MddPayload> for MddStagesAdapter {
                 path_cache: Mutex::new(HashMap::new()),
                 weight_scale: self.weight_scale,
                 generated: Arc::new(AtomicU64::new(0)),
+                skipped: Arc::new(AtomicU64::new(0)),
             }),
         );
         m.insert(
