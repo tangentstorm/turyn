@@ -1405,6 +1405,9 @@ Raising `k` does not rescue it — a smaller middle buys fewer W middles per
 boundary but multiplies the boundary count faster. At k=10 the same
 arithmetic gives 7.6e14 s ≈ 2.4e7 years, three times worse.
 
+**[REVISED — see §12.17: the true figure is ~6e7 years, because the W
+enumeration covers ~99 % of `2^middle`, not one binomial shell.]**
+
 **Seven million years, against 1.4e10 years for the age of the
 universe.** Not a tuning problem, not a plumbing problem: the `apart`
 algorithm enumerates a 2.7e11-element set per boundary, one SAT model at
@@ -1426,3 +1429,64 @@ findable by a better method — a search that never materialises the W
 shell, or one that exploits structure to skip it, is not addressed here.
 The right next question is not "how do we speed up the W enumeration" but
 "what replaces enumerating C(41,20) candidates one at a time".
+
+### 12.17 Checking the 7-million-year claim — it was 8x too low
+
+§12.16 rested on one modelled quantity rather than a measured one: that a
+boundary's W enumeration covers a binomial shell, `C(41, 20) = 2.7e11`.
+The W solver is built by `build_base_solver_pb_set`, which carries the
+sum constraint and a spectral filter and nothing else, so that was an
+assumption about how much the spectral filter prunes — worth testing
+before standing behind a five-order-of-magnitude claim.
+
+**Tested at sizes where a boundary completes** (one working boundary run
+alone to completion, `abandoned=0`):
+
+| n | W middle bits | full space `2^m` | W middles enumerated | fraction |
+|---:|---:|---:|---:|---:|
+| 26 | 11 | 2,048 | 1,914 | **0.935** |
+| 30 | 15 | 32,768 | 32,526 | **0.993** |
+| 32 | 17 | 131,072 | 129,404 | **0.987** |
+
+The enumeration is essentially **exhaustive over the whole `2^m` space**,
+and the fraction rises rather than falls with m. The spectral filter
+barely prunes at the SAT level — it rejects afterwards, which costs the
+enumeration anyway. So the shell figure was wrong by the ratio
+`2^41 / C(41,20) ≈ 8`, in the direction that makes things worse.
+
+**Corrected figures** (rate 505 W/s measured *at n=56*, where each solve
+is over 41 variables — the same boundary at n=26 ran ~40,000/s, so the
+rate must be taken at the target size):
+
+| | |
+|---|---:|
+| W middles per working boundary | 0.99 × 2^41 = **2.18e12** |
+| working boundaries (30 % of 1,465,976) | 439,793 |
+| total W-middle enumerations | **9.6e17** |
+| **whole n=56 search** | **1.9e15 s ≈ 6.0e7 years** |
+
+**How robust.** The conclusion is not sensitive to the remaining
+uncertainties:
+
+* *Rate.* 505/s was measured on a machine partly busy with an unrelated
+  spin loop, so the true rate may be up to ~2x higher. That halves the
+  answer to 3e7 years.
+* *Working fraction.* 30 % came from 150 contiguous samples, and working
+  boundaries cluster (at n=26 the first 50 are all empty), so this could
+  be off by 2-3x either way.
+* *Fraction of `2^m` enumerated.* Measured at m ≤ 17 and extrapolated to
+  m = 41. If the spectral filter somehow became **100x** more effective
+  at m=41 than measured, the answer would still be 6e5 years.
+
+The scale-invariant statement: finishing in one year needs a **6e7x**
+speedup. Implementation work does not produce that; the 3.3x from the
+spectral propagator fix (§12.8) is representative of what tuning yields.
+The barrier is that the algorithm enumerates `2^(n-1-2k)` W middles per
+boundary, one SAT model at a time, and that exponent is the whole
+problem.
+
+**Confidence.** High that it is many millions of years and that no
+amount of optimisation reaches feasibility; roughly one order of
+magnitude either side on the exact figure. The measurement that would
+tighten it most is the enumerated-fraction trend at m = 21-25, which is
+hours of runtime rather than days.
