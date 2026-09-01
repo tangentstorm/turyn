@@ -2935,7 +2935,16 @@ pub(crate) fn build_phase_b_context(
         middle_m,
         max_bnd_sum,
         max_z: cfg.max_z.min(16),
-        individual_bound: problem.spectral_bound(),
+        // London §5.1: a restricted pair budget M implies |W(w)|^2 <= M
+        // individually (since |Z(w)|^2 >= 0), so the restriction can prune
+        // during W ENUMERATION rather than only at the pair check
+        // downstream. Leaving this at the full bound made `--max-spectral`
+        // inert against the dominant cost -- measured identical W
+        // enumeration from M=95 down to M=40 at n=32.
+        //
+        // This makes the search deliberately INCOMPLETE: it is a find-mode
+        // knob, not an exhaustive-mode one. Unset, behaviour is unchanged.
+        individual_bound: cfg.max_spectral.unwrap_or(problem.spectral_bound()),
         pair_bound: cfg.max_spectral.unwrap_or(problem.spectral_bound()),
         theta: cfg.theta_samples,
         mdd_extend: cfg.mdd_extend,

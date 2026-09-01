@@ -1371,6 +1371,13 @@ that to 1,465,976 boundaries gives a floor of **≈5.6e6 s ≈ 65 days**,
 replacing the 49 days of §12.14 — the earlier figure was cheap partly
 because it was skipping work.
 
+> **RETRACTED — see §12.18.** The 6e7-year figure in §12.17 and the
+> 7.4e6-year figure in §12.16 both extrapolate an enumerated-fraction
+> measured on the BRUTE-FORCE W path (`middle_m <= 20`) to n=56, which
+> uses the SAT W path. That extrapolation is invalid. What survives is
+> the section-sampling floor of §12.14/§12.15 (tens of days) and the
+> measured rate; the exhaustive figure for n=56 is unknown.
+
 ### 12.16 The answer: ~7 million years, and why the metric could never have said so
 
 Running one boundary to completion, as §12.15 proposed, gives the number.
@@ -1490,3 +1497,63 @@ amount of optimisation reaches feasibility; roughly one order of
 magnitude either side on the exact figure. The measurement that would
 tighten it most is the enumerated-fraction trend at m = 21-25, which is
 hours of runtime rather than days.
+
+### 12.18 Retraction, and a real lever that was sitting behind an inert flag
+
+**What was wrong.** §12.16 and §12.17 both rest on "a boundary's W
+enumeration covers ~99 % of `2^middle`", measured at n=26/30/32. Those
+sizes have `middle_m` of 11/15/17, and `process_solve_w` branches on
+`if ctx.middle_m <= 20` into a **brute-force** enumeration that walks the
+whole shell and filters afterwards. Of course it covers ~99 % — that is
+what brute force does. n=56 has `middle_m = 41` and uses the **SAT**
+path, which only ever returns models satisfying the encoded constraints.
+Extrapolating the one to the other was invalid, and both the 7.4e6 and
+6.0e7 year figures are withdrawn.
+
+What survives: the measured rate (~500 W middles/s at n=56), the fact
+that one boundary produced 632,119 of them in 1251 s without finishing,
+and the section-sampling floor of §12.14/§12.15 — tens of days, still a
+floor. **The exhaustive cost of n=56 is not currently known.**
+
+**The lever.** `IDEAS.md` records London §5.1: restrict the spectral pair
+budget to `M < 3n-1`, which is how the TT(40) record was set (M=84;
+M=66 for the first TT(32)). `--max-spectral` exists and reaches
+`pair_bound` — but `individual_bound`, the bound the W **enumeration**
+uses, was hardcoded to `problem.spectral_bound()`. So the flag applied
+only at the pair check *downstream* of the bottleneck. Measured at n=32:
+W enumeration is byte-identical from M=95 down to M=40. The documented
+technique for making long searches feasible was inert against the
+dominant cost.
+
+A restricted pair budget implies `|W(w)|^2 <= M` on its own (since
+`|Z(w)|^2 >= 0`), so it can prune during enumeration. Wiring
+`individual_bound` to `max_spectral` — one line, active only when the
+flag is passed — makes it bite on the SAT path. One boundary at n=56,
+60 s each:
+
+| M | W middles produced | W regions refuted |
+|---:|---:|---:|
+| 167 (full bound) | 28,062 | 76 |
+| 120 | 450 | 1,411 |
+| 90 | **0** | 1,543 |
+| 60 | **0** | 1,543 |
+
+At M=120 the enumeration drops **62x**; at M=90 the boundary's entire W
+space is *refuted* rather than enumerated. That is a change of regime,
+not a constant factor, and it is the difference between the search
+grinding and the search moving.
+
+**What it costs.** The restricted search is deliberately **incomplete**:
+it can only find quadruples whose spectral pair sum stays under M, and
+proves nothing about those above it. That is a find-mode knob, not an
+exhaustive-mode one, and it is exactly the trade London made to reach
+TT(40). Default behaviour is unchanged (the full coverage suite is 9/9
+with the flag unset); the flag already declared incompleteness.
+
+**Where this leaves the question "can n=56 be brought into range".** The
+honest answer is that the exhaustive cost is unknown, and that the
+question worth asking is a different one: TT(56) needs to be *found*, not
+*exhausted*. Restricted-M search is the documented route to that, it is
+now functional, and the open work is empirical — sweep M at n=56 and see
+where solutions start appearing versus where the search stalls, exactly
+as London's Table V does for n=32 and n=40.
